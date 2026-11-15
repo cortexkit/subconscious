@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.40.2
+
+- Add optional `changed_pending` rescan rows and pending module-status values,
+  with the activation boundary for each unapplied field. Older wire readers
+  may ignore them; absent fields decode as empty lists.
+- Rust struct literals for `SupervisorRescanResult` must initialize
+  `changed_pending` (use an empty vector when there are no pending edits).
+
 ## 0.40.1
 
 - Add optional script content and runtime details to supervisor status entries.

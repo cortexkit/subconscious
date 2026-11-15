@@ -16,7 +16,7 @@ use subc_jsonc::jsonc_to_json;
 use subc_protocol::manifest::is_valid_capability_identifier;
 
 use crate::{
-    supervise::{ModuleOverlap, SUBC_SPAWN_ROLE_ENV},
+    supervise::{ModuleOverlap, ScriptEntry, ScriptRuntime, SUBC_SPAWN_ROLE_ENV},
     HealthAction, HealthConfig, ModuleSpec, RestartPolicy,
 };
 
@@ -274,8 +274,8 @@ impl StorageConfig {
 pub struct ConfiguredModule {
     pub module_id: String,
     pub program: PathBuf,
-    /// Bundled ECMAScript module, read by the daemon and delivered from memory.
-    pub script: Option<PathBuf>,
+    /// Bundled script content, read by the daemon and delivered from memory.
+    pub script: Option<ScriptEntry>,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
     /// Effective module logging policy. An absent module block inherits the
@@ -324,10 +324,10 @@ pub struct ConfiguredModule {
     /// re-derive the defaults and get them subtly different.
     ///
     /// Read when a module STARTS being supervised (daemon start, or a rescan
-    /// that adds the module). Like `drain_timeout_ms`, an edit to this block for
-    /// an already-running module is not part of the rescan diff, so it takes
-    /// effect on the next daemon start rather than immediately. With approved-
-    /// store authority, approved generations reconcile it live on a separate path.
+    /// that adds the module). Legacy rescan reports an edit as pending until
+    /// supervision next starts, not merely until the child respawns. The
+    /// configuration approval path (`SupervisorCommand::ApprovedConfiguration`)
+    /// reconciles approved module entries live instead of using legacy rescan.
     pub restart: RestartPolicy,
 }
 
@@ -525,11 +525,35 @@ mod script_config_tests {
             parse(serde_json::json!({"script":{"runtime":"bun","path":"bundle.js"}})).unwrap();
         assert_eq!(
             config.modules[0].program,
-            crate::supervise::script::runner_path().unwrap()
+            crate::supervise::script::runner_path(ScriptRuntime::Bun).unwrap()
         );
         assert_eq!(
             config.modules[0].module_spec().script,
-            Some(std::path::absolute("bundle.js").unwrap())
+            Some(ScriptEntry::new(
+                ScriptRuntime::Bun,
+                std::path::absolute("bundle.js").unwrap()
+            ))
+        );
+    }
+
+    #[test]
+    fn script_config_accepts_python_and_resolves_only_the_installed_runner() {
+        let config =
+            parse(serde_json::json!({"script":{"runtime":"python","path":"bundle.py"}})).unwrap();
+        assert_eq!(
+            config.modules[0].program,
+            crate::supervise::script::runner_path(ScriptRuntime::Python).unwrap()
+        );
+        assert_ne!(
+            config.modules[0].program,
+            crate::supervise::script::runner_path(ScriptRuntime::Bun).unwrap()
+        );
+        assert_eq!(
+            config.modules[0].module_spec().script,
+            Some(ScriptEntry::new(
+                ScriptRuntime::Python,
+                std::path::absolute("bundle.py").unwrap()
+            ))
         );
     }
 
@@ -562,13 +586,20 @@ mod script_config_tests {
             "NODE_PATH",
             "BUN_CONFIG_PRELOAD",
             "BUN_CONFIG_any",
+            "PYTHONPATH",
+            "PYTHONHOME",
+            "PYTHONSTARTUP",
+            "PYTHON_any",
         ] {
             let env = BTreeMap::from([(key, "unapproved")]);
-            let error =
-                parse(serde_json::json!({"script":{"runtime":"bun","path":"bundle.js"},"env":env}))
-                    .unwrap_err()
-                    .to_string();
-            assert!(error.contains(key) && error.contains("example"), "{error}");
+            for runtime in ["bun", "python"] {
+                let error = parse(
+                    serde_json::json!({"script":{"runtime":runtime,"path":"bundle.js"},"env":env}),
+                )
+                .unwrap_err()
+                .to_string();
+                assert!(error.contains(key) && error.contains("example"), "{error}");
+            }
             assert!(parse(serde_json::json!({"program":"legacy-interpreter","env":env})).is_ok());
         }
     }
@@ -921,14 +952,18 @@ fn parse_doc_with_activity(
         .map(|(module_id, module)| {
             let (program, script) = match (module.program, module.script) {
                 (Some(program), None) => (program, None),
-                (None, Some(script)) if script.runtime == "bun" => {
+                (None, Some(script)) if matches!(script.runtime.as_str(), "bun" | "python") => {
+                    let runtime = match script.runtime.as_str() {
+                        "python" => ScriptRuntime::Python,
+                        _ => ScriptRuntime::Bun,
+                    };
                     let script_path = crate::supervise::script::resolve_script_path(&script.path)
                         .map_err(|error| DaemonConfigError::InvalidValue { path: path.into(), message: format!("module '{module_id}': {error}") })?;
-                    let runner = crate::supervise::script::runner_path()
+                    let runner = crate::supervise::script::runner_path(runtime)
                         .map_err(|error| DaemonConfigError::InvalidValue { path: path.into(), message: format!("module '{module_id}': {error}") })?;
-                    (runner, Some(script_path))
+                    (runner, Some(ScriptEntry::new(runtime, script_path)))
                 }
-                (None, Some(script)) => return Err(DaemonConfigError::InvalidValue { path: path.into(), message: format!("module '{module_id}' script runtime '{}' is unsupported; expected bun", script.runtime.escape_debug()) }),
+                (None, Some(script)) => return Err(DaemonConfigError::InvalidValue { path: path.into(), message: format!("module '{module_id}' script runtime '{}' is unsupported; expected bun or python", script.runtime.escape_debug()) }),
                 _ => return Err(DaemonConfigError::InvalidValue { path: path.into(), message: format!("module '{module_id}' must name exactly one of program or script") }),
             };
             if script.is_some() {

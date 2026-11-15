@@ -1389,6 +1389,7 @@ async fn serve_bound_daemon(
     }
     if let Some(config_path) = daemon_config_path {
         control = control.with_supervisor_rescan(supervisor.clone(), config_path, configured_port);
+        control = control.with_supervisor_rescan_entries(&configured_modules);
     }
     #[cfg(all(test, feature = "test-support"))]
     let control = if let Some(adapt) = test_control {

@@ -1026,11 +1026,15 @@ fn spec(rig: &Rig) -> ModuleSpec {
 }
 
 fn script_rig() -> (Rig, std::path::PathBuf, std::path::PathBuf) {
+    script_rig_for_runtime("bun")
+}
+
+fn script_rig_for_runtime(runtime: &str) -> (Rig, std::path::PathBuf, std::path::PathBuf) {
     let rig = rig();
     let script = rig.path.join("bundle.js");
     let receipt = rig.path.join("receipt.json");
     std::fs::write(&script, b"abc").unwrap();
-    std::fs::write(rig.path.join("subc.jsonc"), json!({"version":1,"modules":{"a":{"script":{"runtime":"bun","path":script},"args":[receipt],"protocol":"none"}}}).to_string()).unwrap();
+    std::fs::write(rig.path.join("subc.jsonc"), json!({"version":1,"modules":{"a":{"script":{"runtime":runtime,"path":script},"args":[receipt],"protocol":"none"}}}).to_string()).unwrap();
     (rig, script, receipt)
 }
 
@@ -1051,7 +1055,16 @@ async fn script_receipt(path: &std::path::Path) -> serde_json::Value {
 
 #[tokio::test]
 async fn script_admission_swap_after_read_delivers_approved_bytes_and_refuses_next_start() {
-    let (rig, path, receipt) = script_rig();
+    script_swap_after_read("bun").await;
+}
+
+#[tokio::test]
+async fn script_admission_python_swap_after_read_delivers_approved_bytes_and_refuses_next_start() {
+    script_swap_after_read("python").await;
+}
+
+async fn script_swap_after_read(runtime: &str) {
+    let (rig, path, receipt) = script_rig_for_runtime(runtime);
     let owner = Arc::new(rig.owner("script-swap"));
     rig.stamp(&owner);
     let original = spec(&rig);
@@ -1083,9 +1096,46 @@ async fn script_admission_swap_after_read_delivers_approved_bytes_and_refuses_ne
     );
     assert!(owner.has_recorded_admission_hold("a"));
     assert!(
-        crate::supervise::script::status(&path, owner.approved_script("a", &path).as_ref())
-            .needs_review
+        crate::supervise::script::status(
+            original.script.as_ref().unwrap(),
+            owner.approved_script("a", &path).as_ref()
+        )
+        .needs_review
     );
+}
+
+#[tokio::test]
+async fn script_admission_python_starts_python_runner() {
+    let (rig, _, receipt) = script_rig_for_runtime("python");
+    let owner = Arc::new(rig.owner("script-python-start"));
+    rig.stamp(&owner);
+    let launch = crate::config_gate::program::capture(&spec(&rig), &[]).unwrap();
+    assert!(!crate::config_gate::program::definite_program_change(
+        &launch.inputs
+    ));
+    let module = Supervisor::new_for_test(
+        Arc::new(crate::Registry::default()),
+        RestartPolicy::default(),
+    )
+    .with_config_runtime(owner)
+    .spawn_async(spec(&rig))
+    .await
+    .unwrap();
+    let report = script_receipt(&receipt).await;
+    module.stop().await.unwrap();
+    assert_eq!(report["bytes"], json!([97, 98, 99]));
+    assert_eq!(
+        report["runner"],
+        crate::supervise::script::runner_path(crate::ScriptRuntime::Python)
+            .unwrap()
+            .to_string_lossy()
+            .as_ref()
+    );
+    let entry = spec(&rig).script.unwrap();
+    let status = crate::supervise::script::status(&entry, None);
+    assert_eq!(status.runtime, "python");
+    assert_eq!(status.bun_version, None);
+    assert!(!status.needs_review);
 }
 
 #[tokio::test]

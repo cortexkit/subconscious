@@ -447,6 +447,48 @@ async fn audit_registration_list_captures_once_for_all_rows() {
 }
 
 #[tokio::test]
+async fn rescan_pending_approved_protocol_none_registration_metadata_is_not_pending() {
+    let rig = policy_rig();
+    let path = rig.path.join("subc.jsonc");
+    std::fs::write(&path, json!({"version":1,"modules":{
+        "a":{"program":rig.path.join("program"),"enabled":false,"protocol":"none","registration_channel":true}
+    }}).to_string()).unwrap();
+    let owner = std::sync::Arc::new(rig.owner("pending-protocol-none"));
+    rig.stamp(&owner);
+    let registry = std::sync::Arc::new(crate::Registry::default());
+    let handle = crate::supervise::SupervisorHandle::new();
+    let supervisor =
+        crate::supervise::Supervisor::new_for_test(registry.clone(), Default::default())
+            .with_handle(handle.clone())
+            .with_config_runtime(owner.clone());
+    let configuration = crate::daemon_config::load(&path).unwrap().unwrap();
+    let entry = &configuration.modules[0];
+    let module = supervisor
+        .supervise_configured_requested_async(
+            entry.module_spec(),
+            false,
+            entry.health.clone(),
+            entry.drain_timeout_ms,
+            entry.restart,
+            entry.register_timeout,
+            None,
+        )
+        .await
+        .unwrap();
+    let handler = std::sync::Arc::new(
+        crate::ControlHandler::new(registry)
+            .with_supervisor(handle)
+            .with_config_runtime(owner),
+    );
+    let response = registration_declaration_poll(handler, "supervisor.list").await;
+    assert!(
+        response["modules"][0].get("pending").is_none(),
+        "{response}"
+    );
+    module.stop().await.unwrap();
+}
+
+#[tokio::test]
 async fn audit_registration_health_captures_once_for_all_rows() {
     capture_once_for_all_rows("supervisor.health").await;
 }

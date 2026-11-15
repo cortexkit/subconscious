@@ -58,6 +58,174 @@ impl RescanMode {
 /// spec and health policy, and whether it is enabled.
 pub(super) type CurrentModule = (SupervisedModule, ModuleSpec, HealthConfig, bool);
 
+#[derive(Debug, Default)]
+pub(super) struct ModuleEntries {
+    registration_channels: BTreeMap<String, bool>,
+    configured: BTreeMap<String, ConfiguredModule>,
+}
+
+impl ModuleEntries {
+    pub(super) fn seed(&mut self, modules: &[ConfiguredModule]) {
+        self.configured = modules
+            .iter()
+            .cloned()
+            .map(|m| (m.module_id.clone(), m))
+            .collect();
+        self.registration_channels = modules
+            .iter()
+            .map(|m| (m.module_id.clone(), m.registration_channel))
+            .collect();
+    }
+
+    pub(super) fn record(
+        &mut self,
+        configured: &BTreeMap<String, ConfiguredModule>,
+        added: &[String],
+        removed: &[String],
+    ) {
+        for id in removed {
+            self.registration_channels.remove(id);
+        }
+        for id in added {
+            self.registration_channels
+                .insert(id.clone(), configured[id].registration_channel);
+        }
+        self.configured = configured.clone();
+    }
+}
+
+pub(super) fn entry_pending_fields(
+    current: &ConfiguredModule,
+    next: &ConfiguredModule,
+    applies_configuration: bool,
+) -> Vec<subc_control::SupervisorPendingField> {
+    use subc_control::{PendingModuleApply as Apply, SupervisorPendingField};
+    let mut fields = Vec::new();
+    let mut add = |field: &str, applies, value| {
+        fields.push(SupervisorPendingField {
+            field: field.to_owned(),
+            applies,
+            value: Some(value),
+        })
+    };
+    if current.register_timeout != next.register_timeout {
+        add(
+            "register_timeout_s",
+            Apply::NextSupervision,
+            serde_json::json!(next.register_timeout.as_secs()),
+        );
+    }
+    if current.restart != next.restart {
+        add(
+            "restart",
+            Apply::NextSupervision,
+            serde_json::json!({
+                "max_restarts": next.restart.max_restarts,
+                "window_secs": next.restart.window.as_secs(),
+                "backoff_ms": next.restart.backoff.as_millis() as u64,
+                "max_backoff_ms": next.restart.max_backoff.as_millis() as u64,
+            }),
+        );
+    }
+    let drain = |module: &ConfiguredModule| {
+        module
+            .drain_timeout_ms
+            .map(Duration::from_millis)
+            .unwrap_or(crate::supervise::DEFAULT_DRAIN_TIMEOUT)
+    };
+    if !applies_configuration && drain(current) != drain(next) {
+        add(
+            "drain_timeout_ms",
+            Apply::WithNextLaunchOrHealthChange,
+            serde_json::json!(drain(next).as_millis() as u64),
+        );
+    }
+    let relay = |module: &ConfiguredModule| {
+        module
+            .route_bind_relay_timeout_ms
+            .map(Duration::from_millis)
+            .unwrap_or(crate::DEFAULT_ROUTE_BIND_RELAY_TIMEOUT)
+    };
+    if relay(current) != relay(next) {
+        add(
+            "route_bind_relay_timeout_ms",
+            Apply::DaemonRestart,
+            serde_json::json!(relay(next).as_millis() as u64),
+        );
+    }
+    if current.registration_channel != next.registration_channel {
+        add(
+            "registration_channel",
+            Apply::ConfigGate,
+            serde_json::json!(next.registration_channel),
+        );
+    }
+    fields
+}
+
+impl ControlHandler {
+    pub(super) fn registration_channel_in_force(
+        declaration: Option<&str>,
+        configured: Option<bool>,
+    ) -> Option<bool> {
+        match declaration {
+            Some("declared") => Some(true),
+            Some("undeclared") => Some(false),
+            // Entries with `protocol: none` speak no control protocol and have
+            // no registration channel; use their approved metadata instead.
+            _ => configured,
+        }
+    }
+
+    pub(super) fn pending_module_fields(
+        &self,
+        module: &SupervisedModule,
+        proposed: Option<&ConfiguredModule>,
+        applies_configuration: bool,
+        approved_registration_channel: Option<bool>,
+    ) -> Result<Vec<subc_control::SupervisorPendingField>, String> {
+        let id = module.module_id();
+        let (recorded, registration_channel) = self
+            .rescan
+            .as_ref()
+            .map(|context| {
+                let entries = context
+                    .module_entries
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                (
+                    entries.configured.get(id).cloned(),
+                    entries
+                        .registration_channels
+                        .get(id)
+                        .copied()
+                        .unwrap_or(false),
+                )
+            })
+            .unwrap_or_default();
+        let Some(next) = proposed.cloned().or(recorded) else {
+            return Ok(Vec::new());
+        };
+        let status = module.status().map_err(|e| e.to_string())?;
+        let mut current = next.clone();
+        current.register_timeout = module
+            .configured_register_timeout()
+            .map_err(|e| e.to_string())?;
+        current.restart = crate::supervise::RestartPolicy {
+            max_restarts: status.max_restarts,
+            window: status.restart_window,
+            backoff: status.restart_backoff,
+            max_backoff: status.restart_max_backoff,
+        };
+        current.drain_timeout_ms = Some(status.drain_timeout.as_millis() as u64);
+        current.route_bind_relay_timeout_ms =
+            Some(self.route_bind_relay_timeout_for(id).as_millis() as u64);
+        current.registration_channel =
+            approved_registration_channel.unwrap_or(registration_channel);
+        Ok(entry_pending_fields(&current, &next, applies_configuration))
+    }
+}
+
 /// The comparison a rescan makes between the configured modules and the
 /// supervised ones, before anything is applied.
 pub(super) struct RescanPlan {
@@ -68,6 +236,7 @@ pub(super) struct RescanPlan {
     /// Modules whose launch spec changes. Their running process keeps the old
     /// one until it restarts.
     pub(super) changed_pending_reload: Vec<String>,
+    pub(super) changed_pending: Vec<subc_control::SupervisorPendingModule>,
     /// Modules whose launch spec or health policy changes.
     pub(super) configuration_changes: BTreeSet<String>,
     pub(super) enabled_changes: BTreeSet<String>,
@@ -80,6 +249,7 @@ impl RescanPlan {
             added: self.added.clone(),
             removed: self.removed.clone(),
             changed_pending_reload: self.changed_pending_reload.clone(),
+            changed_pending: self.changed_pending.clone(),
             enabled_changes: self.enabled_changes.iter().cloned().collect(),
             unchanged: self.unchanged,
             preview: true,

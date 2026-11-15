@@ -1,5 +1,6 @@
 //! Read bundled code once, then transport those exact bytes to the installed runner.
 
+use super::{ScriptEntry, ScriptRuntime};
 use crate::config_gate::{CapturedInput, GateError};
 use sha2::{Digest, Sha256};
 use std::{
@@ -20,6 +21,7 @@ pub(crate) fn forbidden_env(key: &str) -> bool {
         key.as_str(),
         "NODE_OPTIONS" | "BUN_OPTIONS" | "BUN_INSTALL" | "NODE_PATH"
     ) || key.starts_with("BUN_CONFIG_")
+        || key.starts_with("PYTHON")
 }
 
 pub(super) fn remove_runtime_env(command: &mut tokio::process::Command, spec: &super::ModuleSpec) {
@@ -38,12 +40,12 @@ pub(super) fn remove_runtime_env(command: &mut tokio::process::Command, spec: &s
 }
 
 pub(crate) fn status(
-    path: &Path,
+    entry: &ScriptEntry,
     approved: Option<&CapturedInput>,
 ) -> subc_control::ScriptModuleStatus {
-    let current = ScriptBytes::read(path)
+    let current = ScriptBytes::read(&entry.path)
         .ok()
-        .map(|content| content.input(path));
+        .map(|content| content.input(entry));
     let needs_review = approved.is_some_and(|approved| current.as_ref() != Some(approved));
     let value = approved
         .or(current.as_ref())
@@ -52,9 +54,10 @@ pub(crate) fn status(
             _ => None,
         });
     subc_control::ScriptModuleStatus {
-        runtime: "bun".into(),
+        runtime: entry.runtime.as_str().into(),
+        // Always null for Python: runner versions await signed release metadata.
         bun_version: None,
-        path: path.into(),
+        path: entry.path.clone(),
         sha256: value
             .and_then(|value| value.get("raw")?.as_str()?.strip_prefix("sha256:"))
             .map(str::to_owned),
@@ -63,27 +66,28 @@ pub(crate) fn status(
     }
 }
 
-pub(crate) fn runner_beside(daemon: &Path) -> io::Result<PathBuf> {
+pub(crate) fn runner_beside(daemon: &Path, runtime: ScriptRuntime) -> io::Result<PathBuf> {
     let directory = daemon
         .parent()
         .ok_or_else(|| io::Error::other("daemon install folder is unavailable"))?;
-    Ok(directory.join(if cfg!(windows) {
-        "ck-script-runner-bun.exe"
-    } else {
-        "ck-script-runner-bun"
-    }))
+    Ok(directory.join(format!(
+        "ck-script-runner-{}{}",
+        runtime.as_str(),
+        std::env::consts::EXE_SUFFIX
+    )))
 }
 
-pub(crate) fn runner_path() -> io::Result<PathBuf> {
+pub(crate) fn runner_path(runtime: ScriptRuntime) -> io::Result<PathBuf> {
     #[cfg(test)]
     {
-        Ok(cortexkit_test_support::cargo_profile_bin(
-            "script-runner-fixture",
-        ))
+        Ok(cortexkit_test_support::cargo_profile_bin(match runtime {
+            ScriptRuntime::Bun => "script-runner-fixture",
+            ScriptRuntime::Python => "script-runner-python-fixture",
+        }))
     }
     #[cfg(not(test))]
     {
-        runner_beside(&std::env::current_exe()?)
+        runner_beside(&std::env::current_exe()?, runtime)
     }
 }
 
@@ -132,8 +136,8 @@ impl ScriptBytes {
         })
     }
 
-    pub(crate) fn input(&self, path: &Path) -> CapturedInput {
-        let value = serde_json::json!({"kind":"script", "runtime":"bun", "path":path, "length":self.bytes.len(), "raw":format!("sha256:{}", self.hex_digest())});
+    pub(crate) fn input(&self, entry: &ScriptEntry) -> CapturedInput {
+        let value = serde_json::json!({"kind":"script", "runtime":entry.runtime.as_str(), "path":entry.path, "length":self.bytes.len(), "raw":format!("sha256:{}", self.hex_digest())});
         CapturedInput {
             state: subc_config::InputState::Present {
                 digest: subc_config::raw_digest(
@@ -232,51 +236,66 @@ mod tests {
         } else {
             "ck-script-runner-bun"
         });
-        assert_eq!(runner_beside(&installed).unwrap(), expected);
+        assert_eq!(
+            runner_beside(&installed, ScriptRuntime::Bun).unwrap(),
+            expected
+        );
+        let python = installed.parent().unwrap().join(if cfg!(windows) {
+            "ck-script-runner-python.exe"
+        } else {
+            "ck-script-runner-python"
+        });
+        assert_eq!(
+            runner_beside(&installed, ScriptRuntime::Python).unwrap(),
+            python
+        );
     }
 
     #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn script_environment_daemon_inheritance_is_removed_before_runner_start() {
         let root = cortexkit_test_support::ScratchDir::new("script-env");
-        let runner = root.join(if cfg!(windows) {
-            "ck-script-runner-bun.exe"
-        } else {
-            "ck-script-runner-bun"
-        });
-        std::fs::copy(
-            cortexkit_test_support::cargo_profile_bin("script-runner-fixture"),
-            &runner,
-        )
-        .unwrap();
-        let path = root.join("bundle.js");
-        let receipt = root.join("receipt.json");
-        std::fs::write(&path, b"abc").unwrap();
-        let mut parent = std::process::Command::new(&runner);
-        parent.args([
-            std::ffi::OsStr::new("--env-parent"),
-            path.as_os_str(),
-            receipt.as_os_str(),
-        ]);
-        for key in [
-            "NODE_OPTIONS",
-            "BUN_OPTIONS",
-            "BUN_INSTALL",
-            "NODE_PATH",
-            "BUN_CONFIG_PRELOAD",
-            "BUN_CONFIG_any",
-        ] {
-            parent.env(key, "unapproved");
+        for runtime in [ScriptRuntime::Bun, ScriptRuntime::Python] {
+            let runner = runner_beside(&root.join("ck-subc"), runtime).unwrap();
+            std::fs::copy(
+                cortexkit_test_support::cargo_profile_bin("script-runner-fixture"),
+                &runner,
+            )
+            .unwrap();
+            let path = root.join("bundle.py");
+            let receipt = root.join("receipt.json");
+            std::fs::write(&path, b"abc").unwrap();
+            let mut parent = std::process::Command::new(&runner);
+            parent.args([
+                std::ffi::OsStr::new("--env-parent"),
+                path.as_os_str(),
+                receipt.as_os_str(),
+                std::ffi::OsStr::new(runtime.as_str()),
+            ]);
+            for key in [
+                "NODE_OPTIONS",
+                "BUN_OPTIONS",
+                "BUN_INSTALL",
+                "NODE_PATH",
+                "BUN_CONFIG_PRELOAD",
+                "BUN_CONFIG_any",
+                "PYTHONPATH",
+                "PYTHONHOME",
+            ] {
+                parent.env(key, "unapproved");
+            }
+            let output = parent.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let report: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
+            assert_eq!(report["forbidden_env"], serde_json::json!([]));
+            assert_eq!(report["runner"], runner.to_string_lossy().as_ref());
+            std::fs::remove_file(receipt).unwrap();
         }
-        let output = parent.output().unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let report: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(receipt).unwrap()).unwrap();
-        assert_eq!(report["forbidden_env"], serde_json::json!([]));
     }
 
     #[test]
@@ -291,15 +310,37 @@ mod tests {
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
         assert_eq!(hex,"434b534352495054010000000300000000000000ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
-        let approved = script.input(&path);
+        let entry = ScriptEntry::new(ScriptRuntime::Bun, path.clone());
+        let approved = script.input(&entry);
         std::fs::write(&path, b"changed").unwrap();
-        let status = status(&path, Some(&approved));
+        let status = status(&entry, Some(&approved));
         assert!(status.needs_review);
         assert_eq!(
             status.sha256.as_deref(),
             Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
         );
         assert_eq!(status.size, Some(3));
+    }
+
+    #[test]
+    fn script_runtime_is_part_of_content_and_launch_identity() {
+        let root = cortexkit_test_support::ScratchDir::new("script-runtime-identity");
+        let path = root.join("bundle");
+        std::fs::write(&path, b"abc").unwrap();
+        let content = ScriptBytes::read(&path).unwrap();
+        let bun = ScriptEntry::new(ScriptRuntime::Bun, path.clone());
+        let python = ScriptEntry::new(ScriptRuntime::Python, path);
+        let approved = content.input(&bun);
+        assert_ne!(approved, content.input(&python));
+        assert!(status(&python, Some(&approved)).needs_review);
+        assert_eq!(status(&python, None).runtime, "python");
+        let mut spec = crate::daemon_config::parse_with_activity(
+            &serde_json::json!({"version":1,"modules":{"example":{"script":{"runtime":"bun","path":bun.path}}}}).to_string(),
+            root.join("subc.jsonc"),
+        ).unwrap().0.modules[0].module_spec();
+        let digest = super::super::LaunchSpecDigest::from_spec(&spec);
+        spec.script = Some(python);
+        assert_ne!(digest, super::super::LaunchSpecDigest::from_spec(&spec));
     }
 
     #[test]

@@ -358,6 +358,7 @@ struct SupervisorRescanContext {
     /// names the state a `supervisor.rescan_checked` preview was computed
     /// against.
     generation: Arc<std::sync::atomic::AtomicU64>,
+    module_entries: Arc<Mutex<rescan_checked::ModuleEntries>>,
 }
 
 /// Refusal labels passed to `observe_route_open_refusal` that mean the target
@@ -1563,7 +1564,22 @@ impl ControlHandler {
             federated_scope_owner: self.federated_scope_owner.clone(),
             privileged_operator_prompt: self.privileged_operator_prompt,
             generation: Arc::default(),
+            module_entries: Arc::default(),
         });
+        self
+    }
+
+    pub(crate) fn with_supervisor_rescan_entries(
+        self,
+        modules: &[crate::daemon_config::ConfiguredModule],
+    ) -> Self {
+        if let Some(context) = &self.rescan {
+            let mut entries = context
+                .module_entries
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            entries.seed(modules);
+        }
         self
     }
 
@@ -2766,7 +2782,7 @@ impl ControlHandler {
 
     /// Run `hook` once, in the next `route.open` that attests a launch nonce,
     /// right after the nonce is resolved.
-    #[cfg(all(test, unix))]
+    #[cfg(all(test, unix, feature = "test-support"))]
     pub(crate) fn after_nonce_attestation_for_test(&self, hook: impl FnOnce() + Send + 'static) {
         *self
             .after_nonce_attestation
@@ -7688,12 +7704,33 @@ impl ControlHandler {
                 status.launch_spec_digest.as_ref(),
             ));
             let pending_reload = Some(verdict);
-            let script = configured.script.as_ref().map(|path| {
+            let pending_entry = match &approved {
+                ApprovedDaemonView::Approved { config, .. } => config
+                    .modules
+                    .iter()
+                    .find(|m| m.module_id == module.module_id()),
+                _ => None,
+            };
+            let pending = self
+                .pending_module_fields(
+                    &module,
+                    pending_entry,
+                    false,
+                    Self::registration_channel_in_force(
+                        publication
+                            .as_ref()
+                            .and_then(|view| view.registration_declaration(module.module_id()))
+                            .as_deref(),
+                        pending_entry.map(|entry| entry.registration_channel),
+                    ),
+                )
+                .map_err(|err| RouterError::backend(0, frame.header.corr, err))?;
+            let script = configured.script.as_ref().map(|entry| {
                 let approved = self
                     .config_runtime
                     .as_ref()
-                    .and_then(|owner| owner.approved_script(&status.module_id, path));
-                crate::supervise::script::status(path, approved.as_ref())
+                    .and_then(|owner| owner.approved_script(&status.module_id, &entry.path));
+                crate::supervise::script::status(entry, approved.as_ref())
             });
             let configured_enabled = match &approved {
                 ApprovedDaemonView::Approved {
@@ -7721,38 +7758,38 @@ impl ControlHandler {
                 });
             // Keep the retired policy field on the wire for one release so
             // existing status consumers still receive the platform policy.
-            modules.push(
-                SupervisorEntry::new(
-                    status.module_id,
-                    status.state.to_string(),
-                    status.enabled,
-                    status.live,
-                    status.health.status,
-                )
-                .with_configured_enabled(configured_enabled)
-                .with_script(script)
-                .with_admission_refused(admission_refused)
-                .with_next_retry_at_ms(next_retry_at_ms)
-                .with_launch_nonce_env(Some(!cfg!(unix)))
-                .with_launch_nonce_source(status.launch_nonce_source)
-                .with_waiting_for_previous_pid(status.waiting_for_previous_pid)
-                .with_protocol(status.protocol)
-                .with_pending_reload(pending_reload)
-                .with_last_probe_ms(status.health.last_probe_ms)
-                .with_last_exit_code(status.last_exit.as_ref().and_then(|e| e.code))
-                .with_last_exit_signal(status.last_exit.as_ref().and_then(|e| e.signal))
-                .with_last_exit_ms(status.last_exit.as_ref().map(|e| e.at_ms))
-                .with_last_exit_kind(status.last_exit.as_ref().map(|e| e.kind.into()))
-                .with_restart_count(Some(status.restart_count))
-                .with_max_restarts(Some(status.max_restarts))
-                .with_lifetime_restarts(Some(status.lifetime_restarts))
-                .with_spawn_generation(Some(status.spawn_generation))
-                .with_restart_window_secs(Some(status.restart_window.as_secs()))
-                .with_drain_timeout_ms(Some(status.drain_timeout.as_millis() as u64))
-                .with_restart_backoff_ms(Some(status.restart_backoff.as_millis() as u64))
-                .with_restart_max_backoff_ms(Some(status.restart_max_backoff.as_millis() as u64))
-                .with_resources(resources),
-            );
+            let mut entry = SupervisorEntry::new(
+                status.module_id,
+                status.state.to_string(),
+                status.enabled,
+                status.live,
+                status.health.status,
+            )
+            .with_configured_enabled(configured_enabled)
+            .with_script(script)
+            .with_admission_refused(admission_refused)
+            .with_next_retry_at_ms(next_retry_at_ms)
+            .with_launch_nonce_env(Some(!cfg!(unix)))
+            .with_launch_nonce_source(status.launch_nonce_source)
+            .with_waiting_for_previous_pid(status.waiting_for_previous_pid)
+            .with_protocol(status.protocol)
+            .with_pending_reload(pending_reload)
+            .with_last_probe_ms(status.health.last_probe_ms)
+            .with_last_exit_code(status.last_exit.as_ref().and_then(|e| e.code))
+            .with_last_exit_signal(status.last_exit.as_ref().and_then(|e| e.signal))
+            .with_last_exit_ms(status.last_exit.as_ref().map(|e| e.at_ms))
+            .with_last_exit_kind(status.last_exit.as_ref().map(|e| e.kind.into()))
+            .with_restart_count(Some(status.restart_count))
+            .with_max_restarts(Some(status.max_restarts))
+            .with_lifetime_restarts(Some(status.lifetime_restarts))
+            .with_spawn_generation(Some(status.spawn_generation))
+            .with_restart_window_secs(Some(status.restart_window.as_secs()))
+            .with_drain_timeout_ms(Some(status.drain_timeout.as_millis() as u64))
+            .with_restart_backoff_ms(Some(status.restart_backoff.as_millis() as u64))
+            .with_restart_max_backoff_ms(Some(status.restart_max_backoff.as_millis() as u64))
+            .with_resources(resources);
+            entry.pending = pending;
+            modules.push(entry);
         }
         for module in &mut modules {
             if let Some((tree, hour)) = readings.modules.get(&module.module_id) {
@@ -8740,12 +8777,18 @@ impl ControlHandler {
             .cloned()
             .collect::<Vec<_>>();
         let mut changed_pending_reload = Vec::new();
+        let mut changed_pending = Vec::new();
         let mut configuration_changes = BTreeSet::new();
         let mut enabled_changes = BTreeSet::new();
         let mut unchanged = 0_u32;
+        let publication = self
+            .config_runtime
+            .as_ref()
+            .and_then(|owner| owner.polled_snapshot().ok());
 
         for (module_id, configured_module) in &configured {
-            let Some((_, current_spec, current_health, current_enabled)) = current.get(module_id)
+            let Some((module, current_spec, current_health, current_enabled)) =
+                current.get(module_id)
             else {
                 continue;
             };
@@ -8755,6 +8798,43 @@ impl ControlHandler {
             let launch_changed = *current_spec != configured_module.module_spec();
             let configuration_changed =
                 launch_changed || *current_health != configured_module.health;
+            let pending = self.pending_module_fields(
+                module,
+                Some(configured_module),
+                configuration_changed,
+                Self::registration_channel_in_force(
+                    publication
+                        .as_ref()
+                        .and_then(|view| view.registration_declaration(module_id))
+                        .as_deref(),
+                    publication
+                        .as_ref()
+                        .and_then(|view| match &view.approved_daemon {
+                            crate::config_gate::runtime::ApprovedDaemonView::Approved {
+                                config,
+                                ..
+                            } => config
+                                .modules
+                                .iter()
+                                .find(|entry| entry.module_id == *module_id)
+                                .map(|entry| entry.registration_channel),
+                            _ => None,
+                        }),
+                ),
+            )?;
+            let has_pending = !pending.is_empty();
+            if has_pending {
+                changed_pending.push(subc_control::SupervisorPendingModule {
+                    module_id: module_id.clone(),
+                    fields: pending
+                        .into_iter()
+                        .map(|mut field| {
+                            field.value = None;
+                            field
+                        })
+                        .collect(),
+                });
+            }
             // Applying a rescan also replaces the recorded config value, even
             // when an operator already put the runtime in the requested state.
             let enabled_changed = *current_enabled != configured_module.enabled
@@ -8771,7 +8851,7 @@ impl ControlHandler {
             if enabled_changed {
                 enabled_changes.insert(module_id.clone());
             }
-            if !configuration_changed && !enabled_changed {
+            if !configuration_changed && !enabled_changed && !has_pending {
                 unchanged = unchanged.saturating_add(1);
             }
         }
@@ -8781,6 +8861,7 @@ impl ControlHandler {
             added,
             removed,
             changed_pending_reload,
+            changed_pending,
             configuration_changes,
             enabled_changes,
             unchanged,
@@ -8823,6 +8904,7 @@ impl ControlHandler {
             added,
             removed,
             changed_pending_reload,
+            changed_pending,
             configuration_changes,
             enabled_changes,
             unchanged,
@@ -8834,6 +8916,7 @@ impl ControlHandler {
         if !(added.is_empty()
             && removed.is_empty()
             && configuration_changes.is_empty()
+            && changed_pending.is_empty()
             && enabled_changes.is_empty())
         {
             if let Some(context) = &self.rescan {
@@ -8952,11 +9035,20 @@ impl ControlHandler {
                 })?;
         }
 
+        if let Some(context) = &self.rescan {
+            let mut entries = context
+                .module_entries
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            entries.record(&configured, &added, &removed);
+        }
+
         Ok((
             SupervisorRescanResult {
                 added,
                 removed,
                 changed_pending_reload,
+                changed_pending,
                 enabled_changes: enabled_changes.iter().cloned().collect(),
                 unchanged,
                 preview: false,

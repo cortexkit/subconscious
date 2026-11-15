@@ -135,9 +135,17 @@ pub(crate) fn definite_program_change(approved: &BTreeMap<InputKey, CapturedInpu
         let InputKey::Program { path, .. } = key else {
             return false;
         };
-        if matches!(&expected.value, subc_config::RecordedValue::Value { value } if value.get("kind").and_then(|kind| kind.as_str()) == Some("script")) {
-            return crate::supervise::script::ScriptBytes::read(Path::new(path))
-                .map_or(true, |content| content.input(Path::new(path)) != *expected);
+        if let subc_config::RecordedValue::Value { value } = &expected.value {
+            if value.get("kind").and_then(|kind| kind.as_str()) == Some("script") {
+                let runtime = match value.get("runtime").and_then(|runtime| runtime.as_str()) {
+                    Some("bun") => crate::ScriptRuntime::Bun,
+                    Some("python") => crate::ScriptRuntime::Python,
+                    _ => return true,
+                };
+                let entry = crate::ScriptEntry::new(runtime, path.into());
+                return crate::supervise::script::ScriptBytes::read(Path::new(path))
+                    .map_or(true, |content| content.input(&entry) != *expected);
+            }
         }
         if std::fs::metadata(path).is_ok_and(|metadata| !metadata.is_file()) {
             return true;
@@ -213,15 +221,15 @@ pub(crate) fn native_fixture_for_test() -> std::path::PathBuf {
 
 pub(crate) fn capture(spec: &ModuleSpec, covered: &[String]) -> Result<ProgramLaunch> {
     let mut command = spec.clone();
-    if spec.script.is_some() {
-        command.program = crate::supervise::script::runner_path()
+    if let Some(script) = &spec.script {
+        command.program = crate::supervise::script::runner_path(script.runtime)
             .map_err(|error| GateError::new("program_refused", error))?;
     }
     let spec = &command;
     let script = spec
         .script
         .as_ref()
-        .map(|path| crate::supervise::script::ScriptBytes::read(path))
+        .map(|entry| crate::supervise::script::ScriptBytes::read(&entry.path))
         .transpose()?;
     let binding = resolve(spec)?;
     let mut launch = spec.clone();
@@ -290,13 +298,13 @@ pub(crate) fn capture(spec: &ModuleSpec, covered: &[String]) -> Result<ProgramLa
         windows_files.push(no_delete);
         files.push(file);
     }
-    if let (Some(path), Some(script)) = (&spec.script, &script) {
+    if let (Some(entry), Some(script)) = (&spec.script, &script) {
         inputs.insert(
             InputKey::Program {
                 module: spec.module_id.clone(),
-                path: path.to_string_lossy().into_owned(),
+                path: entry.path.to_string_lossy().into_owned(),
             },
-            script.input(path),
+            script.input(entry),
         );
     }
     Ok(ProgramLaunch {

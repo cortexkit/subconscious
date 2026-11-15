@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.21.15
+
+- Select the installed Python script runner for `ck module check-script` files
+  ending in `.py` or `.pyz`, or override selection with `--runtime bun|python`.
+  Other extensions continue to use Bun. Strip runtime startup environment
+  settings before invoking either runner's check mode.
+- Require subc-daemon 0.48.0 for typed script runtime selection and Python
+  admission, launch, and status support.
+- Show unapplied module-entry fields and their activation boundaries in rescan
+  tables and module status; JSON preserves the optional control diagnostics.
+- Raise the control requirement to 0.40.2.
+
 ## 0.21.14
 
 - Ship the pinned Bun script runner beside Core on darwin-arm64, Linux x64/arm64,

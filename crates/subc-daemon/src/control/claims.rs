@@ -1069,13 +1069,19 @@ pub(crate) mod tests {
 
     impl Net {
         pub(crate) fn connection_id(&self, handler: &ControlHandler) -> ConnectionId {
+            // `caller_endpoints` is keyed from the server's side as (local, remote):
+            // the server's remote end is this client's local address, and its local
+            // end is the listener this client connected to.
             let peer = self.client.local_addr().unwrap();
+            let local = self.client.peer_addr().unwrap();
+            // Each Net has its own listener. TCP can reuse a client source port
+            // across listeners, so only the complete endpoint pair is unique.
             *handler
                 .caller_endpoints
                 .lock()
                 .unwrap()
                 .iter()
-                .find(|(_, (_, remote))| *remote == peer)
+                .find(|(_, endpoints)| **endpoints == (local, peer))
                 .unwrap()
                 .0
         }
@@ -1085,6 +1091,10 @@ pub(crate) mod tests {
                 .unwrap();
         }
         pub(crate) async fn new(router: Arc<Router>) -> Self {
+            Self::new_with_socket(router, tokio::net::TcpSocket::new_v4().unwrap()).await
+        }
+
+        async fn new_with_socket(router: Arc<Router>, socket: tokio::net::TcpSocket) -> Self {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let info = subc_transport::ConnectionInfo {
@@ -1102,7 +1112,7 @@ pub(crate) mod tests {
                     .await
                     .unwrap();
             });
-            let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+            let mut client = socket.connect(address).await.unwrap();
             subc_transport::authenticate_client(&mut client, &info, Duration::from_secs(2))
                 .await
                 .unwrap();
@@ -1398,6 +1408,58 @@ pub(crate) mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn claims_network_connection_ids_distinguish_shared_source_ports() {
+        let handler = Arc::new(ControlHandler::with_forwarding(
+            Arc::new(Registry::default()),
+            Arc::new(ForwardingTable::default()),
+        ));
+        let router = Arc::new(Router::with_control_handler(handler.clone()));
+        let first = tokio::net::TcpSocket::new_v4().unwrap();
+        first.set_reuseaddr(true).unwrap();
+        first.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let source = first.local_addr().unwrap();
+        let mut first = Net::new_with_socket(router.clone(), first).await;
+        let second = tokio::net::TcpSocket::new_v4().unwrap();
+        second.set_reuseaddr(true).unwrap();
+        second.bind(source).unwrap();
+        let mut second = Net::new_with_socket(router, second).await;
+
+        // A PONG proves that the server has recorded each authenticated socket.
+        for net in [&mut first, &mut second] {
+            assert_eq!(
+                net.call(
+                    Frame::build(FrameType::Ping, control_flags(), 0, 0, 2, Vec::new()).unwrap()
+                )
+                .await
+                .header
+                .ty,
+                FrameType::Pong
+            );
+        }
+        assert_eq!(first.client.local_addr().unwrap(), source);
+        assert_eq!(second.client.local_addr().unwrap(), source);
+        assert_ne!(
+            first.client.peer_addr().unwrap(),
+            second.client.peer_addr().unwrap()
+        );
+        let first_id = first.connection_id(&handler);
+        let second_id = second.connection_id(&handler);
+        assert_ne!(
+            first_id, second_id,
+            "different TCP connections must not bind the same registration slot"
+        );
+        let callers = handler.caller_endpoints.lock().unwrap();
+        assert_eq!(
+            callers[&first_id],
+            (first.client.peer_addr().unwrap(), source)
+        );
+        assert_eq!(
+            callers[&second_id],
+            (second.client.peer_addr().unwrap(), source)
+        );
+    }
+
     pub(crate) struct Rig {
         pub(crate) handler: Arc<ControlHandler>,
         pub(crate) router: Arc<Router>,
@@ -1560,16 +1622,7 @@ pub(crate) mod tests {
         let mut net = Net::new(rig.router.clone()).await;
         let ping = Frame::build(FrameType::Ping, control_flags(), 0, 0, 2, Vec::new()).unwrap();
         assert_eq!(net.call(ping).await.header.ty, FrameType::Pong);
-        let peer = net.client.local_addr().unwrap();
-        let connection = *rig
-            .handler
-            .caller_endpoints
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(_, (_, remote))| *remote == peer)
-            .unwrap()
-            .0;
+        let connection = net.connection_id(&rig.handler);
         spawn.bind(connection);
         if register {
             let hello = subc_protocol::ModuleHelloBody {
@@ -3277,16 +3330,7 @@ pub(crate) mod tests {
                 .ty,
             FrameType::Pong
         );
-        let peer = net.client.local_addr().unwrap();
-        let candidate_id = *rig
-            .handler
-            .caller_endpoints
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(_, (_, remote))| *remote == peer)
-            .unwrap()
-            .0;
+        let candidate_id = net.connection_id(&rig.handler);
         candidate.bind(candidate_id);
         let mut manifest = ModuleManifest::builder(module_id, "1.0.0").build();
         manifest.ready = Some(false);

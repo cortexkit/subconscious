@@ -1091,13 +1091,44 @@ pub(crate) fn notify_registration_release() {
     events.send_replace(next_generation);
 }
 
+/// The installed companion that evaluates a script module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScriptRuntime {
+    Bun,
+    Python,
+}
+
+impl ScriptRuntime {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bun => "bun",
+            Self::Python => "python",
+        }
+    }
+}
+
+/// Script content and the runtime approved to evaluate it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ScriptEntry {
+    pub runtime: ScriptRuntime,
+    pub path: PathBuf,
+}
+
+impl ScriptEntry {
+    pub fn new(runtime: ScriptRuntime, path: PathBuf) -> Self {
+        Self { runtime, path }
+    }
+}
+
 /// How to launch one singleton module process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleSpec {
     pub module_id: String,
     pub program: PathBuf,
-    /// A bundled Bun ESM file. The program is always the installed runner.
-    pub script: Option<PathBuf>,
+    /// Bundled script content. The program is always the installed runtime runner.
+    pub script: Option<ScriptEntry>,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
     /// When true this is a reserved module: each spawn gets a fresh one-time launch
@@ -1159,8 +1190,14 @@ impl LaunchSpecDigest {
         }
         let mut hash = Sha256::new();
         if let Some(script) = &spec.script {
-            field(&mut hash, b"bun-script");
-            field(&mut hash, script.as_os_str().as_encoded_bytes());
+            field(
+                &mut hash,
+                match script.runtime {
+                    ScriptRuntime::Bun => b"bun-script",
+                    ScriptRuntime::Python => b"python-script",
+                },
+            );
+            field(&mut hash, script.path.as_os_str().as_encoded_bytes());
         }
         if let Some(program) = spec.program.to_str() {
             field(&mut hash, b"utf8-program");
@@ -11944,20 +11981,21 @@ fn prepare_child_in_slot(
         .and_then(|admission| admission.launch.as_ref())
         .map(|launch| launch.spec.clone())
         .unwrap_or_else(|| spec.clone());
-    if launch_spec.script.is_some() {
-        launch_spec.program = script::runner_path().map_err(|source| SuperviseError::Spawn {
-            program: launch_spec.program.clone(),
-            source,
-            cgroup_path: None,
-        })?;
+    if let Some(script) = &launch_spec.script {
+        launch_spec.program =
+            script::runner_path(script.runtime).map_err(|source| SuperviseError::Spawn {
+                program: launch_spec.program.clone(),
+                source,
+                cgroup_path: None,
+            })?;
     }
-    let script_content = if let Some(path) = &launch_spec.script {
+    let script_content = if let Some(entry) = &launch_spec.script {
         Some(
             spawn_admission
                 .as_ref()
                 .and_then(|admission| admission.launch.as_ref())
                 .and_then(|launch| launch.script.clone())
-                .map_or_else(|| script::ScriptBytes::read(path), Ok)
+                .map_or_else(|| script::ScriptBytes::read(&entry.path), Ok)
                 .map_err(|error| config_delivery::gate_hold_error(&launch_spec, error, None))?,
         )
     } else {

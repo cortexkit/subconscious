@@ -183,11 +183,23 @@ journal_write_failures?:number}`. Zero counters are omitted. Entries carry
 
 `module rescan [--dry-run]`: `{schema, op:"supervisor.rescan", added:[string],
 removed:[string], changed_pending_reload:[string], unchanged:number,
-enabled_changes?:[string], preview?:true, restart_required?:[string],
+enabled_changes?:[string], changed_pending?:[{module_id:string,fields:[{field:string,applies:string}]}],
+preview?:true, restart_required?:[string],
 capability_warnings?:[string]}`. Empty optional arrays and false `preview` are
 omitted. `unchanged` is a count, not a list. `--dry-run` previews what a rescan
 would change and applies nothing. Extra result fields from a newer daemon are
 retained without changing this envelope.
+
+`changed_pending` names module-entry values read but not applied by rescan.
+Such entries are not counted as unchanged. `supervisor.list` entries (also
+returned as `module` by `module status --json`) optionally carry
+`pending:[{field:string,applies:string,value:JSON}]` with the configured values.
+Empty pending arrays are omitted. A dry run does not stage status values.
+Activation boundaries are `next_supervision` (daemon restart or remove/re-add,
+not a child respawn), `with_next_launch_or_health_change` (or daemon restart),
+`daemon_restart`, and `config_gate` (the configuration approval system must
+accept and activate the module entry; rescan alone cannot do so). These
+diagnostics do not change when configuration takes effect.
 
 ### `ck.module.release/v1`
 

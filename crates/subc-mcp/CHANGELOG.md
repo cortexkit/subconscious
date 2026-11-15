@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.8
+
+- Raise the test-only subc-daemon requirement to 0.48.0 for typed script entries.
+
 ## 0.2.7
 
 - Raise the Rust client requirement to 0.40.2 for process-local module re-exports.

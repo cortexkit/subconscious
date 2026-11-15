@@ -421,7 +421,7 @@ fn write_domain_probe_cache(path: &Path, cache: &DomainProbeCache) -> Result<(),
     Ok(())
 }
 
-const MODULE_HELP: &str = "ck module — inspect and control supervised modules\n\nusage: ck [--json] [--verbose] module <verb> [<args>]\n\nverbs:\n  ck module check-script <file>  check a bundle with the installed Bun runner\n  ck module list            all modules with state and health\n  ck module status <id>     one module in detail
+const MODULE_HELP: &str = "ck module — inspect and control supervised modules\n\nusage: ck [--json] [--verbose] module <verb> [<args>]\n\nverbs:\n  ck module check-script <file> [--runtime bun|python]  check with the installed runner\n    --runtime bun|python    override extension (.py/.pyz: python; otherwise bun)\n  ck module list            all modules with state and health\n  ck module status <id>     one module in detail
   ck module resources      process counters via the inspect module
   ck module profile <id>    sample one process via inspect (--seconds 1..10, default 1)
   ck module logs [<id>]     merged module, plugin, stderr, and daemon logs
@@ -576,8 +576,8 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
     if let Command::FleetLint { config, verbose } = &args.command {
         return fleet_lint_command(config.as_deref(), *verbose).await;
     }
-    if let Command::Module(ModuleCommand::CheckScript { file }) = &args.command {
-        return module_check_script(&running_executable()?, file).await;
+    if let Command::Module(ModuleCommand::CheckScript { file, runtime }) = &args.command {
+        return module_check_script(&running_executable()?, file, *runtime).await;
     }
     if let Command::Setup(request) = &args.command {
         return setup_command(&running_executable()?, request, ckni);
@@ -1613,6 +1613,7 @@ struct ModuleLogsOptions {
 enum ModuleCommand {
     CheckScript {
         file: PathBuf,
+        runtime: Option<subc_daemon::ScriptRuntime>,
     },
     List,
     Resources,
@@ -3102,24 +3103,54 @@ async fn module_status(
     Ok(())
 }
 
-async fn module_check_script(program: &Path, file: &Path) -> Result<(), CkError> {
+fn parse_check_script(tail: &[OsString]) -> Result<ModuleCommand, CkError> {
+    let usage =
+        || CkError::Usage("usage: ck module check-script <file> [--runtime bun|python]".into());
+    let (file, runtime) = match tail {
+        [flag, value, file] if flag == "--runtime" => (file, Some(value)),
+        [file, flag, value] if flag == "--runtime" => (file, Some(value)),
+        [file] => (file, None),
+        _ => return Err(usage()),
+    };
+    if file.to_string_lossy().starts_with('-') {
+        return Err(usage());
+    }
+    let runtime = runtime
+        .map(|runtime| match runtime.to_str() {
+            Some("bun") => Ok(subc_daemon::ScriptRuntime::Bun),
+            Some("python") => Ok(subc_daemon::ScriptRuntime::Python),
+            _ => Err(usage()),
+        })
+        .transpose()?;
+    Ok(ModuleCommand::CheckScript {
+        file: file.into(),
+        runtime,
+    })
+}
+
+async fn module_check_script(
+    program: &Path,
+    file: &Path,
+    runtime: Option<subc_daemon::ScriptRuntime>,
+) -> Result<(), CkError> {
+    let runtime = runtime.unwrap_or_else(|| match file.extension().and_then(OsStr::to_str) {
+        Some("py" | "pyz") => subc_daemon::ScriptRuntime::Python,
+        _ => subc_daemon::ScriptRuntime::Bun,
+    });
+    let runner_name = format!("ck-script-runner-{}", runtime.as_str());
     let runner = program
         .parent()
         .ok_or_else(|| CkError::rejected("ck install folder is unavailable".into()))?
-        .join(if cfg!(windows) {
-            "ck-script-runner-bun.exe"
-        } else {
-            "ck-script-runner-bun"
-        });
+        .join(format!("{runner_name}{}", std::env::consts::EXE_SUFFIX));
     if !runner.is_file() {
         return Err(CkError::rejected(format!(
-            "ck-script-runner-bun is not installed beside ck ({})",
+            "{runner_name} is not installed beside ck ({})",
             runner.display()
         )));
     }
     let mut command = tokio::process::Command::new(&runner);
     command.arg("--check").arg(file);
-    // Compiled Bun can run preloads before the runner's own checks execute.
+    // Runtime startup settings must not execute code before the runner's checks.
     for (key, _) in std::env::vars_os() {
         let name = key.to_string_lossy();
         let name = if cfg!(windows) {
@@ -3131,13 +3162,15 @@ async fn module_check_script(program: &Path, file: &Path) -> Result<(), CkError>
             name.as_str(),
             "NODE_OPTIONS" | "BUN_OPTIONS" | "BUN_INSTALL" | "NODE_PATH"
         ) || name.starts_with("BUN_CONFIG_")
+            || name.starts_with("PYTHON")
         {
             command.env_remove(key);
         }
     }
-    let status = command.status().await.map_err(|error| {
-        CkError::rejected(format!("could not start ck-script-runner-bun: {error}"))
-    })?;
+    let status = command
+        .status()
+        .await
+        .map_err(|error| CkError::rejected(format!("could not start {runner_name}: {error}")))?;
     if status.success() {
         Ok(())
     } else {
@@ -6559,6 +6592,84 @@ fn preview_rescan_changed_label() -> &'static str {
     "would change (pending reload)"
 }
 
+fn pending_apply_text(applies: &str) -> &'static str {
+    match applies {
+        "next_supervision" => "when supervision next starts (daemon restart, or remove and re-add)",
+        "with_next_launch_or_health_change" => {
+            "with the next launch or health change, or at daemon restart"
+        }
+        "daemon_restart" => "at daemon restart",
+        "config_gate" => "through an approved config-gate plan, not rescan",
+        _ => "at an unknown activation boundary",
+    }
+}
+
+fn pending_field_lines(fields: Option<&Vec<Value>>, values: bool) -> Vec<String> {
+    fields
+        .into_iter()
+        .flatten()
+        .map(|field| {
+            let name = field
+                .get("field")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let label = match name {
+                "register_timeout_s" => "register timeout",
+                "drain_timeout_ms" => "drain timeout",
+                "route_bind_relay_timeout_ms" => "route bind relay timeout",
+                "registration_channel" => "registration channel",
+                _ => name,
+            };
+            let value = if values {
+                field
+                    .get("value")
+                    .map(|value| {
+                        let unit = if name.ends_with("_ms") {
+                            " ms"
+                        } else if name.ends_with("_s") {
+                            " s"
+                        } else {
+                            ""
+                        };
+                        format!(" {}{unit}", display_json_value(value))
+                    })
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let applies = pending_apply_text(
+                field
+                    .get("applies")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+            );
+            terminal_safe_string(&format!("{label}{value} pending: applies {applies}"))
+        })
+        .collect()
+}
+
+fn rescan_pending_lines(result: &Value) -> Vec<String> {
+    result
+        .get("changed_pending")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|module| {
+            format!(
+                "{} ({})",
+                terminal_safe_string(
+                    module
+                        .get("module_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                ),
+                pending_field_lines(module.get("fields").and_then(Value::as_array), false)
+                    .join("; ")
+            )
+        })
+        .collect()
+}
+
 fn print_rescan_table(result: &Value) {
     let preview = result
         .get("preview")
@@ -6585,6 +6696,7 @@ fn print_rescan_table(result: &Value) {
     let added = module_ids("added");
     let removed = module_ids("removed");
     let changed = module_ids("changed_pending_reload");
+    let pending = rescan_pending_lines(result);
     let enabled = module_ids("enabled_changes");
     let restart_required = module_ids("restart_required");
     let warnings = result
@@ -6602,6 +6714,7 @@ fn print_rescan_table(result: &Value) {
     if added.is_none()
         && removed.is_none()
         && changed.is_none()
+        && pending.is_empty()
         && enabled.is_none()
         && restart_required.is_none()
         && warnings.is_empty()
@@ -6622,6 +6735,9 @@ fn print_rescan_table(result: &Value) {
     }
     if let Some(ids) = changed {
         println!("{}: {ids}", preview_rescan_changed_label());
+    }
+    for line in pending {
+        println!("would change, pending: {line}");
     }
     if let Some(ids) = enabled {
         println!(
@@ -6657,7 +6773,7 @@ fn print_applied_rescan_table(result: &Value) {
             .filter(|ids| !ids.is_empty())
             .unwrap_or_else(|| "-".to_string())
     };
-    let rows = vec![
+    let mut rows = vec![
         vec!["added".to_string(), module_ids("added")],
         vec!["removed".to_string(), module_ids("removed")],
         vec![
@@ -6674,6 +6790,13 @@ fn print_applied_rescan_table(result: &Value) {
                 .unwrap_or_else(|| "-".to_string()),
         ],
     ];
+    let pending = rescan_pending_lines(result);
+    if !pending.is_empty() {
+        rows.insert(
+            rows.len() - 1,
+            vec!["changed, pending".to_string(), pending.join(", ")],
+        );
+    }
     print_table(&["change", "modules / count"], rows);
     if let Some(changed) = result
         .get("changed_pending_reload")
@@ -6772,6 +6895,9 @@ fn print_status_table(
         println!("  {line}");
     }
     print_reload_verdict(module);
+    for line in pending_field_lines(module.get("pending").and_then(Value::as_array), true) {
+        println!("  {line}");
+    }
     if let Some(entry) = health {
         print_health_detail(entry, 1);
         if let Some(metrics) = entry.get("metrics").filter(|metrics| !metrics.is_null()) {
@@ -8571,14 +8697,7 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
                     })
             };
             let command = match verb.as_str() {
-                "check-script" if tail.len() == 2 => ModuleCommand::CheckScript {
-                    file: PathBuf::from(&tail[1]),
-                },
-                "check-script" => {
-                    return Err(CkError::Usage(
-                        "usage: ck module check-script <file>".into(),
-                    ))
-                }
+                "check-script" => parse_check_script(&tail[1..])?,
                 "list" => ModuleCommand::List,
                 "resources" if tail.len() == 1 => ModuleCommand::Resources,
                 "profile" => {
@@ -9139,12 +9258,13 @@ mod tests {
         let args = ["ck", "module", "check-script", "bundle.js"].map(std::ffi::OsString::from);
         let parsed = super::parse_args(args).unwrap();
         assert!(
-            matches!(parsed.command, super::Command::Module(super::ModuleCommand::CheckScript { file }) if file == std::path::Path::new("bundle.js"))
+            matches!(parsed.command, super::Command::Module(super::ModuleCommand::CheckScript { file, runtime: None }) if file == std::path::Path::new("bundle.js"))
         );
         let root = cortexkit_test_support::ScratchDir::new("check-script-missing");
-        let error = super::module_check_script(&root.join("ck"), std::path::Path::new("bundle.js"))
-            .await
-            .unwrap_err();
+        let error =
+            super::module_check_script(&root.join("ck"), std::path::Path::new("bundle.js"), None)
+                .await
+                .unwrap_err();
         assert!(
             error
                 .to_string()
@@ -9156,18 +9276,127 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn script_module_check_selects_python_by_extension() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = cortexkit_test_support::ScratchDir::new("check-script-python");
+        let runner = root.join("ck-script-runner-python");
+        std::fs::write(
+            &runner,
+            b"#!/bin/sh\n[ \"$1\" = --check ] && [ \"$#\" = 2 ]\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for file in ["bundle.py", "bundle.pyz"] {
+            super::module_check_script(&root.join("ck"), std::path::Path::new(file), None)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn script_module_check_accepts_explicit_runtime() {
+        use std::os::unix::fs::PermissionsExt;
+        for (runtime, file) in [("bun", "bundle.py"), ("python", "bundle.js")] {
+            let root = cortexkit_test_support::ScratchDir::new("check-script-override");
+            let runner = root.join(format!("ck-script-runner-{runtime}"));
+            std::fs::write(
+                &runner,
+                format!(
+                    "#!/bin/sh\n[ \"$1\" = --check ] && [ \"$2\" = {file} ] && [ \"$#\" = 2 ]\n"
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o700)).unwrap();
+            for tail in [
+                vec![file, "--runtime", runtime],
+                vec!["--runtime", runtime, file],
+            ] {
+                let args = ["ck", "module", "check-script"]
+                    .into_iter()
+                    .chain(tail)
+                    .map(std::ffi::OsString::from);
+                let parsed = super::parse_args(args).unwrap();
+                let super::Command::Module(super::ModuleCommand::CheckScript {
+                    file,
+                    runtime: Some(selected),
+                }) = parsed.command
+                else {
+                    panic!("expected explicit runtime");
+                };
+                assert_eq!(selected.as_str(), runtime);
+                super::module_check_script(&root.join("ck"), &file, Some(selected))
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn script_module_check_refuses_invalid_runtime_and_arguments() {
+        for tail in [
+            vec![],
+            vec!["bundle.py", "--runtime"],
+            vec!["bundle.py", "--runtime", "node"],
+            vec!["bundle.py", "--unknown", "python"],
+            vec!["bundle.py", "extra.py"],
+            vec!["bundle.py", "--runtime", "bun", "--runtime", "python"],
+        ] {
+            let args = ["ck", "module", "check-script"]
+                .into_iter()
+                .chain(tail)
+                .map(std::ffi::OsString::from);
+            assert!(matches!(
+                super::parse_args(args),
+                Err(super::CkError::Usage(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn script_module_check_missing_runner_names_selected_runtime() {
+        let root = cortexkit_test_support::ScratchDir::new("check-python-missing");
+        for (file, runtime, expected) in [
+            ("bundle.py", None, "python"),
+            ("bundle.pyz", None, "python"),
+            ("bundle.txt", None, "bun"),
+            ("bundle", None, "bun"),
+            ("bundle.py", Some(subc_daemon::ScriptRuntime::Bun), "bun"),
+            (
+                "bundle.js",
+                Some(subc_daemon::ScriptRuntime::Python),
+                "python",
+            ),
+        ] {
+            let error =
+                super::module_check_script(&root.join("ck"), std::path::Path::new(file), runtime)
+                    .await
+                    .unwrap_err();
+            assert!(
+                error.to_string().contains(&format!(
+                    "ck-script-runner-{expected} is not installed beside ck"
+                )),
+                "{error}"
+            );
+        }
+        assert!(super::MODULE_HELP.contains("--runtime bun|python"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn script_module_check_invokes_installed_runner_and_preserves_refusal() {
         use std::os::unix::fs::PermissionsExt;
         let root = cortexkit_test_support::ScratchDir::new("check-script-args");
         let runner = root.join("ck-script-runner-bun");
         std::fs::write(&runner, b"#!/bin/sh\nif [ \"$1\" = --check ] && [ \"$2\" = bundle.js ]; then echo script_import_refused; exit 7; fi\nexit 0\n").unwrap();
         std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let error = super::module_check_script(&root.join("ck"), std::path::Path::new("bundle.js"))
-            .await
-            .unwrap_err();
+        let error =
+            super::module_check_script(&root.join("ck"), std::path::Path::new("bundle.js"), None)
+                .await
+                .unwrap_err();
         assert!(error.to_string().contains("script check failed"), "{error}");
         std::fs::write(&runner, b"#!/bin/sh\necho script_check_ok\nexit 0\n").unwrap();
-        super::module_check_script(&root.join("ck"), std::path::Path::new("bundle.js"))
+        super::module_check_script(&root.join("ck"), std::path::Path::new("bundle.js"), None)
             .await
             .unwrap();
     }
@@ -11359,6 +11588,28 @@ mod tests {
 
     /// This fixture pins the bytes emitted by the `--json` renderer. Human-only
     /// dashboard and footer changes must not alter machine-consumed output.
+    #[test]
+    fn rescan_pending_fields_and_status_explain_activation_and_values() {
+        let fields = json!([
+            {"field":"register_timeout_s","value":1800,"applies":"next_supervision"},
+            {"field":"drain_timeout_ms","value":60000,"applies":"with_next_launch_or_health_change"},
+            {"field":"route_bind_relay_timeout_ms","value":12000,"applies":"daemon_restart"},
+            {"field":"registration_channel","value":true,"applies":"config_gate"}
+        ]);
+        let lines = pending_field_lines(fields.as_array(), true);
+        assert_eq!(lines, [
+            "register timeout 1800 s pending: applies when supervision next starts (daemon restart, or remove and re-add)",
+            "drain timeout 60000 ms pending: applies with the next launch or health change, or at daemon restart",
+            "route bind relay timeout 12000 ms pending: applies at daemon restart",
+            "registration channel true pending: applies through an approved config-gate plan, not rescan",
+        ]);
+        assert!(pending_field_lines(None, true).is_empty());
+        let result = json!({"changed_pending":[{"module_id":"worker","fields":fields}]});
+        let rows = rescan_pending_lines(&result);
+        assert!(rows[0]
+            .starts_with("worker (register timeout pending: applies when supervision next starts"));
+    }
+
     #[test]
     fn module_rescan_json_output_is_byte_stable_against_fixture() {
         let reply = serde_json::json!({

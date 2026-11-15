@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.48.0
+
+- Accept Python script modules with the installed `ck-script-runner-python`,
+  approving the runner executable and script content as for Bun. Send the checked
+  script bytes over a private pipe, never by asking the runner to reopen a path.
+  Refuse configured `PYTHON*` settings and strip inherited ones for both
+  script runtimes.
+- Upgrading: `ModuleSpec::script` and `ConfiguredModule::script` now hold
+  `Option<ScriptEntry>` rather than `Option<PathBuf>`. Construct script entries
+  with `ScriptEntry::new(runtime, path)`, using `ScriptRuntime::Bun` or
+  `ScriptRuntime::Python`;
+  compiled programs continue to use `None`. Both new types are non-exhaustive.
+- Report the configured runtime in script status; runner versions remain unknown.
+- Test-only fix: identify network rig connections by both TCP endpoints so a
+  reused client source port cannot cause one connection to be mistaken for another.
+- Count module-entry edits outside launch, health and enabled state as pending
+  instead of unchanged, and retain their values for status diagnostics.
+  Preserve existing supervision, config-gate and startup application boundaries.
+- Raise the control dependency to 0.40.2 for the additive pending diagnostics.
+
 ## 0.47.2
 
 - Describe configuration field changes from the last approved generation, even

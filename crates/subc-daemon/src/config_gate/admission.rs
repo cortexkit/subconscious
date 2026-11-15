@@ -336,9 +336,9 @@ mod script_origin_tests {
         let path = root.join("bundle.js");
         std::fs::write(&path, b"abc").unwrap();
         let spec = ModuleSpec {
-            script: Some(path),
+            script: Some(crate::ScriptEntry::new(crate::ScriptRuntime::Bun, path)),
             module_id: "example".into(),
-            program: crate::supervise::script::runner_path().unwrap(),
+            program: crate::supervise::script::runner_path(crate::ScriptRuntime::Bun).unwrap(),
             args: vec![],
             env: vec![],
             reserved: true,

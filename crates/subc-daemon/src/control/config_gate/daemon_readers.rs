@@ -11,6 +11,7 @@ pub(in crate::control) fn preview_approved_daemon(
         added: vec![],
         removed: vec![],
         changed_pending_reload: vec![],
+        changed_pending: vec![],
         enabled_changes: vec![],
         unchanged: 0,
         preview: true,
@@ -31,13 +32,33 @@ pub(in crate::control) fn preview_approved_daemon(
         };
         let launch_changed = old.module_spec() != next.module_spec();
         let enabled_changed = old.enabled != next.enabled;
+        let fields = super::super::rescan_checked::entry_pending_fields(
+            old,
+            next,
+            launch_changed || old.health != next.health,
+        );
+        let has_pending = !fields.is_empty();
+        if has_pending {
+            result
+                .changed_pending
+                .push(subc_control::SupervisorPendingModule {
+                    module_id: next.module_id.clone(),
+                    fields: fields
+                        .into_iter()
+                        .map(|mut field| {
+                            field.value = None;
+                            field
+                        })
+                        .collect(),
+                });
+        }
         if launch_changed {
             result.changed_pending_reload.push(next.module_id.clone());
         }
         if enabled_changed {
             result.enabled_changes.push(next.module_id.clone());
         }
-        if !launch_changed && !enabled_changed && old.health == next.health {
+        if !launch_changed && !enabled_changed && old.health == next.health && !has_pending {
             result.unchanged += 1;
         }
     }

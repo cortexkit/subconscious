@@ -74,6 +74,11 @@ impl Rig {
 
     async fn send(&self, request: ClientControlRequest) -> Frame {
         let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 1, Vec::new()).unwrap();
+        if matches!(request, ClientControlRequest::SupervisorList {}) {
+            let replies = self.handler.handle_supervisor_list(frame).await.unwrap();
+            assert_eq!(replies.len(), 1);
+            return replies.into_iter().next().unwrap();
+        }
         let mut replies = tokio::time::timeout(
             Duration::from_secs(20),
             self.handler
@@ -204,6 +209,143 @@ fn doc(modules: Value) -> String {
 /// and enabled.
 fn entry(enabled: bool) -> Value {
     json!({"program": "subc-rescan-checked-test-missing-program", "protocol": "none", "enabled": enabled})
+}
+
+#[tokio::test]
+async fn rescan_register_timeout_edit_is_pending_not_unchanged() {
+    let dir = ScratchDir::new("rescan-register-pending");
+    let rig = Rig::new(&dir.path().join("subc.jsonc"), "pending");
+    rig.write(&doc(json!({"worker": entry(false)})));
+    rig.apply_file().await;
+    let mut next = entry(false);
+    next["register_timeout_s"] = json!(1800);
+    rig.write(&doc(json!({"worker": next})));
+    for preview in [true, false, false] {
+        let result = rig
+            .rescan(ClientControlRequest::SupervisorRescan { preview })
+            .await
+            .unwrap();
+        assert_eq!(result.unchanged, 0);
+        assert!(result.changed_pending_reload.is_empty());
+        assert_eq!(
+            serde_json::to_value(result.changed_pending).unwrap(),
+            json!([
+                {"module_id":"worker", "fields":[{"field":"register_timeout_s","applies":"next_supervision"}]}
+            ])
+        );
+    }
+    assert_eq!(
+        rig.handler
+            .supervisor
+            .get("worker")
+            .unwrap()
+            .configured_register_timeout()
+            .unwrap(),
+        Duration::from_secs(120)
+    );
+}
+
+#[tokio::test]
+async fn rescan_status_shows_pending_register_timeout_until_new_supervision() {
+    let dir = ScratchDir::new("rescan-status-pending");
+    let rig = Rig::new(&dir.path().join("subc.jsonc"), "pending-status");
+    rig.write(&doc(json!({"worker": entry(false)})));
+    rig.apply_file().await;
+    let status = rig.send(ClientControlRequest::SupervisorList {}).await;
+    let status: Value = serde_json::from_slice(&status.body).unwrap();
+    assert!(status["modules"][0].get("pending").is_none());
+    let mut next = entry(false);
+    next["register_timeout_s"] = json!(1800);
+    rig.write(&doc(json!({"worker": next.clone()})));
+    rig.rescan(ClientControlRequest::SupervisorRescan { preview: true })
+        .await
+        .unwrap();
+    let status = rig.send(ClientControlRequest::SupervisorList {}).await;
+    let status: Value = serde_json::from_slice(&status.body).unwrap();
+    assert!(
+        status["modules"][0].get("pending").is_none(),
+        "preview cannot stage pending values"
+    );
+    rig.apply_file().await;
+    let status = rig.send(ClientControlRequest::SupervisorList {}).await;
+    let status: Value = serde_json::from_slice(&status.body).unwrap();
+    assert_eq!(
+        status["modules"][0]["pending"],
+        json!([
+            {"field":"register_timeout_s","applies":"next_supervision","value":1800}
+        ])
+    );
+    rig.write(&doc(json!({})));
+    rig.apply_file().await;
+    rig.write(&doc(json!({"worker": next})));
+    rig.apply_file().await;
+    let status = rig.send(ClientControlRequest::SupervisorList {}).await;
+    let status: Value = serde_json::from_slice(&status.body).unwrap();
+    assert!(status["modules"][0].get("pending").is_none());
+    assert_eq!(
+        rig.handler
+            .supervisor
+            .get("worker")
+            .unwrap()
+            .configured_register_timeout()
+            .unwrap(),
+        Duration::from_secs(1800)
+    );
+}
+
+#[tokio::test]
+async fn rescan_pending_covers_every_non_launch_policy_without_applying_it() {
+    for (field, value, applies) in [
+        ("restart", json!({"max_restarts": 9}), "next_supervision"),
+        (
+            "drain_timeout_ms",
+            json!(60000),
+            "with_next_launch_or_health_change",
+        ),
+        (
+            "route_bind_relay_timeout_ms",
+            json!(60000),
+            "daemon_restart",
+        ),
+        ("registration_channel", json!(true), "config_gate"),
+    ] {
+        let dir = ScratchDir::new("rescan-policy-pending");
+        let rig = Rig::new(&dir.path().join("subc.jsonc"), "pending-policy");
+        rig.write(&doc(json!({"worker": entry(false)})));
+        rig.apply_file().await;
+        let mut next = entry(false);
+        next[field] = value;
+        rig.write(&doc(json!({"worker": next.clone()})));
+        let result = rig.apply_file().await;
+        assert_eq!(result.unchanged, 0, "{field}");
+        assert_eq!(result.changed_pending.len(), 1, "{field}");
+        assert_eq!(
+            serde_json::to_value(&result.changed_pending[0].fields[0]).unwrap(),
+            json!({"field":field,"applies":applies})
+        );
+        let status = rig.send(ClientControlRequest::SupervisorList {}).await;
+        let status: Value = serde_json::from_slice(&status.body).unwrap();
+        assert_eq!(status["modules"][0]["pending"][0]["field"], field);
+        assert_eq!(status["modules"][0]["pending"][0]["applies"], applies);
+        if field == "drain_timeout_ms" {
+            next["env"] = json!({"NEW_LAUNCH_VALUE":"1"});
+            rig.write(&doc(json!({"worker": next})));
+            let result = rig.apply_file().await;
+            assert!(result.changed_pending.is_empty());
+            let status = rig.send(ClientControlRequest::SupervisorList {}).await;
+            let status: Value = serde_json::from_slice(&status.body).unwrap();
+            assert!(status["modules"][0].get("pending").is_none());
+            assert_eq!(status["modules"][0]["drain_timeout_ms"], 60000);
+        }
+        rig.write(&doc(json!({"worker": entry(false)})));
+        rig.apply_file().await;
+        let status = rig.send(ClientControlRequest::SupervisorList {}).await;
+        let status: Value = serde_json::from_slice(&status.body).unwrap();
+        // Drain policy only returns to its default with another launch/health update.
+        if field != "drain_timeout_ms" {
+            assert!(status["modules"][0].get("pending").is_none(), "{field}");
+        }
+    }
 }
 
 #[cfg(unix)]

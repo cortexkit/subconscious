@@ -1498,6 +1498,90 @@ async fn concurrent_rescans_queue_and_reconcile_once() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ck_module_rescan_pending_policy_edits_are_visible_in_status_and_json() {
+    let module_id = "pending-policy";
+    let original = stub_module(module_id, false, []);
+    let daemon = RunningDaemon::start(
+        "daemon-pending-policy",
+        Some(config_doc([original.clone()])),
+    )
+    .await;
+    wait_for_supervisor_entry(
+        &daemon.connection_file_path,
+        module_id,
+        |entry| !entry.enabled,
+        STATE_TIMEOUT,
+    )
+    .await;
+    let mut next = original;
+    next["register_timeout_s"] = json!(1800);
+    next["registration_channel"] = json!(true);
+    fs::write(&daemon.config_path, config_doc([next])).unwrap();
+    for json_output in [false, true] {
+        let mut command = ck_under_test_command();
+        command
+            .args(["module", "rescan", "--subc"])
+            .arg(&daemon.connection_file_path);
+        if json_output {
+            command.arg("--json");
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        if json_output {
+            let result: Value = serde_json::from_str(&stdout).unwrap();
+            assert_eq!(result["unchanged"], 0);
+            assert_eq!(result["changed_pending"][0]["module_id"], module_id);
+            assert_eq!(
+                result["changed_pending"][0]["fields"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                2
+            );
+        } else {
+            assert!(stdout.contains("changed, pending"), "{stdout}");
+            assert!(
+                stdout.contains("register timeout pending: applies when supervision next starts"),
+                "{stdout}"
+            );
+        }
+    }
+    for json_output in [false, true] {
+        let mut command = ck_under_test_command();
+        command
+            .args(["module", "status", module_id, "--subc"])
+            .arg(&daemon.connection_file_path);
+        if json_output {
+            command.arg("--json");
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        if json_output {
+            let status: Value = serde_json::from_str(&stdout).unwrap();
+            assert_eq!(status["module"]["pending"][0]["value"], 1800);
+        } else {
+            assert!(
+                stdout.contains(
+                    "register timeout 1800 s pending: applies when supervision next starts"
+                ),
+                "{stdout}"
+            );
+            assert!(stdout.contains("registration channel true pending: applies through an approved config-gate plan"), "{stdout}");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ck_module_rescan_prints_reconcile_table() {
     let existing_id = "ck-rescan-existing";
     let added_id = "ck-rescan-added";

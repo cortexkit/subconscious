@@ -3,7 +3,7 @@
 use sha2::{Digest, Sha256};
 use std::io::Read;
 
-fn main() {
+pub(crate) fn main() {
     if let Err(error) = run() {
         eprintln!("script fixture refused: {error}");
         std::process::exit(1);
@@ -47,9 +47,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 key.as_str(),
                 "NODE_OPTIONS" | "BUN_OPTIONS" | "BUN_INSTALL" | "NODE_PATH"
             ) || key.starts_with("BUN_CONFIG_")
+                || key.starts_with("PYTHON")
         })
         .collect::<Vec<_>>();
-    let report = serde_json::json!({"header":header.to_vec(),"bytes":bytes,"env":metadata,"forbidden_env":forbidden});
+    let report = serde_json::json!({"header":header.to_vec(),"bytes":bytes,"env":metadata,"forbidden_env":forbidden,"runner":std::env::current_exe()?});
     std::fs::write(output, serde_json::to_vec(&report)?)?;
     // Stay alive until the test stops us so the daemon can compare this
     // process's executable with the runner file it approved before spawning.
@@ -60,6 +61,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 fn env_parent() -> Result<(), Box<dyn std::error::Error>> {
     let script = std::env::args_os().nth(2).ok_or("missing script")?;
     let receipt = std::env::args_os().nth(3).ok_or("missing receipt")?;
+    let script_runtime = match std::env::args().nth(4).as_deref() {
+        Some("bun") => subc_daemon::ScriptRuntime::Bun,
+        Some("python") => subc_daemon::ScriptRuntime::Python,
+        _ => return Err("missing runtime".into()),
+    };
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
         let supervisor = subc_daemon::Supervisor::new(
@@ -70,7 +76,7 @@ fn env_parent() -> Result<(), Box<dyn std::error::Error>> {
             .spawn_async(subc_daemon::ModuleSpec {
                 module_id: "script-env".into(),
                 program: std::env::current_exe()?,
-                script: Some(script.into()),
+                script: Some(subc_daemon::ScriptEntry::new(script_runtime, script.into())),
                 args: vec![receipt.to_string_lossy().into_owned()],
                 env: vec![],
                 reserved: false,

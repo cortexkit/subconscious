@@ -127,8 +127,38 @@ mod tests {
         let result: SupervisorRescanResult = serde_json::from_str(wire).unwrap();
         assert!(result.module_actions.is_empty());
         assert!(result.earlier_pending.is_empty());
+        assert!(result.changed_pending.is_empty());
         assert_eq!(result.expect, None);
         assert_eq!(serde_json::to_string(&result).unwrap(), wire);
+    }
+
+    #[test]
+    fn pending_rescan_and_status_fields_round_trip_and_ignore_unknown_members() {
+        let wire = serde_json::json!({
+            "added":[], "removed":[], "changed_pending_reload":[], "unchanged":0,
+            "future_member": true,
+            "changed_pending":[{"module_id":"worker","fields":[{
+                "field":"register_timeout_s","applies":"next_supervision","future_member":42
+            }]}]
+        });
+        let result: SupervisorRescanResult = serde_json::from_value(wire).unwrap();
+        assert_eq!(
+            result.changed_pending[0].fields[0].applies,
+            crate::PendingModuleApply::NextSupervision
+        );
+        let status = serde_json::json!({
+            "module_id":"worker","state":"disabled","enabled":false,"live":false,"health":"unknown",
+            "pending":[{"field":"register_timeout_s","applies":"next_supervision","value":1800}]
+        });
+        let entry: crate::SupervisorEntry = serde_json::from_value(status).unwrap();
+        assert_eq!(entry.pending[0].value, Some(serde_json::json!(1800)));
+        let value = serde_json::to_value(entry).unwrap();
+        assert_eq!(value["pending"][0]["value"], 1800);
+        let later: crate::SupervisorPendingField = serde_json::from_value(serde_json::json!({
+            "field":"x","applies":"some_later_boundary"
+        }))
+        .unwrap();
+        assert_eq!(later.applies, crate::PendingModuleApply::Other);
     }
 
     /// The op has no default form: a body that leaves `preview` out says

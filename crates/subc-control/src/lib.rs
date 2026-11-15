@@ -2745,11 +2745,45 @@ pub struct CapabilityRequirementStatus {
     pub detail: String,
 }
 
+/// When a module-entry edit can take effect without changing rescan semantics.
+///
+/// The set is open: a newer daemon may name another boundary, which older
+/// readers decode as `Other` instead of refusing the whole rescan reply.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingModuleApply {
+    NextSupervision,
+    WithNextLaunchOrHealthChange,
+    DaemonRestart,
+    ConfigGate,
+    #[serde(other)]
+    Other,
+}
+
+/// A configured value that rescan has read but has not applied.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SupervisorPendingField {
+    pub field: String,
+    pub applies: PendingModuleApply,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SupervisorPendingModule {
+    pub module_id: String,
+    pub fields: Vec<SupervisorPendingField>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SupervisorRescanResult {
     pub added: Vec<String>,
     pub removed: Vec<String>,
     pub changed_pending_reload: Vec<String>,
+    /// Module-entry edits rescan cannot apply, with their activation boundaries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed_pending: Vec<SupervisorPendingModule>,
     /// Modules whose enabled flag differs between config and running state.
     ///
     /// Rescan calls `set_enabled` for these, so omitting them made the preview
@@ -3028,6 +3062,9 @@ pub struct SupervisorEntry {
     /// CPU used across the wall-clock interval covered by retained samples.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_last_hour: Option<CpuLastHour>,
+    /// Values read by an executed rescan that are not yet in force.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending: Vec<SupervisorPendingField>,
 }
 
 impl SupervisorEntry {
@@ -3084,6 +3121,7 @@ impl SupervisorEntry {
             tree: None,
             tree_unavailable: None,
             cpu_last_hour: None,
+            pending: Vec::new(),
         }
     }
 

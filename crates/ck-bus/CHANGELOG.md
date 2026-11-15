@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.11
+
+- Raise the test-only subc-daemon requirement to 0.48.0 for typed script entries.
+
 ## 0.6.10
 
 - Raise the Rust client requirement to 0.40.2 and testkit to 0.9.2 for process-local

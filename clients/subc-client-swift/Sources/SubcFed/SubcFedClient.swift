@@ -131,6 +131,8 @@ public actor SubcFedClient {
         var closing = false
     }
     private var stateContinuations: [UUID: AsyncStream<FedConnectionState>.Continuation] = [:]
+    private var catalogGeneration: UInt64 = 0
+    private var catalogContinuations: [UUID: AsyncStream<FedCatalogUpdate>.Continuation] = [:]
     /// Non-terminal `call_frame`s (`push` / `stream_data`) received while no
     /// subscription surface exists to deliver them to.
     ///
@@ -220,6 +222,9 @@ public actor SubcFedClient {
         reconnectTask?.cancel()
         receiveTask?.cancel()
         timerTask?.cancel()
+        for continuation in catalogContinuations.values {
+            continuation.finish()
+        }
     }
 
     public var state: FedConnectionState { connectionState }
@@ -233,6 +238,27 @@ public actor SubcFedClient {
             continuation.yield(connectionState)
             continuation.onTermination = { [weak self] _ in
                 Task { await self?.removeStateContinuation(id) }
+            }
+        }
+    }
+
+    /// Observes successfully applied session catalog snapshots. The first update
+    /// follows session installation; every later applied snapshot yields, even
+    /// when its contents are unchanged. Failed or rejected snapshots do not yield.
+    /// Generations start at 1 per client and keep increasing across reconnects.
+    /// A late subscriber immediately receives the latest generation, if any.
+    /// Only the newest update is buffered, so gaps reveal missed snapshots.
+    /// The stream survives disconnect/connect and finishes when the client is
+    /// deinitialized. Each call creates an independent stream.
+    public func catalogUpdates() -> AsyncStream<FedCatalogUpdate> {
+        let id = UUID()
+        return AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
+            catalogContinuations[id] = continuation
+            if catalogGeneration > 0 {
+                continuation.yield(FedCatalogUpdate(generation: catalogGeneration))
+            }
+            continuation.onTermination = { [weak self] _ in
+                Task { await self?.removeCatalogContinuation(id) }
             }
         }
     }
@@ -1194,6 +1220,10 @@ public actor SubcFedClient {
                 let advertisedFeatures = await dialed.engine.peerAdvertisedFeatures
                 let machineID = await dialed.engine.peerMachineID
                 let sessionID = await dialed.engine.sessionID
+                await dialed.engine.setCatalogApplied { [weak self, weak engine = dialed.engine] in
+                    guard let engine else { return }
+                    await self?.catalogApplied(on: engine)
+                }
                 // A second explicit connect can replace a ready session. Retire
                 // its carrier before publishing the replacement or starting loops.
                 if activeSession != nil {
@@ -1213,6 +1243,7 @@ public actor SubcFedClient {
                 startTimerLoop(session: dialed)
                 planner.resetBackoff()
                 publish(.ready(sessionID: sessionID))
+                publishCatalogUpdate()
                 activatePendingProfileIfNeeded()
                 return
             } catch is CancellationError {
@@ -1813,6 +1844,23 @@ public actor SubcFedClient {
 
     private func removeStateContinuation(_ id: UUID) {
         stateContinuations[id] = nil
+    }
+
+    private func catalogApplied(on engine: FedSessionEngine) {
+        guard activeSession?.engine === engine else { return }
+        publishCatalogUpdate()
+    }
+
+    private func publishCatalogUpdate() {
+        catalogGeneration += 1
+        let update = FedCatalogUpdate(generation: catalogGeneration)
+        for continuation in catalogContinuations.values {
+            continuation.yield(update)
+        }
+    }
+
+    private func removeCatalogContinuation(_ id: UUID) {
+        catalogContinuations[id] = nil
     }
 
     private func suppressionFacts(

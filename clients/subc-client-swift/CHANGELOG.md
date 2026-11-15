@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add `SubcFedClient.catalogUpdates()` with client-local generations for applied
+  session catalog snapshots, including unchanged contents. Late subscribers
+  receive the latest generation immediately; the stream and counter survive
+  disconnect/connect, and the stream finishes when the client is deinitialized.
 - Add optional Noise and relay companion keychain access groups to
   `FedKeychainPrivateKeyStore`. This is additive: the new initializer parameters
   default to nil, existing call sites and public protocol method signatures stay
@@ -9,7 +13,6 @@
   group with no key throws `FedCompanionKeyNotFoundError`, carrying the group to
   which the app must move its existing companion; no companion is created. With
   nil groups, existing behavior is unchanged.
-
 - Read optional catalog authority metadata and provider declarations, expose
   `catalogWatch` generation updates, and retain `route.open` target metadata on
   `RouteHandle`. Missing or incomplete targets are unmarked; unknown origins

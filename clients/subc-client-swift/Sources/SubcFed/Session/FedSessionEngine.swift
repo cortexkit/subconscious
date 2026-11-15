@@ -263,6 +263,7 @@ public actor FedSessionEngine {
     private var helloGate = FedHelloGate()
     private var negotiation: FedNegotiatedSession?
     private var catalogTracker = FedCatalogTracker()
+    private var catalogApplied: (@Sendable () async -> Void)?
     private var keepalive: FedKeepaliveController?
     private var streamDecoder = FedFrameStreamDecoder(negotiationComplete: false)
     private var writingFrame = false
@@ -423,7 +424,9 @@ public actor FedSessionEngine {
             peerIncarnation: negotiated.peerIncarnation,
             peerFeatures: negotiated.features
         )
-        _ = catalogTracker.apply(remoteCatalog)
+        if catalogTracker.apply(remoteCatalog) {
+            await catalogApplied?()
+        }
         remoteCatalogReceived = true
 
         // Origin-side reconciliation (fed-wire §8.8): on every reconnect that has
@@ -1066,6 +1069,7 @@ public actor FedSessionEngine {
     public func disconnect(reason: FedFailure = .disconnected) async {
         guard !cancelledActivities else { return }
         cancelledActivities = true
+        catalogApplied = nil
         timerDeadlineChanged = nil
         lastFailure = reason
         phase = .closed
@@ -1110,6 +1114,13 @@ public actor FedSessionEngine {
     func setTimerDeadlineChanged(_ callback: @escaping @Sendable () -> Void) {
         guard !cancelledActivities else { return }
         timerDeadlineChanged = callback
+    }
+
+    // The client publishes the initial snapshot only after installing the
+    // session, so an observer can immediately look up its operations.
+    func setCatalogApplied(_ callback: @escaping @Sendable () async -> Void) {
+        guard !cancelledActivities else { return }
+        catalogApplied = callback
     }
 
     /// Absolute deadline for the client-owned timer driver. Traffic can postpone
@@ -1213,7 +1224,9 @@ public actor FedSessionEngine {
                 peerIncarnation: negotiation.peerIncarnation,
                 peerFeatures: negotiation.features
             )
-            _ = catalogTracker.apply(catalog)
+            if catalogTracker.apply(catalog) {
+                await catalogApplied?()
+            }
         case .bye:
             if frame.byeCode == "fed_rekey_needed" {
                 return

@@ -167,8 +167,8 @@ pub(crate) fn supervised() -> bool {
 pub(crate) fn adopt(module_id: &str) -> Result<bool, SubcModuleError> {
     let supervised = init_supervised();
     // The inherited channel belongs to the launched module, not every module
-    // exported by its process. Other ids need a claim authorizing that exact id
-    // under the owner's reserved prefix, or register without channel authority.
+    // exported by its process. Sharing a process does not grant other module ids
+    // the launched module's authority; they need separate registration authority.
     Ok(supervised && is_launched_module(module_id)?)
 }
 

@@ -1,7 +1,7 @@
 # Scopes: owned identity records in the daemon
 
-This document describes current behaviour. Every operation here is built except
-`scope.subscribe`; until it exists, providers read `scope.describe`. Sections 2 to 6 define
+This document describes current behaviour. Providers read `scope.describe` and
+watch selected epoch endings with `scope.watch`. Sections 2 to 6 define
 the record, authority, admission, reader and locking contracts that scope owners, carriers and
 providers rely on; section 9 lists the tests that pin them, and section 11 records details the
 implementation settled. The daemon advertises `scopes/v1` when these operations are available.
@@ -292,8 +292,9 @@ The evaluation points are:
 `scope.describe` does not evaluate expiry: it may still report a past-deadline scope as `live`
 until a sweep. It returns `expires_at_ms` when set; the bind stamp carries that deadline only
 to a target declaring `call-modes/v1` (section 4a). The deadline is fixed per epoch, so the
-bind-time value stays exact. No expiry push or backlog is sent to the owner; it learns
-through describe, `scope_expired`, or `ended` in a call whose own sweep ended the scope.
+bind-time value stays exact. A `scope.watch` on the epoch receives `ended` after
+a sweep expires it. Without a watch the owner learns through describe,
+`scope_expired`, or `ended` in a call whose own sweep ended the scope.
 A periodic sweep's ends do not appear in a later
 call's `ended` reply.
 
@@ -809,8 +810,8 @@ epoch: epochs come only from the owner's records (section 2). The run scope and 
 as they were, and the carrier re-opens its routes.
 
 A drain does not stop a call already delivered (section 7). The provider answers every
-in-flight call with a terminal frame and stops work the run started once `scope.describe`
-confirms the scope ended.
+in-flight call with a terminal frame and stops work the run started once a terminal
+`scope.watch` state/event or `scope.describe` confirms the scope ended.
 
 **What a provider must do,** in addition to section 7:
 1. Declare `call-modes/v1`, list `codemode` only on tools it will serve inside a program, and
@@ -847,7 +848,7 @@ tool without `codemode` in its `modes` is refused `call_mode_unsupported` with `
 an agent named in the arguments never replaces the stamp's `agent_id`; and a route stamped
 `parent_state: ended` serves no new call.
 
-## 5. Reading: `scope.describe` and `scope.subscribe`
+## 5. Reading: `scope.describe` and `scope.watch`
 
 `scope.describe {owner, ref}` answers:
 - `status`: `live`, `ended` (tombstoned since this daemon incarnation) or `not_live`;
@@ -908,17 +909,47 @@ most 45 s, then refuses `scope_unverifiable`. A stored approval is different: it
 refused, for as long as its own expiry allows, and it executes only after a later read answers
 case 1. The 45 s bound applies to a call waiting now, never to a stored approval.
 
-`scope.subscribe` (deferred to a later release) is a held request shaped like
-`supervisor.spawn_subscribe`, with the same `{daemon_incarnation, seq}` cursor and too-old-cursor
-refusal. It sends a snapshot of live scopes, then events:
-- `{owner, ref, scope_epoch, created}` when a scope is created;
-- `{owner, ref, scope_epoch, ended}` when a scope ends;
-- `{owner, ref, scope_epoch, changed}` when its carriers, `delegates`, `agent_id`, `on_behalf_of_agent`, `flow_id`, `run_id` or `parent_state`
-  change;
-- `{owner, synced, scopes: [...]}` when an owner's first sync of this incarnation is accepted,
-  carrying that owner's full live set.
-A scope of that owner the reader holds and not in the `synced` set is ended. Before the owner's
-`synced` event, a scope merely missing is held, never treated as ended.
+### Lifecycle: `scope.watch`
+
+A provider may replace periodic lifetime reads with a channel-0 subscription:
+`{op:"scope.watch", scopes:[{scope_ref:{owner, ref}, epoch}, ...]}`. It watches at
+most 256 selectors and a registered connection may hold at most 16 watches. The
+set is immutable; cancel and reopen to replace it. The initial nonterminal
+`RESPONSE` is `{op:"scope.watch", scopes:[{scope_ref, epoch, status, by_epoch?}]}`:
+- `live`: the requested epoch is live;
+- `superseded`: a higher epoch is now live, named by `by_epoch`;
+- `ended`: the requested epoch, or a later epoch of the ref, has a retained
+  tombstone and the requested epoch is no longer live;
+- `unknown`: the daemon cannot establish the requested epoch's state, including
+  a never-seen ref or an epoch newer than the known record. Tombstone eviction
+  and daemon restarts can lose history. Unknown is never a reason to revoke work.
+
+The snapshot uses exactly describe's reader authorization, including its
+registration-channel checks and federated capability gate. A selector the
+caller cannot describe is indistinguishable from an unknown one, before and
+after its scope ends, and never produces pushes. Every registered module can
+describe ordinary scopes today; watch adds no ownership or service-history rule.
+
+Subsequent `STREAM_DATA` pushes are
+`{op:"scope.watch", event:"ended"|"superseded", scope_ref, epoch, by_epoch?}`.
+Expiry and explicit/omitted ends produce `ended`; a live epoch replacement
+produces `superseded` with its new epoch. The first terminal event for each
+selector is latched once, even behind backpressure. Initial terminal entries
+are not repeated as pushes. Same-epoch content changes produce no event.
+
+A head's epoch move does **not** end its live worker children. A worker re-parented
+to the new head epoch in the same sync keeps its own epoch and its live routes
+(section 4b); there is no worker `ended` or `superseded` push. Without a re-point,
+its link becomes `parent_state: ended` and its routes may drain, but the child
+scope itself still stays live. Only ending/replacing that child's own epoch
+produces a terminal event for its watch.
+
+Cancellation, disconnection and route-credit behavior mirror `catalog.watch`;
+there is no durable history or cursor. On reconnect, register and open a fresh
+watch. The Rust API is `ModuleHandle::scope_watch` on the registered connection,
+not a separate `SubcConsumer`. The TypeScript provider reader API remains a
+follow-up. Wire examples, limits and refusal codes are in
+[`control-plane.md`](control-plane.md#scope-lifecycle-watches).
 
 ### Service history: `scope.served_by`
 
@@ -1143,15 +1174,16 @@ federation owner begins creating scopes; until then existing routes and stamps a
     commands, Cerebellum's open browser, a Broca run) ends it when the scope is revoked, and
     reports it by name (`killed (scope revoked)`, `closed (scope revoked)`, the run sealed
     Interrupted);
-  - **the trigger is a route close followed by `scope.describe`, never the close alone.** The
+  - **the trigger is a terminal `scope.watch` state/event, or `scope.describe`, never a route close alone.** The
     route GOODBYE a module receives has an empty body and carries no reason, and routes close for
     ordinary reasons too (a module restart, a daemon upgrade, a client reconnect), on which work
-    must survive. So when a route stamped with a scope closes, the provider asks `scope.describe`
+    must survive. On older daemons without `scope.watch`, when a route stamped with a scope closes, the provider asks `scope.describe`
     for that scope and ends the work only on a definitive answer (section 5, cases 2 and 3). A
     `not_synced` answer, as after a daemon restart, holds and ends nothing. A carrier removed or
     `delegates` turned off leaves the scope live, so its work is not ended by this rule. Work with
-    no open route under the scope checks `scope.describe` once per running task per interval
-    until `scope.subscribe` ships in stage 7.
+    no open route under the scope uses `scope.watch` to retain lifetime coverage;
+    on older daemons it checks `scope.describe` periodically instead. A lost watch
+    or `unknown` snapshot holds work; neither proves the scope ended.
 
 ## 8. Compatibility
 
@@ -1176,7 +1208,7 @@ scopes without installed identity serialize byte-identically to before.
 
 A provider requiring scope identity refuses a bind without the daemon's scope stamp (§5). Scope owners and their authorized carriers—the modules allowed to open routes for an owner—use scopes only when the daemon advertises `scopes/v1`; failure to open a stamped route returns `scope_unsupported`, never an unscoped fallback.
 
-A caller may retry route-open refusals `scope_changed` and `scope_not_synced`. Older SDKs have a closed retry-code set, so an unrecognized code terminates the call rather than retrying without its scope stamp. Scope-change subscriptions (`scope.subscribe`) are not yet implemented.
+A caller may retry route-open refusals `scope_changed` and `scope_not_synced`. Older SDKs have a closed retry-code set, so an unrecognized code terminates the call rather than retrying without its scope stamp. Before watching lifetime changes, check the exact `scope.watch` op in HELLO_ACK; the older `scopes/v1` capability alone does not advertise it.
 
 Before sending expiry, deltas or run identity, owners check HELLO_ACK's advertised module ops for `scope.apply` (§11). That operation shipped with `expires_at_ms` and `run_id` in subc-protocol 0.30.0, so its presence is their support check; older full-sync bodies without deadline or run ID still decode unchanged.
 
@@ -1280,9 +1312,9 @@ Each fails by name when its rule is removed:
 
 The following implementation rules resolve ambiguous wording above; where they differ, this section governs.
 
-- **Where sync, apply and describe run.** `scope.sync`, `scope.apply` and `scope.describe` are
-  module control requests sent on the sender's own registered module connection. The owner is that registration's
-  `module_id`; nothing in the request body names it. A connection without a registration (`direct`
+- **Where scope operations run.** `scope.sync`, `scope.apply`, `scope.describe` and `scope.watch` are
+  module control requests sent on the sender's own registered module connection. For writes, the owner is that registration's
+  `module_id`; nothing in a write request body names it. A connection without a registration (`direct`
   and every client connection) is refused `not_registered`, which is how "`direct` cannot own
   scopes" is enforced. `scope.describe` is readable by any registered module, since every provider
   reads it.
@@ -1293,8 +1325,8 @@ The following implementation rules resolve ambiguous wording above; where they d
   `scope_sync_not_authority`. The promoted process's first full sync takes authority and replaces
   the set at any generation; an apply before that sync is `scope_sync_required`.
 - **Advertising.** `scopes/v1` appears in both `server.describe` and HELLO_ACK, and HELLO_ACK lists
-  `scope.sync`, `scope.apply` and `scope.describe` among the module ops (`scope.apply` since
-  subc-protocol 0.30.0).
+  `scope.sync`, `scope.apply`, `scope.describe` and `scope.watch` among the module ops (`scope.apply` since
+  subc-protocol 0.30.0, `scope.watch` since daemon 0.49.0).
 - **Codes this note did not list.** `scope_live_limit_exceeded` and `scope_attributes_too_large`
   refuse the whole sync. `scope_carrier_targets_invalid` (an empty target list, or more than 16) and
   `scope_delegates_without_agent` refuse one record. A duplicate or empty ref in one sync refuses

@@ -720,11 +720,17 @@ pub(crate) struct ScopeTable {
     /// Source of every `version`. One counter for the whole table, so a version
     /// is never reused within an incarnation even across an epoch change.
     last_version: u64,
+    watches: Vec<ScopeWatchLatch>,
     wall_clock: Arc<dyn Fn() -> u64 + Send + Sync>,
     #[cfg(test)]
     link_lookups: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     pub(crate) idle_check_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+struct ScopeWatchLatch {
+    remaining: Vec<subc_control::ScopeWatchSelector>,
+    events: tokio::sync::watch::Sender<Vec<subc_control::ScopeWatchPush>>,
 }
 
 fn reserved_module_id(principal: &Principal) -> Option<&str> {
@@ -762,6 +768,7 @@ impl ScopeTable {
             authority_owners: authority_owners.into_iter().collect(),
             owners: HashMap::new(),
             last_version: 0,
+            watches: Vec::new(),
             wall_clock: Arc::new(crate::clock::wall_now_ms),
             #[cfg(test)]
             link_lookups: std::sync::atomic::AtomicUsize::new(0),
@@ -777,6 +784,122 @@ impl ScopeTable {
 
     pub(crate) fn is_federated_owner(&self, owner: &Principal) -> bool {
         reserved_module_id(owner) == Some(self.federated_owner.as_str())
+    }
+
+    /// Share describe's reader gate with watches, including after an end.
+    pub(crate) fn reader_permitted(
+        &self,
+        owner: &Principal,
+        capabilities: Option<&subc_protocol::manifest::CapabilityDeclarations>,
+    ) -> bool {
+        !self.is_federated_owner(owner) || target_supports_federated(capabilities)
+    }
+
+    fn watch_state(
+        &self,
+        selector: &subc_control::ScopeWatchSelector,
+    ) -> subc_control::ScopeWatchState {
+        use subc_control::ScopeWatchStatus;
+        let state =
+            reserved_module_id(&selector.scope_ref.owner).and_then(|owner| self.owners.get(owner));
+        let live = state.and_then(|state| state.live.get(&selector.scope_ref.scope_ref));
+        let (status, by_epoch) = match live.map(|scope| scope.record.scope_epoch) {
+            Some(epoch) if epoch == selector.epoch => (ScopeWatchStatus::Live, None),
+            Some(epoch) if epoch > selector.epoch => (ScopeWatchStatus::Superseded, Some(epoch)),
+            _ if state
+                .and_then(|state| state.tombstones.latest(&selector.scope_ref.scope_ref))
+                .is_some_and(|epoch| epoch >= selector.epoch) =>
+            {
+                (ScopeWatchStatus::Ended, None)
+            }
+            _ => (ScopeWatchStatus::UnknownScope, None),
+        };
+        subc_control::ScopeWatchState {
+            scope_ref: selector.scope_ref.clone(),
+            epoch: selector.epoch,
+            status,
+            by_epoch,
+        }
+    }
+
+    /// Snapshot and subscribe under the same write lock as scope changes. Each
+    /// terminal event stays latched until cancellation, even behind slow egress.
+    pub(crate) fn watch(
+        &mut self,
+        selectors: Vec<subc_control::ScopeWatchSelector>,
+        capabilities: Option<&subc_protocol::manifest::CapabilityDeclarations>,
+    ) -> (
+        Vec<subc_control::ScopeWatchState>,
+        tokio::sync::watch::Receiver<Vec<subc_control::ScopeWatchPush>>,
+    ) {
+        use subc_control::ScopeWatchStatus;
+        let mut remaining = Vec::new();
+        let states = selectors
+            .into_iter()
+            .map(|selector| {
+                if !self.reader_permitted(&selector.scope_ref.owner, capabilities) {
+                    return subc_control::ScopeWatchState {
+                        scope_ref: selector.scope_ref,
+                        epoch: selector.epoch,
+                        status: ScopeWatchStatus::UnknownScope,
+                        by_epoch: None,
+                    };
+                }
+                let state = self.watch_state(&selector);
+                if matches!(
+                    state.status,
+                    ScopeWatchStatus::Live | ScopeWatchStatus::UnknownScope
+                ) {
+                    remaining.push(selector);
+                }
+                state
+            })
+            .collect();
+        let (events, receiver) = tokio::sync::watch::channel(Vec::new());
+        self.watches.retain(|watch| !watch.events.is_closed());
+        self.watches.push(ScopeWatchLatch { remaining, events });
+        (states, receiver)
+    }
+
+    fn notify_scope_watches(&mut self, changes: &[ScopeTagChange]) {
+        use subc_control::{ScopeWatchEvent, ScopeWatchPush, ScopeWatchStatus};
+        let changed: HashSet<_> = changes
+            .iter()
+            .map(|change| (change.owner.as_str(), change.scope_ref.as_str()))
+            .collect();
+        let mut watches = std::mem::take(&mut self.watches);
+        watches.retain_mut(|watch| {
+            if watch.events.is_closed() {
+                return false;
+            }
+            let mut pending = Vec::new();
+            watch.remaining.retain(|selector| {
+                let Some(owner) = reserved_module_id(&selector.scope_ref.owner) else {
+                    return true;
+                };
+                if !changed.contains(&(owner, selector.scope_ref.scope_ref.as_str())) {
+                    return true;
+                }
+                let state = self.watch_state(selector);
+                let event = match state.status {
+                    ScopeWatchStatus::Ended => ScopeWatchEvent::Ended,
+                    ScopeWatchStatus::Superseded => ScopeWatchEvent::Superseded,
+                    _ => return true,
+                };
+                pending.push(ScopeWatchPush::new(
+                    event,
+                    state.scope_ref,
+                    state.epoch,
+                    state.by_epoch,
+                ));
+                false
+            });
+            if !pending.is_empty() {
+                watch.events.send_modify(|events| events.extend(pending));
+            }
+            true
+        });
+        self.watches = watches;
     }
 
     pub(crate) fn set_wall_clock(&mut self, clock: Arc<dyn Fn() -> u64 + Send + Sync>) {
@@ -854,6 +977,7 @@ impl ScopeTable {
         for owner in changed_owners {
             self.refresh_links_to(&owner, &mut swept.tag_changes);
         }
+        self.notify_scope_watches(&swept.tag_changes);
         swept
     }
 
@@ -979,6 +1103,7 @@ impl ScopeTable {
                 result.outcome = ScopeRecordOutcome::Updated;
             }
         }
+        self.notify_scope_watches(&applied.tag_changes);
         Ok(applied)
     }
 

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.9.3
+
+- Raise subc-control to 0.41 for scope lifecycle watches, with co-bumped SDK/sibling floors; no direct behavior changes.
+
 ## 0.9.2
 
 - Raise the Rust client requirement to 0.40.2 for process-local module re-exports.

@@ -548,6 +548,7 @@ const MODULE_TO_DAEMON_OPERATIONS: &[(&str, bool)] = &[
     ("scope.sync", true),
     ("scope.apply", true),
     ("scope.describe", true),
+    ("scope.watch", true),
     ("route.authorize", true),
     ("supervisor.live_roots", true),
     ("supervisor.agent_commands", true),

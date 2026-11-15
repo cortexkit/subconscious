@@ -5,6 +5,7 @@
 - Expose `peer_build` in bind peer facts and through `RouteBindRequest::peer_build()`.
   Targets declare `peer-build/v1` to receive the daemon's honoured production
   phone build fact; legacy binds leave it absent. Require subc-protocol 0.37.2.
+- Add `ModuleHandle::scope_watch` and `ScopeSubscription` with initial states, typed terminal pushes, bounded registration-side stream dispatch and cancellation on drop. Preserve daemon refusal codes and end streams on connection loss; use the registered connection rather than an unauthorized consumer facade. Raise the control dependency to 0.41.
 
 ## 0.40.3
 

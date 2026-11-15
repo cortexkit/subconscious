@@ -57,3 +57,24 @@ or an invalid reply, also leaves the roles uncertain; a successful explicit
 catalog replacement establishes them again. A typed daemon rejection preserves
 the previously accepted roles. The ordinary catalog methods still omit `ready`
 and leave readiness unchanged.
+
+## Scope lifetime watches
+
+Use `ModuleHandle::scope_watch(Vec<ScopeWatchSelector>)` on the module's
+registered connection, beside `scope_describe` and `scope_apply`. It checks the
+`scope.watch` op advertised in HELLO_ACK; an older daemon returns
+`ScopeCallError::NotSupported` without sending a request. A separate consumer
+connection cannot watch scopes because it cannot describe them.
+
+The returned `ScopeSubscription.initial.scopes` contains one state per selected
+`ScopeRef { owner, scope_ref }` and epoch (`scope_ref` serializes as `ref`). States
+are `Live`, `Ended`, `Superseded` with `by_epoch`, or `UnknownScope`. Then
+`next().await` returns typed `ScopeWatchPush` events until cancellation,
+connection loss or a terminal daemon refusal. Queued events precede the terminal
+error, and refusal codes remain in `ScopeCallError::Refused`.
+
+A watch holds at most 256 selectors, with at most 16 watches per connection.
+Drop or `unsubscribe()` to cancel, and reopen to replace the set. After
+re-registering on a new connection, open a fresh watch and inspect its initial
+states; unknown state and a broken feed never prove a scope ended. See
+[scope lifecycle rules](../../docs/scopes.md#lifecycle-scopewatch).

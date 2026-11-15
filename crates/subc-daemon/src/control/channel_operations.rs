@@ -13,7 +13,7 @@
 //! | `claim.mint` | yes | yes | yes |
 //! | `operator.confirm` | yes | yes | yes |
 //! | `scope.sync`, `scope.apply` | yes | no | no |
-//! | `scope.describe` | yes | yes | yes |
+//! | `scope.describe`, `scope.watch` | yes | yes | yes |
 //! | `route.authorize` | yes | no | no |
 //! | `supervisor.live_roots`, `scope.served_by` | yes | yes | yes |
 //! | `supervisor.agent_commands` | yes | no | no |
@@ -59,6 +59,7 @@ pub(super) const REGISTRATION_OPERATIONS: &[&str] = &[
     SCOPE_SYNC_OP,
     SCOPE_APPLY_OP,
     SCOPE_DESCRIBE_OP,
+    ops::SCOPE_WATCH,
     subc_protocol::scope::ROUTE_AUTHORIZE_OP,
     "supervisor.live_roots",
     "supervisor.agent_commands",

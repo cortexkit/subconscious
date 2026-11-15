@@ -164,6 +164,7 @@ use caller_attestation::{caller_for_target, scope_acts_for_another};
 #[path = "control/caller_attestation_tests.rs"]
 mod caller_attestation_tests;
 mod scope_expiry;
+mod scope_watch;
 
 mod agent_commands;
 pub(crate) mod catalog;
@@ -180,6 +181,7 @@ const MODULE_TO_SUBC_CONTROL_OPS: &[&str] = &[
     SCOPE_SYNC_OP,
     SCOPE_APPLY_OP,
     SCOPE_DESCRIBE_OP,
+    ops::SCOPE_WATCH,
     subc_protocol::scope::ROUTE_AUTHORIZE_OP,
     "operator.confirm",
 ];
@@ -465,6 +467,7 @@ pub struct ControlHandler {
     activity: Option<crate::activity::ActivityLedger>,
     activity_streams: Arc<Mutex<HashMap<(ConnectionId, u64), tokio::task::AbortHandle>>>,
     catalog_streams: Arc<Mutex<HashMap<(ConnectionId, u64), tokio::task::AbortHandle>>>,
+    scope_streams: Arc<Mutex<HashMap<(ConnectionId, u64), tokio::task::AbortHandle>>>,
     forwarding: Arc<ForwardingTable>,
     process_liveness: Option<Arc<dyn ModuleProcessLiveness>>,
     supervisor: SupervisorHandle,
@@ -1156,6 +1159,7 @@ impl ControlHandler {
             activity: None,
             activity_streams: Arc::new(Mutex::new(HashMap::new())),
             catalog_streams: Arc::new(Mutex::new(HashMap::new())),
+            scope_streams: Arc::new(Mutex::new(HashMap::new())),
             forwarding,
             process_liveness: None,
             supervisor: SupervisorHandle::new(),
@@ -2345,6 +2349,7 @@ impl ControlHandler {
                             "catalog.update"
                                 | "catalog.update_role_declarations"
                                 | "scope.describe"
+                                | "scope.watch"
                                 | "supervisor.live_roots"
                                 | "activity.record"
                         )
@@ -2502,6 +2507,7 @@ impl ControlHandler {
                         .cancel_spawn_subscription(ctx.connection_id, frame.header.corr)
                     || self.cancel_activity_subscription(ctx, &frame)?
                     || self.cancel_catalog_subscription(ctx.connection_id, frame.header.corr)
+                    || self.cancel_scope_subscription(ctx.connection_id, frame.header.corr)
                 {
                     Ok(Vec::new())
                 } else {
@@ -2551,6 +2557,12 @@ impl ControlHandler {
                     .is_some_and(|probe| probe.op == ops::CATALOG_WATCH)
                 {
                     return self.handle_catalog_watch(ctx, frame);
+                }
+                if op
+                    .as_ref()
+                    .is_some_and(|probe| probe.op == ops::SCOPE_WATCH)
+                {
+                    return self.handle_scope_watch(ctx, frame);
                 }
                 if op
                     .as_ref()
@@ -2838,6 +2850,7 @@ impl ControlHandler {
         // nonce authority.
         self.agent_declarations.close(connection_id);
         self.close_catalog_subscriptions(connection_id);
+        self.close_scope_subscriptions(connection_id);
         #[cfg(test)]
         self.pause_cleanup_for_test(0);
         if let Some(spawn) = self.supervisor.registration_spawn(connection_id) {
@@ -5272,9 +5285,7 @@ impl ControlHandler {
             .scopes
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if scopes.is_federated_owner(&owner)
-            && !crate::scopes::target_supports_federated(registered.manifest.capabilities.as_ref())
-        {
+        if !scopes.reader_permitted(&owner, registered.manifest.capabilities.as_ref()) {
             return Ok(vec![control_error_frame(
                 &frame,
                 error_codes::SCOPE_FEDERATED_UNSUPPORTED,
@@ -20304,6 +20315,9 @@ mod tests {
         }
         mod delta {
             include!("scope_handler_delta_tests.rs");
+        }
+        mod watch {
+            include!("scope_watch_tests.rs");
         }
         mod call_modes {
             include!("scope_call_mode_tests.rs");

@@ -94,6 +94,9 @@ pub use app_open::*;
 mod connection_describe;
 pub use connection_describe::*;
 
+mod scope_watch;
+pub use scope_watch::*;
+
 mod subtree;
 pub use subtree::*;
 mod tree;
@@ -145,6 +148,7 @@ pub mod ops {
     pub const DAEMON_SHUTDOWN_INTENT: &str = "daemon.shutdown_intent";
     pub const CATALOG_LIST: &str = "catalog.list";
     pub const CATALOG_WATCH: &str = "catalog.watch";
+    pub const SCOPE_WATCH: &str = "scope.watch";
     pub const ROUTE_OPEN: &str = "route.open";
     pub const ROUTE_POLL: &str = "route.poll";
     pub const ROUTE_CLOSING: &str = "route.closing";

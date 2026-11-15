@@ -35,6 +35,13 @@ pub use policy_cache::{
     PolicyVerdict, ProjectRef, Subject, DEFAULT_POLICY_RESOLVER_MODULE_ID,
 };
 pub use subc_control::{AppOpenReply, AppOpenStatus, CatalogOrigin, CatalogWatchResponse};
+pub use subc_control::{
+    ScopeRef, ScopeWatchEvent, ScopeWatchPush, ScopeWatchResponse, ScopeWatchSelector,
+    ScopeWatchState, ScopeWatchStatus,
+};
+
+mod module_subscription;
+pub use module_subscription::ScopeSubscription;
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
@@ -503,6 +510,7 @@ struct ModuleHandleShared {
     supports_scope_sync: bool,
     supports_scope_apply: bool,
     supports_scope_describe: bool,
+    supports_scope_watch: bool,
     supports_route_authorize: bool,
     supports_operator_confirm: bool,
     supports_activity: bool,
@@ -522,6 +530,7 @@ struct ModuleHandleShared {
 }
 
 struct ModuleHandleState {
+    pending_control_streams: HashMap<u64, module_subscription::ControlStreamSender>,
     pending_claim_calls: HashMap<u64, oneshot::Sender<Frame>>,
     writer: Option<mpsc::Sender<Frame>>,
     next_corr: Option<u64>,
@@ -588,6 +597,10 @@ impl ModuleHandle {
                 supports_scope_sync: ack.subc_ops.iter().any(|op| op == SCOPE_SYNC_OP),
                 supports_scope_apply: ack.subc_ops.iter().any(|op| op == SCOPE_APPLY_OP),
                 supports_scope_describe: ack.subc_ops.iter().any(|op| op == SCOPE_DESCRIBE_OP),
+                supports_scope_watch: ack
+                    .subc_ops
+                    .iter()
+                    .any(|op| op == subc_control::ops::SCOPE_WATCH),
                 supports_route_authorize: ack
                     .subc_ops
                     .iter()
@@ -613,6 +626,7 @@ impl ModuleHandle {
                 config: config::Session::default(),
                 served_control_ops: std::sync::OnceLock::new(),
                 inner: Mutex::new(ModuleHandleState {
+                    pending_control_streams: HashMap::new(),
                     pending_claim_calls: HashMap::new(),
                     writer: Some(writer),
                     next_corr: Some(HELLO_CORR + 1),
@@ -1421,6 +1435,9 @@ impl ModuleHandle {
     }
 
     fn handle_control_reply(&self, frame: Frame) -> bool {
+        let Some(frame) = self.handle_control_stream_frame(frame) else {
+            return true;
+        };
         let claim_reply = self
             .shared
             .lock_inner()
@@ -1623,6 +1640,7 @@ impl ModuleHandleShared {
             inner.pending_config_calls.clear();
             inner.pending_agent_commands.clear();
             inner.pending_claim_calls.clear();
+            inner.pending_control_streams.clear();
             inner
                 .pending_catalog_updates
                 .drain()
@@ -3209,7 +3227,9 @@ where
             let _ = module_handle.handle_control_reply(frame);
             Ok(true)
         }
-        FrameType::Error if frame.header.channel == 0 => {
+        FrameType::Error | FrameType::StreamData | FrameType::StreamEnd
+            if frame.header.channel == 0 =>
+        {
             let _ = module_handle.handle_control_reply(frame);
             Ok(true)
         }
@@ -4958,6 +4978,11 @@ mod tests {
         Principal::Reserved {
             module_id: "owner".to_string(),
         }
+    }
+
+    mod scope_watch {
+        use super::*;
+        include!("module_subscription_tests.rs");
     }
 
     /// Each scope op is gated on its own `subc_ops` entry: a daemon that

@@ -476,7 +476,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-client-rs",
- "subc-control 0.40.2",
+ "subc-control 0.41.0",
  "subc-daemon",
  "subc-jsonc",
  "subc-protocol 0.37.2",
@@ -490,7 +490,7 @@ dependencies = [
 
 [[package]]
 name = "ck-inspect"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "async-trait",
  "ck-inspect",
@@ -500,7 +500,7 @@ dependencies = [
  "serde",
  "serde_json",
  "subc-client-rs",
- "subc-control 0.40.2",
+ "subc-control 0.41.0",
  "subc-os",
  "subc-protocol 0.37.2",
  "tempfile",
@@ -509,7 +509,7 @@ dependencies = [
 
 [[package]]
 name = "ck-ui"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "chrono",
  "ck-ui",
@@ -523,7 +523,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-client-rs",
- "subc-control 0.40.2",
+ "subc-control 0.41.0",
  "subc-jsonc",
  "subc-os",
  "subc-protocol 0.37.2",
@@ -676,7 +676,7 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-bus-testkit"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -687,7 +687,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-client-rs",
- "subc-control 0.40.2",
+ "subc-control 0.41.0",
  "subc-os",
  "subc-protocol 0.37.2",
  "subc-transport",
@@ -2950,7 +2950,7 @@ dependencies = [
  "sha2",
  "socket2",
  "subc-config",
- "subc-control 0.40.2",
+ "subc-control 0.41.0",
  "subc-os",
  "subc-protocol 0.37.2",
  "subc-transport",
@@ -2984,7 +2984,7 @@ dependencies = [
 
 [[package]]
 name = "subc-control"
-version = "0.40.2"
+version = "0.41.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3014,7 +3014,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-client-rs",
- "subc-control 0.40.2",
+ "subc-control 0.41.0",
  "subc-core",
  "subc-daemon",
  "subc-jsonc",
@@ -3053,7 +3053,7 @@ dependencies = [
  "subc-cgroup",
  "subc-config",
  "subc-control 0.35.0",
- "subc-control 0.40.2",
+ "subc-control 0.41.0",
  "subc-jobobject",
  "subc-jsonc",
  "subc-os",
@@ -3109,7 +3109,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-client-rs",
- "subc-control 0.40.2",
+ "subc-control 0.41.0",
  "subc-daemon",
  "subc-jsonc",
  "subc-os",

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.41.0
+
+- Add standalone `scope.watch` request, snapshot and terminal push shapes, with open lifecycle state/event readers. Advertised as a new module control operation.
+
 ## 0.40.2
 
 - Add optional `changed_pending` rescan rows and pending module-status values,

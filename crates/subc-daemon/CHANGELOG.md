@@ -8,6 +8,7 @@
   openers produce no fact. Binds to targets without the capability retain their
   legacy bytes, and the raw `build_class` key is never relayed.
 - Require subc-protocol 0.37.2 for the optional peer-build wire field.
+- Advertise `scope.watch` on registered module connections: atomically snapshot up to 256 selected epochs, push each first ending or superseding once, and retain events behind backpressure. Reuse describe authorization; cap connections at 16 watches and cancel on channel zero. Re-parented live worker scopes keep their routes and produce no lifetime event.
 
 ## 0.48.3
 

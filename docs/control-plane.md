@@ -64,6 +64,7 @@ so over a second, client connection. Test:
 | `app.open` | Ask the daemon to start a known installed operator app. | Unprivileged; starting an app grants nothing. Standalone request/reply bodies, not variants of the exhaustive control enums. |
 | `connection.describe` | Read the daemon's facts about the caller's own connection. | Unprivileged, never prompts, and cannot inspect another connection. Standalone request/reply bodies. |
 | `catalog.list` | Registered modules with their manifests' roles, capabilities, readiness, optional `display_name` and optional `rich_ui` descriptor. Optional `module_id` narrows the list. | An unregistered id gives an empty list, not an error. This is the wire registry, not the supervised roster. `display_name` is copied from the manifest and omitted when undeclared; apps fall back to the bare `module_id`. It is already-trimmed plain text of 1–40 Unicode scalar values, with no Cc controls or bidi formatting characters (U+061C, U+200E, U+200F, U+202A–U+202E, U+2066–U+2069); invalid names refuse HELLO as `invalid_manifest`, never silently trimmed or truncated. `rich_ui` is opaque and fixed for the registration's lifetime; `nonce_verified: true` appears only when HELLO passes the launch-nonce check required for a reserved module or swap candidate. Optional fields are omitted when absent/unverified, preserving legacy entry bytes. |
+| `catalog.watch` | Follow catalog generations on channel 0. | The first `STREAM_DATA` reports the captured generation; later advances may coalesce behind backpressure. Cancel by correlation id and refresh the catalog after reconnect. |
 | `route.open` | Open a route to a target (section 2.1). | Reply: `route_channel`, `route_epoch`. |
 | `route.poll` | Read a bound route's last status (`kind: "status"`) or whether its module process is live (`kind: "liveness"`). | Answered from the daemon's own state; the module is never asked. |
 | `supervisor.list` | Supervised modules with state, health, restart counts and policy. | Each entry's optional `configured_enabled` is from the approved generation when stamped, otherwise the daemon's loaded configuration. Runtime `enabled`, health and launch observations remain in-force supervisor state, not an assertion that approval activated it. Optional [`subtree`](module-subtree-memory.md) reports memory including child processes beside the unchanged per-process `resources`, with an explicit source and process count or unavailability reason. |
@@ -325,7 +326,68 @@ to a module that lists it.
 | `catalog.update_role_declarations` | Request | Replace the module's complete `role_declarations` map, or clear it with `{}`, without changing provider roles, capabilities or readiness. Served since daemon 0.44.9. |
 | `supervisor.live_roots` | Request | Count live and pending routes per canonical project root, also including the workdir of each bound scoped route. A route contributes once when both paths match. |
 | `scope.sync`, `scope.apply`, `scope.describe` | Request | Register, change and read scopes. See [`scopes.md`](scopes.md). |
+| `scope.watch` | Subscription | Snapshot and follow the lifetime of selected scope epochs (below). |
 | `operator.confirm` | Request | Ask the person at the machine to confirm one in-flight write (section 5.1). |
+
+### Scope lifecycle watches
+
+On a module's registered connection, send a channel-0 subscription `REQUEST`:
+
+```json
+{"op":"scope.watch","scopes":[{"scope_ref":{"owner":{"kind":"reserved","module_id":"owner"},"ref":"session"},"epoch":7}]}
+```
+
+The daemon advertises `scope.watch` in `HELLO_ACK.subc_ops`. The request is an
+immutable set of at most **256 selectors**, and each connection may hold at most
+**16 active scope watches**. Either limit refuses with `scope_watch_limit_exceeded`;
+a repeated active correlation is `duplicate_subscription`. Duplicate selectors
+count toward the input limit but appear only once in the snapshot. To add to or
+replace a set, cancel the old watch and reopen; no update operation exists.
+
+The first frame is a nonterminal `RESPONSE` (without `LAST`), with the same
+channel, epoch zero and correlation id:
+
+```json
+{"op":"scope.watch","scopes":[{"scope_ref":{"owner":{"kind":"reserved","module_id":"owner"},"ref":"session"},"epoch":7,"status":"live"}]}
+```
+
+Every selected epoch reports `live`, `ended`, `superseded` (also `by_epoch`), or
+`unknown`. The snapshot and subscription are captured atomically. Later terminal
+transitions are `STREAM_DATA` on the same correlation:
+
+```json
+{"op":"scope.watch","event":"superseded","scope_ref":{"owner":{"kind":"reserved","module_id":"owner"},"ref":"session"},"epoch":7,"by_epoch":8}
+```
+
+`ended` means the scope ended, including expiry; `superseded` means a newer epoch
+of that ref became live. `by_epoch` is absent for `ended`. Each selector gets at
+most one push, retaining its first terminal event even if egress is blocked and
+the ref changes again. Already-terminal snapshot entries are not pushed again.
+Same-epoch changes, including re-parenting a worker under a moved head, do not
+end that worker and produce no event for it. See [`scopes.md`](scopes.md#5-reading-scopedescribe-and-scopewatch).
+
+Reader admission is exactly `scope.describe`'s: a registered module connection
+is required, and its existing per-owner reader gate is reused. A denied selector
+is always `unknown` and emits no events, before or after its scope ends. Unknown
+also covers a ref the daemon has never seen, lost tombstones after eviction or a
+restart, and an epoch newer than any known one; it is not evidence of an ending.
+
+As with `catalog.watch`, channel-0 `CANCEL` aborts the task without an ordinary
+reply, connection cleanup removes its watches, and neither watch consumes a
+routed request/watch credit. Producers never wait for egress while holding scope
+or forwarding locks. Reconnect ends the feed: register again and open a new
+watch to get a fresh snapshot; there is no replay cursor or persistent history.
+Rust modules use `ModuleHandle::scope_watch`, inspect `ScopeSubscription.initial`,
+and read pushes with `next`; dropping or unsubscribing cancels. This is not a
+consumer-connection API. The TypeScript provider currently has no registered
+scope reader/stream API, so its scope watch SDK remains a follow-up.
+
+Tests: `scope_watch_wire_shapes_require_op_and_accept_future_fields`
+(`crates/subc-control/src/scope_watch.rs`),
+`scope_watch_live_scope_gets_ended_exactly_once`,
+`scope_watch_slow_consumer_retains_first_ended_and_superseded_events`, and
+`scope_watch_child_survives_head_epoch_move_without_push_or_route_drain`
+(`crates/subc-daemon/src/scope_watch_tests.rs`).
 
 ### Live role-declaration updates
 

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.6
+
+- Raise the Rust client requirement to 0.40.1 for additive module control hooks.
+
 ## 0.2.5
 
 - Update daemon launch fixtures and dependency requirements for script-aware

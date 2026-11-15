@@ -3,6 +3,7 @@
 pub mod activity;
 mod agent_commands;
 pub mod config;
+mod control_ops;
 pub use agent_commands::AgentCommandsError;
 pub use subc_protocol::session::{AgentCommandFinished, AgentCommandRoot};
 pub mod consumer;
@@ -361,6 +362,7 @@ pub type ModuleServeFuture = Pin<Box<dyn Future<Output = Result<(), SubcModuleEr
 #[derive(Clone)]
 struct RequestDispatcher {
     in_flight: InFlight,
+    control_slots: Arc<tokio::sync::Semaphore>,
     /// The connection's handler-slot pools, shared with its [`ModuleHandle`]
     /// so the module can read their figures.
     pools: Arc<DispatchPools>,
@@ -390,6 +392,7 @@ impl RequestDispatcher {
     fn with_pools(pools: Arc<DispatchPools>) -> Self {
         Self {
             in_flight: Arc::new(Mutex::new(HashMap::new())),
+            control_slots: Arc::new(tokio::sync::Semaphore::new(16)),
             pools,
             draining_hooks: Arc::new(Mutex::new(Vec::new())),
             undecodable_push_logged: Arc::new(AtomicBool::new(false)),
@@ -514,6 +517,7 @@ struct ModuleHandleShared {
     dispatch_pools: Mutex<Arc<DispatchPools>>,
     catalog_send: tokio::sync::Mutex<()>,
     config: config::Session,
+    served_control_ops: std::sync::OnceLock<Vec<String>>,
     inner: Mutex<ModuleHandleState>,
 }
 
@@ -607,6 +611,7 @@ impl ModuleHandle {
                 dispatch_pools: Mutex::new(Arc::new(DispatchPools::new(RequestPools::new()))),
                 catalog_send: tokio::sync::Mutex::new(()),
                 config: config::Session::default(),
+                served_control_ops: std::sync::OnceLock::new(),
                 inner: Mutex::new(ModuleHandleState {
                     pending_claim_calls: HashMap::new(),
                     writer: Some(writer),
@@ -1959,6 +1964,39 @@ pub trait ModuleHandler: Send + Sync + 'static {
     /// negotiated capabilities and any storage descriptor supplied by the daemon.
     async fn on_hello_ack(&self, _ack: &ModuleHelloAckBody) {}
 
+    /// Extra daemon-to-module operations served on channel 0, such as `consent/v1`.
+    /// Read and validated once before HELLO: names must be nonempty ASCII names
+    /// using letters, digits, `.`, `_`, `-` or `/`, with no empty segments.
+    /// Duplicates and SDK-owned `health.check`, `config.review` and `route.bind`
+    /// are refused with [`SubcModuleError::InvalidControlOp`] before advertising.
+    fn control_ops(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Handle a declared control op with its entire decoded JSON request body.
+    /// The control name is the body's `op` string; for a protocol-tagged request
+    /// with no `op`, such as `consent/v1`, it is the body's `protocol` string.
+    /// Return a JSON RESPONSE body or an [`ErrorBody`] carrying a wire error code
+    /// and message. Runs off the reader, independently of routes, health and
+    /// config review, with at most 16 concurrent calls per connection and no
+    /// queue; overload returns `resource_exhausted`. There is no SDK time limit.
+    ///
+    /// CANCEL for this request's correlation, or disconnect, signals `cancel`.
+    /// A reply produced after cancellation is discarded. Cooperate with the
+    /// signal to release resources promptly; a cancelled call still holds its
+    /// slot until it returns, and connection teardown eventually aborts it.
+    async fn on_control_request(
+        &self,
+        _op: &str,
+        _body: serde_json::Value,
+        _cancel: CancellationToken,
+    ) -> Result<serde_json::Value, ErrorBody> {
+        Err(ErrorBody::new(
+            "unsupported_op",
+            "no control handler implemented",
+        ))
+    }
+
     /// Opt in once per connection. The SDK advertises `config.review`, declares
     /// these locations, and fetches immutable views before calling `config_apply`.
     /// Returning `None` leaves the existing module wire and file reader unchanged.
@@ -2738,6 +2776,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     H: ModuleHandler,
 {
+    let control_ops = control_ops::validate(handler.control_ops())?;
     let (mut read_half, write_half) = tokio::io::split(stream);
     let (tx, rx) = mpsc::channel::<Frame>(EGRESS_BUFFER);
     let connection_runtime = tokio::runtime::Handle::current();
@@ -2748,7 +2787,7 @@ where
     let mut hello_ack = None;
     let provides = manifest.provides.clone();
     let handshake = async {
-        send_hello(&tx, manifest, declaration.is_some()).await?;
+        send_hello(&tx, manifest, declaration.is_some(), &control_ops).await?;
         // A validated ACK means the daemon accepted the module, even while the
         // module's callback is pending. Keep that boundary when the writer wins.
         hello_ack = Some(expect_hello_ack(&mut read_half).await?);
@@ -2826,6 +2865,7 @@ where
         connection_runtime,
     );
     handle.shared.lock_inner().current_provides = Some(provides);
+    let _ = handle.shared.served_control_ops.set(control_ops);
     if options.registration_channel {
         registration::install_owner(&handle)?;
     }
@@ -3468,13 +3508,10 @@ fn bounded_terminal(
 }
 
 fn handle_cancel(frame: Frame, in_flight: &InFlight) -> Result<(), SubcModuleError> {
-    let cancellation = {
-        let guard = lock_in_flight(in_flight)?;
-        guard
-            .get(&(frame.header.channel, frame.header.epoch, frame.header.corr))
-            .cloned()
-    };
-    if let Some(cancellation) = cancellation {
+    let guard = lock_in_flight(in_flight)?;
+    if let Some(cancellation) =
+        guard.get(&(frame.header.channel, frame.header.epoch, frame.header.corr))
+    {
         cancellation.cancel();
     }
     Ok(())
@@ -3508,6 +3545,17 @@ async fn handle_control_request<H>(
 where
     H: ModuleHandler,
 {
+    if control_ops::request(
+        &frame,
+        egress,
+        Arc::clone(&handler),
+        &dispatcher,
+        &module_handle,
+    )
+    .await?
+    {
+        return Ok(());
+    }
     if config::review(
         &frame,
         egress,
@@ -3696,6 +3744,7 @@ async fn send_hello(
     egress: &mpsc::Sender<Frame>,
     mut manifest: ModuleManifest,
     config_gate: bool,
+    extra_control_ops: &[String],
 ) -> Result<(), SubcModuleError> {
     let launch_nonce = if registration::supervised() {
         None
@@ -3712,6 +3761,7 @@ async fn send_hello(
     if config_gate {
         control_ops.push(config::CONFIG_REVIEW_OP.to_owned());
     }
+    control_ops.extend_from_slice(extra_control_ops);
     let body = serde_json::to_vec(&ModuleHelloBody {
         manifest,
         protocol_ver: PROTOCOL_VERSION,
@@ -4023,6 +4073,10 @@ fn data_flags() -> Flags {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum SubcModuleError {
+    /// A module declared a malformed, duplicate or SDK-owned control operation.
+    InvalidControlOp(String),
+    /// A daemon reused an outstanding channel-0 request's correlation.
+    DuplicateControlCorrelation(u64),
     RegistrationChannel(io::Error),
     MissingSubcArg,
     MissingSubcValue,
@@ -4072,6 +4126,12 @@ pub enum SubcModuleError {
 impl fmt::Display for SubcModuleError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidControlOp(op) => {
+                write!(f, "invalid or reserved control operation: {op:?}")
+            }
+            Self::DuplicateControlCorrelation(corr) => {
+                write!(f, "duplicate in-flight control correlation: {corr}")
+            }
             Self::RegistrationChannel(error) => write!(f, "registration channel: {error}"),
             Self::MissingSubcArg => write!(f, "missing required --subc <connection-file> argument"),
             Self::MissingSubcValue => write!(f, "--subc requires a connection-file path value"),
@@ -4143,6 +4203,8 @@ impl Error for SubcModuleError {
             Self::LaunchNonce(err) => Some(err),
             Self::WriterTask(err) => Some(err),
             Self::MissingSubcArg
+            | Self::InvalidControlOp(_)
+            | Self::DuplicateControlCorrelation(_)
             | Self::MissingSubcValue
             | Self::EmptyModuleIdEnv
             | Self::NonUnicodeModuleIdEnv { .. }

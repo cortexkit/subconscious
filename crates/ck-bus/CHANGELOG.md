@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.9
+
+- Raise the Rust client requirement to 0.40.1 and testkit to 0.9.1 for additive
+  module control hooks.
+
 ## 0.6.8
 
 - Raise daemon and control test dependencies for script-aware module launches.

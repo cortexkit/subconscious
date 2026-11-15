@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.8.2
+
+- Raise the Rust client requirement to 0.40.1 for additive module control hooks.
+
 ## 0.8.1
 
 - Raise the daemon test dependency for the script-aware launch specification API.

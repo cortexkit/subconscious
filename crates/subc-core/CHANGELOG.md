@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.21.12
+
+- Raise the Rust client requirement to 0.40.1 for additive module control hooks.
+
 ## 0.21.11
 
 - Add `ck module check-script <file>` using the runner installed beside ck,

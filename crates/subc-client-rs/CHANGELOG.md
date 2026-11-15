@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.40.1
+
+- Add defaulted `ModuleHandler::control_ops` and `on_control_request` hooks for
+  module-served channel-0 control requests, including protocol-tagged
+  `consent/v1` bodies. Validate declarations before HELLO and advertise each op.
+- Run up to 16 extra control handlers independently of route, health and config
+  traffic; refuse overload with `resource_exhausted`. Deliver per-request CANCEL
+  and disconnect signals, discard cancelled replies, and preserve typed wire
+  errors. Existing module handlers require no changes.
+
 ## 0.40.0
 
 - Dependency-only breaking upgrade to control 0.40: public re-exports, activity,

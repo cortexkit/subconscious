@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.3
+
+- Raise the Rust client requirement to 0.40.1 for additive module control hooks.
+
 ## 0.5.2
 
 - Dependency-only upgrade to client/control 0.40; the public manifest and serve

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.9.1
+
+- Raise the Rust client requirement to 0.40.1 for additive module control hooks.
+
 ## 0.9.0
 
 - Dependency-only breaking upgrade to client/control 0.40; public daemon control

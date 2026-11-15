@@ -25,6 +25,12 @@ beforeAll(async () => {
 
 afterAll(() => rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }));
 
+test("version probe runs without a script pipe", async () => {
+  const child = Bun.spawn([executable, "--version"], { env, stdout: "pipe", stderr: "pipe" });
+  const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+  expect({ code, out, err }).toEqual({ code: 0, out: "ck-script-runner-bun 0.1.0 (Bun 1.4.4)\n", err: "" });
+});
+
 // This is also the daemon's wire layout: magic/version/length/digest, then bytes.
 function packet(source: string): Buffer {
   const bytes = Buffer.from(source);

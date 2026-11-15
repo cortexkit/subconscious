@@ -55,7 +55,7 @@ write_release() {
 
 subconscious_release="$test_root/subconscious"
 aft_release="$test_root/aft"
-write_release "$subconscious_release" ck ck-subc ck-subc-mcp
+write_release "$subconscious_release" ck ck-subc ck-subc-mcp ck-script-runner-bun
 write_release "$aft_release" ck-aft
 
 pass_output="$test_root/pass-output"
@@ -73,6 +73,16 @@ grep -Fq 'component=ck-aft lane=aft-external-dependency archive=ck-aft-darwin-ar
   || fail 'AFT archive and sidecar evidence was not recorded'
 grep -Fq 'release-inventory: passed; operator matrix may begin' "$pass_output" \
   || fail 'complete inventory did not permit the matrix'
+
+rm -f "$subconscious_release/ck-script-runner-bun-linux-arm64.zip"
+if bash "$gate" \
+  --subconscious-release-url "file://${subconscious_release}" \
+  --aft-release-url "file://${aft_release}" >"$test_root/missing-runner-output" 2>&1; then
+  fail 'missing runner archive unexpectedly passed'
+fi
+grep -Fq 'release-incomplete: component=ck-script-runner-bun lane=subconscious missing=ck-script-runner-bun-linux-arm64.zip' "$test_root/missing-runner-output" \
+  || fail 'missing runner archive did not block the inventory by name'
+write_asset "$subconscious_release" 'ck-script-runner-bun-linux-arm64.zip'
 
 rm -f "$aft_release/ck-aft-windows-x64.zip"
 missing_aft_output="$test_root/missing-aft-output"

@@ -6,7 +6,7 @@ export LC_ALL=C
 SOURCE_DIR="${1:?usage: $0 <binary-dir>}"
 MAX_GLIBC=2.28
 
-for binary in ck ck-subc ck-subc-mcp; do
+for binary in ck ck-subc ck-subc-mcp ck-script-runner-bun; do
   path="${SOURCE_DIR}/${binary}"
   if ! versions=$(readelf --version-info --wide "$path"); then
     echo "${binary}: cannot read ELF version requirements: ${path}" >&2

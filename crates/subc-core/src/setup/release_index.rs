@@ -488,6 +488,7 @@ mod tests {
             "ck": asset("ck", Some("0.16.0")),
             "ck-subc": asset("ck-subc", Some("0.16.0")),
             "ck-subc-mcp": asset("ck-subc-mcp", None),
+            "ck-script-runner-bun": asset("ck-script-runner-bun", None),
         });
         json!({
             "schema": 1,

@@ -139,6 +139,7 @@ describe("rebuild", () => {
       ...addZip("cortexkit/subconscious", coreTag, "ck-subc-darwin-arm64.zip", ABC_SHA256),
       ...addZip("cortexkit/subconscious", coreTag, "ck-darwin-arm64.zip", ABC_SHA256),
       ...addZip("cortexkit/subconscious", coreTag, "ck-subc-mcp-darwin-arm64.zip", ABC_SHA256),
+      ...addZip("cortexkit/subconscious", coreTag, "ck-script-runner-bun-darwin-arm64.zip", ABC_SHA256),
       ...addZip("cortexkit/subconscious", coreTag, "ck-other-darwin-arm64.zip", ABC_SHA256),
       {
         name: "release-manifest.json",
@@ -261,6 +262,12 @@ describe("rebuild", () => {
     });
     expect(darwin["ck"].reports).toBe("0.14.1");
     expect(darwin["ck-subc-mcp"].reports).toBe("mcp-from-manifest");
+    expect(darwin["ck-script-runner-bun"]).toEqual({
+      url: downloadUrl("cortexkit/subconscious", coreTag, "ck-script-runner-bun-darwin-arm64.zip"),
+      sha256: ABC_SHA256,
+      bytes: 3,
+      reports: null,
+    });
     expect(darwin["ck-other"].reports).toBeNull();
     expect(darwin["ck-other"].sha256).toBe(ABC_SHA256);
 

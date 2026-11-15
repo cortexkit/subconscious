@@ -4,6 +4,8 @@ import { readScript } from "./pipe.ts";
 import { registrationHelper } from "./native.ts";
 import { pathWarnings } from "./warnings.ts";
 
+import { version } from "../package.json";
+
 try {
   for (const name of Object.keys(process.env)) {
     const key = process.platform === "win32" ? name.toUpperCase() : name;
@@ -12,7 +14,9 @@ try {
     }
   }
   const args = process.argv.slice(2);
-  if (args.length === 2 && args[0] === "--check") {
+  if (args.length === 1 && args[0] === "--version") {
+    console.log(`ck-script-runner-bun ${version} (Bun ${Bun.version})`);
+  } else if (args.length === 2 && args[0] === "--check") {
     const source = readFileSync(args[1], "utf8");
     for (const warning of pathWarnings(source)) console.error(warning);
     const refused = check(source);

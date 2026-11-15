@@ -453,7 +453,7 @@ pub fn component_binaries_for_target(
     target: AlphaTarget,
 ) -> &'static [&'static str] {
     match (component, target) {
-        (Component::Core, _) => &["ck-subc", "ck-subc-mcp"],
+        (Component::Core, _) => &["ck-subc", "ck-subc-mcp", "ck-script-runner-bun"],
         // The managed name is the daemon-placed name (`ck-aft`), not the
         // crate's own binary name: the spec inventory, `ck upgrade`, and the
         // release inventory gate all key on it, so setup must too or an
@@ -504,6 +504,14 @@ pub fn component_binary_paths(component: Component, binary_home: &Path) -> Vec<s
 /// core reinstall it then refused.
 pub fn is_installed(component: Component, binary_home: &Path, inventory: &Inventory) -> bool {
     component_is_owned(component, binary_home, inventory)
+        && component_binary_paths(component, binary_home)
+            .iter()
+            .all(|path| {
+                path.is_file()
+                    && OWNED_BINARY_KINDS
+                        .iter()
+                        .any(|kind| inventory.owns_path(kind, path))
+            })
 }
 
 pub(super) fn observe_unowned_binaries(
@@ -588,10 +596,20 @@ pub fn owned_binary_paths(inventory: &Inventory) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Whether every binary of `component` for this host is on disk under
-/// `binary_home` and inventory-owned under either kind.
+/// Companions added after the original component release are not prerequisites
+/// for recognizing an older installation. Setup still requires the full set.
+pub(super) fn is_later_companion(component: Component, binary: &str) -> bool {
+    component == Component::Core && binary == "ck-script-runner-bun"
+}
+
+/// Whether the original binaries of `component` are on disk and inventory-owned.
+/// An older Core remains upgradable before its new runner companion is installed.
 pub fn component_is_owned(component: Component, binary_home: &Path, inventory: &Inventory) -> bool {
-    let paths = component_binary_paths(component, binary_home);
+    let paths = component_binaries(component)
+        .iter()
+        .filter(|binary| !is_later_companion(component, binary))
+        .map(|binary| binary_home.join(platform_binary(binary)))
+        .collect::<Vec<_>>();
     // A component with no binaries on this target (MC on Windows) has nothing
     // to own, and `all` over nothing is true; it must read as not installed.
     !paths.is_empty()
@@ -1029,7 +1047,7 @@ fn host_alpha_target() -> AlphaTarget {
     }
 }
 
-fn platform_binary(binary: &str) -> String {
+pub(super) fn platform_binary(binary: &str) -> String {
     if cfg!(windows) {
         format!("{binary}.exe")
     } else {
@@ -1305,7 +1323,7 @@ mod tests {
                 .into_iter()
                 .map(|target| target.label())
                 .collect::<Vec<_>>(),
-            ["ck-subc", "ck-subc-mcp", "ck"]
+            ["ck-subc", "ck-subc-mcp", "ck-script-runner-bun", "ck"]
         );
     }
 
@@ -1356,7 +1374,7 @@ mod tests {
         assert!(is_installed(Component::Core, &binary_home, &inventory));
         install_component(Component::Core, &binary_home, &mut inventory, &mut source)
             .expect("repeat core install");
-        assert_eq!(inventory.paths_for_kind("managed-binary").len(), 2);
+        assert_eq!(inventory.paths_for_kind("managed-binary").len(), 3);
         let placed = binary_home.join(platform_binary("ck-subc"));
         let entry = inventory
             .entry_for_path("managed-binary", &placed)
@@ -1369,6 +1387,31 @@ mod tests {
             "archive digest currency compares to the index"
         );
         assert_ne!(binary, archive, "the two hashes are of two different files");
+    }
+
+    #[test]
+    fn pre_runner_install_still_counts_as_core_but_setup_adds_the_runner() {
+        let root = fixture_dir("core-before-runner");
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let mut inventory = Inventory::load(root.join("inventory.json"), "linux-x64").unwrap();
+        for binary in ["ck-subc", "ck-subc-mcp"] {
+            let path = bin.join(platform_binary(binary));
+            fs::write(&path, binary).unwrap();
+            inventory.record("managed-binary", &path, Map::new());
+        }
+        assert!(component_is_owned(Component::Core, &bin, &inventory));
+        assert_eq!(installed_components(&inventory), [Component::Core]);
+        assert!(!is_installed(Component::Core, &bin, &inventory));
+        install_component(Component::Core, &bin, &mut inventory, &mut FakeSource).unwrap();
+        let runner = bin.join(platform_binary("ck-script-runner-bun"));
+        assert!(runner.is_file());
+        assert!(inventory.owns_path("managed-binary", &runner));
+        assert!(is_installed(Component::Core, &bin, &inventory));
+        for platform in AlphaTarget::ALL {
+            assert!(component_binaries_for_target(Component::Core, platform)
+                .contains(&"ck-script-runner-bun"));
+        }
     }
 
     /// A source that knows the release's bytes and can say whether a file
@@ -1624,10 +1667,10 @@ mod tests {
         }
     }
 
-    /// Sixth finding of the macOS drive, the parent of the third: ownership
-    /// was saved once at the end of the whole plan, so a refusal on the
-    /// second binary lost the record for the first, already-accepted one —
-    /// on disk, unowned, refused as foreign on the re-run. The record must
+    /// Ownership used to be saved once at the end of the whole plan, so a
+    /// refusal on the second binary lost the record for the first,
+    /// already-accepted one: it stayed on disk, unowned, and the re-run
+    /// refused it as foreign. The record must
     /// survive on disk the moment the binary does; proven by reloading the
     /// inventory from disk between the refused run and the re-run.
     #[test]
@@ -1659,7 +1702,7 @@ mod tests {
             ),
             "the accepted binary's ownership record must have survived on disk"
         );
-        // Re-run with a source that accepts both: first is a no-op, second installs.
+        // Re-run with a source that accepts the rest: the first is a no-op.
         install_component(
             Component::Core,
             &binary_home,
@@ -1668,7 +1711,7 @@ mod tests {
         )
         .expect("re-run after a partial refusal installs the rest cleanly");
         assert!(is_installed(Component::Core, &binary_home, &reloaded));
-        assert_eq!(reloaded.paths_for_kind("managed-binary").len(), 2);
+        assert_eq!(reloaded.paths_for_kind("managed-binary").len(), 3);
     }
 
     #[test]
@@ -1703,6 +1746,7 @@ mod tests {
         let mut binaries = std::collections::BTreeMap::new();
         binaries.insert("ck-subc".to_string(), asset(Some("0.16.0")));
         binaries.insert("ck-subc-mcp".to_string(), asset(None));
+        binaries.insert("ck-script-runner-bun".to_string(), asset(None));
         let mut targets = std::collections::BTreeMap::new();
         targets.insert("linux-x64".to_string(), binaries);
         let mut components = std::collections::BTreeMap::new();

@@ -214,6 +214,7 @@ fast_check() {
       step 'Module terminal placement fixtures' bash scripts/fleet/tests/place-module-terminal.sh
       step 'Store snapshot fixtures' bash scripts/fleet/tests/snapshot-store.sh
       step 'Signing identity fixtures (stubbed tools)' bash scripts/release/test-macos-sign-notarize.sh
+      step 'Runner entitlement allowlist' python3 scripts/release/test-runner-entitlements.py
       step 'Unix release archive fixtures' bash scripts/release/test-package-unix-archives.sh
       step 'Unpublished crate detector fixtures' bash scripts/release/tests/unpublished-wire-crates.sh.test ;;
     *) invalid_check ;;

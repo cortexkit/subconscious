@@ -258,7 +258,7 @@ fn tighten_upgrade_permissions(data_dir: &Path, inventory: &Inventory) -> Result
     file_modes::tighten_inventory_files(inventory)
 }
 
-/// Discover only inventory-owned binaries belonging to installed components.
+/// Discover owned binaries and absent later companions beside an owned daemon.
 pub fn discover_managed_upgrade_targets(
     inventory: &Inventory,
     executable: &Path,
@@ -280,6 +280,30 @@ pub fn discover_managed_upgrade_targets(
                 .cloned()
         };
         let Some(destination) = destination else {
+            if super::components::is_later_companion(target.component, target.binary) {
+                if let Some(daemon) = owned.iter().find(|path| {
+                    path.file_name().is_some_and(|name| {
+                        name == super::components::platform_binary("ck-subc").as_str()
+                    })
+                }) {
+                    let destination = daemon
+                        .parent()
+                        .expect("owned daemon has a parent")
+                        .join(super::components::platform_binary(target.binary));
+                    // An occupied path is never adopted or executed by upgrade.
+                    // The ownership gate reports it as an unowned binary.
+                    if fs::symlink_metadata(&destination)
+                        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                    {
+                        targets.push(ManagedUpgradeTarget {
+                            target,
+                            destination,
+                            installed_version: String::new(),
+                            installed_archive_sha256: None,
+                        });
+                    }
+                }
+            }
             continue;
         };
         if !destination.is_file() {
@@ -400,6 +424,8 @@ pub struct SystemUpgradeBackend {
     activated_inodes: BTreeMap<String, String>,
     rollback_paths: BTreeMap<String, PathBuf>,
     rollback_archive_sha256: BTreeMap<String, Option<String>>,
+    /// Missing later companions roll back to absence, not to a copied image.
+    new_companions: BTreeSet<String>,
     // A binary rollback must also restore its arguments: older daemons reject
     // config-store-root, even if a newer daemon never became ready.
     daemon_definition_snapshot: Option<super::runtime::DefinitionSnapshot>,
@@ -528,6 +554,17 @@ impl SystemUpgradeBackend {
                 )
             })
             .collect();
+        let new_companions = targets
+            .iter()
+            .filter(|item| {
+                item.installed_version.is_empty()
+                    && super::components::is_later_companion(
+                        item.target.component,
+                        item.target.binary,
+                    )
+            })
+            .map(|item| item.target.label().to_string())
+            .collect();
         Self {
             platform,
             targets: targets
@@ -542,6 +579,7 @@ impl SystemUpgradeBackend {
             activated_inodes: BTreeMap::new(),
             rollback_paths: BTreeMap::new(),
             rollback_archive_sha256: BTreeMap::new(),
+            new_companions,
             daemon_definition_snapshot: None,
             replaced_images: BTreeMap::new(),
             expected_versions,
@@ -791,6 +829,23 @@ impl SystemUpgradeBackend {
             .filter(|kind| self.inventory.owns_path(kind, destination))
             .collect::<Vec<_>>();
         if kinds.is_empty() {
+            if self.new_companions.contains(target.label()) {
+                let mut fields = serde_json::Map::new();
+                fields.insert(
+                    "component".into(),
+                    Value::String(target.component.label().into()),
+                );
+                fields.insert("sha256".into(), Value::String(digest));
+                if let Some(archive) = archive_sha256 {
+                    fields.insert("archive_sha256".into(), Value::String(archive.into()));
+                }
+                if let Some(version) = version {
+                    fields.insert("version".into(), Value::String(version));
+                }
+                self.inventory
+                    .record("binary-placement", destination, fields);
+                return self.inventory.save();
+            }
             return Err(format!(
                 "inventory no longer owns {target} destination {}; refusing to record replacement",
                 destination.display()
@@ -916,6 +971,19 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
 
     fn create_rollback_copy(&mut self, target: UpgradeTarget) -> Result<String, String> {
         let (destination, rollback) = self.target_mutable_paths(target)?;
+        if self.new_companions.contains(target.label()) {
+            match fs::symlink_metadata(&destination) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok("new companion; rollback restores absence".into());
+                }
+                _ => {
+                    return Err(format!(
+                        "refusal: new companion destination is occupied: {}",
+                        destination.display()
+                    ))
+                }
+            }
+        }
         let prior_inode = destination_inode(&destination)?;
         file_modes::copy_file_with_mode(&destination, &rollback, 0o755).map_err(|error| {
             format!(
@@ -935,6 +1003,14 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
 
     fn replace_destination(&mut self, target: UpgradeTarget) -> Result<String, String> {
         let (destination, _) = self.target_mutable_paths(target)?;
+        if self.new_companions.contains(target.label())
+            && fs::symlink_metadata(&destination).is_ok()
+        {
+            return Err(format!(
+                "refusal: new companion destination is occupied: {}",
+                destination.display()
+            ));
+        }
         let prepared = self
             .prepared
             .remove(target.label())
@@ -942,6 +1018,12 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
         let prior_identity = destination_inode(&destination).ok();
         let result = self.place_candidate(target, &destination, &prepared);
         prepared.cleanup();
+        if result.is_err()
+            && self.new_companions.contains(target.label())
+            && self.activated_inodes.contains_key(target.label())
+        {
+            self.rollback(target)?;
+        }
         if result.is_err()
             && prior_identity.is_some()
             && destination_inode(&destination).ok() == prior_identity
@@ -1186,6 +1268,21 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
 
     fn rollback(&mut self, target: UpgradeTarget) -> Result<String, String> {
         let destination = self.target(target)?.destination.clone();
+        if self.new_companions.contains(target.label()) {
+            if self.activated_inodes.get(target.label()) != Some(&destination_inode(&destination)?)
+            {
+                return Err(format!(
+                    "refusal: new companion {target} changed before rollback"
+                ));
+            }
+            fs::remove_file(&destination)
+                .map_err(|error| format!("could not remove new companion {target}: {error}"))?;
+            self.inventory
+                .remove_owned_path("binary-placement", &destination);
+            self.inventory.save()?;
+            self.activated_inodes.remove(target.label());
+            return Ok("accepted; removed newly installed companion".into());
+        }
         let rollback = self
             .rollback_paths
             .get(target.label())
@@ -1502,6 +1599,7 @@ pub(super) mod tests {
             .collect(),
             rollback_paths: BTreeMap::new(),
             rollback_archive_sha256: BTreeMap::new(),
+            new_companions: BTreeSet::new(),
             daemon_definition_snapshot: None,
             replaced_images: BTreeMap::new(),
             expected_versions: [(target.label().to_string(), "0.1.0".into())]
@@ -1747,6 +1845,7 @@ pub(super) mod tests {
             activated_inodes: BTreeMap::new(),
             rollback_paths: BTreeMap::new(),
             rollback_archive_sha256: BTreeMap::new(),
+            new_companions: BTreeSet::new(),
             daemon_definition_snapshot: None,
             replaced_images: BTreeMap::new(),
             expected_versions: BTreeMap::from([(target.label().to_string(), "0.2.0".into())]),
@@ -2161,6 +2260,7 @@ pub(super) mod tests {
             activated_inodes: BTreeMap::new(),
             rollback_paths: BTreeMap::from([(aft.label().to_string(), rollback)]),
             rollback_archive_sha256: BTreeMap::new(),
+            new_companions: BTreeSet::new(),
             daemon_definition_snapshot: None,
             replaced_images: BTreeMap::new(),
             expected_versions: BTreeMap::new(),
@@ -2218,14 +2318,22 @@ pub(super) mod tests {
                 .iter()
                 .map(|item| item.target.label())
                 .collect::<Vec<_>>(),
-            ["ck-subc", "ck-subc-mcp", "ck-aft", "ck-mc", "ck"]
+            [
+                "ck-subc",
+                "ck-subc-mcp",
+                "ck-script-runner-bun",
+                "ck-aft",
+                "ck-mc",
+                "ck"
+            ]
         );
         // Every version names its installed binary, not the daemon library.
         assert_eq!(targets[0].installed_version, "1.3.0");
         assert_eq!(targets[1].installed_version, "1.1.0");
-        assert_eq!(targets[2].installed_version, "1.2.0");
-        assert_eq!(targets[3].installed_version, "99.0.0");
-        assert_eq!(targets[4].installed_version, "1.0.0");
+        assert_eq!(targets[2].installed_version, "");
+        assert_eq!(targets[3].installed_version, "1.2.0");
+        assert_eq!(targets[4].installed_version, "99.0.0");
+        assert_eq!(targets[5].installed_version, "1.0.0");
     }
 
     #[cfg(unix)]
@@ -2516,6 +2624,7 @@ exit 1
             activated_inodes: BTreeMap::new(),
             rollback_paths: BTreeMap::new(),
             rollback_archive_sha256: BTreeMap::new(),
+            new_companions: BTreeSet::new(),
             daemon_definition_snapshot: None,
             replaced_images: BTreeMap::new(),
             expected_versions: [(aft.label().to_string(), "2.0.0".to_string())]
@@ -2568,6 +2677,7 @@ exit 1
             activated_inodes: BTreeMap::new(),
             rollback_paths: BTreeMap::new(),
             rollback_archive_sha256: BTreeMap::new(),
+            new_companions: BTreeSet::new(),
             daemon_definition_snapshot: None,
             replaced_images: BTreeMap::new(),
             expected_versions: [(mcp.label().to_string(), "0.17.36".to_string())]

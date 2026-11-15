@@ -1267,6 +1267,7 @@ impl SetupFixture {
             let binaries = [
                 ("core", "ck-subc"),
                 ("core", "ck-subc-mcp"),
+                ("core", "ck-script-runner-bun"),
                 ("aft", "ck-aft"),
                 ("claustrum", "ck-claustrum"),
                 ("claustrum", "ck-auth"),
@@ -1536,7 +1537,11 @@ fn setup_index(base: &str, mc_archive: Option<&[u8]>) -> (Value, BTreeMap<String
             "subc-core-v0.17.9",
             Some("0.17.9"),
             &target,
-            [("ck-subc", dummy.clone()), ("ck-subc-mcp", dummy.clone())],
+            [
+                ("ck-subc", dummy.clone()),
+                ("ck-subc-mcp", dummy.clone()),
+                ("ck-script-runner-bun", dummy.clone()),
+            ],
         ),
     );
     components.insert(
@@ -2500,6 +2505,7 @@ fn set_setup_managed_modes(fixture: &SetupFixture) {
     for binary in [
         "ck-subc",
         "ck-subc-mcp",
+        "ck-script-runner-bun",
         "ck-aft",
         "ck-claustrum",
         "ck-auth",
@@ -2814,7 +2820,7 @@ fn setup_verbose_keeps_every_preexisting_outcome_line() {
 // setup-runtime CI job against a real scheduled task instead.
 #[cfg(not(windows))]
 #[test]
-fn fresh_setup_prints_the_pasteable_claude_code_command() {
+fn fresh_setup_installs_runner_and_prints_the_pasteable_claude_code_command() {
     let fixture = SetupFixture::fresh("ck-setup-fresh-next");
     let subc = fixture_archive(fixture._root.path(), "ck-subc", "ck-subc 0.17.10", 0);
     let mcp = fixture_archive(
@@ -2828,6 +2834,13 @@ fn fresh_setup_prints_the_pasteable_claude_code_command() {
         let mut assets = BTreeMap::new();
         assets.insert("/ck-subc.zip".to_string(), subc.clone());
         assets.insert("/ck-subc-mcp.zip".to_string(), mcp.clone());
+        let runner = fixture_archive(
+            fixture._root.path(),
+            "ck-script-runner-bun",
+            "ck-script-runner-bun 0.1.0 (Bun 1.4.4)",
+            0,
+        );
+        assets.insert("/runner.zip".to_string(), runner.clone());
         (
             json!({
                 "schema": 1,
@@ -2841,6 +2854,7 @@ fn fresh_setup_prints_the_pasteable_claude_code_command() {
                         [
                             ("ck-subc", fixture_asset(format!("{base}/ck-subc.zip"), sha256_hex(&subc), subc.len() as u64, Some("0.17.10"))),
                             ("ck-subc-mcp", fixture_asset(format!("{base}/ck-subc-mcp.zip"), sha256_hex(&mcp), mcp.len() as u64, Some("0.17.10"))),
+                            ("ck-script-runner-bun", fixture_asset(format!("{base}/runner.zip"), sha256_hex(&runner), runner.len() as u64, None)),
                         ],
                     ),
                 },
@@ -2855,6 +2869,34 @@ fn fresh_setup_prints_the_pasteable_claude_code_command() {
         .unwrap();
 
     assert_exit(&output, 0);
+    let runner = fixture
+        .data_home
+        .join("cortexkit/bin")
+        .join(platform_binary("ck-script-runner-bun"));
+    assert!(
+        runner.is_file(),
+        "setup must place the runner beside the daemon"
+    );
+    let manifest: Value = serde_json::from_slice(
+        &fs::read(fixture.data_home.join("cortexkit/installer-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    let entry = manifest["mutations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["path"] == json!(runner))
+        .expect("runner ownership");
+    assert_eq!(entry["component"], "core");
+    assert_eq!(entry["sha256"], sha256_hex(&fs::read(&runner).unwrap()));
+    assert!(entry["archive_sha256"]
+        .as_str()
+        .is_some_and(|digest| digest.len() == 64));
+    assert_eq!(
+        entry["version"], "0.1.0",
+        "setup warm-probed the placed runner"
+    );
+    assert!(!runner.with_extension("setup.tmp").exists());
     let stdout = text(&output.stdout);
     assert!(
         stdout.ends_with(
@@ -2896,6 +2938,7 @@ mode_of() {
 printf '%s %s %s\n' "$(mode_of "$(dirname "$archive")")" "$(mode_of "$destination")" "$(mode_of "$archive")" >>"$CK_TEST_STAGE_REPORT"
 case "$archive" in
   *ck-subc-mcp-*.zip) binary=ck-subc-mcp ;;
+  *ck-script-runner-bun-*.zip) binary=ck-script-runner-bun ;;
   *ck-subc-*.zip) binary=ck-subc ;;
   *) exit 2 ;;
 esac
@@ -2915,6 +2958,13 @@ printf '#!/bin/sh\necho "%s 0.17.10"\n' "$binary" >"$destination/$binary"
         let mut assets = BTreeMap::new();
         assets.insert("/ck-subc.zip".to_string(), subc.clone());
         assets.insert("/ck-subc-mcp.zip".to_string(), mcp.clone());
+        let runner = fixture_archive(
+            fixture._root.path(),
+            "ck-script-runner-bun",
+            "ck-script-runner-bun 0.1.0 (Bun 1.4.4)",
+            0,
+        );
+        assets.insert("/runner.zip".to_string(), runner.clone());
         (
             json!({
                 "schema": 1,
@@ -2928,6 +2978,7 @@ printf '#!/bin/sh\necho "%s 0.17.10"\n' "$binary" >"$destination/$binary"
                         [
                             ("ck-subc", fixture_asset(format!("{base}/ck-subc.zip"), sha256_hex(&subc), subc.len() as u64, Some("0.17.10"))),
                             ("ck-subc-mcp", fixture_asset(format!("{base}/ck-subc-mcp.zip"), sha256_hex(&mcp), mcp.len() as u64, Some("0.17.10"))),
+                            ("ck-script-runner-bun", fixture_asset(format!("{base}/runner.zip"), sha256_hex(&runner), runner.len() as u64, None)),
                         ],
                     ),
                 },
@@ -2953,7 +3004,7 @@ printf '#!/bin/sh\necho "%s 0.17.10"\n' "$binary" >"$destination/$binary"
     assert_mode(&config.join("subc.jsonc"), 0o600);
     assert_mode(&runtime_definition(&fixture.home), 0o644);
     let stage_modes = fs::read_to_string(stage_report).expect("staging mode report");
-    assert_eq!(stage_modes.lines().count(), 2, "{stage_modes}");
+    assert_eq!(stage_modes.lines().count(), 3, "{stage_modes}");
     for modes in stage_modes.lines() {
         assert_eq!(modes, "700 700 600", "unexpected staging modes: {modes}");
     }
@@ -2984,6 +3035,7 @@ fn setup_tightens_existing_owned_modes_on_a_noop_plan_without_chmodding_unowned_
     for binary in [
         "ck-subc",
         "ck-subc-mcp",
+        "ck-script-runner-bun",
         "ck-aft",
         "ck-claustrum",
         "ck-auth",
@@ -3015,6 +3067,7 @@ fn setup_tightens_existing_owned_modes_on_a_noop_plan_without_chmodding_unowned_
     for binary in [
         "ck-subc",
         "ck-subc-mcp",
+        "ck-script-runner-bun",
         "ck-aft",
         "ck-claustrum",
         "ck-auth",
@@ -3047,9 +3100,16 @@ fn setup_keeps_bootstrapped_claustrum_key_owner_only_under_zero_umask() {
     let index = serve_signed_index(|base| {
         let target = host_target();
         let mut assets = BTreeMap::new();
+        let runner = fixture_archive(
+            fixture._root.path(),
+            "ck-script-runner-bun",
+            "ck-script-runner-bun 0.1.0",
+            0,
+        );
         for (name, archive) in [
             ("ck-subc", &core_daemon),
             ("ck-subc-mcp", &core_mcp),
+            ("ck-script-runner-bun", &runner),
             ("ck-claustrum", &claustrum),
             ("ck-auth", &auth),
         ] {
@@ -3068,6 +3128,7 @@ fn setup_keeps_bootstrapped_claustrum_key_owner_only_under_zero_umask() {
                         [
                             ("ck-subc", fixture_asset(format!("{base}/ck-subc.zip"), sha256_hex(&core_daemon), core_daemon.len() as u64, Some("0.17.10"))),
                             ("ck-subc-mcp", fixture_asset(format!("{base}/ck-subc-mcp.zip"), sha256_hex(&core_mcp), core_mcp.len() as u64, Some("0.17.10"))),
+                            ("ck-script-runner-bun", fixture_asset(format!("{base}/ck-script-runner-bun.zip"), sha256_hex(&runner), runner.len() as u64, None)),
                         ],
                     ),
                     "claustrum": index_component(
@@ -3125,11 +3186,13 @@ impl UpgradeFixture {
         let aft = bin.join(platform_binary("ck-aft"));
         let daemon = bin.join(platform_binary("ck-subc"));
         let mcp = bin.join(platform_binary("ck-subc-mcp"));
+        let runner = bin.join(platform_binary("ck-script-runner-bun"));
         let claustrum = bin.join(platform_binary("ck-claustrum"));
         let auth = bin.join(platform_binary("ck-auth"));
         write_executable(&aft, "#!/bin/sh\necho 'ck-aft 0.55.1'\n");
         write_executable(&daemon, "#!/bin/sh\necho 'ck-subc 0.17.9'\n");
         write_executable(&mcp, "#!/bin/sh\necho 'ck-subc-mcp 0.17.9'\n");
+        write_executable(&runner, "#!/bin/sh\necho 'ck-script-runner-bun 0.1.0'\n");
         write_executable(&claustrum, "#!/bin/sh\necho 'ck-claustrum 0.8.0'\n");
         write_executable(&auth, "#!/bin/sh\necho 'ck-auth 0.8.0'\n");
         // The manifest names the `ck` this fixture's commands run: the test
@@ -3145,6 +3208,7 @@ impl UpgradeFixture {
             (aft, "22".repeat(32)),
             (claustrum, "55".repeat(32)),
             (auth, "66".repeat(32)),
+            (runner, "77".repeat(32)),
         ]
         .into_iter()
         .map(|(path, archive_sha256)| {
@@ -3271,6 +3335,7 @@ fn upgrade_index(
                     [
                         ("ck-subc-mcp", fixture_asset(format!("{base}/mcp.zip"), "11".repeat(32), 1, Some("0.17.9"))),
                         ("ck-subc", fixture_asset(format!("{base}/daemon.zip"), "33".repeat(32), 1, Some("0.17.9"))),
+                        ("ck-script-runner-bun", fixture_asset(format!("{base}/runner.zip"), "77".repeat(32), 1, None)),
                         ("ck", fixture_asset(format!("{base}/ck.zip"), ck_digest.to_string(), 1, Some(ck_version))),
                     ],
                 ),
@@ -3329,7 +3394,7 @@ fn upgrade_and_check_say_everything_is_current_in_one_line() {
         )
     });
     let expected =
-        "Everything is up to date (ck 0.17.9 · ck-subc 0.17.9 · ck-subc-mcp · ck-aft 0.55.1 · ck-claustrum 0.8.0 · ck-auth 0.8.0).\n";
+        "Everything is up to date (ck 0.17.9 · ck-subc 0.17.9 · ck-subc-mcp · ck-script-runner-bun 0.1.0 · ck-aft 0.55.1 · ck-claustrum 0.8.0 · ck-auth 0.8.0).\n";
 
     for args in [&["upgrade"][..], &["upgrade", "--check"][..]] {
         let output = fixture.command(&index, args).output().unwrap();
@@ -3845,6 +3910,116 @@ fn upgrade_apply_reports_completed_targets_then_done() {
         text(&output.stdout),
         "upgraded ck-aft 0.55.1 → 0.55.2, restarted\nupgraded ck-claustrum 0.8.0 → 0.8.1, restarted\nupgraded ck 0.17.9 → 0.17.10\nDone.\n"
     );
+}
+
+#[cfg(unix)]
+fn exercise_runner_upgrade(name: &str, already_installed: bool, fails_warm_exec: bool) {
+    let fixture = UpgradeFixture::new(name);
+    let runner = fixture
+        .home
+        .join(".local/share/cortexkit/bin/ck-script-runner-bun");
+    let manifest = fixture
+        .home
+        .join(".local/share/cortexkit/installer-manifest.json");
+    if !already_installed {
+        fs::remove_file(&runner).unwrap();
+        let mut inventory: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+        inventory["mutations"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|entry| entry["path"] != json!(runner));
+        fs::write(&manifest, serde_json::to_vec_pretty(&inventory).unwrap()).unwrap();
+    }
+    let before: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+    let ledger = fixture._root.path().join("runner-probes");
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$0\" >> '{}'\n{}\n",
+        ledger.display(),
+        if fails_warm_exec {
+            "exit 1"
+        } else {
+            "echo 'ck-script-runner-bun 0.2.0 (Bun 1.4.4)'"
+        }
+    );
+    let archive = stored_zip(&[("ck-script-runner-bun", script.as_bytes())]);
+    let index = serve_signed_index(|base| {
+        let (mut index, mut assets) = upgrade_index(
+            base,
+            "0.55.1",
+            &"22".repeat(32),
+            "0.17.9",
+            &"44".repeat(32),
+            "0.8.0",
+            &"55".repeat(32),
+        );
+        index["components"]["core"]["assets"][host_target()]["ck-script-runner-bun"] =
+            fixture_asset(
+                format!("{base}/runner.zip"),
+                sha256_hex(&archive),
+                archive.len() as u64,
+                None,
+            );
+        assets.insert("/runner.zip".into(), archive.clone());
+        (index, assets)
+    });
+    let output = fixture
+        .command(&index, &["upgrade"])
+        .env("CK_UPGRADE_ROLLBACK", "accept")
+        .output()
+        .unwrap();
+    let after: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+    if fails_warm_exec {
+        assert!(
+            !output.status.success(),
+            "a runner that fails warm-exec must fail upgrade"
+        );
+        assert!(
+            text(&output.stderr).contains("warm-execution"),
+            "{}",
+            text(&output.stderr)
+        );
+        assert!(
+            !runner.exists(),
+            "rollback must remove a newly installed companion"
+        );
+        assert_eq!(after, before, "rollback must restore the prior inventory");
+    } else {
+        assert_exit(&output, 0);
+        assert_eq!(fs::read(&runner).unwrap(), script.as_bytes());
+        let entry = after["mutations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["path"] == json!(runner))
+            .expect("runner recorded after placement");
+        assert_eq!(entry["archive_sha256"], sha256_hex(&archive));
+        assert_eq!(entry["sha256"], sha256_hex(script.as_bytes()));
+        assert_eq!(entry["version"], "0.2.0");
+        assert!(!runner.with_extension("ck-upgrade.rollback").exists());
+    }
+    let probes = fs::read_to_string(ledger).expect("the moved runner was warm-executed");
+    assert!(
+        probes.lines().all(|path| path == runner.to_str().unwrap()),
+        "only the final destination may be probed: {probes}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrade_pre_runner_core_gains_verified_runner() {
+    exercise_runner_upgrade("upgrade-new-runner", false, false);
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrade_new_runner_rollback_restores_absence_and_inventory() {
+    exercise_runner_upgrade("upgrade-runner-rollback", false, true);
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrade_existing_runner_is_replaced_in_place() {
+    exercise_runner_upgrade("upgrade-existing-runner", true, false);
 }
 
 #[test]

@@ -16,7 +16,7 @@ finish() {
 trap finish EXIT
 
 mkdir -p "$FIXTURE_DIR/bin" "$FIXTURE_DIR/source" "$FIXTURE_DIR/dist"
-for binary in ck ck-subc ck-subc-mcp; do
+for binary in ck ck-subc ck-subc-mcp ck-script-runner-bun; do
   # Signing smoke-runs a copied binary with --version before checking identities.
   cat > "$FIXTURE_DIR/source/$binary" <<EOF
 #!/bin/sh

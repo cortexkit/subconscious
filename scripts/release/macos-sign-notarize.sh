@@ -5,7 +5,7 @@ set -euo pipefail
 SOURCE_DIR="${1:?usage: $0 <source-dir> <dist-dir>}"
 DIST_DIR="${2:?usage: $0 <source-dir> <dist-dir>}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BINARIES=(ck ck-subc ck-subc-mcp)
+BINARIES=(ck ck-subc ck-subc-mcp ck-script-runner-bun)
 
 fail() {
   echo "$*" >&2
@@ -37,11 +37,22 @@ else
   identity="$(printf '%s\n' "$developer_id_identities" | head -n 1)"
 fi
 
-for binary in "${BINARIES[@]}"; do # nonempty-array: three literal binaries
+# The embedded helper must be signed by this identity before Bun compiles it.
+if [[ "${3:-}" == --print-identity ]]; then
+  printf '%s\n' "$identity"
+  exit 0
+fi
+
+for binary in "${BINARIES[@]}"; do # nonempty-array: literal release binaries
   binary_path="${SOURCE_DIR}/${binary}"
   [[ -f "$binary_path" ]] || fail "missing release binary: ${binary_path}"
 
-  codesign --force --options runtime --timestamp --sign "$identity" "$binary_path"
+  if [[ "$binary" == ck-script-runner-bun ]]; then
+    codesign --force --options runtime --timestamp --entitlements "$SCRIPT_DIR/../../clients/script-runner/entitlements.plist" --sign "$identity" "$binary_path"
+    codesign -d --entitlements :- "$binary_path" 2>/dev/null | python3 "$SCRIPT_DIR/check-runner-entitlements.py"
+  else
+    codesign --force --options runtime --timestamp --sign "$identity" "$binary_path"
+  fi
   codesign --verify --strict --verbose=2 "$binary_path"
 
   # Execute the signed binary: the hardened runtime can break a binary whose
@@ -97,7 +108,7 @@ record_staple_pending() {
   fi
 }
 
-for binary in "${BINARIES[@]}"; do # nonempty-array: three literal binaries
+for binary in "${BINARIES[@]}"; do # nonempty-array: literal release binaries
   archive="${DIST_DIR}/${binary}-darwin-arm64.zip"
   xcrun notarytool submit "$archive" \
     --key "$APP_STORE_CONNECT_API_KEY_PATH" \

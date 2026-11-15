@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.21.14
+
+- Ship the pinned Bun script runner beside Core on darwin-arm64, Linux x64/arm64,
+  and Windows x64/arm64, with JIT-only hardened-runtime signing on macOS.
+- Install the runner through setup and upgrade's verified companion path. Older
+  Core installs remain recognized, and rolling back a new runner restores absence.
+
 ## 0.21.13
 
 - Raise the Rust client requirement to 0.40.2 and UI to 0.9.2 for process-local

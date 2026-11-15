@@ -6,7 +6,7 @@ OS="${1:?usage: $0 <darwin|linux> <arm64|x64> <source-dir> <dist-dir>}"
 ARCH="${2:?usage: $0 <darwin|linux> <arm64|x64> <source-dir> <dist-dir>}"
 SOURCE_DIR="${3:?usage: $0 <darwin|linux> <arm64|x64> <source-dir> <dist-dir>}"
 DIST_DIR="${4:?usage: $0 <darwin|linux> <arm64|x64> <source-dir> <dist-dir>}"
-BINARIES=(ck ck-subc ck-subc-mcp)
+BINARIES=(ck ck-subc ck-subc-mcp ck-script-runner-bun)
 
 case "$OS" in
   darwin|linux) ;;
@@ -44,7 +44,7 @@ if [[ "$shape" != "test-support: off" ]]; then
 fi
 
 mkdir -p "$DIST_DIR"
-for binary in "${BINARIES[@]}"; do # nonempty-array: three literal binaries
+for binary in "${BINARIES[@]}"; do # nonempty-array: literal release binaries
   source_path="${SOURCE_DIR}/${binary}"
   archive_name="${binary}-${OS}-${ARCH}.zip"
   archive_path="${DIST_DIR}/${archive_name}"

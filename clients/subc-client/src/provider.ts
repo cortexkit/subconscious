@@ -396,6 +396,7 @@ interface NormalizedSubcProviderConnectOptions {
   onConnectionState?: (event: ProviderConnectionState) => void | Promise<void>;
   /** The launch nonce to echo in HELLO, already resolved against the environment. */
   launchNonce?: string;
+  registrationChannel: boolean;
   reconnectOnDrop: boolean;
 }
 
@@ -808,7 +809,7 @@ export class SubcProvider {
     const opened = await SubcProvider.openConnection(normalized);
     const provider = new SubcProvider(opened.sock, opened.conn, normalized, opened.ack);
     const owner = registrationOwner();
-    if (owner.supervised) {
+    if (normalized.registrationChannel) {
       owner.bind((body) => provider.configControl(body));
       void provider.closed.then(() => {
         owner.broker?.close();
@@ -843,7 +844,8 @@ export class SubcProvider {
     const conn = await readConnectionFile(opts.connectionFile);
     const deadline = Date.now() + (opts.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS);
     const endpoint = conn.endpoints[0]!;
-    const sock = registrationOwner().take() ?? await SubcSocket.connect(endpoint.host, endpoint.port, deadline);
+    const inherited = opts.registrationChannel ? registrationOwner().take(opts.manifest.module_id) : undefined;
+    const sock = inherited ?? await SubcSocket.connect(endpoint.host, endpoint.port, deadline);
     try {
       onSocket?.(sock);
       await authenticateClient(sock, conn, deadline);
@@ -1634,29 +1636,33 @@ async function normalizeProviderConnectOptions(opts: SubcProviderConnectOptions)
   if (opts.config?.anchorRetryMs !== undefined && (!Number.isInteger(opts.config.anchorRetryMs)
     || opts.config.anchorRetryMs < 1 || opts.config.anchorRetryMs > 30000)) throw new Error("anchorRetryMs must be 1..30000");
   const owner = registrationOwner();
-  // Adopt only when serving starts. Inherited metadata alone does not change
-  // the legacy TCP/nonce path used by ordinary children and older modules.
-  owner.adopt();
   const envModuleId = nonEmpty(process.env[SUBC_MODULE_ID_ENV]);
+  // The inherited channel and nonce belong only to the launched module. Extra
+  // providers must leave them untouched, even when they start before that module.
+  const launchIdentity = envModuleId === undefined || envModuleId === opts.manifest.module_id;
+  if (launchIdentity) owner.adopt();
+  const registrationChannel = launchIdentity && owner.supervised;
   // The nonce comes from the process-wide accessor, which reads the daemon's
   // descriptor at most once. A refused descriptor fails the connect, unless the
   // caller supplied the nonce itself, in which case it only means "not
   // supervised".
   let processNonce: string | undefined;
-  if (owner.supervised) {
+  if (registrationChannel) {
     if (opts.launchNonce !== undefined) throw new SubcProviderError("channel registration cannot override identity", "claim_identity_conflict");
-  } else if (opts.launchNonce === undefined) {
+  } else if (launchIdentity && opts.launchNonce === undefined) {
     try {
       processNonce = (await processLaunchNonce())?.value;
     } catch (error) {
       if (isLaunchNonceError(error)) throw launchNonceUnavailable(error);
       throw error;
     }
-  } else {
+  } else if (launchIdentity) {
     processNonce = (await launchNonceOrUndefinedAsync())?.value;
   }
   const envLaunchNonce = nonEmpty(processNonce);
-  const supervised = owner.supervised || (envModuleId !== undefined && envLaunchNonce !== undefined);
+  // Extra providers still run in the launched process, without consuming its
+  // credentials. They must keep the same no-reconnect default as its own provider.
+  const supervised = owner.supervised || !launchIdentity || (envModuleId !== undefined && envLaunchNonce !== undefined);
   return {
     connectionFile: opts.connectionFile,
     manifest: opts.manifest,
@@ -1675,7 +1681,8 @@ async function normalizeProviderConnectOptions(opts: SubcProviderConnectOptions)
     bodyReadTimeoutMs: opts.bodyReadTimeoutMs,
     onConnectionState: opts.onConnectionState,
     launchNonce: nonEmpty(opts.launchNonce ?? envLaunchNonce),
-    reconnectOnDrop: owner.supervised ? false : opts.reconnectOnDrop ?? !supervised,
+    registrationChannel,
+    reconnectOnDrop: registrationChannel ? false : opts.reconnectOnDrop ?? !supervised,
   };
 }
 

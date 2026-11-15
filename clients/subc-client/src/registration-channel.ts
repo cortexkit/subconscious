@@ -58,9 +58,13 @@ class RegistrationOwner {
       this.socket = SubcSocket.adopt(stream);
     }
   }
-  take(): SubcSocket | undefined {
+  take(moduleId?: string): SubcSocket | undefined {
     if (!this.supervised) return undefined;
-    if (this.taken) throw new ClaimError("registration_already_taken");
+    if (this.taken) {
+      const error = new ClaimError("registration_already_taken");
+      if (moduleId !== undefined) error.message += ` for module ${JSON.stringify(moduleId)}`;
+      throw error;
+    }
     this.taken = true;
     return this.socket!;
   }

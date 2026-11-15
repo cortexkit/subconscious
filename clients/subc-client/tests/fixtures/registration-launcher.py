@@ -97,6 +97,10 @@ else:
             process.wait()
             sys.exit(124)
 remote = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
+if mode.startswith("providers-"):
+    # The peer records source ports so tests can distinguish the inherited
+    # channel's proxy connection from providers connecting directly over TCP.
+    print("REGISTRATION_PORT=" + str(remote.getsockname()[1]), flush=True)
 
 
 def copy(source, target):

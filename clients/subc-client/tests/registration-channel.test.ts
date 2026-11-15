@@ -31,10 +31,12 @@ async function auth(sock: SubcSocket): Promise<void> {
   expect(answer.client_auth).toEqual([...computeProof(key, CLIENT_AUTH_DOMAIN, clientNonce, nonce, id)]);
 }
 
-async function run(mode: string): Promise<{code: number; out: string; err: string; operations: string[]; presented: string[]; purposes: string[]}> {
+async function run(mode: string): Promise<{code: number; out: string; err: string; operations: string[]; presented: string[]; purposes: string[];
+  registrations: {moduleId: string; inherited: boolean; launchNonce: unknown}[]}> {
   const dir = mkdtempSync(resolve("target/scratch/registration-"));
   const operations: string[] = [], presented: string[] = [], purposes: string[] = [], errors: unknown[] = [];
   const sockets: Socket[] = [];
+  const hellos: {moduleId: string; port: number; launchNonce: unknown}[] = [];
   let sequence = 0;
   let directChildren = 0;
   let routeRequests = 0;
@@ -55,6 +57,7 @@ async function run(mode: string): Promise<{code: number; out: string; err: strin
         await sock.write(encodeFrame(buildFrame(ty, 0, 0, 0, frame.header.corr, Buffer.from(JSON.stringify(value)))), Date.now() + 8000);
       }
       if (frame.header.ty === FrameType.Hello) {
+        hellos.push({moduleId: (body.manifest as {module_id: string}).module_id, port: socket.remotePort!, launchNonce: body.launch_nonce});
         expect((body.manifest as {registration_channel: boolean}).registration_channel).toBe(true);
         expect(body.launch_nonce).toBe(fallback ? (mode === "fallback-explicit" ? "explicit-nonce" : "inherited-nonce") : undefined);
         registered = true;
@@ -127,19 +130,63 @@ async function run(mode: string): Promise<{code: number; out: string; err: strin
     childFixture = join(dir, "tests/fixtures/registration-child.ts");
   }
   const args = [process.execPath, childFixture, mode, connectionFile];
-  const command = mode === "direct" ? args : [process.platform === "win32" ? "python" : "python3", launcher, String(port), ...args];
-  const child = Bun.spawn(command, {env: {...env, SUBC_MODULE_ID: "test-channel", ...(mode === "direct" ? {SUBC_REGISTRATION_FD: "999:1", SUBC_REGISTRATION_PIPE: "\\\\.\\pipe\\subc-test-absent", SUBC_DAEMON_PID: "1"} : {})}, stdout: "pipe", stderr: "pipe"});
+  const command = mode === "direct" || mode === "legacy-other-id" ? args : [process.platform === "win32" ? "python" : "python3", launcher, String(port), ...args];
+  const child = Bun.spawn(command, {env: {...env, SUBC_MODULE_ID: "test-channel",
+    ...(mode === "legacy-other-id" ? {SUBC_LAUNCH_NONCE: "inherited-nonce"} : {}),
+    ...(mode === "direct" ? {SUBC_REGISTRATION_FD: "999:1", SUBC_REGISTRATION_PIPE: "\\\\.\\pipe\\subc-test-absent", SUBC_DAEMON_PID: "1"} : {})}, stdout: "pipe", stderr: "pipe"});
   const timer = setTimeout(() => child.kill(), 10000);
   try {
     const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
     if (code !== (mode === "eof" ? 1 : 0) || errors.length > 0) throw new Error(`child failed (${mode}, ${code}): ${err}; peer errors: ${errors.map(String).join("; ")}`);
-    return {code, out, err, operations, presented, purposes};
+    const inheritedPort = Number(/REGISTRATION_PORT=(\d+)/.exec(out)?.[1]);
+    const registrations = hellos.map(({moduleId, port, launchNonce}) => ({moduleId, inherited: port === inheritedPort, launchNonce}));
+    return {code, out, err, operations, presented, purposes, registrations};
   } finally {
     clearTimeout(timer);
     for (const socket of sockets) socket.destroy();
     server.close(); rmSync(dir, {recursive: true, force: true});
   }
 }
+
+test("own id then two other ids register with only the own id on the inherited channel", async () => {
+  const result = await run("providers-own-first");
+  expect(result.out).toContain("PROVIDERS_OK");
+  expect(result.registrations).toEqual([
+    {moduleId: "test-channel", inherited: true, launchNonce: undefined},
+    {moduleId: "other-first", inherited: false, launchNonce: undefined},
+    {moduleId: "other-second", inherited: false, launchNonce: undefined},
+  ]);
+  expect(result.presented).toHaveLength(1);
+  expect(result.operations).toContain("catalog.list");
+  expect(result.err).toBe("");
+}, 15000);
+
+test("another id before the own id leaves the inherited channel for the own provider", async () => {
+  const result = await run("providers-extra-first");
+  expect(result.out).toContain("PROVIDERS_OK");
+  expect(result.registrations).toEqual([
+    {moduleId: "other-first", inherited: false, launchNonce: undefined},
+    {moduleId: "test-channel", inherited: true, launchNonce: undefined},
+  ]);
+  expect(result.operations).toEqual(["HELLO", "HELLO"]);
+  expect(result.err).toBe("");
+}, 15000);
+
+test("a second own-id provider fails with registration_already_taken naming the id", async () => {
+  const result = await run("providers-second-own");
+  expect(result.out).toContain("PROVIDERS_OK");
+  expect(result.registrations).toEqual([{moduleId: "test-channel", inherited: true, launchNonce: undefined}]);
+  expect(result.operations).toEqual(["HELLO"]);
+  expect(result.err).toBe("");
+}, 15000);
+
+test("another id does not inherit the launch nonce without a registration channel", async () => {
+  const result = await run("legacy-other-id");
+  expect(result.out).toContain("PROVIDERS_OK");
+  expect(result.registrations).toEqual([{moduleId: "other-first", inherited: false, launchNonce: undefined}]);
+  expect(result.operations).toEqual(["HELLO"]);
+  expect(result.err).toBe("");
+}, 15000);
 
 test("adopt fails closed when a named registration channel cannot load its helper", async () => {
   const dir = mkdtempSync(resolve("target/scratch/no-native-"));

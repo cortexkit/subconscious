@@ -1420,6 +1420,35 @@ describe("SubcProvider closed", () => {
     }
   });
 
+  for (const launchNonce of [undefined, "extra-provider-legacy-nonce"]) {
+    test(`extra provider in a launched process defaults to no reconnect (${launchNonce === undefined ? "module id only" : "legacy nonce"})`, async () => {
+      const daemon = await ScriptedProviderDaemon.start();
+      const provider = await connectWith(daemon, { SUBC_MODULE_ID: "launched-provider", SUBC_LAUNCH_NONCE: launchNonce });
+      try {
+        await daemon.waitForHelloCount(1);
+        daemon.dropLatest();
+        expect(await settlesWithin(provider.closed, 1_000)).toBe(true);
+        await sleepMs(NO_RECONNECT_WINDOW_MS);
+        expect(daemon.helloCount).toBe(1);
+      } finally {
+        await provider.close();
+      }
+    });
+  }
+
+  test("reconnectOnDrop: true keeps an extra provider in a launched process reconnecting", async () => {
+    const daemon = await ScriptedProviderDaemon.start();
+    const provider = await connectWith(daemon, { SUBC_MODULE_ID: "launched-provider", SUBC_LAUNCH_NONCE: undefined }, true);
+    try {
+      daemon.dropLatest();
+      await daemon.waitForHelloCount(2);
+      await waitForCondition(() => provider.currentEpoch() === 2, "extra provider epoch after re-registration");
+      expect(await settlesWithin(provider.closed, 50)).toBe(false);
+    } finally {
+      await provider.close();
+    }
+  });
+
   test("unsupervised: a socket drop reconnects and closed stays pending", async () => {
     const daemon = await ScriptedProviderDaemon.start();
     const provider = await connectWith(daemon, UNSUPERVISED_ENV);

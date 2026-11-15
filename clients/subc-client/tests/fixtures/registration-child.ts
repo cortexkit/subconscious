@@ -29,6 +29,41 @@ if (mode === "fallback-consumer") {
 }
 const manifest = managementSurfaceManifest({moduleId: "test-channel", operations: []});
 manifest.registration_channel = true;
+if (mode.startsWith("providers-") || mode === "legacy-other-id") {
+  const providers: SubcProvider[] = [];
+  async function connect(moduleId: string): Promise<void> {
+    providers.push(await SubcProvider.connect({connectionFile, manifest: {...manifest, module_id: moduleId},
+      handler: async () => new Uint8Array()}));
+  }
+  if (mode === "legacy-other-id") {
+    await connect("other-first");
+    assert(!registrationOwner().supervised);
+  } else {
+    if (mode === "providers-extra-first") {
+      await connect("other-first");
+      assert(!registrationOwner().supervised);
+    }
+    await connect("test-channel");
+    assert(registrationOwner().supervised);
+    if (mode === "providers-own-first") {
+      await connect("other-first");
+      await connect("other-second");
+      await providers[1]!.close();
+      assert(registrationOwner().broker !== undefined);
+      const client = await SubcClient.connect({connectionFile});
+      await client.catalogList();
+      await client.close();
+    } else if (mode === "providers-second-own") {
+      let caught: unknown;
+      try { await connect("test-channel"); } catch (error) { caught = error; }
+      assert(caught instanceof ClaimError && caught.code === "registration_already_taken"
+        && caught.message.includes("test-channel"));
+    }
+  }
+  for (const provider of providers.reverse()) await provider.close();
+  console.log("PROVIDERS_OK");
+  process.exit(0);
+}
 if (mode === "fallback-missing") {
   let caught: unknown;
   try { await SubcProvider.connect({connectionFile, manifest, handler: async () => new Uint8Array()}); }

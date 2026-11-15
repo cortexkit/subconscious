@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.26.2
+
+- Reserve the inherited registration channel and launch nonce for the launched
+  module id. Other providers in the same process register over the connection
+  file in any order. A second provider for the launched id reports
+  `registration_already_taken` with the module id in its message.
+- Keep the no-reconnect default for every provider in a launched process,
+  including other module ids registering without inherited credentials.
+  Other ids may still opt in with `reconnectOnDrop: true`.
+
 ## 0.26.1
 
 - Managed calls whose `route.open` control request times out locally now fail

@@ -74,8 +74,121 @@ async fn serve_peer(
     (handle, tokio::spawn(serving))
 }
 
+struct RawClaimMinter(tokio::sync::Mutex<Option<Box<dyn ModuleStream>>>);
+
+#[async_trait]
+impl ClaimMinter for RawClaimMinter {
+    async fn mint(&self, request: ClaimMintRequest) -> Result<ClaimMintReply, ClaimError> {
+        let mut stream = self.0.lock().await;
+        let stream = stream.as_mut().ok_or(ClaimError::Unavailable)?;
+        send(stream, FrameType::Request, HELLO_CORR + 1, request).await;
+        let reply = receive(stream).await;
+        if reply.header.channel != 0 || reply.header.corr != HELLO_CORR + 1 {
+            return Err(ClaimError::Protocol);
+        }
+        if reply.header.ty == FrameType::Error {
+            let error: ErrorBody =
+                serde_json::from_slice(&reply.body).map_err(|_| ClaimError::Protocol)?;
+            return Err(ClaimError::Refused { code: error.code });
+        }
+        if reply.header.ty != FrameType::Response {
+            return Err(ClaimError::Protocol);
+        }
+        serde_json::from_slice(&reply.body).map_err(|_| ClaimError::Protocol)
+    }
+}
+
+async fn custom_loop(scenario: &str, path: &Path) {
+    let unavailable = Arc::new(RawClaimMinter(tokio::sync::Mutex::new(None)));
+    assert!(matches!(
+        crate::registration::install_claim_minter(unavailable.clone()),
+        Err(RegistrationError::NotAdopted)
+    ));
+    let channel = crate::registration::adopt_channel().unwrap();
+    if scenario == "custom_none" {
+        assert!(channel.is_none());
+        assert!(matches!(
+            crate::registration::adopt_channel(),
+            Err(RegistrationError::Channel(
+                os::RegistrationChannelError::AlreadyTaken
+            ))
+        ));
+        assert!(matches!(
+            crate::registration::install_claim_minter(unavailable),
+            Err(RegistrationError::NotAdopted)
+        ));
+        assert!(!supervised());
+    } else {
+        let mut channel = channel.expect("daemon supplied a registration channel");
+        assert!(matches!(
+            crate::registration::adopt_channel(),
+            Err(RegistrationError::Channel(
+                os::RegistrationChannelError::AlreadyTaken
+            ))
+        ));
+        let info = connection_file::read_for_client(path).unwrap();
+        authenticate_client(&mut channel, &info, BUDGET)
+            .await
+            .unwrap();
+        send(
+            &mut channel,
+            FrameType::Hello,
+            HELLO_CORR,
+            ModuleHelloBody {
+                manifest: ModuleManifest::builder("channel-worker", "1.0.0")
+                    .registration_channel(true)
+                    .build(),
+                protocol_ver: PROTOCOL_VERSION,
+                control_ops: None,
+                launch_nonce: None,
+            },
+        )
+        .await;
+        let ack = receive(&mut channel).await;
+        assert_eq!(ack.header.ty, FrameType::HelloAck);
+        let _: ModuleHelloAckBody = serde_json::from_slice(&ack.body).unwrap();
+        let minter = Arc::new(RawClaimMinter(tokio::sync::Mutex::new(Some(channel))));
+        crate::registration::install_claim_minter(minter.clone()).unwrap();
+        assert!(matches!(
+            crate::registration::install_claim_minter(minter),
+            Err(RegistrationError::AlreadyInstalled)
+        ));
+    }
+    let client = SubcConsumer::connect(path, options())
+        .await
+        .expect("custom-loop consumer must claim-bind when a channel was adopted");
+    if scenario != "custom_none" {
+        let error = client
+            .open_route(
+                RouteTarget::ToolProvider {
+                    module_id: "provider".into(),
+                },
+                BindIdentity::new("test", "test"),
+                CallOptions {
+                    consumer_identity: Some(ConsumerIdentity {
+                        module_id: "someone-else".into(),
+                        launch_nonce: "not-a-binding".into(),
+                    }),
+                    ..CallOptions::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("conflicts with connection binding"));
+    }
+    query(&client).await;
+    println!("CASE_DONE");
+    std::process::exit(0);
+}
+
 async fn child_case(scenario: &str, test: &str, path: &Path) {
     let role = env::var(ROLE).unwrap();
+    if matches!(scenario, "custom" | "custom_none") {
+        custom_loop(scenario, path).await;
+        unreachable!();
+    }
     if role == "ordinary" || role == "helper" {
         assert!(!supervised());
         let client = SubcConsumer::connect(path, options()).await.unwrap();
@@ -548,6 +661,29 @@ async fn run(scenario: &'static str, test: &str) {
     connection_file::write_atomic(&path, &info).unwrap();
     let mut command = command(test, "module", &path);
     command.env(os::DAEMON_PID_ENV, std::process::id().to_string());
+    if scenario == "custom_none" {
+        command
+            .env_remove(os::REGISTRATION_FD_ENV)
+            .env_remove(os::REGISTRATION_PIPE_ENV);
+        let mut child = command.spawn().unwrap();
+        let (mut stream, _) = timeout(BUDGET, listener.accept()).await.unwrap().unwrap();
+        auth(&mut stream, &info).await;
+        let request = receive(&mut stream).await;
+        assert_eq!(request.header.ty, FrameType::Request);
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(
+            body["op"], "activity.query",
+            "legacy consumer minted a claim"
+        );
+        send(&mut stream, FrameType::Response, request.header.corr,
+            json!({"op":"activity.query","entries":[],"cursor":null,"head":{"daemon_incarnation":"test","seq":0}})).await;
+        let output = assert_child(&mut child).await;
+        assert!(
+            output.contains("CASE_DONE"),
+            "child exited before assertions: {output}"
+        );
+        return;
+    }
     if matches!(
         scenario,
         "provenance" | "multi" | "peer_first" | "duplicate" | "legacy_peer"
@@ -863,6 +999,11 @@ macro_rules! contract_test {
     };
 }
 contract_test!(adopted_eof_exits_after_hook, "eof");
+contract_test!(custom_loop_adopts_and_claim_binds_consumer, "custom");
+contract_test!(
+    custom_loop_without_channel_uses_legacy_connection,
+    "custom_none"
+);
 contract_test!(inherited_variable_without_descriptor_is_direct, "direct");
 contract_test!(mint_refusal_never_falls_back_to_direct, "mint_refused");
 contract_test!(

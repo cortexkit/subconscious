@@ -9,6 +9,6 @@ publish = false
 [dependencies]
 async-trait = "0.1"
 serde_json = "1"
-subc-client-rs = { path = "../../../../subc-client-rs", version = "0.40.2" }
+subc-client-rs = { path = "../../../../subc-client-rs", version = "0.41.0" }
 subc-protocol = { path = "../../../../subc-protocol" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

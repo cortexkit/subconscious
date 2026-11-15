@@ -373,7 +373,7 @@ dependencies = [
 
 [[package]]
 name = "subc-client-rs"
-version = "0.40.2"
+version = "0.41.0"
 dependencies = [
  "async-trait",
  "serde",
@@ -402,7 +402,7 @@ dependencies = [
 
 [[package]]
 name = "subc-control"
-version = "0.40.1"
+version = "0.40.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -412,7 +412,7 @@ dependencies = [
 
 [[package]]
 name = "subc-os"
-version = "0.1.38"
+version = "0.1.39"
 dependencies = [
  "libc",
  "rustix",
@@ -423,7 +423,7 @@ dependencies = [
 
 [[package]]
 name = "subc-protocol"
-version = "0.37.0"
+version = "0.37.1"
 dependencies = [
  "base64",
  "serde",

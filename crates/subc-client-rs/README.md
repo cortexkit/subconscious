@@ -9,6 +9,32 @@ View statuses other than `active`, `pending` or `unstamped` are reported through
 
 Rust module serving and consumer APIs for the Subconscious daemon.
 
+## Custom module loops and registration-channel identity
+
+`serve` and `serve_with_handle` adopt the daemon's private registration channel
+automatically. A module that owns its loop can use `registration` directly:
+
+1. Call `registration::adopt_channel()` once at startup, in a Tokio runtime and
+   before spawning children. `None` means no validated channel is available;
+   continue with the existing connection-file and launch-nonce path.
+2. Authenticate the returned stream using the connection file's handshake inputs.
+3. Send the launched module's HELLO **without `launch_nonce`** and validate the
+   daemon's HELLO_ACK.
+4. Call `registration::install_claim_minter(Arc<dyn registration::ClaimMinter>)`.
+   Implement the trait with `#[subc_client_rs::async_trait]`: send its existing
+   `subc_protocol::claim::ClaimMintRequest` over channel 0 of the same registration
+   connection, correlate/validate the response, and return `ClaimMintReply` or
+   `ClaimError`. Keep reading the connection while minting, honor bounded
+   rate-limit retries, and fail closed when it ends; never reconnect it.
+5. Only then open `SubcConsumer` connections. Each presents a fresh self claim,
+   just as consumers opened under `serve` do.
+
+Channel adoption (even when it returns `None`) and owner installation are each single-use.
+Installing before adoption or installing twice refuses. Without an installed
+minter, a consumer in an adopted process fails closed, never falling back to a
+nonce. Do not pass `CallOptions.consumer_identity` on this path: a claim-bound
+connection refuses the override before sending it.
+
 ## Slow startup without blocking the daemon connection
 
 Register a supervised module with `ModuleManifest::builder(...).ready(false)`.

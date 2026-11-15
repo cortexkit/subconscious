@@ -28,7 +28,7 @@ serde_json = "1"
 # The account pseudonym `ck quota --redact` and the app show instead of an
 # account's email or id.
 sha2 = "0.10"
-subc-client-rs = { path = "../subc-client-rs", version = "0.40.4" }
+subc-client-rs = { path = "../subc-client-rs", version = "0.41.0" }
 subc-control = { path = "../subc-control", version = "0.41.0" }
 subc-jsonc = { path = "../subc-jsonc", version = "0.1.3" }
 subc-os = { path = "../subc-os", version = "0.1.35" }

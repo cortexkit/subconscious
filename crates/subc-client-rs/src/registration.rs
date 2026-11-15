@@ -11,10 +11,113 @@ use subc_protocol::claim::{
     ClaimRateLimitedDetail,
 };
 
-static OWNER: OnceLock<Weak<ModuleHandleShared>> = OnceLock::new();
+static OWNER: OnceLock<Arc<dyn ClaimMinter>> = OnceLock::new();
 static OWNER_READY: tokio::sync::Notify = tokio::sync::Notify::const_new();
 static HELPER_BOUND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static SUPERVISED: OnceLock<bool> = OnceLock::new();
+static CHANNEL_TAKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static CHANNEL_ADOPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A custom module loop's channel-0 `claim.mint` RPC implementation.
+///
+/// Startup order is: call [`adopt_channel`], authenticate the returned stream,
+/// send the launched module's HELLO without `launch_nonce`, validate HELLO_ACK,
+/// call [`install_claim_minter`], then open consumers. If adoption returns `None`,
+/// use the legacy connection and launch-nonce path instead; do not install a minter.
+///
+/// Implement with [`crate::async_trait`]. Send each request on the adopted module
+/// connection and correlate its reply while continuing to read that connection.
+/// Validate the reply's type and operation, map daemon refusals to
+/// [`ClaimError::Refused`], and honor `claim_rate_limited` retry delays within a
+/// bounded budget. Return [`ClaimError::Unavailable`] when the connection closes;
+/// never reconnect the registration channel or fall back to nonce authentication.
+/// The SDK bounds each mint and ignores the reply's informational wall-clock expiry.
+///
+/// A module using this path must not pass
+/// [`CallOptions::consumer_identity`](crate::consumer::CallOptions::consumer_identity):
+/// a claim-bound connection refuses that override before sending it.
+#[async_trait]
+pub trait ClaimMinter: Send + Sync {
+    async fn mint(&self, request: ClaimMintRequest) -> Result<ClaimMintReply, ClaimError>;
+}
+
+/// Failure to adopt or install the process's registration owner.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum RegistrationError {
+    Channel(os::RegistrationChannelError),
+    Transport(io::Error),
+    NotAdopted,
+    AlreadyInstalled,
+}
+
+impl fmt::Display for RegistrationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Channel(error) => error.fmt(f),
+            Self::Transport(_) => f.write_str("could not open registration transport"),
+            Self::NotAdopted => f.write_str("registration channel has not been adopted"),
+            Self::AlreadyInstalled => f.write_str("registration owner already installed"),
+        }
+    }
+}
+
+impl Error for RegistrationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Channel(error) => Some(error),
+            Self::Transport(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+/// Take the daemon's private registration stream for a custom module loop.
+///
+/// Call once at startup, before spawning children. In a Tokio runtime:
+/// adopt, authenticate, send HELLO without `launch_nonce`, validate HELLO_ACK,
+/// install the owner with [`install_claim_minter`], then open consumers.
+/// See [`ClaimMinter`] for the loop's RPC and connection-lifetime obligations.
+/// A second call, even after `None`, returns
+/// [`RegistrationError::Channel`] containing
+/// [`os::RegistrationChannelError::AlreadyTaken`].
+///
+/// `None` means no validated channel was handed to this process (for example,
+/// an older daemon or a non-daemon launch); keep the legacy nonce path then.
+pub fn adopt_channel() -> Result<Option<Box<dyn ModuleStream>>, RegistrationError> {
+    init_supervised();
+    take_channel_stream()
+}
+
+/// Install a custom loop's claim minter after HELLO_ACK and before opening consumers.
+///
+/// Refuses installation before channel adoption or after any owner was installed,
+/// including an owner installed by [`crate::serve`]. The process retains the minter;
+/// it must report a closed registration connection as unavailable. Installation
+/// cannot be undone and must never authorize reconnecting the registration channel.
+pub fn install_claim_minter(minter: Arc<dyn ClaimMinter>) -> Result<(), RegistrationError> {
+    if !CHANNEL_ADOPTED.load(Ordering::Acquire) {
+        return Err(RegistrationError::NotAdopted);
+    }
+    OWNER
+        .set(minter)
+        .map_err(|_| RegistrationError::AlreadyInstalled)?;
+    OWNER_READY.notify_waiters();
+    Ok(())
+}
+
+struct SdkClaimMinter(Weak<ModuleHandleShared>);
+
+#[async_trait]
+impl ClaimMinter for SdkClaimMinter {
+    async fn mint(&self, request: ClaimMintRequest) -> Result<ClaimMintReply, ClaimError> {
+        ModuleHandle {
+            shared: self.0.upgrade().ok_or(ClaimError::Unavailable)?,
+        }
+        .mint_claim_reply(request)
+        .await
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct Session {
@@ -62,17 +165,21 @@ pub(crate) fn supervised() -> bool {
 }
 
 pub(crate) fn adopt(module_id: &str) -> Result<bool, SubcModuleError> {
-    let supervised = *SUPERVISED.get_or_init(|| {
+    let supervised = init_supervised();
+    // The inherited channel belongs to the launched module, not every module
+    // exported by its process. Other ids need a claim authorizing that exact id
+    // under the owner's reserved prefix, or register without channel authority.
+    Ok(supervised && is_launched_module(module_id)?)
+}
+
+fn init_supervised() -> bool {
+    *SUPERVISED.get_or_init(|| {
         let supervised = os::supervised();
         if let Some(reason) = os::registration_refusal() {
             tracing::warn!(%reason, "registration channel not adopted");
         }
         supervised
-    });
-    // The inherited channel belongs to the launched module, not every module
-    // exported by its process. Other ids need their own prefix claim or must
-    // register without the channel's authority.
-    Ok(supervised && is_launched_module(module_id)?)
+    })
 }
 
 pub(crate) fn is_launched_module(module_id: &str) -> Result<bool, SubcModuleError> {
@@ -83,20 +190,29 @@ pub(crate) fn take_stream() -> Result<Option<Box<dyn ModuleStream>>, SubcModuleE
     if !supervised() {
         return Ok(None);
     }
-    let channel = match os::take_registration_channel() {
-        Err(os::RegistrationChannelError::AlreadyTaken) => {
+    match take_channel_stream() {
+        Err(RegistrationError::Channel(os::RegistrationChannelError::AlreadyTaken)) => {
             let error = match module_id_from_env()? {
                 Some(module_id) => io::Error::other(format!(
                     "launched module {module_id:?} is already serving on the registration channel"
                 )),
                 None => io::Error::other(os::RegistrationChannelError::AlreadyTaken),
             };
-            return Err(SubcModuleError::RegistrationChannel(error));
+            Err(SubcModuleError::RegistrationChannel(error))
         }
         result => {
-            result.map_err(|error| SubcModuleError::RegistrationChannel(io::Error::other(error)))?
+            result.map_err(|error| SubcModuleError::RegistrationChannel(io::Error::other(error)))
         }
-    };
+    }
+}
+
+fn take_channel_stream() -> Result<Option<Box<dyn ModuleStream>>, RegistrationError> {
+    if CHANNEL_TAKEN.swap(true, Ordering::AcqRel) {
+        return Err(RegistrationError::Channel(
+            os::RegistrationChannelError::AlreadyTaken,
+        ));
+    }
+    let channel = os::take_registration_channel().map_err(RegistrationError::Channel)?;
     let Some(channel) = channel else {
         return Ok(None);
     };
@@ -105,21 +221,22 @@ pub(crate) fn take_stream() -> Result<Option<Box<dyn ModuleStream>>, SubcModuleE
         let stream = channel.into_unix_stream();
         stream
             .set_nonblocking(true)
-            .map_err(SubcModuleError::RegistrationChannel)?;
-        tokio::net::UnixStream::from_std(stream).map_err(SubcModuleError::RegistrationChannel)?
+            .map_err(RegistrationError::Transport)?;
+        tokio::net::UnixStream::from_std(stream).map_err(RegistrationError::Transport)?
     };
     #[cfg(windows)]
     let stream = channel
         .into_tokio_pipe_client()
-        .map_err(SubcModuleError::RegistrationChannel)?;
+        .map_err(RegistrationError::Transport)?;
     #[cfg(any(unix, windows))]
     {
+        CHANNEL_ADOPTED.store(true, Ordering::Release);
         Ok(Some(Box::new(stream)))
     }
     #[cfg(not(any(unix, windows)))]
     {
         let _ = channel;
-        Err(SubcModuleError::RegistrationChannel(io::Error::new(
+        Err(RegistrationError::Transport(io::Error::new(
             io::ErrorKind::Unsupported,
             "registration transport unsupported",
         )))
@@ -132,13 +249,8 @@ pub(crate) fn install_owner(handle: &ModuleHandle) -> Result<(), SubcModuleError
         .registration
         .active
         .store(true, Ordering::Release);
-    OWNER.set(Arc::downgrade(&handle.shared)).map_err(|_| {
-        SubcModuleError::RegistrationChannel(io::Error::other(
-            "registration owner already installed",
-        ))
-    })?;
-    OWNER_READY.notify_waiters();
-    Ok(())
+    install_claim_minter(Arc::new(SdkClaimMinter(Arc::downgrade(&handle.shared))))
+        .map_err(|error| SubcModuleError::RegistrationChannel(io::Error::other(error)))
 }
 
 pub(crate) async fn prefix_claim(module_id: &str) -> Result<Option<Claim>, ClaimError> {
@@ -151,17 +263,17 @@ pub(crate) async fn prefix_claim(module_id: &str) -> Result<Option<Claim>, Claim
             tokio::pin!(ready);
             ready.as_mut().enable();
             if let Some(owner) = OWNER.get() {
-                break ModuleHandle {
-                    shared: owner.upgrade().ok_or(ClaimError::Unavailable)?,
-                };
+                break owner;
             }
             ready.await;
         };
-        match owner
-            .mint_claim(ClaimPurpose::Prefix {
+        match mint_claim(
+            owner.as_ref(),
+            ClaimPurpose::Prefix {
                 module_id: module_id.to_owned(),
-            })
-            .await
+            },
+        )
+        .await
         {
             Err(ClaimError::Refused { code }) if code == error_codes::CLAIM_PREFIX_REFUSED => {
                 Ok(None)
@@ -268,17 +380,23 @@ impl ModuleHandle {
     }
 
     async fn mint_claim(&self, purpose: ClaimPurpose) -> Result<Claim, ClaimError> {
+        self.mint_claim_reply(ClaimMintRequest::new(purpose))
+            .await
+            .map(|reply| reply.claim)
+    }
+
+    async fn mint_claim_reply(
+        &self,
+        request: ClaimMintRequest,
+    ) -> Result<ClaimMintReply, ClaimError> {
         if !self.shared.registration.active.load(Ordering::Acquire) {
             return Err(ClaimError::Unavailable);
         }
         let deadline = Instant::now() + CATALOG_UPDATE_TIMEOUT;
         loop {
-            let reply = timeout_at(
-                deadline,
-                self.claim_call(&ClaimMintRequest::new(purpose.clone())),
-            )
-            .await
-            .map_err(|_| ClaimError::Timeout)??;
+            let reply = timeout_at(deadline, self.claim_call(&request))
+                .await
+                .map_err(|_| ClaimError::Timeout)??;
             if reply.header.ty == FrameType::Error {
                 let error: ErrorBody =
                     serde_json::from_slice(&reply.body).map_err(|_| ClaimError::Protocol)?;
@@ -303,7 +421,7 @@ impl ModuleHandle {
             }
             let reply: ClaimMintReply =
                 serde_json::from_slice(&reply.body).map_err(|_| ClaimError::Protocol)?;
-            return Ok(reply.claim);
+            return Ok(reply);
         }
     }
 
@@ -357,20 +475,23 @@ pub(crate) fn bound() -> bool {
     supervised() || HELPER_BOUND.load(Ordering::Acquire)
 }
 
+async fn mint_claim(minter: &dyn ClaimMinter, purpose: ClaimPurpose) -> Result<Claim, ClaimError> {
+    timeout(
+        CATALOG_UPDATE_TIMEOUT,
+        minter.mint(ClaimMintRequest::new(purpose)),
+    )
+    .await
+    .map_err(|_| ClaimError::Timeout)?
+    .map(|reply| reply.claim)
+}
+
 pub(crate) async fn bind_consumer<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     deadline: Duration,
 ) -> Result<(), ClaimError> {
     let claim = if supervised() {
-        let shared = OWNER
-            .get()
-            .and_then(Weak::upgrade)
-            .ok_or(ClaimError::Unavailable)?;
-        Some(
-            ModuleHandle { shared }
-                .mint_claim(ClaimPurpose::SelfConnection)
-                .await?,
-        )
+        let owner = OWNER.get().ok_or(ClaimError::Unavailable)?;
+        Some(mint_claim(owner.as_ref(), ClaimPurpose::SelfConnection).await?)
     } else {
         os::helper_claim()
             .map_err(|_| ClaimError::Handoff)?

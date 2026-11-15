@@ -2,6 +2,7 @@
 
 ## 0.21.16
 
+- Require Rust client 0.41.0 for the public registration-channel adoption API.
 - Raise the daemon requirement to 0.49.0 for opt-in phone build facts on route
   binds, and align the co-bumped protocol and Rust client requirements.
 - Raise subc-control to 0.41 and subc-daemon to 0.49 for scope lifecycle watches, with matching minimum dependency versions for the Rust SDK and sibling crates; no direct behavior changes.

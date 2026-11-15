@@ -65,7 +65,7 @@ pub use async_trait::async_trait;
 pub use subc_control::{CatalogEntry, ConsumerIdentity};
 mod scope_served_by;
 pub use scope_served_by::{ScopeServedByAnswer, ScopeServedByReply};
-mod registration;
+pub mod registration;
 mod route_authorize;
 pub use route_authorize::{
     RouteAuthorizeExpected, RouteAuthorizeOutcome, RouteAuthorizeResponse, RouteAuthorizeScope,
@@ -3859,7 +3859,8 @@ where
     }
 }
 
-trait ModuleStream: AsyncRead + AsyncWrite + Unpin + Send {}
+/// Owned byte transport for a module connection, before or after authentication.
+pub trait ModuleStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> ModuleStream for T {}
 
 async fn connect_to_subc(

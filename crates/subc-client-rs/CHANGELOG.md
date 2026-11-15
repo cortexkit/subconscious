@@ -1,7 +1,12 @@
 # Changelog
 
-## 0.40.4
+## 0.41.0
 
+- Expose registration-channel adoption and a `ClaimMinter` seam for modules that
+  run their own loop. After authentication and an accepted nonce-free HELLO,
+  install the minter before opening consumers to use the same self-claim binding
+  as `serve`. Missing channels retain the legacy nonce path; duplicate adoption
+  or owner installation refuses, and adopted consumers never fall back to a nonce.
 - Expose `peer_build` in bind peer facts and through `RouteBindRequest::peer_build()`.
   Targets declare `peer-build/v1` to receive the daemon's honoured production
   phone build fact; legacy binds leave it absent. Require subc-protocol 0.37.2.

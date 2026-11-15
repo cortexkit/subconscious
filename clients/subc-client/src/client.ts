@@ -1923,8 +1923,9 @@ export class SubcClient {
       // attempt can time out locally with only a millisecond or two left. The
       // caller's request was still never sent: report the refusals that used up
       // the deadline, not the local timeout of the final, unanswered attempt.
-      if (!this.closeStarted && error instanceof SubcError && error.code === REQUEST_DEADLINE_MARKER &&
-          this.opts.now() >= deadline) {
+      // The real control timer can expire before the injected retry clock moves;
+      // its timeout alone proves that the route-open budget has elapsed.
+      if (!this.closeStarted && error instanceof SubcError && error.code === REQUEST_DEADLINE_MARKER) {
         if (refusals.last) throw this.routeOpenRetryExhausted(cached.moduleId, routeRetryAttempt, refusals);
         throw this.notSentCallError(`route.open for module ${cached.moduleId} got no answer before its deadline`, error);
       }

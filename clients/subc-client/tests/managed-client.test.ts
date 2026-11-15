@@ -1866,6 +1866,49 @@ describe("scoped route opens", () => {
     } finally { client.close(); }
   });
 
+  for (const priorRefusal of [true, false]) {
+    test(`local route.open timeout ${priorRefusal ? "preserves the last refusal" : "without a prior refusal"} is not_sent`, async () => {
+      const { connFile } = tempConnectionFile();
+      const stats = newStats();
+      const refusals = priorRefusal ? ["module_reloading", "scope_not_synced"] : [];
+      let delayedAnswer: (() => Promise<void>) | undefined;
+      const daemon = await startFakeDaemon({
+        stats,
+        onRouteOpen: (_moduleId, answer) => {
+          const code = refusals[stats.routeOpens - 1];
+          if (code) void answer({ code, message: "retry scope" });
+          // Hold the final reply until the local control timer has settled the
+          // call, so a fast daemon cannot accidentally bypass the timeout path.
+          else delayedAnswer = () => answer({ code: "scope_changed", message: "late refusal" });
+        },
+      });
+      writeConnectionFile(connFile, daemon.port);
+      const clock = { now: 0 };
+      const client = await SubcClient.connect({
+        connectionFile: connFile,
+        identity: IDENTITY,
+        reconnectBackoff: { ...BACKOFF, baseMs: 75, capMs: 150 },
+        now: () => clock.now,
+        random: () => 1,
+        sleep: async (ms) => { clock.now += ms; },
+      });
+      try {
+        const error = await rejectionOf(client.call("retry", "echo", {}, { scope, consumerIdentity: null, timeoutMs: 500 }));
+        expect(error).toMatchObject({
+          kind: "not_sent",
+          code: priorRefusal ? "scope_not_synced" : "request_deadline",
+        });
+        // The injected retry clock stops before the deadline even though the
+        // real control-RPC timer expires. Classification must trust that timer.
+        expect(clock.now).toBe(priorRefusal ? 225 : 0);
+        expect(stats.routeOpens).toBe(refusals.length + 1);
+        expect(stats.dataRequests).toBe(0);
+        expect(delayedAnswer).toBeDefined();
+        await delayedAnswer!();
+      } finally { client.close(); }
+    });
+  }
+
   for (const code of ["scope_not_synced", "scope_changed"]) {
     test(`${code} retries the same scoped selector within the caller deadline`, async () => {
       const { connFile } = tempConnectionFile();

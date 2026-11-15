@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.26.1
+
+- Managed calls whose `route.open` control request times out locally now fail
+  `not_sent`, even when an injected retry clock has not reached the deadline.
+  Preserve the last daemon refusal code when present, otherwise report
+  `request_deadline`. The call's data request is never sent while opening a route.
+
 ## 0.26.0
 
 - Use the script runner's provided `ck:registration` helper when available, while

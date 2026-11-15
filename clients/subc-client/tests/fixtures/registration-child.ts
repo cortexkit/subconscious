@@ -31,34 +31,61 @@ const manifest = managementSurfaceManifest({moduleId: "test-channel", operations
 manifest.registration_channel = true;
 if (mode.startsWith("providers-") || mode === "legacy-other-id") {
   const providers: SubcProvider[] = [];
-  async function connect(moduleId: string): Promise<void> {
+  async function connect(moduleId: string, handshakeTimeoutMs?: number): Promise<void> {
     providers.push(await SubcProvider.connect({connectionFile, manifest: {...manifest, module_id: moduleId},
-      handler: async () => new Uint8Array()}));
+      handler: async () => new Uint8Array(), handshakeTimeoutMs}));
   }
   if (mode === "legacy-other-id") {
     await connect("other-first");
     assert(!registrationOwner().supervised);
+  } else if (mode === "providers-owner-missing") {
+    let caught: unknown;
+    try { await connect("test-channel:first", 100); } catch (error) { caught = error; }
+    assert((caught as {code?: string})?.code === "registration_not_ready"
+      && (caught as Error).message.includes("test-channel:first"));
+    await connect("test-channel");
+    assert(registrationOwner().broker !== undefined);
+    await new Promise(r => setTimeout(r, 30));
   } else {
+    let extra: Promise<void> | undefined;
     if (mode === "providers-extra-first") {
-      await connect("other-first");
-      assert(!registrationOwner().supervised);
+      let settled = false;
+      extra = connect("test-channel:first").finally(() => { settled = true; });
+      await new Promise(r => setTimeout(r, 50));
+      assert(!settled);
     }
     await connect("test-channel");
     assert(registrationOwner().supervised);
     if (mode === "providers-own-first") {
-      await connect("other-first");
-      await connect("other-second");
+      await connect("test-channel:first");
+      await connect("test-channel:second");
+      for (const child of providers.slice(1)) {
+        for (const operation of [() => child.scopeSync(1, []), () => child.scopeApply(1, [], [])]) {
+          let caught: unknown;
+          try { await operation(); } catch (error) { caught = error; }
+          assert((caught as {code?: string})?.code === "claim_operation_not_allowed");
+        }
+      }
       await providers[1]!.close();
       assert(registrationOwner().broker !== undefined);
       const client = await SubcClient.connect({connectionFile});
       await client.catalogList();
       await client.close();
+    } else if (mode === "providers-prefix-refused") {
+      await connect("other-first");
+    } else if (mode === "providers-mint-refused") {
+      let caught: unknown;
+      try { await connect("test-channel:first"); } catch (error) { caught = error; }
+      assert((caught as {code?: string})?.code === "claim_mint_not_allowed"
+        && (caught as Error).message.includes("test-channel:first")
+        && (caught as Error).message.includes("claim_mint_not_allowed"));
     } else if (mode === "providers-second-own") {
       let caught: unknown;
       try { await connect("test-channel"); } catch (error) { caught = error; }
       assert(caught instanceof ClaimError && caught.code === "registration_already_taken"
         && caught.message.includes("test-channel"));
     }
+    await extra;
   }
   for (const provider of providers.reverse()) await provider.close();
   console.log("PROVIDERS_OK");

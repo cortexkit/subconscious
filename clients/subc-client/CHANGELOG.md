@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.26.3
+
+- Register additional providers under a supervised owner's reserved prefix with
+  exact-id prefix claims minted on the owner's channel and presented before
+  HELLO, without a launch nonce. Prefix children remain brokered and never take
+  the inherited channel or become claim brokers.
+- Wait for the owner's registration within the connect budget when an extra
+  provider starts first. Only `claim_prefix_refused` permits plain TCP fallback;
+  other mint failures report the provider id and refusal code.
+- Restore the owner's launch nonce in extra providers' HELLOs for legacy launches
+  without an adopted registration channel. Keep the launched process's
+  no-reconnect default and the single inherited-channel owner.
+
 ## 0.26.2
 
 - Reserve the inherited registration channel and launch nonce for the launched

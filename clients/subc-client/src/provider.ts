@@ -15,7 +15,8 @@ import {
 } from "./client.js";
 import { ConnectionFileError, readConnectionFile, type ConnectionInfo } from "./connection-file.js";
 import { readCaller, type CallerAttestation } from "./attestation.js";
-import { registrationOwner } from "./registration-channel.js";
+import { presentClaim, registrationOwner } from "./registration-channel.js";
+import { ClaimError } from "./claim.js";
 import {
   scopeEndWire, scopeInteger, scopeRecordWire,
   type ScopeApplyReply, type ScopeEnd, type ScopeEndResult, type ScopeRecord, type ScopeSyncReply,
@@ -397,6 +398,7 @@ interface NormalizedSubcProviderConnectOptions {
   /** The launch nonce to echo in HELLO, already resolved against the environment. */
   launchNonce?: string;
   registrationChannel: boolean;
+  prefixRegistration: boolean;
   reconnectOnDrop: boolean;
 }
 
@@ -844,11 +846,24 @@ export class SubcProvider {
     const conn = await readConnectionFile(opts.connectionFile);
     const deadline = Date.now() + (opts.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS);
     const endpoint = conn.endpoints[0]!;
+    let claim: string | undefined;
+    if (opts.prefixRegistration) {
+      try { claim = await registrationOwner().mintPrefix(opts.manifest.module_id, deadline); }
+      catch (error) {
+        if (!(error instanceof ClaimError) || error.code !== "claim_prefix_refused") {
+          const code = (error as {code?: string}).code ?? "unknown";
+          throw new SubcProviderError(`prefix registration for module ${JSON.stringify(opts.manifest.module_id)} failed: ${code}`, code);
+        }
+        // The daemon alone decides prefix membership. An unrelated id remains
+        // a plain TCP provider only when the owner explicitly refuses its prefix.
+      }
+    }
     const inherited = opts.registrationChannel ? registrationOwner().take(opts.manifest.module_id) : undefined;
     const sock = inherited ?? await SubcSocket.connect(endpoint.host, endpoint.port, deadline);
     try {
       onSocket?.(sock);
       await authenticateClient(sock, conn, deadline);
+      if (claim !== undefined) await presentClaim(sock, claim, deadline);
       await sendFrame(sock, buildHelloFrame(opts));
       const ack = await expectHelloAck(sock, deadline);
       return { sock, conn, ack };
@@ -1637,31 +1652,31 @@ async function normalizeProviderConnectOptions(opts: SubcProviderConnectOptions)
     || opts.config.anchorRetryMs < 1 || opts.config.anchorRetryMs > 30000)) throw new Error("anchorRetryMs must be 1..30000");
   const owner = registrationOwner();
   const envModuleId = nonEmpty(process.env[SUBC_MODULE_ID_ENV]);
-  // The inherited channel and nonce belong only to the launched module. Extra
-  // providers must leave them untouched, even when they start before that module.
+  // Adoption is process-wide, but only the launched id takes the channel.
+  // Extra providers use its broker, even when they start before the owner.
   const launchIdentity = envModuleId === undefined || envModuleId === opts.manifest.module_id;
-  if (launchIdentity) owner.adopt();
+  owner.adopt();
   const registrationChannel = launchIdentity && owner.supervised;
+  const prefixRegistration = !launchIdentity && owner.supervised;
   // The nonce comes from the process-wide accessor, which reads the daemon's
   // descriptor at most once. A refused descriptor fails the connect, unless the
   // caller supplied the nonce itself, in which case it only means "not
   // supervised".
   let processNonce: string | undefined;
-  if (registrationChannel) {
+  if (owner.supervised) {
     if (opts.launchNonce !== undefined) throw new SubcProviderError("channel registration cannot override identity", "claim_identity_conflict");
-  } else if (launchIdentity && opts.launchNonce === undefined) {
+  } else if (opts.launchNonce === undefined) {
     try {
       processNonce = (await processLaunchNonce())?.value;
     } catch (error) {
       if (isLaunchNonceError(error)) throw launchNonceUnavailable(error);
       throw error;
     }
-  } else if (launchIdentity) {
+  } else {
     processNonce = (await launchNonceOrUndefinedAsync())?.value;
   }
   const envLaunchNonce = nonEmpty(processNonce);
-  // Extra providers still run in the launched process, without consuming its
-  // credentials. They must keep the same no-reconnect default as its own provider.
+  // Every provider in a launched process keeps the no-reconnect default.
   const supervised = owner.supervised || !launchIdentity || (envModuleId !== undefined && envLaunchNonce !== undefined);
   return {
     connectionFile: opts.connectionFile,
@@ -1682,6 +1697,7 @@ async function normalizeProviderConnectOptions(opts: SubcProviderConnectOptions)
     onConnectionState: opts.onConnectionState,
     launchNonce: nonEmpty(opts.launchNonce ?? envLaunchNonce),
     registrationChannel,
+    prefixRegistration,
     reconnectOnDrop: registrationChannel ? false : opts.reconnectOnDrop ?? !supervised,
   };
 }

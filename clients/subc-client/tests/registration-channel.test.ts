@@ -32,37 +32,50 @@ async function auth(sock: SubcSocket): Promise<void> {
 }
 
 async function run(mode: string): Promise<{code: number; out: string; err: string; operations: string[]; presented: string[]; purposes: string[];
+  prefixMints: {moduleId: unknown; owner: boolean}[];
   registrations: {moduleId: string; inherited: boolean; launchNonce: unknown}[]}> {
   const dir = mkdtempSync(resolve("target/scratch/registration-"));
   const operations: string[] = [], presented: string[] = [], purposes: string[] = [], errors: unknown[] = [];
   const sockets: Socket[] = [];
   const hellos: {moduleId: string; port: number; launchNonce: unknown}[] = [];
+  const prefixMints: {moduleId: unknown; owner: boolean}[] = [];
   let sequence = 0;
   let directChildren = 0;
   let routeRequests = 0;
-  const minted = new Map<string, string>();
+  const minted = new Map<string, {purpose: string; moduleId: unknown}>();
   const fallback = mode.startsWith("fallback-");
   async function peer(socket: Socket): Promise<void> {
     const sock = SubcSocket.adopt(socket);
     await auth(sock);
     let bound = mode === "direct";
     let registered = false;
+    let registeredId: string | undefined;
+    let binding: {purpose: string; moduleId: unknown} | undefined;
+    let first = true;
     for (;;) {
       const frame = await sock.readFrame(Date.now() + 8000, Date.now() + 8000);
       if (frame.header.ty === FrameType.Goodbye) return;
       const body = JSON.parse(Buffer.from(frame.body).toString()) as Record<string, unknown>;
       const op = String(body.op ?? "HELLO");
+      if (op === "claim.present") expect(first).toBe(true);
+      first = false;
       operations.push(op);
       async function reply(ty: FrameType, value: unknown): Promise<void> {
         await sock.write(encodeFrame(buildFrame(ty, 0, 0, 0, frame.header.corr, Buffer.from(JSON.stringify(value)))), Date.now() + 8000);
       }
       if (frame.header.ty === FrameType.Hello) {
+        expect(registered).toBe(false);
+        registeredId = (body.manifest as {module_id: string}).module_id;
+        if (registeredId.startsWith("test-channel:")) {
+          expect(binding).toEqual({purpose: "prefix", moduleId: registeredId});
+        }
         hellos.push({moduleId: (body.manifest as {module_id: string}).module_id, port: socket.remotePort!, launchNonce: body.launch_nonce});
         expect((body.manifest as {registration_channel: boolean}).registration_channel).toBe(true);
-        expect(body.launch_nonce).toBe(fallback ? (mode === "fallback-explicit" ? "explicit-nonce" : "inherited-nonce") : undefined);
+        expect(body.launch_nonce).toBe(fallback ? (mode === "fallback-explicit" ? "explicit-nonce" : "inherited-nonce")
+          : mode === "legacy-other-id" ? "inherited-nonce" : undefined);
         registered = true;
         if (mode === "before-hello") { socket.end(); return; }
-        await reply(FrameType.HelloAck, {negotiated_ver: PROTOCOL_VERSION, subc_ops: ["claim.mint", "catalog.list"]});
+        await reply(FrameType.HelloAck, {negotiated_ver: PROTOCOL_VERSION, subc_ops: ["claim.mint", "catalog.list", "scope.sync", "scope.apply"]});
         if (mode === "eof") {
           // A PONG proves the provider consumed HELLO_ACK and started serving.
           // Windows disconnect discards unread pipe bytes, unlike Unix EOF.
@@ -81,12 +94,21 @@ async function run(mode: string): Promise<{code: number; out: string; err: strin
         await reply(FrameType.Error, {code: "target_not_found", message: "fixture target"});
       } else if (op === "claim.mint") {
         expect(registered).toBe(true);
+        expect(bound).toBe(false);
+        expect(registeredId).toBe("test-channel");
+        if (body.purpose === "prefix") {
+          prefixMints.push({moduleId: body.module_id, owner: registeredId === "test-channel" && !bound});
+          if (mode === "providers-prefix-refused" || mode === "providers-mint-refused") {
+            await reply(FrameType.Error, {code: mode === "providers-prefix-refused" ? "claim_prefix_refused" : "claim_mint_not_allowed", message: "fixture refusal"});
+            continue;
+          }
+        }
         if (mode === "mint-refused") {
           await reply(FrameType.Error, {code: "claim_mint_not_allowed", message: "fixture refusal"});
           continue;
         }
         const claim = (++sequence).toString().padStart(22, "X");
-        minted.set(claim, String(body.purpose));
+        minted.set(claim, {purpose: String(body.purpose), moduleId: body.module_id});
         purposes.push(String(body.purpose));
         await reply(FrameType.Response, {op, claim, expires_at_ms: Date.now() + 30000});
       } else if (op === "claim.present") {
@@ -100,7 +122,10 @@ async function run(mode: string): Promise<{code: number; out: string; err: strin
           continue;
         }
         bound = true;
+        binding = minted.get(String(body.claim));
         await reply(FrameType.Response, {op});
+      } else if (binding?.purpose === "prefix" && (op === "scope.sync" || op === "scope.apply")) {
+        await reply(FrameType.Error, {code: "claim_operation_not_allowed", message: "prefix children are brokered"});
       } else {
         if (!bound && mode === "success" && !registered && op === "catalog.list") {
           directChildren++;
@@ -140,7 +165,7 @@ async function run(mode: string): Promise<{code: number; out: string; err: strin
     if (code !== (mode === "eof" ? 1 : 0) || errors.length > 0) throw new Error(`child failed (${mode}, ${code}): ${err}; peer errors: ${errors.map(String).join("; ")}`);
     const inheritedPort = Number(/REGISTRATION_PORT=(\d+)/.exec(out)?.[1]);
     const registrations = hellos.map(({moduleId, port, launchNonce}) => ({moduleId, inherited: port === inheritedPort, launchNonce}));
-    return {code, out, err, operations, presented, purposes, registrations};
+    return {code, out, err, operations, presented, purposes, prefixMints, registrations};
   } finally {
     clearTimeout(timer);
     for (const socket of sockets) socket.destroy();
@@ -148,27 +173,61 @@ async function run(mode: string): Promise<{code: number; out: string; err: strin
   }
 }
 
-test("own id then two other ids register with only the own id on the inherited channel", async () => {
+test("own id then two prefix ids mint and present exact prefix claims without a nonce", async () => {
   const result = await run("providers-own-first");
   expect(result.out).toContain("PROVIDERS_OK");
   expect(result.registrations).toEqual([
     {moduleId: "test-channel", inherited: true, launchNonce: undefined},
-    {moduleId: "other-first", inherited: false, launchNonce: undefined},
-    {moduleId: "other-second", inherited: false, launchNonce: undefined},
+    {moduleId: "test-channel:first", inherited: false, launchNonce: undefined},
+    {moduleId: "test-channel:second", inherited: false, launchNonce: undefined},
   ]);
-  expect(result.presented).toHaveLength(1);
+  expect(result.prefixMints).toEqual([
+    {moduleId: "test-channel:first", owner: true}, {moduleId: "test-channel:second", owner: true},
+  ]);
+  expect(result.purposes).toEqual(["prefix", "prefix", "self", "self", "self", "self"]);
+  expect(result.presented).toHaveLength(3);
+  expect(result.operations.slice(0, 9)).toEqual(["HELLO", "claim.mint", "claim.present", "HELLO", "claim.mint", "claim.present", "HELLO", "scope.sync", "scope.apply"]);
   expect(result.operations).toContain("catalog.list");
   expect(result.err).toBe("");
 }, 15000);
 
-test("another id before the own id leaves the inherited channel for the own provider", async () => {
+test("a prefix provider before the owner waits then mints through the owner's channel", async () => {
   const result = await run("providers-extra-first");
   expect(result.out).toContain("PROVIDERS_OK");
   expect(result.registrations).toEqual([
-    {moduleId: "other-first", inherited: false, launchNonce: undefined},
     {moduleId: "test-channel", inherited: true, launchNonce: undefined},
+    {moduleId: "test-channel:first", inherited: false, launchNonce: undefined},
   ]);
-  expect(result.operations).toEqual(["HELLO", "HELLO"]);
+  expect(result.prefixMints).toEqual([{moduleId: "test-channel:first", owner: true}]);
+  expect(result.operations).toEqual(["HELLO", "claim.mint", "claim.present", "HELLO"]);
+  expect(result.err).toBe("");
+}, 15000);
+
+test("claim_prefix_refused falls back to plain TCP for an unrelated provider id", async () => {
+  const result = await run("providers-prefix-refused");
+  expect(result.registrations).toEqual([
+    {moduleId: "test-channel", inherited: true, launchNonce: undefined},
+    {moduleId: "other-first", inherited: false, launchNonce: undefined},
+  ]);
+  expect(result.prefixMints).toEqual([{moduleId: "other-first", owner: true}]);
+  expect(result.presented).toEqual([]);
+  expect(result.operations).toEqual(["HELLO", "claim.mint", "HELLO"]);
+  expect(result.err).toBe("");
+}, 15000);
+
+test("another prefix mint failure names the provider id and code without plain TCP fallback", async () => {
+  const result = await run("providers-mint-refused");
+  expect(result.registrations).toEqual([{moduleId: "test-channel", inherited: true, launchNonce: undefined}]);
+  expect(result.prefixMints).toEqual([{moduleId: "test-channel:first", owner: true}]);
+  expect(result.operations).toEqual(["HELLO", "claim.mint"]);
+  expect(result.err).toBe("");
+}, 15000);
+
+test("a prefix provider without a registered owner fails within its connect budget naming the id", async () => {
+  const result = await run("providers-owner-missing");
+  expect(result.registrations).toEqual([{moduleId: "test-channel", inherited: true, launchNonce: undefined}]);
+  expect(result.operations).toEqual(["HELLO"]);
+  expect(result.out).toContain("PROVIDERS_OK");
   expect(result.err).toBe("");
 }, 15000);
 
@@ -180,10 +239,10 @@ test("a second own-id provider fails with registration_already_taken naming the 
   expect(result.err).toBe("");
 }, 15000);
 
-test("another id does not inherit the launch nonce without a registration channel", async () => {
+test("another id sends the owner's launch nonce without a registration channel", async () => {
   const result = await run("legacy-other-id");
   expect(result.out).toContain("PROVIDERS_OK");
-  expect(result.registrations).toEqual([{moduleId: "other-first", inherited: false, launchNonce: undefined}]);
+  expect(result.registrations).toEqual([{moduleId: "other-first", inherited: false, launchNonce: "inherited-nonce"}]);
   expect(result.operations).toEqual(["HELLO"]);
   expect(result.err).toBe("");
 }, 15000);

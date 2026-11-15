@@ -39,6 +39,8 @@ class RegistrationOwner {
   private taken = false;
   helperTaken = false;
   broker?: ClaimBroker;
+  private onReady!: (broker: ClaimBroker) => void;
+  private readonly ready = new Promise<ClaimBroker>(resolve => { this.onReady = resolve; });
   adopt(): void {
     if (this.adoptionError) throw this.adoptionError;
     if (this.decided) return;
@@ -71,6 +73,24 @@ class RegistrationOwner {
   bind(request: ConstructorParameters<typeof ClaimBroker>[0]): void {
     if (this.broker || !this.supervised) throw new ClaimError("registration_owner_conflict");
     this.broker = new ClaimBroker(request);
+    this.onReady(this.broker);
+  }
+  async mintPrefix(moduleId: string, deadline: number): Promise<string> {
+    // Extra providers can start first, but only the launched provider may use
+    // the inherited channel. Wait for its broker within the same connect budget.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        this.ready.then(broker => {
+          if (Date.now() >= deadline) throw new ClaimError("registration_not_ready");
+          return broker.mint({purpose: "prefix", module_id: moduleId});
+        }),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new ClaimError(this.broker ? "request_timeout" : "registration_not_ready")),
+            Math.max(0, deadline - Date.now()));
+        }),
+      ]);
+    } finally { clearTimeout(timer); }
   }
 }
 const key = Symbol.for("@cortexkit/subc-client.registration-owner/v1");
@@ -90,6 +110,10 @@ export async function bindConsumer(sock: SubcSocket, deadline: number): Promise<
     if (!claim) throw new ClaimError("helper_claim_unavailable");
   }
   if (!claim) return;
+  await presentClaim(sock, claim, deadline);
+}
+
+export async function presentClaim(sock: SubcSocket, claim: string, deadline: number): Promise<void> {
   try {
     const frame = buildFrame(FrameType.Request, buildFlags(false, Priority.Passive, false), 0, 0, 1n,
       new TextEncoder().encode(JSON.stringify({op: "claim.present", claim})));

@@ -200,6 +200,9 @@ pub(crate) fn take_stream() -> Result<Option<Box<dyn ModuleStream>>, SubcModuleE
             };
             Err(SubcModuleError::RegistrationChannel(error))
         }
+        Err(RegistrationError::Transport(error)) => {
+            Err(SubcModuleError::RegistrationChannel(error))
+        }
         result => {
             result.map_err(|error| SubcModuleError::RegistrationChannel(io::Error::other(error)))
         }

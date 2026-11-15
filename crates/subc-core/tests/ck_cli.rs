@@ -3272,6 +3272,7 @@ impl UpgradeFixture {
             .env("CK_TEST_RELEASE_INDEX_PUBKEY", &index.public_key)
             .env("CK_TEST_CK_VERSION", "0.17.9")
             .env("CK_TEST_SUBC_MCP_VERSION", "0.17.9")
+            .env("CK_TEST_SCRIPT_RUNNER_BUN_VERSION", "0.1.0")
             .env("CK_TEST_AFT_VERSION", "0.55.1")
             .env("CK_TEST_CLAUSTRUM_VERSION", "0.8.0")
             .env("CK_TEST_AUTH_VERSION", "0.8.0")

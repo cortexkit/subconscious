@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.48.3
+
+- Test only: the script-runner environment test retries its runner start while Linux reports
+  "Text file busy", which happens when another test in the process forks while the freshly
+  copied runner is still open for writing.
+
 ## 0.48.2
 
 - Add an Entorhinal-backed project registry reader using the nonce-verified

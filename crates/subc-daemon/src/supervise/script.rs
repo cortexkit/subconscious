@@ -228,6 +228,26 @@ impl Delivery {
 mod tests {
     use super::*;
 
+    /// Runs `command` and collects its output, retrying while Linux answers ETXTBSY.
+    ///
+    /// A test that copies a program and then executes it can race another test in this
+    /// process that is spawning a child: between that child's fork and its exec, the child
+    /// holds a copy of every descriptor this process had open, including the copy's write
+    /// descriptor, and Linux refuses to execute a file open for writing. The window closes
+    /// within milliseconds, when that child execs, so a short bounded retry is enough.
+    #[cfg(any(target_os = "linux", windows))]
+    fn output_retrying_text_file_busy(command: &mut std::process::Command) -> std::process::Output {
+        for _ in 0..50 {
+            match command.output() {
+                Err(err) if err.kind() == io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                result => return result.unwrap(),
+            }
+        }
+        command.output().unwrap()
+    }
+
     #[test]
     fn script_runner_path_is_beside_daemon_not_path_or_config() {
         let installed = std::path::absolute("install/ck-subc").unwrap();
@@ -284,7 +304,7 @@ mod tests {
             ] {
                 parent.env(key, "unapproved");
             }
-            let output = parent.output().unwrap();
+            let output = output_retrying_text_file_busy(&mut parent);
             assert!(
                 output.status.success(),
                 "{}",

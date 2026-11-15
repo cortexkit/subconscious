@@ -22,9 +22,30 @@ use serde_json::Value;
 /// CPython's own bootstrap modules (Modules/Setup.bootstrap): the interpreter can't start
 /// or import its standard library without them.
 const INTERPRETER_MODULES: &[&str] = &[
-    "_abc", "_codecs", "_collections", "_functools", "_io", "_locale", "_operator", "_signal",
-    "_sre", "_stat", "_suggestions", "_symtable", "_sysconfig", "_thread", "_tracemalloc",
-    "_typing", "_weakref", "atexit", "errno", "faulthandler", "itertools", "posix", "pwd", "time",
+    "_abc",
+    "_codecs",
+    "_collections",
+    "_functools",
+    "_io",
+    "_locale",
+    "_operator",
+    "_signal",
+    "_sre",
+    "_stat",
+    "_suggestions",
+    "_symtable",
+    "_sysconfig",
+    "_thread",
+    "_tracemalloc",
+    "_typing",
+    "_weakref",
+    "atexit",
+    "errno",
+    "faulthandler",
+    "itertools",
+    "posix",
+    "pwd",
+    "time",
 ];
 
 /// Standard-library extensions linked on every platform. The rule for this set: an extension is
@@ -32,15 +53,59 @@ const INTERPRETER_MODULES: &[&str] = &[
 /// no file, and needs no macOS entitlement. That leaves out `_ctypes` (it loads native libraries
 /// chosen at run time), curses, readline, dbm and gdbm, tkinter, and the `_test*`/`xx*` modules.
 const STDLIB_MODULES: &[&str] = &[
-    "_asyncio", "_bisect", "_blake2", "_bz2", "_codecs_cn", "_codecs_hk", "_codecs_iso2022",
-    "_codecs_jp", "_codecs_kr", "_codecs_tw", "_contextvars", "_csv", "_datetime", "_decimal",
-    "_hashlib", "_heapq", "_json", "_lsprof", "_lzma", "_md5", "_multibytecodec", "_opcode",
-    "_pickle", "_queue", "_random", "_sha1", "_sha2", "_sha3", "_socket", "_sqlite3", "_ssl",
-    "_statistics", "_struct", "_zoneinfo", "array", "binascii", "cmath", "math", "mmap",
-    "pyexpat", "select", "unicodedata", "zlib",
+    "_asyncio",
+    "_bisect",
+    "_blake2",
+    "_bz2",
+    "_codecs_cn",
+    "_codecs_hk",
+    "_codecs_iso2022",
+    "_codecs_jp",
+    "_codecs_kr",
+    "_codecs_tw",
+    "_contextvars",
+    "_csv",
+    "_datetime",
+    "_decimal",
+    "_hashlib",
+    "_heapq",
+    "_json",
+    "_lsprof",
+    "_lzma",
+    "_md5",
+    "_multibytecodec",
+    "_opcode",
+    "_pickle",
+    "_queue",
+    "_random",
+    "_sha1",
+    "_sha2",
+    "_sha3",
+    "_socket",
+    "_sqlite3",
+    "_ssl",
+    "_statistics",
+    "_struct",
+    "_zoneinfo",
+    "array",
+    "binascii",
+    "cmath",
+    "math",
+    "mmap",
+    "pyexpat",
+    "select",
+    "unicodedata",
+    "zlib",
 ];
-const UNIX_MODULES: &[&str] =
-    &["_posixshmem", "_posixsubprocess", "fcntl", "grp", "resource", "syslog", "termios"];
+const UNIX_MODULES: &[&str] = &[
+    "_posixshmem",
+    "_posixsubprocess",
+    "fcntl",
+    "grp",
+    "resource",
+    "syslog",
+    "termios",
+];
 /// macOS only: urllib's proxy lookup, through the SystemConfiguration system framework.
 const MACOS_MODULES: &[&str] = &["_scproxy"];
 const WINDOWS_MODULES: &[&str] = &["_overlapped", "_winapi"];
@@ -62,7 +127,9 @@ fn required_env(name: &str) -> PathBuf {
 }
 
 fn text<'a>(value: &'a Value, what: &str) -> &'a str {
-    value.as_str().unwrap_or_else(|| panic!("PYTHON.json: {what} is not a string"))
+    value
+        .as_str()
+        .unwrap_or_else(|| panic!("PYTHON.json: {what} is not a string"))
 }
 
 /// Link inputs collected from PYTHON.json, in the order they were named.
@@ -106,11 +173,20 @@ fn main() {
     println!("cargo:rerun-if-changed=src/embed.c");
     println!("cargo:rerun-if-changed=tools/pack_stdlib.py");
     let info: Value = serde_json::from_slice(
-        &fs::read(&manifest).unwrap_or_else(|error| panic!("cannot read {}: {error}", manifest.display())),
+        &fs::read(&manifest)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", manifest.display())),
     )
     .unwrap_or_else(|error| panic!("{} is not valid JSON: {error}", manifest.display()));
-    let minor = text(&info["python_major_minor_version"], "python_major_minor_version");
-    assert_eq!(minor, "3.13", "the runner embeds CPython 3.13, but {} is {minor}", manifest.display());
+    let minor = text(
+        &info["python_major_minor_version"],
+        "python_major_minor_version",
+    );
+    assert_eq!(
+        minor,
+        "3.13",
+        "the runner embeds CPython 3.13, but {} is {minor}",
+        manifest.display()
+    );
     let build = &info["build_info"];
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
     let windows = env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
@@ -119,7 +195,10 @@ fn main() {
     // The archive's own init table names every module it built, _ctypes included; the runner
     // generates its own table below instead.
     let archive_inittab = build["inittab_object"].as_str();
-    for object in build["core"]["objs"].as_array().expect("PYTHON.json: build_info.core.objs") {
+    for object in build["core"]["objs"]
+        .as_array()
+        .expect("PYTHON.json: build_info.core.objs")
+    {
         let object = text(object, "core object");
         if Some(object) != archive_inittab {
             plan.objects.push(dist.join(object));
@@ -128,20 +207,35 @@ fn main() {
     plan.add_links(&dist, &build["core"]["links"], "the CPython core");
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    let mut wanted: Vec<&str> = INTERPRETER_MODULES.iter().chain(STDLIB_MODULES).copied().collect();
+    let mut wanted: Vec<&str> = INTERPRETER_MODULES
+        .iter()
+        .chain(STDLIB_MODULES)
+        .copied()
+        .collect();
     match target_os.as_str() {
         "windows" => wanted.extend(WINDOWS_MODULES),
         "macos" => wanted.extend(UNIX_MODULES.iter().chain(MACOS_MODULES)),
         _ => wanted.extend(UNIX_MODULES),
     }
-    let extensions = build["extensions"].as_object().expect("PYTHON.json: build_info.extensions");
+    let extensions = build["extensions"]
+        .as_object()
+        .expect("PYTHON.json: build_info.extensions");
     for name in &wanted {
-        assert!(extensions.contains_key(*name), "the archive has no {name} module");
+        assert!(
+            extensions.contains_key(*name),
+            "the archive has no {name} module"
+        );
     }
-    wanted.extend(OPTIONAL_MODULES.iter().filter(|name| extensions.contains_key(**name)));
+    wanted.extend(
+        OPTIONAL_MODULES
+            .iter()
+            .filter(|name| extensions.contains_key(**name)),
+    );
     let mut inittab = BTreeMap::new();
     for (name, variants) in extensions {
-        let variants = variants.as_array().expect("PYTHON.json: extension variants");
+        let variants = variants
+            .as_array()
+            .expect("PYTHON.json: extension variants");
         let variant = variants
             .iter()
             .find(|variant| variant["variant"].as_str() == Some("default"))
@@ -149,12 +243,15 @@ fn main() {
             .unwrap_or_else(|| panic!("PYTHON.json: {name} has no variant"));
         let in_core = variant["in_core"].as_bool() == Some(true);
         let required = variant["required"].as_bool() == Some(true);
-        if REFUSED_MODULES.contains(&name.as_str()) || !(in_core || required || wanted.contains(&name.as_str())) {
+        if REFUSED_MODULES.contains(&name.as_str())
+            || !(in_core || required || wanted.contains(&name.as_str()))
+        {
             continue;
         }
         if !in_core {
             for object in variant["objs"].as_array().into_iter().flatten() {
-                plan.objects.push(dist.join(text(object, "extension object")));
+                plan.objects
+                    .push(dist.join(text(object, "extension object")));
             }
             plan.add_links(&dist, &variant["links"], name);
         }
@@ -177,15 +274,30 @@ fn main() {
     let inittab_c = out.join("inittab.c");
     fs::write(&inittab_c, source).expect("write inittab.c");
 
-    let include = dist.join(text(&info["python_paths"]["include"], "python_paths.include"));
+    let include = dist.join(text(
+        &info["python_paths"]["include"],
+        "python_paths.include",
+    ));
     let mut embed = cc::Build::new();
-    embed.file("src/embed.c").file(&inittab_c).include(&include).warnings(true).cargo_metadata(false);
+    embed
+        .file("src/embed.c")
+        .file(&inittab_c)
+        .include(&include)
+        .warnings(true)
+        .cargo_metadata(false);
     embed.compile("ck_embed");
-    let embed_library = out.join(if windows { "ck_embed.lib" } else { "libck_embed.a" });
+    let embed_library = out.join(if windows {
+        "ck_embed.lib"
+    } else {
+        "libck_embed.a"
+    });
 
     // Everything CPython goes to the runner binary only, never to test binaries.
     let link = |argument: &dyn AsRef<std::ffi::OsStr>| {
-        println!("cargo:rustc-link-arg-bins={}", Path::new(argument.as_ref()).display());
+        println!(
+            "cargo:rustc-link-arg-bins={}",
+            Path::new(argument.as_ref()).display()
+        );
     };
     link(&embed_library);
     for object in &plan.objects {
@@ -204,22 +316,47 @@ fn main() {
 
     // The archive's objects may be LLVM bitcode, which only an LLVM lld at least as new as the
     // archive's LLVM can link. rustc ships one (rust-lld), so the final link uses it.
-    if let Some(format) = build["object_file_format"].as_str().and_then(|format| format.strip_prefix("llvm-bitcode:")) {
-        let major = |version: &str| version.split('.').next().and_then(|major| major.parse::<u32>().ok()).unwrap_or(0);
+    if let Some(format) = build["object_file_format"]
+        .as_str()
+        .and_then(|format| format.strip_prefix("llvm-bitcode:"))
+    {
+        let major = |version: &str| {
+            version
+                .split('.')
+                .next()
+                .and_then(|major| major.parse::<u32>().ok())
+                .unwrap_or(0)
+        };
         let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
-        let version = Command::new(&rustc).arg("-vV").output().expect("run rustc -vV");
+        let version = Command::new(&rustc)
+            .arg("-vV")
+            .output()
+            .expect("run rustc -vV");
         let version = String::from_utf8_lossy(&version.stdout);
-        let rustc_llvm = version.lines().find_map(|line| line.strip_prefix("LLVM version: ")).unwrap_or_default();
+        let rustc_llvm = version
+            .lines()
+            .find_map(|line| line.strip_prefix("LLVM version: "))
+            .unwrap_or_default();
         assert!(
             major(rustc_llvm) >= major(format),
             "the archive's objects are LLVM {format} bitcode, but rustc's LLVM is {rustc_llvm}: \
              use a Rust toolchain whose LLVM is at least as new"
         );
-        let sysroot = Command::new(&rustc).args(["--print", "sysroot"]).output().expect("run rustc --print sysroot");
+        let sysroot = Command::new(&rustc)
+            .args(["--print", "sysroot"])
+            .output()
+            .expect("run rustc --print sysroot");
         let sysroot = String::from_utf8_lossy(&sysroot.stdout).trim().to_string();
         let host = env::var("HOST").expect("HOST");
-        let gcc_ld = Path::new(&sysroot).join("lib/rustlib").join(host).join("bin/gcc-ld");
-        assert!(gcc_ld.is_dir(), "rust-lld is missing from {}", gcc_ld.display());
+        let gcc_ld = Path::new(&sysroot)
+            .join("lib/rustlib")
+            .join(host)
+            .join("bin/gcc-ld");
+        assert!(
+            gcc_ld.is_dir(),
+            "rust-lld is missing from {}",
+            gcc_ld.display()
+        );
         link(&"-fuse-ld=lld");
         link(&format!("-B{}", gcc_ld.display()));
     }
@@ -231,10 +368,18 @@ fn main() {
         .arg(&dist)
         .arg(&table)
         .status()
-        .unwrap_or_else(|error| panic!("cannot run CK_PYTHON_HOST {}: {error}", host_python.display()));
+        .unwrap_or_else(|error| {
+            panic!(
+                "cannot run CK_PYTHON_HOST {}: {error}",
+                host_python.display()
+            )
+        });
     assert!(status.success(), "compiling the standard library failed");
 
-    println!("cargo:rustc-env=CK_PYTHON_VERSION={}", text(&info["python_version"], "python_version"));
+    println!(
+        "cargo:rustc-env=CK_PYTHON_VERSION={}",
+        text(&info["python_version"], "python_version")
+    );
     // Lets the tests drive the runner with the shared pipe harness without a system Python, and
     // list the standard library the runner ships.
     println!("cargo:rustc-env=CK_TEST_PYTHON={}", host_python.display());

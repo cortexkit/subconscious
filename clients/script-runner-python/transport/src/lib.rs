@@ -46,8 +46,13 @@ where
 {
     for name in names {
         let shown = name.to_string_lossy().into_owned();
-        let key = if windows { shown.to_uppercase() } else { shown.clone() };
-        let loader = ["NODE_OPTIONS", "BUN_OPTIONS", "BUN_INSTALL", "NODE_PATH"].contains(&key.as_str())
+        let key = if windows {
+            shown.to_uppercase()
+        } else {
+            shown.clone()
+        };
+        let loader = ["NODE_OPTIONS", "BUN_OPTIONS", "BUN_INSTALL", "NODE_PATH"]
+            .contains(&key.as_str())
             || key.starts_with("BUN_CONFIG_");
         if key.starts_with("PYTHON") || loader {
             return Some(Refused(format!("script_environment_refused: {shown}")));
@@ -132,7 +137,9 @@ fn open_unix_pipe(value: &str) -> Result<std::fs::File, Refused> {
     // must stay open, because it may belong to other code in this process.
     // SAFETY: descriptor 6 is only borrowed here; ManuallyDrop keeps it from being closed.
     let borrowed = ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(6) });
-    let metadata = borrowed.metadata().map_err(|_| pipe_refused("wrong pipe identity"))?;
+    let metadata = borrowed
+        .metadata()
+        .map_err(|_| pipe_refused("wrong pipe identity"))?;
     if !metadata.file_type().is_fifo() || metadata.ino() != inode {
         return Err(pipe_refused("wrong pipe identity"));
     }
@@ -163,7 +170,8 @@ mod tests {
         // It holds two JSON strings; this reads them without a JSON crate.
         let text = include_str!("../../../script-runner/tests/script-pipe-vector.json");
         let field = |name: &str| {
-            let start = text.find(&format!("\"{name}\": \"")).expect("vector field") + name.len() + 5;
+            let start =
+                text.find(&format!("\"{name}\": \"")).expect("vector field") + name.len() + 5;
             let mut value = String::new();
             let mut chars = text[start..].chars();
             while let Some(c) = chars.next() {
@@ -204,7 +212,10 @@ mod tests {
         let mut swapped = source.clone();
         swapped[0] ^= 1;
         bytes.extend_from_slice(&swapped);
-        assert_eq!(read_framed(&mut &bytes[..]), Err(pipe_refused("digest mismatch")));
+        assert_eq!(
+            read_framed(&mut &bytes[..]),
+            Err(pipe_refused("digest mismatch"))
+        );
     }
 
     #[test]
@@ -214,24 +225,74 @@ mod tests {
             (good[..51].to_vec(), "short pipe"),
             (good[..good.len() - 1].to_vec(), "short pipe"),
             ([good.clone(), vec![0]].concat(), "extra byte"),
-            ({ let mut b = good.clone(); b[0] ^= 1; b }, "bad magic or version"),
-            ({ let mut b = good.clone(); b[8] = 2; b }, "bad magic or version"),
-            ({ let mut b = good.clone(); b[20] ^= 1; b }, "digest mismatch"),
-            ({ let mut b = good.clone(); b[12..20].copy_from_slice(&(MAX_SCRIPT_BYTES + 1).to_le_bytes()); b }, "script exceeds 32 MiB"),
+            (
+                {
+                    let mut b = good.clone();
+                    b[0] ^= 1;
+                    b
+                },
+                "bad magic or version",
+            ),
+            (
+                {
+                    let mut b = good.clone();
+                    b[8] = 2;
+                    b
+                },
+                "bad magic or version",
+            ),
+            (
+                {
+                    let mut b = good.clone();
+                    b[20] ^= 1;
+                    b
+                },
+                "digest mismatch",
+            ),
+            (
+                {
+                    let mut b = good.clone();
+                    b[12..20].copy_from_slice(&(MAX_SCRIPT_BYTES + 1).to_le_bytes());
+                    b
+                },
+                "script exceeds 32 MiB",
+            ),
         ];
         for (bytes, reason) in cases {
-            assert_eq!(read_framed(&mut &bytes[..]), Err(pipe_refused(reason)), "{reason}");
+            assert_eq!(
+                read_framed(&mut &bytes[..]),
+                Err(pipe_refused(reason)),
+                "{reason}"
+            );
         }
     }
 
     #[test]
     fn python_and_loader_variables_are_refused() {
-        let refused = |names: &[&str], windows| environment_refusal(names.iter().map(OsString::from), windows);
-        for name in ["PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONSAFEPATH", "NODE_OPTIONS", "BUN_CONFIG_X"] {
-            assert_eq!(refused(&["HOME", name], false), Some(Refused(format!("script_environment_refused: {name}"))));
+        let refused = |names: &[&str], windows| {
+            environment_refusal(names.iter().map(OsString::from), windows)
+        };
+        for name in [
+            "PYTHONPATH",
+            "PYTHONHOME",
+            "PYTHONSTARTUP",
+            "PYTHONSAFEPATH",
+            "NODE_OPTIONS",
+            "BUN_CONFIG_X",
+        ] {
+            assert_eq!(
+                refused(&["HOME", name], false),
+                Some(Refused(format!("script_environment_refused: {name}")))
+            );
         }
-        assert_eq!(refused(&["Pythonpath"], true), Some(Refused("script_environment_refused: Pythonpath".into())));
-        assert_eq!(refused(&["Pythonpath", "HOME", "SUBC_SCRIPT_FD"], false), None);
+        assert_eq!(
+            refused(&["Pythonpath"], true),
+            Some(Refused("script_environment_refused: Pythonpath".into()))
+        );
+        assert_eq!(
+            refused(&["Pythonpath", "HOME", "SUBC_SCRIPT_FD"], false),
+            None
+        );
     }
 
     #[cfg(unix)]
@@ -239,7 +300,11 @@ mod tests {
     fn descriptor_identity_must_name_descriptor_six() {
         assert_eq!(unix_identity("6:42"), Ok(42));
         for value in ["5:42", "6:", ":42", "6:4x", "06:42x", "6:42:1", "+6:42"] {
-            assert_eq!(unix_identity(value), Err(pipe_refused("invalid descriptor identity")), "{value}");
+            assert_eq!(
+                unix_identity(value),
+                Err(pipe_refused("invalid descriptor identity")),
+                "{value}"
+            );
         }
     }
 }

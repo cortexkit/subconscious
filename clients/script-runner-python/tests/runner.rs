@@ -23,7 +23,9 @@ fn manifest_dir() -> &'static Path {
 
 /// A fresh scratch folder under the crate's target directory.
 fn scratch(name: &str) -> PathBuf {
-    let dir = manifest_dir().join("target/scratch").join(format!("{name}-{}", std::process::id()));
+    let dir = manifest_dir()
+        .join("target/scratch")
+        .join(format!("{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("scratch folder");
     dir
@@ -34,8 +36,11 @@ fn clean_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut command = Command::new(program);
     for (name, _) in std::env::vars_os() {
         let key = name.to_string_lossy().to_uppercase();
-        let refused = key.starts_with("PYTHON") || key.starts_with("BUN_") || key.starts_with("SUBC_")
-            || key == "NODE_OPTIONS" || key == "NODE_PATH";
+        let refused = key.starts_with("PYTHON")
+            || key.starts_with("BUN_")
+            || key.starts_with("SUBC_")
+            || key == "NODE_OPTIONS"
+            || key == "NODE_PATH";
         if refused {
             command.env_remove(&name);
         }
@@ -50,19 +55,43 @@ struct Outcome {
 }
 
 /// Runs `bytes` through the daemon's channel. `scenario` is the harness's fault to inject.
-fn run_with(executable: &Path, bytes: &[u8], scenario: &str, env: &[(&str, &str)], cwd: Option<&Path>) -> Outcome {
+fn run_with(
+    executable: &Path,
+    bytes: &[u8],
+    scenario: &str,
+    env: &[(&str, &str)],
+    cwd: Option<&Path>,
+) -> Outcome {
     let launcher = manifest_dir().join("../script-runner/tests/pipe-launcher.py");
     let mut command = clean_command(env!("CK_TEST_PYTHON"));
     // -I keeps the harness's own interpreter from reading the PYTHON* variables under test.
-    command.arg("-I").arg(launcher).arg(executable).arg(scenario);
+    command
+        .arg("-I")
+        .arg(launcher)
+        .arg(executable)
+        .arg(scenario);
     command.envs(env.iter().copied());
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
-    let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().expect("harness starts");
-    child.stdin.take().expect("stdin").write_all(bytes).expect("payload written");
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("harness starts");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(bytes)
+        .expect("payload written");
     let output = child.wait_with_output().expect("harness ends");
-    assert!(output.status.success(), "harness failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "harness failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let result: Value = serde_json::from_slice(&output.stdout).expect("harness JSON");
     assert_eq!(result["write_errors"], serde_json::json!([]));
     Outcome {
@@ -77,7 +106,11 @@ fn run(script: &str) -> Outcome {
 }
 
 fn check(file: &Path) -> Outcome {
-    let output = clean_command(runner()).arg("--check").arg(file).output().expect("runner starts");
+    let output = clean_command(runner())
+        .arg("--check")
+        .arg(file)
+        .output()
+        .expect("runner starts");
     Outcome {
         code: i64::from(output.status.code().unwrap_or(-1)),
         out: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -87,27 +120,55 @@ fn check(file: &Path) -> Outcome {
 
 /// Writes a zip bundle with the harness's Python: the runner's tests carry no zip writer.
 fn bundle(path: &Path, entries: &[(&str, &[u8])]) {
-    let mut program = String::from("import sys, zipfile\nwith zipfile.ZipFile(sys.argv[1], 'w') as z:\n");
+    let mut program =
+        String::from("import sys, zipfile\nwith zipfile.ZipFile(sys.argv[1], 'w') as z:\n");
     for (name, data) in entries {
-        program.push_str(&format!("    z.writestr({name:?}, bytes({:?}))\n", data.to_vec()));
+        program.push_str(&format!(
+            "    z.writestr({name:?}, bytes({:?}))\n",
+            data.to_vec()
+        ));
     }
-    let status = clean_command(env!("CK_TEST_PYTHON")).arg("-I").arg("-c").arg(program).arg(path).status().expect("python");
+    let status = clean_command(env!("CK_TEST_PYTHON"))
+        .arg("-I")
+        .arg("-c")
+        .arg(program)
+        .arg(path)
+        .status()
+        .expect("python");
     assert!(status.success());
 }
 
 #[test]
 fn version_probe_runs_without_a_script_pipe() {
-    let output = clean_command(runner()).arg("--version").output().expect("runner starts");
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "ck-script-runner-python 0.1.0 (CPython 3.13.18)\n");
+    let output = clean_command(runner())
+        .arg("--version")
+        .output()
+        .expect("runner starts");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "ck-script-runner-python 0.1.0 (CPython 3.13.18)\n"
+    );
     assert!(output.status.success() && output.stderr.is_empty());
 }
 
 fn shared_vector() -> (Vec<u8>, Vec<u8>) {
-    let text = fs::read_to_string(manifest_dir().join("../script-runner/tests/script-pipe-vector.json")).expect("vector");
+    let text =
+        fs::read_to_string(manifest_dir().join("../script-runner/tests/script-pipe-vector.json"))
+            .expect("vector");
     let vector: Value = serde_json::from_str(&text).expect("vector JSON");
     let hex = vector["header_hex"].as_str().expect("header");
-    let header = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex")).collect();
-    (header, vector["source"].as_str().expect("source").as_bytes().to_vec())
+    let header = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex"))
+        .collect();
+    (
+        header,
+        vector["source"]
+            .as_str()
+            .expect("source")
+            .as_bytes()
+            .to_vec(),
+    )
 }
 
 #[test]
@@ -116,8 +177,18 @@ fn shared_vector_header_admits_its_bytes_to_python() {
     let (header, source) = shared_vector();
     let result = run_with(&runner(), &[header, source].concat(), "valid", &[], None);
     assert_eq!(result.code, 1, "{}", result.err);
-    assert!(!result.err.contains("script_pipe_refused"), "{}", result.err);
-    assert!(result.err.contains("NameError: name 'console' is not defined"), "{}", result.err);
+    assert!(
+        !result.err.contains("script_pipe_refused"),
+        "{}",
+        result.err
+    );
+    assert!(
+        result
+            .err
+            .contains("NameError: name 'console' is not defined"),
+        "{}",
+        result.err
+    );
 }
 
 #[test]
@@ -126,7 +197,11 @@ fn shared_vector_header_refuses_other_bytes() {
     source[0] ^= 1;
     let result = run_with(&runner(), &[header, source].concat(), "valid", &[], None);
     assert_eq!((result.code, result.out.as_str()), (1, ""));
-    assert!(result.err.contains("script_pipe_refused: digest mismatch"), "{}", result.err);
+    assert!(
+        result.err.contains("script_pipe_refused: digest mismatch"),
+        "{}",
+        result.err
+    );
 }
 
 #[test]
@@ -138,24 +213,59 @@ fn transport_faults_are_refused_before_any_code_runs() {
         ("valid", good[..HEADER_LEN - 1].to_vec()),
         ("valid", good[..good.len() - 1].to_vec()),
         ("valid", [good.clone(), vec![0]].concat()),
-        ("valid", { let mut bytes = good.clone(); bytes[0] ^= 1; bytes }),
-        ("valid", { let mut bytes = good.clone(); bytes[8] = 2; bytes }),
-        ("valid", { let mut bytes = good.clone(); bytes[20] ^= 1; bytes }),
+        ("valid", {
+            let mut bytes = good.clone();
+            bytes[0] ^= 1;
+            bytes
+        }),
+        ("valid", {
+            let mut bytes = good.clone();
+            bytes[8] = 2;
+            bytes
+        }),
+        ("valid", {
+            let mut bytes = good.clone();
+            bytes[20] ^= 1;
+            bytes
+        }),
     ];
     for (index, (scenario, bytes)) in faults.into_iter().enumerate() {
         let result = run_with(&runner(), &bytes, scenario, &[], None);
         assert_ne!(result.code, 0, "fault {index} ({scenario})");
         assert_eq!(result.out, "", "fault {index} ({scenario})");
-        assert!(result.err.contains("script_pipe_refused:"), "fault {index} ({scenario}): {}", result.err);
+        assert!(
+            result.err.contains("script_pipe_refused:"),
+            "fault {index} ({scenario}): {}",
+            result.err
+        );
     }
 }
 
 #[test]
 fn python_and_loader_variables_are_refused_at_start() {
-    for name in ["PYTHONSTARTUP", "PYTHONPATH", "PYTHONHOME", "PYTHONSAFEPATH", "NODE_OPTIONS", "BUN_CONFIG_TEST"] {
-        let result = run_with(&runner(), &frame(b"print('EVALUATED')\n"), "valid", &[(name, "")], None);
+    for name in [
+        "PYTHONSTARTUP",
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "PYTHONSAFEPATH",
+        "NODE_OPTIONS",
+        "BUN_CONFIG_TEST",
+    ] {
+        let result = run_with(
+            &runner(),
+            &frame(b"print('EVALUATED')\n"),
+            "valid",
+            &[(name, "")],
+            None,
+        );
         assert_eq!((result.code, result.out.as_str()), (1, ""), "{name}");
-        assert!(result.err.contains(&format!("script_environment_refused: {name}")), "{name}: {}", result.err);
+        assert!(
+            result
+                .err
+                .contains(&format!("script_environment_refused: {name}")),
+            "{name}: {}",
+            result.err
+        );
     }
 }
 
@@ -173,12 +283,31 @@ fn nothing_beside_the_runner_or_in_the_working_folder_is_read() {
     for folder in [&bin, &cwd, &pth] {
         fs::write(folder.join("diskmod.py"), "print('DISK_EVALUATED')\n").expect("module");
         fs::write(folder.join("nativemod.so"), b"\x7fELF not really").expect("native");
-        fs::write(folder.join("nativemod.cpython-313-darwin.so"), b"\x7fELF not really").expect("native");
-        fs::write(folder.join("nativemod.cpython-313-x86_64-linux-gnu.so"), b"\x7fELF not really").expect("native");
+        fs::write(
+            folder.join("nativemod.cpython-313-darwin.so"),
+            b"\x7fELF not really",
+        )
+        .expect("native");
+        fs::write(
+            folder.join("nativemod.cpython-313-x86_64-linux-gnu.so"),
+            b"\x7fELF not really",
+        )
+        .expect("native");
     }
     // Startup files CPython would honour beside an ordinary interpreter.
-    fs::write(bin.join("pyvenv.cfg"), format!("home = {}\ninclude-system-site-packages = true\n", pth.display())).unwrap();
-    fs::write(bin.join("ck-script-runner-python._pth"), format!("{}\nimport diskmod\n", pth.display())).unwrap();
+    fs::write(
+        bin.join("pyvenv.cfg"),
+        format!(
+            "home = {}\ninclude-system-site-packages = true\n",
+            pth.display()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        bin.join("ck-script-runner-python._pth"),
+        format!("{}\nimport diskmod\n", pth.display()),
+    )
+    .unwrap();
     fs::write(bin.join("pybuilddir.txt"), "../pth\n").unwrap();
     let script = r#"
 import os, sys
@@ -190,7 +319,13 @@ for name in ("diskmod", "nativemod"):
     except ModuleNotFoundError as error:
         print(type(error).__name__, error)
 "#;
-    let result = run_with(&executable, &frame(script.as_bytes()), "valid", &[], Some(&cwd));
+    let result = run_with(
+        &executable,
+        &frame(script.as_bytes()),
+        "valid",
+        &[],
+        Some(&cwd),
+    );
     assert_eq!(result.err, "");
     assert_eq!(
         result.out,
@@ -203,7 +338,11 @@ for name in ("diskmod", "nativemod"):
 
 #[test]
 fn built_in_modules_import_and_ctypes_does_not() {
-    let unix = if cfg!(unix) { "'_posixsubprocess', 'fcntl', 'termios', " } else { "" };
+    let unix = if cfg!(unix) {
+        "'_posixsubprocess', 'fcntl', 'termios', "
+    } else {
+        ""
+    };
     let script = format!(
         r#"
 import importlib, sys
@@ -224,29 +363,64 @@ for name in ('_ctypes', 'ctypes'):
     );
     let result = run(&script);
     assert_eq!(result.err, "");
-    assert_eq!(result.out, format!("BUILTINS_OK 786a02f7\n_ctypes {REFUSAL}\n_ctypes {REFUSAL}\n"));
+    assert_eq!(
+        result.out,
+        format!("BUILTINS_OK 786a02f7\n_ctypes {REFUSAL}\n_ctypes {REFUSAL}\n")
+    );
 }
 
 /// Modules whose import is expected to fail, by the missing module the failure names: the
 /// extensions the runner leaves out on purpose.
-const LEFT_OUT: &[&str] = &["_ctypes", "_curses", "_curses_panel", "readline", "_dbm", "_gdbm", "_tkinter", "tkinter"];
+const LEFT_OUT: &[&str] = &[
+    "_ctypes",
+    "_curses",
+    "_curses_panel",
+    "readline",
+    "_dbm",
+    "_gdbm",
+    "_tkinter",
+    "tkinter",
+];
 
 #[test]
 fn every_shipped_standard_library_module_imports() {
     let stdlib = Path::new(env!("CK_TEST_STDLIB"));
-    let dropped = ["test", "idlelib", "tkinter", "turtledemo", "ensurepip", "lib2to3", "venv", "pydoc_data"];
+    let dropped = [
+        "test",
+        "idlelib",
+        "tkinter",
+        "turtledemo",
+        "ensurepip",
+        "lib2to3",
+        "venv",
+        "pydoc_data",
+    ];
     // Importing these has side effects (a browser opens, text prints) and proves nothing more.
     let noisy = ["antigravity", "this", "__hello__", "__phello__"];
     let mut names = BTreeSet::new();
     for entry in fs::read_dir(stdlib).expect("stdlib") {
         let path = entry.expect("entry").path();
-        let file = path.file_name().expect("name").to_string_lossy().into_owned();
-        let name = file.strip_suffix(".py").map(str::to_string).or_else(|| path.join("__init__.py").exists().then_some(file));
-        if let Some(name) = name.filter(|name| !dropped.contains(&name.as_str()) && !noisy.contains(&name.as_str())) {
+        let file = path
+            .file_name()
+            .expect("name")
+            .to_string_lossy()
+            .into_owned();
+        let name = file
+            .strip_suffix(".py")
+            .map(str::to_string)
+            .or_else(|| path.join("__init__.py").exists().then_some(file));
+        if let Some(name) =
+            name.filter(|name| !dropped.contains(&name.as_str()) && !noisy.contains(&name.as_str()))
+        {
             names.insert(name);
         }
     }
-    assert!(names.len() > 150, "found only {} modules in {}", names.len(), stdlib.display());
+    assert!(
+        names.len() > 150,
+        "found only {} modules in {}",
+        names.len(),
+        stdlib.display()
+    );
     let script = format!(
         r#"
 import sys
@@ -266,9 +440,17 @@ print('IMPORTED', len({names:?}))
     let unexpected: Vec<&str> = result
         .out
         .lines()
-        .filter(|line| line.starts_with("ERROR") || (line.starts_with("IMPORT_FAILED") && !LEFT_OUT.contains(&line.rsplit(' ').next().unwrap_or(""))))
+        .filter(|line| {
+            line.starts_with("ERROR")
+                || (line.starts_with("IMPORT_FAILED")
+                    && !LEFT_OUT.contains(&line.rsplit(' ').next().unwrap_or("")))
+        })
         .collect();
-    assert!(unexpected.is_empty(), "unexpected import failures: {unexpected:#?}\nstderr: {}", result.err);
+    assert!(
+        unexpected.is_empty(),
+        "unexpected import failures: {unexpected:#?}\nstderr: {}",
+        result.err
+    );
     assert!(result.out.contains(&format!("IMPORTED {}", names.len())));
     // Importing every module is quiet apart from the script's own prints.
     assert!(!result.err.contains("ERROR:"), "{}", result.err);
@@ -278,14 +460,29 @@ print('IMPORTED', len({names:?}))
 fn bundle_modules_are_served_from_the_piped_bytes() {
     let dir = scratch("bundle");
     let path = dir.join("app.pyz");
-    bundle(&path, &[
-        ("__main__.py", b"import pkg.mod\nprint(pkg.mod.VALUE, __file__, __name__)\n"),
-        ("pkg/__init__.py", b""),
-        ("pkg/mod.py", b"VALUE = 'BUNDLE_OK'\n"),
-        ("README.txt", b"data files are allowed"),
-    ]);
-    let result = run_with(&runner(), &frame(&fs::read(&path).unwrap()), "valid", &[], None);
-    assert_eq!((result.out.as_str(), result.err.as_str()), ("BUNDLE_OK ck-script:main __main__\n", ""));
+    bundle(
+        &path,
+        &[
+            (
+                "__main__.py",
+                b"import pkg.mod\nprint(pkg.mod.VALUE, __file__, __name__)\n",
+            ),
+            ("pkg/__init__.py", b""),
+            ("pkg/mod.py", b"VALUE = 'BUNDLE_OK'\n"),
+            ("README.txt", b"data files are allowed"),
+        ],
+    );
+    let result = run_with(
+        &runner(),
+        &frame(&fs::read(&path).unwrap()),
+        "valid",
+        &[],
+        None,
+    );
+    assert_eq!(
+        (result.out.as_str(), result.err.as_str()),
+        ("BUNDLE_OK ck-script:main __main__\n", "")
+    );
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -299,12 +496,31 @@ fn bundle_holding_a_native_file_is_refused_at_load() {
     ];
     for (name, data) in cases {
         let path = dir.join("native.pyz");
-        bundle(&path, &[("__main__.py", b"print('EVALUATED')\n"), ("pkg/__init__.py", b""), (name, data)]);
-        let result = run_with(&runner(), &frame(&fs::read(&path).unwrap()), "valid", &[], None);
+        bundle(
+            &path,
+            &[
+                ("__main__.py", b"print('EVALUATED')\n"),
+                ("pkg/__init__.py", b""),
+                (name, data),
+            ],
+        );
+        let result = run_with(
+            &runner(),
+            &frame(&fs::read(&path).unwrap()),
+            "valid",
+            &[],
+            None,
+        );
         assert_eq!((result.code, result.out.as_str()), (1, ""), "{name}");
-        assert_eq!(result.err, format!("script_bundle_refused: native file {name}\n"));
+        assert_eq!(
+            result.err,
+            format!("script_bundle_refused: native file {name}\n")
+        );
         let checked = check(&path);
-        assert_eq!((checked.code, checked.err), (1, format!("script_bundle_refused: native file {name}\n")));
+        assert_eq!(
+            (checked.code, checked.err),
+            (1, format!("script_bundle_refused: native file {name}\n"))
+        );
     }
     let _ = fs::remove_dir_all(dir);
 }
@@ -332,7 +548,12 @@ except ImportError:
     )
     .unwrap();
     let result = check(&file);
-    assert_eq!((result.code, result.out.as_str()), (0, ""), "{}", result.err);
+    assert_eq!(
+        (result.code, result.out.as_str()),
+        (0, ""),
+        "{}",
+        result.err
+    );
     let expected = [
         "script_load_warning: exec at line 2: runs code that is not in the approved script",
         "script_load_warning: eval at line 3: runs code that is not in the approved script",
@@ -354,6 +575,9 @@ fn check_mode_refuses_imports_the_runner_cannot_serve() {
     let result = check(&file);
     assert_eq!(result.code, 1);
     assert_eq!(result.out, "");
-    assert_eq!(result.err, "script_import_refused: requests\nscript_import_refused: yaml\n");
+    assert_eq!(
+        result.err,
+        "script_import_refused: requests\nscript_import_refused: yaml\n"
+    );
     let _ = fs::remove_dir_all(dir);
 }

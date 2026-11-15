@@ -30,7 +30,9 @@ extern "C" {
 }
 
 fn executable_path() -> CString {
-    let path = std::env::current_exe().map(|path| path.into_os_string()).unwrap_or_else(|_| "ck-script-runner-python".into());
+    let path = std::env::current_exe()
+        .map(|path| path.into_os_string())
+        .unwrap_or_else(|_| "ck-script-runner-python".into());
     #[cfg(unix)]
     let bytes = std::os::unix::ffi::OsStringExt::into_vec(path);
     #[cfg(not(unix))]
@@ -42,7 +44,13 @@ fn run_python(mode: c_int, payload: &[u8]) -> ExitCode {
     let executable = executable_path();
     // SAFETY: every pointer stays valid for the call, and BOOTSTRAP ends with NUL.
     let code = unsafe {
-        ck_python_main(executable.as_ptr(), BOOTSTRAP.as_ptr().cast(), mode, payload.as_ptr(), payload.len())
+        ck_python_main(
+            executable.as_ptr(),
+            BOOTSTRAP.as_ptr().cast(),
+            mode,
+            payload.as_ptr(),
+            payload.len(),
+        )
     };
     ExitCode::from(u8::try_from(code).unwrap_or(1))
 }
@@ -56,13 +64,20 @@ fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     match args.as_slice() {
         [flag] if flag == "--version" => {
-            println!("ck-script-runner-python {} (CPython {})", env!("CARGO_PKG_VERSION"), env!("CK_PYTHON_VERSION"));
+            println!(
+                "ck-script-runner-python {} (CPython {})",
+                env!("CARGO_PKG_VERSION"),
+                env!("CK_PYTHON_VERSION")
+            );
             ExitCode::SUCCESS
         }
         [flag, file] if flag == "--check" => match std::fs::read(file) {
             Ok(source) => run_python(MODE_CHECK, &source),
             Err(error) => {
-                eprintln!("script_check_failed: cannot read {}: {error}", file.to_string_lossy());
+                eprintln!(
+                    "script_check_failed: cannot read {}: {error}",
+                    file.to_string_lossy()
+                );
                 ExitCode::FAILURE
             }
         },

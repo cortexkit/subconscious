@@ -13,10 +13,20 @@ python="${2:?usage: $0 <runner> <python>}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 launcher="$here/../../script-runner/tests/pipe-launcher.py"
 
-# Same convention as macos-sign-notarize.sh: a copy under /tmp named ckdev-<name>, so a smoke
-# process is never listed under a production name and never stalls on a fresh $TMPDIR path.
+# Same convention as macos-sign-notarize.sh: a copy named ckdev-<name>, so a smoke process is
+# never listed under a production ck-* name. It lives under /tmp rather than $TMPDIR because
+# macOS can take minutes to run a brand-new executable from the per-user $TMPDIR the first time.
 smoke_dir="$(mktemp -d /tmp/subc-smoke.XXXXXX)"
-trap 'rm -rf "$smoke_dir"' EXIT
+finished=0
+cleanup() {
+  rm -rf "$smoke_dir"
+  # Fail closed: any exit before the last line, even one that reports success, is a failure.
+  if [[ "$finished" != 1 ]]; then
+    echo "signed runner smoke run did not finish" >&2
+    exit 1
+  fi
+}
+trap cleanup EXIT
 smoke="$smoke_dir/ckdev-script-runner-python"
 cp -p "$binary" "$smoke"
 
@@ -34,3 +44,4 @@ if result["code"] != 0 or not result["out"].startswith("SMOKE_OK") or result["er
     sys.exit(f"signed runner failed its smoke run: {result}")
 print(result["out"].strip())' "$result"
 echo "signed ck-script-runner-python runs: $version"
+finished=1

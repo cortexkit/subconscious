@@ -23,9 +23,10 @@ jobs:
           - {os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, sign: ""}
           - {os: macos-latest, target: aarch64-apple-darwin, sign: "--sign"}
           # Windows (x86_64-pc-windows-msvc on windows-latest, aarch64-pc-windows-msvc on
-          # windows-11-arm) waits on an open decision: python-build-standalone ships libpython,
-          # OpenSSL and SQLite for Windows only as DLLs, so its archives can't make one
-          # self-contained runner. The transport job below still tests the Windows pipe reader.
+          # windows-11-arm) is left out: python-build-standalone ships libpython, OpenSSL and
+          # SQLite for Windows only as DLLs, so its archives can't make one self-contained
+          # runner, and how to build one for Windows is not decided yet. The transport job below
+          # still tests the Windows pipe reader.
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable

@@ -33,7 +33,13 @@ extern "system" {
     ) -> Handle;
     fn GetFileType(handle: Handle) -> u32;
     fn GetNamedPipeServerProcessId(handle: Handle, pid: *mut u32) -> i32;
-    fn ReadFile(handle: Handle, buffer: *mut u8, length: u32, read: *mut u32, overlapped: *mut c_void) -> i32;
+    fn ReadFile(
+        handle: Handle,
+        buffer: *mut u8,
+        length: u32,
+        read: *mut u32,
+        overlapped: *mut c_void,
+    ) -> i32;
     fn GetLastError() -> u32;
     fn CloseHandle(handle: Handle) -> i32;
 }
@@ -46,7 +52,12 @@ fn refused(reason: &str) -> Refused {
 pub fn valid_identity(name: &str, daemon_pid: Option<&str>) -> bool {
     let valid_name = name
         .strip_prefix(r"\\.\pipe\subc-launch-")
-        .is_some_and(|id| id.len() == 32 && id.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')));
+        .is_some_and(|id| {
+            id.len() == 32
+                && id
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        });
     let valid_pid = daemon_pid.is_some_and(|pid| {
         !pid.is_empty() && !pid.starts_with('0') && pid.bytes().all(|byte| byte.is_ascii_digit())
     });
@@ -68,7 +79,16 @@ impl Read for Pipe {
         let mut count = 0u32;
         let length = u32::try_from(buffer.len()).unwrap_or(u32::MAX);
         // SAFETY: the buffer is valid for `length` bytes and the call is synchronous.
-        if unsafe { ReadFile(self.0, buffer.as_mut_ptr(), length, &mut count, std::ptr::null_mut()) } == 0 {
+        if unsafe {
+            ReadFile(
+                self.0,
+                buffer.as_mut_ptr(),
+                length,
+                &mut count,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
             // SAFETY: reads this thread's last error code.
             if unsafe { GetLastError() } == ERROR_BROKEN_PIPE {
                 return Ok(0);
@@ -84,7 +104,9 @@ pub fn open(name: &str, daemon_pid: Option<&str>) -> Result<Pipe, Refused> {
     if !valid_identity(name, daemon_pid) {
         return Err(refused("invalid pipe name or daemon PID"));
     }
-    let expected: u64 = daemon_pid.and_then(|pid| pid.parse().ok()).ok_or_else(|| refused("invalid pipe name or daemon PID"))?;
+    let expected: u64 = daemon_pid
+        .and_then(|pid| pid.parse().ok())
+        .ok_or_else(|| refused("invalid pipe name or daemon PID"))?;
     let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
     // SAFETY: `wide` is NUL-terminated and outlives the call; the other pointers are null.
     let handle = unsafe {
@@ -131,7 +153,13 @@ mod tests {
             security: *mut c_void,
         ) -> Handle;
         fn ConnectNamedPipe(handle: Handle, overlapped: *mut c_void) -> i32;
-        fn WriteFile(handle: Handle, buffer: *const u8, length: u32, written: *mut u32, overlapped: *mut c_void) -> i32;
+        fn WriteFile(
+            handle: Handle,
+            buffer: *const u8,
+            length: u32,
+            written: *mut u32,
+            overlapped: *mut c_void,
+        ) -> i32;
         fn FlushFileBuffers(handle: Handle) -> i32;
     }
 
@@ -142,13 +170,28 @@ mod tests {
     unsafe impl Send for Server {}
 
     fn pipe_name(tag: u32) -> String {
-        format!(r"\\.\pipe\subc-launch-{:08x}{:024x}", std::process::id(), tag)
+        format!(
+            r"\\.\pipe\subc-launch-{:08x}{:024x}",
+            std::process::id(),
+            tag
+        )
     }
 
     fn serve(name: &str, payload: Vec<u8>) -> std::thread::JoinHandle<()> {
         let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
         // SAFETY: `wide` is NUL-terminated; default security.
-        let handle = unsafe { CreateNamedPipeW(wide.as_ptr(), PIPE_ACCESS_OUTBOUND, 0, 1, 65536, 65536, 0, std::ptr::null_mut()) };
+        let handle = unsafe {
+            CreateNamedPipeW(
+                wide.as_ptr(),
+                PIPE_ACCESS_OUTBOUND,
+                0,
+                1,
+                65536,
+                65536,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
         assert!(handle != INVALID_HANDLE_VALUE, "CreateNamedPipeW failed");
         let server = Server(handle);
         std::thread::spawn(move || {
@@ -157,7 +200,13 @@ mod tests {
             unsafe {
                 ConnectNamedPipe(server.0, std::ptr::null_mut());
                 let mut written = 0u32;
-                WriteFile(server.0, payload.as_ptr(), payload.len() as u32, &mut written, std::ptr::null_mut());
+                WriteFile(
+                    server.0,
+                    payload.as_ptr(),
+                    payload.len() as u32,
+                    &mut written,
+                    std::ptr::null_mut(),
+                );
                 FlushFileBuffers(server.0);
                 CloseHandle(server.0);
             }
@@ -178,7 +227,10 @@ mod tests {
         let name = pipe_name(2);
         let writer = serve(&name, frame(b"print('ok')\n"));
         let other = (std::process::id() + 1).to_string();
-        assert_eq!(open(&name, Some(&other)).err(), Some(refused("wrong pipe server")));
+        assert_eq!(
+            open(&name, Some(&other)).err(),
+            Some(refused("wrong pipe server"))
+        );
         // The refused client closed its end, so the server's write fails and its thread ends.
         writer.join().expect("writer");
     }
@@ -188,8 +240,16 @@ mod tests {
         let pid = std::process::id().to_string();
         let good = r"\\.\pipe\subc-launch-0123456789abcdef0123456789abcdef";
         assert!(valid_identity(good, Some(&pid)));
-        for name in [r"\\.\pipe\other-0123456789abcdef0123456789abcdef", r"\\.\pipe\subc-launch-0123456789ABCDEF0123456789abcdef", r"\\.\pipe\subc-launch-0123"] {
-            assert_eq!(open(name, Some(&pid)).err(), Some(refused("invalid pipe name or daemon PID")), "{name}");
+        for name in [
+            r"\\.\pipe\other-0123456789abcdef0123456789abcdef",
+            r"\\.\pipe\subc-launch-0123456789ABCDEF0123456789abcdef",
+            r"\\.\pipe\subc-launch-0123",
+        ] {
+            assert_eq!(
+                open(name, Some(&pid)).err(),
+                Some(refused("invalid pipe name or daemon PID")),
+                "{name}"
+            );
         }
         for daemon in [None, Some(""), Some("0"), Some("012"), Some("12a")] {
             assert!(!valid_identity(good, daemon), "{daemon:?}");

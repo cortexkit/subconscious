@@ -33,7 +33,13 @@ fn parse(table: &'static [u8]) -> HashMap<&'static [u8], Module> {
         let data_len = u32::from_le_bytes(take(4).try_into().expect(malformed)) as usize;
         let name = take(name_len);
         let code = take(data_len);
-        modules.insert(name, Module { is_package: flags & 1 == 1, code });
+        modules.insert(
+            name,
+            Module {
+                is_package: flags & 1 == 1,
+                code,
+            },
+        );
     }
     modules
 }

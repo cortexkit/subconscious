@@ -57,6 +57,12 @@
 - **Rust migration:** `RouteCloseReason` adds `AuthorityChanged` and is now
   non-exhaustive. Add a wildcard match arm; the new reason is reopenable.
   Adopt protocol 0.37, control 0.39 and transport 0.18 public types together.
+- **Breaking for modules that adopt the registration channel:** once a process
+  has adopted the daemon's registration channel, its consumer connections are
+  bound to the module by a claim, and any call that sets
+  `CallOptions::consumer_identity` is refused before it is sent ("consumer
+  identity conflicts with connection binding"). Remove those overrides before
+  adopting; the connection's own identity is used instead.
 - Add optional `ModuleHandler` configuration hooks to declare, review immutable
   changes, apply complete views and observe delivery or refusal state. Adoption
   occurs only when serving, not when constructing a handler or merely declaring

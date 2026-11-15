@@ -1,0 +1,28 @@
+[package]
+name = "ck-script-runner-python"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Runs one approved Python script from memory with an embedded CPython 3.13."
+
+[[bin]]
+name = "ck-script-runner-python"
+path = "src/main.rs"
+
+[dependencies]
+ck-script-transport = { path = "transport" }
+
+[build-dependencies]
+cc = "1.2.65"
+serde_json = "1.0.150"
+
+[dev-dependencies]
+serde_json = "1.0.150"
+
+# Its own workspace: embedding CPython must never enter the main workspace's
+# `cargo test --workspace`, and its build needs an extracted CPython archive.
+[workspace]
+members = ["transport"]
+
+[profile.release]
+strip = true

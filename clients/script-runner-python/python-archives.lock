@@ -1,0 +1,14 @@
+# python-build-standalone CPython 3.13 `full` archives that ck-script-runner-python links.
+# scripts/release/build-script-runner-python.sh downloads the line for its Rust target and refuses
+# the archive unless both the size and the SHA-256 match. build.rs never downloads anything.
+#
+# The objects in these archives are LLVM 23 bitcode (PYTHON.json `object_file_format`), so the
+# final link must use an LLVM 23 lld; the build uses the rust-lld that ships with rustc.
+#
+# Windows has no line: its archives provide libpython, OpenSSL and SQLite only as DLLs, and the
+# way to build a self-contained Windows runner is still an open decision.
+#
+# <rust-target> <size-bytes> <sha256> <url>
+aarch64-apple-darwin 61374878 11c316dfa24e1184e91de3c1434ed1d3e986c30b2d7a0273257067efe611a677 https://github.com/astral-sh/python-build-standalone/releases/download/20261110/cpython-3.13.18%2B20261110-aarch64-apple-darwin-pgo%2Blto-full.tar.zst
+x86_64-unknown-linux-gnu 113048202 dec4f6d23031233beddfe91b99751977ef96e90642109836b1f9ad80b0019a68 https://github.com/astral-sh/python-build-standalone/releases/download/20261110/cpython-3.13.18%2B20261110-x86_64-unknown-linux-gnu-pgo%2Blto-full.tar.zst
+aarch64-unknown-linux-gnu 98841248 160b0ca941266cd8f0e0dda7fd355ce1089df50d15853ea8cd99f4599067db39 https://github.com/astral-sh/python-build-standalone/releases/download/20261110/cpython-3.13.18%2B20261110-aarch64-unknown-linux-gnu-pgo%2Blto-full.tar.zst

@@ -1,5 +1,7 @@
 [workspace]
 resolver = "2"
+# Embeds CPython and needs an extracted CPython archive to build; it is its own workspace.
+exclude = ["clients/script-runner-python"]
 members = [
     "clients/subc-registration-native",
     "crates/subc-protocol",

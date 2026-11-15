@@ -1,0 +1,9 @@
+[package]
+name = "ck-script-transport"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Receives the approved script from the subconscious daemon and checks the runner's launch environment."
+
+[lib]
+path = "src/lib.rs"

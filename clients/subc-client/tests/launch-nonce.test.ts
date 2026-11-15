@@ -256,7 +256,16 @@ describe.skipIf(POSIX_DESCRIPTOR_ONLY)("launch nonce accessor, in process", () =
   test("cleanup leaves a descriptor number the process reused alone", () => {
     const pipe = fifo("x");
     closeSync(pipe.fd); // as the accessor does after reading
-    const reused = openSync(join(import.meta.dir, "launch-nonce.test.ts"), "r");
+    // The kernel hands out the lowest free number, and an earlier test may have
+    // freed a lower one. Open until the closed pipe's number comes back to a
+    // file this test owns; a number above it means another owner took it.
+    const fillers: number[] = [];
+    let reused = openSync(join(import.meta.dir, "launch-nonce.test.ts"), "r");
+    while (reused < pipe.fd && fillers.length < 256) {
+      fillers.push(reused);
+      reused = openSync(join(import.meta.dir, "launch-nonce.test.ts"), "r");
+    }
+    for (const fd of fillers) closeSync(fd);
     expect(reused).toBe(pipe.fd);
 
     closeRecorded([{ fd: pipe.fd, inode: pipe.inode }]);

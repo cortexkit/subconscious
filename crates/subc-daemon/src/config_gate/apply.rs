@@ -2,14 +2,14 @@
 
 use std::collections::BTreeMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use subc_config::{ApplyKind, Changeset};
 
 use super::{GateError, Result};
 
 /// Declaration order is the increasing transition strength. Every stronger
 /// transition must still perform the route/readiness work of the weaker ones.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Transition {
     Live,
@@ -35,18 +35,18 @@ impl Transition {
     }
 
     pub(crate) fn for_module(changeset: &Changeset, module: &str) -> Result<Self> {
-        let floor = if changes_program(changeset, module) {
-            Self::ModuleRestart
-        } else {
-            Self::Live
-        };
-        changeset
-            .fields
-            .iter()
-            .filter(|field| field.module_id == module)
-            .try_fold(floor, |current, field| {
-                Ok(current.max(Self::from_apply(field.apply)?))
-            })
+        // Execution must use the digest-bound transition the person reviewed,
+        // not the field rows, whose base may be a still-pending approval.
+        let table = changeset
+            .apply_plan
+            .get("module_transitions")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| {
+                GateError::new("apply_plan_invalid", "bound module transitions are absent")
+            })?;
+        table.get(module).map_or(Ok(Self::Live), |entry| {
+            serde_json::from_value(entry["transition"].clone()).map_err(GateError::invalid)
+        })
     }
 
     pub(crate) fn requires_spawn(self) -> bool {
@@ -90,20 +90,39 @@ fn changes_program(changeset: &Changeset, module: &str) -> bool {
 /// The resulting transition is approval input, not an execution-time guess.
 /// Preserve the existing apply plan alongside the module transition table.
 pub(super) fn bind_plan(changeset: &mut Changeset) -> Result<()> {
-    let mut policies: BTreeMap<&str, (Transition, Vec<String>)> = BTreeMap::new();
-    for field in &changeset.fields {
-        let (kind, live_fields) = policies
-            .entry(&field.module_id)
-            .or_insert((Transition::Live, vec![]));
-        *kind = (*kind).max(Transition::from_apply(field.apply)?);
-        if field.apply == ApplyKind::Live {
-            live_fields.push(field.path.clone());
+    let mut policies: BTreeMap<String, (Transition, Vec<String>)> = BTreeMap::new();
+    if let Some(table) = changeset.apply_plan.get("module_transitions") {
+        // RuntimeOwner has already reduced active-to-candidate fields. Keep
+        // that result while adding any program-replacement restart floor.
+        let table = table
+            .as_object()
+            .ok_or_else(|| GateError::invalid("invalid module transitions"))?;
+        for (module, entry) in table {
+            policies.insert(
+                module.clone(),
+                (
+                    serde_json::from_value(entry["transition"].clone())
+                        .map_err(GateError::invalid)?,
+                    serde_json::from_value(entry["deferred_live_fields"].clone())
+                        .map_err(GateError::invalid)?,
+                ),
+            );
+        }
+    } else {
+        for field in &changeset.fields {
+            let (kind, live_fields) = policies
+                .entry(field.module_id.clone())
+                .or_insert((Transition::Live, vec![]));
+            *kind = (*kind).max(Transition::from_apply(field.apply)?);
+            if field.apply == ApplyKind::Live {
+                live_fields.push(field.path.clone());
+            }
         }
     }
     for module in changeset.launch_manifests.keys() {
         if changes_program(changeset, module) {
             let (kind, _) = policies
-                .entry(module.as_str())
+                .entry(module.clone())
                 .or_insert((Transition::Live, vec![]));
             *kind = (*kind).max(Transition::ModuleRestart);
         }

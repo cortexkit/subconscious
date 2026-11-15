@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.47.2
+
+- Describe configuration field changes from the last approved generation, even
+  before it activates, while binding activation transitions from the running
+  generation. Reviewers receive the same last-approved base as the approval card.
+- Expose otherwise uncovered layer-file changes with raw-byte SHA-256 and length
+  (or absence) in policy rows, including comment-only edits and same-byte file
+  replacements.
+
 ## 0.47.1
 
 - Test-only fix: stop equating spawn numbers with successful starts in a

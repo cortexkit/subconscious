@@ -2882,7 +2882,11 @@ fn config_admission_final_check_keeps_the_pending_exit_fence_then_holds_without_
 
 #[test]
 fn config_admission_daemon_restart_precedence_keeps_the_active_command_until_a_new_daemon() {
-    let rig = rig();
+    let mut rig = rig();
+    rig.declaration.schema["properties"]["daemon_dependency"] = json!({
+        "type":"integer", "description":"Daemon dependency", "default":1,
+        "x-ck-apply":"daemon_restart",
+    });
     let owner = rig.owner("deferred-command");
     rig.declare(&owner, 10);
     rig.stamp(&owner);
@@ -2902,23 +2906,17 @@ fn config_admission_daemon_restart_precedence_keeps_the_active_command_until_a_n
     let mut doc: serde_json::Value =
         serde_json::from_slice(&std::fs::read(rig.path.join("subc.jsonc")).unwrap()).unwrap();
     doc["modules"]["a"]["args"] = json!(["601"]);
+    let layer = rig.path.join("cortexkit/a.jsonc");
+    let mut input = json!({});
+    input["daemon_dependency"] = json!(2);
+    std::fs::write(layer, serde_json::to_vec(&input).unwrap()).unwrap();
     std::fs::write(
         rig.path.join("subc.jsonc"),
         serde_json::to_vec(&doc).unwrap(),
     )
     .unwrap();
     let plan = owner
-        .finish_plan(owner.prepare(PlanKind::Change).unwrap(), |old, new| {
-            let mut changes = daemon_review(old, new)?;
-            changes.fields.push(subc_config::FieldChange::new(
-                "a",
-                "/daemon_dependency",
-                subc_config::RecordedValue::new(json!(1)),
-                subc_config::RecordedValue::new(json!(2)),
-                subc_config::ApplyKind::DaemonRestart,
-            ));
-            Ok(changes)
-        })
+        .finish_plan(owner.prepare(PlanKind::Change).unwrap(), daemon_review)
         .unwrap();
     owner
         .desktop_view_delivered(ConnectionId::new(7), &plan)

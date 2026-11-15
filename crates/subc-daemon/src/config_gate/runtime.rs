@@ -283,6 +283,56 @@ pub(crate) const PLAN_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// Remember recent expirations by digest without retaining unbounded plan bodies.
 const EXPIRED_PLAN_IDS: usize = 64;
 
+fn layer_file_rows(
+    changeset: &mut Changeset,
+    old: &super::GateSnapshot,
+    new: &super::GateSnapshot,
+    previous: Option<&DeliverySnapshot>,
+    candidate: &DeliverySnapshot,
+) -> Result<()> {
+    for key in old.changed_keys(new) {
+        let super::InputKey::Layer { module, path } = key else {
+            continue;
+        };
+        // A value or source row already explains the changed layer. Otherwise
+        // expose the exact raw input without disclosing its contents.
+        if changeset.fields.iter().any(|field| {
+            field.module_id == *module
+                && (field.old_source == subc_config::Layer::User
+                    || field.new_source == subc_config::Layer::User)
+        }) {
+            continue;
+        }
+        let describe = |snapshot: Option<&DeliverySnapshot>,
+                        input: Option<&super::CapturedInput>|
+         -> Result<serde_json::Value> {
+            if input.is_none()
+                || input.is_some_and(|input| input.state == subc_config::InputState::Absent)
+            {
+                return Ok(serde_json::json!({"absent":true}));
+            }
+            let bytes = snapshot
+                .and_then(|snapshot| snapshot.modules.get(module))
+                .and_then(|view| {
+                    view.layers
+                        .iter()
+                        .find(|layer| layer.path.as_deref() == Some(path.as_str()))
+                })
+                .and_then(|layer| layer.bytes.as_deref())
+                .ok_or_else(|| GateError::new("config_gated", "retained layer bytes are absent"))?;
+            Ok(
+                serde_json::json!({"sha256":subc_config::raw_digest(bytes).as_str().trim_start_matches("sha256:"), "bytes":bytes.len()}),
+            )
+        };
+        changeset.policy_changes.push(serde_json::json!({
+            "kind":"layer_file", "module_id":module, "layer":"user",
+            "old":describe(previous, old.inputs.get(key))?,
+            "new":describe(Some(candidate), new.inputs.get(key))?,
+        }));
+    }
+    Ok(())
+}
+
 pub(crate) fn daemon_review(
     old: &super::GateSnapshot,
     new: &super::GateSnapshot,
@@ -1386,6 +1436,7 @@ impl RuntimeOwner {
         let mut active_generations = BTreeMap::new();
         if state.store.status().state == StoreState::Stamped {
             let body = state.store.body()?;
+            let approved_id = placement::last_approved_generation(body);
             for (tuple, versions) in &body.versions {
                 if touched_modules.contains(&tuple.module) {
                     active_generations.insert(tuple.clone(), versions.active);
@@ -1393,7 +1444,15 @@ impl RuntimeOwner {
                 if tuple.project.is_some() || !review_modules.contains(&tuple.module) {
                     continue;
                 }
-                if let Some(id) = versions.active {
+                // A plan replaces the last approval, even when that generation
+                // has not activated. The reviewer and the card use that base.
+                // A launch entry alone is not an approved configuration base;
+                // only a retained declaration establishes one for review.
+                if old
+                    .inputs
+                    .contains_key(&super::InputKey::Declaration(tuple.module.clone()))
+                {
+                    let id = approved_id;
                     let snapshot = body
                         .generations
                         .get(&id)
@@ -1426,12 +1485,16 @@ impl RuntimeOwner {
                     let view = snapshot.modules.get(&tuple.module).ok_or_else(|| {
                         GateError::new(
                             "config_gated",
-                            format!("{}: approved active view is absent", tuple.module),
+                            format!("{}: approved view is absent", tuple.module),
                         )
                     })?;
                     let mut view = view.clone();
                     view.generation = id;
-                    view.status = ConfigStatus::Active;
+                    view.status = if versions.active == Some(id) {
+                        ConfigStatus::Active
+                    } else {
+                        ConfigStatus::Pending
+                    };
                     bases.insert(tuple.module.clone(), view);
                 }
             }
@@ -1510,6 +1573,51 @@ impl RuntimeOwner {
         };
         let mut handles = prepared.candidate.take_handles();
         handles.append(&mut prepared.observed_handles);
+        let previous_delivery = if state.store.status().state == StoreState::Stamped {
+            let body = state.store.body()?;
+            body.generations
+                .get(&placement::last_approved_generation(body))
+                .and_then(|entry| entry.delivery.clone())
+        } else {
+            None
+        };
+        // Activation policy compares the candidate with what is running, not
+        // with the last approval used by the visible field rows.
+        let mut active_fields = Vec::new();
+        for (module, captured) in prepared.candidate.modules.iter().filter(|(module, _)| {
+            // Stamping records the inputs already running; unstamping returns
+            // authority to files. Neither operation changes runtime values.
+            matches!(prepared.kind, PlanKind::Change | PlanKind::Rollback(_))
+                && prepared.touched_modules.contains(*module)
+        }) {
+            let active = if state.store.status().state == StoreState::Stamped {
+                let body = state.store.body()?;
+                body.versions
+                    .iter()
+                    .find(|(tuple, _)| tuple.module == *module && tuple.project.is_none())
+                    .and_then(|(_, versions)| versions.active)
+                    .and_then(|id| body.generations.get(&id))
+                    .and_then(|entry| entry.delivery.as_ref())
+            } else {
+                None
+            };
+            let base = active.and_then(|snapshot| snapshot.modules.get(module));
+            let schema = active
+                .and_then(|snapshot| snapshot.declarations.get(module))
+                .map(|declaration| subc_config::Schema::new(declaration.schema.clone()))
+                .transpose()
+                .map_err(GateError::invalid)?;
+            active_fields.extend(
+                super::review::expected_fields(
+                    module,
+                    &captured.schema,
+                    base,
+                    schema.as_ref(),
+                    &captured.view,
+                )?
+                .into_values(),
+            );
+        }
         let OwnerState { gate, store, .. } = &mut *state;
         let view = gate.plan_reviewed(
             store,
@@ -1517,7 +1625,29 @@ impl RuntimeOwner {
             prepared.candidate.diagnostic,
             &current.diagnostic,
             super::ReviewRecord::Reviewed(&prepared.review_modules),
-            review,
+            |old, new| {
+                let mut changeset = review(old, new)?;
+                layer_file_rows(
+                    &mut changeset,
+                    old,
+                    new,
+                    previous_delivery.as_ref(),
+                    &delivery,
+                )?;
+                let mut activation = changeset.clone();
+                activation.fields = active_fields;
+                super::apply::bind_plan(&mut activation)?;
+                if !changeset.apply_plan.is_object() {
+                    changeset.apply_plan = if changeset.apply_plan.is_null() {
+                        serde_json::json!({})
+                    } else {
+                        serde_json::json!({"review": changeset.apply_plan})
+                    };
+                }
+                changeset.apply_plan["module_transitions"] =
+                    activation.apply_plan["module_transitions"].clone();
+                Ok(changeset)
+            },
         )?;
         if let Err(error) = self.check_route_policy_authority(&view.plan.changeset) {
             gate.expire_plan(&view.digest);

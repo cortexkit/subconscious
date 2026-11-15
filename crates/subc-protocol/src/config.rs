@@ -264,8 +264,10 @@ impl ConfigView {
 }
 
 /// Pure daemon-to-module review of immutable candidate layers against a supplied
-/// active base. The module must not read files, environment, network or secrets,
-/// or recompute old values under a new build. `base: null` means no active base.
+/// last-approved base, which the plan replaces and which can differ from the
+/// generation the module is running. The module must not read files, environment,
+/// network or secrets, or recompute old values under a new build. `base: null`
+/// means there is no previous approval.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConfigReviewRequest {

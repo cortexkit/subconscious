@@ -13,7 +13,17 @@ const INCUMBENT: ConnectionId = ConnectionId::new(10);
 const CANDIDATE: ConnectionId = ConnectionId::new(20);
 
 fn rig() -> (Rig, RuntimeOwner) {
-    let rig = Rig::new();
+    rig_with_kinds(&[
+        subc_config::ApplyKind::Live,
+        subc_config::ApplyKind::RouteRebind,
+        subc_config::ApplyKind::NextSupervision,
+        subc_config::ApplyKind::ModuleRestart,
+        subc_config::ApplyKind::DaemonRestart,
+    ])
+}
+
+fn rig_with_kinds(kinds: &[subc_config::ApplyKind]) -> (Rig, RuntimeOwner) {
+    let rig = policy_rig_for(kinds);
     write(&rig, 1);
     let owner = rig.owner("delivery");
     rig.declare(&owner, INCUMBENT.get());
@@ -156,7 +166,7 @@ fn config_delivery_get_binds_exact_generation_and_attempt_to_one_child() {
 
 #[test]
 fn config_delivery_newest_approval_supersedes_unacked_generation_across_restart() {
-    let (rig, owner) = rig();
+    let (rig, owner) = rig_with_kinds(&[]);
     let old = pending(&owner, INCUMBENT);
     assert_eq!(approve(&rig, &owner, 2), 2);
     assert_eq!(
@@ -312,7 +322,7 @@ fn sealed_owner(
 }
 
 fn nack_while_anchor_pending() -> (Rig, crate::config_store::TestStoreKey, RuntimeOwner) {
-    let rig = Rig::new();
+    let rig = policy_rig();
     write(&rig, 1);
     let key = crate::config_store::TestStoreKey::default();
     let owner = sealed_owner(&rig, &key, "sealed-delivery");
@@ -518,7 +528,7 @@ async fn config_delivery_anchor_pending_restart_before_failure_anchor_may_redeli
 
 #[tokio::test(start_paused = true)]
 async fn config_delivery_ack_anchor_failure_stays_pending_on_status_until_recovery() {
-    let rig = Rig::new();
+    let rig = policy_rig();
     write(&rig, 1);
     let key = crate::config_store::TestStoreKey::default();
     let owner = sealed_owner(&rig, &key, "unanchored-ack");
@@ -649,7 +659,7 @@ fn plan_kinds(
     kinds: &[subc_config::ApplyKind],
 ) -> super::super::super::Result<ConfigPlanView> {
     write(rig, 2);
-    plan_kinds_from_disk(owner, kinds)
+    plan_kinds_from_disk(rig, owner, kinds)
 }
 
 #[tokio::test]
@@ -937,21 +947,62 @@ fn config_admission_daemon_owned_route_rebind_is_refused_by_name() {
     assert_eq!(error.code, "daemon_route_policy_authority_unavailable");
 }
 
+fn policy_field(kind: subc_config::ApplyKind) -> String {
+    format!(
+        "field_{}",
+        serde_json::to_value(kind).unwrap().as_str().unwrap()
+    )
+}
+
+fn policy_rig() -> Rig {
+    policy_rig_for(&[
+        subc_config::ApplyKind::Live,
+        subc_config::ApplyKind::RouteRebind,
+        subc_config::ApplyKind::NextSupervision,
+        subc_config::ApplyKind::ModuleRestart,
+        subc_config::ApplyKind::DaemonRestart,
+    ])
+}
+
+fn policy_rig_for(kinds: &[subc_config::ApplyKind]) -> Rig {
+    let mut rig = Rig::new();
+    for kind in kinds {
+        rig.declaration.schema["properties"][policy_field(*kind)] = json!({
+            "type":"integer", "description":"Transition fixture field", "default":1, "x-ck-apply":kind,
+        });
+    }
+    rig
+}
+
 fn plan_kinds_from_disk(
+    rig: &Rig,
     owner: &RuntimeOwner,
     kinds: &[subc_config::ApplyKind],
 ) -> super::super::super::Result<ConfigPlanView> {
-    owner.finish_plan(owner.prepare(PlanKind::Change)?, |old, new| {
+    // Activation is derived from declared active-to-candidate fields, not from
+    // the review closure's rows. Give every exercised policy a real input.
+    let path = rig.path.join("cortexkit/a.jsonc");
+    let mut input: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let proposed = input["limit"].clone();
+    for kind in kinds {
+        input[policy_field(*kind)] = proposed.clone();
+    }
+    std::fs::write(path, serde_json::to_vec(&input).unwrap()).unwrap();
+    let prepared = owner.prepare(PlanKind::Change)?;
+    let captured = &prepared.candidate.modules["a"];
+    let fields = super::super::super::review::expected_fields(
+        "a",
+        &captured.schema,
+        prepared.bases.get("a"),
+        prepared.base_schemas.get("a"),
+        &captured.view,
+    )?
+    .into_values()
+    .collect();
+    owner.finish_plan(prepared, |old, new| {
         let mut changeset = daemon_review(old, new)?;
-        for (index, kind) in kinds.iter().enumerate() {
-            changeset.fields.push(subc_config::FieldChange::new(
-                "a",
-                format!("/field{index}"),
-                subc_config::RecordedValue::new(json!(1)),
-                subc_config::RecordedValue::new(json!(2)),
-                *kind,
-            ));
-        }
+        changeset.fields = fields;
         Ok(changeset)
     })
 }
@@ -1168,7 +1219,7 @@ async fn config_delivery_change_after_an_inactive_program_change_still_waits_for
         .unwrap()
         .write_all(b"replacement program bytes")
         .unwrap();
-    let plan = plan_kinds_from_disk(&owner, &[]).unwrap();
+    let plan = plan_kinds_from_disk(&rig, &owner, &[]).unwrap();
     owner
         .desktop_view_delivered(ConnectionId::new(7), &plan)
         .unwrap();
@@ -1209,6 +1260,7 @@ async fn config_delivery_mixed_live_and_next_supervision_defer_live_fields_in_pl
     )
     .await;
     let (rig, owner) = rig();
+    applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();
     let plan = approve_kinds(
         &rig,
         &owner,
@@ -1218,7 +1270,10 @@ async fn config_delivery_mixed_live_and_next_supervision_defer_live_fields_in_pl
         ],
     );
     let transition = &plan.plan.changeset.apply_plan["module_transitions"]["a"];
-    assert_eq!(transition["deferred_live_fields"], json!(["/field0"]));
+    assert_eq!(
+        transition["deferred_live_fields"],
+        json!(["/field_live", "/limit"])
+    );
     assert!(transition["explanation"]
         .as_str()
         .unwrap()
@@ -1318,7 +1373,7 @@ fn config_delivery_mixed_daemon_and_module_restart_waits_for_new_daemon_without_
 
 #[test]
 fn config_status_pending_only_view_is_gated_until_supervision_boundary_opens() {
-    let (rig, owner) = rig();
+    let (rig, owner) = rig_with_kinds(&[subc_config::ApplyKind::NextSupervision]);
     approve_kinds(&rig, &owner, &[subc_config::ApplyKind::NextSupervision]);
     assert_eq!(
         owner
@@ -1612,7 +1667,7 @@ async fn config_delivery_io_get_checks_keychain_and_store_hash_off_the_runtime_t
 #[tokio::test]
 async fn config_spawn_async_io_checks_keychain_and_store_hash_off_the_runtime_thread() {
     use std::sync::Arc;
-    let rig = Rig::new();
+    let rig = policy_rig();
     rig.write_native_program("sleep");
     write(&rig, 1);
     let key = crate::config_store::TestStoreKey::default();
@@ -2130,7 +2185,7 @@ fn supervised_fixture_with_program(
     std::sync::Arc<crate::ControlHandler>,
 ) {
     use std::sync::Arc;
-    let rig = Rig::new();
+    let rig = policy_rig();
     rig.write_native_program(program);
     write(&rig, 1);
     let path = rig.path.join("subc.jsonc");
@@ -2551,7 +2606,7 @@ async fn config_delivery_supervisor_pre_hello_failure_without_active_stops_befor
 #[tokio::test]
 async fn config_delivery_exit_fence_restores_memory_under_anchor_pending_and_never_redelivers_after_retry(
 ) {
-    let rig = Rig::new();
+    let rig = policy_rig();
     write(&rig, 1);
     let key = crate::config_store::TestStoreKey::default();
     let owner = sealed_owner(&rig, &key, "exit-anchor-pending");
@@ -2668,7 +2723,7 @@ fn config_delivery_an_old_child_crash_preserves_a_generation_deferred_until_its_
 
 #[test]
 fn config_delivery_stamp_attempt_survives_transport_cleanup_until_its_process_exits() {
-    let rig = Rig::new();
+    let rig = policy_rig();
     write(&rig, 1);
     let owner = rig.owner("stamp-after-launch");
     let old = owner
@@ -3116,7 +3171,7 @@ async fn config_delivery_route_receipt_ack_commits_after_durable_publication_and
 #[tokio::test]
 async fn config_delivery_route_receipt_waits_for_the_ack_anchor_before_committing() {
     use std::sync::Arc;
-    let rig = Rig::new();
+    let rig = policy_rig();
     write(&rig, 1);
     let key = crate::config_store::TestStoreKey::default();
     let authority = Arc::new(FakeRouteAuthority::default());
@@ -3166,7 +3221,8 @@ async fn config_delivery_route_receipt_is_retained_on_decline_and_restored_befor
         owner.install_approved_route_policy("a", 2).await.unwrap();
         owner.ready(INCUMBENT, "a", 2).unwrap();
         write(&rig, 3);
-        let next = plan_kinds_from_disk(&owner, &[subc_config::ApplyKind::RouteRebind]).unwrap();
+        let next =
+            plan_kinds_from_disk(&rig, &owner, &[subc_config::ApplyKind::RouteRebind]).unwrap();
         owner
             .desktop_view_delivered(ConnectionId::new(7), &next)
             .unwrap();
@@ -3632,7 +3688,7 @@ async fn config_delivery_route_worker_requests_immediate_health_and_uses_deliver
     use std::sync::{atomic::Ordering, Arc};
     use subc_protocol::session::{HealthStatus, ModuleControlResponse};
     for answer in [Some(HealthStatus::Ok), Some(HealthStatus::Failing), None] {
-        let rig = Rig::new();
+        let rig = policy_rig();
         rig.write_native_program("sleep");
         write(&rig, 1);
         let authority = Arc::new(FakeRouteAuthority::default());
@@ -3820,7 +3876,7 @@ async fn config_delivery_swap_owner_release_supersedes_retained_restart_exactly_
 async fn restart_after_busy_swap_warmup(candidate_exits_first: bool) {
     use crate::supervise::{ModuleOverlap, RestartPolicy, Supervisor, SupervisorHandle};
     use std::sync::Arc;
-    let rig = Rig::new();
+    let rig = policy_rig();
     write(&rig, 1);
     rig.write_native_program("pid-sleep");
     let mut spec = supervised_spec(&rig, "a");

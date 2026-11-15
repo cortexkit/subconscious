@@ -29,6 +29,35 @@ pub(crate) fn checked_fields(
             format!("{module}: {paths:?}"),
         ));
     }
+    let expected = expected_fields(module, schema, base, base_schema, candidate)?;
+    let mut seen = BTreeSet::new();
+    for mut field in reply.fields {
+        let Some(wanted) = expected.get(&field.path) else {
+            return Err(invalid(module));
+        };
+        if !seen.insert(field.path.clone()) {
+            return Err(invalid(module));
+        }
+        // Reasons may add explanation, but cannot alter the checked old/new
+        // values, source layers, apply kind, module or project identity.
+        field.reasons.clear();
+        if field != *wanted {
+            return Err(invalid(module));
+        }
+    }
+    if seen.len() != expected.len() {
+        return Err(invalid(module));
+    }
+    Ok(expected.into_values().collect())
+}
+
+pub(super) fn expected_fields(
+    module: &str,
+    schema: &Schema,
+    base: Option<&ConfigView>,
+    base_schema: Option<&Schema>,
+    candidate: &ConfigView,
+) -> Result<BTreeMap<String, FieldChange>> {
     let mut paths = BTreeSet::new();
     leaf_paths(&candidate.effective, "", &mut paths);
     if let Some(base) = base {
@@ -91,25 +120,7 @@ pub(crate) fn checked_fields(
         field.new_source = new_source;
         expected.insert(path, field);
     }
-    let mut seen = BTreeSet::new();
-    for mut field in reply.fields {
-        let Some(wanted) = expected.get(&field.path) else {
-            return Err(invalid(module));
-        };
-        if !seen.insert(field.path.clone()) {
-            return Err(invalid(module));
-        }
-        // Reasons may add explanation, but cannot alter the checked old/new
-        // values, source layers, apply kind, module or project identity.
-        field.reasons.clear();
-        if field != *wanted {
-            return Err(invalid(module));
-        }
-    }
-    if seen.len() != expected.len() {
-        return Err(invalid(module));
-    }
-    Ok(expected.into_values().collect())
+    Ok(expected)
 }
 
 fn invalid(module: &str) -> GateError {

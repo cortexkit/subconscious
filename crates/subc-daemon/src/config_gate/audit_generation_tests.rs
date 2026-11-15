@@ -455,7 +455,7 @@ async fn capture_once_for_all_rows(operation: &str) {
     use std::sync::{atomic::Ordering, Arc};
     let list_request = operation == "supervisor.list";
     {
-        let rig = Arc::new(Rig::new());
+        let rig = Arc::new(policy_rig());
         let path = rig.path.join("subc.jsonc");
         let config = json!({"version":1,"modules":{
             "a":{"program":rig.path.join("program"),"enabled":false,"registration_channel":operation != "supervisor.list"},
@@ -788,7 +788,7 @@ async fn audit_registration_release_consumed_behind_exit_fence_is_retried_after_
 
 #[tokio::test]
 async fn audit_registration_status_uses_one_publication_across_a_commit() {
-    let rig = std::sync::Arc::new(Rig::new());
+    let rig = std::sync::Arc::new(policy_rig());
     std::fs::write(
         rig.path.join("subc.jsonc"),
         br#"{"version":1,"modules":{}}"#,

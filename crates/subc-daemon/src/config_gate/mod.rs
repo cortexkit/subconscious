@@ -324,6 +324,22 @@ impl ConfigGate {
         }
         // Bind the full retained view and operation, including identity-only and
         // declaration-only changes a module's scalar diff would not describe.
+        // Keep activation policy out of reviewer metadata. `small_prompt` in
+        // approval.rs offers the compact one-change prompt only when `review`
+        // is null, so leaving the transition table in it would deny that
+        // prompt to every one-field change.
+        let transitions = changeset
+            .apply_plan
+            .as_object_mut()
+            .and_then(|review| review.remove("module_transitions"));
+        if transitions.is_some()
+            && changeset
+                .apply_plan
+                .as_object()
+                .is_some_and(|review| review.is_empty())
+        {
+            changeset.apply_plan = serde_json::Value::Null;
+        }
         changeset.apply_plan = serde_json::json!({
             "operation": match kind { PlanKind::Change => "change", PlanKind::Stamp => "stamp", PlanKind::Unstamp => "unstamp", PlanKind::Rollback(_) => "rollback" },
             "rollback_to": if let PlanKind::Rollback(id) = kind { Some(id) } else { None },
@@ -331,6 +347,12 @@ impl ConfigGate {
             "previous": approved.to_store()?,
             "snapshot": candidate.to_store()?,
         });
+        if let Some(transitions) = transitions {
+            if let Some(table) = transitions.as_object() {
+                modules.extend(table.keys().cloned());
+            }
+            changeset.apply_plan["module_transitions"] = transitions;
+        }
         if matches!(kind, PlanKind::Rollback(_)) {
             changeset.apply_plan["rollback_programs"] = serde_json::Value::Array(rollback_programs);
         }

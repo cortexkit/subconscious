@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.37.1
+
+- Clarify that `config.review` uses the last approved generation, which the plan
+  replaces; it can differ from the generation the module is running. The wire
+  shape is unchanged.
+
 ## 0.37.0
 
 - **Rust migration:** `RouteCloseReason` adds `AuthorityChanged` and is now

@@ -1833,7 +1833,7 @@ mod tests {
             ConnectionId::new(1),
             "timed",
             subc_protocol::config::ConfigDeclareRequest::new(
-                json!({"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","unevaluatedProperties":false,"x-ck-layers":["user"],"x-ck-apply":"live","properties":{"limit":{"type":"integer","description":"Limit","default":1}}}),
+                json!({"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","unevaluatedProperties":false,"x-ck-layers":["user"],"x-ck-apply":"live","properties":{"limit":{"type":"integer","description":"Limit","default":1,"x-ck-apply":"module_restart"}}}),
                 path.to_string_lossy(), vec![],
             ),
             true,
@@ -1854,17 +1854,10 @@ mod tests {
             )
             .unwrap();
             let plan = owner
-                .finish_plan(owner.prepare(kind).unwrap(), |old, new| {
-                    let mut changeset = crate::config_gate::runtime::daemon_review(old, new)?;
-                    changeset.fields.push(subc_config::FieldChange::new(
-                        "timed",
-                        "/limit",
-                        subc_config::RecordedValue::new(json!(generation - 1)),
-                        subc_config::RecordedValue::new(json!(generation)),
-                        subc_config::ApplyKind::ModuleRestart,
-                    ));
-                    Ok(changeset)
-                })
+                .finish_plan(
+                    owner.prepare(kind).unwrap(),
+                    crate::config_gate::runtime::daemon_review,
+                )
                 .unwrap();
             owner
                 .desktop_view_delivered(ConnectionId::new(7), &plan)

@@ -21,7 +21,13 @@ const DAEMON_NONCE = "a".repeat(32) + "0123456789abcdef".repeat(2);
 const ENV_NONCE = "nonce-from-the-environment";
 
 let scratch: string;
-let openFds: number[] = [];
+/**
+ * Descriptors a test opened, with the inode each held. The accessor under test
+ * closes some of them, and the process can reuse a closed number at once (Bun's
+ * child_process does, for its own spawn plumbing), so cleanup closes a number
+ * only while it still holds the inode recorded for it.
+ */
+let openFds: { fd: number; inode: bigint }[] = [];
 let fifoCount = 0;
 
 beforeEach(() => {
@@ -31,13 +37,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  for (const fd of openFds) {
-    try {
-      closeSync(fd);
-    } catch {
-      // Already closed by the accessor under test.
-    }
-  }
+  closeRecorded(openFds);
   rmSync(scratch, { recursive: true, force: true });
 });
 
@@ -56,12 +56,12 @@ interface Fifo {
 function fifo(bytes: Uint8Array | string | null, opts: { keepWriter?: boolean; path?: string } = {}): Fifo {
   const path = opts.path ?? fifoPath();
   const fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
-  openFds.push(fd);
+  openFds.push({ fd, inode: inodeOf(fd) });
   // Opening the write end does not block, because a reader is already open.
   const writer = openSync(path, constants.O_WRONLY);
   if (bytes !== null) writeSync(writer, typeof bytes === "string" ? Buffer.from(bytes) : bytes);
   if (opts.keepWriter) {
-    openFds.push(writer);
+    openFds.push({ fd: writer, inode: inodeOf(writer) });
   } else {
     closeSync(writer);
   }
@@ -78,6 +78,19 @@ function fifoPath(): string {
   const path = join(scratch, `fifo-${fifoCount}`);
   execFileSync("mkfifo", [path]);
   return path;
+}
+
+/** Close each recorded descriptor that still holds its recorded inode. */
+function closeRecorded(fds: { fd: number; inode: bigint }[]): void {
+  for (const { fd, inode } of fds) {
+    let current: bigint;
+    try {
+      current = inodeOf(fd);
+    } catch {
+      continue; // Closed by the accessor and not reused.
+    }
+    if (current === inode) closeSync(fd);
+  }
 }
 
 function inodeOf(fd: number): bigint {
@@ -240,6 +253,18 @@ describe.skipIf(POSIX_DESCRIPTOR_ONLY)("launch nonce accessor, in process", () =
     expect(cell.get()?.value).toBe(DAEMON_NONCE);
   });
 
+  test("cleanup leaves a descriptor number the process reused alone", () => {
+    const pipe = fifo("x");
+    closeSync(pipe.fd); // as the accessor does after reading
+    const reused = openSync(join(import.meta.dir, "launch-nonce.test.ts"), "r");
+    expect(reused).toBe(pipe.fd);
+
+    closeRecorded([{ fd: pipe.fd, inode: pipe.inode }]);
+
+    expect(isOpen(reused)).toBe(true);
+    closeSync(reused);
+  });
+
   test("NotOpen: a closed descriptor is refused without a fallback", () => {
     const fd = openSync(join(import.meta.dir, "launch-nonce.test.ts"), "r");
     closeSync(fd);
@@ -257,7 +282,7 @@ describe.skipIf(POSIX_DESCRIPTOR_ONLY)("launch nonce accessor, in process", () =
     const path = join(scratch, "not-a-pipe");
     writeFileSync(path, "file contents");
     const fd = openSync(path, "r");
-    openFds.push(fd);
+    openFds.push({ fd, inode: inodeOf(fd) });
 
     const cell = cellWith(`${fd}:${inodeOf(fd)}`);
     const error = refusal(cell);

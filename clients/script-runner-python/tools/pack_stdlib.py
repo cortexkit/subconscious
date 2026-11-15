@@ -45,7 +45,9 @@ def main():
         )
         for file in sorted(files):
             stem, suffix = os.path.splitext(file)
-            if suffix != ".py" or not stem.isidentifier():
+            # Module names needn't be identifiers: sysconfig imports _sysconfigdata_<abi>_<platform>
+            # modules whose names hold dashes. A dot would make the name ambiguous.
+            if suffix != ".py" or not stem or "." in stem:
                 continue
             is_package = stem == "__init__"
             if is_package and not package:

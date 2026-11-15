@@ -89,9 +89,16 @@ if [[ "$target" == *-apple-darwin ]]; then
 fi
 
 cargo build --locked --release --manifest-path "$crate/Cargo.toml" --target "$target"
+target_dir="$(cargo metadata --locked --no-deps --format-version 1 --manifest-path "$crate/Cargo.toml" |
+  "$CK_PYTHON_HOST" -I -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"
+built="$target_dir/$target/release/ck-script-runner-python"
 binary="$root/target/$target/release/ck-script-runner-python"
 mkdir -p "$(dirname "$binary")"
-cp "$crate/target/$target/release/ck-script-runner-python" "$binary"
+if [[ "$built" -ef "$binary" ]]; then
+  : # CARGO_TARGET_DIR already points at the repository's target folder.
+else
+  cp "$built" "$binary"
+fi
 
 if [[ "$sign" == --sign ]]; then
   [[ "$target" == *-apple-darwin ]] || fail "--sign is for macOS targets only"

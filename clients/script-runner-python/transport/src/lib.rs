@@ -160,13 +160,26 @@ mod tests {
 
     fn vector() -> (Vec<u8>, Vec<u8>) {
         // The shared vector was produced by Python's struct and hashlib, not by frame().
+        // It holds two JSON strings; this reads them without a JSON crate.
         let text = include_str!("../../../script-runner/tests/script-pipe-vector.json");
         let field = |name: &str| {
             let start = text.find(&format!("\"{name}\": \"")).expect("vector field") + name.len() + 5;
-            let end = start + text[start..].find('"').expect("closing quote");
-            text[start..end].to_string()
+            let mut value = String::new();
+            let mut chars = text[start..].chars();
+            while let Some(c) = chars.next() {
+                match c {
+                    '"' => return value,
+                    '\\' => value.push(match chars.next().expect("escape") {
+                        'n' => '\n',
+                        't' => '\t',
+                        other => other,
+                    }),
+                    other => value.push(other),
+                }
+            }
+            panic!("unterminated vector field {name}");
         };
-        let source = field("source").replace("\\\"", "\"").replace("\\n", "\n").into_bytes();
+        let source = field("source").into_bytes();
         let header_hex = field("header_hex");
         let header = (0..header_hex.len())
             .step_by(2)

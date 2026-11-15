@@ -202,19 +202,18 @@ fn main() {
         link(framework);
     }
 
-    // The archive's objects may be LLVM bitcode, linked by an LLVM lld of the same major
-    // version. rustc ships one (rust-lld); use it when the archive's LLVM matches rustc's.
+    // The archive's objects may be LLVM bitcode, which only an LLVM lld at least as new as the
+    // archive's LLVM can link. rustc ships one (rust-lld), so the final link uses it.
     if let Some(format) = build["object_file_format"].as_str().and_then(|format| format.strip_prefix("llvm-bitcode:")) {
-        let archive_major = format.split('.').next().unwrap_or_default();
+        let major = |version: &str| version.split('.').next().and_then(|major| major.parse::<u32>().ok()).unwrap_or(0);
         let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
         let version = Command::new(&rustc).arg("-vV").output().expect("run rustc -vV");
         let version = String::from_utf8_lossy(&version.stdout);
         let rustc_llvm = version.lines().find_map(|line| line.strip_prefix("LLVM version: ")).unwrap_or_default();
-        assert_eq!(
-            rustc_llvm.split('.').next().unwrap_or_default(),
-            archive_major,
+        assert!(
+            major(rustc_llvm) >= major(format),
             "the archive's objects are LLVM {format} bitcode, but rustc's LLVM is {rustc_llvm}: \
-             use a Rust toolchain whose rust-lld has the same LLVM major version"
+             use a Rust toolchain whose LLVM is at least as new"
         );
         let sysroot = Command::new(&rustc).args(["--print", "sysroot"]).output().expect("run rustc --print sysroot");
         let sysroot = String::from_utf8_lossy(&sysroot.stdout).trim().to_string();

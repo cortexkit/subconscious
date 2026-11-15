@@ -3,7 +3,7 @@
 # the archive unless both the size and the SHA-256 match. build.rs never downloads anything.
 #
 # The objects in these archives are LLVM 23 bitcode (PYTHON.json `object_file_format`), so the
-# final link must use an LLVM 23 lld; the build uses the rust-lld that ships with rustc.
+# final link needs an lld from LLVM 23 or newer; the build uses the rust-lld that ships with rustc.
 #
 # Windows has no line: its archives provide libpython, OpenSSL and SQLite only as DLLs, and the
 # way to build a self-contained Windows runner is still an open decision.

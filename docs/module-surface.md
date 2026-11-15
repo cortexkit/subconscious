@@ -203,10 +203,9 @@ on `RouteBindRequest.peer`:
 Absent peer facts are omitted, never `null`. Targets that do not declare
 `peer-build/v1` retain their existing bind bytes. A daemon advertises support
 for peer-build delivery as `peer-build/v1` in HELLO_ACK `subc_capabilities`.
-Tests: `peer_build_production_reaches_opted_in_target`,
-`peer_build_requires_opt_in_and_callosums_exact_production_claim`, and
-`peer_build_is_advertised_in_hello_ack`
-(`crates/subc-daemon/src/peer_manifest_tests.rs`).
+Tests: `peer_build_production_reaches_opted_in_target` (`crates/subc-daemon/src/peer_manifest_tests.rs`),
+`peer_build_requires_opt_in_and_callosums_exact_production_claim` (`crates/subc-daemon/src/peer_manifest_tests.rs`), and
+`peer_build_is_advertised_in_hello_ack` (`crates/subc-daemon/src/peer_manifest_tests.rs`).
 
 Reply with an empty `route.bind` response to accept. Reply with an `ERROR` to
 refuse; the daemon relays it to the opener unchanged. Nothing is forwarded on

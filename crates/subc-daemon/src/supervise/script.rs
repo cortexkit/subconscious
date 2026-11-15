@@ -293,7 +293,13 @@ mod tests {
             let report: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
             assert_eq!(report["forbidden_env"], serde_json::json!([]));
-            assert_eq!(report["runner"], runner.to_string_lossy().as_ref());
+            // The runner reports the path it was started from, which Windows may spell in
+            // its long form while TEMP holds the 8.3 short form (RUNNER~1). Compare the file.
+            let reported = std::path::PathBuf::from(report["runner"].as_str().unwrap());
+            assert_eq!(
+                std::fs::canonicalize(&reported).unwrap(),
+                std::fs::canonicalize(&runner).unwrap()
+            );
             std::fs::remove_file(receipt).unwrap();
         }
     }

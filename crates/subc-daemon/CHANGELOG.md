@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.48.1
+
+- Test-only: the script environment test compares the runner's reported path to the
+  installed one as files, so Windows' short and long path spellings both match.
+
 ## 0.48.0
 
 - Accept Python script modules with the installed `ck-script-runner-python`,

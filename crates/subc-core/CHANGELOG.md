@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.21.16
+
+- Raise the daemon requirement to 0.49.0 for opt-in phone build facts on route
+  binds, and align the co-bumped protocol and Rust client requirements.
+
 ## 0.21.15
 
 - Select the installed Python script runner for `ck module check-script` files

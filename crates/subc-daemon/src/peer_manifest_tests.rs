@@ -444,6 +444,107 @@ async fn operator_app_native_connection_is_stamped_again_by_a_restarted_daemon()
     assert_eq!(fixture.pid(), original_pid);
 }
 
+async fn peer_build_bind(
+    opener: Option<&str>,
+    claim: Option<&str>,
+    capabilities: Option<Value>,
+) -> (Frame, Arc<crate::forwarding::RouteBinding>) {
+    let supervisor = SupervisorHandle::new();
+    if let Some(module_id) = opener {
+        supervisor.set_spawn_nonce(module_id, "nonce".into());
+    }
+    let handler = ControlHandler::default().with_supervisor(supervisor);
+    let (target, mut target_rx) = route_ctx(ConnectionId::new(1));
+    let mut hello: Value =
+        serde_json::from_slice(&hello_frame("target", PROTOCOL_VERSION, 1).body).unwrap();
+    if let Some(provides) = capabilities {
+        hello["manifest"]["capabilities"] = json!({"provides": provides});
+    }
+    hello_via_sink(
+        &handler,
+        &target,
+        &mut target_rx,
+        Frame::build(
+            FrameType::Hello,
+            control_flags(),
+            0,
+            0,
+            1,
+            serde_json::to_vec(&hello).unwrap(),
+        )
+        .unwrap(),
+    )
+    .await;
+    let (client, _client_rx) = route_ctx(ConnectionId::new(2));
+    let mut identity = BindIdentity::new("fed-phone:0123456789abcdef0123456789abcdef", "s");
+    identity.build_class = claim.map(str::to_owned);
+    let consumer = opener.map(|module_id| subc_control::ConsumerIdentity {
+        module_id: module_id.into(),
+        launch_nonce: "nonce".into(),
+    });
+    bind_route(
+        &handler,
+        &target,
+        &mut target_rx,
+        &client,
+        identity,
+        consumer,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn peer_build_production_reaches_opted_in_target() {
+    let (bind, binding) = peer_build_bind(
+        Some("callosum"),
+        Some("production"),
+        Some(json!(["peer-build/v1"])),
+    )
+    .await;
+    let raw: Value = serde_json::from_slice(&bind.body).unwrap();
+    assert_eq!(raw["peer_build"], "production");
+    assert_eq!(binding.build_class.as_deref(), Some("production"));
+    assert_eq!(
+        binding.principal,
+        Principal::Reserved { module_id: "callosum".into() }
+    );
+    assert!(!String::from_utf8_lossy(&bind.body).contains("build_class"));
+}
+
+#[tokio::test]
+async fn peer_build_requires_opt_in_and_callosums_exact_production_claim() {
+    for capabilities in [None, Some(json!([])), Some(json!(["peer-build/v1"]))] {
+        for opener in [None, Some("other"), Some("callosum")] {
+            for claim in [None, Some("debug"), Some("Production"), Some("production")] {
+                let opted_in = capabilities == Some(json!(["peer-build/v1"]));
+                if opted_in && opener == Some("callosum") && claim == Some("production") {
+                    continue;
+                }
+                let (bind, _) = peer_build_bind(opener, claim, capabilities.clone()).await;
+                let raw: Value = serde_json::from_slice(&bind.body).unwrap();
+                assert!(raw.get("peer_build").is_none(), "{opener:?} {claim:?} {capabilities:?}");
+                assert!(!String::from_utf8_lossy(&bind.body).contains("build_class"));
+                let legacy: LegacyBind = serde_json::from_slice(&bind.body).unwrap();
+                assert_eq!(bind.body, serde_json::to_vec(&legacy).unwrap());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn peer_build_is_advertised_in_hello_ack() {
+    let handler = ControlHandler::default();
+    let (target, mut rx) = route_ctx(ConnectionId::new(1));
+    let ack = hello_via_sink(
+        &handler,
+        &target,
+        &mut rx,
+        hello_frame("target", PROTOCOL_VERSION, 1),
+    )
+    .await;
+    assert!(parse_ack(&ack).subc_capabilities.iter().any(|cap| cap == "peer-build/v1"));
+}
+
 #[tokio::test]
 async fn build_class_is_callosum_production_only_captured_not_relayed_and_warned_once() {
     for opener in [None, Some("other"), Some("callosum")] {

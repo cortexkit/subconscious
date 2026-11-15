@@ -2409,6 +2409,10 @@ pub struct RouteBindRequest {
     ///   permission grants require a well-formed caller with claim `own` and `first_party: true`.
     ///   An absent or incomplete caller establishes no first-party mark.
     ///
+    /// - `peer_build` is sent only for `peer-build/v1`, when the opener is
+    ///   `reserved:callosum` and its phone build claim was exactly `production`.
+    ///   Otherwise it is absent; the opener's raw `build_class` is never relayed.
+    ///
     /// The peer keys decode together. If they don't decode, the bind still
     /// reaches [`ModuleHandler::on_bind`] with all absent and a warning is
     /// logged, so a handler that admits only on `operator_app` refuses it.
@@ -2440,6 +2444,12 @@ impl RouteBindRequest {
     pub fn with_peer(mut self, peer: subc_protocol::peer::RouteBindPeer) -> Self {
         self.peer = peer;
         self
+    }
+
+    /// The daemon's attested phone build fact, present only for `peer-build/v1`.
+    /// A supporting daemon sends only `production`, otherwise the key is absent.
+    pub fn peer_build(&self) -> Option<&str> {
+        self.peer.peer_build.as_deref()
     }
 
     /// Set [`Self::principal`].

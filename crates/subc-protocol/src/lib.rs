@@ -516,8 +516,9 @@ pub struct BindIdentity {
     /// the claim only when the opener's principal is
     /// `Reserved { module_id: "callosum" }`, and only the exact value
     /// [`BUILD_CLASS_PRODUCTION`]; any other value counts as absent. From any
-    /// other opener it is ignored. The daemon never relays it to the target
-    /// module: the identity on `route.bind` never carries it.
+    /// other opener it is ignored. The identity on `route.bind` never carries
+    /// it. Targets declaring [`peer::PEER_BUILD_CAPABILITY`] receive the
+    /// honoured production claim separately as [`peer::RouteBindPeer::peer_build`].
     ///
     /// An absent build-class claim is omitted from the wire. A reader that
     /// predates this field drops it, which grants nothing.

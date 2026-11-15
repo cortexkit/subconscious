@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.37.2
+
+- Add the opt-in `peer-build/v1` capability and `RouteBindPeer::peer_build`
+  with a builder. Supporting daemons send `production` only for the honoured
+  production phone claim from `reserved:callosum`; absent facts are omitted,
+  never `null`. The raw `build_class` remains absent from bind identities.
+
 ## 0.37.1
 
 - Clarify that `config.review` uses the last approved generation, which the plan

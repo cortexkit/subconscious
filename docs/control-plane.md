@@ -179,6 +179,15 @@ Tests: `connection_describe_wire_shapes` (`crates/subc-control/src/connection_de
 `describe_connection_decodes_facts_and_only_unknown_control_op_is_older` (`crates/subc-client-rs/src/consumer/connection_ops_tests.rs`), and
 `describe_connection_reports_tcp_and_local_listener_on_real_daemon` (`crates/subc-client-rs/tests/real_daemon.rs`).
 
+Phone build attestation is a separate bind-only peer fact: a target declaring
+`peer-build/v1` receives `peer_build: "production"` only for an opener attested
+as `reserved:callosum` whose build claim was exactly `production`. No other
+value is sent; absent claims, other values, other openers, and targets without
+the capability omit the key, never send `null`. The raw `build_class` key never
+appears in a bind, and targets without the capability keep their existing bind
+bytes. HELLO_ACK `subc_capabilities` advertises `peer-build/v1`. See
+[route-bind peer facts](module-surface.md#4-routes-routebind).
+
 ### 2.1 `route.open`
 
 ```json

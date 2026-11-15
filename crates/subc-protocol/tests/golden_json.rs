@@ -4,7 +4,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use subc_protocol::peer::{
     encode_route_bind, ObservedPeer, ObservedPeerStatus, OperatorApp, RouteBindPeer,
-    OBSERVED_PEER_CAPABILITY, OPERATOR_APP_CAPABILITY,
+    OBSERVED_PEER_CAPABILITY, OPERATOR_APP_CAPABILITY, PEER_BUILD_CAPABILITY,
 };
 use subc_protocol::{
     call_mode::CallMode,
@@ -495,6 +495,40 @@ fn call_mode_route_binds_match_golden_json_and_round_trip() {
         }
         assert_golden(name, &bind);
     }
+}
+
+#[test]
+fn route_bind_peer_build_round_trips_and_absence_preserves_legacy_bytes() {
+    assert_eq!(PEER_BUILD_CAPABILITY, "peer-build/v1");
+    let bind = module_control_request(None, None);
+    let legacy = serde_json::to_vec(&bind).unwrap();
+    let absent: RouteBindPeer = serde_json::from_slice(&legacy).unwrap();
+    assert!(absent.peer_build.is_none());
+    assert!(absent.is_empty());
+    assert_eq!(encode_route_bind(&bind, &absent).unwrap(), legacy);
+
+    let peer = RouteBindPeer::new().with_peer_build(Some("production".into()));
+    assert!(!peer.is_empty());
+    let encoded = encode_route_bind(&bind, &peer).unwrap();
+    let raw: Value = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(raw["peer_build"], "production");
+    assert!(!String::from_utf8_lossy(&encoded).contains("build_class"));
+    assert_eq!(
+        serde_json::from_slice::<RouteBindPeer>(&encoded).unwrap(),
+        peer
+    );
+    assert_eq!(
+        serde_json::from_slice::<ModuleControlRequest>(&encoded).unwrap(),
+        bind
+    );
+
+    let cleared = peer.with_peer_build(None);
+    assert!(cleared.is_empty());
+    assert_eq!(encode_route_bind(&bind, &cleared).unwrap(), legacy);
+    assert!(serde_json::to_value(cleared)
+        .unwrap()
+        .get("peer_build")
+        .is_none());
 }
 
 /// The four `route.bind` peer-key combinations: neither (a target declaring

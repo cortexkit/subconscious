@@ -181,6 +181,33 @@ The bind carries:
 | `consumer_capabilities`, `role_versions` | Nobody. | Choosing which optional behaviours and role versions to speak. |
 | `admission_facts` | The configured carrier module. | Whatever the carrier and target agree. |
 
+Optional peer facts sit beside these fields in the same bind body. Rust modules
+decode them as `subc_protocol::peer::RouteBindPeer`; the Rust SDK exposes them
+on `RouteBindRequest.peer`:
+
+- `observed_peer` requires `observed-peer/v1` in the target manifest's
+  `capabilities.provides`. It reports the daemon's connection observation,
+  possibly `unobserved`.
+- `operator_app` requires `operator-app/v1` and daemon recognition of an operator
+  app under its platform policy. It records recognition, not permission to act
+  on the person's behalf.
+- `caller` requires `caller-attestation/v1`. An absent or incomplete attestation
+  establishes no first-party mark.
+- `peer_build` requires `peer-build/v1` in the captured target manifest. The
+  daemon sends only `"production"`, only when the opener is `reserved:callosum`
+  and its phone session's build claim was exactly `production`. Other openers,
+  absent claims and other values produce no key. This is the honoured phone
+  build fact, not the opener's raw identity claim; `build_class` itself never
+  appears in bind bytes. The Rust SDK also exposes `peer_build()`.
+
+Absent peer facts are omitted, never `null`. Targets that do not declare
+`peer-build/v1` retain their existing bind bytes. A daemon advertises support
+for peer-build delivery as `peer-build/v1` in HELLO_ACK `subc_capabilities`.
+Tests: `peer_build_production_reaches_opted_in_target`,
+`peer_build_requires_opt_in_and_callosums_exact_production_claim`, and
+`peer_build_is_advertised_in_hello_ack`
+(`crates/subc-daemon/src/peer_manifest_tests.rs`).
+
 Reply with an empty `route.bind` response to accept. Reply with an `ERROR` to
 refuse; the daemon relays it to the opener unchanged. Nothing is forwarded on
 the route until the module accepts. See [`principal.md`](principal.md) for the

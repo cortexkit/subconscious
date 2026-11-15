@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.0.8
+
+- Raise the daemon requirement to 0.49.0 for opt-in phone build facts on route
+  binds, and align the co-bumped protocol requirements.
+
 ## 0.0.7
 
 - Raise the daemon requirement for the script-aware launch specification API.

@@ -135,6 +135,21 @@ async fn a_bind_without_peer_keys_or_with_malformed_ones_has_none() {
 }
 
 #[tokio::test]
+async fn peer_build_reaches_bind_handlers_and_is_absent_on_legacy_binds() {
+    let request = decoded_bind_with(None, None, json!({"peer_build": "production"})).await;
+    assert_eq!(request.peer_build(), Some("production"));
+    assert_eq!(request.peer.peer_build.as_deref(), Some("production"));
+    assert_eq!(decoded_bind(None, None).await.peer_build(), None);
+    let synthetic = request.with_peer(
+        subc_protocol::peer::RouteBindPeer::new().with_peer_build(Some("production".into())),
+    );
+    assert_eq!(synthetic.peer_build(), Some("production"));
+    let malformed = decoded_bind_with(None, None, json!({"peer_build": 42})).await;
+    assert!(malformed.peer.is_empty());
+    assert_eq!(malformed.peer_build(), None);
+}
+
+#[tokio::test]
 async fn absent_call_mode_on_a_run_bind_reads_codemode() {
     let request = decoded_bind(Some(scope(json!({ "run_id": "run-a" }))), None).await;
     assert_eq!(request.call_mode, CallMode::Codemode);

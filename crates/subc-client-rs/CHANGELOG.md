@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.40.4
+
+- Expose `peer_build` in bind peer facts and through `RouteBindRequest::peer_build()`.
+  Targets declare `peer-build/v1` to receive the daemon's honoured production
+  phone build fact; legacy binds leave it absent. Require subc-protocol 0.37.2.
+
 ## 0.40.3
 
 - Register supervised re-exports under the owner's reserved prefix with exact-id

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.49.0
+
+- Advertise `peer-build/v1` in HELLO_ACK and relay `peer_build: "production"`
+  only to targets whose captured manifest declares it, and only for the honoured
+  production phone build claim from `reserved:callosum`. Other claims and
+  openers produce no fact. Binds to targets without the capability retain their
+  legacy bytes, and the raw `build_class` key is never relayed.
+- Require subc-protocol 0.37.2 for the optional peer-build wire field.
+
 ## 0.48.3
 
 - Test only: the script-runner environment test retries its runner start while Linux reports

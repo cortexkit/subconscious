@@ -24,6 +24,10 @@ pub const OBSERVED_PEER_CAPABILITY: &str = "observed-peer/v1";
 /// a recognised operator app.
 pub const OPERATOR_APP_CAPABILITY: &str = "operator-app/v1";
 
+/// A target declares this to receive [`RouteBindPeer::peer_build`] on a
+/// `route.bind` opened by an attested production phone session.
+pub const PEER_BUILD_CAPABILITY: &str = "peer-build/v1";
+
 /// A target declares this to receive [`RouteBindPeer::caller`] on `route.bind`.
 pub const CALLER_ATTESTATION_CAPABILITY: &str = "caller-attestation/v1";
 
@@ -355,6 +359,12 @@ pub struct RouteBindPeer {
         deserialize_with = "deserialize_caller"
     )]
     pub caller: Option<CallerAttestation>,
+    /// Sent only to a target declaring [`PEER_BUILD_CAPABILITY`], only when
+    /// the opener is `reserved:callosum` and its build claim was exactly
+    /// `production`. The daemon sends only `production`, never another value
+    /// or `null`; otherwise the key is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_build: Option<String>,
 }
 
 impl RouteBindPeer {
@@ -384,9 +394,19 @@ impl RouteBindPeer {
         self
     }
 
+    /// Set or clear `peer_build`.
+    #[must_use]
+    pub fn with_peer_build(mut self, peer_build: Option<String>) -> Self {
+        self.peer_build = peer_build;
+        self
+    }
+
     /// Whether no peer key is present.
     pub fn is_empty(&self) -> bool {
-        self.observed_peer.is_none() && self.operator_app.is_none() && self.caller.is_none()
+        self.observed_peer.is_none()
+            && self.operator_app.is_none()
+            && self.caller.is_none()
+            && self.peer_build.is_none()
     }
 }
 

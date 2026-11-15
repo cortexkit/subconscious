@@ -33,7 +33,10 @@ use subc_protocol::{
         CapabilityDeclarations, CapabilityNeed, Concurrency, ManifestProvenance, ModuleManifest,
         ProviderRole,
     },
-    peer::{ObservedPeer, RouteBindPeer, OBSERVED_PEER_CAPABILITY, OPERATOR_APP_CAPABILITY},
+    peer::{
+        ObservedPeer, RouteBindPeer, OBSERVED_PEER_CAPABILITY, OPERATOR_APP_CAPABILITY,
+        PEER_BUILD_CAPABILITY,
+    },
     provider_declarations::ProviderDeclarations,
     scope::{
         ScopeEnd, ScopeRecord, ScopeRecordOutcome, ScopeRecordResult, ScopeSelector,
@@ -1170,6 +1173,7 @@ impl ControlHandler {
                 CAP_SCOPES_V1.to_string(),
                 subc_protocol::scope::SCOPE_FEDERATED_CAPABILITY.to_string(),
                 subc_protocol::peer::CALLER_ATTESTATION_CAPABILITY.to_string(),
+                PEER_BUILD_CAPABILITY.to_string(),
                 CAP_ROUTE_ROLE_VERSIONS_V1.to_string(),
                 subc_protocol::manifest::CAP_CATALOG_EVENTS_V1.to_string(),
                 subc_protocol::manifest::CAP_SCOPE_BIND_PROOF_V1.to_string(),
@@ -6872,8 +6876,8 @@ impl ControlHandler {
             },
         };
 
-        // Only Callosum can attest a production phone build. Consume the claim
-        // here so it can be kept on the route without reaching any module.
+        // Only Callosum can attest a production phone build. Consume the raw
+        // claim here; opted-in targets receive only the honoured peer fact.
         let build_class = identity.build_class.take().filter(|build_class| {
             if caller_module_id.as_deref() == Some("callosum") {
                 build_class == subc_protocol::BUILD_CLASS_PRODUCTION
@@ -7121,6 +7125,8 @@ impl ControlHandler {
             .unwrap_or_else(|p| p.into_inner())
             .get(&ctx.connection_id)
             .cloned();
+        let production_peer_build =
+            build_class.as_deref() == Some(subc_protocol::BUILD_CLASS_PRODUCTION);
         timings.enter(RouteOpenPhase::EgressReservation);
         let pending = match self
             .forwarding
@@ -7361,7 +7367,14 @@ impl ControlHandler {
                 caller_capture.as_ref(),
                 relay_capabilities,
                 &target_module_id,
-            ));
+            ))
+            .with_peer_build(
+                (production_peer_build
+                    && relay_capabilities.is_some_and(|caps| {
+                        caps.provides.iter().any(|cap| cap == PEER_BUILD_CAPABILITY)
+                    }))
+                .then(|| subc_protocol::BUILD_CLASS_PRODUCTION.to_owned()),
+            );
         let relay_body = crate::bind_compat::encode_bind(
             &relay,
             &peer,

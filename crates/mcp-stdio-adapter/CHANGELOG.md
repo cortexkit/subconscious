@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.8.5
+
+- Raise the daemon requirement to 0.49.0 for opt-in phone build facts on route
+  binds, and align the co-bumped protocol and Rust client requirements.
+
 ## 0.8.4
 
 - Raise the test-only subc-daemon requirement to 0.48.0 for typed script entries.

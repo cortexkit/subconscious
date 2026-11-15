@@ -45,11 +45,11 @@ private actor TestKeychainBacking: FedKeychainBacking {
         self.raceWinner = raceWinner
     }
 
-    func readItem(service _: String, account _: String) async throws -> Data? {
+    func readItem(service _: String, account _: String, accessGroup _: String?) async throws -> Data? {
         item
     }
 
-    func addItemIfAbsent(_ data: Data, service _: String, account _: String) async throws -> Bool {
+    func addItemIfAbsent(_ data: Data, service _: String, account _: String, accessGroup _: String?) async throws -> Bool {
         if let raceWinner {
             item = raceWinner
             return false

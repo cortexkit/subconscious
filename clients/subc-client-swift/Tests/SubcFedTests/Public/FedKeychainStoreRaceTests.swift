@@ -91,7 +91,7 @@ private actor RacyFirstLoadBacking: FedKeychainBacking {
         self.barrier = FirstLoadBarrier(count: firstReaders)
     }
 
-    func readItem(service: String, account: String) async throws -> Data? {
+    func readItem(service: String, account: String, accessGroup _: String?) async throws -> Data? {
         // Only the initial empty-store reads rendezvous; once an item exists the
         // re-read of the winner and any later reads return it immediately.
         if persisted[account] == nil, firstReadsSeen < firstReaders {
@@ -101,7 +101,7 @@ private actor RacyFirstLoadBacking: FedKeychainBacking {
         return persisted[account]
     }
 
-    func addItemIfAbsent(_ data: Data, service: String, account: String) async throws -> Bool {
+    func addItemIfAbsent(_ data: Data, service: String, account: String, accessGroup _: String?) async throws -> Bool {
         if persisted[account] != nil {
             return false
         }

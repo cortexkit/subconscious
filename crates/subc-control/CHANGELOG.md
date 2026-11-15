@@ -3,6 +3,7 @@
 ## 0.41.0
 
 - Add standalone `scope.watch` request, snapshot and terminal push shapes, with open lifecycle state/event readers. Advertised as a new module control operation.
+- Require subc-protocol 0.37.2, released alongside.
 
 ## 0.40.2
 

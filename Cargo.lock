@@ -735,6 +735,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d14cf5bd9d4b76fcf4d5380550dd11f9191598309ecaacc4805e317b2d6deb90"
 
 [[package]]
+name = "cortexkit-project-identity"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "041978e9b041bc7db3f7e5239f2ea18c189ad9aeff2440c9c0a7435dca3d8cc6"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "cortexkit-release"
 version = "0.1.2"
 dependencies = [
@@ -3022,11 +3032,12 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.48.1"
+version = "0.48.2"
 dependencies = [
  "base64",
  "cortexkit-log",
  "cortexkit-paths",
+ "cortexkit-project-identity",
  "cortexkit-test-support",
  "fs4",
  "getrandom 0.2.17",
@@ -3110,7 +3121,7 @@ dependencies = [
 
 [[package]]
 name = "subc-os"
-version = "0.1.38"
+version = "0.1.39"
 dependencies = [
  "cortexkit-test-support",
  "libc",

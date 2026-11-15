@@ -822,7 +822,7 @@ fn config_recovery_fixture() {
                     crate::config_gate::capture::ConfigCapturer {
                         daemon_path: root.join("subc.jsonc"),
                         config_home: root.join("config"),
-                        projects: Arc::new(crate::config_gate::capture::UnavailableProjectRegistry),
+                        projects: Arc::new(crate::config_gate::capture::OfflineProjectRegistry),
                     },
                 );
                 let prepared = owner.prepare(PlanKind::Stamp).unwrap();

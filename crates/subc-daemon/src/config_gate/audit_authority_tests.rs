@@ -42,7 +42,7 @@ fn sealed_owner(rig: &Rig, key: crate::config_store::TestStoreKey) -> RuntimeOwn
         ConfigCapturer {
             daemon_path: rig.path.join("subc.jsonc"),
             config_home: rig.path.clone(),
-            projects: std::sync::Arc::new(crate::config_gate::capture::UnavailableProjectRegistry),
+            projects: std::sync::Arc::new(crate::config_gate::capture::OfflineProjectRegistry),
         },
     )
 }

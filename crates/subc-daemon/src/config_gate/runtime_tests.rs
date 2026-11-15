@@ -667,7 +667,7 @@ impl Rig {
             ConfigCapturer {
                 daemon_path: self.path.join("subc.jsonc"),
                 config_home: self.path.clone(),
-                projects: std::sync::Arc::new(super::super::capture::UnavailableProjectRegistry),
+                projects: std::sync::Arc::new(super::super::capture::OfflineProjectRegistry),
             },
         )
     }

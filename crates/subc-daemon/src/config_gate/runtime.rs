@@ -1111,8 +1111,8 @@ impl RuntimeOwner {
             })?;
         if request.project_id.is_some() {
             return Err(GateError::new(
-                "project_registry_unavailable",
-                format!("{module}: project layer registry is not connected"),
+                "config_gated",
+                format!("{module}: project-tuple delivery is not supported yet"),
             ));
         }
         if check_store {

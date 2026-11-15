@@ -185,7 +185,7 @@ fn review_fixture() -> (
 ) {
     use crate::{
         config_gate::{
-            capture::{ConfigCapturer, UnavailableProjectRegistry},
+            capture::{ConfigCapturer, OfflineProjectRegistry},
             runtime::{daemon_review, RuntimeOwner},
             PlanKind,
         },
@@ -209,7 +209,7 @@ fn review_fixture() -> (
         ConfigCapturer {
             daemon_path: path.join("subc.jsonc"),
             config_home: path.clone(),
-            projects: Arc::new(UnavailableProjectRegistry),
+            projects: Arc::new(OfflineProjectRegistry),
         },
     ));
     let view = owner

@@ -94,9 +94,11 @@ pub use durable_replace::durable_replace_with_rename_hook;
 pub use durable_replace::{durable_replace, DurableReplaceError};
 #[cfg(any(unix, windows))]
 pub use retained_file::{
-    open_regular_nofollow, open_regular_nofollow_all, retained_file_identity, OpenRegularError,
-    RetainedFileIdentity,
+    open_directory_nofollow_all, open_regular_nofollow, open_regular_nofollow_all,
+    retained_file_identity, OpenRegularError, RetainedFileIdentity,
 };
+#[cfg(windows)]
+pub use retained_file::{retained_file_index, WindowsFileIndexIdentity};
 #[cfg(all(unix, feature = "test-support"))]
 pub mod fork_exec_test;
 pub mod host;

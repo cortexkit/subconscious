@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.39
+
+- Add all-component no-symlink directory opens and a retained-handle query for
+  Windows legacy volume serial/file index identities, distinct from FILE_ID_INFO.
+
 ## 0.1.38
 
 - Reserve Unix descriptor 6 for an identity-bearing script pipe and keep all

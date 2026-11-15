@@ -1597,8 +1597,8 @@ impl RuntimeOwner {
         }
         if request.project_id.is_some() {
             return Err(GateError::new(
-                "project_registry_unavailable",
-                "project delivery requires the authoritative project registry",
+                "config_gated",
+                "project-tuple delivery is not supported yet",
             ));
         }
         if state.active_declarations.get(module) != Some(&connection) {

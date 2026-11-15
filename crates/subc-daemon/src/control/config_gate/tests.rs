@@ -66,7 +66,7 @@ async fn config_gate_ops_are_explicitly_unprivileged_and_inactive_dispatch_is_na
 #[tokio::test]
 async fn config_plan_proceeds_without_an_unavailable_rereview_and_keeps_it_owed() {
     use crate::config_gate::{
-        capture::{ConfigCapturer, UnavailableProjectRegistry},
+        capture::{ConfigCapturer, OfflineProjectRegistry},
         runtime::{AppliedDisposition, DeliveryObserver, RuntimeOwner},
         ApprovalFacts, ApprovalReply, PlanKind, PresenceDecision,
     };
@@ -96,7 +96,7 @@ async fn config_plan_proceeds_without_an_unavailable_rereview_and_keeps_it_owed(
         ConfigCapturer {
             daemon_path: path,
             config_home: root.to_path_buf(),
-            projects: Arc::new(UnavailableProjectRegistry),
+            projects: Arc::new(OfflineProjectRegistry),
         },
     ));
     let declaration = ConfigDeclareRequest::new(

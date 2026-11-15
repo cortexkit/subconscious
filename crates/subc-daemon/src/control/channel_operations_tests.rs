@@ -180,7 +180,7 @@ async fn channel_operations_config_row_serves_current_and_candidate_not_draining
         crate::config_gate::capture::ConfigCapturer {
             daemon_path: path.join("subc.jsonc"),
             config_home: path.clone(),
-            projects: Arc::new(crate::config_gate::capture::UnavailableProjectRegistry),
+            projects: Arc::new(crate::config_gate::capture::OfflineProjectRegistry),
         },
     ));
     let rig = rig_with(move |handler| handler.with_config_runtime(owner)).await;

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.48.2
+
+- Add an Entorhinal-backed project registry reader using the nonce-verified
+  `projects.enumerate` control op. Validate registry roots with published
+  filesystem identities and compare only affected entries at review recheck.
+- Project layers remain unsupported until project-tuple planning and delivery
+  are implemented; existing user-tuple delivery needs no registry connection.
+
 ## 0.48.1
 
 - Test-only: the script environment test compares the runner's reported path to the

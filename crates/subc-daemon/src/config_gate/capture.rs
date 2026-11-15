@@ -40,7 +40,7 @@ pub enum FileObjectId {
     },
 }
 
-mod decimal_id {
+pub(super) mod decimal_id {
     use serde::{Deserialize, Deserializer, Serializer};
     pub fn serialize<S: Serializer>(
         value: &u64,
@@ -111,39 +111,9 @@ impl UserFileMetadata {
     }
 }
 
-/// The planning adapter must supply a complete authoritative revision, never
-/// roots proposed by a module or a caller's current working directory.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RegistryProject {
-    pub project_id: String,
-    pub workspace_id: Option<String>,
-    pub project_root: PathBuf,
-    pub project_identity: FileObjectId,
-    pub workspace_root: Option<PathBuf>,
-    pub workspace_identity: Option<FileObjectId>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RegistryRevision {
-    pub revision: u64,
-    pub projects: Vec<RegistryProject>,
-}
-
-pub trait ProjectRegistry: Send + Sync {
-    fn snapshot(&self) -> Result<RegistryRevision>;
-}
-
-/// Delivery needs no registry connection. Only a new project-layer plan needs
-/// this adapter, which refuses until an authoritative registry reader is wired.
-pub struct UnavailableProjectRegistry;
-impl ProjectRegistry for UnavailableProjectRegistry {
-    fn snapshot(&self) -> Result<RegistryRevision> {
-        Err(GateError::new(
-            "project_registry_unavailable",
-            "project/workspace registry is unavailable",
-        ))
-    }
-}
+#[cfg(test)]
+pub(crate) use super::project_registry::OfflineProjectRegistry;
+pub use super::project_registry::{ProjectRegistry, RegistryRevision};
 
 pub struct ConfigCapturer {
     pub daemon_path: PathBuf,
@@ -482,15 +452,9 @@ impl ConfigCapturer {
             }
             if !declaration.project_dirs.is_empty() {
                 // Module-authored directories never become registry roots.
-                self.projects.snapshot().map_err(|_| {
-                    GateError::new(
-                        "project_registry_unavailable",
-                        format!("{module}: project/workspace layer registry is unavailable"),
-                    )
-                })?;
                 return Err(GateError::new(
-                    "project_registry_unavailable",
-                    format!("{module}: project/workspace layer capture is unavailable"),
+                    "config_gated",
+                    format!("{module}: project-tuple planning and delivery are not supported yet"),
                 ));
             }
             if module.is_empty() || module.contains(['/', '\\']) || module == "." || module == ".."
@@ -806,7 +770,7 @@ mod tests {
                 capturer: ConfigCapturer {
                     daemon_path,
                     config_home: root.clone(),
-                    projects: Arc::new(UnavailableProjectRegistry),
+                    projects: Arc::new(OfflineProjectRegistry),
                 },
                 declarations: BTreeMap::from([("a".into(), declaration)]),
                 root,
@@ -871,8 +835,9 @@ mod tests {
         let mut rig = Rig::new();
         rig.declarations.get_mut("a").unwrap().project_dirs = vec!["/not-a-registry-root".into()];
         let error = rig.capturer.capture(&rig.declarations).err().unwrap();
-        assert_eq!(error.code, "project_registry_unavailable");
-        assert!(error.detail.contains("a: project/workspace"));
+        assert_eq!(error.code, "config_gated");
+        assert!(error.detail.contains("project-tuple planning and delivery"));
+        assert!(error.detail.contains("a: project-tuple"));
     }
 
     #[test]

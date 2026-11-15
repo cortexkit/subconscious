@@ -10,6 +10,7 @@ mod apply;
 mod approval;
 pub mod capture;
 pub(crate) mod program;
+pub mod project_registry;
 pub(crate) mod review;
 mod reviewed_build;
 pub mod runtime;

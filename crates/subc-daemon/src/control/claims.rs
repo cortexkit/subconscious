@@ -2961,7 +2961,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn claims_prefix_mint_refuses_gated_id() {
         use crate::config_gate::{
-            capture::{ConfigCapturer, UnavailableProjectRegistry},
+            capture::{ConfigCapturer, OfflineProjectRegistry},
             runtime::RuntimeOwner,
             ApprovalFacts, ApprovalReply, PlanKind, PresenceDecision,
         };
@@ -2992,7 +2992,7 @@ pub(crate) mod tests {
             ConfigCapturer {
                 daemon_path,
                 config_home: root.clone(),
-                projects: Arc::new(UnavailableProjectRegistry),
+                projects: Arc::new(OfflineProjectRegistry),
             },
         ));
         let plan = owner

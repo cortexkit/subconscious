@@ -84,7 +84,7 @@ async fn recovery_slow_retry_roundtrip(
         crate::config_gate::capture::ConfigCapturer {
             daemon_path: path,
             config_home: dir.path().to_path_buf(),
-            projects: Arc::new(crate::config_gate::capture::UnavailableProjectRegistry),
+            projects: Arc::new(crate::config_gate::capture::OfflineProjectRegistry),
         },
     ));
     let policy = RestartPolicy::new(1, Duration::ZERO).with_window(Duration::from_secs(3600));

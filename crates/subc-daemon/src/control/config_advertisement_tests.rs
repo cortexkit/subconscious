@@ -18,7 +18,7 @@ fn config_admission_gate_capability_requires_explicit_store_activation() {
         crate::config_gate::capture::ConfigCapturer {
             daemon_path: path.join("subc.jsonc"),
             config_home: path.clone(),
-            projects: Arc::new(crate::config_gate::capture::UnavailableProjectRegistry),
+            projects: Arc::new(crate::config_gate::capture::OfflineProjectRegistry),
         },
     ));
     let plain = ControlHandler::new(Arc::new(Registry::default()));
@@ -99,7 +99,7 @@ async fn config_admission_production_reviewer_requires_the_active_live_child_non
         crate::config_gate::capture::ConfigCapturer {
             daemon_path: path.join("subc.jsonc"),
             config_home: path.clone(),
-            projects: Arc::new(crate::config_gate::capture::UnavailableProjectRegistry),
+            projects: Arc::new(crate::config_gate::capture::OfflineProjectRegistry),
         },
     ));
     let registry = Arc::new(Registry::default());

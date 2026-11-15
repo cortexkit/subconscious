@@ -9618,7 +9618,10 @@ impl ControlHandler {
                     }
                 }
                 Ok(probe) => {
-                    let outcome = if matches!(probe.op.as_str(), "config.review" | "consent/v1") {
+                    let outcome = if matches!(
+                        probe.op.as_str(),
+                        "config.review" | "consent/v1" | "projects.enumerate"
+                    ) {
                         ModuleControlRpcOutcome::RawResponse(frame.body.clone())
                     } else {
                         match serde_json::from_slice::<ModuleControlResponse>(&frame.body) {
@@ -10635,7 +10638,7 @@ fn response_version(frame: &Frame) -> u8 {
     }
 }
 
-fn control_flags() -> Flags {
+pub(crate) fn control_flags() -> Flags {
     Flags::new(false, Priority::Passive, false)
 }
 

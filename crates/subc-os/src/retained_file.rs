@@ -59,6 +59,19 @@ pub fn open_regular_nofollow(path: &std::path::Path) -> Result<File, OpenRegular
 /// Directory descriptors anchor each lookup even if an ancestor is renamed.
 #[cfg(unix)]
 pub fn open_regular_nofollow_all(path: &std::path::Path) -> Result<File, OpenRegularError> {
+    open_nofollow_all(path, false)
+}
+
+/// Open an absolute directory without following symlinks in any component.
+pub fn open_directory_nofollow_all(path: &std::path::Path) -> Result<File, OpenRegularError> {
+    open_nofollow_all(path, true)
+}
+
+#[cfg(unix)]
+fn open_nofollow_all(
+    path: &std::path::Path,
+    want_directory: bool,
+) -> Result<File, OpenRegularError> {
     use rustix::fs::{open, openat, Mode, OFlags};
     use std::path::Component;
     if !path.is_absolute() {
@@ -81,7 +94,7 @@ pub fn open_regular_nofollow_all(path: &std::path::Path) -> Result<File, OpenReg
             | OFlags::CLOEXEC
             | OFlags::NOFOLLOW
             | OFlags::NONBLOCK
-            | if leaf {
+            | if leaf && !want_directory {
                 OFlags::empty()
             } else {
                 OFlags::DIRECTORY
@@ -95,7 +108,11 @@ pub fn open_regular_nofollow_all(path: &std::path::Path) -> Result<File, OpenReg
         })?;
     }
     let file = File::from(directory);
-    if !file.metadata()?.is_file() {
+    if if want_directory {
+        !file.metadata()?.is_dir()
+    } else {
+        !file.metadata()?.is_file()
+    } {
         return Err(OpenRegularError::NotRegularFile);
     }
     Ok(file)
@@ -107,6 +124,15 @@ pub fn open_regular_nofollow_all(path: &std::path::Path) -> Result<File, OpenReg
 #[cfg(windows)]
 #[allow(unsafe_code)]
 pub fn open_regular_nofollow_all(path: &std::path::Path) -> Result<File, OpenRegularError> {
+    open_nofollow_all(path, false)
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn open_nofollow_all(
+    path: &std::path::Path,
+    want_directory: bool,
+) -> Result<File, OpenRegularError> {
     use std::{
         os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
         path::Component,
@@ -144,7 +170,11 @@ pub fn open_regular_nofollow_all(path: &std::path::Path) -> Result<File, OpenReg
         ancestors.push(file);
     }
     let file = ancestors.pop().ok_or(OpenRegularError::NotRegularFile)?;
-    if !file.metadata()?.is_file() {
+    if if want_directory {
+        !file.metadata()?.is_dir()
+    } else {
+        !file.metadata()?.is_file()
+    } {
         return Err(OpenRegularError::NotRegularFile);
     }
     Ok(file)
@@ -206,6 +236,36 @@ pub fn retained_file_identity(file: &File) -> io::Result<RetainedFileIdentity> {
     })
 }
 
+/// The published registry's Windows identity uses the legacy 64-bit file index,
+/// not FILE_ID_INFO's 128-bit identifier; neither is a padded form of the other.
+#[cfg(windows)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowsFileIndexIdentity {
+    pub volume_serial: u32,
+    pub file_index: u64,
+}
+
+/// Read the legacy 64-bit file index and volume serial from the exact handle.
+/// Registries publish this identity; FILE_ID_INFO's 128-bit identifier is a
+/// different representation and cannot safely be inferred by padding this one.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+pub fn retained_file_index(file: &File) -> io::Result<WindowsFileIndexIdentity> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    let mut info: BY_HANDLE_FILE_INFORMATION = Default::default();
+    // SAFETY: file owns the live handle and info is a writable, correctly sized buffer.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(WindowsFileIndexIdentity {
+        volume_serial: info.dwVolumeSerialNumber,
+        file_index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    })
+}
+
 /// Identify an already-open file using the complete Windows file-object id.
 #[cfg(windows)]
 #[allow(unsafe_code)]
@@ -237,6 +297,31 @@ pub fn retained_file_identity(file: &File) -> io::Result<RetainedFileIdentity> {
 #[cfg(all(test, any(unix, windows)))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_directory_open_checks_type_and_identity() {
+        let dir = cortexkit_test_support::ScratchDir::new("retained-directory");
+        let opened = open_directory_nofollow_all(&dir).unwrap();
+        assert!(opened.metadata().unwrap().is_dir());
+        assert_eq!(
+            retained_file_identity(&opened).unwrap(),
+            retained_file_identity(&open_directory_nofollow_all(&dir).unwrap()).unwrap()
+        );
+        let path = dir.join("file");
+        std::fs::write(&path, b"file").unwrap();
+        assert!(open_directory_nofollow_all(&path).is_err());
+        assert!(open_directory_nofollow_all(std::path::Path::new("relative")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_directory_open_refuses_symlink_ancestors_and_leaf() {
+        let dir = cortexkit_test_support::ScratchDir::new("retained-directory-symlink");
+        std::fs::create_dir_all(dir.join("real/child")).unwrap();
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("link")).unwrap();
+        assert!(open_directory_nofollow_all(&dir.join("link")).is_err());
+        assert!(open_directory_nofollow_all(&dir.join("link/child")).is_err());
+    }
 
     #[test]
     fn retained_file_identity_hard_links_share_identity_but_copies_do_not() {

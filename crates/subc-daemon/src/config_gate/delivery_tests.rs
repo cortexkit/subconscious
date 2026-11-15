@@ -124,6 +124,32 @@ fn config_delivery_first_ack_activates_whole_generation_and_duplicates_do_nothin
     assert!(reply.pending.is_none());
 }
 
+#[tokio::test]
+async fn registry_offline_refuses_snapshot_but_active_user_tuple_delivery_continues() {
+    let (_rig, mut owner) = rig();
+    let view = pending(&owner, INCUMBENT);
+    applied(&owner, INCUMBENT, &view, true).unwrap();
+    owner.capturer.projects = std::sync::Arc::new(
+        crate::config_gate::project_registry::EntorhinalProjectRegistry::new(
+            std::sync::Arc::new(crate::registry::Registry::default()),
+            std::sync::Arc::new(crate::forwarding::ForwardingTable::default()),
+        ),
+    );
+    let error = owner
+        .capturer
+        .projects
+        .snapshot("a", &BTreeSet::from(["project".into()]))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "project_registry_unavailable");
+    assert!(error.detail.contains("not registered"));
+    let delivered = owner
+        .module_get(INCUMBENT, "a", ConfigGetRequest::new())
+        .unwrap();
+    assert_eq!(delivered.active.unwrap().generation, view.generation);
+    assert!(delivered.pending.is_none());
+}
+
 #[test]
 fn config_delivery_get_binds_exact_generation_and_attempt_to_one_child() {
     let (rig, owner) = rig();
@@ -316,7 +342,7 @@ fn sealed_owner(
         ConfigCapturer {
             daemon_path: rig.path.join("subc.jsonc"),
             config_home: rig.path.clone(),
-            projects: std::sync::Arc::new(super::super::super::capture::UnavailableProjectRegistry),
+            projects: std::sync::Arc::new(super::super::super::capture::OfflineProjectRegistry),
         },
     )
 }

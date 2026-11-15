@@ -101,7 +101,7 @@ pub(super) fn gated_owner(
         ConfigCapturer {
             daemon_path,
             config_home: root,
-            projects: Arc::new(crate::config_gate::capture::UnavailableProjectRegistry),
+            projects: Arc::new(crate::config_gate::capture::OfflineProjectRegistry),
         },
     ));
     if stamped {

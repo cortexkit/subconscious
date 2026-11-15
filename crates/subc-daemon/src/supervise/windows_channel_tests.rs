@@ -206,7 +206,7 @@ async fn windows_channel_tokio_server_accepts_and_exchanges_frame() {
 use crate::{
     caller_identity::CallerIdentity,
     config_gate::{
-        capture::{ConfigCapturer, UnavailableProjectRegistry},
+        capture::{ConfigCapturer, OfflineProjectRegistry},
         runtime::{daemon_review, RuntimeOwner},
         ApprovalFacts, ApprovalReply, PlanKind, PresenceDecision,
     },
@@ -246,7 +246,7 @@ async fn windows_channel_gated_spawn_withholds_nonce() {
         ConfigCapturer {
             daemon_path: path.join("subc.jsonc"),
             config_home: path.clone(),
-            projects: Arc::new(UnavailableProjectRegistry),
+            projects: Arc::new(OfflineProjectRegistry),
         },
     ));
     let facts = ApprovalFacts {

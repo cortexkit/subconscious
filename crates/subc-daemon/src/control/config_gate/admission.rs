@@ -59,7 +59,7 @@ impl crate::config_gate::ReviewAdmission for SupervisedReviewAdmission {
 mod dual_path_tests {
     use super::*;
     use crate::config_gate::{
-        capture::{ConfigCapturer, UnavailableProjectRegistry},
+        capture::{ConfigCapturer, OfflineProjectRegistry},
         runtime::RuntimeOwner,
         ApprovalFacts, ApprovalReply, PlanKind, PresenceDecision, ReviewAdmission,
     };
@@ -100,7 +100,7 @@ mod dual_path_tests {
                 ConfigCapturer {
                     daemon_path: path.clone(),
                     config_home: root.to_path_buf(),
-                    projects: Arc::new(UnavailableProjectRegistry),
+                    projects: Arc::new(OfflineProjectRegistry),
                 },
             ));
             if gated {

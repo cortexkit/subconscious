@@ -1217,6 +1217,12 @@ async fn serve_bound_daemon(
         })?;
         let config_home = daemon_config::default_config_home();
         let incarnation = daemon_incarnation.clone();
+        let projects = Arc::new(
+            crate::config_gate::project_registry::EntorhinalProjectRegistry::new(
+                registry.clone(),
+                forwarding.clone(),
+            ),
+        );
         Some(Arc::new(
             tokio::task::spawn_blocking(move || {
                 crate::config_gate::runtime::RuntimeOwner::new(
@@ -1225,7 +1231,7 @@ async fn serve_bound_daemon(
                     crate::config_gate::capture::ConfigCapturer {
                         daemon_path: path,
                         config_home,
-                        projects: Arc::new(crate::config_gate::capture::UnavailableProjectRegistry),
+                        projects,
                     },
                 )
                 .retain_writer_lock(writer_lock)

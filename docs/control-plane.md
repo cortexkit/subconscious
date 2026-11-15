@@ -271,9 +271,23 @@ informational: restart and reload reasons still classify as `MayReopen`.
 | --- | --- | --- |
 | `route.bind` | Request | Bind a client route to a module channel. Carries `route_channel`, `epoch`, `target`, `identity`, the daemon-stamped `principal`, `consumer_capabilities`, `role_versions`, `admission_facts`, the scope stamp and the call mode. Success is an empty `route.bind` reply; a refusal is an `ERROR`, whose code and message reach the opener unchanged (test `route_open_module_rejection_uses_daemon_counter_key` (`crates/subc-daemon/src/control.rs`)). |
 | `health.check` | Request | Ask the module for its health. Reply: `status` (`ok`, `degraded`, `failing`), optional `detail` and `metrics`. Sent only to modules that declared the op in HELLO `control_ops`. |
+| `projects.enumerate` | Request | Read Entorhinal's authoritative project/workspace registry for configuration planning. Requires the nonce-verified reserved `entorhinal` principal, readiness and HELLO `control_ops` opt-in. |
 | `module.draining` | Command | Tell the module its routes are draining, with `reason` and an absolute wall-clock `deadline_ms`. Treat the deadline as "no later than". |
 
 What a module does with these is in [`module-surface.md`](module-surface.md).
+
+`projects.enumerate` uses the same channel-0 request/response framing as
+`consent/v1`, not a routed capability request. The request is
+`{"op":"projects.enumerate"}`. Success is
+`{"op":"projects.enumerate","result":<EnumerateReply>}`, where `EnumerateReply`
+is the `cortexkit-project-identity` 0.1.5 shape (projects with `rootRecords` and
+workspaces with `root` and `fileId`). Refusals use an `ERROR` frame containing
+`{"code":"unavailable","message":"store not open yet"}`, for example, rather
+than a successful response with an error field. The daemon maps refusals to
+`project_registry_unavailable`, preserving the message. Queue admission and
+reply share one 10-second deadline; a timeout refuses planning with the same
+code. This reader is preparation for project-tuple planning and delivery, which
+are not supported yet. Runtime delivery never enumerates the registry.
 
 `daemon.shutdown_intent` is a client-originated channel-0 request with
 `{"intent":"restart"}`. It uses the same client admission as `supervisor.restart`

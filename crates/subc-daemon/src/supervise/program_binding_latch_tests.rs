@@ -22,7 +22,7 @@ fn audit2_gated_handle() -> (
         ConfigCapturer {
             daemon_path: path,
             config_home: root.to_path_buf(),
-            projects: Arc::new(crate::config_gate::capture::UnavailableProjectRegistry),
+            projects: Arc::new(crate::config_gate::capture::OfflineProjectRegistry),
         },
     ));
     let prepared = owner.prepare(PlanKind::Stamp).unwrap();

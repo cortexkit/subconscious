@@ -1402,7 +1402,7 @@ mod tests {
             crate::config_gate::capture::ConfigCapturer {
                 daemon_path: dir.join("subc.jsonc"),
                 config_home: dir.to_path_buf(),
-                projects: Arc::new(crate::config_gate::capture::UnavailableProjectRegistry),
+                projects: Arc::new(crate::config_gate::capture::OfflineProjectRegistry),
             },
         ));
         let registry = Arc::new(Registry::default());

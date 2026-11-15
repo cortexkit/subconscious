@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.21.13
+
+- Raise the Rust client requirement to 0.40.2 and UI to 0.9.2 for process-local
+  module re-exports.
+
 ## 0.21.12
 
 - Raise the Rust client requirement to 0.40.1 for additive module control hooks.

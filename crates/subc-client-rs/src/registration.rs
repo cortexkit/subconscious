@@ -51,23 +51,42 @@ pub(crate) fn supervised() -> bool {
     SUPERVISED.get().copied().unwrap_or(false)
 }
 
-pub(crate) fn adopt() -> bool {
-    *SUPERVISED.get_or_init(|| {
+pub(crate) fn adopt(module_id: &str) -> Result<bool, SubcModuleError> {
+    let supervised = *SUPERVISED.get_or_init(|| {
         let supervised = os::supervised();
         if let Some(reason) = os::registration_refusal() {
             tracing::warn!(%reason, "registration channel not adopted");
         }
         supervised
-    })
+    });
+    // The inherited channel belongs to the launched module, not every module
+    // exported by its process. Other ids must register without that authority.
+    Ok(supervised && is_launched_module(module_id)?)
+}
+
+pub(crate) fn is_launched_module(module_id: &str) -> Result<bool, SubcModuleError> {
+    Ok(module_id_from_env()?.is_none_or(|launched_id| launched_id == module_id))
 }
 
 pub(crate) fn take_stream() -> Result<Option<Box<dyn ModuleStream>>, SubcModuleError> {
     if !supervised() {
         return Ok(None);
     }
-    let Some(channel) = os::take_registration_channel()
-        .map_err(|error| SubcModuleError::RegistrationChannel(io::Error::other(error)))?
-    else {
+    let channel = match os::take_registration_channel() {
+        Err(os::RegistrationChannelError::AlreadyTaken) => {
+            let error = match module_id_from_env()? {
+                Some(module_id) => io::Error::other(format!(
+                    "launched module {module_id:?} is already serving on the registration channel"
+                )),
+                None => io::Error::other(os::RegistrationChannelError::AlreadyTaken),
+            };
+            return Err(SubcModuleError::RegistrationChannel(error));
+        }
+        result => {
+            result.map_err(|error| SubcModuleError::RegistrationChannel(io::Error::other(error)))?
+        }
+    };
+    let Some(channel) = channel else {
         return Ok(None);
     };
     #[cfg(unix)]

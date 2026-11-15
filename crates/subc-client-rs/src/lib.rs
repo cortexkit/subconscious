@@ -2757,11 +2757,11 @@ async fn prepare_connection<H: ModuleHandler>(
     handler: H,
     mut options: ServeOptions,
 ) -> Result<Option<(ModuleHandle, ModuleServeFuture)>, SubcModuleError> {
-    options.registration_channel = registration::adopt();
+    options.registration_channel = registration::adopt(&manifest.module_id)?;
     let stream = tokio::select! {
         biased;
         () = options.stop_handle.token.cancelled() => return Ok(None),
-        stream = connect_to_subc(connection_file) => stream?,
+        stream = connect_to_subc(connection_file, options.registration_channel) => stream?,
     };
     register_connection(stream, manifest, handler, options).await
 }
@@ -3746,16 +3746,17 @@ async fn send_hello(
     config_gate: bool,
     extra_control_ops: &[String],
 ) -> Result<(), SubcModuleError> {
-    let launch_nonce = if registration::supervised() {
-        None
-    } else {
-        match retained_launch_nonce() {
-            Some(retained) => Some(retained),
-            None => launch_nonce()
-                .map_err(SubcModuleError::LaunchNonce)?
-                .map(|nonce| nonce.value().to_string()),
-        }
-    };
+    let launch_nonce =
+        if registration::supervised() || !registration::is_launched_module(&manifest.module_id)? {
+            None
+        } else {
+            match retained_launch_nonce() {
+                Some(retained) => Some(retained),
+                None => launch_nonce()
+                    .map_err(SubcModuleError::LaunchNonce)?
+                    .map(|nonce| nonce.value().to_string()),
+            }
+        };
     stamp_launch_nonce_source(&mut manifest, launch_nonce.as_deref());
     let mut control_ops = vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_string()];
     if config_gate {
@@ -3797,6 +3798,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> ModuleStream for T {}
 
 async fn connect_to_subc(
     connection_file_path: &Path,
+    registration_channel: bool,
 ) -> Result<Box<dyn ModuleStream>, SubcModuleError> {
     let conn = connection_file::read_for_client(connection_file_path).map_err(|source| {
         SubcModuleError::ConnectionFile {
@@ -3804,7 +3806,11 @@ async fn connect_to_subc(
             source,
         }
     })?;
-    if let Some(mut stream) = registration::take_stream()? {
+    if let Some(mut stream) = if registration_channel {
+        registration::take_stream()?
+    } else {
+        None
+    } {
         authenticate_client(&mut stream, &conn, AUTH_DEADLINE)
             .await
             .map_err(|source| SubcModuleError::Auth {
@@ -6527,7 +6533,10 @@ fn stamp_launch_nonce_source(manifest: &mut ModuleManifest, sent: Option<&str>) 
         return;
     }
     if let Ok(Some(nonce)) = launch_nonce() {
-        if registration::supervised() || sent == Some(nonce.value()) {
+        // Another module served from the same process sent no nonce and has no
+        // claim to the launch's provenance, even though the process is supervised.
+        let launched = registration::is_launched_module(&manifest.module_id).unwrap_or(false);
+        if (registration::supervised() && launched) || sent == Some(nonce.value()) {
             provenance.launch_nonce_source =
                 Some(LaunchNonceSource::from_wire_name(nonce.source().as_str()));
         }

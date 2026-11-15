@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.4
+
+- Raise the Rust client requirement to 0.40.2 for process-local module re-exports.
+
 ## 0.5.3
 
 - Raise the Rust client requirement to 0.40.1 for additive module control hooks.

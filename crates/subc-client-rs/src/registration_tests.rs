@@ -55,12 +55,36 @@ async fn query(client: &SubcConsumer) {
     client.query_activity(request).await.unwrap();
 }
 
+async fn serve_peer(
+    path: &Path,
+    module_id: &str,
+) -> (
+    ModuleHandle,
+    tokio::task::JoinHandle<Result<(), SubcModuleError>>,
+) {
+    let mut manifest = ModuleManifest::builder(module_id, "1.0.0")
+        .registration_channel(true)
+        .build();
+    // A re-export sends no nonce, so it must not claim the launch's nonce source.
+    manifest.provenance = Some(build_provenance(None, None, None).unwrap());
+    let (handle, serving) = serve_with_handle(path, manifest, Hook).await.unwrap();
+    assert!(!handle.shared.registration.active.load(Ordering::Acquire));
+    (handle, tokio::spawn(serving))
+}
+
 async fn child_case(scenario: &str, test: &str, path: &Path) {
     let role = env::var(ROLE).unwrap();
     if role == "ordinary" || role == "helper" {
         assert!(!supervised());
         let client = SubcConsumer::connect(path, options()).await.unwrap();
         query(&client).await;
+        std::process::exit(0);
+    }
+    if scenario == "legacy_peer" {
+        let (_, serving) = serve_peer(path, "fed:peer:legacy").await;
+        assert!(!supervised());
+        serving.abort();
+        println!("CASE_DONE");
         std::process::exit(0);
     }
     let mut manifest = ModuleManifest::builder("channel-worker", "1.0.0")
@@ -75,6 +99,14 @@ async fn child_case(scenario: &str, test: &str, path: &Path) {
             "transport lookup adopted before serving"
         );
         assert!(!bound(), "consumer identity lookup adopted before serving");
+    }
+    let mut peers = Vec::new();
+    if scenario == "peer_first" {
+        peers.push(serve_peer(path, "fed:peer:before").await);
+        assert!(
+            OWNER.get().is_none(),
+            "re-export became the registration owner"
+        );
     }
     let stop = ModuleStopHandle::default();
     let (handle, serving) = ServeOptions::default()
@@ -96,6 +128,21 @@ async fn child_case(scenario: &str, test: &str, path: &Path) {
     }
     let serving = tokio::spawn(serving);
     match scenario {
+        "multi" => {
+            peers.push(serve_peer(path, "fed:peer:one").await);
+            peers.push(serve_peer(path, "fed:peer:two").await);
+        }
+        "peer_first" => {}
+        "duplicate" => {
+            let error = match serve_with_handle(path, manifest, Hook).await {
+                Err(error) => error,
+                Ok(_) => panic!("duplicate launched module registered"),
+            };
+            assert_eq!(
+                error.to_string(),
+                "registration channel: launched module \"channel-worker\" is already serving on the registration channel"
+            );
+        }
         "second_take" | "lazy" => {
             assert!(matches!(
                 serve_with_handle(path, manifest, Hook).await,
@@ -209,6 +256,9 @@ async fn child_case(scenario: &str, test: &str, path: &Path) {
     // Only the EOF case asks the SDK to end the child. Other cases exit before
     // the test daemon closes registration, so an unexpected EOF cannot mask a failure.
     serving.abort();
+    for (_, serving) in peers {
+        serving.abort();
+    }
     println!("CASE_DONE");
     std::process::exit(0);
 }
@@ -290,6 +340,46 @@ async fn auth<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S, info: &Connecti
         .unwrap();
 }
 
+async fn register_peer(
+    listener: &TcpListener,
+    info: &ConnectionInfo,
+    module_id: &str,
+) -> tokio::net::TcpStream {
+    let (mut stream, _) = timeout(BUDGET, listener.accept()).await.unwrap().unwrap();
+    auth(&mut stream, info).await;
+    let frame = receive(&mut stream).await;
+    assert_eq!(
+        frame.header.ty,
+        FrameType::Hello,
+        "re-export sent a channel claim"
+    );
+    let hello: ModuleHelloBody = serde_json::from_slice(&frame.body).unwrap();
+    assert_eq!(hello.manifest.module_id, module_id);
+    assert!(
+        hello.launch_nonce.is_none(),
+        "re-export sent a launch nonce"
+    );
+    assert_eq!(
+        hello.manifest.provenance.unwrap().launch_nonce_source,
+        None,
+        "re-export claimed the launch's nonce source"
+    );
+    send(
+        &mut stream,
+        FrameType::HelloAck,
+        HELLO_CORR,
+        ModuleHelloAckBody {
+            negotiated_ver: PROTOCOL_VERSION,
+            subc_ops: vec![],
+            subc_capabilities: vec![],
+            storage: None,
+            machine_id: None,
+        },
+    )
+    .await;
+    stream
+}
+
 #[cfg(unix)]
 fn inherited_channel(command: &mut Command) -> (Box<dyn ModuleStream>, std::process::Child) {
     use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
@@ -355,18 +445,39 @@ async fn run(scenario: &'static str, test: &str) {
     connection_file::write_atomic(&path, &info).unwrap();
     let mut command = command(test, "module", &path);
     command.env(os::DAEMON_PID_ENV, std::process::id().to_string());
-    if scenario == "provenance" {
+    if matches!(
+        scenario,
+        "provenance" | "multi" | "peer_first" | "duplicate" | "legacy_peer"
+    ) {
         command.env("SUBC_LAUNCH_NONCE", "legacy-diagnostic-nonce");
+    }
+    if scenario == "legacy_peer" {
+        command
+            .env_remove(os::REGISTRATION_FD_ENV)
+            .env_remove(os::REGISTRATION_PIPE_ENV);
+        let mut child = command.spawn().unwrap();
+        let _peer = register_peer(&listener, &info, "fed:peer:legacy").await;
+        let output = assert_child(&mut child).await;
+        assert!(
+            output.contains("CASE_DONE"),
+            "child exited before assertions: {output}"
+        );
+        return;
     }
     #[cfg(unix)]
     let (mut registration, mut child) = inherited_channel(&mut command);
     #[cfg(windows)]
     let (mut registration, mut child) = inherited_channel(&mut command, scenario).await;
+    let mut peers = Vec::new();
+    if scenario == "peer_first" {
+        peers.push(register_peer(&listener, &info, "fed:peer:before").await);
+    }
     auth(&mut registration, &info).await;
     let hello = receive(&mut registration).await;
     assert_eq!(hello.header.ty, FrameType::Hello);
     let hello: ModuleHelloBody = serde_json::from_slice(&hello.body).unwrap();
     assert!(hello.launch_nonce.is_none());
+    assert_eq!(hello.manifest.module_id, "channel-worker");
     assert_eq!(hello.manifest.registration_channel, Some(true));
     if scenario == "provenance" {
         assert_eq!(
@@ -387,6 +498,28 @@ async fn run(scenario: &'static str, test: &str) {
         },
     )
     .await;
+    if matches!(scenario, "multi" | "peer_first" | "duplicate") {
+        if scenario == "multi" {
+            peers.push(register_peer(&listener, &info, "fed:peer:one").await);
+            peers.push(register_peer(&listener, &info, "fed:peer:two").await);
+        }
+        let output = assert_child(&mut child).await;
+        assert!(
+            output.contains("CASE_DONE"),
+            "child exited before assertions: {output}"
+        );
+        assert!(
+            next_request(&mut registration).await.is_none(),
+            "re-export minted a channel claim"
+        );
+        assert!(
+            timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err(),
+            "unexpected TCP registration"
+        );
+        return;
+    }
     if scenario == "eof" {
         registration.shutdown().await.unwrap();
         drop(registration);
@@ -581,6 +714,16 @@ contract_test!(rate_limit_observes_retry_after_ms, "rate");
 contract_test!(bound_connection_refuses_identity_override, "identity");
 contract_test!(only_explicit_helper_handoff_delegates_claim, "helper");
 contract_test!(registration_is_never_reconnected, "second_take");
+contract_test!(
+    supervised_process_registers_own_id_and_two_reexports,
+    "multi"
+);
+contract_test!(
+    reexport_before_own_serve_preserves_inherited_channel,
+    "peer_first"
+);
+contract_test!(duplicate_launched_module_serve_names_the_id, "duplicate");
+contract_test!(legacy_launch_nonce_is_not_sent_by_a_reexport, "legacy_peer");
 contract_test!(consumer_lookup_does_not_adopt_before_serving, "lazy");
 contract_test!(local_stop_returns_without_exiting, "close");
 contract_test!(

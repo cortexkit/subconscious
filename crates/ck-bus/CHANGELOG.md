@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.10
+
+- Raise the Rust client requirement to 0.40.2 and testkit to 0.9.2 for process-local
+  module re-exports.
+
 ## 0.6.9
 
 - Raise the Rust client requirement to 0.40.1 and testkit to 0.9.1 for additive

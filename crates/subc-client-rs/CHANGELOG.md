@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.40.2
+
+- Reserve the inherited registration channel and launch nonce for the launched
+  module id. Re-exported modules register over the connection file, regardless of
+  serve order, without a channel claim or launch nonce. Report a duplicate serve
+  of the launched id with an error naming that id. A re-export's provenance no
+  longer claims the launch's nonce source.
+
 ## 0.40.1
 
 - Add defaulted `ModuleHandler::control_ops` and `on_control_request` hooks for

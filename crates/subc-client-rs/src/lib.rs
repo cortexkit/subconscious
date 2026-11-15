@@ -2581,6 +2581,7 @@ impl ModuleStopHandle {
 #[non_exhaustive]
 pub struct ServeOptions {
     registration_channel: bool,
+    prefix_child: bool,
     writer_drain_timeout: Duration,
     stop_handle: ModuleStopHandle,
 }
@@ -2590,6 +2591,7 @@ impl Default for ServeOptions {
         Self {
             writer_drain_timeout: DEFAULT_WRITER_DRAIN_TIMEOUT,
             registration_channel: false,
+            prefix_child: false,
             stop_handle: ModuleStopHandle::new(),
         }
     }
@@ -2761,7 +2763,21 @@ async fn prepare_connection<H: ModuleHandler>(
     let stream = tokio::select! {
         biased;
         () = options.stop_handle.token.cancelled() => return Ok(None),
-        stream = connect_to_subc(connection_file, options.registration_channel) => stream?,
+        stream = async {
+            let claim = if registration::supervised() && !options.registration_channel {
+                registration::prefix_claim(&manifest.module_id).await
+                    .map_err(|error| registration::serve_claim_error(&manifest.module_id, error))?
+            } else {
+                None
+            };
+            let mut stream = connect_to_subc(connection_file, options.registration_channel).await?;
+            if let Some(claim) = claim {
+                registration::present_claim(&mut stream, claim, AUTH_DEADLINE).await
+                    .map_err(|error| registration::serve_claim_error(&manifest.module_id, error))?;
+                options.prefix_child = true;
+            }
+            Ok::<_, SubcModuleError>(stream)
+        } => stream?,
     };
     register_connection(stream, manifest, handler, options).await
 }
@@ -2782,7 +2798,11 @@ where
     let connection_runtime = tokio::runtime::Handle::current();
     let mut writer = tokio::spawn(drain_writer(write_half, rx));
     let handler = Arc::new(handler);
-    let declaration = handler.config_declaration();
+    let declaration = if options.prefix_child {
+        None
+    } else {
+        handler.config_declaration()
+    };
 
     let mut hello_ack = None;
     let provides = manifest.provides.clone();
@@ -2836,7 +2856,7 @@ where
             return Err(result);
         }
     }
-    let ack = match hello_ack {
+    let mut ack = match hello_ack {
         Some(ack) => ack,
         None => {
             return Err(writer_ended(
@@ -2844,6 +2864,16 @@ where
             ))
         }
     };
+    if options.prefix_child {
+        // A prefix registration is brokered, not another primary channel. Keep
+        // its registration RPCs while refusing owner-only operations locally.
+        ack.subc_ops.retain(|op| {
+            matches!(
+                op.as_str(),
+                "catalog.update" | "scope.describe" | "supervisor.live_roots" | "activity.record"
+            )
+        });
+    }
     // The callback can be cancelled by a writer failure, but a failure after
     // acceptance belongs to the serving lifecycle, including its teardown hook.
     let writer_end = writer_result.map(writer_connection_end);
@@ -2865,6 +2895,11 @@ where
         connection_runtime,
     );
     handle.shared.lock_inner().current_provides = Some(provides);
+    handle
+        .shared
+        .registration
+        .prefix_child
+        .store(options.prefix_child, Ordering::Release);
     let _ = handle.shared.served_control_ops.set(control_ops);
     if options.registration_channel {
         registration::install_owner(&handle)?;
@@ -2932,7 +2967,9 @@ where
         // reconnect task or in-flight reconnect gate; a supervisor that needs
         // recovery starts a fresh serve_with_handle invocation.
         let dispatcher = RequestDispatcher::with_pools(serve_handle.dispatch_pools());
-        config::start(serve_handle.clone(), Arc::clone(&handler), &dispatcher);
+        if !options.prefix_child {
+            config::start(serve_handle.clone(), Arc::clone(&handler), &dispatcher);
+        }
         let mut writer_finished = writer_end.is_some();
         let mut loop_result = if let Some(end) = writer_end {
             end
@@ -3746,17 +3783,16 @@ async fn send_hello(
     config_gate: bool,
     extra_control_ops: &[String],
 ) -> Result<(), SubcModuleError> {
-    let launch_nonce =
-        if registration::supervised() || !registration::is_launched_module(&manifest.module_id)? {
-            None
-        } else {
-            match retained_launch_nonce() {
-                Some(retained) => Some(retained),
-                None => launch_nonce()
-                    .map_err(SubcModuleError::LaunchNonce)?
-                    .map(|nonce| nonce.value().to_string()),
-            }
-        };
+    let launch_nonce = if registration::supervised() {
+        None
+    } else {
+        match retained_launch_nonce() {
+            Some(retained) => Some(retained),
+            None => launch_nonce()
+                .map_err(SubcModuleError::LaunchNonce)?
+                .map(|nonce| nonce.value().to_string()),
+        }
+    };
     stamp_launch_nonce_source(&mut manifest, launch_nonce.as_deref());
     let mut control_ops = vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_string()];
     if config_gate {
@@ -6533,10 +6569,10 @@ fn stamp_launch_nonce_source(manifest: &mut ModuleManifest, sent: Option<&str>) 
         return;
     }
     if let Ok(Some(nonce)) = launch_nonce() {
-        // Another module served from the same process sent no nonce and has no
-        // claim to the launch's provenance, even though the process is supervised.
+        // A re-export may send the owner's legacy nonce, but cannot claim the
+        // launched module's nonce provenance.
         let launched = registration::is_launched_module(&manifest.module_id).unwrap_or(false);
-        if (registration::supervised() && launched) || sent == Some(nonce.value()) {
+        if launched && (registration::supervised() || sent == Some(nonce.value())) {
             provenance.launch_nonce_source =
                 Some(LaunchNonceSource::from_wire_name(nonce.source().as_str()));
         }

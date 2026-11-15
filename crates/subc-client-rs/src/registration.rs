@@ -12,12 +12,14 @@ use subc_protocol::claim::{
 };
 
 static OWNER: OnceLock<Weak<ModuleHandleShared>> = OnceLock::new();
+static OWNER_READY: tokio::sync::Notify = tokio::sync::Notify::const_new();
 static HELPER_BOUND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static SUPERVISED: OnceLock<bool> = OnceLock::new();
 
 #[derive(Default)]
 pub(crate) struct Session {
     active: std::sync::atomic::AtomicBool,
+    pub(super) prefix_child: std::sync::atomic::AtomicBool,
     pool: tokio::sync::Mutex<Vec<PoolEntry>>,
 }
 
@@ -36,13 +38,21 @@ pub enum ClaimError {
     Unavailable,
     Timeout,
     Protocol,
-    Refused { code: String },
+    Refused {
+        code: String,
+    },
     Handoff,
+    /// Prefix children cannot open consumer connections in this SDK yet.
+    PrefixChildConsumer,
 }
 
 impl fmt::Display for ClaimError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("claim authentication failed")
+        if matches!(self, Self::PrefixChildConsumer) {
+            f.write_str("prefix children have no consumer connections in this SDK yet")
+        } else {
+            f.write_str("claim authentication failed")
+        }
     }
 }
 impl Error for ClaimError {}
@@ -60,7 +70,8 @@ pub(crate) fn adopt(module_id: &str) -> Result<bool, SubcModuleError> {
         supervised
     });
     // The inherited channel belongs to the launched module, not every module
-    // exported by its process. Other ids must register without that authority.
+    // exported by its process. Other ids need their own prefix claim or must
+    // register without the channel's authority.
     Ok(supervised && is_launched_module(module_id)?)
 }
 
@@ -116,17 +127,62 @@ pub(crate) fn take_stream() -> Result<Option<Box<dyn ModuleStream>>, SubcModuleE
 }
 
 pub(crate) fn install_owner(handle: &ModuleHandle) -> Result<(), SubcModuleError> {
-    OWNER.set(Arc::downgrade(&handle.shared)).map_err(|_| {
-        SubcModuleError::RegistrationChannel(io::Error::other(
-            "registration owner already installed",
-        ))
-    })?;
     handle
         .shared
         .registration
         .active
         .store(true, Ordering::Release);
+    OWNER.set(Arc::downgrade(&handle.shared)).map_err(|_| {
+        SubcModuleError::RegistrationChannel(io::Error::other(
+            "registration owner already installed",
+        ))
+    })?;
+    OWNER_READY.notify_waiters();
     Ok(())
+}
+
+pub(crate) async fn prefix_claim(module_id: &str) -> Result<Option<Claim>, ClaimError> {
+    let deadline = Instant::now() + CATALOG_UPDATE_TIMEOUT;
+    timeout_at(deadline, async {
+        let owner = loop {
+            // Register the waiter before checking OWNER so installation cannot
+            // race the transition to sleep.
+            let ready = OWNER_READY.notified();
+            tokio::pin!(ready);
+            ready.as_mut().enable();
+            if let Some(owner) = OWNER.get() {
+                break ModuleHandle {
+                    shared: owner.upgrade().ok_or(ClaimError::Unavailable)?,
+                };
+            }
+            ready.await;
+        };
+        match owner
+            .mint_claim(ClaimPurpose::Prefix {
+                module_id: module_id.to_owned(),
+            })
+            .await
+        {
+            Err(ClaimError::Refused { code }) if code == error_codes::CLAIM_PREFIX_REFUSED => {
+                Ok(None)
+            }
+            result => result.map(Some),
+        }
+    })
+    .await
+    .map_err(|_| ClaimError::Timeout)?
+}
+
+pub(crate) fn serve_claim_error(module_id: &str, error: ClaimError) -> SubcModuleError {
+    let code = match error {
+        ClaimError::Refused { code } => code,
+        ClaimError::Unavailable => "claim_unavailable".into(),
+        ClaimError::Timeout => "claim_timeout".into(),
+        _ => "claim_protocol".into(),
+    };
+    SubcModuleError::RegistrationChannel(io::Error::other(format!(
+        "prefix registration for module {module_id:?} failed: {code}"
+    )))
 }
 
 impl ModuleHandle {
@@ -158,6 +214,14 @@ impl ModuleHandle {
         options: ConsumerOptions,
         local: bool,
     ) -> Result<Arc<SubcConsumer>, ConsumerError> {
+        if self
+            .shared
+            .registration
+            .prefix_child
+            .load(Ordering::Acquire)
+        {
+            return Err(ConsumerError::claim(ClaimError::PrefixChildConsumer));
+        }
         if !self.shared.registration.active.load(Ordering::Acquire)
             || self.shared.close_token.is_cancelled()
         {
@@ -318,6 +382,14 @@ pub(crate) async fn bind_consumer<S: AsyncRead + AsyncWrite + Unpin>(
     let Some(claim) = claim else {
         return Ok(());
     };
+    present_claim(stream, claim, deadline).await
+}
+
+pub(crate) async fn present_claim<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    claim: Claim,
+    deadline: Duration,
+) -> Result<(), ClaimError> {
     let frame = Frame::build(
         FrameType::Request,
         control_flags(),

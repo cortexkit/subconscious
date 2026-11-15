@@ -65,7 +65,9 @@ async fn serve_peer(
     let mut manifest = ModuleManifest::builder(module_id, "1.0.0")
         .registration_channel(true)
         .build();
-    // A re-export sends no nonce, so it must not claim the launch's nonce source.
+    // Only the launched module can report how its launch nonce was delivered.
+    // A second module served by the same process leaves that source field unset,
+    // even when its HELLO uses the owner's environment-delivered nonce.
     manifest.provenance = Some(build_provenance(None, None, None).unwrap());
     let (handle, serving) = serve_with_handle(path, manifest, Hook).await.unwrap();
     assert!(!handle.shared.registration.active.load(Ordering::Acquire));
@@ -101,13 +103,21 @@ async fn child_case(scenario: &str, test: &str, path: &Path) {
         assert!(!bound(), "consumer identity lookup adopted before serving");
     }
     let mut peers = Vec::new();
-    if scenario == "peer_first" {
-        peers.push(serve_peer(path, "fed:peer:before").await);
+    let early_peer = if scenario == "peer_first" {
+        let path = path.to_owned();
+        let mut peer = tokio::spawn(async move { serve_peer(&path, "fed:peer:before").await });
+        assert!(
+            timeout(Duration::from_millis(30), &mut peer).await.is_err(),
+            "re-export did not wait for the owner registration"
+        );
         assert!(
             OWNER.get().is_none(),
             "re-export became the registration owner"
         );
-    }
+        Some(peer)
+    } else {
+        None
+    };
     let stop = ModuleStopHandle::default();
     let (handle, serving) = ServeOptions::default()
         .with_stop_handle(stop.clone())
@@ -131,8 +141,49 @@ async fn child_case(scenario: &str, test: &str, path: &Path) {
         "multi" => {
             peers.push(serve_peer(path, "fed:peer:one").await);
             peers.push(serve_peer(path, "fed:peer:two").await);
+            peers[0].0.catalog_update(vec![]).await.unwrap();
         }
-        "peer_first" => {}
+        "peer_first" => peers.push(early_peer.unwrap().await.unwrap()),
+        "prefix_consumer" => {
+            let peer = serve_peer(path, "fed:peer:consumer").await;
+            for local in [false, true] {
+                let result = if local {
+                    peer.0.consumer_local(path, options()).await
+                } else {
+                    peer.0.consumer(path, options()).await
+                };
+                let error = result.err().expect("prefix child opened a consumer");
+                assert!(error
+                    .to_string()
+                    .contains("prefix children have no consumer connections in this SDK yet"));
+            }
+            assert!(matches!(
+                peer.0.helper_claim_handoff().await,
+                Err(ClaimError::Unavailable)
+            ));
+            // Even an over-advertising daemon cannot make a prefix child mint
+            // claims or send an owner-only operation on its registration.
+            assert!(matches!(
+                peer.0.scope_sync(1, vec![]).await,
+                Err(ScopeCallError::NotSupported { .. })
+            ));
+            peers.push(peer);
+        }
+        "prefix_fallback" => peers.push(serve_peer(path, "unprefixed-extra").await),
+        "prefix_error" => {
+            let error = serve_with_handle(
+                path,
+                ModuleManifest::builder("fed:peer:refused", "1.0.0").build(),
+                Hook,
+            )
+            .await
+            .err()
+            .expect("mint refusal registered an extra module");
+            assert!(error.to_string().contains("fed:peer:refused"));
+            assert!(error
+                .to_string()
+                .contains(error_codes::CLAIM_MINT_NOT_ALLOWED));
+        }
         "duplicate" => {
             let error = match serve_with_handle(path, manifest, Hook).await {
                 Err(error) => error,
@@ -344,21 +395,33 @@ async fn register_peer(
     listener: &TcpListener,
     info: &ConnectionInfo,
     module_id: &str,
+    claim: Option<Claim>,
+    nonce: Option<&str>,
 ) -> tokio::net::TcpStream {
     let (mut stream, _) = timeout(BUDGET, listener.accept()).await.unwrap().unwrap();
     auth(&mut stream, info).await;
+    if let Some(claim) = claim {
+        let presentation = receive(&mut stream).await;
+        assert_eq!(presentation.header.ty, FrameType::Request);
+        let presented: ClaimPresentRequest = serde_json::from_slice(&presentation.body).unwrap();
+        assert_eq!(presented.claim, claim);
+        send(
+            &mut stream,
+            FrameType::Response,
+            presentation.header.corr,
+            ClaimPresentReply::new(),
+        )
+        .await;
+    }
     let frame = receive(&mut stream).await;
     assert_eq!(
         frame.header.ty,
         FrameType::Hello,
-        "re-export sent a channel claim"
+        "expected exactly one HELLO after any claim presentation"
     );
     let hello: ModuleHelloBody = serde_json::from_slice(&frame.body).unwrap();
     assert_eq!(hello.manifest.module_id, module_id);
-    assert!(
-        hello.launch_nonce.is_none(),
-        "re-export sent a launch nonce"
-    );
+    assert_eq!(hello.launch_nonce.as_deref(), nonce);
     assert_eq!(
         hello.manifest.provenance.unwrap().launch_nonce_source,
         None,
@@ -370,7 +433,11 @@ async fn register_peer(
         HELLO_CORR,
         ModuleHelloAckBody {
             negotiated_ver: PROTOCOL_VERSION,
-            subc_ops: vec![],
+            subc_ops: vec![
+                "catalog.update".into(),
+                "scope.sync".into(),
+                "claim.mint".into(),
+            ],
             subc_capabilities: vec![],
             storage: None,
             machine_id: None,
@@ -378,6 +445,42 @@ async fn register_peer(
     )
     .await;
     stream
+}
+
+async fn mint_prefix(
+    registration: &mut Box<dyn ModuleStream>,
+    module_id: &str,
+    refusal: Option<&str>,
+) -> Option<Claim> {
+    let mint = receive(registration).await;
+    assert_eq!(mint.header.ty, FrameType::Request);
+    let request: ClaimMintRequest = serde_json::from_slice(&mint.body).unwrap();
+    assert_eq!(
+        request.purpose,
+        ClaimPurpose::Prefix {
+            module_id: module_id.into()
+        }
+    );
+    if let Some(code) = refusal {
+        send(
+            registration,
+            FrameType::Error,
+            mint.header.corr,
+            ErrorBody::new(code, "refused"),
+        )
+        .await;
+        None
+    } else {
+        let claim = Claim::new(format!("prefix-{module_id}"));
+        send(
+            registration,
+            FrameType::Response,
+            mint.header.corr,
+            ClaimMintReply::new(claim.clone(), 0),
+        )
+        .await;
+        Some(claim)
+    }
 }
 
 #[cfg(unix)]
@@ -456,7 +559,14 @@ async fn run(scenario: &'static str, test: &str) {
             .env_remove(os::REGISTRATION_FD_ENV)
             .env_remove(os::REGISTRATION_PIPE_ENV);
         let mut child = command.spawn().unwrap();
-        let _peer = register_peer(&listener, &info, "fed:peer:legacy").await;
+        let _peer = register_peer(
+            &listener,
+            &info,
+            "fed:peer:legacy",
+            None,
+            Some("legacy-diagnostic-nonce"),
+        )
+        .await;
         let output = assert_child(&mut child).await;
         assert!(
             output.contains("CASE_DONE"),
@@ -470,7 +580,12 @@ async fn run(scenario: &'static str, test: &str) {
     let (mut registration, mut child) = inherited_channel(&mut command, scenario).await;
     let mut peers = Vec::new();
     if scenario == "peer_first" {
-        peers.push(register_peer(&listener, &info, "fed:peer:before").await);
+        assert!(
+            timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err(),
+            "extra serve connected before the owner registration was live"
+        );
     }
     auth(&mut registration, &info).await;
     let hello = receive(&mut registration).await;
@@ -498,10 +613,50 @@ async fn run(scenario: &'static str, test: &str) {
         },
     )
     .await;
-    if matches!(scenario, "multi" | "peer_first" | "duplicate") {
+    if matches!(
+        scenario,
+        "multi"
+            | "peer_first"
+            | "duplicate"
+            | "prefix_fallback"
+            | "prefix_error"
+            | "prefix_consumer"
+    ) {
+        let ids: &[&str] = match scenario {
+            "multi" => &["fed:peer:one", "fed:peer:two"],
+            "peer_first" => &["fed:peer:before"],
+            "prefix_fallback" => &["unprefixed-extra"],
+            "prefix_error" => &["fed:peer:refused"],
+            "prefix_consumer" => &["fed:peer:consumer"],
+            _ => &[],
+        };
+        for id in ids {
+            let refusal = match scenario {
+                "prefix_fallback" => Some(error_codes::CLAIM_PREFIX_REFUSED),
+                "prefix_error" => Some(error_codes::CLAIM_MINT_NOT_ALLOWED),
+                _ => None,
+            };
+            let claim = mint_prefix(&mut registration, id, refusal).await;
+            if scenario != "prefix_error" {
+                peers.push(register_peer(&listener, &info, id, claim, None).await);
+            }
+        }
         if scenario == "multi" {
-            peers.push(register_peer(&listener, &info, "fed:peer:one").await);
-            peers.push(register_peer(&listener, &info, "fed:peer:two").await);
+            let update = receive(&mut peers[0]).await;
+            assert_eq!(
+                update.header.ty,
+                FrameType::Request,
+                "child sent a second HELLO"
+            );
+            let body: Value = serde_json::from_slice(&update.body).unwrap();
+            assert_eq!(body["op"], "catalog.update");
+            send(
+                &mut peers[0],
+                FrameType::Response,
+                update.header.corr,
+                json!({"op":"catalog.update"}),
+            )
+            .await;
         }
         let output = assert_child(&mut child).await;
         assert!(
@@ -510,8 +665,14 @@ async fn run(scenario: &'static str, test: &str) {
         );
         assert!(
             next_request(&mut registration).await.is_none(),
-            "re-export minted a channel claim"
+            "unexpected owner-channel operation after prefix registration"
         );
+        for peer in &mut peers {
+            assert!(
+                next_request(peer).await.is_none(),
+                "extra serve sent another HELLO or an unrequested registration operation"
+            );
+        }
         assert!(
             timeout(Duration::from_millis(20), listener.accept())
                 .await
@@ -723,7 +884,19 @@ contract_test!(
     "peer_first"
 );
 contract_test!(duplicate_launched_module_serve_names_the_id, "duplicate");
-contract_test!(legacy_launch_nonce_is_not_sent_by_a_reexport, "legacy_peer");
+contract_test!(
+    legacy_reexport_sends_owner_nonce_without_claiming_its_provenance,
+    "legacy_peer"
+);
+contract_test!(
+    unprefixed_extra_serve_falls_back_only_on_prefix_refusal,
+    "prefix_fallback"
+);
+contract_test!(prefix_mint_failure_names_module_and_code, "prefix_error");
+contract_test!(
+    prefix_child_refuses_consumers_and_owner_operations,
+    "prefix_consumer"
+);
 contract_test!(consumer_lookup_does_not_adopt_before_serving, "lazy");
 contract_test!(local_stop_returns_without_exiting, "close");
 contract_test!(

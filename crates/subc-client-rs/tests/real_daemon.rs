@@ -1007,6 +1007,62 @@ async fn capability_resolver_does_not_fall_back_to_module_id_equality_and_orders
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prefix_child_registers_through_real_daemon() {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
+    );
+    let module_bin = ensure_binary(
+        &workspace,
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-client-rs",
+            "--example",
+            "prefix-owner",
+            "--message-format=json",
+        ],
+    );
+    let directory = unique_temp_dir("subc-client-rs-prefix-child");
+    let runtime_dir = directory.join("runtime");
+    let config_dir = directory.join("config");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    fs::create_dir_all(config_dir.join("cortexkit")).unwrap();
+    fs::write(
+        config_dir.join("cortexkit/subc.jsonc"),
+        serde_json::to_vec_pretty(&json!({
+            "version": 1,
+            "modules": {
+                "test-owner": {
+                    "program": module_bin,
+                    "reserved": true,
+                    "reserved_prefixes": ["test-owner:"],
+                    "enabled": true
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    // spawn_daemon isolates runtime, config and data homes on its Command.
+    let mut daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    wait_for_catalog_module(&daemon.connection_file, "test-owner", START_TIMEOUT).await;
+    wait_for_catalog_module(&daemon.connection_file, "test-owner:child", START_TIMEOUT).await;
+    daemon.kill_and_wait();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn clean_subc_client_rs_serves_through_real_daemon() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(

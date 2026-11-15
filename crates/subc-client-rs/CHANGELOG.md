@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.40.3
+
+- Register supervised re-exports under the owner's reserved prefix with exact-id
+  prefix claims, waiting for the owner channel and failing closed on mint errors
+  other than `claim_prefix_refused`.
+- Preserve prefix-child catalog updates while refusing owner-only operations and
+  consumer connections; legacy re-exports send the owner's nonce without claiming
+  its nonce provenance.
+
 ## 0.40.2
 
 - Reserve the inherited registration channel and launch nonce for the launched

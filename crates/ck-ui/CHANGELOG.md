@@ -2,7 +2,7 @@
 
 ## 0.9.3
 
-- Raise subc-control to 0.41 for scope lifecycle watches, with co-bumped SDK/sibling floors; no direct behavior changes.
+- Raise subc-control to 0.41 for scope lifecycle watches, with matching minimum dependency versions for the Rust SDK and sibling crates; no direct behavior changes.
 
 ## 0.9.2
 

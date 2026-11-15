@@ -382,12 +382,11 @@ and read pushes with `next`; dropping or unsubscribing cancels. This is not a
 consumer-connection API. The TypeScript provider currently has no registered
 scope reader/stream API, so its scope watch SDK remains a follow-up.
 
-Tests: `scope_watch_wire_shapes_require_op_and_accept_future_fields`
-(`crates/subc-control/src/scope_watch.rs`),
-`scope_watch_live_scope_gets_ended_exactly_once`,
-`scope_watch_slow_consumer_retains_first_ended_and_superseded_events`, and
-`scope_watch_child_survives_head_epoch_move_without_push_or_route_drain`
-(`crates/subc-daemon/src/scope_watch_tests.rs`).
+Tests:
+- `scope_watch_wire_shapes_require_op_and_accept_future_fields` (`crates/subc-control/src/scope_watch.rs`).
+- `scope_watch_live_scope_gets_ended_exactly_once` (`crates/subc-daemon/src/scope_watch_tests.rs`).
+- `scope_watch_slow_consumer_retains_first_ended_and_superseded_events` (`crates/subc-daemon/src/scope_watch_tests.rs`).
+- `scope_watch_child_survives_head_epoch_move_without_push_or_route_drain` (`crates/subc-daemon/src/scope_watch_tests.rs`).
 
 ### Live role-declaration updates
 

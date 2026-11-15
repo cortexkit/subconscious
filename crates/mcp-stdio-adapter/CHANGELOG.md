@@ -4,7 +4,7 @@
 
 - Raise the daemon requirement to 0.49.0 for opt-in phone build facts on route
   binds, and align the co-bumped protocol and Rust client requirements.
-- Raise subc-daemon to 0.49 for scope lifecycle watches, with co-bumped SDK/sibling floors; no direct behavior changes.
+- Raise subc-daemon to 0.49 for scope lifecycle watches, with matching minimum dependency versions for the Rust SDK and sibling crates; no direct behavior changes.
 
 ## 0.8.4
 

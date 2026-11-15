@@ -3238,26 +3238,31 @@ async fn config_delivery_approved_restart_preserves_the_crash_ring_and_its_warmu
     })
     .await;
     let _worker = WorkerGuard(handler.spawn_config_delivery_worker().unwrap());
-    wait_for_supervised_stage(&module, "first crash respawns generation two", || {
+    // Spawn generations identify launch attempts, including preparation that
+    // defers before a process starts. Count actual starts with the fixture log.
+    wait_for_supervised_stage(&module, "first crash spawns a replacement", || {
         module
             .status()
-            .is_ok_and(|status| status.spawn_generation == 2 && status.process_alive)
+            .is_ok_and(|status| status.spawn_generation > 1 && status.process_alive)
     })
     .await;
     assert_eq!(module.status().unwrap().restart_count, 1);
-    // A generation is published before the resumed shell records its start.
-    // Let generation two begin warmup before approval replaces that child.
+    // A generation is published before the resumed fixture records its start.
+    // Let the second child begin warmup before approval replaces it.
     wait_for_supervised_stage(&module, "second script starts before approval", || {
         std::fs::read_to_string(rig.path.join("a.launches"))
             .is_ok_and(|text| text.lines().count() == 2)
     })
     .await;
+    let before_approval = module.status().unwrap();
     approve_kinds(&rig, &owner, &[subc_config::ApplyKind::ModuleRestart]);
     owner.notify_delivery_changed();
-    wait_for_supervised_stage(&module, "approved restart spawns generation three", || {
-        module
-            .status()
-            .is_ok_and(|status| status.spawn_generation == 3 && status.process_alive)
+    wait_for_supervised_stage(&module, "approved restart replaces the child", || {
+        module.status().is_ok_and(|status| {
+            status.spawn_generation > before_approval.spawn_generation
+                && status.pid != before_approval.pid
+                && status.process_alive
+        })
     })
     .await;
     assert_eq!(
@@ -3277,28 +3282,34 @@ async fn config_delivery_approved_restart_preserves_the_crash_ring_and_its_warmu
             .count(),
         3
     );
+    let replacement = module.status().unwrap();
+    // This duplicate only queues a command. The approved child already carries
+    // config generation 3, so revalidation must not replace it again.
     module.config_apply_restart(3).await.unwrap();
-    let pid = module.status().unwrap().pid.unwrap();
+    let pid = replacement.pid.unwrap();
     assert!(std::process::Command::new("/bin/kill")
         .args(["-KILL", &pid.to_string()])
         .status()
         .unwrap()
         .success());
-    wait_for_supervised_stage(
-        &module,
-        "replacement crash respawns generation four",
-        || {
-            module
-                .status()
-                .is_ok_and(|status| status.spawn_generation == 4 && status.process_alive)
-        },
-    )
+    wait_for_supervised_stage(&module, "replacement crash spawns a new child", || {
+        module.status().is_ok_and(|status| {
+            status.spawn_generation > replacement.spawn_generation
+                && status.pid != replacement.pid
+                && status.process_alive
+        })
+    })
     .await;
     assert_eq!(
         module.status().unwrap().restart_count,
         2,
         "the failed replacement spends exactly one additional entry"
     );
+    wait_for_supervised_stage(&module, "crash recovery records its fourth start", || {
+        std::fs::read_to_string(rig.path.join("a.launches"))
+            .is_ok_and(|text| text.lines().count() == 4)
+    })
+    .await;
     assert!(owner.delivery_exit_fence("a").unwrap().is_none());
     rig.declare(&owner, 30);
     let view = owner

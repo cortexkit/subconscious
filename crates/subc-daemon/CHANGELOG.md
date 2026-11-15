@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.47.1
+
+- Test-only fix: stop equating spawn numbers with successful starts in a
+  config-gate delivery test; deferred launch attempts also reserve a number.
+
 ## 0.47.0
 
 - Upgrading: `ModuleSpec` and `ConfiguredModule` struct literals must add

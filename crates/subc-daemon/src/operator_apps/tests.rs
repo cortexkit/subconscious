@@ -1,5 +1,24 @@
 use super::*;
 
+#[cfg(not(feature = "dev-desktop-approval"))]
+#[test]
+fn release_effective_floor_is_always_sentinel() {
+    assert_eq!(effective_release_floor(), RELEASE_FLOOR);
+    assert_eq!(OperatorAppPolicy::default().floor, RELEASE_FLOOR);
+}
+
+#[cfg(feature = "dev-desktop-approval")]
+#[test]
+fn development_effective_floor_uses_compiled_semver_or_sentinel() {
+    let floor = OperatorAppPolicy::default().floor;
+    match option_env!("SUBC_DEV_OPERATOR_APP_FLOOR") {
+        Some("0.1.0") => assert_eq!(floor, Version::new(0, 1, 0)),
+        None => assert_eq!(floor, RELEASE_FLOOR),
+        Some(raw) if Version::parse(raw).is_err() => assert_eq!(floor, RELEASE_FLOOR),
+        Some(raw) => assert_eq!(floor.to_string(), raw),
+    }
+}
+
 #[test]
 fn release_floor_uses_numeric_semver_and_rejects_unknown_versions() {
     let floor = Version::new(1, 2, 10);
@@ -69,6 +88,77 @@ mod macos {
             linux_force_direct: false,
         }
         .into()
+    }
+
+    #[cfg(not(feature = "dev-desktop-approval"))]
+    #[test]
+    fn release_sentinel_skips_native_requirement_check() {
+        let root = cortexkit_test_support::ScratchDir::new("operator-app-sentinel");
+        let mut fixture = SignedPeerFixture::new(
+            &root.join("good"),
+            "io.cortexkit.alfonso.fixture",
+            Some("0.1.0"),
+            true,
+            None,
+        );
+        let (_stream, peer) = fixture.connect();
+        assert!(matches!(
+            peer.check_code_requirement(REQUIREMENT),
+            CodeRequirementOutcome::Satisfied(_)
+        ));
+        let release = OperatorAppPolicy {
+            requirement: REQUIREMENT,
+            ..Default::default()
+        };
+        assert!(release.macos_enabled);
+        assert!(release.stamp(peer.clone()).is_none());
+        assert!(release.config_identity(peer).is_none());
+        assert_eq!(
+            release
+                .requirement_checks
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "sentinel must skip native requirement verification"
+        );
+    }
+
+    #[test]
+    fn production_table_at_development_floor_stamps_cross_platform_id() {
+        let root = cortexkit_test_support::ScratchDir::new("operator-app-production-id");
+        let mut fixture = SignedPeerFixture::new(
+            &root.join("good"),
+            "io.cortexkit.alfonso.fixture",
+            Some("0.1.0"),
+            true,
+            None,
+        );
+        let (_stream, peer) = fixture.connect();
+        // Ad-hoc fixtures cannot satisfy the production Apple certificate chain.
+        // Keep the production identity table and only substitute that requirement.
+        let production = OperatorAppPolicy {
+            requirement: REQUIREMENT,
+            floor: Version::new(0, 1, 0),
+            ..Default::default()
+        };
+        let stamp = production.stamp(peer).expect("signed peer at floor");
+        assert_eq!(stamp.app.app, "alfonso-desktop");
+    }
+
+    #[test]
+    fn explicit_development_floor_keeps_signature_and_version_guards() {
+        let root = cortexkit_test_support::ScratchDir::new("operator-app-development-floor");
+        let mut development = policy();
+        development.floor = Version::new(0, 1, 0);
+        for (label, identifier, version, accepted) in [
+            ("good", "io.cortexkit.alfonso.fixture", "0.1.0", true),
+            ("lower", "io.cortexkit.alfonso.fixture", "0.0.9", false),
+            ("wrong", "io.cortexkit.other.fixture", "0.1.0", false),
+        ] {
+            let mut fixture =
+                SignedPeerFixture::new(&root.join(label), identifier, Some(version), true, None);
+            let (_stream, peer) = fixture.connect();
+            assert_eq!(development.stamp(peer).is_some(), accepted, "{label}");
+        }
     }
 
     #[test]

@@ -11,10 +11,10 @@ fn operator_app_production_switches_and_identity_are_fail_closed() {
             LINUX_OPERATOR_APP_ENABLED,
             PHONE_OPERATOR_ENABLED,
         ],
-        [false; 4]
+        [true, false, false, false]
     );
     let app = COMPILED_APP;
-    assert_eq!(app.id, None);
+    assert_eq!(app.id, Some("alfonso-desktop"));
     assert_eq!(app.macos_bundle_id, "io.cortexkit.alfonso.desktop");
     assert_eq!(
         (app.macos_executable, app.macos_bundle),
@@ -22,10 +22,9 @@ fn operator_app_production_switches_and_identity_are_fail_closed() {
     );
     assert_eq!(app.windows_executable, "Alfonso.exe");
     assert_eq!(app.linux_executable, "alfonso");
-    // No platform launches or verifies in production: the publisher, the
-    // install locations and the Linux index identity are all unset, so
-    // `app.open` answers `app_unknown` on Windows and Linux and the pipe and
-    // peer paths stamp nothing.
+    // Windows and Linux cannot launch: their switches are off, and their
+    // publisher, install locations and Linux index identity remain unset.
+    // The reserved release floor still prevents every production stamp.
     assert_eq!(app.windows_publisher, None);
     assert_eq!(app.windows_path, None);
     assert_eq!(app.linux_path, None);

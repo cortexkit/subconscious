@@ -1915,6 +1915,35 @@ fn registration_declaration_commit_is_visible_in_the_next_projection() {
     assert_eq!(owner.polled_status().unwrap().state, "stamped");
 }
 
+#[test]
+fn config_status_reports_compiled_operator_app_floor() {
+    let rig = Rig::new();
+    let owner = rig.owner("operator-app-floor-status");
+    for status in [owner.status().unwrap(), owner.polled_status().unwrap()] {
+        let floors: Vec<_> = status
+            .development_switches
+            .iter()
+            .filter(|switch| switch.starts_with("SUBC_DEV_OPERATOR_APP_FLOOR="))
+            .collect();
+        #[cfg(feature = "dev-desktop-approval")]
+        match option_env!("SUBC_DEV_OPERATOR_APP_FLOOR") {
+            Some(raw) => {
+                let expected = match raw {
+                    "0.1.0" => "SUBC_DEV_OPERATOR_APP_FLOOR=0.1.0".to_owned(),
+                    _ => format!(
+                        "SUBC_DEV_OPERATOR_APP_FLOOR={}",
+                        semver::Version::parse(raw).unwrap_or(crate::operator_apps::RELEASE_FLOOR)
+                    ),
+                };
+                assert_eq!(floors, [&expected], "compiled floor must be visible");
+            }
+            None => assert!(floors.is_empty()),
+        }
+        #[cfg(not(feature = "dev-desktop-approval"))]
+        assert!(floors.is_empty());
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn registration_declaration_stamp_names_all_enabled_entries_without_hello() {

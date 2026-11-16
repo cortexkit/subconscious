@@ -174,6 +174,10 @@ impl RuntimeOwner {
                 .development_switches
                 .push("dev-desktop-approval".into());
         }
+        #[cfg(feature = "dev-desktop-approval")]
+        if let Some(floor) = crate::operator_apps::development_floor_diagnostic() {
+            status.development_switches.push(floor);
+        }
         if cfg!(feature = "dev-placement") {
             status.development_switches.push("dev-placement".into());
         }

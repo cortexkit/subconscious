@@ -5,13 +5,32 @@ use semver::Version;
 use subc_os::local_peer::{CapturedPeer, CodeRequirementOutcome, ObservedPeer};
 use subc_protocol::peer::OperatorApp;
 
-pub const MACOS_OPERATOR_APP_ENABLED: bool = false;
+pub const MACOS_OPERATOR_APP_ENABLED: bool = true;
 pub const WINDOWS_OPERATOR_APP_ENABLED: bool = false;
 pub const LINUX_OPERATOR_APP_ENABLED: bool = false;
 pub const PHONE_OPERATOR_ENABLED: bool = false;
 
 /// No release is admitted until an enabling release replaces this sentinel.
 pub const RELEASE_FLOOR: Version = Version::new(u64::MAX, u64::MAX, u64::MAX);
+
+fn effective_release_floor() -> Version {
+    #[cfg(feature = "dev-desktop-approval")]
+    {
+        option_env!("SUBC_DEV_OPERATOR_APP_FLOOR")
+            .and_then(|floor| Version::parse(floor).ok())
+            .unwrap_or(RELEASE_FLOOR)
+    }
+    #[cfg(not(feature = "dev-desktop-approval"))]
+    {
+        RELEASE_FLOOR
+    }
+}
+
+#[cfg(feature = "dev-desktop-approval")]
+pub(crate) fn development_floor_diagnostic() -> Option<String> {
+    option_env!("SUBC_DEV_OPERATOR_APP_FLOOR")
+        .map(|_| format!("SUBC_DEV_OPERATOR_APP_FLOOR={}", effective_release_floor()))
+}
 
 /// Hardened runtime is checked separately in the native verifier because it is
 /// a signed CodeDirectory flag, not a code-requirement language predicate.
@@ -41,7 +60,7 @@ pub struct CompiledApp {
 }
 
 pub const COMPILED_APP: CompiledApp = CompiledApp {
-    id: None,
+    id: Some("alfonso-desktop"),
     macos_bundle_id: "io.cortexkit.alfonso.desktop",
     macos_executable: "Alfonso",
     macos_bundle: "Alfonso.app",
@@ -163,6 +182,8 @@ pub(crate) struct OperatorAppPolicy {
     app: CompiledApp,
     requirement: &'static str,
     floor: Version,
+    #[cfg(test)]
+    requirement_checks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Where the installed app lives. The production table leaves both unset;
     /// a known app with no location answers `app_not_installed` once its
     /// platform switch is on.
@@ -192,7 +213,9 @@ impl Default for OperatorAppPolicy {
             phone_enabled: PHONE_OPERATOR_ENABLED,
             app: COMPILED_APP,
             requirement: MACOS_REQUIREMENT,
-            floor: RELEASE_FLOOR,
+            floor: effective_release_floor(),
+            #[cfg(test)]
+            requirement_checks: Default::default(),
             windows_path: COMPILED_APP.windows_path.map(std::path::PathBuf::from),
             linux_path: COMPILED_APP.linux_path.map(std::path::PathBuf::from),
             windows_breakaway: true,
@@ -202,8 +225,8 @@ impl Default for OperatorAppPolicy {
 }
 
 impl OperatorAppPolicy {
-    /// The app id this policy launches and stamps, or `None` for the
-    /// production table. With the platform switch on, a `None` id answers
+    /// The cross-platform app id this policy launches and stamps.
+    /// With the platform switch on, a `None` id answers
     /// `app_unknown` on Windows and Linux; with every switch off, the daemon
     /// answers `app_open_disabled` first. macOS answers `app_open_not_used`
     /// before reaching it.
@@ -252,7 +275,9 @@ impl OperatorAppPolicy {
     /// A trusted full-diff surface needs the same process identity and release
     /// floor, but never gains the operator-app prompt exemption from this check.
     pub(crate) fn config_identity(&self, peer: CapturedPeer) -> Option<OperatorAppStamp> {
-        if !cfg!(target_os = "macos") {
+        // The reserved floor admits nothing, so avoid native signature work
+        // on every local connection until a release or development floor exists.
+        if self.floor == RELEASE_FLOOR || !cfg!(target_os = "macos") {
             return None;
         }
         let app = self.app.id?;
@@ -260,6 +285,9 @@ impl OperatorAppPolicy {
             return None;
         };
         let pid = observation.pid;
+        #[cfg(test)]
+        self.requirement_checks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let CodeRequirementOutcome::Satisfied(code) = peer.check_code_requirement(self.requirement)
         else {
             return None;
@@ -311,6 +339,8 @@ impl From<TestOperatorAppPolicy> for OperatorAppPolicy {
             },
             requirement: test.requirement,
             floor: test.floor,
+            #[cfg(test)]
+            requirement_checks: Default::default(),
             windows_path: test.windows_path,
             linux_path: test.linux_path,
             windows_breakaway: test.windows_breakaway,

@@ -283,24 +283,33 @@ fn decision_order_disabled_before_unknown() {
 }
 
 #[test]
-fn decision_order_non_test_table_answers_unknown() {
-    // The production table names no app and no install location. With a
-    // platform switch forced on, `app.open` answers `app_unknown` before any
-    // filesystem or signature check runs; with the switch off the disabled
-    // check fires first, per the fixed order.
+fn decision_order_production_table_keeps_platform_refusals() {
+    // Naming the production app does not enable a launcher. Platform and
+    // switch refusals still precede the identity and install-location checks.
     let policy = OperatorAppPolicy::default();
-    assert!(policy.app_id().is_none());
+    assert_eq!(policy.app_id(), Some("alfonso-desktop"));
+    assert_eq!(
+        decide_code(decide(&policy, AppOpenPlatform::MacOS, "alfonso-desktop")),
+        subc_control::APP_OPEN_NOT_USED
+    );
     for platform in [AppOpenPlatform::Windows, AppOpenPlatform::Linux] {
-        assert_eq!(
-            decide_code(decide(&policy, platform, TEST_APP)),
-            subc_control::APP_OPEN_DISABLED,
-            "{platform:?}: the switch check precedes the table check"
-        );
+        for app in ["alfonso-desktop", TEST_APP] {
+            assert_eq!(
+                decide_code(decide(&policy, platform, app)),
+                subc_control::APP_OPEN_DISABLED,
+                "{platform:?}: the switch check precedes the table check"
+            );
+        }
     }
     let mut switched = OperatorAppPolicy::default();
     switched.windows_enabled = true;
     switched.linux_enabled = true;
     for platform in [AppOpenPlatform::Windows, AppOpenPlatform::Linux] {
+        assert_eq!(
+            decide_code(decide(&switched, platform, "alfonso-desktop")),
+            subc_control::APP_NOT_INSTALLED,
+            "{platform:?}: the production table has no install location"
+        );
         assert_eq!(
             decide_code(decide(&switched, platform, TEST_APP)),
             subc_control::APP_UNKNOWN,

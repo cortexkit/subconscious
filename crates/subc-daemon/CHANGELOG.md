@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.49.1
+
+- Enable the macOS operator-app policy for the signed Alfonso desktop app,
+  with cross-platform app id `alfonso-desktop`. Release builds still stamp
+  nothing: the reserved release floor admits no version and skips native
+  signature verification. Windows, Linux and phone switches remain off.
+- With `dev-desktop-approval` only, compile a development floor from
+  `SUBC_DEV_OPERATOR_APP_FLOOR` (SemVer; unset or invalid admits nothing).
+  `ck config status` reports the effective compiled-in floor beside the
+  development feature in `development_switches` when the override is set.
+  The override is absent from builds without that feature.
+
 ## 0.49.0
 
 - Advertise `peer-build/v1` in HELLO_ACK and relay `peer_build: "production"`

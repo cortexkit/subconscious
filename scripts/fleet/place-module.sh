@@ -70,7 +70,7 @@
 # Usage:
 #   place-module.sh --module <id> --staged <path> [--dest <path>] [--path-face <name>]
 #                   --marker <string> [--control <string>] [--old-control <string>]
-#                   --tool-defs <unchanged|additive|unregistered|changed|none> [--host-restart-window]
+#                   --tool-defs <unchanged|additive|unregistered|changed|none>
 #                   [--terminal | --no-restart [--reexec-safe]] [--allow-debuggable <ask_id>]
 #   place-module.sh --module <id> --rollback <stamp> [--dest <path>]
 #                   [--restore-store <path>] [--terminal | --no-restart]
@@ -89,7 +89,7 @@ set -euo pipefail
 
 STAGING="${CK_STAGING:-$HOME/.local/share/cortexkit/staging}"
 BIN_DIR="${CK_BIN_DIR:-$HOME/.local/share/cortexkit/bin}"
-MODULE=""; STAGED=""; DEST=""; PATH_FACE=""; MARKER=""; CONTROL=""; OLD_CONTROL=""; GONE=""; RESTART=1; REEXEC_SAFE=0; PLACE=0; OLDER=0; MIGRATES=""; NEW_REQUIREMENT=""; ALLOW_UNHARDENED=0; ALLOW_UNSTRIPPED=0; ALLOW_UNSTAMPED=0; INSTALL=0; ROLLBACK=""; RESTORE_STORE=""; TOOL_DEFS=""; HOST_RESTART_WINDOW=0; ALLOW_DEBUGGABLE=""
+MODULE=""; STAGED=""; DEST=""; PATH_FACE=""; MARKER=""; CONTROL=""; OLD_CONTROL=""; GONE=""; RESTART=1; REEXEC_SAFE=0; PLACE=0; OLDER=0; MIGRATES=""; NEW_REQUIREMENT=""; ALLOW_UNHARDENED=0; ALLOW_UNSTRIPPED=0; ALLOW_UNSTAMPED=0; INSTALL=0; ROLLBACK=""; RESTORE_STORE=""; TOOL_DEFS=""; ALLOW_DEBUGGABLE=""
 TERMINAL=0
 
 while (($# > 0)); do
@@ -153,16 +153,14 @@ while (($# > 0)); do
     # and the marker must read in it. It never restarts: the module starts when
     # its subc.jsonc entry is approved (or an unstamped rescan picks it up).
     --install) INSTALL=1; RESTART=0; shift ;;
-    # Agent hosts register each head's tool definitions (descriptions and argument
-    # schemas) when the head starts, and core refuses a call whose provider's
-    # definitions changed since then (`provider_snapshot_reregister_required`)
-    # until the hosts restart. So a build that changes a definition must be placed
-    # just before a host restart, never on its own. Nothing in this script can read
-    # a build's definitions, so the operator states the answer explicitly, compared
-    # against the RUNNING build rather than the card it replaces: `none` for a
-    # module that serves no tools.
+    # Every agent runs on a runner, which takes a provider's changed tool
+    # definitions (descriptions and argument schemas) through its session plan:
+    # prefrontal re-reads the catalog after the provider restarts and each agent
+    # applies the change at its next prompt rebuild. So any answer is placeable,
+    # but it is still stated explicitly, compared against the RUNNING build rather
+    # than the card it replaces, so the placement log says what agents will see:
+    # `none` for a module that serves no tools.
     --tool-defs) TOOL_DEFS="$2"; shift 2 ;;
-    --host-restart-window) HOST_RESTART_WINDOW=1; shift ;;
     # A build signed with get-task-allow lets any process running as the user
     # attach to the module and read its memory, including its launch secret,
     # which the daemon accepts on new connections for the life of the process.
@@ -213,23 +211,16 @@ else
   if [ "$INSTALL" -eq 0 ]; then
     case "$TOOL_DEFS" in
       unchanged|none) ;;
-      additive)
-        # Core compares a registered head's tools by input-schema shape and
-        # never stores the tool-level description. So new optional properties
-        # and new tool-level description text are accepted by heads that are
-        # already running; they keep the old text until their next restart.
-        # Changed property descriptions, types or required lists, and removed
-        # properties, are not additive: those are --tool-defs changed.
-        echo "tool definitions: additive (new optional properties or tool-level description only); running heads keep their registered tools" ;;
+      additive|changed)
+        # A restart cuts the provider's in-flight tool calls; agents pick up
+        # the new definitions at their next prompt rebuild. A provider that
+        # enforces the call's schema pin refuses a head's older pin until then
+        # (tool_schema_changed), so check the provider handles that first.
+        echo "tool definitions: $TOOL_DEFS; agents take them at their next prompt rebuild; a provider enforcing schema pins refuses older pins until then" ;;
       unregistered)
-        # Core checks each head's registered tools one by one, and only the
-        # tools that head was granted; a provider's catalog generation and
-        # digest are not compared on that path. So a changed definition on a
-        # tool that no head registers leaves every running head's tools valid.
-        # The person placing it must have checked that no head registers it.
-        echo "tool definitions: changed only on tools no head registers; running heads keep their registered tools" ;;
-      changed)
-        [ "$HOST_RESTART_WINDOW" -eq 1 ] || { echo "REFUSED: --tool-defs changed: a tool definition change is placed only just before a host restart; pass --host-restart-window when that restart is booked" >&2; exit 2; } ;;
+        # A changed definition on a tool that no agent's plan includes reaches
+        # no agent. The person placing it must have checked that.
+        echo "tool definitions: changed only on tools no agent's plan includes" ;;
       "") echo "REFUSED: --tool-defs is required: compare the build's tool descriptions and schemas against the RUNNING build and pass unchanged, additive, unregistered, changed or none (serves no tools)" >&2; exit 2 ;;
       *) echo "REFUSED: --tool-defs must be unchanged, additive, unregistered, changed or none, not '$TOOL_DEFS'" >&2; exit 2 ;;
     esac

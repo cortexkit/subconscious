@@ -43,8 +43,6 @@ const INTERPRETER_MODULES: &[&str] = &[
     "errno",
     "faulthandler",
     "itertools",
-    "posix",
-    "pwd",
     "time",
 ];
 
@@ -102,18 +100,35 @@ const UNIX_MODULES: &[&str] = &[
     "_posixsubprocess",
     "fcntl",
     "grp",
+    "posix",
+    "pwd",
     "resource",
     "syslog",
     "termios",
 ];
 /// macOS only: urllib's proxy lookup, through the SystemConfiguration system framework.
 const MACOS_MODULES: &[&str] = &["_scproxy"];
-const WINDOWS_MODULES: &[&str] = &["_overlapped", "_winapi"];
+/// Windows: the OS interface (`nt`, the counterpart of `posix`), the registry and console
+/// helpers the standard library imports, and the overlapped I/O asyncio uses.
+const WINDOWS_MODULES: &[&str] = &["_overlapped", "_winapi", "msvcrt", "nt", "winreg"];
 /// Linked when the archive has them; not every platform's build provides them.
 const OPTIONAL_MODULES: &[&str] = &["_uuid"];
 
 /// Never linked, even if a future archive marks it as required.
 const REFUSED_MODULES: &[&str] = &["_ctypes"];
+/// Compiled into the Windows core but not on the runner's list, so left out of the init table:
+/// an example module and the multiple-interpreter modules, which other platforms don't link.
+const LEFT_OUT_CORE_MODULES: &[&str] = &[
+    "xxsubtype",
+    "_interpreters",
+    "_interpchannels",
+    "_interpqueues",
+];
+
+/// Test and example modules are never linked, wherever an archive puts them.
+fn is_test_module(name: &str) -> bool {
+    name.starts_with("_test") || name.starts_with("xx")
+}
 
 fn required_env(name: &str) -> PathBuf {
     println!("cargo:rerun-if-env-changed={name}");
@@ -244,6 +259,8 @@ fn main() {
         let in_core = variant["in_core"].as_bool() == Some(true);
         let required = variant["required"].as_bool() == Some(true);
         if REFUSED_MODULES.contains(&name.as_str())
+            || is_test_module(name)
+            || LEFT_OUT_CORE_MODULES.contains(&name.as_str())
             || !(in_core || required || wanted.contains(&name.as_str()))
         {
             continue;
@@ -285,6 +302,11 @@ fn main() {
         .include(&include)
         .warnings(true)
         .cargo_metadata(false);
+    if windows {
+        // The Windows core is a static library: without this, pyconfig.h declares the C API as
+        // imported from python313.dll.
+        embed.define("Py_NO_ENABLE_SHARED", None);
+    }
     embed.compile("ck_embed");
     let embed_library = out.join(if windows {
         "ck_embed.lib"
@@ -307,7 +329,11 @@ fn main() {
         link(library);
     }
     for library in &plan.system_libraries {
-        link(&format!("-l{library}"));
+        if windows {
+            link(&format!("{library}.lib"));
+        } else {
+            link(&format!("-l{library}"));
+        }
     }
     for framework in &plan.frameworks {
         link(&"-framework");
@@ -381,8 +407,14 @@ fn main() {
         text(&info["python_version"], "python_version")
     );
     // Lets the tests drive the runner with the shared pipe harness without a system Python, and
-    // list the standard library the runner ships.
-    println!("cargo:rustc-env=CK_TEST_PYTHON={}", host_python.display());
+    // list the standard library the runner ships. On Windows the harness needs ctypes, which the
+    // statically built host Python lacks, so CK_HARNESS_PYTHON can name another interpreter.
+    println!("cargo:rerun-if-env-changed=CK_HARNESS_PYTHON");
+    let harness = env::var_os("CK_HARNESS_PYTHON")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| host_python.clone());
+    println!("cargo:rustc-env=CK_TEST_PYTHON={}", harness.display());
     let stdlib = dist.join(text(&info["python_paths"]["stdlib"], "python_paths.stdlib"));
     println!("cargo:rustc-env=CK_TEST_STDLIB={}", stdlib.display());
 }

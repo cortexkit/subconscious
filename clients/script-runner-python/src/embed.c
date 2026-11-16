@@ -15,6 +15,13 @@
 extern int ck_resource_lookup(const char *name, size_t name_len, const unsigned char **data,
                               size_t *data_len, int *is_package);
 
+/*
+ * From OpenSSL's crypto.h (stable API since OpenSSL 1.1.0), declared here because the runner
+ * builds against CPython's headers only. The OpenSSL that _ssl and _hashlib use is linked in.
+ */
+extern int OPENSSL_init_crypto(uint64_t opts, const void *settings);
+#define CK_OPENSSL_INIT_NO_LOAD_CONFIG 0x00000080L
+
 static const unsigned char *payload_bytes;
 static size_t payload_length;
 
@@ -93,6 +100,16 @@ int ck_python_main(const char *executable, const char *bootstrap, int mode,
                    const unsigned char *payload, size_t payload_len) {
     payload_bytes = payload;
     payload_length = payload_len;
+    /*
+     * On first use OpenSSL reads a config file: OPENSSL_CONF if set, otherwise openssl.cnf in
+     * the folder compiled into it. A config file can load provider modules, native code from
+     * outside the approved script. OpenSSL initialises once and the first call's options win,
+     * so initialising here without the config means no later use can read one.
+     */
+    if (OPENSSL_init_crypto(CK_OPENSSL_INIT_NO_LOAD_CONFIG, NULL) != 1) {
+        fprintf(stderr, "ck-script-runner-python: OpenSSL failed to initialise\n");
+        return 1;
+    }
     if (PyImport_AppendInittab("_ck_runner", init_runner) < 0) {
         fprintf(stderr, "ck-script-runner-python: cannot register the runner module\n");
         return 1;
@@ -115,6 +132,10 @@ int ck_python_main(const char *executable, const char *bootstrap, int mode,
     config.parse_argv = 0;
     /* Like the python command: SIGINT raises KeyboardInterrupt and SIGPIPE is ignored. */
     config.install_signal_handlers = 1;
+    /* Like the python command: the C standard streams are set up by CPython (binary mode on
+       Windows, where Python's own text layer writes "\n" as "\r\n", as every Windows Python
+       does). */
+    config.configure_c_stdio = 1;
     config.use_frozen_modules = 1;
     config._init_main = 0;
     char *argv[] = {"ck-script:main"};

@@ -1,0 +1,5 @@
+# The Windows runner links the static C runtime, like the CPython it embeds, so it needs no
+# Visual C++ runtime DLL beside it. Cargo reads this only when run from this folder, which
+# scripts/release/build-script-runner-python.sh and the workflow do.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]

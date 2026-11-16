@@ -1,0 +1,23 @@
+# Sources and build tools for the Windows CPython that ck-script-runner-python links.
+#
+# python-build-standalone ships libpython, OpenSSL and SQLite for Windows only as DLLs, so the
+# Windows runner builds CPython itself, statically: tools/build_windows_cpython.py turns these
+# into the same extracted layout and PYTHON.json that build.rs reads for the other platforms.
+# scripts/release/build-script-runner-python.sh downloads each file once and refuses it unless
+# both the size and the SHA-256 match.
+#
+# The library versions are the ones CPython 3.13.18's own PCbuild/get_externals.bat names;
+# OpenSSL is the official release tarball (its SHA-256 matches openssl.org's published sum).
+# Strawberry Perl and NASM are only build tools for OpenSSL: Configure needs a native Windows
+# Perl, and NASM assembles its x64 code. They are unpacked under target/ for the build only.
+#
+# <name> <size-bytes> <sha256> <url>
+cpython 23243936 abb0102e6d4ae027509bcb82327d9dd85515b44a3ba8ad538cfc5e9847029f68 https://www.python.org/ftp/python/3.13.18/Python-3.13.18.tar.xz
+openssl 53279637 603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz
+bzip2 818771 ab8d1b0cc087c20d4c32c0e4fcf7d0c733a95da12cedc6d63b3f0a9af07427e2 https://github.com/python/cpython-source-deps/archive/bzip2-1.0.8.tar.gz
+mpdecimal 319629 338fac3fb8cdd60f406b6326431338756f58a8af94229ffd9bf1e7c2b1ad71ca https://github.com/python/cpython-source-deps/archive/mpdecimal-4.0.0.tar.gz
+sqlite 2845090 fb5ab81f27612b0a7b4861ba655906c76dc85ee969e7a4905d2075aff931e8d0 https://github.com/python/cpython-source-deps/archive/sqlite-3.50.4.0.tar.gz
+xz 1744796 a15c168e39e87d750c3dc766edc7f19bdda57dacf01e509678467eace91ad282 https://github.com/python/cpython-source-deps/archive/xz-5.2.5.tar.gz
+zlib 1570732 e3f3fb32564952006eb18b091ca8464740e5eca29d328cfb0b2da22768e0b638 https://github.com/python/cpython-source-deps/archive/zlib-1.3.1.tar.gz
+strawberry-perl 304765269 6a081a811781c30aca51dbc036afd93092af91e3297901f02c17043795a10690 https://github.com/StrawberryPerl/Perl-Dist-Strawberry/releases/download/SP_54231_64bit/strawberry-perl-5.42.3.1-64bit-portable.zip
+nasm 513543 3ee4782247bcb874378d02f7eab4e294a84d3d15f3f6ee2de2f47a46aa7226e6 https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/win64/nasm-2.16.03-win64.zip

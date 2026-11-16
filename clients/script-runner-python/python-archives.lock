@@ -5,8 +5,8 @@
 # The objects in these archives are LLVM 23 bitcode (PYTHON.json `object_file_format`), so the
 # final link needs an lld from LLVM 23 or newer; the build uses the rust-lld that ships with rustc.
 #
-# Windows has no line: its archives provide libpython, OpenSSL and SQLite only as DLLs, and the
-# way to build a self-contained Windows runner is still an open decision.
+# Windows has no line: its archives provide libpython, OpenSSL and SQLite only as DLLs, so the
+# Windows runner builds CPython statically from the sources in windows-sources.lock instead.
 #
 # <rust-target> <size-bytes> <sha256> <url>
 aarch64-apple-darwin 61374878 11c316dfa24e1184e91de3c1434ed1d3e986c30b2d7a0273257067efe611a677 https://github.com/astral-sh/python-build-standalone/releases/download/20261110/cpython-3.13.18%2B20261110-aarch64-apple-darwin-pgo%2Blto-full.tar.zst

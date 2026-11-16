@@ -48,6 +48,16 @@ fn clean_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     command
 }
 
+/// The runner's output with line endings made uniform: like every Python on Windows, it
+/// writes "\n" to its standard streams as "\r\n" there.
+fn text(output: &str) -> String {
+    if cfg!(windows) {
+        output.replace("\r\n", "\n")
+    } else {
+        output.to_string()
+    }
+}
+
 struct Outcome {
     code: i64,
     out: String,
@@ -96,8 +106,8 @@ fn run_with(
     assert_eq!(result["write_errors"], serde_json::json!([]));
     Outcome {
         code: result["code"].as_i64().expect("exit code"),
-        out: result["out"].as_str().expect("stdout").to_string(),
-        err: result["err"].as_str().expect("stderr").to_string(),
+        out: text(result["out"].as_str().expect("stdout")),
+        err: text(result["err"].as_str().expect("stderr")),
     }
 }
 
@@ -113,8 +123,8 @@ fn check(file: &Path) -> Outcome {
         .expect("runner starts");
     Outcome {
         code: i64::from(output.status.code().unwrap_or(-1)),
-        out: String::from_utf8_lossy(&output.stdout).into_owned(),
-        err: String::from_utf8_lossy(&output.stderr).into_owned(),
+        out: text(&String::from_utf8_lossy(&output.stdout)),
+        err: text(&String::from_utf8_lossy(&output.stderr)),
     }
 }
 
@@ -209,7 +219,16 @@ fn transport_faults_are_refused_before_any_code_runs() {
     let good = frame(b"print('EVALUATED')\n");
     let faults: Vec<(&str, Vec<u8>)> = vec![
         ("wrong-identity", good.clone()),
-        ("not-pipe", good.clone()),
+        // The harness's Unix fault hands over a file instead of a pipe; its Windows fault
+        // serves a pipe whose name isn't the daemon's.
+        (
+            if cfg!(windows) {
+                "wrong-name"
+            } else {
+                "not-pipe"
+            },
+            good.clone(),
+        ),
         ("valid", good[..HEADER_LEN - 1].to_vec()),
         ("valid", good[..good.len() - 1].to_vec()),
         ("valid", [good.clone(), vec![0]].concat()),
@@ -278,21 +297,21 @@ fn nothing_beside_the_runner_or_in_the_working_folder_is_read() {
     for folder in [&bin, &cwd, &pth] {
         fs::create_dir_all(folder).expect("folder");
     }
-    let executable = bin.join("ck-script-runner-python");
+    // The copy keeps the runner's own file name, .exe included on Windows.
+    let executable = bin.join(runner().file_name().expect("runner file name"));
     fs::copy(runner(), &executable).expect("copy runner");
     for folder in [&bin, &cwd, &pth] {
         fs::write(folder.join("diskmod.py"), "print('DISK_EVALUATED')\n").expect("module");
-        fs::write(folder.join("nativemod.so"), b"\x7fELF not really").expect("native");
-        fs::write(
-            folder.join("nativemod.cpython-313-darwin.so"),
-            b"\x7fELF not really",
-        )
-        .expect("native");
-        fs::write(
-            folder.join("nativemod.cpython-313-x86_64-linux-gnu.so"),
-            b"\x7fELF not really",
-        )
-        .expect("native");
+        for native in [
+            "nativemod.so",
+            "nativemod.cpython-313-darwin.so",
+            "nativemod.cpython-313-x86_64-linux-gnu.so",
+            "nativemod.pyd",
+            "nativemod.cp313-win_amd64.pyd",
+            "nativemod.cp313-win_arm64.pyd",
+        ] {
+            fs::write(folder.join(native), b"\x7fELF not really").expect("native");
+        }
     }
     // Startup files CPython would honour beside an ordinary interpreter.
     fs::write(
@@ -382,6 +401,20 @@ const LEFT_OUT: &[&str] = &[
     "tkinter",
 ];
 
+/// Unix-only extensions: on Windows, CPython itself has no build of them, so the standard-library
+/// modules that need them (pty, tty and the like) fail there as they do in any Windows Python.
+const UNIX_ONLY: &[&str] = &[
+    "termios",
+    "fcntl",
+    "grp",
+    "pwd",
+    "resource",
+    "syslog",
+    "posix",
+    "_posixsubprocess",
+    "_posixshmem",
+];
+
 #[test]
 fn every_shipped_standard_library_module_imports() {
     let stdlib = Path::new(env!("CK_TEST_STDLIB"));
@@ -443,7 +476,9 @@ print('IMPORTED', len({names:?}))
         .filter(|line| {
             line.starts_with("ERROR")
                 || (line.starts_with("IMPORT_FAILED")
-                    && !LEFT_OUT.contains(&line.rsplit(' ').next().unwrap_or("")))
+                    && !LEFT_OUT.contains(&line.rsplit(' ').next().unwrap_or(""))
+                    && !(cfg!(windows)
+                        && UNIX_ONLY.contains(&line.rsplit(' ').next().unwrap_or(""))))
         })
         .collect();
     assert!(
@@ -526,6 +561,46 @@ fn bundle_holding_a_native_file_is_refused_at_load() {
 }
 
 #[test]
+fn openssl_never_reads_a_config_file() {
+    // OpenSSL loads its config file on first use unless told not to: OPENSSL_CONF if set,
+    // otherwise openssl.cnf in its compiled-in folder. A config file can load provider modules,
+    // which is native code from outside the approved script. This config only sets a property
+    // that is easy to see: if it is read, OpenSSL is in FIPS mode and fetches no algorithms.
+    let dir = scratch("openssl-conf");
+    let conf = dir.join("openssl.cnf");
+    fs::write(
+        &conf,
+        "openssl_conf = openssl_init\n\n[openssl_init]\nalg_section = evp_properties\n\n\
+         [evp_properties]\ndefault_properties = fips=yes\n",
+    )
+    .unwrap();
+    let script = r#"
+import hashlib, ssl, _hashlib
+try:
+    ssl.create_default_context()
+    print("SSL ok")
+except ssl.SSLError as error:
+    print("SSL failed", error)
+print("SHA256", hashlib.sha256.__name__, hashlib.sha256(b"").hexdigest()[:8])
+print("FIPS", _hashlib.get_fips_mode())
+"#;
+    let conf_path = conf.to_string_lossy().into_owned();
+    let result = run_with(
+        &runner(),
+        &frame(script.as_bytes()),
+        "valid",
+        &[("OPENSSL_CONF", conf_path.as_str())],
+        None,
+    );
+    assert_eq!(result.err, "");
+    assert_eq!(
+        result.out,
+        "SSL ok\nSHA256 openssl_sha256 e3b0c442\nFIPS 0\n"
+    );
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn check_mode_warns_on_loads_without_running_anything() {
     let dir = scratch("check");
     let file = dir.join("script.py");
@@ -544,6 +619,8 @@ try:
     import cffi
 except ImportError:
     cffi = None
+import sqlite3
+sqlite3.connect(":memory:").enable_load_extension(True)
 "#,
     )
     .unwrap();
@@ -562,6 +639,7 @@ except ImportError:
         "script_load_warning: ctypes at line 9: loads native code; it is not available in this runner",
         "script_load_warning: cffi at line 11: loads native code; it is not available in this runner",
         "script_import_warning: cffi at line 11: not in the approved runner; this import fails at run time",
+        "script_load_warning: enable_load_extension at line 15: lets SQLite load native extensions from files outside the approved script",
     ];
     assert_eq!(result.err.lines().collect::<Vec<_>>(), expected);
     let _ = fs::remove_dir_all(dir);

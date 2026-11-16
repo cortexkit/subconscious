@@ -14,7 +14,8 @@ jobs:
   build:
     name: Embedded CPython (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 40
+    # Windows builds compile OpenSSL and CPython from source unless the cache below holds them.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -22,56 +23,34 @@ jobs:
           - {os: ubuntu-latest, target: x86_64-unknown-linux-gnu, sign: ""}
           - {os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, sign: ""}
           - {os: macos-latest, target: aarch64-apple-darwin, sign: "--sign"}
-          # Windows (x86_64-pc-windows-msvc on windows-latest, aarch64-pc-windows-msvc on
-          # windows-11-arm) is left out: python-build-standalone ships libpython, OpenSSL and
-          # SQLite for Windows only as DLLs, so its archives can't make one self-contained
-          # runner. Building those ourselves for Windows is pending a ruling. The transport job
-          # below still tests the Windows pipe reader.
+          # python-build-standalone ships libpython, OpenSSL and SQLite for Windows only as
+          # DLLs, so the Windows runner builds CPython statically from the sources in
+          # windows-sources.lock (tools/build_windows_cpython.py).
+          - {os: windows-latest, target: x86_64-pc-windows-msvc, sign: ""}
+          - {os: windows-11-arm, target: aarch64-pc-windows-msvc, sign: ""}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - name: Cache the pinned CPython archive
+      - name: Cache the pinned CPython archive or Windows sources
         uses: actions/cache@v4
         with:
-          path: target/python-dist/archives/${{ matrix.target }}.tar.zst
-          key: python-archive-${{ matrix.target }}-${{ hashFiles('clients/script-runner-python/python-archives.lock') }}
-      - name: Build (and on macOS sign ad hoc and run the signed binary)
+          path: |
+            target/python-dist/archives/${{ matrix.target }}.tar.zst
+            target/python-dist/windows-sources
+            target/python-build/${{ matrix.target }}-openssl
+          key: python-inputs-${{ matrix.target }}-${{ hashFiles('clients/script-runner-python/python-archives.lock', 'clients/script-runner-python/windows-sources.lock') }}
+      - name: Build and test (on macOS also sign ad hoc and run the signed binary)
         shell: bash
         env:
           DEVELOPER_ID_APPLICATION_IDENTITY: "-"
-        run: bash scripts/release/build-script-runner-python.sh ${{ matrix.target }} ${{ matrix.sign }}
-      - name: Test
-        shell: bash
-        run: |
-          # The same values the build script used, so cargo reuses its build.
-          export CK_PYTHON_DIST="$PWD/target/python-dist/${{ matrix.target }}/python"
-          export CK_PYTHON_HOST="$CK_PYTHON_DIST/install/bin/python3"
-          if [[ "${{ matrix.target }}" == *-apple-darwin ]]; then
-            MACOSX_DEPLOYMENT_TARGET="$("$CK_PYTHON_HOST" -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["python_config_vars"]["MACOSX_DEPLOYMENT_TARGET"])' "$CK_PYTHON_DIST/PYTHON.json")"
-            export MACOSX_DEPLOYMENT_TARGET
-          fi
-          cargo test --locked --release --manifest-path clients/script-runner-python/Cargo.toml --target ${{ matrix.target }} --workspace
+        run: bash scripts/release/build-script-runner-python.sh ${{ matrix.target }} ${{ matrix.sign }} --test
       - name: Size
         shell: bash
-        run: ls -l target/${{ matrix.target }}/release/ck-script-runner-python
+        run: ls -l target/${{ matrix.target }}/release/ck-script-runner-python*
       - uses: actions/upload-artifact@v4
         with:
           name: script-runner-python-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/ck-script-runner-python
+          path: target/${{ matrix.target }}/release/ck-script-runner-python*
           if-no-files-found: error
-
-  transport:
-    name: Script transport (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, windows-11-arm]
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Test the pipe reader and environment check
-        run: cargo test --locked --manifest-path clients/script-runner-python/Cargo.toml -p ck-script-transport

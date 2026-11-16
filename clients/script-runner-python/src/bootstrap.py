@@ -225,6 +225,7 @@ EXEC_REASON = "runs code that is not in the approved script"
 LOADER_REASONS = {
     "spec_from_file_location": "loads a module from a file outside the approved script",
     "run_path": "runs a file outside the approved script",
+    "enable_load_extension": "lets SQLite load native extensions from files outside the approved script",
 }
 NATIVE_MODULES = {"ctypes", "_ctypes", "cffi", "_cffi_backend"}
 NATIVE_REASON = "loads native code; it is not available in this runner"

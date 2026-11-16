@@ -1,4 +1,5 @@
 use super::*;
+use crate::registry::ModuleRegistration;
 use crate::ChannelState;
 
 fn admit_route(
@@ -10,18 +11,77 @@ fn admit_route(
     owner_configured: bool,
     mode: AdmissionMode<'_>,
 ) -> Result<RouteAdmission, Refusal> {
-    super::admit_route(
+    let expected = super::admit_route(
         scopes,
         &RouteAdmissionSnapshot {
-            modules: registry.to_vec(),
+            modules: registry
+                .iter()
+                .map(|registration| {
+                    Arc::new(RouteRegistration {
+                        module_id: registration.manifest.module_id.clone(),
+                        capabilities: registration.manifest.capabilities.clone(),
+                        roles: vec![],
+                        ready: registration.ready,
+                        state: registration.state,
+                        connection_id: registration.connection_id,
+                    })
+                })
+                .collect(),
             unpublished: HashSet::new(),
+            connections: HashMap::new(),
         },
         principal,
         target,
         selector,
         owner_configured,
+        match mode {
+            AdmissionMode::Open => AdmissionMode::Open,
+            AdmissionMode::Authorize(expected) => AdmissionMode::Authorize(expected),
+        },
+    );
+    let owner = crate::registry::Registry::default();
+    for registration in registry {
+        let mut manifest = registration.manifest.clone();
+        manifest.ready = Some(registration.ready);
+        owner
+            .register_with_control_ops(
+                manifest,
+                registration.negotiated_ver,
+                registration.connection_id,
+                registration.control_ops.clone(),
+            )
+            .unwrap();
+        owner
+            .set_module_state_for_test(&registration.manifest.module_id, registration.state)
+            .unwrap();
+    }
+    let snapshot = owner.route_admission_snapshot().unwrap();
+    assert!(Arc::ptr_eq(
+        &snapshot,
+        &owner.route_admission_snapshot().unwrap()
+    ));
+    let actual = super::admit_route(
+        scopes,
+        &snapshot,
+        principal,
+        target,
+        selector,
+        owner_configured,
         mode,
-    )
+    );
+    match (&expected, &actual) {
+        (Ok(expected), Ok(actual)) => {
+            assert_eq!(expected.scope, actual.scope);
+            assert_eq!(expected.content_version, actual.content_version);
+        }
+        (Err(expected), Err(actual)) => {
+            assert_eq!(expected.outcome, actual.outcome);
+            assert_eq!(expected.code, actual.code);
+            assert_eq!(expected.message, actual.message);
+        }
+        _ => panic!("cached and uncached admission decisions differ"),
+    }
+    actual
 }
 
 #[test]

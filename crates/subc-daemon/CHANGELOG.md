@@ -8,6 +8,19 @@
   helpers) and started the module in a fresh group. The retry now joins the
   carried group. The warning for a failed carried-group spawn now includes
   the spawn error.
+- Cache serialized catalog replies until registry or effective-readiness facts
+  change, keeping filtered declaration replies separate from the full catalog.
+- Report bounded, one-minute channel-zero operation counts by caller principal
+  in `server.describe` counters, including overflow accounting.
+- Check desktop review delivery only for review-producing requests, avoiding
+  another JSON scan of every catalog response.
+- For modules retaining their container across restarts, observe Unix child
+  exits every 50 ms rather than every millisecond, without reaping the leader.
+- Log successful route opens at DEBUG rather than INFO; refusal and outage
+  recovery diagnostics keep their existing levels.
+- Share immutable route-admission metadata between opens instead of cloning
+  every provider manifest. Keep unpublished providers and both processes of a
+  provider replacement distinct.
 
 ## 0.49.2
 

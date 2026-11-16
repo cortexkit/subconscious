@@ -359,6 +359,15 @@ const RULES: &[Rule] = &[
         json_kind: string,
         pins: &[],
     },
+    // The daemon's channel-zero call counts for its last minute: how many
+    // requests `ck` and the kit made, by whom and when, differ on every run.
+    Rule {
+        name: "control_usage",
+        text: no_text,
+        json_keys: &["control_usage"],
+        json_kind: Value::is_object,
+        pins: &[],
+    },
     // `ck` prints the capabilities the daemon advertises, and a daemon that
     // gains one must not change this pin; another test checks that every
     // advertised capability is printed.

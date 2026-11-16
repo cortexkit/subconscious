@@ -3,6 +3,14 @@ use std::future::Future;
 use crate::router::test_log::{captured_logs, log_capture};
 
 async fn open_with_ack_delay(delay: Duration, scope_ref: Option<&str>) -> String {
+    open_with_ack_delay_at_level(delay, scope_ref, tracing::Level::DEBUG).await
+}
+
+async fn open_with_ack_delay_at_level(
+    delay: Duration,
+    scope_ref: Option<&str>,
+    level: tracing::Level,
+) -> String {
     let mut rig = rig().await;
     let scope = scope_ref.map(|scope_ref| rig.selector(scope_ref, Some(1)));
     if let Some(scope_ref) = scope_ref {
@@ -10,7 +18,7 @@ async fn open_with_ack_delay(delay: Duration, scope_ref: Option<&str>) -> String
         record.carriers.push(ScopeCarrier::new(Principal::Direct));
         rig.sync(vec![record]).await;
     }
-    let (output, subscriber) = log_capture(tracing::Level::INFO);
+    let (output, subscriber) = log_capture(level);
     let (client, mut client_rx, frame) = rig.open_frame(None, PLEXUS, scope);
     let corr = frame.header.corr;
     let started_at = Instant::now().into_std();
@@ -97,12 +105,19 @@ async fn fast_route_open_emits_no_slow_dispatch_warning() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn successful_route_open_is_silent_at_info() {
+    let logs = open_with_ack_delay_at_level(Duration::ZERO, None, tracing::Level::INFO).await;
+    assert!(!logs.contains("route.open accepted"), "{logs}");
+}
+
+#[tokio::test(start_paused = true)]
 async fn route_open_accept_log_records_scoped_and_unscoped_opens() {
     let unscoped_logs = open_with_ack_delay(Duration::ZERO, None).await;
     let unscoped = unscoped_logs
         .lines()
         .find(|line| line.contains("route.open accepted"))
         .expect("accepted route.open log");
+    assert!(unscoped.contains("DEBUG"), "{unscoped}");
     assert!(unscoped.contains("scope=none"), "{unscoped}");
 
     let scope_ref = "scope-reference-123456789";

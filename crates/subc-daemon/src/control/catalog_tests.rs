@@ -1,6 +1,201 @@
 use super::*;
 use subc_control::{CatalogWatchRequest, CatalogWatchResponse};
 
+#[cfg(target_os = "linux")]
+#[path = "catalog_bench.rs"]
+mod perf;
+
+#[tokio::test]
+async fn control_usage_records_direct_and_registered_requests_in_server_counters() {
+    let handler = ControlHandler::new(Arc::new(Registry::default()));
+    handler
+        .handle_control(ConnectionId::new(1), hello_declarations(json!({})))
+        .unwrap();
+    for connection in [1, 2] {
+        let (ctx, _rx) = route_ctx(ConnectionId::new(connection));
+        let frame = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            11,
+            br#"{"op":"catalog.list"}"#.to_vec(),
+        )
+        .unwrap();
+        handler.handle_control_frame(&ctx, frame).await.unwrap();
+    }
+    let request = Frame::build(
+        FrameType::Request,
+        control_flags(),
+        0,
+        0,
+        12,
+        br#"{"op":"server.describe"}"#.to_vec(),
+    )
+    .unwrap();
+    let reply = handler.handle_server_describe(request).unwrap();
+    let value: Value = serde_json::from_slice(&reply[0].body).unwrap();
+    let usage = &value["counters"]["control_usage"];
+    assert_eq!(usage["requests"], 2);
+    let top = usage["top"].as_array().unwrap();
+    assert!(top.iter().any(|row| row["op"] == "catalog.list"
+        && row["principal"] == "reserved:declaring"
+        && row["requests"] == 1));
+    assert!(top.iter().any(|row| row["op"] == "catalog.list"
+        && row["principal"] == "direct"
+        && row["requests"] == 1));
+}
+
+fn assert_cached_catalog_matches(handler: &ControlHandler) {
+    for module in [None, Some("declaring"), Some("missing")] {
+        let (reply, _) = catalog(handler, module);
+        let expected =
+            serde_json::to_vec(&handler.uncached_catalog_list(2, module).unwrap()).unwrap();
+        assert_eq!(reply.body, expected, "variant {module:?}");
+    }
+}
+
+#[test]
+fn catalog_cache_reuses_serialized_replies_and_invalidates_every_catalog_change() {
+    let registry = Arc::new(Registry::default());
+    let handler = ControlHandler::new(registry.clone());
+    assert_cached_catalog_matches(&handler);
+    assert_eq!(handler.catalog_cache.lock().unwrap().builds, 1);
+    assert_cached_catalog_matches(&handler);
+    assert_eq!(handler.catalog_cache.lock().unwrap().builds, 1);
+
+    handler
+        .handle_control(
+            ConnectionId::new(1),
+            hello_declarations(json!({"provider": {"read": true}})),
+        )
+        .unwrap();
+    assert_cached_catalog_matches(&handler);
+    assert_eq!(handler.catalog_cache.lock().unwrap().builds, 2);
+    let current = registry.get_module("declaring").unwrap().unwrap();
+    registry
+        .replace_catalog_for_connection(
+            ConnectionId::new(1),
+            current.manifest.provides.clone(),
+            None,
+            Some(false),
+        )
+        .unwrap();
+    assert_cached_catalog_matches(&handler);
+    assert_eq!(handler.catalog_cache.lock().unwrap().builds, 3);
+    registry
+        .replace_catalog_for_connection(ConnectionId::new(1), Vec::new(), None, Some(true))
+        .unwrap();
+    assert_cached_catalog_matches(&handler);
+    assert_eq!(handler.catalog_cache.lock().unwrap().builds, 4);
+    registry
+        .replace_role_declarations_for_connection(
+            ConnectionId::new(1),
+            BTreeMap::from([(
+                "provider".into(),
+                serde_json::from_value(json!({"revision": 2})).unwrap(),
+            )]),
+        )
+        .unwrap();
+    assert_cached_catalog_matches(&handler);
+    assert_eq!(handler.catalog_cache.lock().unwrap().builds, 5);
+
+    let authority = crate::spawn_authority::SpawnAuthorityRecord::new("cache-test", 1, "declaring");
+    handler
+        .forwarding
+        .bind_target_authority(ConnectionId::new(1), authority.clone())
+        .unwrap();
+    registry.catalog_authority_changed().unwrap();
+    assert_cached_catalog_matches(&handler);
+    assert_eq!(handler.catalog_cache.lock().unwrap().builds, 6);
+    authority.activate(|| Ok::<(), ()>(())).unwrap();
+    registry.catalog_authority_changed().unwrap();
+    assert_cached_catalog_matches(&handler);
+    assert_eq!(catalog(&handler, None).1[0].first_party, Some(true));
+    assert_eq!(handler.catalog_cache.lock().unwrap().builds, 7);
+    authority.set_approved_for_test(
+        serde_json::from_value(json!({"provider": {"read": true}})).unwrap(),
+    );
+    registry.catalog_authority_changed().unwrap();
+    assert_cached_catalog_matches(&handler);
+    assert_eq!(handler.catalog_cache.lock().unwrap().builds, 8);
+    registry
+        .deregister_connection(ConnectionId::new(1))
+        .unwrap();
+    assert_cached_catalog_matches(&handler);
+    assert_eq!(handler.catalog_cache.lock().unwrap().builds, 9);
+
+    registry
+        .register_unpublished_verified_with_control_ops(
+            manifest("declaring", PROTOCOL_VERSION),
+            PROTOCOL_VERSION,
+            ConnectionId::new(2),
+            vec![],
+            true,
+        )
+        .unwrap();
+    assert_cached_catalog_matches(&handler);
+    assert_eq!(handler.catalog_cache.lock().unwrap().builds, 9);
+    registry.publish_registration(ConnectionId::new(2)).unwrap();
+    assert_cached_catalog_matches(&handler);
+    assert!(catalog(&handler, None).1[0].nonce_verified);
+    assert_eq!(handler.catalog_cache.lock().unwrap().builds, 10);
+}
+
+#[test]
+fn catalog_cache_readiness_revision_invalidates_without_registry_generation_change() {
+    let registry = Arc::new(Registry::default());
+    let handler = ControlHandler::new(registry.clone());
+    let mut consumer = manifest("declaring", PROTOCOL_VERSION);
+    consumer.capabilities = Some(CapabilityDeclarations {
+        requires: vec![subc_protocol::manifest::CapabilityRequirement {
+            capability: "cache-provider/v1".into(),
+            need: CapabilityNeed::Required,
+        }],
+        provides: vec![],
+        must_never_reach: vec![],
+    });
+    let consumer_capabilities = consumer.capabilities.clone();
+    registry
+        .register_with_control_ops(consumer, PROTOCOL_VERSION, ConnectionId::new(1), vec![])
+        .unwrap();
+    let mut provider = manifest("provider", PROTOCOL_VERSION);
+    provider.capabilities = Some(CapabilityDeclarations {
+        provides: vec!["cache-provider/v1".into()],
+        requires: vec![],
+        must_never_reach: vec![],
+    });
+    registry
+        .register_with_control_ops(provider, PROTOCOL_VERSION, ConnectionId::new(2), vec![])
+        .unwrap();
+    // Model the interval between registry publication and its verdict refresh.
+    handler.capability_evaluator.evaluate_at_ms(
+        0,
+        &[],
+        &[RegisteredModule {
+            module_id: "declaring".into(),
+            module_version: "0.1.0".into(),
+            capabilities: consumer_capabilities,
+        }],
+    );
+    assert_cached_catalog_matches(&handler);
+    assert!(!catalog(&handler, None).1[0].ready);
+    let generation = registry.generation().unwrap();
+    let revision = handler
+        .catalog_readiness_revision
+        .load(std::sync::atomic::Ordering::Acquire);
+    handler.refresh_capability_requirements();
+    assert!(
+        handler
+            .catalog_readiness_revision
+            .load(std::sync::atomic::Ordering::Acquire)
+            > revision
+    );
+    assert_eq!(registry.generation().unwrap(), generation);
+    assert_cached_catalog_matches(&handler);
+    assert!(catalog(&handler, None).1[0].ready);
+}
+
 fn hello_declarations(entries: Value) -> Frame {
     let mut hello: Value =
         serde_json::from_slice(&hello_frame("declaring", PROTOCOL_VERSION, 1).body).unwrap();
@@ -253,13 +448,19 @@ async fn relay_seams_catalog_watch_advances_for_authority_without_routes_or_egre
     };
     watch(&handler, &ctx).await;
     assert_eq!(generation(&mut rx).await, 0);
-    ctx.egress.try_send(Frame::build(FrameType::Pong, control_flags(), 0, 0, 0, vec![]).unwrap()).unwrap();
+    ctx.egress
+        .try_send(Frame::build(FrameType::Pong, control_flags(), 0, 0, 0, vec![]).unwrap())
+        .unwrap();
     for _ in 0..20 {
         handler.change_spawn_authority(&record);
     }
     assert_eq!(record.epoch_for_test(), 20);
     assert_eq!(handler.registry.generation().unwrap(), 20);
-    assert!(handler.forwarding.module_endpoint_for_connection(ctx.connection_id).unwrap().is_none());
+    assert!(handler
+        .forwarding
+        .module_endpoint_for_connection(ctx.connection_id)
+        .unwrap()
+        .is_none());
     assert_eq!(rx.recv().await.unwrap().header.ty, FrameType::Pong);
     assert_eq!(generation(&mut rx).await, 20);
     handler.cleanup_connection(ctx.connection_id).unwrap();

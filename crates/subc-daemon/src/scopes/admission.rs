@@ -1,9 +1,9 @@
 //! Pure route admission over one scope-table view and one registry snapshot.
 
 use super::*;
-use crate::registry::{ModuleRegistration, RouteAdmissionSnapshot};
+use crate::registry::{RouteAdmissionSnapshot, RouteRegistration};
 use subc_protocol::{
-    manifest::ModuleManifest,
+    manifest::CapabilityDeclarations,
     scope::{RouteAuthorizeExpected, RouteAuthorizeOutcome as Outcome, RouteAuthorizeResponse},
 };
 
@@ -62,9 +62,9 @@ impl Refusal {
 /// Target availability is separate from transport state: an authorization
 /// query neither reserves egress nor promises that a provider will answer.
 pub(crate) fn target_registration<'a>(
-    registry: &'a [ModuleRegistration],
+    registry: &'a [std::sync::Arc<RouteRegistration>],
     target: &str,
-) -> Result<&'a ModuleRegistration, Refusal> {
+) -> Result<&'a RouteRegistration, Refusal> {
     let registration = registered_target(registry, target)
         .ok_or_else(|| Refusal::only(Outcome::TargetAbsent, "target is not registered"))?;
     if !registration.ready {
@@ -74,15 +74,18 @@ pub(crate) fn target_registration<'a>(
 }
 
 pub(crate) fn registered_target<'a>(
-    registry: &'a [ModuleRegistration],
+    registry: &'a [std::sync::Arc<RouteRegistration>],
     target: &str,
-) -> Option<&'a ModuleRegistration> {
-    registry.iter().find(|r| r.manifest.module_id == target)
+) -> Option<&'a RouteRegistration> {
+    registry
+        .iter()
+        .find(|r| r.module_id == target)
+        .map(AsRef::as_ref)
 }
 
 fn check_target_published(
     registry: &RouteAdmissionSnapshot,
-    target: &ModuleRegistration,
+    target: &RouteRegistration,
 ) -> Result<(), Refusal> {
     if registry.unpublished.contains(&target.connection_id) {
         return Err(Refusal::only(
@@ -94,21 +97,20 @@ fn check_target_published(
 }
 
 fn principal_registration<'a>(
-    registry: &'a [ModuleRegistration],
+    registry: &'a [std::sync::Arc<RouteRegistration>],
     principal: &Principal,
-) -> Option<&'a ModuleRegistration> {
-    reserved_module_id(principal)
-        .and_then(|id| registry.iter().find(|r| r.manifest.module_id == id))
+) -> Option<&'a RouteRegistration> {
+    reserved_module_id(principal).and_then(|id| registered_target(registry, id))
 }
 
 /// Find the opener's first denied capability claimed by the target. Both
 /// manifests are attested registrations, never facts supplied by a route opener.
 pub(crate) fn denied_capability<'a>(
-    opening: &'a ModuleManifest,
-    target: &ModuleManifest,
+    opening: Option<&'a CapabilityDeclarations>,
+    target: Option<&CapabilityDeclarations>,
 ) -> Option<&'a str> {
-    let denied = &opening.capabilities.as_ref()?.must_never_reach;
-    let provides = &target.capabilities.as_ref()?.provides;
+    let denied = &opening?.must_never_reach;
+    let provides = &target?.provides;
     denied
         .iter()
         .find(|capability| provides.contains(capability))
@@ -116,17 +118,19 @@ pub(crate) fn denied_capability<'a>(
 }
 
 pub(crate) fn check_deny_edge(
-    registry: &[ModuleRegistration],
+    registry: &[std::sync::Arc<RouteRegistration>],
     principal: &Principal,
-    target: &ModuleRegistration,
+    target: &RouteRegistration,
 ) -> Result<(), ScopeAdmissionRefusal> {
     if let Some(opening) = principal_registration(registry, principal) {
-        if let Some(capability) = denied_capability(&opening.manifest, &target.manifest) {
+        if let Some(capability) =
+            denied_capability(opening.capabilities.as_ref(), target.capabilities.as_ref())
+        {
             return Err(ScopeAdmissionRefusal {
                 code: "capability_forbidden",
                 message: format!(
                     "module_id '{}' must never reach capability '{capability}' provided by '{}'",
-                    opening.manifest.module_id, target.manifest.module_id
+                    opening.module_id, target.module_id
                 ),
             });
         }
@@ -136,10 +140,10 @@ pub(crate) fn check_deny_edge(
 
 fn check_stamp_support(
     admission: &ScopeAdmission,
-    target: &ModuleRegistration,
+    target: &RouteRegistration,
 ) -> Result<(), ScopeAdmissionRefusal> {
-    let id = &target.manifest.module_id;
-    let capabilities = target.manifest.capabilities.as_ref();
+    let id = &target.module_id;
+    let capabilities = target.capabilities.as_ref();
     check_target_required_stamp(admission.stamp_required, id, capabilities)?;
     check_target_flow_support(&admission.stamp, id, capabilities)?;
     check_target_agent_run_support(&admission.stamp, id, capabilities)

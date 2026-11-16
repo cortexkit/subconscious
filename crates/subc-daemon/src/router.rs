@@ -1159,14 +1159,20 @@ impl Router {
             // wait in an application-owned queue.
             let dispatch_started_at = (frame.header.ty == FrameType::Request)
                 .then(|| dispatch_started_at.unwrap_or_else(Instant::now));
+            // Only review-producing requests need the post-flush receipt hook.
+            // Probing every response would scan large catalog bodies again.
+            let review_request = self.control.config_desktop_review_request(&frame);
             let responses = self
                 .control
                 .handle_control_frame_ingress(ctx, frame, dispatch_started_at, first)
                 .await?;
             for response in responses {
-                if let Some(view) = self
-                    .control
-                    .config_desktop_review_response(ctx.connection_id, &response)
+                if let Some(view) = review_request
+                    .then(|| {
+                        self.control
+                            .config_desktop_review_response(ctx.connection_id, &response)
+                    })
+                    .flatten()
                 {
                     self.observe_connection_wait(
                         ctx,

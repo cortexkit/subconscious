@@ -214,8 +214,8 @@ impl ControlHandler {
     pub(super) fn caller_registration(
         &self,
         attested: &ConsumerAttestation,
-        admission_registry: &[crate::registry::ModuleRegistration],
-    ) -> Option<crate::registry::ModuleRegistration> {
+        admission_registry: &crate::registry::RouteAdmissionSnapshot,
+    ) -> Option<Arc<crate::registry::RouteRegistration>> {
         let Principal::Reserved { module_id } = &attested.principal else {
             return None;
         };
@@ -225,7 +225,11 @@ impl ControlHandler {
                 .connection_for_spawn(&record.key())
                 .ok()
                 .flatten()
-                .and_then(|connection| self.registry.get_module_by_connection(connection).ok())
+                .and_then(|connection| {
+                    self.registry
+                        .route_registration_by_connection(connection)
+                        .ok()
+                })
                 .flatten();
             if own.is_some() {
                 return own;
@@ -233,7 +237,7 @@ impl ControlHandler {
         }
         admission_registry
             .iter()
-            .find(|registration| registration.manifest.module_id == *module_id)
+            .find(|registration| registration.module_id == *module_id)
             .cloned()
     }
 

@@ -2,6 +2,45 @@ use super::*;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+#[test]
+fn config_desktop_review_hook_is_limited_to_review_producing_requests() {
+    let (_scratch, owner, _view) = review_fixture();
+    let handler = ControlHandler::new(Arc::new(Registry::default())).with_config_runtime(owner);
+    for op in [
+        "config.plan",
+        "config.stamp",
+        "config.unstamp",
+        "config.rollback",
+        "catalog.list",
+        "config.status",
+        "server.describe",
+    ] {
+        let frame = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            1,
+            serde_json::to_vec(&serde_json::json!({"op": op})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            handler.config_desktop_review_request(&frame),
+            op != "catalog.list" && op != "config.status" && op != "server.describe"
+        );
+    }
+    let response = Frame::build(
+        FrameType::Response,
+        control_flags(),
+        0,
+        0,
+        1,
+        br#"{"op":"config.plan"}"#.to_vec(),
+    )
+    .unwrap();
+    assert!(!handler.config_desktop_review_request(&response));
+}
+
 #[cfg(feature = "dev-desktop-approval")]
 #[tokio::test]
 async fn config_desktop_background_waiters_do_not_retain_the_config_store_owner() {

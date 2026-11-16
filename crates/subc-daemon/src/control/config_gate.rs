@@ -445,6 +445,17 @@ impl ControlHandler {
         }
     }
 
+    pub(crate) fn config_desktop_review_request(&self, request: &Frame) -> bool {
+        self.config_runtime.is_some()
+            && request.header.ty == FrameType::Request
+            && serde_json::from_slice::<ControlOpProbe>(&request.body).is_ok_and(|probe| {
+                matches!(
+                    probe.op.as_str(),
+                    "config.plan" | "config.stamp" | "config.unstamp" | "config.rollback"
+                )
+            })
+    }
+
     pub(crate) fn config_desktop_review_response(
         &self,
         connection: ConnectionId,

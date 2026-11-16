@@ -659,7 +659,11 @@ impl ProcessChild {
                 if let Some(status) = self.try_wait()? {
                     return Ok(status);
                 }
-                sleep(Duration::from_millis(1)).await;
+                // A module retaining its container across restarts cannot reap
+                // its Unix leader yet: the zombie pins the process group until
+                // containment teardown. Poll at 50 ms instead of waking 1,000
+                // times per second per idle child, keeping non-reaping ownership.
+                sleep(Duration::from_millis(50)).await;
             }
         }
         self.process

@@ -16,6 +16,7 @@ exit: Some(0)
     "client_connections_with_routes": 0,
     "client_egress_close_delivery_failed": 0,
     "client_frames_dropped_stale_route": 0,
+    "control_usage": "<control_usage>",
     "drains_with_undeclared_gauge": 0,
     "goodbye_relay_client_failed": 0,
     "goodbye_relay_module_dropped": 0,

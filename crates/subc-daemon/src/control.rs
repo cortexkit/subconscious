@@ -165,6 +165,7 @@ use caller_attestation::{caller_for_target, scope_acts_for_another};
 mod caller_attestation_tests;
 mod scope_expiry;
 mod scope_watch;
+mod usage;
 
 mod agent_commands;
 pub(crate) mod catalog;
@@ -461,6 +462,9 @@ pub struct ControlHandler {
     agent_commands_pause: Arc<Mutex<Option<(u8, TestPause)>>>,
     claims: Arc<claims::Claims>,
     registry: Arc<Registry>,
+    control_usage: Arc<Mutex<usage::ControlUsage>>,
+    catalog_cache: Arc<Mutex<catalog::CatalogCache>>,
+    catalog_readiness_revision: Arc<std::sync::atomic::AtomicU64>,
     config_runtime: Option<Arc<crate::config_gate::runtime::RuntimeOwner>>,
     config_review_admission: Arc<dyn crate::config_gate::ReviewAdmission>,
     config_review_admission_is_default: bool,
@@ -1142,6 +1146,9 @@ impl ControlHandler {
         let route_outages = forwarding.route_outages();
         Self {
             registry,
+            control_usage: Arc::new(Mutex::new(usage::ControlUsage::default())),
+            catalog_cache: Arc::new(Mutex::new(catalog::CatalogCache::default())),
+            catalog_readiness_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(test)]
             activity_request_pause: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -1735,11 +1742,14 @@ impl ControlHandler {
     pub fn refresh_capability_requirements(&self) {
         match self.runtime_capability_snapshot() {
             Ok((runtime, registrations)) => {
-                log_requirement_events(
-                    self.capability_evaluator
-                        .evaluate_now(&runtime, &registrations),
-                    &self.daemon_shutdown,
-                );
+                let events = self
+                    .capability_evaluator
+                    .evaluate_now(&runtime, &registrations);
+                if !events.is_empty() {
+                    self.catalog_readiness_revision
+                        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                }
+                log_requirement_events(events, &self.daemon_shutdown);
             }
             Err(err) => warn!(error = %err, "failed to recompute capability requirements"),
         }
@@ -1789,7 +1799,10 @@ impl ControlHandler {
                 let Some(opening_manifest) = manifests.get(opening_module_id) else {
                     continue;
                 };
-                let Some(capability) = denied_capability(opening_manifest, target_manifest) else {
+                let Some(capability) = denied_capability(
+                    opening_manifest.capabilities.as_ref(),
+                    target_manifest.capabilities.as_ref(),
+                ) else {
                     continue;
                 };
 
@@ -1885,10 +1898,19 @@ impl ControlHandler {
         &self,
         registration: &crate::registry::ModuleRegistration,
     ) -> Option<String> {
-        let required = registration
-            .manifest
-            .capabilities
-            .iter()
+        self.first_unprovided_required_capability_for(
+            &registration.manifest.module_id,
+            registration.manifest.capabilities.as_ref(),
+        )
+    }
+
+    fn first_unprovided_required_capability_for(
+        &self,
+        module_id: &str,
+        capabilities: Option<&subc_protocol::manifest::CapabilityDeclarations>,
+    ) -> Option<String> {
+        let required = capabilities
+            .into_iter()
             .flat_map(|declarations| declarations.requires.iter())
             .filter(|requirement| requirement.need == CapabilityNeed::Required)
             .map(|requirement| requirement.capability.as_str())
@@ -1896,7 +1918,6 @@ impl ControlHandler {
         if required.is_empty() {
             return None;
         }
-        let module_id = registration.manifest.module_id.as_str();
         let verdict = |capability: &str| self.capability_evaluator.verdict(module_id, capability);
         if required
             .iter()
@@ -2522,6 +2543,9 @@ impl ControlHandler {
                 // This additive operation is not part of the existing exhaustive
                 // module-control enum. Probe the op before decoding that enum.
                 let op = serde_json::from_slice::<ControlOpProbe>(&frame.body).ok();
+                if let Some(probe) = &op {
+                    self.record_control_usage(ctx.connection_id, &probe.op);
+                }
                 let claim_present = op.as_ref().is_some_and(|probe| probe.op == "claim.present");
                 if let Some(refusal) = self
                     .recovery_request_refusal(
@@ -5221,8 +5245,8 @@ impl ControlHandler {
                 .find(|r| r.connection_id == connection_id)
                 .is_some_and(|r| {
                     scopes.is_federated_owner(&Principal::Reserved {
-                        module_id: r.manifest.module_id.clone(),
-                    }) && r.manifest.capabilities.as_ref().is_some_and(|caps| {
+                        module_id: r.module_id.clone(),
+                    }) && r.capabilities.as_ref().is_some_and(|caps| {
                         caps.provides
                             .iter()
                             .any(|cap| cap == ROUTE_AUTHORIZE_CAPABILITY)
@@ -5909,6 +5933,29 @@ impl ControlHandler {
         Ok(actor)
     }
 
+    fn record_control_usage(&self, connection: ConnectionId, op: &str) {
+        let module_id = self
+            .claims
+            .binding(connection)
+            .filter(|binding| {
+                binding.consumer_live(connection) && binding.registration.authority.alive()
+            })
+            .map(|binding| binding.registration.module_id.clone())
+            .or_else(|| {
+                self.registry
+                    .module_id_for_connection(connection)
+                    .ok()
+                    .flatten()
+            });
+        let principal = module_id
+            .map(|module_id| format!("reserved:{module_id}"))
+            .unwrap_or_else(|| "direct".to_owned());
+        self.control_usage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record(op, &principal);
+    }
+
     fn handle_server_describe(&self, frame: Frame) -> Result<Vec<Frame>, RouterError> {
         self.refresh_capability_requirements();
         // A bare connection count is ambiguous between many clients holding a
@@ -5917,6 +5964,15 @@ impl ControlHandler {
         // diagnostic endpoint must still answer if the forwarding lock is
         // contended.
         let mut counters = self.counters.snapshot();
+        if let Some(obj) = counters.as_object_mut() {
+            obj.insert(
+                "control_usage".into(),
+                self.control_usage
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .snapshot(),
+            );
+        }
         let losses = self.resource_tracker.loss_diagnostics();
         if losses.as_object().is_some_and(|losses| !losses.is_empty()) {
             if let Some(obj) = counters.as_object_mut() {
@@ -5995,24 +6051,49 @@ impl ControlHandler {
         frame: Frame,
         module_id: Option<String>,
     ) -> Result<Vec<Frame>, RouterError> {
+        let body = self.cached_catalog_body(frame.header.corr, module_id.as_deref())?;
+        Ok(vec![Frame::build_with_version(
+            response_version(&frame),
+            FrameType::Response,
+            control_flags(),
+            0,
+            0,
+            frame.header.corr,
+            body,
+        )
+        .map_err(RouterError::FrameBuild)?])
+    }
+
+    #[cfg(test)]
+    fn uncached_catalog_list(
+        &self,
+        corr: u64,
+        module_id: Option<&str>,
+    ) -> Result<ClientControlResponse, RouterError> {
+        self.catalog_list_snapshot(corr, module_id, module_id.is_some())
+    }
+
+    fn catalog_list_snapshot(
+        &self,
+        corr: u64,
+        module_id: Option<&str>,
+        include_declarations: bool,
+    ) -> Result<ClientControlResponse, RouterError> {
         let (generation, modules) = self
             .registry
             .list_modules_with_nonce_verification()
-            .map_err(|err| {
-                RouterError::backend(0, frame.header.corr, format!("registry error: {err}"))
-            })?;
+            .map_err(|err| RouterError::backend(0, corr, format!("registry error: {err}")))?;
         let entries = modules
             .into_iter()
             .filter(|(registration, _)| {
                 module_id
-                    .as_deref()
                     .map(|wanted| registration.manifest.module_id == wanted)
                     .unwrap_or(true)
             })
             .map(|(registration, nonce_verified)| {
                 let entry = self
-                    .catalog_discovery_entry(&registration, module_id.is_some())
-                    .map_err(|err| RouterError::backend(0, frame.header.corr, err))?;
+                    .catalog_discovery_entry(&registration, include_declarations)
+                    .map_err(|err| RouterError::backend(0, corr, err))?;
                 let not_ready = self.not_ready_reason(&registration);
                 let mut entry = entry;
                 entry.roles = registration.manifest.provides;
@@ -6036,16 +6117,11 @@ impl ControlHandler {
                     .with_nonce_verified(nonce_verified))
             })
             .collect::<Result<Vec<_>, RouterError>>()?;
-        let response = ClientControlResponse::CatalogList {
+        Ok(ClientControlResponse::CatalogList {
             generation,
             modules: entries,
             subc_ops: subc_ops(),
-        };
-        Ok(vec![control_response_body_frame(
-            &frame,
-            &response,
-            "ClientControlResponse::CatalogList",
-        )?])
+        })
     }
 
     /// The caller fields for a refusal that only has the raw request frame,
@@ -6388,7 +6464,7 @@ impl ControlHandler {
     ) {
         self.route_outages.record_accepted(module_id);
         self.counters.increment_route_open_accepted(principal);
-        info!(
+        debug!(
             target: "control",
             principal,
             module_id,
@@ -6691,7 +6767,10 @@ impl ControlHandler {
         // goes away stay bound: nothing here tears them down, and the module
         // answers them as it can. Like the readiness read above this is
         // best-effort against a provider registering or leaving concurrently.
-        if let Some(capability) = self.first_unprovided_required_capability(registration) {
+        if let Some(capability) = self.first_unprovided_required_capability_for(
+            &registration.module_id,
+            registration.capabilities.as_ref(),
+        ) {
             self.counters
                 .increment_route_open_refused(ROUTE_OPEN_REFUSED_REQUIRED_CAPABILITY_UNPROVIDED);
             info!(
@@ -6722,7 +6801,7 @@ impl ControlHandler {
             )?]);
         }
 
-        if !target_has_required_role(&target, &registration.manifest.provides) {
+        if !target_has_required_role(&target, &registration.roles) {
             return Ok(vec![self.route_open_refusal_frame(
                 ctx,
                 &caller,
@@ -6911,10 +6990,11 @@ impl ControlHandler {
         // path: data frames must never acquire a per-frame capability check.
         if let Some(opening_registration) = self.caller_registration(&attested, &admission_registry)
         {
-            let opening_module_id = opening_registration.manifest.module_id.as_str();
-            if let Some(capability) =
-                denied_capability(&opening_registration.manifest, &registration.manifest)
-            {
+            let opening_module_id = opening_registration.module_id.as_str();
+            if let Some(capability) = denied_capability(
+                opening_registration.capabilities.as_ref(),
+                registration.capabilities.as_ref(),
+            ) {
                 warn!(
                     opening_module_id,
                     target_module_id,
@@ -7199,11 +7279,11 @@ impl ControlHandler {
         // its replacement. The captured sink stays bound to that connection.
         let relay_registration = self
             .registry
-            .get_module_by_connection(endpoint.connection_id)
+            .route_registration_by_connection(endpoint.connection_id)
             .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?;
         let relay_capabilities = relay_registration
             .as_ref()
-            .and_then(|registration| registration.manifest.capabilities.as_ref());
+            .and_then(|registration| registration.capabilities.as_ref());
         if let Some(selector) = &scope {
             // Egress reservation may wait across a scope update. Recheck the
             // proof against the current record before sending the captured bind.
@@ -9404,14 +9484,9 @@ impl ControlHandler {
     }
 
     fn module_grants_op(&self, module_id: &str, op: &str, corr: u64) -> Result<bool, RouterError> {
-        let Some(registration) = self
-            .registry
-            .get_module(module_id)
-            .map_err(|err| RouterError::backend(0, corr, err.to_string()))?
-        else {
-            return Ok(false);
-        };
-        Ok(module_registration_grants_op(&registration.control_ops, op))
+        self.registry
+            .grants_control_op(module_id, op)
+            .map_err(|err| RouterError::backend(0, corr, err.to_string()))
     }
 
     fn handle_status_update(
@@ -9896,16 +9971,17 @@ fn target_module_id(target: &RouteTarget) -> &str {
     }
 }
 
-fn target_has_required_role(target: &RouteTarget, roles: &[ProviderRole]) -> bool {
+fn target_has_required_role(
+    target: &RouteTarget,
+    roles: &[crate::registry::AdmissionRole],
+) -> bool {
+    use crate::registry::AdmissionRole;
     roles.iter().any(|role| match (target, role) {
-        (RouteTarget::ToolProvider { .. }, ProviderRole::ToolProvider { .. }) => true,
-        (RouteTarget::ManagementSurface { .. }, ProviderRole::ManagementSurface { .. }) => true,
+        (RouteTarget::ToolProvider { .. }, AdmissionRole::ToolProvider) => true,
+        (RouteTarget::ManagementSurface { .. }, AdmissionRole::ManagementSurface) => true,
         (
             RouteTarget::InternalService { service_id, .. },
-            ProviderRole::InternalService {
-                service_id: provided,
-                ..
-            },
+            AdmissionRole::InternalService(provided),
         ) => service_id == provided,
         _ => false,
     })

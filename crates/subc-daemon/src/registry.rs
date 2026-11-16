@@ -2,12 +2,16 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     error::Error,
     fmt,
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 use subc_protocol::manifest::{CapabilityDeclarations, ModuleManifest, ProviderRole};
 use tokio::sync::watch;
 use tracing::info;
+
+#[cfg(test)]
+#[path = "registry_admission_tests.rs"]
+mod admission_cache_tests;
 
 /// Per-connection identity assigned by [`crate::Router`] while serving a socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -70,14 +74,62 @@ pub struct ModuleRegistration {
     pub control_ops: Vec<String>,
 }
 
-/// Active routing registrations and their publication state from one lock.
+/// Only the role identities used by route target selection, not their schemas.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AdmissionRole {
+    ToolProvider,
+    ManagementSurface,
+    InternalService(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RouteRegistration {
+    pub(crate) module_id: String,
+    pub(crate) capabilities: Option<CapabilityDeclarations>,
+    pub(crate) roles: Vec<AdmissionRole>,
+    pub(crate) ready: bool,
+    pub(crate) state: ChannelState,
+    pub(crate) connection_id: ConnectionId,
+}
+
+impl From<&ModuleRegistration> for RouteRegistration {
+    fn from(registration: &ModuleRegistration) -> Self {
+        Self {
+            module_id: registration.manifest.module_id.clone(),
+            capabilities: registration.manifest.capabilities.clone(),
+            roles: registration
+                .manifest
+                .provides
+                .iter()
+                .filter_map(|role| match role {
+                    ProviderRole::ToolProvider { .. } => Some(AdmissionRole::ToolProvider),
+                    ProviderRole::ManagementSurface { .. } => {
+                        Some(AdmissionRole::ManagementSurface)
+                    }
+                    ProviderRole::InternalService { service_id, .. } => {
+                        Some(AdmissionRole::InternalService(service_id.clone()))
+                    }
+                    _ => None,
+                })
+                .collect(),
+            ready: registration.ready,
+            state: registration.state,
+            connection_id: registration.connection_id,
+        }
+    }
+}
+
+/// Immutable admission facts from one registry lock. Capability verdicts and
+/// forwarding availability are deliberately checked live, outside this view.
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct RouteAdmissionSnapshot {
-    pub(crate) modules: Vec<ModuleRegistration>,
+    pub(crate) modules: Vec<Arc<RouteRegistration>>,
     pub(crate) unpublished: HashSet<ConnectionId>,
+    pub(crate) connections: HashMap<ConnectionId, Arc<RouteRegistration>>,
 }
 
 impl std::ops::Deref for RouteAdmissionSnapshot {
-    type Target = [ModuleRegistration];
+    type Target = [Arc<RouteRegistration>];
 
     fn deref(&self) -> &Self::Target {
         &self.modules
@@ -136,6 +188,7 @@ pub struct Registry {
 
 #[derive(Debug, Default)]
 struct RegistryInner {
+    admission_cache: Option<Arc<RouteAdmissionSnapshot>>,
     /// Only subscribed module ids have a sender. Changes coalesce, and writers
     /// never wait for a supervisor to receive them.
     // The value counts accepted active registrations. Keep that evidence even
@@ -307,6 +360,7 @@ impl Registry {
         };
 
         inner.modules.insert(module_id, registration.clone());
+        inner.admission_cache = None;
         if nonce_verified {
             inner.nonce_verified.insert(connection_id);
         } else {
@@ -522,18 +576,64 @@ impl Registry {
         Ok(self.lock_inner()?.modules.get(module_id).cloned())
     }
 
+    pub(crate) fn grants_control_op(
+        &self,
+        module_id: &str,
+        op: &str,
+    ) -> Result<bool, RegistryError> {
+        Ok(self
+            .lock_inner()?
+            .modules
+            .get(module_id)
+            .is_some_and(|registration| {
+                registration.control_ops.iter().any(|granted| granted == op)
+            }))
+    }
+
     /// Unlike the published-only catalog view, admission sees staged active
     /// registrations too, exactly as `get_module` does. A target whose
     /// registration is accepted but not yet published in the catalog must
     /// answer `target_unavailable`, not `unknown_module`, on an ordinary open.
-    pub(crate) fn route_admission_snapshot(&self) -> Result<RouteAdmissionSnapshot, RegistryError> {
-        let inner = self.lock_inner()?;
-        let mut modules = inner.modules.values().cloned().collect::<Vec<_>>();
-        modules.sort_by(|a, b| a.manifest.module_id.cmp(&b.manifest.module_id));
-        Ok(RouteAdmissionSnapshot {
+    pub(crate) fn route_admission_snapshot(
+        &self,
+    ) -> Result<Arc<RouteAdmissionSnapshot>, RegistryError> {
+        let mut inner = self.lock_inner()?;
+        if let Some(snapshot) = &inner.admission_cache {
+            return Ok(snapshot.clone());
+        }
+        let mut modules = inner
+            .modules
+            .values()
+            .map(|registration| Arc::new(RouteRegistration::from(registration)))
+            .collect::<Vec<_>>();
+        modules.sort_by(|a, b| a.module_id.cmp(&b.module_id));
+        let mut connections: HashMap<_, _> = modules
+            .iter()
+            .map(|registration| (registration.connection_id, registration.clone()))
+            .collect();
+        for registration in inner.candidates.values().chain(inner.superseded.iter()) {
+            connections
+                .entry(registration.connection_id)
+                .or_insert_with(|| Arc::new(RouteRegistration::from(registration)));
+        }
+        let snapshot = Arc::new(RouteAdmissionSnapshot {
             modules,
             unpublished: inner.unpublished.clone(),
-        })
+            connections,
+        });
+        inner.admission_cache = Some(snapshot.clone());
+        Ok(snapshot)
+    }
+
+    pub(crate) fn route_registration_by_connection(
+        &self,
+        connection: ConnectionId,
+    ) -> Result<Option<Arc<RouteRegistration>>, RegistryError> {
+        Ok(self
+            .route_admission_snapshot()?
+            .connections
+            .get(&connection)
+            .cloned())
     }
 
     /// The swap candidate registered for `module_id`, if any.
@@ -663,6 +763,16 @@ impl Registry {
             .lock_inner()?
             .find_by_connection(connection_id)
             .map(|(_, registration)| registration.clone()))
+    }
+
+    pub(crate) fn module_id_for_connection(
+        &self,
+        connection_id: ConnectionId,
+    ) -> Result<Option<String>, RegistryError> {
+        Ok(self
+            .lock_inner()?
+            .find_by_connection(connection_id)
+            .map(|(_, registration)| registration.manifest.module_id.clone()))
     }
 
     /// Replace only the validated role declarations owned by this connection.
@@ -899,7 +1009,10 @@ impl RegistryInner {
         true
     }
 
-    fn notify_module_changed(&self, module_id: &str) {
+    fn notify_module_changed(&mut self, module_id: &str) {
+        // Staging, candidate updates and disconnects can change admission facts
+        // without advancing the published catalog generation.
+        self.admission_cache = None;
         if let Some(sender) = self.module_changes.get(module_id) {
             sender.send_modify(|_| {});
         }
@@ -953,6 +1066,7 @@ impl RegistryInner {
     }
 
     fn bump_generation(&mut self) {
+        self.admission_cache = None;
         self.generation = self.generation.wrapping_add(1);
         if let Some(sender) = &self.catalog_changes {
             sender.send_replace(self.generation);

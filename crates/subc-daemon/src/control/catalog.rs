@@ -10,6 +10,33 @@ use crate::spawn_authority::{ApprovedDeclarations, AuthorityCapture};
 use subc_control::{CatalogOrigin, CatalogWatchRequest, CatalogWatchResponse};
 use subc_protocol::provider_declarations::validate_hello_provider_declarations;
 
+#[derive(Default)]
+pub(super) struct CatalogCache {
+    #[cfg(test)]
+    pub(super) builds: u64,
+    key: Option<(u64, u64)>,
+    full: Vec<u8>,
+    filtered: BTreeMap<String, Vec<u8>>,
+    empty: Vec<u8>,
+}
+
+#[derive(Serialize)]
+struct CatalogBody<'a> {
+    op: &'static str,
+    generation: u64,
+    modules: &'a [CatalogEntry],
+    subc_ops: &'a [String],
+}
+
+impl CatalogCache {
+    fn body(&self, module_id: Option<&str>) -> Vec<u8> {
+        match module_id {
+            None => self.full.clone(),
+            Some(module_id) => self.filtered.get(module_id).unwrap_or(&self.empty).clone(),
+        }
+    }
+}
+
 /// The config canonicalizer is the single numeric rule for declarations and
 /// their digests. Refuse at HELLO so every accepted entry can be digested later.
 pub(super) fn validate_hello_declarations(hello: &serde_json::Value) -> Result<(), String> {
@@ -25,6 +52,68 @@ pub(super) fn validate_hello_declarations(hello: &serde_json::Value) -> Result<(
 }
 
 impl ControlHandler {
+    pub(super) fn cached_catalog_body(
+        &self,
+        corr: u64,
+        module_id: Option<&str>,
+    ) -> Result<Vec<u8>, RouterError> {
+        let mut cache = self.catalog_cache.lock().unwrap_or_else(|p| p.into_inner());
+        let key = (
+            self.registry
+                .generation()
+                .map_err(|err| RouterError::backend(0, corr, format!("registry error: {err}")))?,
+            self.catalog_readiness_revision
+                .load(std::sync::atomic::Ordering::Acquire),
+        );
+        if cache.key == Some(key) {
+            return Ok(cache.body(module_id));
+        }
+        let ClientControlResponse::CatalogList {
+            generation,
+            mut modules,
+            subc_ops,
+        } = self.catalog_list_snapshot(corr, None, true)?
+        else {
+            unreachable!("catalog snapshot returns a catalog response")
+        };
+        let encode = |modules: &[CatalogEntry]| {
+            serde_json::to_vec(&CatalogBody {
+                op: "catalog.list",
+                generation,
+                modules,
+                subc_ops: &subc_ops,
+            })
+            .map_err(|err| {
+                RouterError::backend(0, corr, format!("failed to encode catalog: {err}"))
+            })
+        };
+        let mut filtered = BTreeMap::new();
+        for entry in &mut modules {
+            filtered.insert(
+                entry.module_id.clone(),
+                encode(std::slice::from_ref(entry))?,
+            );
+            entry.requested_declarations = None;
+            entry.approved_declarations = None;
+        }
+        // Only registered IDs occupy the filtered cache; arbitrary absent filters
+        // share the empty reply. No caller-provided value can add cache entries.
+        *cache = CatalogCache {
+            #[cfg(test)]
+            builds: cache.builds + 1,
+            key: Some(key),
+            full: encode(&modules)?,
+            filtered,
+            empty: encode(&[])?,
+        };
+        // A concurrent registry or verdict update invalidates this snapshot on
+        // the next request, including an update during the first serialization.
+        if generation != key.0 {
+            cache.key = None;
+        }
+        Ok(cache.body(module_id))
+    }
+
     /// The spawn authority record is the only source of approvals;
     /// requested bytes alone never grant approval.
     fn catalog_approved_declarations(

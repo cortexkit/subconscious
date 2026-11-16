@@ -81,6 +81,15 @@ impl Drop for StartingModule {
 
 impl Fixture {
     async fn new(label: &str, max_restarts: u32, backoff: Duration) -> Self {
+        Self::with_config_runtime(label, max_restarts, backoff, None).await
+    }
+
+    async fn with_config_runtime(
+        label: &str,
+        max_restarts: u32,
+        backoff: Duration,
+        config: Option<Arc<crate::config_gate::runtime::RuntimeOwner>>,
+    ) -> Self {
         let dir = ScratchDir::new(label);
         let record = dir.join("live-children.json");
         let holder_path = dir.join("holder.pid");
@@ -106,6 +115,10 @@ impl Fixture {
         .with_drain_timeout(Duration::from_millis(20))
         .with_forwarding(Arc::new(ForwardingTable::default()))
         .with_live_children_record(&record);
+        let supervisor = match config {
+            Some(owner) => supervisor.with_config_runtime(owner),
+            None => supervisor,
+        };
         let mut starting = StartingModule(Some(
             supervisor
                 .supervise_configured_requested(
@@ -818,4 +831,61 @@ async fn carried_group_join_error_retries_exactly_one_fresh_container() {
         "the old pin must be reaped only after its terminal cleanup"
     );
     fixture.module.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn carried_restart_deferred_by_config_admission_keeps_the_carried_group() {
+    let (_store, owner) = crate::config_gate::runtime::RuntimeOwner::unstamped_for_test();
+    let fixture = Fixture::with_config_runtime(
+        "carried-config-deferred",
+        3,
+        Duration::from_millis(5),
+        Some(owner.clone()),
+    )
+    .await;
+    let initial = fixture.module.status().unwrap();
+    let gate = owner.module_gate(&fixture.spec.module_id).unwrap();
+    let (released, release_seen) = std::sync::mpsc::channel();
+    // The replacement's launch checks the module gate once before preparation
+    // and claims it after. Take the gate in between, as a configuration
+    // publication or exit reconciliation can, and keep it briefly: the launch
+    // reports a configuration deferral, which the supervisor retries shortly.
+    owner.set_spawn_preflight_hook_for_test(move || {
+        let held = gate
+            .try_lock_owned()
+            .expect("the launch does not hold the module gate during preparation");
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(held);
+            let _ = released.send(());
+        });
+    });
+    fixture.module.restart(None).await.unwrap();
+    let replacement = fixture
+        .status(|status| {
+            status.state == ModuleState::Running
+                && status.pid.is_some()
+                && status.spawn_generation > initial.spawn_generation
+        })
+        .await;
+    release_seen
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the preparation hook ran and released the gate");
+    assert!(
+        fixture.holder.alive(),
+        "a configuration deferral is not a failed group join; the carried holder must survive"
+    );
+    let entries = crate::live_children::read_record(&fixture.record).unwrap();
+    let container = entries
+        .iter()
+        .find_map(|entry| entry.container.as_ref())
+        .unwrap();
+    assert_eq!(
+        container.pgid, initial.pid,
+        "the replacement {:?} must join the carried group, not a fresh one",
+        replacement.pid
+    );
+    fixture.pin_waitable();
+    fixture.module.stop().await.unwrap();
+    fixture.holder.gone().await;
 }

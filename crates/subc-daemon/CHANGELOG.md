@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.49.3
+
+- Keep a module's carried process group when the replacement's launch is
+  deferred because the configuration gate was briefly busy. The deferral
+  only postponed the launch, but the supervisor ended the group (killing its
+  helpers) and started the module in a fresh group. The retry now joins the
+  carried group. The warning for a failed carried-group spawn now includes
+  the spawn error.
+
 ## 0.49.2
 
 - Test-only: wait for the stub's recorded exit before testing operator-restart

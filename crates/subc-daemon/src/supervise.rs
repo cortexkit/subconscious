@@ -11495,7 +11495,10 @@ fn spawn_child(
         false,
         register_timeout,
     );
-    if result.is_err() {
+    if result
+        .as_ref()
+        .is_err_and(|error| !is_launch_deferral(error))
+    {
         if roster.admission_pending(&spec.module_id) {
             containment::terminate_deferred(&roster.containment);
         } else {
@@ -11503,6 +11506,15 @@ fn spawn_child(
         }
     }
     result
+}
+
+/// A configuration deferral means the launch never started: the module gate
+/// or the configuration owner was briefly busy, and every caller schedules
+/// the same launch again shortly. A carried container stays for that retry,
+/// as it does across a restart backoff; ending it here would kill the
+/// module's helpers and give up the group the retry is meant to join.
+fn is_launch_deferral(error: &SuperviseError) -> bool {
+    matches!(error, SuperviseError::ConfigDeliveryDeferred { .. })
 }
 
 /// Spawn one process of `spec` into a slot.
@@ -11804,7 +11816,10 @@ async fn spawn_child_async(
         });
     }
     let result = spawn_child_in_slot_async(spec, runtime, SpawnRole::Plain, false).await;
-    if result.is_err() {
+    if result
+        .as_ref()
+        .is_err_and(|error| !is_launch_deferral(error))
+    {
         if runtime.child_roster.admission_pending(&spec.module_id) {
             containment::terminate_deferred(&runtime.child_roster.containment);
         } else {
@@ -13913,21 +13928,23 @@ async fn spawn_and_mark_running_async(
         .is_some_and(|container| container.group().is_some());
     let result = spawn_child_async(spec, runtime).await;
     #[cfg(unix)]
-    let result = if result.is_err()
-        && joining_group
-        && !runtime.child_roster.is_closed()
-        && lock_snapshot(snapshot).is_ok_and(|state| state.enabled)
-        && runtime
-            .child_roster
-            .previous_instance(&spec.module_id)
-            .is_none()
-    {
-        // A failed group join has already ended the old container. Its single
-        // fresh-container retry belongs to the same restart budget entry.
-        warn!(module_id = %spec.module_id, "carried process-group spawn failed; trying one fresh container");
-        spawn_child_async(spec, runtime).await
-    } else {
-        result
+    let result = match result {
+        Err(error)
+            if joining_group
+                && !is_launch_deferral(&error)
+                && !runtime.child_roster.is_closed()
+                && lock_snapshot(snapshot).is_ok_and(|state| state.enabled)
+                && runtime
+                    .child_roster
+                    .previous_instance(&spec.module_id)
+                    .is_none() =>
+        {
+            // A failed group join has already ended the old container. Its single
+            // fresh-container retry belongs to the same restart budget entry.
+            warn!(module_id = %spec.module_id, %error, "carried process-group spawn failed; trying one fresh container");
+            spawn_child_async(spec, runtime).await
+        }
+        other => other,
     };
     let mut child = result?;
     arm_registration_deadline(&mut child, runtime.register_timeout, registration_watch);
@@ -13968,22 +13985,24 @@ fn spawn_and_mark_running(
     };
     let result = spawn();
     #[cfg(unix)]
-    let result = if result.is_err()
-        && joining_group
-        && !runtime.child_roster.is_closed()
-        && lock_snapshot(snapshot).is_ok_and(|state| state.enabled)
-        && runtime
-            .child_roster
-            .previous_instance(&spec.module_id)
-            .is_none()
-    {
-        // The failed join already destroyed and verified the old container.
-        // Try one fresh group as part of this same restart, without spending
-        // another crash-budget entry. Cgroups and Windows jobs do not retry.
-        warn!(module_id = %spec.module_id, "carried process-group spawn failed; trying one fresh container");
-        spawn()
-    } else {
-        result
+    let result = match result {
+        Err(error)
+            if joining_group
+                && !is_launch_deferral(&error)
+                && !runtime.child_roster.is_closed()
+                && lock_snapshot(snapshot).is_ok_and(|state| state.enabled)
+                && runtime
+                    .child_roster
+                    .previous_instance(&spec.module_id)
+                    .is_none() =>
+        {
+            // The failed join already destroyed and verified the old container.
+            // Try one fresh group as part of this same restart, without spending
+            // another crash-budget entry. Cgroups and Windows jobs do not retry.
+            warn!(module_id = %spec.module_id, %error, "carried process-group spawn failed; trying one fresh container");
+            spawn()
+        }
+        other => other,
     };
     let child = result?;
     let mut child = child;

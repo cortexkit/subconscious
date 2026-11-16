@@ -2256,6 +2256,15 @@ fn supervised_fixture_with_program(
 
 #[cfg(unix)]
 impl RuntimeOwner {
+    /// An owner with a configuration store that was never stamped, as on a
+    /// daemon started with a config store root but no stamp. The returned
+    /// guard removes the owner's scratch directory.
+    pub(crate) fn unstamped_for_test() -> (impl Drop, std::sync::Arc<Self>) {
+        let rig = Rig::new();
+        let owner = std::sync::Arc::new(rig.owner("unstamped-supervisor"));
+        (rig, owner)
+    }
+
     pub(crate) fn unactivated_supervisor_fixture_for_test() -> (
         impl Drop,
         std::sync::Arc<Self>,

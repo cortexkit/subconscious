@@ -552,7 +552,7 @@ pub fn render_fixture_document(fixture: GoldenFixture) -> Result<String, GrantRe
         fixture.module_id
     ));
     output.push_str(&format!(
-        "expect-refused prefrontal-routing subscribe {live_prefix}broca.run.v1 foreign-live-subscribe\n"
+        "expect-refused striatum subscribe {live_prefix}broca.run.v1 foreign-live-subscribe\n"
     ));
     for bucket in cortexkit_bus_naming::MODULE_BUCKETS {
         let name = account.module_bucket_name(bucket.owner, bucket.name)?;

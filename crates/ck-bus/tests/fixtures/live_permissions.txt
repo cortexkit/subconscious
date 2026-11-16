@@ -55,65 +55,24 @@ allow bus publish $JS.API.STREAM.UPDATE.KV_CK_BOX_GOLDENFIXTURE_ENTORHINAL_CHANG
 allow bus publish $JS.API.STREAM.UPDATE.KV_CK_BOX_GOLDENFIXTURE_PREFRONTAL_CORE_SESSION_LIVENESS
 allow flow-engine publish ck.box_goldenfixture.live.basal.>
 allow flow-engine subscribe ck.box_goldenfixture.live.>
-allow aft publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EFFECT.*.>
-allow aft publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EVENT.m_aft_cards.>
-allow aft publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EVENT.m_aft_sendstate.>
-allow aft publish $JS.ACK.CK_BOX_GOLDENFIXTURE_PEER.*.>
-allow aft publish $JS.ACK.CK_BOX_GOLDENFIXTURE_WAKE.*.>
 allow aft publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_AFT_STATUS
 allow aft publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_AFT_VIEWS
-allow aft publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS
-allow aft publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow aft publish $JS.API.CONSUMER.DELETE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow aft publish $JS.API.CONSUMER.DURABLE.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow aft publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EFFECT.*
-allow aft publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EVENT.m_aft_cards
-allow aft publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EVENT.m_aft_sendstate
-allow aft publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_PEER.*
-allow aft publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_WAKE.*
-allow aft publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EFFECT.*
-allow aft publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_aft_cards
-allow aft publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_aft_sendstate
-allow aft publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_PEER.*
-allow aft publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_WAKE.*
 allow aft publish $JS.API.DIRECT.GET.KV_CK_BOX_GOLDENFIXTURE_AFT_STATUS.>
 allow aft publish $JS.API.DIRECT.GET.KV_CK_BOX_GOLDENFIXTURE_AFT_VIEWS.>
-allow aft publish $JS.API.DIRECT.GET.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow aft publish $JS.API.STREAM.INFO.CK_BOX_GOLDENFIXTURE_EFFECT
-allow aft publish $JS.API.STREAM.INFO.CK_BOX_GOLDENFIXTURE_PEER
-allow aft publish $JS.API.STREAM.INFO.CK_BOX_GOLDENFIXTURE_WAKE
 allow aft publish $JS.API.STREAM.INFO.KV_CK_BOX_GOLDENFIXTURE_AFT_STATUS
 allow aft publish $JS.API.STREAM.INFO.KV_CK_BOX_GOLDENFIXTURE_AFT_VIEWS
-allow aft publish $JS.API.STREAM.INFO.KV_CK_BOX_GOLDENFIXTURE_CENSUS
 allow aft publish $JS.API.STREAM.MSG.GET.KV_CK_BOX_GOLDENFIXTURE_AFT_STATUS
 allow aft publish $JS.API.STREAM.MSG.GET.KV_CK_BOX_GOLDENFIXTURE_AFT_VIEWS
-allow aft publish $JS.API.STREAM.MSG.GET.KV_CK_BOX_GOLDENFIXTURE_CENSUS
 allow aft publish $JS.FC.KV_CK_BOX_GOLDENFIXTURE_AFT_STATUS.>
 allow aft publish $JS.FC.KV_CK_BOX_GOLDENFIXTURE_AFT_VIEWS.>
 allow aft publish $KV.CK_BOX_GOLDENFIXTURE_AFT_STATUS.>
 allow aft publish $KV.CK_BOX_GOLDENFIXTURE_AFT_VIEWS.>
-allow aft publish ck.box_goldenfixture.effect.dead
-allow aft publish ck.box_goldenfixture.event.aft.>
 allow aft publish ck.box_goldenfixture.live.aft.>
-allow aft subscribe $KV.CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow aft subscribe _INBOX.aft.>
 allow aft subscribe ck.box_goldenfixture.live.broca.send_state.v1.aft
 allow aft subscribe ck.box_goldenfixture.live.cingulate.card_settled.v1.aft
 allow aft subscribe ck.box_goldenfixture.live.thalamus-harness.send_state.v1
-allow astrocyte publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_attribution.>
-allow astrocyte publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_catalog.>
-allow astrocyte publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_media_usage.>
-allow astrocyte publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_payer.>
 allow astrocyte publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_ASTROCYTE_MULTIPLIER
 allow astrocyte publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_ASTROCYTE_READ_MARKS
-allow astrocyte publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_attribution
-allow astrocyte publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_catalog
-allow astrocyte publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_media_usage
-allow astrocyte publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_payer
-allow astrocyte publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_attribution
-allow astrocyte publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_catalog
-allow astrocyte publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_media_usage
-allow astrocyte publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_payer
 allow astrocyte publish $JS.API.DIRECT.GET.KV_CK_BOX_GOLDENFIXTURE_ASTROCYTE_MULTIPLIER.>
 allow astrocyte publish $JS.API.DIRECT.GET.KV_CK_BOX_GOLDENFIXTURE_ASTROCYTE_READ_MARKS.>
 allow astrocyte publish $JS.API.STREAM.INFO.KV_CK_BOX_GOLDENFIXTURE_ASTROCYTE_MULTIPLIER
@@ -153,33 +112,7 @@ allow cerebellum publish $KV.CK_BOX_GOLDENFIXTURE_CEREBELLUM_VIEWS.>
 allow cerebellum publish ck.box_goldenfixture.live.cerebellum.>
 allow cerebellum subscribe ck.box_goldenfixture.live.thalamus-harness.turn_ended.v1
 allow cerebellum subscribe ck.box_goldenfixture.live.thalamus-harness.turn_started.v1
-allow colliculus publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EFFECT.*.>
-allow colliculus publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EVENT.m_colliculus_events.>
-allow colliculus publish $JS.ACK.CK_BOX_GOLDENFIXTURE_PEER.*.>
-allow colliculus publish $JS.ACK.CK_BOX_GOLDENFIXTURE_WAKE.*.>
-allow colliculus publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS
-allow colliculus publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow colliculus publish $JS.API.CONSUMER.DELETE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow colliculus publish $JS.API.CONSUMER.DURABLE.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow colliculus publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EFFECT.*
-allow colliculus publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EVENT.m_colliculus_events
-allow colliculus publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_PEER.*
-allow colliculus publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_WAKE.*
-allow colliculus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EFFECT.*
-allow colliculus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_colliculus_events
-allow colliculus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_PEER.*
-allow colliculus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_WAKE.*
-allow colliculus publish $JS.API.DIRECT.GET.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow colliculus publish $JS.API.STREAM.INFO.CK_BOX_GOLDENFIXTURE_EFFECT
-allow colliculus publish $JS.API.STREAM.INFO.CK_BOX_GOLDENFIXTURE_PEER
-allow colliculus publish $JS.API.STREAM.INFO.CK_BOX_GOLDENFIXTURE_WAKE
-allow colliculus publish $JS.API.STREAM.INFO.KV_CK_BOX_GOLDENFIXTURE_CENSUS
-allow colliculus publish $JS.API.STREAM.MSG.GET.KV_CK_BOX_GOLDENFIXTURE_CENSUS
-allow colliculus publish ck.box_goldenfixture.effect.dead
-allow colliculus publish ck.box_goldenfixture.event.colliculus.>
 allow colliculus publish ck.box_goldenfixture.live.colliculus.>
-allow colliculus subscribe $KV.CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow colliculus subscribe _INBOX.colliculus.>
 allow colliculus subscribe ck.box_goldenfixture.live.broca.run.ended.v1
 allow colliculus subscribe ck.box_goldenfixture.live.fusiform.catalog_changed.v1
 allow colliculus subscribe ck.box_goldenfixture.live.magic-context.memory_changed.v1
@@ -220,10 +153,7 @@ allow entorhinal publish ck.box_goldenfixture.event.entorhinal.>
 allow entorhinal publish ck.box_goldenfixture.live.entorhinal.>
 allow entorhinal subscribe $KV.CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow entorhinal subscribe _INBOX.entorhinal.>
-allow magic-context publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EVENT.m_magic-context_runs.>
 allow magic-context publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_ENTORHINAL_CHANGES
-allow magic-context publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EVENT.m_magic-context_runs
-allow magic-context publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_magic-context_runs
 allow magic-context publish $JS.API.DIRECT.GET.KV_CK_BOX_GOLDENFIXTURE_ENTORHINAL_CHANGES.>
 allow magic-context publish $JS.API.STREAM.INFO.KV_CK_BOX_GOLDENFIXTURE_ENTORHINAL_CHANGES
 allow magic-context publish $JS.API.STREAM.MSG.GET.KV_CK_BOX_GOLDENFIXTURE_ENTORHINAL_CHANGES
@@ -235,86 +165,30 @@ allow magic-context subscribe ck.box_goldenfixture.live.broca.run.ended.v1
 allow magic-context subscribe ck.box_goldenfixture.live.thalamus-harness.compaction.>
 allow magic-context subscribe ck.box_goldenfixture.live.thalamus-harness.turn_ended.v1
 allow magic-context subscribe ck.box_goldenfixture.live.thalamus.compaction.>
-allow occipital publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EFFECT.*.>
-allow occipital publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EVENT.m_occipital.>
-allow occipital publish $JS.ACK.CK_BOX_GOLDENFIXTURE_PEER.*.>
-allow occipital publish $JS.ACK.CK_BOX_GOLDENFIXTURE_WAKE.*.>
 allow occipital publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_AFT_VIEWS
-allow occipital publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS
-allow occipital publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow occipital publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CEREBELLUM_VIEWS
-allow occipital publish $JS.API.CONSUMER.DELETE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow occipital publish $JS.API.CONSUMER.DURABLE.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow occipital publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EFFECT.*
-allow occipital publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EVENT.m_occipital
-allow occipital publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_PEER.*
-allow occipital publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_WAKE.*
-allow occipital publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EFFECT.*
-allow occipital publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_occipital
-allow occipital publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_PEER.*
-allow occipital publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_WAKE.*
 allow occipital publish $JS.API.DIRECT.GET.KV_CK_BOX_GOLDENFIXTURE_AFT_VIEWS.>
-allow occipital publish $JS.API.DIRECT.GET.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow occipital publish $JS.API.DIRECT.GET.KV_CK_BOX_GOLDENFIXTURE_CEREBELLUM_VIEWS.>
-allow occipital publish $JS.API.STREAM.INFO.CK_BOX_GOLDENFIXTURE_EFFECT
-allow occipital publish $JS.API.STREAM.INFO.CK_BOX_GOLDENFIXTURE_PEER
-allow occipital publish $JS.API.STREAM.INFO.CK_BOX_GOLDENFIXTURE_WAKE
 allow occipital publish $JS.API.STREAM.INFO.KV_CK_BOX_GOLDENFIXTURE_AFT_VIEWS
-allow occipital publish $JS.API.STREAM.INFO.KV_CK_BOX_GOLDENFIXTURE_CENSUS
 allow occipital publish $JS.API.STREAM.INFO.KV_CK_BOX_GOLDENFIXTURE_CEREBELLUM_VIEWS
 allow occipital publish $JS.API.STREAM.MSG.GET.KV_CK_BOX_GOLDENFIXTURE_AFT_VIEWS
-allow occipital publish $JS.API.STREAM.MSG.GET.KV_CK_BOX_GOLDENFIXTURE_CENSUS
 allow occipital publish $JS.API.STREAM.MSG.GET.KV_CK_BOX_GOLDENFIXTURE_CEREBELLUM_VIEWS
 allow occipital publish $JS.FC.KV_CK_BOX_GOLDENFIXTURE_AFT_VIEWS.>
 allow occipital publish $JS.FC.KV_CK_BOX_GOLDENFIXTURE_CEREBELLUM_VIEWS.>
-allow occipital publish ck.box_goldenfixture.effect.dead
-allow occipital publish ck.box_goldenfixture.event.occipital.>
 allow occipital publish ck.box_goldenfixture.live.occipital.>
-allow occipital subscribe $KV.CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow occipital subscribe _INBOX.occipital.>
 allow occipital subscribe ck.box_goldenfixture.live.aft.display_record_ready.v1
 allow occipital subscribe ck.box_goldenfixture.live.broca.send_state.v1.occipital
-allow occipital subscribe ck.box_goldenfixture.live.cerebellum.tool_display.v1
+allow occipital subscribe ck.box_goldenfixture.live.cerebellum.display_record_ready.v1
 allow occipital subscribe ck.box_goldenfixture.live.fusiform.catalog_changed.v1
 allow occipital subscribe ck.box_goldenfixture.live.thalamus-harness.send_state.v1.occipital
-allow plexus publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EFFECT.*.>
-allow plexus publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EVENT.m_plexus.>
-allow plexus publish $JS.ACK.CK_BOX_GOLDENFIXTURE_PEER.*.>
-allow plexus publish $JS.ACK.CK_BOX_GOLDENFIXTURE_WAKE.*.>
-allow plexus publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS
-allow plexus publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow plexus publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_ENTORHINAL_CHANGES
-allow plexus publish $JS.API.CONSUMER.DELETE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow plexus publish $JS.API.CONSUMER.DURABLE.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow plexus publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EFFECT.*
-allow plexus publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EVENT.m_plexus
-allow plexus publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_PEER.*
-allow plexus publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_WAKE.*
-allow plexus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EFFECT.*
-allow plexus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_plexus
-allow plexus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_PEER.*
-allow plexus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_WAKE.*
-allow plexus publish $JS.API.DIRECT.GET.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow plexus publish $JS.API.DIRECT.GET.KV_CK_BOX_GOLDENFIXTURE_ENTORHINAL_CHANGES.>
-allow plexus publish $JS.API.STREAM.INFO.CK_BOX_GOLDENFIXTURE_EFFECT
-allow plexus publish $JS.API.STREAM.INFO.CK_BOX_GOLDENFIXTURE_PEER
-allow plexus publish $JS.API.STREAM.INFO.CK_BOX_GOLDENFIXTURE_WAKE
-allow plexus publish $JS.API.STREAM.INFO.KV_CK_BOX_GOLDENFIXTURE_CENSUS
 allow plexus publish $JS.API.STREAM.INFO.KV_CK_BOX_GOLDENFIXTURE_ENTORHINAL_CHANGES
-allow plexus publish $JS.API.STREAM.MSG.GET.KV_CK_BOX_GOLDENFIXTURE_CENSUS
 allow plexus publish $JS.API.STREAM.MSG.GET.KV_CK_BOX_GOLDENFIXTURE_ENTORHINAL_CHANGES
 allow plexus publish $JS.FC.KV_CK_BOX_GOLDENFIXTURE_ENTORHINAL_CHANGES.>
-allow plexus publish ck.box_goldenfixture.effect.dead
-allow plexus publish ck.box_goldenfixture.event.plexus.>
 allow plexus publish ck.box_goldenfixture.live.plexus.>
-allow plexus subscribe $KV.CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow plexus subscribe _INBOX.plexus.>
 allow plexus subscribe ck.box_goldenfixture.live.cingulate.card_settled.v1.plexus
 allow plexus subscribe ck.box_goldenfixture.live.prefrontal-core.agent_changed.v1
-allow prefrontal-routing publish ck.box_goldenfixture.live.prefrontal-routing.>
-allow prefrontal-routing subscribe ck.box_goldenfixture.live.broca.step.finished.v1
-allow prefrontal-routing subscribe ck.box_goldenfixture.live.insula.>
-allow prefrontal-routing subscribe ck.box_goldenfixture.live.thalamus-harness.step.finished.v1
 allow striatum publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_ASTROCYTE_MULTIPLIER
 allow striatum publish $JS.API.DIRECT.GET.KV_CK_BOX_GOLDENFIXTURE_ASTROCYTE_MULTIPLIER.>
 allow striatum publish $JS.API.STREAM.INFO.KV_CK_BOX_GOLDENFIXTURE_ASTROCYTE_MULTIPLIER
@@ -332,10 +206,7 @@ allow striatum subscribe ck.box_goldenfixture.live.thalamus-harness.route_fact.v
 allow striatum subscribe ck.box_goldenfixture.live.thalamus-harness.step.finished.v1
 allow thalamus publish ck.box_goldenfixture.live.thalamus.>
 allow thalamus subscribe ck.box_goldenfixture.live.magic-context.compaction.>
-allow thalamus-harness publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus-harness_late_results.>
 allow thalamus-harness publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_ASTROCYTE_READ_MARKS
-allow thalamus-harness publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus-harness_late_results
-allow thalamus-harness publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus-harness_late_results
 allow thalamus-harness publish $JS.API.DIRECT.GET.KV_CK_BOX_GOLDENFIXTURE_ASTROCYTE_READ_MARKS.>
 allow thalamus-harness publish $JS.API.STREAM.INFO.KV_CK_BOX_GOLDENFIXTURE_ASTROCYTE_READ_MARKS
 allow thalamus-harness publish $JS.API.STREAM.MSG.GET.KV_CK_BOX_GOLDENFIXTURE_ASTROCYTE_READ_MARKS
@@ -346,395 +217,39 @@ allow thalamus-harness subscribe ck.box_goldenfixture.live.basal.late_result_rea
 allow thalamus-harness subscribe ck.box_goldenfixture.live.cerebellum.late_result_ready.v1.thalamus-harness
 allow thalamus-harness subscribe ck.box_goldenfixture.live.magic-context.compaction.>
 allow thalamus-harness subscribe ck.box_goldenfixture.live.prefrontal-core.late_result_ready.v1.thalamus-harness
-allow wernicke publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EFFECT.*.>
-allow wernicke publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EVENT.m_wernicke_agents.>
-allow wernicke publish $JS.ACK.CK_BOX_GOLDENFIXTURE_PEER.*.>
-allow wernicke publish $JS.ACK.CK_BOX_GOLDENFIXTURE_WAKE.*.>
-allow wernicke publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS
-allow wernicke publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow wernicke publish $JS.API.CONSUMER.DELETE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow wernicke publish $JS.API.CONSUMER.DURABLE.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow wernicke publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EFFECT.*
-allow wernicke publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EVENT.m_wernicke_agents
-allow wernicke publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_PEER.*
-allow wernicke publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_WAKE.*
-allow wernicke publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EFFECT.*
-allow wernicke publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_wernicke_agents
-allow wernicke publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_PEER.*
-allow wernicke publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_WAKE.*
-allow wernicke publish $JS.API.DIRECT.GET.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow wernicke publish $JS.API.STREAM.INFO.CK_BOX_GOLDENFIXTURE_EFFECT
-allow wernicke publish $JS.API.STREAM.INFO.CK_BOX_GOLDENFIXTURE_PEER
-allow wernicke publish $JS.API.STREAM.INFO.CK_BOX_GOLDENFIXTURE_WAKE
-allow wernicke publish $JS.API.STREAM.INFO.KV_CK_BOX_GOLDENFIXTURE_CENSUS
-allow wernicke publish $JS.API.STREAM.MSG.GET.KV_CK_BOX_GOLDENFIXTURE_CENSUS
-allow wernicke publish ck.box_goldenfixture.effect.dead
-allow wernicke publish ck.box_goldenfixture.event.wernicke.>
 allow wernicke publish ck.box_goldenfixture.live.wernicke.>
-allow wernicke subscribe $KV.CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow wernicke subscribe _INBOX.wernicke.>
 allow wernicke subscribe ck.box_goldenfixture.live.prefrontal-core.agent_changed.v1
 expect-refused participant publish ck.box_goldenfixture.live.other.pull_request_review.v1 foreign-module-live
-expect-refused delivery-authority publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_aft_cards foreign-event-durable
-expect-refused delivery-authority publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_aft_sendstate foreign-event-durable
-expect-refused delivery-authority publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_attribution foreign-event-durable
-expect-refused delivery-authority publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_catalog foreign-event-durable
-expect-refused delivery-authority publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_media_usage foreign-event-durable
-expect-refused delivery-authority publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_payer foreign-event-durable
-expect-refused delivery-authority publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_colliculus_events foreign-event-durable
-expect-refused delivery-authority publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_magic-context_runs foreign-event-durable
-expect-refused delivery-authority publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_occipital foreign-event-durable
-expect-refused delivery-authority publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_plexus foreign-event-durable
-expect-refused delivery-authority publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus-harness_late_results foreign-event-durable
-expect-refused delivery-authority publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_wernicke_agents foreign-event-durable
 expect-refused delivery-authority publish ck.box_goldenfixture.live.broca.run.v1 foreign-module-live
 expect-refused delivery-authority publish ck.box_goldenfixture.live.insula.quota_sampled.v1 foreign-module-live
 expect-refused delivery-authority subscribe ck.box_goldenfixture.live.basal.> foreign-live-subscribe
 expect-refused bus publish ck.box_goldenfixture.live.broca.run.v1 foreign-module-live
 expect-refused flow-engine publish ck.box_goldenfixture.live.other.pull_request_review.v1 foreign-module-live
-expect-refused aft publish $JS.ACK.CK_BOX_GOLDENFIXTURE_CORE_WORK.m_prefrontal-core.> core-delivery-durable
-expect-refused aft publish $JS.ACK.CK_BOX_GOLDENFIXTURE_DELIVERY_DEAD.c_ckbus_dead.> bus-diagnostic-durable
-expect-refused aft publish $JS.ACK.CK_BOX_GOLDENFIXTURE_INBOX.m_prefrontal-core.> core-delivery-durable
-expect-refused aft publish $JS.API.CONSUMER.CREATE.CK_BOX_GOLDENFIXTURE_EVENT event-consumer-create
-expect-refused aft publish $JS.API.CONSUMER.DELETE.CK_BOX_GOLDENFIXTURE_EVENT.m_aft_cards event-consumer-delete
-expect-refused aft publish $JS.API.CONSUMER.DELETE.CK_BOX_GOLDENFIXTURE_EVENT.m_aft_sendstate event-consumer-delete
-expect-refused aft publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_CORE_WORK.m_prefrontal-core core-delivery-durable
-expect-refused aft publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_DELIVERY_DEAD.c_ckbus_dead bus-diagnostic-durable
-expect-refused aft publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_INBOX.m_prefrontal-core core-delivery-durable
-expect-refused aft publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_CORE_WORK.m_prefrontal-core core-delivery-durable
-expect-refused aft publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_DELIVERY_DEAD.c_ckbus_dead bus-diagnostic-durable
-expect-refused aft publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte foreign-event-durable
-expect-refused aft publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_attribution foreign-event-durable
-expect-refused aft publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_catalog foreign-event-durable
-expect-refused aft publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_media_usage foreign-event-durable
-expect-refused aft publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_payer foreign-event-durable
-expect-refused aft publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_basal foreign-event-durable
-expect-refused aft publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_broca foreign-event-durable
-expect-refused aft publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_cerebellum foreign-event-durable
-expect-refused aft publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_colliculus_events foreign-event-durable
-expect-refused aft publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_magic-context foreign-event-durable
-expect-refused aft publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_magic-context_runs foreign-event-durable
-expect-refused aft publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_occipital foreign-event-durable
-expect-refused aft publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_plexus foreign-event-durable
-expect-refused aft publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_prefrontal-core foreign-event-durable
-expect-refused aft publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_prefrontal-routing foreign-event-durable
-expect-refused aft publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_striatum foreign-event-durable
-expect-refused aft publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus foreign-event-durable
-expect-refused aft publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus-harness foreign-event-durable
-expect-refused aft publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus-harness_late_results foreign-event-durable
-expect-refused aft publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_wernicke_agents foreign-event-durable
-expect-refused aft publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_INBOX.m_prefrontal-core core-delivery-durable
-expect-refused aft publish $JS.API.STREAM.MSG.GET.CK_BOX_GOLDENFIXTURE_EVENT event-direct-read
-expect-refused aft publish ck.box_goldenfixture.core_work.campaign.*.run core-delivery-publish
-expect-refused aft publish ck.box_goldenfixture.core_work.consult.*.run core-delivery-publish
-expect-refused aft publish ck.box_goldenfixture.core_work.effect.*.run core-delivery-publish
-expect-refused aft publish ck.box_goldenfixture.core_work.hire.*.run core-delivery-publish
-expect-refused aft publish ck.box_goldenfixture.core_work.spec.*.run core-delivery-publish
-expect-refused aft publish ck.box_goldenfixture.core_work.work.*.run core-delivery-publish
-expect-refused aft publish ck.box_goldenfixture.delivery.dead core-delivery-publish
-expect-refused aft publish ck.box_goldenfixture.event.broca.run.v1 foreign-module-event
 expect-refused aft publish ck.box_goldenfixture.live.broca.run.v1 foreign-module-live
-expect-refused aft publish ck.box_goldenfixture.event.insula.quota_sampled.v1 foreign-module-event
 expect-refused aft publish ck.box_goldenfixture.live.insula.quota_sampled.v1 foreign-module-live
-expect-refused aft publish ck.box_goldenfixture.inbox.head.*.ready core-delivery-publish
-expect-refused aft publish ck.box_goldenfixture.inbox.worker.*.ready core-delivery-publish
-expect-refused astrocyte publish $JS.API.CONSUMER.DELETE.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_attribution event-consumer-delete
-expect-refused astrocyte publish $JS.API.CONSUMER.DELETE.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_catalog event-consumer-delete
-expect-refused astrocyte publish $JS.API.CONSUMER.DELETE.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_media_usage event-consumer-delete
-expect-refused astrocyte publish $JS.API.CONSUMER.DELETE.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_payer event-consumer-delete
-expect-refused astrocyte publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_aft_cards foreign-event-durable
-expect-refused astrocyte publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_aft_sendstate foreign-event-durable
-expect-refused astrocyte publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_colliculus_events foreign-event-durable
-expect-refused astrocyte publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_magic-context_runs foreign-event-durable
-expect-refused astrocyte publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_occipital foreign-event-durable
-expect-refused astrocyte publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_plexus foreign-event-durable
-expect-refused astrocyte publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus-harness_late_results foreign-event-durable
-expect-refused astrocyte publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_wernicke_agents foreign-event-durable
 expect-refused astrocyte publish ck.box_goldenfixture.live.broca.run.v1 foreign-module-live
 expect-refused astrocyte publish ck.box_goldenfixture.live.insula.quota_sampled.v1 foreign-module-live
-expect-refused broca publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_aft_cards foreign-event-durable
-expect-refused broca publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_aft_sendstate foreign-event-durable
-expect-refused broca publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_attribution foreign-event-durable
-expect-refused broca publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_catalog foreign-event-durable
-expect-refused broca publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_media_usage foreign-event-durable
-expect-refused broca publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_payer foreign-event-durable
-expect-refused broca publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_colliculus_events foreign-event-durable
-expect-refused broca publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_magic-context_runs foreign-event-durable
-expect-refused broca publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_occipital foreign-event-durable
-expect-refused broca publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_plexus foreign-event-durable
-expect-refused broca publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus-harness_late_results foreign-event-durable
-expect-refused broca publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_wernicke_agents foreign-event-durable
 expect-refused broca publish ck.box_goldenfixture.live.insula.quota_sampled.v1 foreign-module-live
-expect-refused cerebellum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_aft_cards foreign-event-durable
-expect-refused cerebellum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_aft_sendstate foreign-event-durable
-expect-refused cerebellum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_attribution foreign-event-durable
-expect-refused cerebellum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_catalog foreign-event-durable
-expect-refused cerebellum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_media_usage foreign-event-durable
-expect-refused cerebellum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_payer foreign-event-durable
-expect-refused cerebellum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_colliculus_events foreign-event-durable
-expect-refused cerebellum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_magic-context_runs foreign-event-durable
-expect-refused cerebellum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_occipital foreign-event-durable
-expect-refused cerebellum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_plexus foreign-event-durable
-expect-refused cerebellum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus-harness_late_results foreign-event-durable
-expect-refused cerebellum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_wernicke_agents foreign-event-durable
 expect-refused cerebellum publish ck.box_goldenfixture.live.broca.run.v1 foreign-module-live
 expect-refused cerebellum publish ck.box_goldenfixture.live.insula.quota_sampled.v1 foreign-module-live
-expect-refused colliculus publish $JS.ACK.CK_BOX_GOLDENFIXTURE_CORE_WORK.m_prefrontal-core.> core-delivery-durable
-expect-refused colliculus publish $JS.ACK.CK_BOX_GOLDENFIXTURE_DELIVERY_DEAD.c_ckbus_dead.> bus-diagnostic-durable
-expect-refused colliculus publish $JS.ACK.CK_BOX_GOLDENFIXTURE_INBOX.m_prefrontal-core.> core-delivery-durable
-expect-refused colliculus publish $JS.API.CONSUMER.CREATE.CK_BOX_GOLDENFIXTURE_EVENT event-consumer-create
-expect-refused colliculus publish $JS.API.CONSUMER.DELETE.CK_BOX_GOLDENFIXTURE_EVENT.m_colliculus_events event-consumer-delete
-expect-refused colliculus publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_CORE_WORK.m_prefrontal-core core-delivery-durable
-expect-refused colliculus publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_DELIVERY_DEAD.c_ckbus_dead bus-diagnostic-durable
-expect-refused colliculus publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_INBOX.m_prefrontal-core core-delivery-durable
-expect-refused colliculus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_CORE_WORK.m_prefrontal-core core-delivery-durable
-expect-refused colliculus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_DELIVERY_DEAD.c_ckbus_dead bus-diagnostic-durable
-expect-refused colliculus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_aft_cards foreign-event-durable
-expect-refused colliculus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_aft_sendstate foreign-event-durable
-expect-refused colliculus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte foreign-event-durable
-expect-refused colliculus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_attribution foreign-event-durable
-expect-refused colliculus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_catalog foreign-event-durable
-expect-refused colliculus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_media_usage foreign-event-durable
-expect-refused colliculus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_payer foreign-event-durable
-expect-refused colliculus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_basal foreign-event-durable
-expect-refused colliculus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_broca foreign-event-durable
-expect-refused colliculus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_cerebellum foreign-event-durable
-expect-refused colliculus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_magic-context foreign-event-durable
-expect-refused colliculus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_magic-context_runs foreign-event-durable
-expect-refused colliculus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_occipital foreign-event-durable
-expect-refused colliculus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_plexus foreign-event-durable
-expect-refused colliculus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_prefrontal-core foreign-event-durable
-expect-refused colliculus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_prefrontal-routing foreign-event-durable
-expect-refused colliculus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_striatum foreign-event-durable
-expect-refused colliculus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus foreign-event-durable
-expect-refused colliculus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus-harness foreign-event-durable
-expect-refused colliculus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus-harness_late_results foreign-event-durable
-expect-refused colliculus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_wernicke_agents foreign-event-durable
-expect-refused colliculus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_INBOX.m_prefrontal-core core-delivery-durable
-expect-refused colliculus publish $JS.API.STREAM.MSG.GET.CK_BOX_GOLDENFIXTURE_EVENT event-direct-read
-expect-refused colliculus publish ck.box_goldenfixture.core_work.campaign.*.run core-delivery-publish
-expect-refused colliculus publish ck.box_goldenfixture.core_work.consult.*.run core-delivery-publish
-expect-refused colliculus publish ck.box_goldenfixture.core_work.effect.*.run core-delivery-publish
-expect-refused colliculus publish ck.box_goldenfixture.core_work.hire.*.run core-delivery-publish
-expect-refused colliculus publish ck.box_goldenfixture.core_work.spec.*.run core-delivery-publish
-expect-refused colliculus publish ck.box_goldenfixture.core_work.work.*.run core-delivery-publish
-expect-refused colliculus publish ck.box_goldenfixture.delivery.dead core-delivery-publish
-expect-refused colliculus publish ck.box_goldenfixture.event.broca.run.v1 foreign-module-event
 expect-refused colliculus publish ck.box_goldenfixture.live.broca.run.v1 foreign-module-live
-expect-refused colliculus publish ck.box_goldenfixture.event.insula.quota_sampled.v1 foreign-module-event
 expect-refused colliculus publish ck.box_goldenfixture.live.insula.quota_sampled.v1 foreign-module-live
-expect-refused colliculus publish ck.box_goldenfixture.inbox.head.*.ready core-delivery-publish
-expect-refused colliculus publish ck.box_goldenfixture.inbox.worker.*.ready core-delivery-publish
-expect-refused magic-context publish $JS.API.CONSUMER.DELETE.CK_BOX_GOLDENFIXTURE_EVENT.m_magic-context_runs event-consumer-delete
-expect-refused magic-context publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_aft_cards foreign-event-durable
-expect-refused magic-context publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_aft_sendstate foreign-event-durable
-expect-refused magic-context publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_attribution foreign-event-durable
-expect-refused magic-context publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_catalog foreign-event-durable
-expect-refused magic-context publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_media_usage foreign-event-durable
-expect-refused magic-context publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_payer foreign-event-durable
-expect-refused magic-context publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_colliculus_events foreign-event-durable
-expect-refused magic-context publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_occipital foreign-event-durable
-expect-refused magic-context publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_plexus foreign-event-durable
-expect-refused magic-context publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus-harness_late_results foreign-event-durable
-expect-refused magic-context publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_wernicke_agents foreign-event-durable
 expect-refused magic-context publish ck.box_goldenfixture.live.broca.run.v1 foreign-module-live
 expect-refused magic-context publish ck.box_goldenfixture.live.insula.quota_sampled.v1 foreign-module-live
-expect-refused occipital publish $JS.ACK.CK_BOX_GOLDENFIXTURE_CORE_WORK.m_prefrontal-core.> core-delivery-durable
-expect-refused occipital publish $JS.ACK.CK_BOX_GOLDENFIXTURE_DELIVERY_DEAD.c_ckbus_dead.> bus-diagnostic-durable
-expect-refused occipital publish $JS.ACK.CK_BOX_GOLDENFIXTURE_INBOX.m_prefrontal-core.> core-delivery-durable
-expect-refused occipital publish $JS.API.CONSUMER.CREATE.CK_BOX_GOLDENFIXTURE_EVENT event-consumer-create
-expect-refused occipital publish $JS.API.CONSUMER.DELETE.CK_BOX_GOLDENFIXTURE_EVENT.m_occipital event-consumer-delete
-expect-refused occipital publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_CORE_WORK.m_prefrontal-core core-delivery-durable
-expect-refused occipital publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_DELIVERY_DEAD.c_ckbus_dead bus-diagnostic-durable
-expect-refused occipital publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_INBOX.m_prefrontal-core core-delivery-durable
-expect-refused occipital publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_CORE_WORK.m_prefrontal-core core-delivery-durable
-expect-refused occipital publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_DELIVERY_DEAD.c_ckbus_dead bus-diagnostic-durable
-expect-refused occipital publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_aft_cards foreign-event-durable
-expect-refused occipital publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_aft_sendstate foreign-event-durable
-expect-refused occipital publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte foreign-event-durable
-expect-refused occipital publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_attribution foreign-event-durable
-expect-refused occipital publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_catalog foreign-event-durable
-expect-refused occipital publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_media_usage foreign-event-durable
-expect-refused occipital publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_payer foreign-event-durable
-expect-refused occipital publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_basal foreign-event-durable
-expect-refused occipital publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_broca foreign-event-durable
-expect-refused occipital publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_cerebellum foreign-event-durable
-expect-refused occipital publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_colliculus_events foreign-event-durable
-expect-refused occipital publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_magic-context foreign-event-durable
-expect-refused occipital publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_magic-context_runs foreign-event-durable
-expect-refused occipital publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_plexus foreign-event-durable
-expect-refused occipital publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_prefrontal-core foreign-event-durable
-expect-refused occipital publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_prefrontal-routing foreign-event-durable
-expect-refused occipital publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_striatum foreign-event-durable
-expect-refused occipital publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus foreign-event-durable
-expect-refused occipital publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus-harness foreign-event-durable
-expect-refused occipital publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus-harness_late_results foreign-event-durable
-expect-refused occipital publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_wernicke_agents foreign-event-durable
-expect-refused occipital publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_INBOX.m_prefrontal-core core-delivery-durable
-expect-refused occipital publish $JS.API.STREAM.MSG.GET.CK_BOX_GOLDENFIXTURE_EVENT event-direct-read
-expect-refused occipital publish ck.box_goldenfixture.core_work.campaign.*.run core-delivery-publish
-expect-refused occipital publish ck.box_goldenfixture.core_work.consult.*.run core-delivery-publish
-expect-refused occipital publish ck.box_goldenfixture.core_work.effect.*.run core-delivery-publish
-expect-refused occipital publish ck.box_goldenfixture.core_work.hire.*.run core-delivery-publish
-expect-refused occipital publish ck.box_goldenfixture.core_work.spec.*.run core-delivery-publish
-expect-refused occipital publish ck.box_goldenfixture.core_work.work.*.run core-delivery-publish
-expect-refused occipital publish ck.box_goldenfixture.delivery.dead core-delivery-publish
-expect-refused occipital publish ck.box_goldenfixture.event.broca.run.v1 foreign-module-event
 expect-refused occipital publish ck.box_goldenfixture.live.broca.run.v1 foreign-module-live
-expect-refused occipital publish ck.box_goldenfixture.event.insula.quota_sampled.v1 foreign-module-event
 expect-refused occipital publish ck.box_goldenfixture.live.insula.quota_sampled.v1 foreign-module-live
-expect-refused occipital publish ck.box_goldenfixture.inbox.head.*.ready core-delivery-publish
-expect-refused occipital publish ck.box_goldenfixture.inbox.worker.*.ready core-delivery-publish
-expect-refused plexus publish $JS.ACK.CK_BOX_GOLDENFIXTURE_CORE_WORK.m_prefrontal-core.> core-delivery-durable
-expect-refused plexus publish $JS.ACK.CK_BOX_GOLDENFIXTURE_DELIVERY_DEAD.c_ckbus_dead.> bus-diagnostic-durable
-expect-refused plexus publish $JS.ACK.CK_BOX_GOLDENFIXTURE_INBOX.m_prefrontal-core.> core-delivery-durable
-expect-refused plexus publish $JS.API.CONSUMER.CREATE.CK_BOX_GOLDENFIXTURE_EVENT event-consumer-create
-expect-refused plexus publish $JS.API.CONSUMER.DELETE.CK_BOX_GOLDENFIXTURE_EVENT.m_plexus event-consumer-delete
-expect-refused plexus publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_CORE_WORK.m_prefrontal-core core-delivery-durable
-expect-refused plexus publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_DELIVERY_DEAD.c_ckbus_dead bus-diagnostic-durable
-expect-refused plexus publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_INBOX.m_prefrontal-core core-delivery-durable
-expect-refused plexus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_CORE_WORK.m_prefrontal-core core-delivery-durable
-expect-refused plexus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_DELIVERY_DEAD.c_ckbus_dead bus-diagnostic-durable
-expect-refused plexus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_aft_cards foreign-event-durable
-expect-refused plexus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_aft_sendstate foreign-event-durable
-expect-refused plexus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte foreign-event-durable
-expect-refused plexus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_attribution foreign-event-durable
-expect-refused plexus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_catalog foreign-event-durable
-expect-refused plexus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_media_usage foreign-event-durable
-expect-refused plexus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_payer foreign-event-durable
-expect-refused plexus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_basal foreign-event-durable
-expect-refused plexus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_broca foreign-event-durable
-expect-refused plexus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_cerebellum foreign-event-durable
-expect-refused plexus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_colliculus_events foreign-event-durable
-expect-refused plexus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_magic-context foreign-event-durable
-expect-refused plexus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_magic-context_runs foreign-event-durable
-expect-refused plexus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_occipital foreign-event-durable
-expect-refused plexus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_prefrontal-core foreign-event-durable
-expect-refused plexus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_prefrontal-routing foreign-event-durable
-expect-refused plexus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_striatum foreign-event-durable
-expect-refused plexus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus foreign-event-durable
-expect-refused plexus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus-harness foreign-event-durable
-expect-refused plexus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus-harness_late_results foreign-event-durable
-expect-refused plexus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_wernicke_agents foreign-event-durable
-expect-refused plexus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_INBOX.m_prefrontal-core core-delivery-durable
-expect-refused plexus publish $JS.API.STREAM.MSG.GET.CK_BOX_GOLDENFIXTURE_EVENT event-direct-read
-expect-refused plexus publish ck.box_goldenfixture.core_work.campaign.*.run core-delivery-publish
-expect-refused plexus publish ck.box_goldenfixture.core_work.consult.*.run core-delivery-publish
-expect-refused plexus publish ck.box_goldenfixture.core_work.effect.*.run core-delivery-publish
-expect-refused plexus publish ck.box_goldenfixture.core_work.hire.*.run core-delivery-publish
-expect-refused plexus publish ck.box_goldenfixture.core_work.spec.*.run core-delivery-publish
-expect-refused plexus publish ck.box_goldenfixture.core_work.work.*.run core-delivery-publish
-expect-refused plexus publish ck.box_goldenfixture.delivery.dead core-delivery-publish
-expect-refused plexus publish ck.box_goldenfixture.event.broca.run.v1 foreign-module-event
 expect-refused plexus publish ck.box_goldenfixture.live.broca.run.v1 foreign-module-live
-expect-refused plexus publish ck.box_goldenfixture.event.insula.quota_sampled.v1 foreign-module-event
 expect-refused plexus publish ck.box_goldenfixture.live.insula.quota_sampled.v1 foreign-module-live
-expect-refused plexus publish ck.box_goldenfixture.inbox.head.*.ready core-delivery-publish
-expect-refused plexus publish ck.box_goldenfixture.inbox.worker.*.ready core-delivery-publish
-expect-refused prefrontal-routing publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_aft_cards foreign-event-durable
-expect-refused prefrontal-routing publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_aft_sendstate foreign-event-durable
-expect-refused prefrontal-routing publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_attribution foreign-event-durable
-expect-refused prefrontal-routing publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_catalog foreign-event-durable
-expect-refused prefrontal-routing publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_media_usage foreign-event-durable
-expect-refused prefrontal-routing publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_payer foreign-event-durable
-expect-refused prefrontal-routing publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_colliculus_events foreign-event-durable
-expect-refused prefrontal-routing publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_magic-context_runs foreign-event-durable
-expect-refused prefrontal-routing publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_occipital foreign-event-durable
-expect-refused prefrontal-routing publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_plexus foreign-event-durable
-expect-refused prefrontal-routing publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus-harness_late_results foreign-event-durable
-expect-refused prefrontal-routing publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_wernicke_agents foreign-event-durable
-expect-refused prefrontal-routing publish ck.box_goldenfixture.live.broca.run.v1 foreign-module-live
-expect-refused prefrontal-routing publish ck.box_goldenfixture.live.insula.quota_sampled.v1 foreign-module-live
-expect-refused striatum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_aft_cards foreign-event-durable
-expect-refused striatum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_aft_sendstate foreign-event-durable
-expect-refused striatum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_attribution foreign-event-durable
-expect-refused striatum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_catalog foreign-event-durable
-expect-refused striatum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_media_usage foreign-event-durable
-expect-refused striatum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_payer foreign-event-durable
-expect-refused striatum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_colliculus_events foreign-event-durable
-expect-refused striatum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_magic-context_runs foreign-event-durable
-expect-refused striatum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_occipital foreign-event-durable
-expect-refused striatum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_plexus foreign-event-durable
-expect-refused striatum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus-harness_late_results foreign-event-durable
-expect-refused striatum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_wernicke_agents foreign-event-durable
 expect-refused striatum publish ck.box_goldenfixture.live.broca.run.v1 foreign-module-live
 expect-refused striatum publish ck.box_goldenfixture.live.insula.quota_sampled.v1 foreign-module-live
-expect-refused thalamus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_aft_cards foreign-event-durable
-expect-refused thalamus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_aft_sendstate foreign-event-durable
-expect-refused thalamus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_attribution foreign-event-durable
-expect-refused thalamus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_catalog foreign-event-durable
-expect-refused thalamus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_media_usage foreign-event-durable
-expect-refused thalamus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_payer foreign-event-durable
-expect-refused thalamus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_colliculus_events foreign-event-durable
-expect-refused thalamus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_magic-context_runs foreign-event-durable
-expect-refused thalamus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_occipital foreign-event-durable
-expect-refused thalamus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_plexus foreign-event-durable
-expect-refused thalamus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus-harness_late_results foreign-event-durable
-expect-refused thalamus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_wernicke_agents foreign-event-durable
 expect-refused thalamus publish ck.box_goldenfixture.live.broca.run.v1 foreign-module-live
 expect-refused thalamus publish ck.box_goldenfixture.live.insula.quota_sampled.v1 foreign-module-live
-expect-refused thalamus-harness publish $JS.API.CONSUMER.DELETE.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus-harness_late_results event-consumer-delete
-expect-refused thalamus-harness publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_aft_cards foreign-event-durable
-expect-refused thalamus-harness publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_aft_sendstate foreign-event-durable
-expect-refused thalamus-harness publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_attribution foreign-event-durable
-expect-refused thalamus-harness publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_catalog foreign-event-durable
-expect-refused thalamus-harness publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_media_usage foreign-event-durable
-expect-refused thalamus-harness publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_payer foreign-event-durable
-expect-refused thalamus-harness publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_colliculus_events foreign-event-durable
-expect-refused thalamus-harness publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_magic-context_runs foreign-event-durable
-expect-refused thalamus-harness publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_occipital foreign-event-durable
-expect-refused thalamus-harness publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_plexus foreign-event-durable
-expect-refused thalamus-harness publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_wernicke_agents foreign-event-durable
 expect-refused thalamus-harness publish ck.box_goldenfixture.live.broca.run.v1 foreign-module-live
 expect-refused thalamus-harness publish ck.box_goldenfixture.live.insula.quota_sampled.v1 foreign-module-live
-expect-refused wernicke publish $JS.ACK.CK_BOX_GOLDENFIXTURE_CORE_WORK.m_prefrontal-core.> core-delivery-durable
-expect-refused wernicke publish $JS.ACK.CK_BOX_GOLDENFIXTURE_DELIVERY_DEAD.c_ckbus_dead.> bus-diagnostic-durable
-expect-refused wernicke publish $JS.ACK.CK_BOX_GOLDENFIXTURE_INBOX.m_prefrontal-core.> core-delivery-durable
-expect-refused wernicke publish $JS.API.CONSUMER.CREATE.CK_BOX_GOLDENFIXTURE_EVENT event-consumer-create
-expect-refused wernicke publish $JS.API.CONSUMER.DELETE.CK_BOX_GOLDENFIXTURE_EVENT.m_wernicke_agents event-consumer-delete
-expect-refused wernicke publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_CORE_WORK.m_prefrontal-core core-delivery-durable
-expect-refused wernicke publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_DELIVERY_DEAD.c_ckbus_dead bus-diagnostic-durable
-expect-refused wernicke publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_INBOX.m_prefrontal-core core-delivery-durable
-expect-refused wernicke publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_CORE_WORK.m_prefrontal-core core-delivery-durable
-expect-refused wernicke publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_DELIVERY_DEAD.c_ckbus_dead bus-diagnostic-durable
-expect-refused wernicke publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_aft_cards foreign-event-durable
-expect-refused wernicke publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_aft_sendstate foreign-event-durable
-expect-refused wernicke publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte foreign-event-durable
-expect-refused wernicke publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_attribution foreign-event-durable
-expect-refused wernicke publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_catalog foreign-event-durable
-expect-refused wernicke publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_media_usage foreign-event-durable
-expect-refused wernicke publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_payer foreign-event-durable
-expect-refused wernicke publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_basal foreign-event-durable
-expect-refused wernicke publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_broca foreign-event-durable
-expect-refused wernicke publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_cerebellum foreign-event-durable
-expect-refused wernicke publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_colliculus_events foreign-event-durable
-expect-refused wernicke publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_magic-context foreign-event-durable
-expect-refused wernicke publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_magic-context_runs foreign-event-durable
-expect-refused wernicke publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_occipital foreign-event-durable
-expect-refused wernicke publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_plexus foreign-event-durable
-expect-refused wernicke publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_prefrontal-core foreign-event-durable
-expect-refused wernicke publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_prefrontal-routing foreign-event-durable
-expect-refused wernicke publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_striatum foreign-event-durable
-expect-refused wernicke publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus foreign-event-durable
-expect-refused wernicke publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus-harness foreign-event-durable
-expect-refused wernicke publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus-harness_late_results foreign-event-durable
-expect-refused wernicke publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_INBOX.m_prefrontal-core core-delivery-durable
-expect-refused wernicke publish $JS.API.STREAM.MSG.GET.CK_BOX_GOLDENFIXTURE_EVENT event-direct-read
-expect-refused wernicke publish ck.box_goldenfixture.core_work.campaign.*.run core-delivery-publish
-expect-refused wernicke publish ck.box_goldenfixture.core_work.consult.*.run core-delivery-publish
-expect-refused wernicke publish ck.box_goldenfixture.core_work.effect.*.run core-delivery-publish
-expect-refused wernicke publish ck.box_goldenfixture.core_work.hire.*.run core-delivery-publish
-expect-refused wernicke publish ck.box_goldenfixture.core_work.spec.*.run core-delivery-publish
-expect-refused wernicke publish ck.box_goldenfixture.core_work.work.*.run core-delivery-publish
-expect-refused wernicke publish ck.box_goldenfixture.delivery.dead core-delivery-publish
-expect-refused wernicke publish ck.box_goldenfixture.event.broca.run.v1 foreign-module-event
 expect-refused wernicke publish ck.box_goldenfixture.live.broca.run.v1 foreign-module-live
-expect-refused wernicke publish ck.box_goldenfixture.event.insula.quota_sampled.v1 foreign-module-event
 expect-refused wernicke publish ck.box_goldenfixture.live.insula.quota_sampled.v1 foreign-module-live
-expect-refused wernicke publish ck.box_goldenfixture.inbox.head.*.ready core-delivery-publish
-expect-refused wernicke publish ck.box_goldenfixture.inbox.worker.*.ready core-delivery-publish
 expect-refused participant subscribe ck.box_goldenfixture.live.ckbus.step.finished.v1 no-event-reader
-expect-refused prefrontal-routing subscribe ck.box_goldenfixture.live.broca.run.v1 foreign-live-subscribe
+expect-refused striatum subscribe ck.box_goldenfixture.live.broca.run.v1 foreign-live-subscribe
 expect-refused delivery-authority publish $KV.CK_BOX_GOLDENFIXTURE_AFT_STATUS.key module-bucket-write
 expect-refused delivery-authority publish $JS.API.CONSUMER.DELETE.KV_CK_BOX_GOLDENFIXTURE_AFT_STATUS.watch module-bucket-admin
 expect-refused delivery-authority publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_AFT_STATUS.watch module-bucket-admin

@@ -196,16 +196,6 @@
     },
     {
       "ack_wait_secs": 30,
-      "durable": "m_prefrontal-routing",
-      "filter_subjects": [
-        "ck.box_upgradegolden.event.insula.>"
-      ],
-      "max_ack_pending": 1000,
-      "max_deliver": -1,
-      "stream": "CK_BOX_UPGRADEGOLDEN_EVENT"
-    },
-    {
-      "ack_wait_secs": 30,
       "durable": "m_striatum",
       "filter_subjects": [
         "ck.box_upgradegolden.event.insula.>",
@@ -285,7 +275,7 @@
       "filter_subjects": [
         "ck.box_upgradegolden.event.thalamus-harness.send_state.v1.occipital",
         "ck.box_upgradegolden.event.broca.send_state.v1.occipital",
-        "ck.box_upgradegolden.event.cerebellum.tool_display.v1",
+        "ck.box_upgradegolden.event.cerebellum.display_record_ready.v1",
         "ck.box_upgradegolden.event.aft.display_record_ready.v1",
         "ck.box_upgradegolden.event.fusiform.catalog_changed.v1"
       ],

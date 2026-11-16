@@ -952,7 +952,7 @@ async fn second_bootstrap_keeps_event_durable_creation_times_and_ack_floors() {
         "m_basal",
         "m_prefrontal-core",
         "m_astrocyte",
-        "m_prefrontal-routing",
+        "m_striatum",
         "m_magic-context",
         "m_thalamus-harness",
         "m_thalamus",
@@ -1006,13 +1006,13 @@ async fn bootstrap_updates_event_filters_and_limits_in_place_preserving_ack_floo
 }
 
 #[tokio::test]
-async fn naming_032_bootstrap_removes_routing_step_filters_preserving_delivered_position() {
+async fn bootstrap_removes_striatum_step_filters_preserving_delivered_position() {
     let _gate = harness::acceptance_gate().await;
     let Some(plane) = UpgradePlane::start().await else {
         return;
     };
     drop(plane.bootstrap().await);
-    let durable = "m_prefrontal-routing";
+    let durable = "m_striatum";
     let mut old = plane.consumer(durable).await.cached_info().config.clone();
     old.filter_subject.clear();
     old.filter_subjects = vec![
@@ -1046,7 +1046,17 @@ async fn naming_032_bootstrap_removes_routing_step_filters_preserving_delivered_
             .unwrap()
             .config
             .filter_subjects,
-        vec![format!("ck.{}.event.insula.>", plane.names.account())]
+        [
+            "insula.>",
+            "broca.route_fact.v1",
+            "thalamus-harness.route_fact.v1",
+            "colliculus.route_fact.v1",
+            "prefrontal-core.route_fact.v1",
+            "plexus.route_fact.v1",
+            "fusiform.catalog_changed.v1",
+        ]
+        .map(|filter| format!("ck.{}.event.{filter}", plane.names.account()))
+        .to_vec()
     );
     for field in ["created", "ack_floor", "delivered", "num_ack_pending"] {
         assert_eq!(after[field], before[field], "{durable} must keep {field}");
@@ -1196,7 +1206,7 @@ async fn prefrontal_event_grant_pulls_and_acks_seven_token_events_but_refuses_ot
     for durable in [
         "m_basal",
         "m_astrocyte",
-        "m_prefrontal-routing",
+        "m_striatum",
         "m_magic-context",
         "m_thalamus-harness",
         "m_thalamus",
@@ -1650,7 +1660,7 @@ async fn module_durable_plan_reports_orphans_without_deleting_their_cursor() {
         .js
         .create_consumer_on_stream(
             pull::Config {
-                durable_name: Some("m_retired_reader".into()),
+                durable_name: Some("m_prefrontal-routing".into()),
                 ack_policy: jetstream::consumer::AckPolicy::Explicit,
                 ..Default::default()
             },
@@ -1659,8 +1669,8 @@ async fn module_durable_plan_reports_orphans_without_deleting_their_cursor() {
         .await
         .unwrap();
     let sequence = plane.store_event("broca", "run").await;
-    assert_eq!(plane.ack_one("m_retired_reader").await, sequence);
-    let before = plane.cursor("m_retired_reader").await;
+    assert_eq!(plane.ack_one("m_prefrontal-routing").await, sequence);
+    let before = plane.cursor("m_prefrontal-routing").await;
     let ready = plane.bootstrap().await;
     assert_eq!(ready.orphaned_module_durables, 1);
     let desired = bootstrap::module_durables::planned(&plane.names).unwrap();
@@ -1670,11 +1680,9 @@ async fn module_durable_plan_reports_orphans_without_deleting_their_cursor() {
             .unwrap();
     assert_eq!(output.orphaned_module_durables, 1);
     assert!(output.rows.contains(&json!({
-        "stream": stream, "durable": "m_retired_reader", "state": "orphaned",
+        "stream": stream, "durable": "m_prefrontal-routing", "state": "orphaned",
     })));
-    assert!(desired
-        .iter()
-        .any(|row| row.durable == "m_prefrontal-routing"));
-    assert_eq!(plane.cursor("m_retired_reader").await, before);
+    assert!(desired.iter().any(|row| row.durable == "m_striatum"));
+    assert_eq!(plane.cursor("m_prefrontal-routing").await, before);
     plane.server.stop().await;
 }

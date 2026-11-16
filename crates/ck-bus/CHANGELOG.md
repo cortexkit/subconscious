@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.7.1
+
+- Adopt cortexkit-bus-naming 0.4.3: the retired `prefrontal-routing` id gets no permissions or durables, and Cerebellum's display event filter follows tool-display's `display_record_ready` name.
+
 ## 0.7.0
 
 - Adopt cortexkit-bus-naming 0.4.2, cortexkit-bus-nats 0.5.0 and

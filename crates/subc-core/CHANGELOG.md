@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.21.17
+
+- Ship the pinned Python script runner with Core on macOS arm64, Linux x64/arm64,
+  and Windows x64/arm64, with compiled-code-only hardened-runtime signing on macOS.
+- Setup and upgrade install the Python runner from the signed release index and
+  verify its downloaded archive before placement.
+  Older Core installs remain recognized, and rollback restores a missing runner.
+
 ## 0.21.16
 
 - Require Rust client 0.41.0 for the public registration-channel adoption API.

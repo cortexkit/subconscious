@@ -5,7 +5,7 @@ set -euo pipefail
 SOURCE_DIR="${1:?usage: $0 <source-dir> <dist-dir>}"
 DIST_DIR="${2:?usage: $0 <source-dir> <dist-dir>}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BINARIES=(ck ck-subc ck-subc-mcp ck-script-runner-bun)
+BINARIES=(ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python)
 
 fail() {
   echo "$*" >&2
@@ -52,6 +52,10 @@ for binary in "${BINARIES[@]}"; do # nonempty-array: literal release binaries
     codesign -d --entitlements :- "$binary_path" 2>/dev/null | python3 "$SCRIPT_DIR/check-runner-entitlements.py"
   else
     codesign --force --options runtime --timestamp --sign "$identity" "$binary_path"
+    if [[ "$binary" == ck-script-runner-python ]]; then
+      entitlements="$(codesign -d --entitlements :- "$binary_path" 2>/dev/null)"
+      [[ -z "$entitlements" ]] || fail "refusing Python runner: it carries entitlements: $entitlements"
+    fi
   fi
   codesign --verify --strict --verbose=2 "$binary_path"
 

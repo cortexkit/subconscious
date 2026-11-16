@@ -2322,6 +2322,7 @@ pub(super) mod tests {
                 "ck-subc",
                 "ck-subc-mcp",
                 "ck-script-runner-bun",
+                "ck-script-runner-python",
                 "ck-aft",
                 "ck-mc",
                 "ck"
@@ -2331,9 +2332,10 @@ pub(super) mod tests {
         assert_eq!(targets[0].installed_version, "1.3.0");
         assert_eq!(targets[1].installed_version, "1.1.0");
         assert_eq!(targets[2].installed_version, "");
-        assert_eq!(targets[3].installed_version, "1.2.0");
-        assert_eq!(targets[4].installed_version, "99.0.0");
-        assert_eq!(targets[5].installed_version, "1.0.0");
+        assert_eq!(targets[3].installed_version, "");
+        assert_eq!(targets[4].installed_version, "1.2.0");
+        assert_eq!(targets[5].installed_version, "99.0.0");
+        assert_eq!(targets[6].installed_version, "1.0.0");
     }
 
     #[cfg(unix)]

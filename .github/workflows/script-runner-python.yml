@@ -3,9 +3,9 @@ name: Script runner (Python)
 on:
   push:
     branches: [master, "train/**"]
-    paths: ["clients/script-runner-python/**", "clients/script-runner/tests/pipe-launcher.py", "clients/script-runner/tests/script-pipe-vector.json", "scripts/release/build-script-runner-python.sh", "scripts/release/macos-sign-notarize.sh", ".github/workflows/script-runner-python.yml"]
+    paths: ["clients/script-runner-python/**", "clients/script-runner/tests/pipe-launcher.py", "clients/script-runner/tests/script-pipe-vector.json", "scripts/release/build-script-runner-python*.sh", "scripts/release/check-glibc.sh", "scripts/release/test-check-glibc.sh", "scripts/release/macos-sign-notarize.sh", ".github/workflows/script-runner-python.yml", ".github/workflows/release.yml"]
   pull_request:
-    paths: ["clients/script-runner-python/**", "clients/script-runner/tests/pipe-launcher.py", "clients/script-runner/tests/script-pipe-vector.json", "scripts/release/build-script-runner-python.sh", "scripts/release/macos-sign-notarize.sh", ".github/workflows/script-runner-python.yml"]
+    paths: ["clients/script-runner-python/**", "clients/script-runner/tests/pipe-launcher.py", "clients/script-runner/tests/script-pipe-vector.json", "scripts/release/build-script-runner-python*.sh", "scripts/release/check-glibc.sh", "scripts/release/test-check-glibc.sh", "scripts/release/macos-sign-notarize.sh", ".github/workflows/script-runner-python.yml", ".github/workflows/release.yml"]
 
 permissions:
   contents: read
@@ -42,10 +42,26 @@ jobs:
             target/python-build/${{ matrix.target }}-openssl
           key: python-inputs-${{ matrix.target }}-${{ hashFiles('clients/script-runner-python/python-archives.lock', 'clients/script-runner-python/windows-sources.lock') }}
       - name: Build and test (on macOS also sign ad hoc and run the signed binary)
+        if: runner.os != 'Linux'
         shell: bash
         env:
           DEVELOPER_ID_APPLICATION_IDENTITY: "-"
         run: bash scripts/release/build-script-runner-python.sh ${{ matrix.target }} ${{ matrix.sign }} --test
+      - name: Build and test in the release glibc 2.28 environment
+        if: runner.os == 'Linux'
+        run: bash scripts/release/build-script-runner-python-linux.sh ${{ matrix.target }} --test
+      - name: Check the Python runner's glibc ceiling and the checker fixtures
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          bash scripts/release/test-check-glibc.sh
+          # The shared checker requires the complete Core set. Copies of the
+          # runner stand in for the other binaries in this runner-only job.
+          mkdir -p target/python-glibc-check
+          for binary in ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python; do
+            cp target/${{ matrix.target }}/release/ck-script-runner-python target/python-glibc-check/$binary
+          done
+          bash scripts/release/check-glibc.sh target/python-glibc-check
       - name: Size
         shell: bash
         run: ls -l target/${{ matrix.target }}/release/ck-script-runner-python*

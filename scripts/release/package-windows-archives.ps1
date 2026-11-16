@@ -16,7 +16,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$binaries = @("ck", "ck-subc", "ck-subc-mcp", "ck-script-runner-bun")
+$binaries = @("ck", "ck-subc", "ck-subc-mcp", "ck-script-runner-bun", "ck-script-runner-python")
 
 # The shipped ck must not carry the test-only release-index key path; it answers
 # for its own build shape. Only the host-native x64 binary can be executed on

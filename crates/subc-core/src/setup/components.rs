@@ -453,7 +453,12 @@ pub fn component_binaries_for_target(
     target: AlphaTarget,
 ) -> &'static [&'static str] {
     match (component, target) {
-        (Component::Core, _) => &["ck-subc", "ck-subc-mcp", "ck-script-runner-bun"],
+        (Component::Core, _) => &[
+            "ck-subc",
+            "ck-subc-mcp",
+            "ck-script-runner-bun",
+            "ck-script-runner-python",
+        ],
         // The managed name is the daemon-placed name (`ck-aft`), not the
         // crate's own binary name: the spec inventory, `ck upgrade`, and the
         // release inventory gate all key on it, so setup must too or an
@@ -599,7 +604,8 @@ pub fn owned_binary_paths(inventory: &Inventory) -> Vec<PathBuf> {
 /// Companions added after the original component release are not prerequisites
 /// for recognizing an older installation. Setup still requires the full set.
 pub(super) fn is_later_companion(component: Component, binary: &str) -> bool {
-    component == Component::Core && binary == "ck-script-runner-bun"
+    component == Component::Core
+        && matches!(binary, "ck-script-runner-bun" | "ck-script-runner-python")
 }
 
 /// Whether the original binaries of `component` are on disk and inventory-owned.
@@ -1323,7 +1329,13 @@ mod tests {
                 .into_iter()
                 .map(|target| target.label())
                 .collect::<Vec<_>>(),
-            ["ck-subc", "ck-subc-mcp", "ck-script-runner-bun", "ck"]
+            [
+                "ck-subc",
+                "ck-subc-mcp",
+                "ck-script-runner-bun",
+                "ck-script-runner-python",
+                "ck"
+            ]
         );
     }
 
@@ -1374,7 +1386,7 @@ mod tests {
         assert!(is_installed(Component::Core, &binary_home, &inventory));
         install_component(Component::Core, &binary_home, &mut inventory, &mut source)
             .expect("repeat core install");
-        assert_eq!(inventory.paths_for_kind("managed-binary").len(), 3);
+        assert_eq!(inventory.paths_for_kind("managed-binary").len(), 4);
         let placed = binary_home.join(platform_binary("ck-subc"));
         let entry = inventory
             .entry_for_path("managed-binary", &placed)
@@ -1404,13 +1416,17 @@ mod tests {
         assert_eq!(installed_components(&inventory), [Component::Core]);
         assert!(!is_installed(Component::Core, &bin, &inventory));
         install_component(Component::Core, &bin, &mut inventory, &mut FakeSource).unwrap();
-        let runner = bin.join(platform_binary("ck-script-runner-bun"));
-        assert!(runner.is_file());
-        assert!(inventory.owns_path("managed-binary", &runner));
+        for binary in ["ck-script-runner-bun", "ck-script-runner-python"] {
+            let runner = bin.join(platform_binary(binary));
+            assert!(runner.is_file());
+            assert!(inventory.owns_path("managed-binary", &runner));
+        }
         assert!(is_installed(Component::Core, &bin, &inventory));
         for platform in AlphaTarget::ALL {
             assert!(component_binaries_for_target(Component::Core, platform)
                 .contains(&"ck-script-runner-bun"));
+            assert!(component_binaries_for_target(Component::Core, platform)
+                .contains(&"ck-script-runner-python"));
         }
     }
 
@@ -1711,7 +1727,7 @@ mod tests {
         )
         .expect("re-run after a partial refusal installs the rest cleanly");
         assert!(is_installed(Component::Core, &binary_home, &reloaded));
-        assert_eq!(reloaded.paths_for_kind("managed-binary").len(), 3);
+        assert_eq!(reloaded.paths_for_kind("managed-binary").len(), 4);
     }
 
     #[test]
@@ -1742,11 +1758,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn pre_python_install_still_counts_as_core_but_setup_adds_python() {
+        let root = fixture_dir("core-before-python");
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let mut inventory = Inventory::load(root.join("inventory.json"), "linux-x64").unwrap();
+        for binary in ["ck-subc", "ck-subc-mcp", "ck-script-runner-bun"] {
+            let path = bin.join(platform_binary(binary));
+            fs::write(&path, binary).unwrap();
+            inventory.record("managed-binary", &path, Map::new());
+        }
+        assert!(component_is_owned(Component::Core, &bin, &inventory));
+        assert_eq!(installed_components(&inventory), [Component::Core]);
+        assert!(!is_installed(Component::Core, &bin, &inventory));
+        install_component(Component::Core, &bin, &mut inventory, &mut FakeSource).unwrap();
+        let python = bin.join(platform_binary("ck-script-runner-python"));
+        assert!(python.is_file());
+        assert!(inventory.owns_path("managed-binary", &python));
+        assert!(is_installed(Component::Core, &bin, &inventory));
+        assert_eq!(
+            fs::read(bin.join(platform_binary("ck-script-runner-bun"))).unwrap(),
+            b"ck-script-runner-bun"
+        );
+    }
+
     fn index_with_core_linux() -> ReleaseIndex {
         let mut binaries = std::collections::BTreeMap::new();
         binaries.insert("ck-subc".to_string(), asset(Some("0.16.0")));
         binaries.insert("ck-subc-mcp".to_string(), asset(None));
         binaries.insert("ck-script-runner-bun".to_string(), asset(None));
+        binaries.insert("ck-script-runner-python".to_string(), asset(None));
         let mut targets = std::collections::BTreeMap::new();
         targets.insert("linux-x64".to_string(), binaries);
         let mut components = std::collections::BTreeMap::new();

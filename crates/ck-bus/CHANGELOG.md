@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.2
+
+- Record a digest of each issued module grant in the census (ck-bus's bucket
+  of issued bus credentials). On restart, revoke only credentials whose
+  permissions changed or were removed, including older entries without a
+  digest, in one batched account update before readiness. Unchanged
+  grants keep their connections; credential retirement leaves durable cursors
+  and stored data intact.
+
 ## 0.7.1
 
 - Adopt cortexkit-bus-naming 0.4.3: the retired `prefrontal-routing` id gets no permissions or durables, and Cerebellum's display event filter follows tool-display's `display_record_ready` name.

@@ -234,6 +234,16 @@ async fn one_census_key_per_live_process_overwritten_by_refetch_and_respawn() {
             user_jwt_id: first["user_jwt_id"].as_str().unwrap().to_string(),
             spawn_generation: first_generation,
             credential_epoch: 0,
+            grant_digest: Some(
+                grants::issued_grant(
+                    &run.names(),
+                    PARTICIPANT,
+                    first["credential_public"].as_str().unwrap(),
+                    &[]
+                )
+                .unwrap()
+                .permission_digest(),
+            ),
             identities: vec![],
             rooms: vec![],
         }
@@ -251,6 +261,7 @@ async fn one_census_key_per_live_process_overwritten_by_refetch_and_respawn() {
         "user_jwt_id",
         "spawn_generation",
         "credential_epoch",
+        "grant_digest",
         "schema_versions",
         "identities",
         "rooms",

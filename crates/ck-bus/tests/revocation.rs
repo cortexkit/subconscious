@@ -28,7 +28,7 @@
 //!   the record is cleared and nothing is pushed. (iv) Corrupted with the census read
 //!   failing: recovery defers and leaves the file as it is.
 //! - Restart (real `SIGKILL` of the supervised ck-bus): established connections survive
-//!   and the restarted ck-bus revokes nothing on its own. The participant's next connect
+//!   and the restarted ck-bus preserves its unchanged grant. The participant's next connect
 //!   fails inside `ckbus.nonce_sign` (`ckbus_credential_superseded`) without the server
 //!   seeing a credential. Its refetch revokes the superseded user, which the restarted
 //!   process found in the census. That user connected before the restarted process was
@@ -67,7 +67,7 @@ mod revocation;
 mod runtime;
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -535,6 +535,7 @@ impl Victim {
             user_jwt_id: jti.clone(),
             spawn_generation: generation,
             credential_epoch: 0,
+            grant_digest: None,
             identities: vec![],
             rooms: vec![],
         };
@@ -1118,6 +1119,7 @@ async fn a_census_read_lost_at_box_reconnect_is_replayed_within_its_original_bud
         user_jwt_id: "predecessor".into(),
         spawn_generation: 2,
         credential_epoch: 0,
+        grant_digest: None,
         identities: vec![],
         rooms: vec![],
     };
@@ -1269,6 +1271,7 @@ async fn damaged_supersede_progress_never_infers_revocation_from_a_replaced_cens
                 user_jwt_id: "successor".into(),
                 spawn_generation: victim.identity().spawn_generation,
                 credential_epoch: victim.identity().credential_epoch + 1,
+                grant_digest: None,
                 identities: vec![],
                 rooms: vec![],
             }
@@ -1864,6 +1867,327 @@ async fn a_killed_ckbus_restarts_and_revokes_the_superseded_user_it_finds_in_the
     run.run.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_revokes_a_changed_grant_before_readiness_and_reissues_the_new_grant() {
+    restart_with_previous_grant(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_revokes_a_legacy_grant_without_a_digest() {
+    restart_with_previous_grant(true).await;
+}
+
+async fn restart_with_previous_grant(legacy: bool) {
+    let _gate = harness::acceptance_gate().await;
+    harness::install_tracing();
+    // Without a nats-server, `start` reports the row skipped (as every other
+    // row here does); CI runners without one, such as Windows, skip it.
+    let Some(run) = start(true).await else {
+        return;
+    };
+    let first = credential(&run.run).await;
+    let names = run.names();
+    let pair = KeyPair::new_user();
+    let public = pair.public_key();
+    let grant_b = grants::issued_grant(&names, PARTICIPANT, &public, &[]).unwrap();
+    let added_permission = grant_b.publish_allow().iter().next().unwrap().clone();
+    // Model an earlier build by signing its smaller permission set, rather than
+    // merely falsifying the digest of an otherwise current credential.
+    let grant_a = grants::Grant::from_entries(
+        grant_b.role(),
+        &names,
+        grant_b
+            .allow_entries()
+            .into_iter()
+            .filter(|entry| {
+                legacy || entry.operation != Operation::Publish || entry.subject != added_permission
+            })
+            .collect(),
+    )
+    .unwrap();
+    let credentials = credentials_over(run.trust.signer.clone());
+    let signed = sign_user_jwt(
+        credentials.vault.as_ref(),
+        &credentials.key_ids,
+        &UserJwtRequest {
+            root_credential_id: &bus::box_root_id(),
+            user_public: &public,
+            issuer_account: Some(&run.account_public()),
+            name: PARTICIPANT,
+            issued_at: unix_now() - 60,
+            expires_at: unix_now() + 600,
+            grant: &grant_a,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        bus::claims(&signed.jwt)["nats"]["pub"],
+        grant_a.jwt_permissions()["pub"]
+    );
+    if !legacy {
+        assert!(!grant_a.publish_allow().contains(&added_permission));
+        assert_ne!(grant_a.permission_digest(), grant_b.permission_digest());
+    }
+    let plane = plane(&run).await;
+    let old = CensusValue {
+        credential_public: public.clone(),
+        user_jwt_id: signed.jti,
+        spawn_generation: first["spawn_generation"].as_u64().unwrap(),
+        credential_epoch: first["credential_epoch"].as_u64().unwrap(),
+        grant_digest: (!legacy).then(|| grant_a.permission_digest()),
+        identities: vec![],
+        rooms: vec![],
+    };
+    plane
+        .box_plane
+        .census_put(&names.census_subject(PARTICIPANT).unwrap(), old.to_bytes())
+        .await
+        .unwrap();
+    let (client, _) = connect_once(
+        &run.server.url,
+        &signed.jwt,
+        seed_signer(pair.seed().unwrap()),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+    let disconnects = Disconnects::watch(&run).await;
+    bus::restart_ckbus(&run.run.connection_file).await;
+    bus::wait_event(run.run.root.path(), "ckbus.bootstrap.ready", 2, BOOT_LIMIT).await;
+    assert!(
+        run.revocations().await.contains_key(&public),
+        "changed grant was not revoked at boot"
+    );
+    wait_severed(&client).await;
+    let events = disconnects.settled_for(&public).await;
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["reason"], REVOKED_REASON);
+    let changed = bus::events(run.run.root.path(), "ckbus.bootstrap.module_revoked");
+    assert_eq!(changed.len(), 1);
+    let mut changed = changed[0].clone();
+    assert!(changed["at_ms"].is_u64());
+    changed.as_object_mut().unwrap().remove("at_ms");
+    assert_eq!(
+        changed,
+        json!({"event": "ckbus.bootstrap.module_revoked", "module_id": PARTICIPANT, "cause": "grant_changed"})
+    );
+    let next = credential(&run.run).await;
+    let next_public = next["credential_public"].as_str().unwrap();
+    assert_ne!(next_public, public);
+    let expected = grants::issued_grant(&names, PARTICIPANT, next_public, &[]).unwrap();
+    let claims = bus::claims(next["jwt"].as_str().unwrap());
+    assert_eq!(claims["nats"]["pub"], expected.jwt_permissions()["pub"]);
+    assert_eq!(claims["nats"]["sub"], expected.jwt_permissions()["sub"]);
+    assert!(expected.publish_allow().contains(&added_permission));
+    let (reconnected, _) = connect_participant(&run, &next).await.unwrap();
+    reconnected.flush().await.unwrap();
+    assert_eq!(
+        run.census_value(PARTICIPANT).await.unwrap().grant_digest,
+        Some(expected.permission_digest())
+    );
+    run.server.stop().await;
+    run.run.shutdown().await;
+    passed();
+}
+
+/// Read-only census fixture: any attempt to mutate broker data fails the sweep.
+#[derive(Default)]
+struct GrantCensus {
+    rows: BTreeMap<String, Vec<u8>>,
+    fail_list: bool,
+    fail_read: bool,
+}
+
+#[async_trait]
+impl BoxPlane for GrantCensus {
+    async fn census_keys(&self, _: &AccountNames) -> Result<Vec<String>, PlaneError> {
+        if self.fail_list {
+            return Err(PlaneError::new("census list unavailable"));
+        }
+        Ok(self.rows.keys().cloned().collect())
+    }
+    async fn census_get(
+        &self,
+        _: &AccountNames,
+        key: &str,
+    ) -> Result<Option<CensusRecord>, PlaneError> {
+        if self.fail_read {
+            return Err(PlaneError::new("census read unavailable"));
+        }
+        Ok(self.rows.get(key).map(|value| CensusRecord {
+            value: value.clone(),
+            revision: 1,
+        }))
+    }
+    async fn ensure_census(&self, _: &AccountNames) -> Result<(), PlaneError> {
+        panic!("sweep must not ensure census")
+    }
+    async fn ensure_stream(&self, _: &StreamSpec) -> Result<(), PlaneError> {
+        panic!("sweep must not ensure streams")
+    }
+    async fn publish(&self, _: &str, _: Vec<u8>) -> Result<(), PlaneError> {
+        panic!("sweep must not publish")
+    }
+    async fn census_put(&self, _: &str, _: Vec<u8>) -> Result<(), PlaneError> {
+        panic!("sweep must not overwrite census")
+    }
+    async fn census_delete(&self, _: &AccountNames, _: &str, _: u64) -> Result<(), PlaneError> {
+        panic!("sweep must not delete census")
+    }
+    async fn create_durable(&self, _: &DurableConsumer) -> Result<(), PlaneError> {
+        panic!("sweep must not create durables")
+    }
+    async fn consumer_state(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<Option<bootstrap::plane::ConsumerState>, PlaneError> {
+        panic!("sweep must not inspect durables")
+    }
+    async fn delete_durable(&self, _: &str, _: &str) -> Result<bool, PlaneError> {
+        panic!("sweep must not delete durables")
+    }
+    async fn purge_subject(&self, _: &str, _: &str) -> Result<u64, PlaneError> {
+        panic!("sweep must not purge data")
+    }
+    async fn consumer_names(&self, _: &str) -> Result<Vec<String>, PlaneError> {
+        panic!("sweep must not enumerate consumers")
+    }
+}
+
+#[tokio::test]
+async fn boot_grant_sweep_batches_changes_and_preserves_unchanged_users_and_data() {
+    let trust = TrustChain::generate();
+    let credentials = credentials_over(trust.signer.clone());
+    let names = grants::derive_account("box_test").unwrap();
+    let system = StoredAccount {
+        jwt: Mutex::new(String::new()),
+        updates: Mutex::new(vec![]),
+    };
+    let mut census = GrantCensus::default();
+    let mut keys = BTreeMap::new();
+    for module in ["unchanged", "changed", "legacy", "invalid.module", "ckbus"] {
+        let public = KeyPair::new_user().public_key();
+        let digest = match module {
+            "unchanged" => Some(
+                grants::issued_grant(&names, module, &public, &[])
+                    .unwrap()
+                    .permission_digest(),
+            ),
+            "changed" => Some("previous permission digest".to_string()),
+            _ => None,
+        };
+        if module == "invalid.module" {
+            assert!(grants::issued_grant(&names, module, &public, &[]).is_err());
+        }
+        census.rows.insert(
+            module.to_string(),
+            CensusValue {
+                credential_public: public.clone(),
+                user_jwt_id: "JTI".to_string(),
+                spawn_generation: 1,
+                credential_epoch: 0,
+                grant_digest: digest,
+                identities: vec![],
+                rooms: vec![],
+            }
+            .to_bytes(),
+        );
+        keys.insert(module, public);
+    }
+    let mut claims = bootstrap::account_jwt::AccountClaims {
+        account_public: KeyPair::new_account().public_key(),
+        name: names.account().to_string(),
+        signing_keys: vec![],
+        revocations: BTreeMap::new(),
+        issued_at: unix_now(),
+    };
+    let signer = credentials::roots::RootCredential::OperatorSigner
+        .credential_id()
+        .unwrap();
+    bootstrap::grant_changes::revoke_changed(
+        &credentials,
+        &system,
+        &census,
+        &names,
+        "ckbus",
+        &signer,
+        &mut claims,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        system.updates.lock().unwrap().len(),
+        1,
+        "all changes share one claims push"
+    );
+    let applied = bus::claims(&system.jwt.lock().unwrap());
+    assert_eq!(applied["nats"]["revocations"].as_object().unwrap().len(), 3);
+    for module in ["changed", "legacy", "invalid.module"] {
+        assert!(applied["nats"]["revocations"].get(&keys[module]).is_some());
+    }
+    assert!(!claims.revocations.contains_key(&keys["unchanged"]));
+    assert!(!claims.revocations.contains_key(&keys["ckbus"]));
+    bootstrap::grant_changes::revoke_changed(
+        &credentials,
+        &system,
+        &census,
+        &names,
+        "ckbus",
+        &signer,
+        &mut claims,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        system.updates.lock().unwrap().len(),
+        1,
+        "no push when nothing new changed"
+    );
+}
+
+#[tokio::test]
+async fn boot_grant_sweep_refuses_bad_or_unreadable_census_before_pushing() {
+    let trust = TrustChain::generate();
+    let credentials = credentials_over(trust.signer.clone());
+    let names = grants::derive_account("box_test").unwrap();
+    let signer = credentials::roots::RootCredential::OperatorSigner
+        .credential_id()
+        .unwrap();
+    for mode in ["malformed", "list", "read"] {
+        let system = StoredAccount {
+            jwt: Mutex::new(String::new()),
+            updates: Mutex::new(vec![]),
+        };
+        let census = GrantCensus {
+            rows: BTreeMap::from([("module".to_string(), b"not JSON".to_vec())]),
+            fail_list: mode == "list",
+            fail_read: mode == "read",
+        };
+        let mut claims = bootstrap::account_jwt::AccountClaims {
+            account_public: KeyPair::new_account().public_key(),
+            name: names.account().to_string(),
+            signing_keys: vec![],
+            revocations: BTreeMap::new(),
+            issued_at: unix_now(),
+        };
+        let error = bootstrap::grant_changes::revoke_changed(
+            &credentials,
+            &system,
+            &census,
+            &names,
+            "ckbus",
+            &signer,
+            &mut claims,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.cause, bootstrap::cause::CENSUS_UNAVAILABLE, "{mode}");
+        assert!(system.updates.lock().unwrap().is_empty(), "{mode}");
+    }
+}
+
 /// A system plane holding one stored account JWT, recording every update. Nothing in
 /// the foreign-claim arm lists accounts, kicks or watches, so those calls fail loudly.
 struct StoredAccount {
@@ -2075,6 +2399,7 @@ fn bootstraps_own_census_value_is_a_census_value() {
             user_jwt_id: "JTI".to_string(),
             spawn_generation: 7,
             credential_epoch: 0,
+            grant_digest: None,
             identities: vec![],
             rooms: vec![],
         }

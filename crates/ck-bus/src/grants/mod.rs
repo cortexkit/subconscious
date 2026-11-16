@@ -23,6 +23,7 @@ use cortexkit_bus_naming::{
     AllowEntry, GoldenFixture, GrantError, NamingError, Operation, Principal,
 };
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 /// The first line of a document this generator renders. It names this generator, so it
 /// is the one line allowed to differ from the committed reference document's header.
@@ -199,6 +200,15 @@ impl Grant {
             "pub": { "allow": self.publish.iter().collect::<Vec<_>>() },
             "sub": { "allow": self.subscribe.iter().collect::<Vec<_>>() },
         })
+    }
+
+    /// SHA-256 of `[publish_allow, subscribe_allow]` encoded as compact JSON. Each
+    /// list is sorted and deduplicated, so only JWT permissions affect the digest,
+    /// not construction order, role metadata, or JSON object-key ordering.
+    pub fn permission_digest(&self) -> String {
+        let canonical = serde_json::to_vec(&(&self.publish, &self.subscribe))
+            .expect("permission sets always encode as JSON");
+        data_encoding::HEXLOWER.encode(&Sha256::digest(canonical))
     }
 }
 
@@ -683,5 +693,33 @@ impl crate::runtime::GrantGeneration for GrantSeam {
         grant
             .map(|grant| grant.generated())
             .map_err(|refusal| crate::runtime::GrantSeamError::Refused(refusal.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permission_digest_hashes_sorted_directional_sets_not_role_metadata() {
+        let grant = Grant {
+            role: GrantRole::Participant,
+            account: "metadata".to_string(),
+            publish: ["b", "a", "a"].into_iter().map(str::to_string).collect(),
+            subscribe: ["c"].into_iter().map(str::to_string).collect(),
+        };
+        assert_eq!(
+            grant.permission_digest(),
+            data_encoding::HEXLOWER.encode(&Sha256::digest(br#"[["a","b"],["c"]]"#))
+        );
+        let mut other = grant.clone();
+        other.role = GrantRole::FlowEngine;
+        other.account = "different metadata".to_string();
+        assert_eq!(grant.permission_digest(), other.permission_digest());
+        std::mem::swap(&mut other.publish, &mut other.subscribe);
+        assert_ne!(grant.permission_digest(), other.permission_digest());
+        other = grant.clone();
+        other.publish.remove("a");
+        assert_ne!(grant.permission_digest(), other.permission_digest());
     }
 }

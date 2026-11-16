@@ -17,6 +17,9 @@ pub struct CensusValue {
     pub user_jwt_id: String,
     pub spawn_generation: u64,
     pub credential_epoch: u64,
+    /// Permissions signed into this credential. Older rows have no digest and
+    /// must be refreshed before their grant can be trusted across a restart.
+    pub grant_digest: Option<String>,
     /// The agent ids the credential is bound to.
     pub identities: Vec<String>,
     /// The room ids the credential is bound to.
@@ -25,7 +28,7 @@ pub struct CensusValue {
 
 impl CensusValue {
     pub fn to_json(&self) -> Value {
-        json!({
+        let mut value = json!({
             "credential_public": self.credential_public,
             "user_jwt_id": self.user_jwt_id,
             "spawn_generation": self.spawn_generation,
@@ -33,7 +36,11 @@ impl CensusValue {
             "schema_versions": { "census": CENSUS_SCHEMA_VERSION },
             "identities": self.identities,
             "rooms": self.rooms,
-        })
+        });
+        if let Some(digest) = &self.grant_digest {
+            value["grant_digest"] = json!(digest);
+        }
+        value
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -78,6 +85,15 @@ impl CensusValue {
             user_jwt_id: text("user_jwt_id")?,
             spawn_generation: number("spawn_generation")?,
             credential_epoch: number("credential_epoch")?,
+            grant_digest: value
+                .get("grant_digest")
+                .map(|digest| {
+                    digest
+                        .as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| "grant_digest is not a string".to_string())
+                })
+                .transpose()?,
             identities: list("identities")?,
             rooms: list("rooms")?,
         })
@@ -95,6 +111,7 @@ mod tests {
             user_jwt_id: "JTI".to_string(),
             spawn_generation: 3,
             credential_epoch: 1,
+            grant_digest: Some("digest".to_string()),
             identities: vec![],
             rooms: vec![],
         };
@@ -104,6 +121,7 @@ mod tests {
             "user_jwt_id",
             "spawn_generation",
             "credential_epoch",
+            "grant_digest",
             "schema_versions",
             "identities",
             "rooms",
@@ -111,5 +129,22 @@ mod tests {
             assert!(json.get(field).is_some(), "census value lacks {field}");
         }
         assert_eq!(CensusValue::parse(&value.to_bytes()).unwrap(), value);
+    }
+
+    #[test]
+    fn legacy_rows_without_a_digest_parse_but_malformed_digests_do_not() {
+        let mut value = json!({
+            "credential_public": "UABC", "user_jwt_id": "JTI",
+            "spawn_generation": 3, "credential_epoch": 1,
+            "schema_versions": { "census": 1 }, "identities": [], "rooms": [],
+        });
+        assert_eq!(
+            CensusValue::parse(&serde_json::to_vec(&value).unwrap())
+                .unwrap()
+                .grant_digest,
+            None
+        );
+        value["grant_digest"] = json!(42);
+        assert!(CensusValue::parse(&serde_json::to_vec(&value).unwrap()).is_err());
     }
 }

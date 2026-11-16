@@ -288,6 +288,7 @@ async fn plant(run: &Run, module_id: &str, generation: u64) -> (String, async_na
         user_jwt_id: bus::claims(&jwt)["jti"].as_str().unwrap().to_string(),
         spawn_generation: generation,
         credential_epoch: 0,
+        grant_digest: None,
         identities: vec![],
         rooms: vec![],
     };

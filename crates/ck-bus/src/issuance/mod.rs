@@ -22,7 +22,7 @@
 //!    that signs every user JWT in the box account) sign its JWT;
 //! 4. (retired: issuance no longer creates agent durables; prefrontal creates them
 //!    through `ckbus.agent_durable_bind`, in the membership area);
-//! 5. write the census key;
+//! 5. write the census key, including a digest of the signed permission set;
 //! 6. answer.
 //!
 //! A failure (or a crash) before step 5 leaves a signed JWT whose seed is dropped and no
@@ -43,7 +43,7 @@
 //! rooms (the `ck.{acct}.room.{room_id}` subjects) a credential is bound to, but nothing
 //! yet tells ck-bus which rooms a module belongs to, so every module is issued with none.
 
-pub mod census;
+pub use crate::bootstrap::census;
 pub mod handler;
 pub mod high_water;
 
@@ -381,7 +381,8 @@ impl Issuance {
         let user_public = custody.generate_user();
         let identities: Vec<String> = Vec::new();
         let rooms: Vec<String> = Vec::new();
-        let signed = match self.sign(&plane, module_id, &user_public, &rooms).await {
+        let (signed, grant_digest) = match self.sign(&plane, module_id, &user_public, &rooms).await
+        {
             Ok(signed) => signed,
             Err(refusal) => {
                 custody.forget(&user_public);
@@ -402,6 +403,7 @@ impl Issuance {
             user_jwt_id: signed.jti.clone(),
             spawn_generation: generation,
             credential_epoch: epoch,
+            grant_digest: Some(grant_digest),
             identities: identities.clone(),
             rooms: rooms.clone(),
         };
@@ -486,7 +488,7 @@ impl Issuance {
         module_id: &str,
         user_public: &str,
         rooms: &[String],
-    ) -> Result<SignedUserJwt, Refusal> {
+    ) -> Result<(SignedUserJwt, String), Refusal> {
         let bound_rooms: Vec<&str> = rooms.iter().map(String::as_str).collect();
         let grant: Grant = grants::issued_grant(&plane.names, module_id, user_public, &bound_rooms)
             .map_err(|refusal| Refusal::new(code::GRANT_REFUSED, refusal.to_string()))?;
@@ -508,6 +510,7 @@ impl Issuance {
             },
         )
         .await
+        .map(|signed| (signed, grant.permission_digest()))
         .map_err(|error| Refusal::new(code::SIGNING_FAILED, error.to_string()))
     }
 
@@ -572,7 +575,7 @@ impl Issuance {
             )
         })?;
         let rooms: Vec<String> = Vec::new();
-        let signed = self
+        let (signed, _) = self
             .sign(&plane, module_id, credential_public, &rooms)
             .await?;
         // Checked again after signing: a revocation recorded while the vault signed has

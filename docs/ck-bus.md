@@ -435,8 +435,16 @@ Credentials (design D; foundation amendment `48c83a68e`, `0eb12229f`, `b9e827c69
   whose revocation was lost to damage stays valid for at most 15 minutes.
 - ck-bus restart and in-memory keys. With nats-server 2.15.0 and the full resolver, while ck-bus is down, open
   connections keep working and new connects and reconnects fail, because nobody can sign
-  a nonce. A ck-bus restart loses every seed, and the restarted process does not revoke
-  the users it cannot sign for, because revoking disconnects them. A child that asks it
+  a nonce. A ck-bus restart loses every seed. Before readiness, the restarted process
+  compares each module census row's grant digest with the permissions this build would
+  issue for the same module and public key. The digest is lowercase SHA-256 of compact
+  JSON `[publish_allow, subscribe_allow]`, with both lists sorted and deduplicated.
+  It revokes changed grants and legacy rows without a digest in one batched account
+  update, verified by read-back; unchanged grants keep their sockets. A module the
+  grant generator now refuses is revoked as `grant_removed`. Credential retirement
+  does not delete durable consumers or stored data. Issuance remains unavailable
+  until this sweep finishes, so its census snapshot cannot include a fresh issue.
+  A child that asks it
   to sign for a key it does not hold gets `ckbus_credential_superseded`. The child then
   calls `ckbus.credential`, and ck-bus issues at the next epoch: high-water first, JWT
   signed, census overwritten, then the superseded user revoked by the three steps.

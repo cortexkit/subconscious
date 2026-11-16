@@ -42,7 +42,9 @@
 //! machine id, a missing input) is not. The module never exits for either.
 
 pub mod account_jwt;
+pub mod census;
 pub mod config;
+pub(crate) mod grant_changes;
 pub mod module_durables;
 pub mod plane;
 pub mod store;
@@ -99,6 +101,7 @@ pub mod cause {
     pub const CLAIMS_READBACK_MISMATCH: &str = "claims-readback-mismatch";
     pub const BOX_USER_UNISSUABLE: &str = "box-user-unissuable";
     pub const STREAMS_UNAVAILABLE: &str = "streams-unavailable";
+    pub const CENSUS_UNAVAILABLE: &str = "census-unavailable";
     /// A module durable could not be planned or reconciled, or its stream could not be
     /// inspected for orphans. Immutable mismatches leave the cursor in place.
     pub const MODULE_DURABLES_UNAVAILABLE: &str = "module-durables-unavailable";
@@ -426,7 +429,7 @@ pub async fn boot(
         .as_ref()
         .and_then(|claims| claims["iat"].as_i64())
         .unwrap_or_default();
-    let claims = AccountClaims {
+    let mut claims = AccountClaims {
         account_public: account.account_public.clone(),
         name: account.acct.clone(),
         signing_keys: vec![encode_public(NkeyRole::Account, &box_root.public)],
@@ -534,6 +537,18 @@ pub async fn boot(
         .own_process()
         .await
         .map_err(|error| Failure::retry(cause::OWN_CENSUS_UNWRITTEN, error))?;
+    // Issuance cannot see a box plane until this boot returns Ready, so no fresh
+    // credential can race the census snapshot and be revoked by this sweep.
+    grant_changes::revoke_changed(
+        deps.credentials.as_ref(),
+        system.as_ref(),
+        box_plane.as_ref(),
+        &names,
+        &own.module_id,
+        &signer_id,
+        &mut claims,
+    )
+    .await?;
     let own_subject = names
         .census_subject(&own.module_id)
         .map_err(|error| Failure::stop(cause::NAMING_CONSTRUCTOR_ABSENT, error.to_string()))?;

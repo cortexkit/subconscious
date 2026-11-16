@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.3
+
+- Adopt cortexkit-bus-naming 0.4.4: the `astrocyte.multiplier` bucket takes
+  values up to 64 KiB (8 MiB in total), up from 8 KiB, so per-plan multiplier
+  entries of 14 to 16 KiB fit. An existing bucket's limits are raised in place
+  at boot; its keys and history stay.
+
 ## 0.7.2
 
 - Record a digest of each issued module grant in the census (ck-bus's bucket

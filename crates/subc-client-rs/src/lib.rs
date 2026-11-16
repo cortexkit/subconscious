@@ -2972,6 +2972,14 @@ where
     )
 }
 
+fn registration_channel_exit_code(result: &Result<ConnectionEnd, SubcModuleError>) -> i32 {
+    if matches!(result, Ok(ConnectionEnd::Goodbye)) {
+        0
+    } else {
+        1
+    }
+}
+
 fn connection_serve_future_with_options<R, H>(
     mut read_half: R,
     tx: mpsc::Sender<Frame>,
@@ -3071,7 +3079,7 @@ where
         let loop_result = match loop_result {
             Ok(end) => {
                 handler.on_connection_end(end).await;
-                Ok(())
+                Ok(end)
             }
             Err(error) => Err(error),
         };
@@ -3095,9 +3103,11 @@ where
         if options.registration_channel && !locally_closed {
             // An inherited registration cannot be recreated. Finish the hook
             // and teardown before letting the supervisor restart the process.
-            std::process::exit(if loop_result.is_ok() { 0 } else { 1 });
+            // The supervisor treats an unrequested clean exit as a stop, so
+            // only a daemon GOODBYE may exit successfully.
+            std::process::exit(registration_channel_exit_code(&loop_result));
         }
-        match (loop_result, writer_result) {
+        match (loop_result.map(|_| ()), writer_result) {
             (Err(SubcModuleError::WriterClosed), Err(writer_error)) => Err(writer_error),
             (Err(loop_err), _) => Err(loop_err),
             (Ok(()), Ok(())) => Ok(()),

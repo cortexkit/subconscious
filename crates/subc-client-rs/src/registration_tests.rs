@@ -239,9 +239,9 @@ async fn child_case(scenario: &str, test: &str, path: &Path) {
         .unwrap()
         .unwrap();
     assert!(supervised());
-    if scenario == "eof" {
+    if scenario == "eof" || scenario == "goodbye" {
         serving.await.unwrap();
-        panic!("adopted channel EOF returned instead of ending the process");
+        panic!("adopted channel {scenario} returned instead of ending the process");
     }
     if scenario == "close" || scenario == "provenance" {
         stop.stop();
@@ -428,6 +428,10 @@ async fn child_case(scenario: &str, test: &str, path: &Path) {
 }
 
 async fn assert_child(child: &mut std::process::Child) -> String {
+    assert_child_exit(child, 0).await
+}
+
+async fn assert_child_exit(child: &mut std::process::Child, expected_code: i32) -> String {
     let deadline = Instant::now() + BUDGET;
     loop {
         if let Some(status) = child.try_wait().unwrap() {
@@ -446,9 +450,10 @@ async fn assert_child(child: &mut std::process::Child) -> String {
                 .unwrap()
                 .read_to_string(&mut stderr)
                 .unwrap();
-            assert!(
-                status.success(),
-                "child failed: {status}\n{stdout}\n{stderr}"
+            assert_eq!(
+                status.code(),
+                Some(expected_code),
+                "unexpected child exit: {status}\n{stdout}\n{stderr}"
             );
             return stdout;
         }
@@ -817,12 +822,18 @@ async fn run(scenario: &'static str, test: &str) {
         );
         return;
     }
-    if scenario == "eof" {
-        registration.shutdown().await.unwrap();
-        drop(registration);
-        let output = assert_child(&mut child).await;
+    if scenario == "eof" || scenario == "goodbye" {
+        if scenario == "goodbye" {
+            let goodbye =
+                Frame::build(FrameType::Goodbye, control_flags(), 0, 0, 0, Vec::new()).unwrap();
+            write_frame(&mut registration, &goodbye).await.unwrap();
+        } else {
+            registration.shutdown().await.unwrap();
+            drop(registration);
+        }
+        let output = assert_child_exit(&mut child, if scenario == "goodbye" { 0 } else { 1 }).await;
         assert!(
-            output.contains("HOOK_eof"),
+            output.contains(&format!("HOOK_{scenario}")),
             "process exited without its serve hook: {output}"
         );
 
@@ -999,6 +1010,7 @@ macro_rules! contract_test {
     };
 }
 contract_test!(adopted_eof_exits_after_hook, "eof");
+contract_test!(adopted_goodbye_exits_after_hook, "goodbye");
 contract_test!(custom_loop_adopts_and_claim_binds_consumer, "custom");
 contract_test!(
     custom_loop_without_channel_uses_legacy_connection,

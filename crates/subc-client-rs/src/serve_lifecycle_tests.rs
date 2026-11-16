@@ -3,6 +3,40 @@ use std::task::{Context, Poll};
 use tokio::io::{DuplexStream, ReadBuf};
 use tokio::sync::Notify;
 
+#[test]
+fn registration_channel_goodbye_exits_zero() {
+    assert_eq!(
+        registration_channel_exit_code(&Ok(ConnectionEnd::Goodbye)),
+        0
+    );
+}
+
+#[test]
+fn registration_channel_reset_exits_nonzero() {
+    assert_eq!(registration_channel_exit_code(&Ok(ConnectionEnd::Reset)), 1);
+}
+
+#[test]
+fn registration_channel_eof_exits_nonzero() {
+    assert_eq!(registration_channel_exit_code(&Ok(ConnectionEnd::Eof)), 1);
+}
+
+#[test]
+fn registration_channel_closed_exits_nonzero() {
+    assert_eq!(
+        registration_channel_exit_code(&Ok(ConnectionEnd::Closed)),
+        1
+    );
+}
+
+#[test]
+fn registration_channel_error_exits_nonzero() {
+    assert_eq!(
+        registration_channel_exit_code(&Err(SubcModuleError::WriterClosed)),
+        1
+    );
+}
+
 struct Echo;
 #[async_trait]
 impl ModuleHandler for Echo {

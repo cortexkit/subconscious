@@ -77,13 +77,16 @@ async function run(mode: string): Promise<{code: number; out: string; err: strin
         registered = true;
         if (mode === "before-hello") { socket.end(); return; }
         await reply(FrameType.HelloAck, {negotiated_ver: PROTOCOL_VERSION, subc_ops: ["claim.mint", "catalog.list", "scope.sync", "scope.apply"]});
-        if (mode === "eof") {
+        if (mode === "eof" || mode === "goodbye") {
           // A PONG proves the provider consumed HELLO_ACK and started serving.
           // Windows disconnect discards unread pipe bytes, unlike Unix EOF.
           await sock.write(encodeFrame(buildFrame(FrameType.Ping, 0, 0, 0, 991n, new Uint8Array())), Date.now() + 8000);
           const pong = await sock.readFrame(Date.now() + 8000, Date.now() + 8000);
           expect(pong.header.ty).toBe(FrameType.Pong);
           expect(pong.header.corr).toBe(991n);
+          if (mode === "goodbye") {
+            await sock.write(encodeFrame(buildFrame(FrameType.Goodbye, 0, 0, 0, 0n, new Uint8Array())), Date.now() + 8000);
+          }
           socket.end(); return;
         }
       } else if (fallback && op === "server.describe") {
@@ -345,6 +348,12 @@ test("an inherited registration variable without its descriptor connects direct"
 test("adopted registration EOF ends the process even with reconnect requested", async () => {
   const result = await run("eof");
   expect(result.code).toBe(1); expect(result.out).toContain("CLOSED_HOOK");
+  expect(result.operations).toEqual(["HELLO"]);
+}, 15000);
+
+test("adopted registration GOODBYE exits zero after the closed hook", async () => {
+  const result = await run("goodbye");
+  expect(result.code).toBe(0); expect(result.out).toContain("CLOSED_HOOK");
   expect(result.operations).toEqual(["HELLO"]);
 }, 15000);
 

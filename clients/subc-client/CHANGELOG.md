@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.26.4
+
+- Exit successfully after a daemon GOODBYE on an inherited registration
+  connection. Unexpected connection loss still exits with a failure status so
+  the supervisor restarts the module, and local close still returns normally.
+
 ## 0.26.3
 
 - Register additional providers under a supervised owner's reserved prefix with

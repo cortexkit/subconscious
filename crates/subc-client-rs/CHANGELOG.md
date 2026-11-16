@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.41.1
+
+- Exit with a failure status when an inherited registration connection ends
+  without a daemon GOODBYE, so the supervisor restarts the module instead of
+  leaving it stopped. Run the connection-end hook before exiting as before.
+
 ## 0.41.0
 
 - Expose registration-channel adoption and a `ClaimMinter` seam for modules that

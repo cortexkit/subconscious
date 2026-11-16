@@ -134,7 +134,7 @@ if (mode === "close") {
   await new Promise(r => setTimeout(r, 30));
   console.log("LOCAL_CLOSE_OK");
   process.exit(0);
-} else if (mode === "eof") {
+} else if (mode === "eof" || mode === "goodbye") {
   setInterval(() => {}, 1000);
   await provider.closed;
   console.log("CLOSED_HOOK");

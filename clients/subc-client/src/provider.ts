@@ -815,7 +815,12 @@ export class SubcProvider {
       owner.bind((body) => provider.configControl(body));
       void provider.closed.then(() => {
         owner.broker?.close();
-        if (!provider.locallyClosed) setImmediate(() => process.exit(1));
+        if (!provider.locallyClosed) {
+          // An unrequested clean exit is a stop to the supervisor. Only the
+          // daemon's channel-0 GOODBYE should stop rather than restart a module.
+          const goodbye = provider.closedErr instanceof SubcProviderError && provider.closedErr.code === "connection_closed";
+          setImmediate(() => process.exit(goodbye ? 0 : 1));
+        }
       });
     }
     await provider.config?.refresh();

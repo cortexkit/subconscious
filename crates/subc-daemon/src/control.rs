@@ -17454,6 +17454,17 @@ mod tests {
         handler.route_outages.record_accepted("outage-restart");
         assert_eq!(outage_lines(&capture, OUTAGE_RECOVERED).len(), 1);
 
+        // The missing connection file makes the stub exit immediately. Restart
+        // is deliberately deferred while that exit is being recorded; Failed
+        // means the zero restart budget and terminal record have been published.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while module.state().unwrap() != crate::ModuleState::Failed {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stub exit must be recorded before the operator restart");
+
         let restart = handler
             .handle_control_frame(&ctx, supervisor_restart_frame(392, "outage-restart"))
             .await

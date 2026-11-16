@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.49.2
+
+- Test-only: wait for the stub's recorded exit before testing operator-restart
+  outage logging, so the restart cannot race the supervisor's exit observation.
+
 ## 0.49.1
 
 - Enable the macOS operator-app policy for the signed Alfonso desktop app,

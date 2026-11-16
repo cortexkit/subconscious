@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.40
+
+- macOS: accept a registration channel whose inode the daemon read as zero while
+  the child reads a real one, falling back to the socket-name and peer-PID checks
+  as for a child-side zero. Seen on a macOS VM, where every module otherwise fell
+  back to the launch nonce.
+
 ## 0.1.39
 
 - Add all-component no-symlink directory opens and a retained-handle query for

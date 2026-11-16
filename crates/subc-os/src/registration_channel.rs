@@ -503,8 +503,11 @@ mod unix {
             if stat.st_mode & libc::S_IFMT != libc::S_IFSOCK {
                 return Err(RegistrationRefusal::NotSocket);
             }
-            // Darwin commonly reports zero for socket inodes. A nonzero inode
-            // remains binding; zero falls back to socket names and peer PID.
+            // Darwin commonly reports zero for socket inodes, on either end: the
+            // daemon's fstat may read zero for a socket the child later reads as
+            // nonzero. When both sides know an inode it stays binding; when
+            // either side read zero, the check falls back to socket names and
+            // peer PID.
             // ino_t is narrower than u64 on some Unix targets.
             #[allow(clippy::unnecessary_cast)]
             let actual_inode = stat.st_ino as u64;
@@ -569,7 +572,7 @@ mod unix {
     }
 
     pub(super) fn inode_matches(actual: u64, expected: u64) -> bool {
-        (cfg!(target_os = "macos") && actual == 0) || actual == expected
+        (cfg!(target_os = "macos") && (actual == 0 || expected == 0)) || actual == expected
     }
 }
 
@@ -868,6 +871,39 @@ mod tests {
         eprintln!("Darwin zero-inode fallback: socketpair adopted; non-socket, named peer and wrong peer PID refused");
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_daemon_side_zero_inode_keeps_the_other_checks() {
+        // The daemon wrote inode 0 while the child reads a real one, as seen on
+        // a macOS VM. Adoption still requires an unnamed socket from the daemon.
+        fn some_inode(fd: i32) -> std::io::Result<libc::stat> {
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: the writable output is read only after successful fstat.
+            if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut stat = unsafe { stat.assume_init() };
+            stat.st_ino = 2;
+            Ok(stat)
+        }
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let fd = stream.into_raw_fd();
+        let decision =
+            unix::adopt_with_stat(format!("{fd}:0").as_ref(), std::process::id(), some_inode);
+        assert!(
+            decision.supervised,
+            "daemon-side zero inode refused: {:?}",
+            decision.refusal
+        );
+        drop(decision.take().unwrap());
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let value = format!("{}:0", stream.as_raw_fd());
+        assert_eq!(
+            unix::adopt_with_stat(value.as_ref(), std::process::id() + 1, some_inode).refusal,
+            Some(RegistrationRefusal::WrongPeer)
+        );
+    }
+
     #[test]
     fn unix_channel_parent_prepares_cloexec_sources() {
         let (parent, child, metadata) = registration_socketpair().unwrap();
@@ -892,6 +928,13 @@ mod tests {
             unix::inode_matches(0, 13),
             "zero inode must retain the other three validators"
         );
+        #[cfg(target_os = "macos")]
+        assert!(
+            unix::inode_matches(2, 0),
+            "a daemon that read zero must fall back like a child that read zero"
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert!(!unix::inode_matches(2, 0));
     }
 
     #[test]

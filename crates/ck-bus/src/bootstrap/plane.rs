@@ -15,7 +15,9 @@ use std::{fmt, sync::Arc, time::Duration};
 
 use async_nats::jetstream::{self, kv, stream};
 use async_trait::async_trait;
-use cortexkit_bus_naming::{AccountNames, DiscardPolicy, StreamKind, StreamSpec, MIB};
+use cortexkit_bus_naming::{
+    AccountNames, DiscardPolicy, ModuleBucket, StreamKind, StreamSpec, MIB,
+};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, watch};
@@ -73,6 +75,46 @@ pub fn census_config(account: &AccountNames) -> stream::Config {
         num_replicas: 1,
         ..Default::default()
     }
+}
+
+/// A module KV store, derived from the reviewed naming table. Like census, it is
+/// created through its backing stream so bootstrap needs no account-wide API grant.
+pub fn module_bucket_config(
+    account: &AccountNames,
+    bucket: &ModuleBucket,
+) -> Result<stream::Config, PlaneError> {
+    let name = account
+        .module_bucket_name(bucket.owner, bucket.name)
+        .map_err(|error| PlaneError::new(error.to_string()))?;
+    Ok(stream::Config {
+        name: format!("KV_{name}"),
+        subjects: vec![format!("$KV.{name}.>")],
+        max_messages_per_subject: i64::from(bucket.history),
+        max_message_size: i32::try_from(bucket.max_value_bytes)
+            .map_err(|_| PlaneError::new(format!("module bucket {name}: value cap exceeds i32")))?,
+        max_bytes: i64::try_from(bucket.max_bytes)
+            .map_err(|_| PlaneError::new(format!("module bucket {name}: total cap exceeds i64")))?,
+        max_age: bucket.ttl.map(Duration::from_secs).unwrap_or_default(),
+        max_messages: -1,
+        // This is a per-bucket bound, not a per-principal reservation: a reader
+        // can block new watches, even the owner's, but not puts, key reads, or other buckets.
+        // Unbounded watches would let one reader grow server memory for every module.
+        max_consumers: (8 * (1 + bucket.readers.len())).try_into().map_err(|_| {
+            PlaneError::new(format!("module bucket {name}: consumer cap exceeds i32"))
+        })?,
+        duplicate_window: bucket
+            .ttl
+            .map(Duration::from_secs)
+            .unwrap_or(CENSUS_DUPLICATE_WINDOW)
+            .min(CENSUS_DUPLICATE_WINDOW),
+        allow_rollup: true,
+        deny_delete: true,
+        allow_direct: true,
+        discard: stream::DiscardPolicy::New,
+        storage: stream::StorageType::File,
+        num_replicas: 1,
+        ..Default::default()
+    })
 }
 
 /// A shipped stream as ck-bus creates it. Optional limits stay at the client's
@@ -181,6 +223,14 @@ pub trait BoxPlane: Send + Sync {
     /// Creates the census bucket's backing stream if absent, and brings an existing one
     /// to the configuration below (its messages are kept).
     async fn ensure_census(&self, account: &AccountNames) -> Result<(), PlaneError>;
+    /// Ensures a declared module KV store, retaining its keys on reconciliation.
+    async fn ensure_module_bucket(
+        &self,
+        _account: &AccountNames,
+        _bucket: &ModuleBucket,
+    ) -> Result<(), PlaneError> {
+        Err(PlaneError::new("this plane cannot ensure module buckets"))
+    }
     async fn ensure_stream(&self, spec: &StreamSpec) -> Result<(), PlaneError>;
     async fn publish(&self, subject: &str, payload: Vec<u8>) -> Result<(), PlaneError>;
     /// A projection may checkpoint only after JetStream acknowledges storage.
@@ -634,6 +684,60 @@ pub struct NatsBox {
 
 #[async_trait]
 impl BoxPlane for NatsBox {
+    async fn ensure_module_bucket(
+        &self,
+        account: &AccountNames,
+        bucket: &ModuleBucket,
+    ) -> Result<(), PlaneError> {
+        let desired = module_bucket_config(account, bucket)?;
+        let what = format!("module bucket {}", desired.name);
+        let reply = self
+            .api(format!("STREAM.INFO.{}", desired.name), json!({}), &what)
+            .await?;
+        if api_error_code(&reply) == Some(STREAM_NOT_FOUND) {
+            return self.create(desired).await;
+        }
+        api_refusal(&reply, &what)?;
+        let mut config: stream::Config = serde_json::from_value(reply["config"].clone())
+            .map_err(|error| PlaneError::new(format!("{what}: {error}")))?;
+        // A bucket must remain a plain, file-backed limits stream. Never replace a
+        // conflicting stream: recreation would silently discard the existing keys.
+        for (setting, differs) in [
+            ("storage", config.storage != desired.storage),
+            ("retention", config.retention != desired.retention),
+            ("mirror", config.mirror.is_some()),
+            ("sources", config.sources.is_some()),
+            ("sealed", config.sealed),
+        ] {
+            if differs {
+                return Err(PlaneError::new(format!(
+                    "module-bucket-immutable: {what}: incompatible {setting}; keys retained"
+                )));
+            }
+        }
+        config.subjects = desired.subjects;
+        config.max_messages_per_subject = desired.max_messages_per_subject;
+        config.max_message_size = desired.max_message_size;
+        config.max_bytes = desired.max_bytes;
+        config.max_age = desired.max_age;
+        config.duplicate_window = desired.duplicate_window;
+        config.max_messages = desired.max_messages;
+        config.max_consumers = desired.max_consumers;
+        config.allow_rollup = desired.allow_rollup;
+        config.deny_delete = desired.deny_delete;
+        config.allow_direct = desired.allow_direct;
+        config.discard = desired.discard;
+        self.jetstream
+            .update_stream(config)
+            .await
+            .map_err(|error| {
+                PlaneError::new(format!(
+                    "module-bucket-reconcile-refused: {what}: {error}; keys retained"
+                ))
+            })?;
+        Ok(())
+    }
+
     async fn ensure_census(&self, account: &AccountNames) -> Result<(), PlaneError> {
         let config = census_config(account);
         // Update first, create when absent: a census stream an earlier ck-bus created

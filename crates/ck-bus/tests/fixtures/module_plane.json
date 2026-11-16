@@ -1,0 +1,476 @@
+{
+  "account": "box_upgradegolden",
+  "buckets": [
+    {
+      "allow_direct": true,
+      "allow_rollup_hdrs": true,
+      "consumer_limits": null,
+      "deny_delete": true,
+      "discard": "new",
+      "duplicate_window": 10000000000,
+      "max_age": 10000000000,
+      "max_bytes": 2097152,
+      "max_consumers": 16,
+      "max_msg_size": 2048,
+      "max_msgs": -1,
+      "max_msgs_per_subject": 1,
+      "name": "KV_CK_BOX_UPGRADEGOLDEN_AFT_STATUS",
+      "num_replicas": 1,
+      "retention": "limits",
+      "storage": "file",
+      "subjects": [
+        "$KV.CK_BOX_UPGRADEGOLDEN_AFT_STATUS.>"
+      ]
+    },
+    {
+      "allow_direct": true,
+      "allow_rollup_hdrs": true,
+      "consumer_limits": null,
+      "deny_delete": true,
+      "discard": "new",
+      "duplicate_window": 120000000000,
+      "max_age": 0,
+      "max_bytes": 1048576,
+      "max_consumers": 16,
+      "max_msg_size": 8192,
+      "max_msgs": -1,
+      "max_msgs_per_subject": 1,
+      "name": "KV_CK_BOX_UPGRADEGOLDEN_ASTROCYTE_MULTIPLIER",
+      "num_replicas": 1,
+      "retention": "limits",
+      "storage": "file",
+      "subjects": [
+        "$KV.CK_BOX_UPGRADEGOLDEN_ASTROCYTE_MULTIPLIER.>"
+      ]
+    },
+    {
+      "allow_direct": true,
+      "allow_rollup_hdrs": true,
+      "consumer_limits": null,
+      "deny_delete": true,
+      "discard": "new",
+      "duplicate_window": 120000000000,
+      "max_age": 0,
+      "max_bytes": 16777216,
+      "max_consumers": 16,
+      "max_msg_size": 256,
+      "max_msgs": -1,
+      "max_msgs_per_subject": 1,
+      "name": "KV_CK_BOX_UPGRADEGOLDEN_ASTROCYTE_READ_MARKS",
+      "num_replicas": 1,
+      "retention": "limits",
+      "storage": "file",
+      "subjects": [
+        "$KV.CK_BOX_UPGRADEGOLDEN_ASTROCYTE_READ_MARKS.>"
+      ]
+    },
+    {
+      "allow_direct": true,
+      "allow_rollup_hdrs": true,
+      "consumer_limits": null,
+      "deny_delete": true,
+      "discard": "new",
+      "duplicate_window": 120000000000,
+      "max_age": 0,
+      "max_bytes": 33554432,
+      "max_consumers": 32,
+      "max_msg_size": 512,
+      "max_msgs": -1,
+      "max_msgs_per_subject": 1,
+      "name": "KV_CK_BOX_UPGRADEGOLDEN_ENTORHINAL_CHANGES",
+      "num_replicas": 1,
+      "retention": "limits",
+      "storage": "file",
+      "subjects": [
+        "$KV.CK_BOX_UPGRADEGOLDEN_ENTORHINAL_CHANGES.>"
+      ]
+    },
+    {
+      "allow_direct": true,
+      "allow_rollup_hdrs": true,
+      "consumer_limits": null,
+      "deny_delete": true,
+      "discard": "new",
+      "duplicate_window": 120000000000,
+      "max_age": 0,
+      "max_bytes": 16777216,
+      "max_consumers": 16,
+      "max_msg_size": 1024,
+      "max_msgs": -1,
+      "max_msgs_per_subject": 1,
+      "name": "KV_CK_BOX_UPGRADEGOLDEN_PREFRONTAL_CORE_SESSION_LIVENESS",
+      "num_replicas": 1,
+      "retention": "limits",
+      "storage": "file",
+      "subjects": [
+        "$KV.CK_BOX_UPGRADEGOLDEN_PREFRONTAL_CORE_SESSION_LIVENESS.>"
+      ]
+    },
+    {
+      "allow_direct": true,
+      "allow_rollup_hdrs": true,
+      "consumer_limits": null,
+      "deny_delete": true,
+      "discard": "new",
+      "duplicate_window": 120000000000,
+      "max_age": 0,
+      "max_bytes": 33554432,
+      "max_consumers": 16,
+      "max_msg_size": 262144,
+      "max_msgs": -1,
+      "max_msgs_per_subject": 1,
+      "name": "KV_CK_BOX_UPGRADEGOLDEN_AFT_VIEWS",
+      "num_replicas": 1,
+      "retention": "limits",
+      "storage": "file",
+      "subjects": [
+        "$KV.CK_BOX_UPGRADEGOLDEN_AFT_VIEWS.>"
+      ]
+    },
+    {
+      "allow_direct": true,
+      "allow_rollup_hdrs": true,
+      "consumer_limits": null,
+      "deny_delete": true,
+      "discard": "new",
+      "duplicate_window": 120000000000,
+      "max_age": 0,
+      "max_bytes": 33554432,
+      "max_consumers": 16,
+      "max_msg_size": 262144,
+      "max_msgs": -1,
+      "max_msgs_per_subject": 1,
+      "name": "KV_CK_BOX_UPGRADEGOLDEN_CEREBELLUM_VIEWS",
+      "num_replicas": 1,
+      "retention": "limits",
+      "storage": "file",
+      "subjects": [
+        "$KV.CK_BOX_UPGRADEGOLDEN_CEREBELLUM_VIEWS.>"
+      ]
+    }
+  ],
+  "durables": [
+    {
+      "ack_wait_secs": 30,
+      "durable": "m_basal",
+      "filter_subjects": [
+        "ck.box_upgradegolden.event.>"
+      ],
+      "max_ack_pending": 1000,
+      "max_deliver": -1,
+      "stream": "CK_BOX_UPGRADEGOLDEN_EVENT"
+    },
+    {
+      "ack_wait_secs": 30,
+      "durable": "m_prefrontal-core",
+      "filter_subjects": [
+        "ck.box_upgradegolden.event.broca.>",
+        "ck.box_upgradegolden.event.basal.flow_instance_created.v1",
+        "ck.box_upgradegolden.event.basal.flow_instance_extended.v1",
+        "ck.box_upgradegolden.event.basal.flow_instance_ended.v1",
+        "ck.box_upgradegolden.event.basal.flow_instance_expired.v1",
+        "ck.box_upgradegolden.event.basal.flow_instance_rescheduled.v1",
+        "ck.box_upgradegolden.event.aft.late_result_ready.v1.prefrontal-core",
+        "ck.box_upgradegolden.event.basal.late_result_ready.v1.prefrontal-core",
+        "ck.box_upgradegolden.event.cerebellum.late_result_ready.v1.prefrontal-core",
+        "ck.box_upgradegolden.event.fusiform.catalog_changed.v1",
+        "ck.box_upgradegolden.event.basal.flow_owner_notice.v1",
+        "ck.box_upgradegolden.event.cingulate.card_settled.v1.prefrontal-core"
+      ],
+      "max_ack_pending": 1000,
+      "max_deliver": -1,
+      "stream": "CK_BOX_UPGRADEGOLDEN_EVENT"
+    },
+    {
+      "ack_wait_secs": 30,
+      "durable": "m_astrocyte",
+      "filter_subjects": [
+        "ck.box_upgradegolden.event.insula.>",
+        "ck.box_upgradegolden.event.broca.step.finished.v1",
+        "ck.box_upgradegolden.event.thalamus-harness.step.finished.v1",
+        "ck.box_upgradegolden.event.thalamus.step.finished.v1"
+      ],
+      "max_ack_pending": 1000,
+      "max_deliver": -1,
+      "stream": "CK_BOX_UPGRADEGOLDEN_EVENT"
+    },
+    {
+      "ack_wait_secs": 30,
+      "durable": "m_prefrontal-routing",
+      "filter_subjects": [
+        "ck.box_upgradegolden.event.insula.>"
+      ],
+      "max_ack_pending": 1000,
+      "max_deliver": -1,
+      "stream": "CK_BOX_UPGRADEGOLDEN_EVENT"
+    },
+    {
+      "ack_wait_secs": 30,
+      "durable": "m_striatum",
+      "filter_subjects": [
+        "ck.box_upgradegolden.event.insula.>",
+        "ck.box_upgradegolden.event.broca.route_fact.v1",
+        "ck.box_upgradegolden.event.thalamus-harness.route_fact.v1",
+        "ck.box_upgradegolden.event.colliculus.route_fact.v1",
+        "ck.box_upgradegolden.event.prefrontal-core.route_fact.v1",
+        "ck.box_upgradegolden.event.plexus.route_fact.v1",
+        "ck.box_upgradegolden.event.fusiform.catalog_changed.v1"
+      ],
+      "max_ack_pending": 1000,
+      "max_deliver": -1,
+      "stream": "CK_BOX_UPGRADEGOLDEN_EVENT"
+    },
+    {
+      "ack_wait_secs": 30,
+      "durable": "m_magic-context",
+      "filter_subjects": [
+        "ck.box_upgradegolden.event.thalamus-harness.compaction.>",
+        "ck.box_upgradegolden.event.thalamus.compaction.>",
+        "ck.box_upgradegolden.event.broca.compaction.>"
+      ],
+      "max_ack_pending": 1000,
+      "max_deliver": -1,
+      "stream": "CK_BOX_UPGRADEGOLDEN_EVENT"
+    },
+    {
+      "ack_wait_secs": 30,
+      "durable": "m_magic-context_runs",
+      "filter_subjects": [
+        "ck.box_upgradegolden.event.thalamus-harness.turn_ended.v1",
+        "ck.box_upgradegolden.event.broca.run.ended.v1"
+      ],
+      "max_ack_pending": 1000,
+      "max_deliver": -1,
+      "stream": "CK_BOX_UPGRADEGOLDEN_EVENT"
+    },
+    {
+      "ack_wait_secs": 30,
+      "durable": "m_thalamus-harness",
+      "filter_subjects": [
+        "ck.box_upgradegolden.event.magic-context.compaction.>"
+      ],
+      "max_ack_pending": 1000,
+      "max_deliver": -1,
+      "stream": "CK_BOX_UPGRADEGOLDEN_EVENT"
+    },
+    {
+      "ack_wait_secs": 30,
+      "durable": "m_thalamus",
+      "filter_subjects": [
+        "ck.box_upgradegolden.event.magic-context.compaction.>"
+      ],
+      "max_ack_pending": 1000,
+      "max_deliver": -1,
+      "stream": "CK_BOX_UPGRADEGOLDEN_EVENT"
+    },
+    {
+      "ack_wait_secs": 30,
+      "durable": "m_broca",
+      "filter_subjects": [
+        "ck.box_upgradegolden.event.magic-context.compaction.>",
+        "ck.box_upgradegolden.event.aft.late_result_ready.v1.broca",
+        "ck.box_upgradegolden.event.cerebellum.late_result_ready.v1.broca",
+        "ck.box_upgradegolden.event.prefrontal-core.late_result_ready.v1.broca",
+        "ck.box_upgradegolden.event.basal.late_result_ready.v1.broca",
+        "ck.box_upgradegolden.event.fusiform.catalog_changed.v1",
+        "ck.box_upgradegolden.event.cingulate.card_settled.v1.broca"
+      ],
+      "max_ack_pending": 1000,
+      "max_deliver": -1,
+      "stream": "CK_BOX_UPGRADEGOLDEN_EVENT"
+    },
+    {
+      "ack_wait_secs": 30,
+      "durable": "m_occipital",
+      "filter_subjects": [
+        "ck.box_upgradegolden.event.thalamus-harness.send_state.v1.occipital",
+        "ck.box_upgradegolden.event.broca.send_state.v1.occipital",
+        "ck.box_upgradegolden.event.cerebellum.tool_display.v1",
+        "ck.box_upgradegolden.event.aft.display_record_ready.v1",
+        "ck.box_upgradegolden.event.fusiform.catalog_changed.v1"
+      ],
+      "max_ack_pending": 1000,
+      "max_deliver": -1,
+      "stream": "CK_BOX_UPGRADEGOLDEN_EVENT"
+    },
+    {
+      "ack_wait_secs": 30,
+      "durable": "m_cerebellum",
+      "filter_subjects": [
+        "ck.box_upgradegolden.event.thalamus-harness.turn_started.v1",
+        "ck.box_upgradegolden.event.thalamus-harness.turn_ended.v1"
+      ],
+      "max_ack_pending": 1000,
+      "max_deliver": -1,
+      "stream": "CK_BOX_UPGRADEGOLDEN_EVENT"
+    },
+    {
+      "ack_wait_secs": 30,
+      "durable": "m_thalamus-harness_late_results",
+      "filter_subjects": [
+        "ck.box_upgradegolden.event.aft.late_result_ready.v1.thalamus-harness",
+        "ck.box_upgradegolden.event.cerebellum.late_result_ready.v1.thalamus-harness",
+        "ck.box_upgradegolden.event.basal.late_result_ready.v1.thalamus-harness",
+        "ck.box_upgradegolden.event.prefrontal-core.late_result_ready.v1.thalamus-harness"
+      ],
+      "max_ack_pending": 1000,
+      "max_deliver": -1,
+      "stream": "CK_BOX_UPGRADEGOLDEN_EVENT"
+    },
+    {
+      "ack_wait_secs": 30,
+      "durable": "m_astrocyte_payer",
+      "filter_subjects": [
+        "ck.box_upgradegolden.event.thalamus-harness.payer_row.v1"
+      ],
+      "max_ack_pending": 1000,
+      "max_deliver": -1,
+      "stream": "CK_BOX_UPGRADEGOLDEN_EVENT"
+    },
+    {
+      "ack_wait_secs": 30,
+      "durable": "m_astrocyte_media_usage",
+      "filter_subjects": [
+        "ck.box_upgradegolden.event.colliculus.usage_recorded.v1"
+      ],
+      "max_ack_pending": 1000,
+      "max_deliver": -1,
+      "stream": "CK_BOX_UPGRADEGOLDEN_EVENT"
+    },
+    {
+      "ack_wait_secs": 30,
+      "durable": "m_astrocyte_catalog",
+      "filter_subjects": [
+        "ck.box_upgradegolden.event.fusiform.catalog_changed.v1"
+      ],
+      "max_ack_pending": 1000,
+      "max_deliver": -1,
+      "stream": "CK_BOX_UPGRADEGOLDEN_EVENT"
+    },
+    {
+      "ack_wait_secs": 30,
+      "durable": "m_astrocyte_attribution",
+      "filter_subjects": [
+        "ck.box_upgradegolden.event.prefrontal-core.attribution_fact.v1",
+        "ck.box_upgradegolden.event.magic-context.attribution_fact.v1",
+        "ck.box_upgradegolden.event.entorhinal.placement_fact.v1",
+        "ck.box_upgradegolden.event.basal.attribution_fact.v1"
+      ],
+      "max_ack_pending": 1000,
+      "max_deliver": -1,
+      "stream": "CK_BOX_UPGRADEGOLDEN_EVENT"
+    },
+    {
+      "ack_wait_secs": 30,
+      "durable": "m_aft_sendstate",
+      "filter_subjects": [
+        "ck.box_upgradegolden.event.thalamus-harness.send_state.v1",
+        "ck.box_upgradegolden.event.broca.send_state.v1.aft"
+      ],
+      "max_ack_pending": 1000,
+      "max_deliver": -1,
+      "stream": "CK_BOX_UPGRADEGOLDEN_EVENT"
+    },
+    {
+      "ack_wait_secs": 30,
+      "durable": "m_aft_cards",
+      "filter_subjects": [
+        "ck.box_upgradegolden.event.cingulate.card_settled.v1.aft"
+      ],
+      "max_ack_pending": 1000,
+      "max_deliver": -1,
+      "stream": "CK_BOX_UPGRADEGOLDEN_EVENT"
+    },
+    {
+      "ack_wait_secs": 30,
+      "durable": "m_plexus",
+      "filter_subjects": [
+        "ck.box_upgradegolden.event.prefrontal-core.agent_changed.v1",
+        "ck.box_upgradegolden.event.cingulate.card_settled.v1.plexus"
+      ],
+      "max_ack_pending": 1000,
+      "max_deliver": -1,
+      "stream": "CK_BOX_UPGRADEGOLDEN_EVENT"
+    },
+    {
+      "ack_wait_secs": 30,
+      "durable": "m_wernicke_agents",
+      "filter_subjects": [
+        "ck.box_upgradegolden.event.prefrontal-core.agent_changed.v1"
+      ],
+      "max_ack_pending": 1000,
+      "max_deliver": -1,
+      "stream": "CK_BOX_UPGRADEGOLDEN_EVENT"
+    },
+    {
+      "ack_wait_secs": 30,
+      "durable": "m_colliculus_events",
+      "filter_subjects": [
+        "ck.box_upgradegolden.event.fusiform.catalog_changed.v1",
+        "ck.box_upgradegolden.event.prefrontal-core.board_changed.v1",
+        "ck.box_upgradegolden.event.magic-context.memory_changed.v1",
+        "ck.box_upgradegolden.event.thalamus-harness.turn_ended.v1",
+        "ck.box_upgradegolden.event.broca.run.ended.v1"
+      ],
+      "max_ack_pending": 1000,
+      "max_deliver": -1,
+      "stream": "CK_BOX_UPGRADEGOLDEN_EVENT"
+    },
+    {
+      "ack_wait_secs": 30,
+      "durable": "m_prefrontal-core",
+      "filter_subjects": [
+        "ck.box_upgradegolden.room.*.post"
+      ],
+      "max_ack_pending": 1000,
+      "max_deliver": -1,
+      "stream": "CK_BOX_UPGRADEGOLDEN_ROOM"
+    },
+    {
+      "ack_wait_secs": 30,
+      "durable": "m_prefrontal-core",
+      "filter_subjects": [
+        "ck.box_upgradegolden.inbox.head.*.ready",
+        "ck.box_upgradegolden.inbox.worker.*.ready"
+      ],
+      "max_ack_pending": 1,
+      "max_deliver": -1,
+      "stream": "CK_BOX_UPGRADEGOLDEN_INBOX"
+    },
+    {
+      "ack_wait_secs": 30,
+      "durable": "m_prefrontal-core",
+      "filter_subjects": [
+        "ck.box_upgradegolden.core_work.effect.*.run",
+        "ck.box_upgradegolden.core_work.consult.*.run",
+        "ck.box_upgradegolden.core_work.work.*.run",
+        "ck.box_upgradegolden.core_work.campaign.*.run",
+        "ck.box_upgradegolden.core_work.hire.*.run",
+        "ck.box_upgradegolden.core_work.spec.*.run"
+      ],
+      "max_ack_pending": 1,
+      "max_deliver": -1,
+      "stream": "CK_BOX_UPGRADEGOLDEN_CORE_WORK"
+    },
+    {
+      "ack_wait_secs": 30,
+      "durable": "c_ckbus_dead",
+      "filter_subjects": [
+        "ck.box_upgradegolden.effect.dead"
+      ],
+      "max_ack_pending": 1000,
+      "max_deliver": -1,
+      "stream": "CK_BOX_UPGRADEGOLDEN_EFFECT_DEAD"
+    },
+    {
+      "ack_wait_secs": 30,
+      "durable": "c_ckbus_dead",
+      "filter_subjects": [
+        "ck.box_upgradegolden.delivery.dead"
+      ],
+      "max_ack_pending": 1000,
+      "max_deliver": -1,
+      "stream": "CK_BOX_UPGRADEGOLDEN_DELIVERY_DEAD"
+    }
+  ]
+}

@@ -34,6 +34,85 @@ const SERVED_BY: &str = "none";
 /// digest. These pin the principal and operation as well as the subject of every line.
 const LIVE_GOLDEN: &str = include_str!("fixtures/live_permissions.txt");
 
+/// Run explicitly after a reviewed naming-table update; ordinary suites never write fixtures.
+#[test]
+#[ignore = "explicit fixture regeneration only"]
+fn regenerate_local_permission_fixture() {
+    let rendered = grants::render_fixture_document(PINNED_GOLDEN_FIXTURE).unwrap();
+    let additions = golden_diff(&vendored_golden(), &rendered).unwrap();
+    fs::write(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/live_permissions.txt"),
+        format!("{}\n", additions.join("\n")),
+    )
+    .unwrap();
+}
+
+#[test]
+fn module_bucket_only_principal_is_in_the_validated_permission_golden() {
+    let fixture = PINNED_GOLDEN_FIXTURE;
+    let names = grants::derive_account(fixture.account).unwrap();
+    let golden = extended_golden();
+    grants::validate_document(&golden, &names).unwrap();
+    let writes = "$KV.CK_BOX_GOLDENFIXTURE_ENTORHINAL_CHANGES.>";
+    let watch = "$JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_PREFRONTAL_CORE_SESSION_LIVENESS";
+    let allowed = golden_allows(
+        &golden,
+        Principal::EventConsumer("entorhinal"),
+        Operation::Publish,
+    );
+    assert!(allowed.contains(writes));
+    assert!(allowed.contains(watch));
+    assert!(!allowed.contains("$KV.CK_BOX_GOLDENFIXTURE_PREFRONTAL_CORE_SESSION_LIVENESS.>"));
+}
+
+#[test]
+fn module_durables_are_granted_by_explicit_owner_for_every_table_row() {
+    let names = grants::derive_account("box_multidurables").unwrap();
+    for module in cortexkit_bus_naming::EVENT_CONSUMERS
+        .iter()
+        .map(|row| row.module_id)
+    {
+        let grant = grants::issued_grant(&names, module, "credential", &[]).unwrap();
+        for row in cortexkit_bus_naming::EVENT_CONSUMERS {
+            for subject in [
+                format!(
+                    "$JS.API.CONSUMER.INFO.{}.{}",
+                    names.streams().event,
+                    row.durable
+                ),
+                format!(
+                    "$JS.API.CONSUMER.MSG.NEXT.{}.{}",
+                    names.streams().event,
+                    row.durable
+                ),
+                format!("$JS.ACK.{}.{}.1", names.streams().event, row.durable),
+            ] {
+                assert_eq!(
+                    grant
+                        .publish_allow()
+                        .iter()
+                        .any(|pattern| subject_matches(pattern, &subject)),
+                    row.module_id == module,
+                    "{module}: {subject}"
+                );
+            }
+        }
+    }
+    let astrocyte = grants::issued_grant(&names, "astrocyte", "credential", &[]).unwrap();
+    for durable in [
+        "m_astrocyte",
+        "m_astrocyte_payer",
+        "m_astrocyte_media_usage",
+        "m_astrocyte_catalog",
+        "m_astrocyte_attribution",
+    ] {
+        assert!(astrocyte.publish_allow().contains(&format!(
+            "$JS.API.CONSUMER.MSG.NEXT.{}.{durable}",
+            names.streams().event
+        )));
+    }
+}
+
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/foundation")
 }
@@ -448,6 +527,12 @@ fn grant_generation_emits_each_role_set_from_the_pinned_literals() {
         .expect("thalamus's issued participant grant");
     let cerebellum = grants::issued_grant(&account, "cerebellum", "cerebellum", &[])
         .expect("cerebellum's issued participant grant");
+    let aft = grants::issued_grant(&account, "aft", "aft", &[]).unwrap();
+    let plexus = grants::issued_grant(&account, "plexus", "plexus", &[]).unwrap();
+    let colliculus = grants::issued_grant(&account, "colliculus", "colliculus", &[]).unwrap();
+    let wernicke = grants::issued_grant(&account, "wernicke", "wernicke", &[]).unwrap();
+    let entorhinal = grants::issued_grant(&account, "entorhinal", "entorhinal", &[]).unwrap();
+    let occipital = grants::issued_grant(&account, "occipital", "occipital", &[]).unwrap();
     let by_role = [
         (Principal::Participant, &participant),
         (Principal::DeliveryAuthority, &delivery),
@@ -465,6 +550,12 @@ fn grant_generation_emits_each_role_set_from_the_pinned_literals() {
         ),
         (Principal::EventConsumer("thalamus"), &thalamus),
         (Principal::EventConsumer("cerebellum"), &cerebellum),
+        (Principal::EventConsumer("aft"), &aft),
+        (Principal::EventConsumer("plexus"), &plexus),
+        (Principal::EventConsumer("colliculus"), &colliculus),
+        (Principal::EventConsumer("wernicke"), &wernicke),
+        (Principal::EventConsumer("entorhinal"), &entorhinal),
+        (Principal::EventConsumer("occipital"), &occipital),
     ];
 
     for (principal, grant) in by_role {
@@ -733,7 +824,7 @@ fn wired_grant_seam_generates_own_user_grants_for_the_given_account_and_key() {
     use runtime::{GrantGeneration, OwnUser};
     let fixture = PINNED_GOLDEN_FIXTURE;
     let account = grants::derive_account(fixture.account).expect("pinned account derives");
-    let golden = vendored_golden();
+    let golden = extended_golden();
     let bus = grants::GrantSeam
         .own_user_grant(OwnUser::BusModule, &account, fixture.module_id)
         .expect("the wired seam generates the bus-module grant");

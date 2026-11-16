@@ -524,8 +524,8 @@ Ownership of acts.
   incarnation's box users, pushes it, and reads it back through the claims lookup
   before treating it as applied (a claims update is saved without a trust or `iat`
   check). It then issues its box-account user, connects, and creates the census bucket
-  and all six streams with their literal bindings if absent, then the two module
-  durables (Module streams and durables, below). It does NOT revoke the
+  and all nine streams with their literal bindings if absent, then the module
+  durables (Module streams, durables and KV buckets, below). It does NOT revoke the
   previous incarnation's system-account users (trust-chain design 6.7): their seeds
   died with that process, so they cannot answer a nonce, and revoking them would
   re-sign the root-signed system account. Only ck-bus's system user holds the
@@ -557,31 +557,101 @@ Ownership of acts.
   spawning.
 - Dead-letter consumer: `c_ckbus_dead` on `CK_{ACCT}_EFFECT_DEAD`, deduplicating on
   message id, because the claimant publishes the record before `term()`.
-- Module streams and durables. Bootstrap creates the six streams of
-  `shipped_streams`: ROOM, WAKE, PEER, EFFECT, EFFECT_DEAD and EVENT. EVENT
+- Module streams, durables and KV buckets. Bootstrap creates the nine streams of
+  `shipped_streams`: ROOM, WAKE, PEER, EFFECT, EFFECT_DEAD, EVENT, INBOX, CORE_WORK
+  and DELIVERY_DEAD. The census and seven module KV backing streams are additional
+  streams, separate from that nine-stream message plane. EVENT
   (`CK_{ACCT}_EVENT`, binding `ck.{acct}.event.>`, subjects
-  `ck.{acct}.event.{module_id}.{event}.v{version}`) holds module events: 7 days, 1 GiB,
-  discard old, limits retention (not a work queue), and at most 10,000 messages per
-  subject (`max_msgs_per_subject`), so one noisy event cannot evict every other
-  subject's history. Only EVENT sets a per-subject cap; the other five are sent exactly
-  the configuration the five-stream ck-bus sent, so a plane built by it is upgraded in
-  place: the server accepts each create as the existing stream, and only EVENT and the
-  durables below are new. Bootstrap then creates two module durables, named
-  `module_consumer_name(module_id)` (`m_{module_id}`), on every boot and before either
-  module's first credential, so events and posts made before the module first connects
-  are kept for it:
+  `ck.{acct}.event.{module_id}.{event}.v{version}[.{reader}]`) holds module events:
+  7 days, 1 GiB, discard old, limits retention (not a work queue), and at most 100,000
+  messages per subject (`max_msgs_per_subject`). Optional reader suffixes follow the
+  version; publishers use `event_subject_with_reader`, and readers can use
+  `parse_event_subject` rather than assuming the last token is the version.
+  Existing streams and module readers reconcile in place, preserving stored messages
+  and acknowledgement floors. Bootstrap creates these readers before issuing module
+  credentials, so events and posts made before the module first connects are kept:
   - `m_basal` on `CK_{ACCT}_EVENT`, filtered on `ck.{acct}.event.>`: the flow engine
     reads every module event through it;
   - `m_prefrontal-core` on `CK_{ACCT}_ROOM`, filtered on the ROOM binding
     `ck.{acct}.room.*.post`: prefrontal-core is the only consumer of room posts.
+  - Every `EVENT_CONSUMERS` row on EVENT, using its explicit durable and filters.
+    A module may own several rows: astrocyte owns `m_astrocyte`,
+    `m_astrocyte_payer`, `m_astrocyte_media_usage`, `m_astrocyte_catalog` and
+    `m_astrocyte_attribution`;
+    thalamus-harness owns `m_thalamus-harness` and
+    `m_thalamus-harness_late_results`. Names are owner-namespaced as
+    `m_{module}` or `m_{module}_{suffix}`. Each module receives pull, ack and info
+    for every one of its rows, never another owner's rows. Naming 0.4 still
+    includes `m_prefrontal-routing`, so bootstrap continues to provision it.
+  - INBOX and CORE_WORK each have prefrontal-core's command reader, and each
+    dead-letter stream has the bus's `c_ckbus_dead` diagnostic reader, as declared
+    by `delivery_consumer_specs`.
 
-  Both carry the shipped durable configuration (pull, explicit ack, deliver all, ack
-  wait 30 s, max-deliver unlimited, max ack pending 1000), each filter checked with
-  `validate_consumer` against its stream's binding. Creation is strict: an identical
-  durable is the server's idempotent success, and one with a different configuration
-  is refused, never replaced, and boot reports `module-durables-unavailable`. Neither
-  module may create, delete or replace its durable; each holds pull, ack and info on its
-  own durable by name.
+  The command streams' limits come from naming's `shipped_streams`:
+  - INBOX binds `ck.{acct}.inbox.{kind}.*.ready` for `head` and `worker`.
+  - CORE_WORK binds `ck.{acct}.core_work.{family}.*.run` for `effect`, `consult`,
+    `work`, `campaign`, `hire` and `spec`.
+    Both are work queues with no broker age eviction, 256 MiB total, discard new,
+    a 16 KiB message cap, no per-subject cap, and the server-default duplicate window.
+  - DELIVERY_DEAD binds `ck.{acct}.delivery.dead`: limits retention, seven days,
+    64 MiB total, discard old, no stream-specific message-size or per-subject cap,
+    and the 120-second dead-letter duplicate window.
+
+  Event and ROOM readers carry pull, explicit ack, deliver all, ack wait 30 s,
+  unlimited deliveries and max ack pending 1000. Command readers have max ack
+  pending 1. Filters are validated against their stream bindings. Mutable settings,
+  including filters, update in place; immutable mismatches refuse boot with
+  `module-durables-unavailable`, never delete and recreate a cursor.
+  `ckbus.bootstrap.module_durable_plan` lists desired rows and observed retired
+  `m_` consumers on EVENT, ROOM, INBOX and CORE_WORK as `state: orphaned`.
+  Health metrics always include `orphaned_module_durables`; nonzero counts also
+  appear in the detail text as `orphaned_module_durables: <count>`, while zero
+  leaves the normal health text unchanged. Bootstrap never deletes
+  orphans. The plane's low-level `delete_durable` can delete by stream and name,
+  but there is no module-orphan deletion command; agent membership operations do
+  not manage module cursors. Only the bus bootstrap user can list those consumers.
+
+  Bootstrap also provisions every `MODULE_BUCKETS` row. The bucket name comes from
+  `AccountNames::module_bucket_name`: `CK_{ACCT}_{OWNER}_{NAME}`, uppercased with
+  hyphens and dots replaced by underscores. Its backing stream is `KV_<bucket>`.
+  All current rows have history 1; a dash below means no TTL:
+
+  | Owner | Local bucket | Readers | Value cap | Total cap | TTL |
+  | --- | --- | --- | --- | --- | --- |
+  | aft | status | prefrontal-core | 2,048 B | 2 MiB | 10 s |
+  | astrocyte | multiplier | striatum | 8,192 B | 1 MiB | - |
+  | astrocyte | read-marks | thalamus-harness | 256 B | 16 MiB | - |
+  | entorhinal | changes | prefrontal-core, plexus, magic-context | 512 B | 32 MiB | - |
+  | prefrontal-core | session-liveness | entorhinal | 1,024 B | 16 MiB | - |
+  | aft | views | occipital | 256 KiB | 32 MiB | - |
+  | cerebellum | views | occipital | 256 KiB | 32 MiB | - |
+
+  History, value size, TTL (seconds in naming) and total byte cap reconcile on the
+  existing stream. Each module bucket also has `max_consumers` set to
+  `8 * (1 + readers.len())`, including the owner in the shared watch budget.
+  NATS 2.15.0 permits updating that cap in place, so an existing bucket reconciles
+  without replacing its stream or keys. An incompatible immutable setting fails by bucket and setting
+  (`module-bucket-immutable`); a refused broker update reports
+  `module-bucket-reconcile-refused`. Neither path deletes stored keys. The owner
+  alone can put/delete on `$KV.<bucket>.>`; it and declared readers can use
+  stream info, direct get, stream message get and the bare
+  `$JS.API.CONSUMER.CREATE.KV_<bucket>` watch endpoint, with delivery to their own
+  credential-scoped inbox and stream-scoped flow-control replies. No named or
+  durable consumer-create endpoint, consumer info/delete/list, or stream
+  create/update/delete/purge is granted to readers. Census remains separate and
+  keeps its existing permissions.
+
+  Plain NATS subject permissions cannot inspect a consumer-create body. The
+  bucket-scoped unnamed watch endpoint is the accepted reader surface: it cannot
+  expand the reader's data access, but crafted ephemeral consumers can consume
+  resources on a stream the reader may already read. Against nats-server 2.15.0,
+  a `durable_name` in a bare-create body is refused (`10020`, durable expected in
+  subject), while a `name` and ephemeral settings in that body are accepted. The
+  real-server tests pin both outcomes; named API subjects remain forbidden.
+  The consumer bound is per bucket, not per principal: a reader holding every slot
+  can block new watches on that bucket, its owner's included, but never writes,
+  key reads or other buckets. This trade is deliberate: unbounded consumers would
+  let one reader grow server memory for every module.
 - Membership: re-issue at the next epoch of the same generation, overwrite the census
   key, adjust the room consumer's `filter_subjects`, and revoke the superseded epoch,
   within the foundation's 10 s bound. The client reconnects by refetching.
@@ -615,7 +685,7 @@ Standing rules carried from the foundation.
 - Spawn generation belongs to the daemon. Credential epoch is ck-bus's and starts at 0 per
   generation.
 - Permission files are allow-only, wildcards are whole-token, and every stream-bearing
-  subject is emitted with the six literal stream names expanded per account.
+  subject is emitted with the nine literal stream names expanded per account.
 - Inbox prefix is `_INBOX.{credential_public}` on every client the module runs or
   issues for, set before connecting.
 - No constant from an unverified citation is hard-coded in a control. The drain
@@ -893,7 +963,7 @@ records it.
 | Vault authorization | real claustrum + `ck auth` ceremony in a fixture vault; `route.open` with and without `ConsumerIdentity` | claustrum-binary | `claustrum-binary-absent` (C) | gates when the binaries are present; loud skip otherwise |
 | User JWT and seed absence | `credential.sign` for JWT signatures; real `nats-server` with harness-written operator and account JWTs | harness-signer | none row-specific | gates now |
 | Machine id and account | `ModuleHelloAckBody.machine_id`; `account.json`; bucket and stream creation | harness-signer | none row-specific | gates now |
-| Install bootstrap and own users | own box and system users; census bucket, six streams, the two module durables, in-place upgrade of a five-stream plane; `$SYS` kick; `own_users.json` | harness-signer | none row-specific | gates now |
+| Install bootstrap and own users | own box and system users; census and module buckets, nine message streams, module durables and orphan reporting, in-place upgrade of a five-stream plane; `$SYS` kick; `own_users.json` | harness-signer | none row-specific | gates now |
 | Credential delivery and attestation | `ckbus.credential`, `ckbus.nonce_sign` over subc; stamped principal; spawn snapshot for the live generation | harness-signer | `spawn-stream-unlanded` (C) | gates now |
 | A3 census write and issuance recovery | issuance order; census key grammar; `epoch_high_water.json` | harness-signer | `naming-constructor-absent` for the census key until commons constructs it | skipped until the census key constructor lands |
 | A9 grant conformance | participant, bus-module and system users on a live server; prefrontal seat for the golden | harness-signer | `prefrontal-seat-unnamed` (S, the golden-commit half only) | live-server half gates now |
@@ -1030,17 +1100,20 @@ Row contents.
   and the answer is `machine-id-absent`.
 - Install bootstrap and own users. From an empty broker store and a fixture vault
   holding only the roots, ck-bus issues its own box and system users, creates the census
-  bucket and the six streams with their literal bindings and the two module durables,
+  and module buckets, the nine message streams with their literal bindings and the module durables,
   writes its own census key, publishes on its sentinel subject, and performs a
   successful `$SYS` kick of a harness client. No fleet operator key is present anywhere.
   - Upgrade in place (`tests/stream_upgrade.rs`): a plane built the way the five-stream
     ck-bus built it, with one message stored on each stream, is booted by the current
-    ck-bus. The five streams keep their configuration as the server reports it, their
-    creation time and their messages; the event stream and both module durables exist,
-    and a room post made before `m_prefrontal-core` existed is pending on it. A further
-    boot changes nothing. The configuration ck-bus emits for the five is asserted
-    byte-for-byte against what the five-stream build emitted, since the server refuses a
-    create that differs from the stored stream.
+    ck-bus. This remains the historical upgrade scenario the test checks: all five
+    keep their creation times and messages, while EFFECT's age changes from one day
+    to no broker age eviction and its message cap becomes 16 KiB. The other stored
+    settings stay unchanged; the wire-config golden permits only those reviewed
+    changes and omission of unset optional properties, not arbitrary differences.
+    All nine message streams and the declared module durables then exist, and a
+    room post made before `m_prefrontal-core` existed is pending on it. A further
+    boot preserves stream state and durable cursors. Separate cases in the same
+    file check every declared module bucket, its watch cap and in-place cap updates.
   - A restart writes a new `own_users.json` and revokes the previous incarnation's box
     users (not its system users): the claims read back contain their keys, and a
     client presenting a revoked user's JWT is refused as revoked. The old ck-bus user's
@@ -1084,7 +1157,7 @@ Row contents.
   - It is refused (server-side `Denied`) on another identity's ack, pull or info, on a
     consumer create on the four workload streams, on a census write, on an unbound room,
     and on any `$SYS` or sentinel subject.
-  - The bus-module user may get, watch, put and delete the census and manage the six
+   - The bus-module user may get, watch, put and delete the census and manage the nine
     streams, and is refused every workload publish.
   - The system user may send the kick, the claims update and the claims lookup, and
     nothing else. These subject strings are what the golden records.

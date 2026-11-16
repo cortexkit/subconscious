@@ -78,6 +78,70 @@ const EARLIER_STREAM_CONFIGS: [&str; 5] = [
 
 const EVENT_PER_SUBJECT_CAP: i64 = 100_000;
 
+fn module_plane_fixture_path() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/module_plane.json")
+}
+
+fn module_plane_document() -> Value {
+    let names = AccountNames::derive(GOLDEN_ACCOUNT).unwrap();
+    let durables = bootstrap::module_durables::planned(&names).unwrap().into_iter()
+        .map(|row| json!({
+            "stream": row.stream, "durable": row.durable, "filter_subjects": row.filter_subjects,
+            "ack_wait_secs": row.ack_wait.as_secs(), "max_deliver": row.max_deliver,
+            "max_ack_pending": row.max_ack_pending,
+        })).collect::<Vec<_>>();
+    let buckets = cortexkit_bus_naming::MODULE_BUCKETS
+        .iter()
+        .map(|row| bootstrap::plane::module_bucket_config(&names, row).unwrap())
+        .collect::<Vec<_>>();
+    json!({"account": GOLDEN_ACCOUNT, "durables": durables, "buckets": buckets})
+}
+
+/// Server expectations come from the checked-in fixture, not a fresh planner run.
+fn expected_module_durables(names: &AccountNames) -> Vec<(String, String, Vec<String>)> {
+    let template = std::fs::read_to_string(module_plane_fixture_path())
+        .unwrap()
+        .replace(GOLDEN_ACCOUNT, names.account())
+        .replace(
+            &GOLDEN_ACCOUNT.to_ascii_uppercase(),
+            &names.account().to_ascii_uppercase(),
+        );
+    let document: Value = serde_json::from_str(&template).unwrap();
+    document["durables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row["stream"].as_str().unwrap().to_owned(),
+                row["durable"].as_str().unwrap().to_owned(),
+                serde_json::from_value(row["filter_subjects"].clone()).unwrap(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn module_plane_plan_matches_regenerated_fixture() {
+    let pinned: Value =
+        serde_json::from_slice(&std::fs::read(module_plane_fixture_path()).unwrap()).unwrap();
+    assert_eq!(module_plane_document(), pinned);
+}
+
+/// Run explicitly after a reviewed naming-table update; ordinary suites never write fixtures.
+#[test]
+#[ignore = "explicit fixture regeneration only"]
+fn regenerate_module_plane_fixture() {
+    std::fs::write(
+        module_plane_fixture_path(),
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&module_plane_document()).unwrap()
+        ),
+    )
+    .unwrap();
+}
+
 fn signer_vocabulary() -> BTreeSet<String> {
     SIGNER_OPERATIONS
         .iter()
@@ -271,6 +335,13 @@ struct FiveStreamBox(Arc<dyn BoxPlane>);
 
 #[async_trait]
 impl BoxPlane for FiveStreamBox {
+    async fn ensure_module_bucket(
+        &self,
+        _account: &AccountNames,
+        _bucket: &cortexkit_bus_naming::ModuleBucket,
+    ) -> Result<(), PlaneError> {
+        Ok(())
+    }
     async fn ensure_census(&self, account: &AccountNames) -> Result<(), PlaneError> {
         self.0.ensure_census(account).await
     }
@@ -334,7 +405,8 @@ impl BoxPlane for FiveStreamBox {
         self.0.purge_subject(stream, filter_subject).await
     }
     async fn consumer_names(&self, stream: &str) -> Result<Vec<String>, PlaneError> {
-        self.0.consumer_names(stream).await
+        let _ = stream;
+        Ok(vec![])
     }
     fn sentinel_link(&self) -> Option<SentinelLink> {
         self.0.sentinel_link()
@@ -547,128 +619,7 @@ async fn a_five_stream_plane_upgrades_in_place_to_nine_streams_and_the_module_du
     assert_eq!(dead_config["max_bytes"], 64 * 1024 * 1024);
     assert_eq!(dead_config["duplicate_window"], 120_000_000_000_u64);
 
-    let module_durables = [
-        (
-            streams.event.clone(),
-            "m_basal",
-            vec![names.event_binding()],
-        ),
-        (
-            streams.event.clone(),
-            "m_prefrontal-core",
-            vec![
-                format!("ck.{}.event.broca.>", names.account()),
-                format!(
-                    "ck.{}.event.basal.flow_instance_created.v1",
-                    names.account()
-                ),
-                format!(
-                    "ck.{}.event.basal.flow_instance_extended.v1",
-                    names.account()
-                ),
-                format!("ck.{}.event.basal.flow_instance_ended.v1", names.account()),
-                format!(
-                    "ck.{}.event.basal.flow_instance_expired.v1",
-                    names.account()
-                ),
-                format!(
-                    "ck.{}.event.basal.flow_instance_rescheduled.v1",
-                    names.account()
-                ),
-            ],
-        ),
-        (
-            streams.event.clone(),
-            "m_astrocyte",
-            vec![
-                format!("ck.{}.event.insula.>", names.account()),
-                format!("ck.{}.event.broca.step.finished.v1", names.account()),
-                format!(
-                    "ck.{}.event.thalamus-harness.step.finished.v1",
-                    names.account()
-                ),
-                format!("ck.{}.event.thalamus.step.finished.v1", names.account()),
-            ],
-        ),
-        (
-            streams.event.clone(),
-            "m_prefrontal-routing",
-            vec![format!("ck.{}.event.insula.>", names.account())],
-        ),
-        (
-            streams.event.clone(),
-            "m_magic-context",
-            vec![
-                format!("ck.{}.event.thalamus-harness.compaction.>", names.account()),
-                format!("ck.{}.event.thalamus.compaction.>", names.account()),
-                format!("ck.{}.event.broca.compaction.>", names.account()),
-            ],
-        ),
-        (
-            streams.event.clone(),
-            "m_thalamus-harness",
-            vec![format!(
-                "ck.{}.event.magic-context.compaction.>",
-                names.account()
-            )],
-        ),
-        (
-            streams.event.clone(),
-            "m_thalamus",
-            vec![format!(
-                "ck.{}.event.magic-context.compaction.>",
-                names.account()
-            )],
-        ),
-        (
-            streams.event.clone(),
-            "m_broca",
-            vec![format!(
-                "ck.{}.event.magic-context.compaction.>",
-                names.account()
-            )],
-        ),
-        (
-            streams.event.clone(),
-            "m_cerebellum",
-            [
-                "thalamus-harness.turn_started",
-                "thalamus-harness.turn_ended",
-            ]
-            .iter()
-            .map(|event| format!("ck.{}.event.{event}.v1", names.account()))
-            .collect(),
-        ),
-        (
-            streams.room.clone(),
-            "m_prefrontal-core",
-            vec![names.room_binding()],
-        ),
-        (
-            streams.inbox.clone(),
-            "m_prefrontal-core",
-            ["head", "worker"]
-                .map(|kind| format!("ck.{}.inbox.{kind}.*.ready", names.account()))
-                .into(),
-        ),
-        (
-            streams.core_work.clone(),
-            "m_prefrontal-core",
-            ["effect", "consult", "work", "campaign", "hire", "spec"]
-                .map(|family| format!("ck.{}.core_work.{family}.*.run", names.account()))
-                .into(),
-        ),
-        (
-            streams.effect_dead.clone(),
-            "c_ckbus_dead",
-            vec![names.effect_dead()],
-        ),
-        (
-            streams.delivery_dead.clone(),
-            "c_ckbus_dead",
-            vec![format!("ck.{}.delivery.dead", names.account())],
-        ),
-    ];
+    let module_durables = expected_module_durables(&names);
     for (stream, durable, filter) in &module_durables {
         let (config, _, _) = consumer_state(&js, stream, durable).await;
         let filters = match config.get("filter_subjects") {
@@ -755,6 +706,43 @@ struct UpgradePlane {
 }
 
 impl UpgradePlane {
+    async fn module_client(&self, module: &str) -> VerdictClient {
+        let credentials = self.deps.credentials.clone();
+        let user = credentials.custody.generate_user();
+        let grant = grants::issued_grant(&self.names, module, &user, &[]).unwrap();
+        let now = harness::signer::nats::unix_now();
+        let jwt = sign_user_jwt(
+            credentials.vault.as_ref(),
+            &credentials.key_ids,
+            &UserJwtRequest {
+                root_credential_id: &bus::box_root_id(),
+                user_public: &user,
+                issuer_account: Some(&self.account_public),
+                name: "module-bucket-conformance",
+                issued_at: now,
+                expires_at: now + 900,
+                grant: &grant,
+            },
+        )
+        .await
+        .unwrap();
+        let signer_user = user.clone();
+        VerdictClient::connect(
+            &self.server.url,
+            &jwt.jwt,
+            Arc::new(move |nonce| {
+                let signed = credentials
+                    .custody
+                    .sign_nonce(&signer_user, &nonce)
+                    .map_err(|error| error.to_string());
+                Box::pin(async move { signed })
+            }),
+            Some(format!("_INBOX.{user}")),
+        )
+        .await
+        .unwrap()
+    }
+
     /// Starts the plane, or records the crate's usual `nats-server-absent` skip and
     /// returns `None` when no server binary is available (the Windows CI leg has none).
     async fn start() -> Option<Self> {
@@ -909,106 +897,20 @@ async fn bootstrap_creates_every_table_event_durable_with_its_filter_and_setting
         return;
     };
     drop(plane.bootstrap().await);
-    let readers = [
-        (
-            "m_prefrontal-core",
-            vec![
-                format!("ck.{}.event.broca.>", plane.names.account()),
-                format!(
-                    "ck.{}.event.basal.flow_instance_created.v1",
-                    plane.names.account()
-                ),
-                format!(
-                    "ck.{}.event.basal.flow_instance_extended.v1",
-                    plane.names.account()
-                ),
-                format!(
-                    "ck.{}.event.basal.flow_instance_ended.v1",
-                    plane.names.account()
-                ),
-                format!(
-                    "ck.{}.event.basal.flow_instance_expired.v1",
-                    plane.names.account()
-                ),
-                format!(
-                    "ck.{}.event.basal.flow_instance_rescheduled.v1",
-                    plane.names.account()
-                ),
-            ],
-        ),
-        (
-            "m_astrocyte",
-            vec![
-                format!("ck.{}.event.insula.>", plane.names.account()),
-                format!("ck.{}.event.broca.step.finished.v1", plane.names.account()),
-                format!(
-                    "ck.{}.event.thalamus-harness.step.finished.v1",
-                    plane.names.account()
-                ),
-                format!(
-                    "ck.{}.event.thalamus.step.finished.v1",
-                    plane.names.account()
-                ),
-            ],
-        ),
-        (
-            "m_prefrontal-routing",
-            vec![format!("ck.{}.event.insula.>", plane.names.account())],
-        ),
-        (
-            "m_striatum",
-            vec![format!("ck.{}.event.insula.>", plane.names.account())],
-        ),
-        (
-            "m_magic-context",
-            vec![
-                format!(
-                    "ck.{}.event.thalamus-harness.compaction.>",
-                    plane.names.account()
-                ),
-                format!("ck.{}.event.thalamus.compaction.>", plane.names.account()),
-                format!("ck.{}.event.broca.compaction.>", plane.names.account()),
-            ],
-        ),
-        (
-            "m_thalamus-harness",
-            vec![format!(
-                "ck.{}.event.magic-context.compaction.>",
-                plane.names.account()
-            )],
-        ),
-        (
-            "m_thalamus",
-            vec![format!(
-                "ck.{}.event.magic-context.compaction.>",
-                plane.names.account()
-            )],
-        ),
-        (
-            "m_broca",
-            vec![format!(
-                "ck.{}.event.magic-context.compaction.>",
-                plane.names.account()
-            )],
-        ),
-        (
-            "m_cerebellum",
-            [
-                "thalamus-harness.turn_started",
-                "thalamus-harness.turn_ended",
-            ]
-            .iter()
-            .map(|event| format!("ck.{}.event.{event}.v1", plane.names.account()))
-            .collect(),
-        ),
-    ];
+    let readers = expected_module_durables(&plane.names)
+        .into_iter()
+        .filter(|(stream, durable, _)| {
+            stream == &plane.names.streams().event && durable != "m_basal"
+        })
+        .map(|(_, durable, filters)| (durable, filters))
+        .collect::<Vec<_>>();
     assert_eq!(
         readers.len(),
         cortexkit_bus_naming::EVENT_CONSUMERS.len(),
         "the startup expectations cover every event-consumer table entry"
     );
     for (durable, expected_filters) in readers {
-        let info = plane.consumer(durable).await.get_info().await.unwrap();
+        let info = plane.consumer(&durable).await.get_info().await.unwrap();
         let config = info.config;
         let filters = if config.filter_subjects.is_empty() {
             vec![config.filter_subject]
@@ -1343,5 +1245,436 @@ async fn prefrontal_event_grant_pulls_and_acks_seven_token_events_but_refuses_ot
         1 + cortexkit_bus_naming::EVENT_CONSUMERS.len(),
         "a denied create added no consumer"
     );
+    plane.server.stop().await;
+}
+
+#[tokio::test]
+async fn module_buckets_owner_put_delete_and_declared_reader_get_watch() {
+    let _gate = harness::acceptance_gate().await;
+    let Some(plane) = UpgradePlane::start().await else {
+        return;
+    };
+    drop(plane.bootstrap().await);
+    // Exercise every declaration, including both participant and authority readers.
+    for row in cortexkit_bus_naming::MODULE_BUCKETS {
+        let bucket = plane.names.module_bucket_name(row.owner, row.name).unwrap();
+        let owner = plane.module_client(row.owner).await;
+        let store = jetstream::new(owner.client.clone())
+            .get_key_value(&bucket)
+            .await
+            .unwrap();
+        for reader_module in row.readers {
+            let reader = plane.module_client(reader_module).await;
+            let read_store = jetstream::new(reader.client.clone())
+                .get_key_value(&bucket)
+                .await
+                .unwrap();
+            let mut watch = read_store
+                .watch("key")
+                .await
+                .expect("declared reader may watch");
+            let revision = store
+                .put("key", "value".into())
+                .await
+                .expect("owner may put");
+            assert_eq!(
+                read_store.get("key").await.unwrap().unwrap().as_ref(),
+                b"value"
+            );
+            let entry = tokio::time::timeout(Duration::from_secs(3), watch.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(entry.revision, revision);
+            assert_eq!(entry.value.as_ref(), b"value");
+            store.delete("key").await.expect("owner may delete");
+            let deleted = tokio::time::timeout(Duration::from_secs(3), watch.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(deleted.operation, jetstream::kv::Operation::Delete);
+            assert!(read_store.get("key").await.unwrap().is_none());
+        }
+    }
+    plane.server.stop().await;
+}
+
+#[tokio::test]
+async fn module_buckets_refuse_nonreaders_foreign_writers_and_reader_administration() {
+    let _gate = harness::acceptance_gate().await;
+    let Some(plane) = UpgradePlane::start().await else {
+        return;
+    };
+    drop(plane.bootstrap().await);
+    let bucket = plane
+        .names
+        .module_bucket_name("astrocyte", "multiplier")
+        .unwrap();
+    let stream = format!("KV_{bucket}");
+    for module in ["striatum", "aft", "unlisted"] {
+        let client = plane.module_client(module).await;
+        let value = format!("$KV.{bucket}.key");
+        client.publish(&value, b"not the owner").await;
+        client.expect_denied(&value).await;
+        // A tombstone is the same forbidden publish, not a separate write API.
+        let js = jetstream::new(client.client.clone());
+        if module == "striatum" {
+            let store = js.get_key_value(&bucket).await.unwrap();
+            assert!(store.delete("key").await.is_err());
+            client.expect_denied(&value).await;
+        } else {
+            for subject in [
+                format!("$JS.API.STREAM.INFO.{stream}"),
+                format!("$JS.API.DIRECT.GET.{stream}.$KV.{bucket}.key"),
+                format!("$JS.API.STREAM.MSG.GET.{stream}"),
+                format!("$JS.API.CONSUMER.CREATE.{stream}"),
+            ] {
+                client.publish(&subject, b"{}").await;
+                client.expect_denied(&subject).await;
+            }
+        }
+        for subject in [
+            format!("$JS.API.STREAM.UPDATE.{stream}"),
+            format!("$JS.API.STREAM.DELETE.{stream}"),
+            format!("$JS.API.STREAM.PURGE.{stream}"),
+            format!("$JS.API.CONSUMER.CREATE.{stream}.named"),
+            format!("$JS.API.CONSUMER.DURABLE.CREATE.{stream}.named"),
+            format!("$JS.API.CONSUMER.INFO.{stream}.named"),
+            format!("$JS.API.CONSUMER.DELETE.{stream}.named"),
+            format!("$JS.API.CONSUMER.NAMES.{stream}"),
+        ] {
+            client.publish(&subject, b"{}").await;
+            client.expect_denied(&subject).await;
+        }
+        for stream in [
+            &plane.names.streams().event,
+            &plane.names.streams().room,
+            &plane.names.streams().inbox,
+            &plane.names.streams().core_work,
+        ] {
+            let subject = format!("$JS.API.CONSUMER.NAMES.{stream}");
+            client.publish(&subject, b"{}").await;
+            client.expect_denied(&subject).await;
+        }
+    }
+    plane.server.stop().await;
+}
+
+#[tokio::test]
+async fn module_buckets_unnamed_watch_api_rejects_durable_but_accepts_named_ephemeral_body() {
+    let _gate = harness::acceptance_gate().await;
+    let Some(plane) = UpgradePlane::start().await else {
+        return;
+    };
+    drop(plane.bootstrap().await);
+    let bucket = plane
+        .names
+        .module_bucket_name("astrocyte", "multiplier")
+        .unwrap();
+    let stream = format!("KV_{bucket}");
+    let reader = plane.module_client("striatum").await;
+    for (field, name) in [
+        ("durable_name", "crafted_durable"),
+        ("name", "crafted_ephemeral"),
+    ] {
+        let mut config = json!({
+            "deliver_subject": reader.client.new_inbox(),
+            "filter_subject": format!("$KV.{bucket}.>"),
+            "ack_policy": "none", "deliver_policy": "all", "max_deliver": 1,
+            "inactive_threshold": 30_000_000_000_u64, "mem_storage": true,
+        });
+        config[field] = json!(name);
+        let reply = reader
+            .client
+            .request(
+                format!("$JS.API.CONSUMER.CREATE.{stream}"),
+                serde_json::to_vec(&json!({"stream_name": stream, "config": config}))
+                    .unwrap()
+                    .into(),
+            )
+            .await
+            .unwrap();
+        let reply: Value = serde_json::from_slice(&reply.payload).unwrap();
+        eprintln!("bare watch create with {field}: {reply}");
+        if field == "durable_name" {
+            assert_eq!(reply["error"]["err_code"], 10020);
+        } else {
+            assert!(reply.get("error").is_none(), "{reply}");
+            assert_eq!(reply["name"], name);
+        }
+    }
+    plane.server.stop().await;
+}
+
+#[tokio::test]
+async fn module_buckets_reconcile_limits_in_place_and_refuse_immutable_storage() {
+    let _gate = harness::acceptance_gate().await;
+    let Some(plane) = UpgradePlane::start().await else {
+        return;
+    };
+    let ready = plane.bootstrap().await;
+    for row in cortexkit_bus_naming::MODULE_BUCKETS {
+        let bucket = plane.names.module_bucket_name(row.owner, row.name).unwrap();
+        let stream = format!("KV_{bucket}");
+        let mut handle = plane.js.get_stream(&stream).await.unwrap();
+        let original = handle.info().await.unwrap().clone();
+        assert_eq!(original.config.max_message_size, row.max_value_bytes as i32);
+        assert_eq!(
+            original.config.max_messages_per_subject,
+            i64::from(row.history)
+        );
+        assert_eq!(original.config.max_bytes, row.max_bytes as i64);
+        assert_eq!(
+            original.config.max_consumers as usize,
+            8 * (1 + row.readers.len())
+        );
+        assert_eq!(
+            original.config.max_age,
+            row.ttl.map(Duration::from_secs).unwrap_or_default()
+        );
+        let store = plane.js.get_key_value(&bucket).await.unwrap();
+        let revision = store.put("kept", "before".into()).await.unwrap();
+        let mut altered = original.config.clone();
+        altered.max_message_size *= 2;
+        altered.max_bytes *= 2;
+        altered.max_messages_per_subject = 2;
+        altered.max_age = Duration::from_secs(60);
+        altered.duplicate_window = Duration::from_secs(10);
+        plane.js.update_stream(altered).await.unwrap();
+        ready
+            .box_plane
+            .ensure_module_bucket(&plane.names, row)
+            .await
+            .unwrap();
+        let current = handle.info().await.unwrap();
+        assert_eq!(current.created, original.created);
+        assert_eq!(
+            current.config.max_message_size,
+            original.config.max_message_size
+        );
+        assert_eq!(current.config.max_bytes, original.config.max_bytes);
+        assert_eq!(
+            current.config.max_messages_per_subject,
+            original.config.max_messages_per_subject
+        );
+        assert_eq!(current.config.max_age, original.config.max_age);
+        assert_eq!(
+            store.entry("kept").await.unwrap().unwrap().revision,
+            revision
+        );
+        ready
+            .box_plane
+            .ensure_module_bucket(&plane.names, row)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.entry("kept").await.unwrap().unwrap().revision,
+            revision
+        );
+    }
+    let row = &cortexkit_bus_naming::MODULE_BUCKETS[1];
+    let mut wrong = bootstrap::plane::module_bucket_config(&plane.names, row).unwrap();
+    plane.js.delete_stream(&wrong.name).await.unwrap();
+    wrong.storage = jetstream::stream::StorageType::Memory;
+    plane.js.create_stream(wrong.clone()).await.unwrap();
+    let before = stream_state(&plane.js, &wrong.name).await;
+    let error = ready
+        .box_plane
+        .ensure_module_bucket(&plane.names, row)
+        .await
+        .unwrap_err();
+    assert!(error.message.contains("module-bucket-immutable"), "{error}");
+    assert!(error.message.contains("storage"), "{error}");
+    assert_eq!(stream_state(&plane.js, &wrong.name).await, before);
+    plane.server.stop().await;
+}
+
+#[tokio::test]
+async fn module_buckets_consumer_cap_refuses_reader_growth_but_keeps_owner_watch_puts_and_reads() {
+    let _gate = harness::acceptance_gate().await;
+    let Some(plane) = UpgradePlane::start().await else {
+        return;
+    };
+    drop(plane.bootstrap().await);
+    let bucket = plane
+        .names
+        .module_bucket_name("astrocyte", "multiplier")
+        .unwrap();
+    let stream = format!("KV_{bucket}");
+    let owner = plane.module_client("astrocyte").await;
+    let owner_store = jetstream::new(owner.client.clone())
+        .get_key_value(&bucket)
+        .await
+        .unwrap();
+    let mut owner_watch = owner_store.watch("key").await.unwrap();
+    let reader = plane.module_client("striatum").await;
+    let reader_js = jetstream::new(reader.client.clone());
+    let mut handle = reader_js.get_stream(&stream).await.unwrap();
+
+    // The owner holds one slot before the reader fills the remaining shared budget.
+    for _ in 1..16 {
+        let reply = reader
+            .client
+            .request(
+                format!("$JS.API.CONSUMER.CREATE.{stream}"),
+                serde_json::to_vec(&json!({"stream_name": stream, "config": {
+                    "deliver_subject": reader.client.new_inbox(),
+                    "filter_subject": format!("$KV.{bucket}.>"),
+                    "ack_policy": "none", "deliver_policy": "new",
+                    "inactive_threshold": 30_000_000_000_u64,
+                }}))
+                .unwrap()
+                .into(),
+            )
+            .await
+            .unwrap();
+        let reply: Value = serde_json::from_slice(&reply.payload).unwrap();
+        assert!(reply.get("error").is_none(), "{reply}");
+    }
+    assert_eq!(handle.info().await.unwrap().state.consumer_count, 16);
+    for _ in 0..2 {
+        let reply = reader
+            .client
+            .request(
+                format!("$JS.API.CONSUMER.CREATE.{stream}"),
+                serde_json::to_vec(&json!({"stream_name": stream, "config": {
+                    "deliver_subject": reader.client.new_inbox(),
+                    "filter_subject": format!("$KV.{bucket}.>"),
+                    "ack_policy": "none", "deliver_policy": "new",
+                    "inactive_threshold": 30_000_000_000_u64,
+                }}))
+                .unwrap()
+                .into(),
+            )
+            .await
+            .unwrap();
+        let reply: Value = serde_json::from_slice(&reply.payload).unwrap();
+        assert_eq!(reply["error"]["err_code"], 10026, "{reply}");
+    }
+    let revision = owner_store
+        .put("key", "bounded".into())
+        .await
+        .expect("consumer saturation never prevents the owner's value writes");
+    let update = tokio::time::timeout(Duration::from_secs(3), owner_watch.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(update.revision, revision);
+    assert_eq!(update.value.as_ref(), b"bounded");
+    let direct = reader
+        .client
+        .request(
+            format!("$JS.API.DIRECT.GET.{stream}.$KV.{bucket}.key"),
+            "".into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(direct.payload.as_ref(), b"bounded");
+    let raw = handle
+        .get_raw_message(revision)
+        .await
+        .expect("stream-message reads need no consumer slot");
+    assert_eq!(raw.payload.as_ref(), b"bounded");
+    assert_eq!(handle.info().await.unwrap().state.consumer_count, 16);
+    let other_bucket = plane
+        .names
+        .module_bucket_name("astrocyte", "read-marks")
+        .unwrap();
+    let other = jetstream::new(owner.client.clone())
+        .get_key_value(&other_bucket)
+        .await
+        .unwrap();
+    let mut other_watch = other
+        .watch("key")
+        .await
+        .expect("another bucket has its own watch budget");
+    other.put("key", "independent".into()).await.unwrap();
+    let update = tokio::time::timeout(Duration::from_secs(3), other_watch.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(update.value.as_ref(), b"independent");
+    plane.server.stop().await;
+}
+
+#[tokio::test]
+async fn module_buckets_reconcile_consumer_cap_in_place_without_recreating_keys() {
+    let _gate = harness::acceptance_gate().await;
+    let Some(plane) = UpgradePlane::start().await else {
+        return;
+    };
+    let row = &cortexkit_bus_naming::MODULE_BUCKETS[1];
+    let desired = bootstrap::plane::module_bucket_config(&plane.names, row).unwrap();
+    let mut unlimited = desired.clone();
+    unlimited.max_consumers = -1;
+    plane.js.create_stream(unlimited.clone()).await.unwrap();
+    let bucket = plane.names.module_bucket_name(row.owner, row.name).unwrap();
+    let store = plane.js.get_key_value(&bucket).await.unwrap();
+    let revision = store.put("kept", "before".into()).await.unwrap();
+    let before = stream_state(&plane.js, &desired.name).await;
+    // Probe the server directly before checking bootstrap's reconciliation path.
+    let updated = plane
+        .js
+        .update_stream(desired.clone())
+        .await
+        .expect("NATS 2.15.0 permits max_consumers updates in place");
+    assert_eq!(updated.config.max_consumers, 16);
+    let mut expected = before.clone();
+    expected.0["max_consumers"] = json!(16);
+    assert_eq!(stream_state(&plane.js, &desired.name).await, expected);
+    plane.js.update_stream(unlimited).await.unwrap();
+    assert_eq!(stream_state(&plane.js, &desired.name).await, before);
+    let ready = plane.bootstrap().await;
+    assert_eq!(ready.orphaned_module_durables, 0);
+    assert_eq!(stream_state(&plane.js, &desired.name).await, expected);
+    assert_eq!(
+        store.entry("kept").await.unwrap().unwrap().revision,
+        revision
+    );
+    plane.server.stop().await;
+}
+
+#[tokio::test]
+async fn module_durable_plan_reports_orphans_without_deleting_their_cursor() {
+    let _gate = harness::acceptance_gate().await;
+    let Some(plane) = UpgradePlane::start().await else {
+        return;
+    };
+    drop(plane.bootstrap().await);
+    let stream = &plane.names.streams().event;
+    plane
+        .js
+        .create_consumer_on_stream(
+            pull::Config {
+                durable_name: Some("m_retired_reader".into()),
+                ack_policy: jetstream::consumer::AckPolicy::Explicit,
+                ..Default::default()
+            },
+            stream,
+        )
+        .await
+        .unwrap();
+    let sequence = plane.store_event("broca", "run").await;
+    assert_eq!(plane.ack_one("m_retired_reader").await, sequence);
+    let before = plane.cursor("m_retired_reader").await;
+    let ready = plane.bootstrap().await;
+    assert_eq!(ready.orphaned_module_durables, 1);
+    let desired = bootstrap::module_durables::planned(&plane.names).unwrap();
+    let output =
+        bootstrap::module_durables::plan_output(&plane.names, ready.box_plane.as_ref(), &desired)
+            .await
+            .unwrap();
+    assert_eq!(output.orphaned_module_durables, 1);
+    assert!(output.rows.contains(&json!({
+        "stream": stream, "durable": "m_retired_reader", "state": "orphaned",
+    })));
+    assert!(desired
+        .iter()
+        .any(|row| row.durable == "m_prefrontal-routing"));
+    assert_eq!(plane.cursor("m_retired_reader").await, before);
     plane.server.stop().await;
 }

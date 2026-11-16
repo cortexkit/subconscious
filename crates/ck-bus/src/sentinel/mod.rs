@@ -571,8 +571,11 @@ impl Answer {
 #[async_trait]
 impl SentinelHealth for Answer {
     async fn report_health(&self) -> SeamResult<HealthReport> {
-        if self.ready.borrow().is_some() {
-            return Ok(self.monitor.report());
+        if let Some(ready) = self.ready.borrow().as_ref() {
+            return Ok(with_orphan_count(
+                self.monitor.report(),
+                ready.orphaned_module_durables,
+            ));
         }
         let answer = self.bootstrap.report_health().await?;
         // Bootstrap finished but has not yet published its connections: from here on
@@ -586,6 +589,19 @@ impl SentinelHealth for Answer {
         }
         Ok(answer)
     }
+}
+
+fn with_orphan_count(mut report: HealthReport, count: usize) -> HealthReport {
+    if count > 0 {
+        report.detail = Some(format!(
+            "{} orphaned_module_durables: {count}",
+            report.detail.unwrap_or_default(),
+        ));
+    }
+    if let Some(metrics) = report.metrics.as_mut() {
+        metrics["orphaned_module_durables"] = json!(count);
+    }
+    report
 }
 
 fn unix_ms() -> u64 {

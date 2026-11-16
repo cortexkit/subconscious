@@ -222,6 +222,7 @@ pub fn participant_grant(
 ) -> Result<Grant, GrantRefusal> {
     let mut entries = participant_permissions(account, credential_public, module_id, bound_rooms)?;
     add_live_permissions(account, module_id, GrantRole::Participant, &mut entries)?;
+    add_module_bucket_permissions(account, module_id, GrantRole::Participant, &mut entries)?;
     Grant::from_entries(GrantRole::Participant, account, entries)
 }
 
@@ -243,6 +244,12 @@ pub fn delivery_authority_grant(
         GrantRole::DeliveryAuthority,
         &mut entries,
     )?;
+    add_module_bucket_permissions(
+        account,
+        module_id,
+        GrantRole::DeliveryAuthority,
+        &mut entries,
+    )?;
     Grant::from_entries(GrantRole::DeliveryAuthority, account, entries)
 }
 
@@ -257,7 +264,45 @@ pub fn flow_engine_grant(
 ) -> Result<Grant, GrantRefusal> {
     let mut entries = flow_engine_permissions(account, credential_public, module_id)?;
     add_live_permissions(account, module_id, GrantRole::FlowEngine, &mut entries)?;
+    add_module_bucket_permissions(account, module_id, GrantRole::FlowEngine, &mut entries)?;
     Grant::from_entries(GrantRole::FlowEngine, account, entries)
+}
+
+/// Only the owner writes values. Owners and declared readers may read and create
+/// unnamed watch consumers on this bucket, with delivery on their existing inbox.
+/// Named consumer and stream administration are deliberately absent.
+fn add_module_bucket_permissions(
+    account: &AccountNames,
+    module_id: &str,
+    role: GrantRole,
+    entries: &mut Vec<AllowEntry>,
+) -> Result<(), GrantRefusal> {
+    for bucket in cortexkit_bus_naming::MODULE_BUCKETS {
+        let owner = bucket.owner == module_id;
+        if !owner && !bucket.readers.contains(&module_id) {
+            continue;
+        }
+        let name = account.module_bucket_name(bucket.owner, bucket.name)?;
+        let stream = format!("KV_{name}");
+        let mut subjects = vec![
+            format!("$JS.API.STREAM.INFO.{stream}"),
+            format!("$JS.API.DIRECT.GET.{stream}.>"),
+            format!("$JS.API.STREAM.MSG.GET.{stream}"),
+            format!("$JS.API.CONSUMER.CREATE.{stream}"),
+            format!("$JS.FC.{stream}.>"),
+        ];
+        if owner {
+            // KV put and delete both publish to the key's value subject. Headers
+            // distinguish tombstones; raw stream-message delete is not granted.
+            subjects.push(format!("$KV.{name}.>"));
+        }
+        entries.extend(subjects.into_iter().map(|subject| AllowEntry {
+            principal: role.principal(),
+            operation: Operation::Publish,
+            subject,
+        }));
+    }
+    Ok(())
 }
 
 /// Live hints mirror event publishers but use Core NATS rather than a durable.
@@ -334,14 +379,39 @@ pub fn issued_grant(
     }
 }
 
-/// ck-bus's own box-account grant: census read and write, management of the six
+/// ck-bus's own box-account grant: census read and write, management of the nine
 /// streams and their consumers (the dead-letter durable and the module durables among
 /// them), and the sentinel subjects. No workload publish.
 pub fn bus_module_grant(
     account: &AccountNames,
     credential_public: &str,
 ) -> Result<Grant, GrantRefusal> {
-    let entries = bus_permissions(account, credential_public)?;
+    let mut entries = bus_permissions(account, credential_public)?;
+    for stream in [
+        &account.streams().event,
+        &account.streams().room,
+        &account.streams().inbox,
+        &account.streams().core_work,
+    ] {
+        entries.push(AllowEntry {
+            principal: Principal::Bus,
+            operation: Operation::Publish,
+            subject: format!("$JS.API.CONSUMER.NAMES.{stream}"),
+        });
+    }
+    for bucket in cortexkit_bus_naming::MODULE_BUCKETS {
+        let stream = format!(
+            "KV_{}",
+            account.module_bucket_name(bucket.owner, bucket.name)?
+        );
+        for verb in ["CREATE", "UPDATE", "INFO"] {
+            entries.push(AllowEntry {
+                principal: Principal::Bus,
+                operation: Operation::Publish,
+                subject: format!("$JS.API.STREAM.{verb}.{stream}"),
+            });
+        }
+    }
     Grant::from_entries(GrantRole::BusModule, account, entries)
 }
 
@@ -406,6 +476,13 @@ pub fn render_fixture_document(fixture: GoldenFixture) -> Result<String, GrantRe
             cortexkit_bus_naming::LIVE_HINT_READERS
                 .iter()
                 .map(|reader| reader.module_id),
+        )
+        .chain(
+            cortexkit_bus_naming::MODULE_BUCKETS
+                .iter()
+                .flat_map(|bucket| {
+                    std::iter::once(bucket.owner).chain(bucket.readers.iter().copied())
+                }),
         )
         .filter(|module_id| {
             *module_id != fixture.delivery_authority_module && *module_id != fixture.module_id
@@ -477,18 +554,58 @@ pub fn render_fixture_document(fixture: GoldenFixture) -> Result<String, GrantRe
     output.push_str(&format!(
         "expect-refused prefrontal-routing subscribe {live_prefix}broca.run.v1 foreign-live-subscribe\n"
     ));
+    for bucket in cortexkit_bus_naming::MODULE_BUCKETS {
+        let name = account.module_bucket_name(bucket.owner, bucket.name)?;
+        let stream = format!("KV_{name}");
+        for reader in bucket.readers {
+            for (subject, reason) in [
+                (format!("$KV.{name}.key"), "module-bucket-write"),
+                (
+                    format!("$JS.API.CONSUMER.DELETE.{stream}.watch"),
+                    "module-bucket-admin",
+                ),
+                (
+                    format!("$JS.API.CONSUMER.CREATE.{stream}.watch"),
+                    "module-bucket-admin",
+                ),
+                (
+                    format!("$JS.API.STREAM.UPDATE.{stream}"),
+                    "module-bucket-admin",
+                ),
+            ] {
+                let principal = if *reader == fixture.delivery_authority_module {
+                    Principal::DeliveryAuthority
+                } else {
+                    Principal::EventConsumer(reader)
+                };
+                output.push_str(&format!(
+                    "expect-refused {} publish {subject} {reason}\n",
+                    principal.as_str()
+                ));
+            }
+        }
+        for subject in [
+            format!("$KV.{name}.key"),
+            format!("$JS.API.STREAM.MSG.GET.{stream}"),
+            format!("$JS.API.CONSUMER.CREATE.{stream}"),
+        ] {
+            output.push_str(&format!(
+                "expect-refused participant publish {subject} module-bucket-nonreader\n"
+            ));
+        }
+    }
     validate_document(&output, &account)?;
     Ok(output)
 }
 
 /// Checks a whole permission document: allow-only, whole-token wildcards, and every one
-/// of the account's six literal stream names expanded somewhere.
+/// of the account's nine literal stream names expanded somewhere.
 pub fn validate_document(contents: &str, account: &AccountNames) -> Result<(), GrantRefusal> {
     Ok(validate_permission_file(contents, account)?)
 }
 
 /// Checks one role's entries with the naming crate's permission-file validator. A single
-/// role legitimately does not expand all six streams (a participant never names the
+/// role legitimately does not expand all nine streams (a participant never names the
 /// dead-letter stream), so only the stream-expansion finding is waived here; the whole
 /// document is held to it by `validate_document`.
 fn validate_role_entries(

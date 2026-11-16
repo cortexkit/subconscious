@@ -1,4 +1,4 @@
-//! The non-agent durables bootstrap creates: module readers named `m_{module_id}`
+//! The non-agent durables bootstrap creates: module readers named `m_{module_id}[_suffix]`
 //! and dead-letter diagnostics named `c_ckbus_dead` by the naming crate.
 //!
 //! - `m_basal` on the event stream, filtered on every module event
@@ -24,7 +24,7 @@ use cortexkit_bus_naming::{
     validate_consumer, AccountNames, AckPolicy, ConsumerSpec, DeliverPolicy,
 };
 
-use super::plane::DurableConsumer;
+use super::plane::{BoxPlane, DurableConsumer, PlaneError};
 use crate::grants::{DELIVERY_AUTHORITY_MODULE, FLOW_ENGINE_MODULE};
 
 /// The module durables, each filter checked against its stream's binding before the
@@ -82,4 +82,52 @@ pub fn planned(names: &AccountNames) -> Result<Vec<DurableConsumer>, String> {
         });
     }
     Ok(durables)
+}
+
+/// Bootstrap's log rows and the number of retired cursors observed on the broker.
+pub struct PlanOutput {
+    pub rows: Vec<serde_json::Value>,
+    pub orphaned_module_durables: usize,
+}
+
+/// Describes desired readers and retired module names without removing any cursor.
+/// Only `m_` consumers on module streams belong to this reconciliation domain.
+pub async fn plan_output(
+    names: &AccountNames,
+    plane: &dyn BoxPlane,
+    desired: &[DurableConsumer],
+) -> Result<PlanOutput, PlaneError> {
+    let mut rows = desired
+        .iter()
+        .map(|row| {
+            serde_json::json!({
+                "stream": row.stream, "durable": row.durable,
+                "filter_subjects": row.filter_subjects, "state": "desired",
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut orphaned_module_durables = 0;
+    for stream in [
+        &names.streams().event,
+        &names.streams().room,
+        &names.streams().inbox,
+        &names.streams().core_work,
+    ] {
+        for durable in plane.consumer_names(stream).await? {
+            if durable.starts_with("m_")
+                && !desired
+                    .iter()
+                    .any(|row| row.stream == *stream && row.durable == durable)
+            {
+                orphaned_module_durables += 1;
+                rows.push(serde_json::json!({
+                    "stream": stream, "durable": durable, "state": "orphaned",
+                }));
+            }
+        }
+    }
+    Ok(PlanOutput {
+        rows,
+        orphaned_module_durables,
+    })
 }

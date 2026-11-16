@@ -13,7 +13,8 @@ use subc_protocol::session::{HealthReport, HealthStatus};
 use tokio::time::Instant;
 
 use super::{
-    cause, is_own_violation, Answer, Class, Monitor, Probe, RoundOutcome, Timing, Verdict,
+    cause, is_own_violation, with_orphan_count, Answer, Class, Monitor, Probe, RoundOutcome,
+    Timing, Verdict,
 };
 use crate::{
     bootstrap,
@@ -191,6 +192,23 @@ impl Probe for ScriptedProbe {
 }
 
 struct FixedBootstrap(serde_json::Value);
+
+#[test]
+fn module_durable_orphan_count_is_visible_without_changing_sentinel_verdict() {
+    let monitor = Monitor::new("orphan-health".to_string(), timing(1000, 200));
+    for count in [0, 2] {
+        let report = with_orphan_count(monitor.report(), count);
+        assert_eq!(report.status, HealthStatus::Failing);
+        assert_eq!(cause_of(&report), Some(cause::NO_ANSWER_YET));
+        let expected = if count == 0 {
+            "Message bus is down.".to_string()
+        } else {
+            format!("Message bus is down. orphaned_module_durables: {count}")
+        };
+        assert_eq!(report.detail.unwrap(), expected);
+        assert_eq!(report.metrics.unwrap()["orphaned_module_durables"], count);
+    }
+}
 
 #[async_trait]
 impl SentinelHealth for FixedBootstrap {

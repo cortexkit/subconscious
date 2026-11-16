@@ -703,6 +703,7 @@ impl crate::bootstrap::plane::SystemPlane for UnusedSystem {
 
 fn ready_plane(plane: Arc<dyn crate::bootstrap::plane::BoxPlane>) -> Arc<Ready> {
     Arc::new(Ready {
+        orphaned_module_durables: 0,
         account: crate::bootstrap::store::AccountRecord {
             machine_id: "machine".into(),
             acct: "box_alpha".into(),

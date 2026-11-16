@@ -1,5 +1,5 @@
-//! Bootstrap: the machine id and the box account, ck-bus's own users, the census bucket,
-//! the six streams and the module durables.
+//! Bootstrap: the machine id and the box account, ck-bus's own users, census and module
+//! buckets, the nine message streams and the module durables.
 //!
 //! Keys and signatures follow `docs/nats-install-trust-chain.md` (sections 1, 3
 //! and 7). The operator root signed the operator JWT and the system account JWT at
@@ -16,14 +16,14 @@
 //!    incarnation's box users added), has the operator signer sign it, pushes it, and
 //!    reads it back through the claims lookup before treating it as applied;
 //! 4. signs its box-account user with the box account root, connects, creates the
-//!    census bucket and the six streams if absent, reconciles the event and ROOM module
+//!    census and module buckets and nine message streams if absent, reconciles module
 //!    durables without deleting their cursors, writes its own census key
 //!    (the single census entry ck-bus writes for itself), and publishes on its sentinel
 //!    subject.
 //!
-//! A plane an earlier ck-bus built with five streams is upgraded in place: the five are
-//! sent exactly the configuration they were created with, which the server accepts as
-//! the existing stream, and only the event stream and the module durables are new.
+//! A plane an earlier ck-bus built with five streams is upgraded in place: existing
+//! messages are kept, reviewed limits update without recreation, and missing streams,
+//! buckets and module durables are added.
 //!
 //! Both users' JWTs expire 15 minutes after issue; a renewal task per user
 //! (`credentials::renewal`) re-signs the same key before then, and each connection
@@ -54,7 +54,9 @@ use std::{
 };
 
 use async_trait::async_trait;
-use cortexkit_bus_naming::{shipped_streams, validate_streams, AccountNames};
+use cortexkit_bus_naming::{
+    shipped_streams, validate_module_buckets, validate_streams, AccountNames, MODULE_BUCKETS,
+};
 use nkeys::KeyPair;
 use serde_json::{json, Value};
 use subc_client_rs::{ModuleHandler, SubcModuleError};
@@ -97,9 +99,8 @@ pub mod cause {
     pub const CLAIMS_READBACK_MISMATCH: &str = "claims-readback-mismatch";
     pub const BOX_USER_UNISSUABLE: &str = "box-user-unissuable";
     pub const STREAMS_UNAVAILABLE: &str = "streams-unavailable";
-    /// A module durable (`m_basal`, `m_prefrontal-core`) could not be planned or
-    /// created; one that exists with a different configuration is refused by the server
-    /// and left as it is.
+    /// A module durable could not be planned or reconciled, or its stream could not be
+    /// inspected for orphans. Immutable mismatches leave the cursor in place.
     pub const MODULE_DURABLES_UNAVAILABLE: &str = "module-durables-unavailable";
     /// ck-bus's own census key could not be written: its spawn generation could not be
     /// read, or the census write failed.
@@ -138,6 +139,8 @@ impl Failure {
 
 /// A finished bootstrap. The two connections are held for the life of the process.
 pub struct Ready {
+    /// Retired module cursors observed at boot; reported, never deleted automatically.
+    pub orphaned_module_durables: usize,
     pub account: AccountRecord,
     pub system_user: String,
     pub box_user: String,
@@ -497,6 +500,14 @@ pub async fn boot(
             .await
             .map_err(|error| Failure::retry(cause::STREAMS_UNAVAILABLE, error.message))?;
     }
+    validate_module_buckets(&names, MODULE_BUCKETS)
+        .map_err(|error| Failure::stop(cause::STREAMS_UNAVAILABLE, error.to_string()))?;
+    for bucket in MODULE_BUCKETS {
+        box_plane
+            .ensure_module_bucket(&names, bucket)
+            .await
+            .map_err(|error| Failure::retry(cause::STREAMS_UNAVAILABLE, error.message))?;
+    }
     // Create or reconcile module readers before issuing credentials. Updates retain
     // their acknowledgement floors; an immutable configuration mismatch stops boot
     // rather than deleting a module's cursor.
@@ -508,6 +519,14 @@ pub async fn boot(
             .await
             .map_err(|error| Failure::retry(cause::MODULE_DURABLES_UNAVAILABLE, error.message))?;
     }
+    let plan = module_durables::plan_output(&names, box_plane.as_ref(), &durables)
+        .await
+        .map_err(|error| Failure::retry(cause::MODULE_DURABLES_UNAVAILABLE, error.message))?;
+    let orphaned_module_durables = plan.orphaned_module_durables;
+    log_event(
+        "ckbus.bootstrap.module_durable_plan",
+        json!({ "level": "INFO", "rows": plan.rows }),
+    );
     // ck-bus's own census key: self-written, under its own box-account user, like every
     // participant's entry and before its first publish.
     let own = deps
@@ -551,6 +570,7 @@ pub async fn boot(
         .map_err(|error| Failure::retry(cause::BROKER_UNAVAILABLE, error.message))?;
 
     Ok(Ready {
+        orphaned_module_durables,
         account,
         system_user,
         box_user,

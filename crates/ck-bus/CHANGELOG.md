@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.7.0
+
+- Adopt cortexkit-bus-naming 0.4.2, cortexkit-bus-nats 0.5.0 and
+  cortexkit-bus-inmemory 0.4.0. Provision the seven declared module KV buckets,
+  reconciling their limits in place without recreating stored keys. Refuse
+  incompatible immutable backing-stream settings with a named error.
+- Bound each module bucket's watch consumers to eight times its owner-and-reader
+  count. Reconcile an existing cap in place, as supported by NATS 2.15.0, without
+  recreating the stream or keys. Return durable-plan rows and the orphan count as
+  a typed result on the boot path.
+- Grant module bucket writes only to their owner and bucket-scoped read/watch
+  APIs only to owners and declared readers; keep census isolation unchanged.
+  Refresh the local permission golden for these grants and the expanded event
+  consumer table, including multiple owner-namespaced durables per module.
+- Include naming 0.4.2's additional event readers and view buckets, including
+  astrocyte attribution facts, and regenerate permission and provisioning fixtures.
+- Report retired module durables as orphaned in the bootstrap plan log and health
+  detail without deleting their cursors. Keep `m_prefrontal-routing`, which is
+  still declared by naming. Correct the documented message-plane count to nine.
+
 ## 0.6.12
 
 - Require Rust client 0.41.0 for the public registration-channel adoption API.

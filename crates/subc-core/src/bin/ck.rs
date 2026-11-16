@@ -9253,6 +9253,30 @@ mod tests {
         assert!(super::script_status_lines(&serde_json::json!({})).is_empty());
     }
 
+    /// Write an executable fake runner without opening it for writing in this
+    /// process. Tests run on many threads, and a child that another thread forks
+    /// inherits any writable descriptor this process holds until that child
+    /// execs. Executing the file inside that window fails with ETXTBSY ("Text
+    /// file busy"). A short-lived `sh` holds the only writable descriptor here,
+    /// so it is closed before the test runs the file.
+    #[cfg(unix)]
+    fn write_runner(path: &std::path::Path, contents: &[u8]) {
+        use std::io::Write;
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", r#"cat > "$1" && chmod 700 "$1""#, "write_runner"])
+            .arg(path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("start sh to write a fake runner");
+        child.stdin.take().unwrap().write_all(contents).unwrap();
+        let status = child.wait().unwrap();
+        assert!(
+            status.success(),
+            "writing {} failed: {status}",
+            path.display()
+        );
+    }
+
     #[tokio::test]
     async fn script_module_check_parses_file_and_reports_missing_runner_without_daemon() {
         let args = ["ck", "module", "check-script", "bundle.js"].map(std::ffi::OsString::from);
@@ -9277,15 +9301,12 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn script_module_check_selects_python_by_extension() {
-        use std::os::unix::fs::PermissionsExt;
         let root = cortexkit_test_support::ScratchDir::new("check-script-python");
         let runner = root.join("ck-script-runner-python");
-        std::fs::write(
+        write_runner(
             &runner,
             b"#!/bin/sh\n[ \"$1\" = --check ] && [ \"$#\" = 2 ]\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o700)).unwrap();
+        );
         for file in ["bundle.py", "bundle.pyz"] {
             super::module_check_script(&root.join("ck"), std::path::Path::new(file), None)
                 .await
@@ -9296,18 +9317,16 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn script_module_check_accepts_explicit_runtime() {
-        use std::os::unix::fs::PermissionsExt;
         for (runtime, file) in [("bun", "bundle.py"), ("python", "bundle.js")] {
             let root = cortexkit_test_support::ScratchDir::new("check-script-override");
             let runner = root.join(format!("ck-script-runner-{runtime}"));
-            std::fs::write(
+            write_runner(
                 &runner,
                 format!(
                     "#!/bin/sh\n[ \"$1\" = --check ] && [ \"$2\" = {file} ] && [ \"$#\" = 2 ]\n"
-                ),
-            )
-            .unwrap();
-            std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o700)).unwrap();
+                )
+                .as_bytes(),
+            );
             for tail in [
                 vec![file, "--runtime", runtime],
                 vec!["--runtime", runtime, file],
@@ -9385,17 +9404,15 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn script_module_check_invokes_installed_runner_and_preserves_refusal() {
-        use std::os::unix::fs::PermissionsExt;
         let root = cortexkit_test_support::ScratchDir::new("check-script-args");
         let runner = root.join("ck-script-runner-bun");
-        std::fs::write(&runner, b"#!/bin/sh\nif [ \"$1\" = --check ] && [ \"$2\" = bundle.js ]; then echo script_import_refused; exit 7; fi\nexit 0\n").unwrap();
-        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_runner(&runner, b"#!/bin/sh\nif [ \"$1\" = --check ] && [ \"$2\" = bundle.js ]; then echo script_import_refused; exit 7; fi\nexit 0\n");
         let error =
             super::module_check_script(&root.join("ck"), std::path::Path::new("bundle.js"), None)
                 .await
                 .unwrap_err();
         assert!(error.to_string().contains("script check failed"), "{error}");
-        std::fs::write(&runner, b"#!/bin/sh\necho script_check_ok\nexit 0\n").unwrap();
+        write_runner(&runner, b"#!/bin/sh\necho script_check_ok\nexit 0\n");
         super::module_check_script(&root.join("ck"), std::path::Path::new("bundle.js"), None)
             .await
             .unwrap();

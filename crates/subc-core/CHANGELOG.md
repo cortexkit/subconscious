@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.21.18
+
+- Test-only: the `ck module check-script` tests write their fake runners through a short-lived
+  `sh`, so another test thread's fork can't inherit a writable descriptor and make the exec fail
+  with "Text file busy" on Linux.
+
 ## 0.21.17
 
 - Ship the pinned Python script runner with Core on macOS arm64, Linux x64/arm64,

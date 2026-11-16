@@ -533,12 +533,13 @@ impl std::ops::DerefMut for OwnerGuard<'_> {
 
 /// The parts of a store that a read-only integrity check can change and that
 /// feed the published views: its state (a failed check moves it into
-/// recovery), its atomic publications and its pending anchor.
-fn store_witness(store: &ConfigStore) -> (StoreState, u64, bool) {
+/// recovery), its atomic publications, its pending anchor and its key status.
+fn store_witness(store: &ConfigStore) -> (StoreState, u64, bool, u64) {
     (
         store.loaded_admission_state().0,
         store.publication_sequence(),
         store.loaded_anchor_pending(),
+        store.key_status_revision(),
     )
 }
 

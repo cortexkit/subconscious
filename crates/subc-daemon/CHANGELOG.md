@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.49.4
+
+- Let unstamped macOS installs run modules when the configuration sealing key
+  cannot be read, with a warning and degraded configuration status. Stamped
+  installs still hold modules, and stamping still requires a readable key.
+- Refuse all configuration-record publications while key access is degraded,
+  preserving sealed bytes for verification when the key becomes readable again.
+- Only the unverified record's unstamped bit (or an absent store) selects this
+  fallback; its approvals, history, programs and settings are never used while
+  the key is unreadable, and the record file stays as it was. A same-user program
+  that deletes the key and rewrites the record can make a stamped install look
+  unstamped; like changes made while the daemon is stopped, that is an accepted
+  limitation. Keeping the key in the data protection keychain removes the
+  deletion half.
+
 ## 0.49.3
 
 - Keep a module's carried process group when the replacement's launch is

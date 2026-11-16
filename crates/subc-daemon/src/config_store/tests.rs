@@ -10,6 +10,7 @@ use subc_config::{raw_digest, Changeset, Generation, InputVector, RecordedValue}
 #[derive(Default)]
 pub(super) struct MemoryKey {
     pub key: Option<[u8; 32]>,
+    pub(super) load_error: Option<KeychainError>,
     anchor: subc_os::config_keychain::AnchorState,
     fail: bool,
     denied: bool,
@@ -23,11 +24,11 @@ impl MemoryKey {
         self.anchor_calls
     }
     pub fn load(&self) -> Result<Option<KeychainState>, StoreError> {
+        if let Some(error) = &self.load_error {
+            return Err(key_access_error(error));
+        }
         if self.denied {
-            return Err(StoreError::new(
-                StoreErrorCode::StoreUnverified,
-                "restore key access",
-            ));
+            return Err(key_access_error(&KeychainError::Denied));
         }
         Ok(self.key.map(|key| KeychainState {
             key: StoreKey::new(key),
@@ -107,6 +108,37 @@ fn tuple() -> Tuple {
     Tuple {
         module: "sample".into(),
         project: Some("project".into()),
+    }
+}
+
+#[test]
+fn config_store_degraded_publish_refuses_both_publication_modes() {
+    for fresh in [false, true] {
+        let rig = Rig::new();
+        let mut sealed = rig.open(true);
+        commit(&mut sealed, CommitKind::Stamp);
+        commit(&mut sealed, CommitKind::Unstamp);
+        let before = rig.bytes();
+        drop(sealed);
+        rig.key.lock().unwrap().denied = true;
+        let mut degraded = rig.open(true);
+        assert_eq!(degraded.status().state, StoreState::Unstamped);
+        error_code(
+            degraded.publish(StoreBody::default(), fresh, 3),
+            StoreErrorCode::StoreUnverified,
+        );
+        assert_eq!(
+            rig.bytes(),
+            before,
+            "degraded publish changed the record (fresh={fresh})"
+        );
+        assert_eq!(degraded.publication_sequence(), 0);
+        rig.key.lock().unwrap().denied = false;
+        degraded.check().unwrap();
+        let restored = degraded.status();
+        assert_eq!(restored.state, StoreState::Unstamped);
+        assert_eq!(restored.integrity, IntegrityMode::Sealed);
+        assert_eq!(restored.revision, 2);
     }
 }
 

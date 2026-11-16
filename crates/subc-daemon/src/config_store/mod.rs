@@ -110,6 +110,14 @@ pub(crate) struct TestStoreKey(std::sync::Arc<std::sync::Mutex<tests::MemoryKey>
 
 #[cfg(test)]
 impl TestStoreKey {
+    pub(crate) fn fail_load(&self, error: Option<KeychainError>) {
+        self.0.lock().unwrap().load_error = error;
+    }
+
+    pub(crate) fn remove(&self) {
+        self.0.lock().unwrap().key = None;
+    }
+
     pub(crate) fn fail_anchor(&self, fail: bool) {
         self.0.lock().unwrap().set_anchor_failure(fail);
     }
@@ -227,7 +235,7 @@ impl Backend {
         match KeychainStore::open(KEYCHAIN_SERVICE) {
             Ok(store) => Self::Os(store),
             Err(KeychainError::Unsupported) => Self::Unsupported,
-            Err(error) => Self::Unavailable(error.to_string()),
+            Err(error) => Self::Unavailable(key_access_error(&error).detail),
         }
     }
     fn load(&self) -> Result<Option<KeychainState>, StoreError> {
@@ -242,7 +250,7 @@ impl Backend {
             #[cfg(test)]
             Self::Memory(store) => return store.lock().unwrap().load(),
         };
-        result.map_err(|e| StoreError::new(StoreErrorCode::StoreUnverified, e))
+        result.map_err(|error| key_access_error(&error))
     }
     fn create(&self) -> Result<(), StoreError> {
         let mut bytes = [0; 32];
@@ -298,6 +306,23 @@ impl Backend {
     }
 }
 
+fn key_access_error(error: &KeychainError) -> StoreError {
+    let class = match error {
+        KeychainError::Unsupported => "Unsupported",
+        KeychainError::Unavailable => "Unavailable",
+        KeychainError::Denied => "Denied",
+        KeychainError::Missing => "Missing",
+        KeychainError::AlreadyExists => "AlreadyExists",
+        KeychainError::InvalidData => "InvalidData",
+        KeychainError::InvalidRequirement => "InvalidRequirement",
+        KeychainError::RevisionConflict => "RevisionConflict",
+        KeychainError::OsStatus(_) => "OsStatus",
+        KeychainError::Io(_) => "Io",
+        _ => "Unknown",
+    };
+    StoreError::new(StoreErrorCode::StoreUnverified, format!("{class}: {error}"))
+}
+
 struct UnanchoredAck {
     visible: StoreBody,
     tuple: Tuple,
@@ -321,6 +346,9 @@ pub struct ConfigStore {
     pending_anchor: Option<(StoreAnchor, bool)>,
     pending_prior_anchor: Option<AnchorState>,
     warnings: Vec<String>,
+    degraded_key: Option<String>,
+    key_status_revision: u64,
+    key_warning_logged: bool,
     activities: Vec<StoreActivity>,
     deferred_failure: Option<StoreBody>,
     // The approved-store file containing the ACK has been atomically renamed,
@@ -341,6 +369,10 @@ impl ConfigStore {
     /// persisted revision and generation, but never resets this sequence.
     pub(crate) fn publication_sequence(&self) -> u64 {
         self.publication_sequence
+    }
+
+    pub(crate) fn key_status_revision(&self) -> u64 {
+        self.key_status_revision
     }
 
     #[cfg(all(test, unix))]
@@ -414,6 +446,9 @@ impl ConfigStore {
             pending_anchor: None,
             pending_prior_anchor: None,
             warnings: Vec::new(),
+            degraded_key: None,
+            key_status_revision: 0,
+            key_warning_logged: false,
             activities: Vec::new(),
             deferred_failure: None,
             unanchored_ack: None,
@@ -438,7 +473,10 @@ impl ConfigStore {
     }
 
     fn start_check(&mut self) -> Result<(), StoreError> {
-        let key = self.backend.load()?;
+        let key = match self.backend.load() {
+            Ok(key) => key,
+            Err(error) => return self.degrade_unstamped(error),
+        };
         let bytes = disk::read(&self.path())
             .map_err(|e| StoreError::new(StoreErrorCode::StoreUnverified, e))?;
         self.expected_digest = bytes.as_deref().map(hash);
@@ -504,6 +542,7 @@ impl ConfigStore {
                 ))
             }
         };
+        let key_missing = key.is_none();
         if let Some(key) = key {
             if let Some(anchor) = key.anchor.current {
                 let exact = self.expected_digest == Some(anchor.sha256)
@@ -540,10 +579,15 @@ impl ConfigStore {
             }
         }
         if envelope.integrity == IntegrityMode::Sealed {
-            return Err(StoreError::new(
+            let error = StoreError::new(
                 StoreErrorCode::StoreUnverified,
                 "sealed key missing or unavailable; restore key access",
-            ));
+            );
+            return if self.backend.seal_available() && key_missing {
+                self.degrade_unstamped(key_access_error(&KeychainError::Missing))
+            } else {
+                Err(error)
+            };
         }
         self.state = if envelope.body.stamped {
             StoreState::Stamped
@@ -555,6 +599,46 @@ impl ConfigStore {
             self.warnings
                 .push("Re-stamp would seal this digest-only store".into());
         }
+        Ok(())
+    }
+
+    fn degrade_unstamped(&mut self, error: StoreError) -> Result<(), StoreError> {
+        let bytes = disk::read(&self.path())
+            .map_err(|e| StoreError::new(StoreErrorCode::StoreUnverified, e))?;
+        if let Some(bytes) = bytes {
+            let record = serde_json::from_slice::<Envelope>(&bytes).ok();
+            if !record.is_some_and(|record| {
+                record.format_version == STORE_FORMAT_VERSION
+                    && record.revision > 0
+                    && !record.body.stamped
+            }) {
+                return Err(error);
+            }
+        }
+        // Only absence or the unverified stamped bit selects this fallback; no
+        // retained approvals, history, programs or settings become authority.
+        // Same-user key deletion plus record rewriting can disguise a stamped
+        // install as unstamped, an accepted limitation while the daemon is stopped.
+        // A data-protection keychain closes the key-deletion half of that gap.
+        self.envelope = Envelope {
+            format_version: STORE_FORMAT_VERSION,
+            revision: 0,
+            previous_digest: None,
+            integrity: IntegrityMode::DigestOnly,
+            body: StoreBody::default(),
+            mac: None,
+        };
+        self.expected_digest = None;
+        self.state = StoreState::Unstamped;
+        let reason = format!(
+            "Configuration gate degraded: running as unstamped on an unverified record (or absent store); sealing key problem: {}",
+            error.detail
+        );
+        if !self.key_warning_logged {
+            tracing::warn!("{reason}");
+            self.key_warning_logged = true;
+        }
+        self.degraded_key = Some(reason);
         Ok(())
     }
 
@@ -583,6 +667,27 @@ impl ConfigStore {
     /// Re-check before every authority use, including after delivery writes.
     pub fn check(&mut self) -> Result<(), StoreError> {
         self.usable()?;
+        if let Some(previous) = self.degraded_key.take() {
+            // Reuse ordinary authority checks, not a new keychain polling task.
+            // A restored key must not leave formerly ungated processes running
+            // against a now-verified stamped record.
+            let result = self.start_check();
+            if self.degraded_key.as_ref() != Some(&previous) {
+                self.key_status_revision = self.key_status_revision.wrapping_add(1);
+            }
+            if result.is_err() || self.state == StoreState::Stamped {
+                self.state = StoreState::StoreUnverified;
+                let error = result.err().unwrap_or_else(|| {
+                    StoreError::new(
+                        StoreErrorCode::StoreUnverified,
+                        "key access restored to a stamped store; recovery required",
+                    )
+                });
+                self.warnings.push(error.to_string());
+                return Err(error);
+            }
+            return Ok(());
+        }
         if self.envelope.integrity == IntegrityMode::Sealed {
             #[cfg(test)]
             self.observe_io_thread("keychain_load");
@@ -654,6 +759,7 @@ impl ConfigStore {
             anchor_pending: self.pending_anchor.is_some(),
             warnings: {
                 let mut warnings = self.warnings.clone();
+                warnings.extend(self.degraded_key.clone());
                 if self.envelope.integrity == IntegrityMode::DigestOnly {
                     warnings.push("Digest-only: while the daemon is stopped, rewriting the store into another well-formed store, replay, deletion and data-home relocation are not detected".into());
                 }
@@ -835,6 +941,11 @@ impl ConfigStore {
     }
 
     fn publish(&mut self, body: StoreBody, fresh: bool, now_ms: u64) -> Result<(), StoreError> {
+        // The degraded envelope is only an ungated runtime view. Publishing it
+        // would replace the sealed record and prevent verification on key restore.
+        if let Some(reason) = &self.degraded_key {
+            return Err(StoreError::new(StoreErrorCode::StoreUnverified, reason));
+        }
         if self.pending_anchor.is_some() {
             return Err(StoreError::new(
                 StoreErrorCode::AnchorPending,
@@ -1063,6 +1174,9 @@ impl ConfigStore {
     }
 
     fn select_stamp_mode(&mut self) -> Result<(), StoreError> {
+        if let Some(reason) = &self.degraded_key {
+            return Err(StoreError::new(StoreErrorCode::StoreUnverified, reason));
+        }
         if self.backend.seal_available() {
             if self.backend.load()?.is_none() {
                 self.backend.create()?;

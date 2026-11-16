@@ -19,6 +19,7 @@ members = [
     "crates/subc-daemon",
     "crates/subc-daemon/tests/consumer",
     "crates/ck-bus",
+    "crates/ck-nats-server",
     "crates/ck-inspect",
     "crates/ck-ui",
     "crates/cortexkit-bus-testkit",

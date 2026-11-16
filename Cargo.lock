@@ -508,6 +508,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ck-nats-server"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "subc-client-rs",
+ "subc-protocol 0.37.2",
+ "subc-transport",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "ck-ui"
 version = "0.9.3"
 dependencies = [

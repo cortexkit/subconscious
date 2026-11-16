@@ -13,6 +13,7 @@ use std::{
 use subc_daemon::{read_frame, write_frame, Frame};
 use subc_protocol::{manifest::ModuleManifest, Flags, FrameType, Priority};
 use tokio::{
+    io::{AsyncRead, AsyncWrite},
     net::UnixStream,
     time::{sleep, timeout},
 };
@@ -100,34 +101,7 @@ impl Rig {
             .to_string(),
         )
         .unwrap();
-        let mut command = Command::new(ckdev_binary(env!("CARGO_BIN_EXE_ck-subc-under-test")));
-        command
-            .env("HOME", root.join("home"))
-            .env("XDG_CONFIG_HOME", root.join("config"))
-            .env("XDG_DATA_HOME", root.join("data"))
-            .env("XDG_RUNTIME_DIR", root.join("runtime"))
-            .env(
-                "SUBC_CONNECTION_FILE",
-                root.join("runtime/subc-connection.json"),
-            )
-            .env("SUBC_CGROUP_PLACEMENT", "disabled")
-            .env("SUBC_TEST_CONFIG_GATE", "1")
-            .env("SUBC_TEST_OPERATOR_SCRIPT", root.join("operator"))
-            .env_remove("SUBC_PORT")
-            .env_remove("SUBC_MODULE_ID")
-            .env_remove("SUBC_LAUNCH_NONCE")
-            .env_remove("SUBC_LAUNCH_NONCE_FD")
-            .env_remove("SUBC_REGISTRATION_FD")
-            .env_remove("DBUS_SESSION_BUS_ADDRESS")
-            .arg("--config-store-root")
-            .arg(root.join("authority"))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(fs::File::create(root.join("daemon.log")).unwrap());
-        let rig = Self {
-            daemon: command.spawn().unwrap(),
-            root,
-        };
+        let rig = Self::spawn(root);
         rig.wait(|| {
             subc_transport::connection_file::read_with_local_endpoint(
                 rig.root.join("runtime/subc-connection.json"),
@@ -153,6 +127,37 @@ impl Rig {
         })
         .await;
         rig
+    }
+
+    fn spawn(root: ScratchDir) -> Self {
+        let mut command = Command::new(ckdev_binary(env!("CARGO_BIN_EXE_ck-subc-under-test")));
+        command
+            .env("HOME", root.join("home"))
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env("XDG_RUNTIME_DIR", root.join("runtime"))
+            .env(
+                "SUBC_CONNECTION_FILE",
+                root.join("runtime/subc-connection.json"),
+            )
+            .env("SUBC_CGROUP_PLACEMENT", "disabled")
+            .env("SUBC_TEST_CONFIG_GATE", "1")
+            .env("SUBC_TEST_OPERATOR_SCRIPT", root.join("operator"))
+            .env_remove("SUBC_PORT")
+            .env_remove("SUBC_MODULE_ID")
+            .env_remove("SUBC_LAUNCH_NONCE")
+            .env_remove("SUBC_LAUNCH_NONCE_FD")
+            .env_remove("SUBC_REGISTRATION_FD")
+            .env_remove("DBUS_SESSION_BUS_ADDRESS")
+            .arg("--config-store-root")
+            .arg(root.join("authority"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(fs::File::create(root.join("daemon.log")).unwrap());
+        Self {
+            daemon: command.spawn().unwrap(),
+            root,
+        }
     }
 
     fn published(&self) -> subc_transport::connection_file::ConnectionInfoWithLocalEndpoint {
@@ -250,7 +255,7 @@ impl Rig {
     }
 }
 
-async fn rpc(stream: &mut UnixStream, body: Value) -> Value {
+async fn rpc<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S, body: Value) -> Value {
     let frame = Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Interactive, false),
@@ -375,4 +380,112 @@ async fn child_bound_ungated_nonce_control() {
         provenance["modules"][0]["registration"], "nonce",
         "{provenance}"
     );
+}
+
+/// Build `cargo build --locked -p ck-nats-server --bin ck-nats-server` and set
+/// `CK_NATS_WRAPPER_TEST_BIN` to that executable. Run the filtered case with
+/// `cargo test --locked -p subc-core --features test-support --test child_bound_registration nats_engine_does_not_inherit_module_launch_authority -- --ignored --exact --nocapture`.
+#[tokio::test]
+#[ignore = "requires a separately built ck-nats-server; see doc comment"]
+async fn nats_engine_does_not_inherit_module_launch_authority() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = ScratchDir::new("nats-authority");
+    for directory in ["home", "config/cortexkit", "data", "runtime", "authority"] {
+        fs::create_dir_all(root.join(directory)).unwrap();
+    }
+    fs::write(root.join("operator"), "approve\n".repeat(16)).unwrap();
+    let wrapper = ckdev_binary(
+        std::env::var_os("CK_NATS_WRAPPER_TEST_BIN")
+            .expect("build ck-nats-server and set CK_NATS_WRAPPER_TEST_BIN"),
+    );
+    let engine = root.join("engine");
+    fs::write(
+        &engine,
+        include_str!("../../ck-nats-server/tests/fixtures/engine.py"),
+    )
+    .unwrap();
+    fs::set_permissions(&engine, fs::Permissions::from_mode(0o700)).unwrap();
+    let server_config = root.join("server.conf");
+    fs::write(
+        &server_config,
+        json!({"events":root.join("engine.events")}).to_string(),
+    )
+    .unwrap();
+    fs::write(
+        root.join("config/cortexkit/subc.jsonc"),
+        json!({
+            "version":1,"port":0,"modules":{"nats-server":{
+                "program":wrapper,"args":["-c",server_config,"--engine",engine],
+                "protocol":"subc","enabled":true,"reserved":true,"registration_channel":true,
+            "env":{"SUBC_ENGINE_INHERITANCE_SENTINEL":"must_be_stripped",
+                "NATS_ENGINE_INHERITANCE_SENTINEL":"must_be_retained"}
+            }}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let rig = Rig::spawn(root);
+    rig.wait(|| {
+        rig.events("engine")
+            .iter()
+            .any(|event| event["startup"] == true)
+    })
+    .await;
+    let startup = rig
+        .events("engine")
+        .into_iter()
+        .find(|event| event["startup"] == true)
+        .unwrap();
+    eprintln!("engine launch snapshot: {startup}");
+    assert_eq!(startup["retained_environment"], "must_be_retained");
+    assert_eq!(
+        startup["subc_environment"],
+        json!([]),
+        "engine must not receive module launch variables: {startup}"
+    );
+    let mut persistent: Vec<u64> = startup["persistent_descriptors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|fd| fd.as_str().unwrap().parse().unwrap())
+        .collect();
+    persistent.sort_unstable();
+    assert_eq!(
+        persistent,
+        vec![0, 1, 2],
+        "engine must not keep the registration descriptor: {startup}"
+    );
+    assert!(
+        startup["descriptors"].as_array().unwrap().len() <= 4,
+        "only the directory enumeration descriptor may be transient: {startup}"
+    );
+    // Provenance is a read-only control query, so use the published loopback
+    // endpoint even when the isolated root is too long for a Unix socket.
+    let info = rig.published().info;
+    assert_eq!(info.pid, rig.daemon.id());
+    let endpoint = &info.endpoints[0];
+    assert!(matches!(endpoint.host.as_str(), "127.0.0.1" | "::1"));
+    let mut client = tokio::net::TcpStream::connect((endpoint.host.as_str(), endpoint.port))
+        .await
+        .unwrap();
+    subc_transport::authenticate_client(&mut client, &info, Duration::from_secs(3))
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(30), async {
+        loop {
+            let provenance = rpc(
+                &mut client,
+                json!({"op":"supervisor.provenance","module_id":"nats-server"}),
+            )
+            .await;
+            if provenance["modules"][0]["registration"] == "channel" {
+                eprintln!("nats-server registration: channel");
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("wrapper registers using its daemon channel");
 }

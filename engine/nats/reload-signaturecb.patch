@@ -1,0 +1,6 @@
+--- a/server/reload.go
++++ b/server/reload.go
+@@ -1104 +1104,2 @@
+-		"Disabled",
++		"Disabled",
++		"SignatureCB",

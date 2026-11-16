@@ -136,6 +136,14 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  nats-engine:
+    name: Embedded NATS engine
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Test checksum-verified patched server
+        run: bash scripts/go-toolchain.sh bash scripts/build-nats-engine.sh --test -v -run 'Test(Codec|Signer|Remote|Engine)'
+
   vectors:
     name: Shared wire vectors
     runs-on: ubuntu-latest

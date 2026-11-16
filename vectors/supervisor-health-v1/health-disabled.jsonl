@@ -1,0 +1,2 @@
+{"op":"supervisor.health"}
+{"op":"supervisor.health","generation":7,"modules":[{"module_id":"moonstone","status":"unknown","consecutive_failures":0,"late_answer_count":0,"last_action":null,"last_action_ms":null}]}

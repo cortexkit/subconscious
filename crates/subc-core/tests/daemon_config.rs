@@ -17,7 +17,9 @@ use subc_control::{
 };
 use subc_daemon::{
     bootstrap::{run_with_config, run_with_daemon_config_path, BootstrapConfig},
-    daemon_config, read_frame, write_frame, Frame, Registry, RestartPolicy, Supervisor,
+    daemon_config, read_frame,
+    supervise::CHILD_ADMISSION_TIMEOUT,
+    write_frame, Frame, Registry, RestartPolicy, Supervisor,
 };
 use subc_protocol::{
     manifest::ModuleManifest, BindIdentity, ErrorBody, Flags, FrameType, ModuleHelloBody, Priority,
@@ -2254,11 +2256,12 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let description = format!("control RPC {request:?} corr={corr}");
+    let reply_timeout = control_rpc_timeout(&request);
     write_frame(stream, &control_request_frame(corr, request))
         .await
         .unwrap();
     stream.flush().await.unwrap();
-    let frame = read_frame_timeout_for(stream, description).await;
+    let frame = read_frame_with_timeout(stream, description, reply_timeout).await;
     assert_eq!(frame.header.channel, 0);
     assert_eq!(frame.header.corr, corr);
     match frame.header.ty {
@@ -2266,6 +2269,40 @@ where
         FrameType::Error => Err(serde_json::from_slice(&frame.body).unwrap()),
         ty => panic!("unexpected control RPC frame type: {ty:?}"),
     }
+}
+
+fn control_rpc_timeout(request: &ClientControlRequest) -> Duration {
+    use subc_daemon::supervise::{DEFAULT_DRAIN_TIMEOUT, DEFAULT_SWAP_READY_TIMEOUT};
+
+    // Rescan answers after spawning added children, not after their HELLO. Child
+    // admission can use its whole daemon-side budget before spawn returns; allow
+    // that budget plus one ordinary frame-read window for the reply. Other
+    // launch operations need the same allowance, and may also drain an old child
+    // or wait for a swap candidate to become ready.
+    let work_timeout = match request {
+        ClientControlRequest::SupervisorRescan { preview: false }
+        | ClientControlRequest::SupervisorSetEnabled { enabled: true, .. } => {
+            CHILD_ADMISSION_TIMEOUT
+        }
+        ClientControlRequest::SupervisorRestart {
+            drain_timeout_ms, ..
+        } => {
+            drain_timeout_ms.map_or(DEFAULT_DRAIN_TIMEOUT, Duration::from_millis)
+                + CHILD_ADMISSION_TIMEOUT
+        }
+        ClientControlRequest::SupervisorReload { .. } => {
+            DEFAULT_DRAIN_TIMEOUT + CHILD_ADMISSION_TIMEOUT
+        }
+        ClientControlRequest::SupervisorSetEnabled { enabled: false, .. } => DEFAULT_DRAIN_TIMEOUT,
+        ClientControlRequest::SupervisorSwap {
+            ready_timeout_ms, ..
+        } => {
+            CHILD_ADMISSION_TIMEOUT
+                + ready_timeout_ms.map_or(DEFAULT_SWAP_READY_TIMEOUT, Duration::from_millis)
+        }
+        _ => Duration::ZERO,
+    };
+    work_timeout + READ_TIMEOUT
 }
 
 fn control_request_frame(corr: u64, request: ClientControlRequest) -> Frame {
@@ -2349,9 +2386,21 @@ fn read_frame_timeout_for<S>(
 where
     S: AsyncRead + Unpin,
 {
+    read_frame_with_timeout(stream, description, READ_TIMEOUT)
+}
+
+#[track_caller]
+fn read_frame_with_timeout<S>(
+    stream: &mut S,
+    description: String,
+    wait: Duration,
+) -> impl Future<Output = Frame> + '_
+where
+    S: AsyncRead + Unpin,
+{
     let caller = Location::caller();
     async move {
-        timeout(READ_TIMEOUT, async {
+        timeout(wait, async {
             read_frame(stream)
                 .await
                 .unwrap()
@@ -2359,6 +2408,68 @@ where
         })
         .await
         .unwrap_or_else(|error| panic!("timed out waiting for {description} at {caller}: {error}"))
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn spawn_control_rpc_accepts_reply_after_frame_deadline() {
+    let requests = [
+        ClientControlRequest::SupervisorRescan { preview: false },
+        ClientControlRequest::SupervisorRestart {
+            module_id: "delayed-spawn".into(),
+            drain_timeout_ms: Some(0),
+        },
+        ClientControlRequest::SupervisorReload {
+            module_id: "delayed-spawn".into(),
+        },
+        ClientControlRequest::SupervisorSetEnabled {
+            module_id: "delayed-spawn".into(),
+            enabled: true,
+        },
+        ClientControlRequest::SupervisorSwap {
+            module_id: "delayed-spawn".into(),
+            ready_timeout_ms: Some(10_000),
+        },
+    ];
+    for request in requests {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let responder = tokio::spawn(async move {
+            let request = read_frame(&mut server).await.unwrap().unwrap();
+            // Model a spawn that completes within admission's budget but takes
+            // longer than a plain frame read. Paused time avoids a real sleep.
+            sleep(READ_TIMEOUT + Duration::from_secs(1)).await;
+            let error = ErrorBody {
+                code: "spawn_refused".into(),
+                message: "delayed child admission refusal".into(),
+                detail: None,
+            };
+            let response = Frame::build(
+                FrameType::Error,
+                request.header.flags,
+                0,
+                0,
+                request.header.corr,
+                serde_json::to_vec(&error).unwrap(),
+            )
+            .unwrap();
+            write_frame(&mut server, &response).await.unwrap();
+        });
+        let error = control_rpc_result_on_stream(&mut client, 300, request)
+            .await
+            .expect_err("a delayed admission refusal should remain a typed RPC error");
+        assert_eq!(error.code, "spawn_refused");
+        responder.await.unwrap();
+    }
+}
+
+#[test]
+fn ordinary_control_rpc_keeps_frame_deadline() {
+    for request in [
+        ClientControlRequest::ServerDescribe {},
+        ClientControlRequest::SupervisorList {},
+        ClientControlRequest::SupervisorRescan { preview: true },
+    ] {
+        assert_eq!(control_rpc_timeout(&request), READ_TIMEOUT, "{request:?}");
     }
 }
 

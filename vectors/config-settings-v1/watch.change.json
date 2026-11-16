@@ -1,0 +1,9 @@
+{
+  "active_generation": 1,
+  "approved_generation": 1,
+  "event": "change",
+  "module_id": "sample-reader",
+  "op": "config.watch",
+  "schema_digest": "sha256:6265d0e7a8e4dfe6a8f467df89b3a91a14eeeda16a51a32f16bb54e69ea456aa",
+  "status": "adopted"
+}

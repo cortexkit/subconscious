@@ -322,6 +322,9 @@ impl ControlHandler {
     /// other daemon refuses the op as `rescan_unavailable`.
     pub(super) fn describe_capabilities(&self) -> Vec<String> {
         let mut capabilities = self.subc_capabilities.as_ref().to_vec();
+        if super::config_gate::CONFIG_SETTINGS_SURFACE_ENABLED && self.config_runtime.is_some() {
+            capabilities.push(subc_control::config::CONFIG_SETTINGS_CAPABILITY.to_owned());
+        }
         if self.rescan.is_some() {
             capabilities.push(RESCAN_CANDIDATE_PREVIEW_CAPABILITY.to_string());
         }

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.21.23
+
+- Keep CLI file-based planning compatible with edit-plan request members; require subc-control 0.42.0, subc-daemon 0.50.0, subc-client-rs 0.41.2, ck-ui 0.9.4 and subc-os 0.1.42.
+- Test-only: budget daemon configuration rescan and restart RPC replies for child admission rather than a plain frame read, while retaining the short deadline for ordinary reads.
+
 ## 0.21.22
 
 - Test-only: compare NATS executable paths with native path components and construct operator-program fixtures through JSON fields so Windows separators cannot bypass the intended refusal assertion. Run the macOS bundle LaunchAgent path test only on macOS.

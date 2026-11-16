@@ -313,6 +313,25 @@ async fn config_gate_unstamped_user_file_undeclared_module_gets_no_push() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn config_gate_unstamped_user_file_over_bound_is_never_unchanged() {
+    let live = LiveFiles::new().await;
+    std::fs::write(
+        live.rig.path.join("cortexkit/a.jsonc"),
+        vec![b' '; 1024 * 1024 + 1],
+    )
+    .unwrap();
+    let mut watch = crate::config_gate::runtime::unstamped::UserFileWatch::default();
+    for _ in 0..2 {
+        assert_eq!(
+            live.owner
+                .poll_user_file(INCUMBENT, "a", &mut watch)
+                .unwrap(),
+            crate::config_gate::runtime::unstamped::UserFilePoll::Observed
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn config_gate_unstamped_user_file_unchanged_tick_takes_no_owner_guard() {
     use std::sync::atomic::Ordering::SeqCst;
     let mut live = LiveFiles::new().await;
@@ -334,7 +353,21 @@ async fn config_gate_unstamped_user_file_unchanged_tick_takes_no_owner_guard() {
     assert_eq!(live.owner.projection_builds.load(SeqCst), builds);
 
     // A change on the next tick still takes the full pass and pushes.
+    let modified = std::fs::metadata(live.rig.path.join("cortexkit/a.jsonc"))
+        .unwrap()
+        .modified()
+        .unwrap();
     write_limit(&live.rig, 5);
+    {
+        // Filesystems can give two same-size writes the same modification time.
+        // Keep that time identical even if this test runs across a clock tick.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(live.rig.path.join("cortexkit/a.jsonc"))
+            .unwrap();
+        file.set_modified(modified).unwrap();
+        assert_eq!(file.metadata().unwrap().modified().unwrap(), modified);
+    }
     live.tick().await;
     live.expect_edit();
     assert!(live.owner.owner_guards.load(SeqCst) > guards);

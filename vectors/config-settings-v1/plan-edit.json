@@ -1,0 +1,316 @@
+{
+  "reply": {
+    "op": "config.plan",
+    "view": {
+      "base_revision": 0,
+      "digest": "sha256:6590e0aa80fbbd3ac21151e3a8accb0d7a3fd10772355114273f7b78ee65c68a",
+      "plan": {
+        "active_generations": {},
+        "base_generation": 0,
+        "base_revision": 0,
+        "changeset": {
+          "affected_projects": [],
+          "apply_plan": {
+            "edit_plan": {
+              "unstamped": true,
+              "write_back": [
+                {
+                  "candidate_digest": "sha256:70d18f6fa493d68427545276db30f940786f7dba0369d618e9fa4b5893b135d0",
+                  "expected": {
+                    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "state": "present"
+                  },
+                  "module_id": "demo",
+                  "path": "/home/example/cortexkit/demo.jsonc",
+                  "plan_time_digest": "sha256:c2f141850ebe3e529a94334d3a7b1f9ef67803b677c7afbb89be66c5d132291a"
+                }
+              ]
+            },
+            "module_transitions": {
+              "demo": {
+                "deferred_live_fields": [],
+                "explanation": "The complete generation activates only after every required transition and readiness check finishes.",
+                "transition": "live",
+                "waits_for_daemon_restart": false,
+                "waits_for_next_start": false,
+                "whole_generation": true
+              }
+            },
+            "operation": "change",
+            "previous": {
+              "\"Daemon\"": {
+                "kind": "value",
+                "value": {
+                  "state": {
+                    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "state": "present"
+                  },
+                  "value": {
+                    "kind": "value",
+                    "value": {
+                      "modules": {
+                        "demo": {
+                          "program": "/home/example/program",
+                          "registration_channel": true
+                        }
+                      },
+                      "version": 1
+                    }
+                  }
+                }
+              },
+              "{\"Declaration\":\"demo\"}": {
+                "kind": "value",
+                "value": {
+                  "state": {
+                    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "state": "present"
+                  },
+                  "value": {
+                    "kind": "value",
+                    "value": {
+                      "op": "config.declare",
+                      "project_dirs": [],
+                      "schema": {
+                        "$schema": "https://json-schema.org/draft/2020-12/schema",
+                        "properties": {
+                          "limit": {
+                            "default": 1,
+                            "description": "Limit",
+                            "type": "integer"
+                          }
+                        },
+                        "type": "object",
+                        "unevaluatedProperties": false,
+                        "x-ck-apply": "live",
+                        "x-ck-layers": [
+                          "user"
+                        ]
+                      },
+                      "user_file": "/home/example/cortexkit/demo.jsonc"
+                    }
+                  }
+                }
+              },
+              "{\"Entry\":\"demo\"}": {
+                "kind": "value",
+                "value": {
+                  "state": {
+                    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "state": "present"
+                  },
+                  "value": {
+                    "kind": "value",
+                    "value": {
+                      "program": "/home/example/program",
+                      "registration_channel": true
+                    }
+                  }
+                }
+              },
+              "{\"Layer\":{\"module\":\"demo\",\"path\":\"/home/example/cortexkit/demo.jsonc\"}}": {
+                "kind": "value",
+                "value": {
+                  "state": {
+                    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "state": "present"
+                  },
+                  "value": {
+                    "kind": "value",
+                    "value": {
+                      "limit": 1
+                    }
+                  }
+                }
+              },
+              "{\"Program\":{\"module\":\"demo\",\"path\":\"/home/example/program\"}}": {
+                "kind": "value",
+                "value": {
+                  "state": {
+                    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "state": "present"
+                  },
+                  "value": {
+                    "kind": "value",
+                    "value": {
+                      "file": {
+                        "device": "1",
+                        "inode": "1",
+                        "platform": "unix"
+                      },
+                      "length": 15,
+                      "path": "/home/example/program",
+                      "raw": "sha256:868d6bd28d3a6fa8e5ab189904db15df65f49ea4369735a771678aad32ab23b4"
+                    }
+                  }
+                }
+              }
+            },
+            "review": null,
+            "reviewed_programs": {
+              "demo": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            "rollback_to": null,
+            "snapshot": {
+              "\"Daemon\"": {
+                "kind": "value",
+                "value": {
+                  "state": {
+                    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "state": "present"
+                  },
+                  "value": {
+                    "kind": "value",
+                    "value": {
+                      "modules": {
+                        "demo": {
+                          "program": "/home/example/program",
+                          "registration_channel": true
+                        }
+                      },
+                      "version": 1
+                    }
+                  }
+                }
+              },
+              "{\"Declaration\":\"demo\"}": {
+                "kind": "value",
+                "value": {
+                  "state": {
+                    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "state": "present"
+                  },
+                  "value": {
+                    "kind": "value",
+                    "value": {
+                      "op": "config.declare",
+                      "project_dirs": [],
+                      "schema": {
+                        "$schema": "https://json-schema.org/draft/2020-12/schema",
+                        "properties": {
+                          "limit": {
+                            "default": 1,
+                            "description": "Limit",
+                            "type": "integer"
+                          }
+                        },
+                        "type": "object",
+                        "unevaluatedProperties": false,
+                        "x-ck-apply": "live",
+                        "x-ck-layers": [
+                          "user"
+                        ]
+                      },
+                      "user_file": "/home/example/cortexkit/demo.jsonc"
+                    }
+                  }
+                }
+              },
+              "{\"Entry\":\"demo\"}": {
+                "kind": "value",
+                "value": {
+                  "state": {
+                    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "state": "present"
+                  },
+                  "value": {
+                    "kind": "value",
+                    "value": {
+                      "program": "/home/example/program",
+                      "registration_channel": true
+                    }
+                  }
+                }
+              },
+              "{\"Layer\":{\"module\":\"demo\",\"path\":\"/home/example/cortexkit/demo.jsonc\"}}": {
+                "kind": "value",
+                "value": {
+                  "state": {
+                    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "state": "present"
+                  },
+                  "value": {
+                    "kind": "value",
+                    "value": {
+                      "limit": 4
+                    }
+                  }
+                }
+              },
+              "{\"Program\":{\"module\":\"demo\",\"path\":\"/home/example/program\"}}": {
+                "kind": "value",
+                "value": {
+                  "state": {
+                    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "state": "present"
+                  },
+                  "value": {
+                    "kind": "value",
+                    "value": {
+                      "file": {
+                        "device": "1",
+                        "inode": "1",
+                        "platform": "unix"
+                      },
+                      "length": 15,
+                      "path": "/home/example/program",
+                      "raw": "sha256:868d6bd28d3a6fa8e5ab189904db15df65f49ea4369735a771678aad32ab23b4"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "fields": [
+            {
+              "apply": "live",
+              "module_id": "demo",
+              "new": {
+                "kind": "value",
+                "value": 4
+              },
+              "new_source": "user",
+              "old": {
+                "kind": "value",
+                "value": 1
+              },
+              "old_source": "user",
+              "path": "/limit",
+              "project_id": null,
+              "reasons": []
+            }
+          ],
+          "launch_manifests": {},
+          "policy_changes": []
+        },
+        "daemon_incarnation": "example-daemon",
+        "input_vector": {
+          "inputs": {
+            "module:\"demo\"": {
+              "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "state": "present"
+            },
+            "subc.jsonc": {
+              "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "state": "present"
+            }
+          }
+        }
+      }
+    }
+  },
+  "request": {
+    "base_generations": {
+      "demo": 0
+    },
+    "edits": [
+      {
+        "layer": "user",
+        "module_id": "demo",
+        "path": "/limit",
+        "set": 4
+      }
+    ],
+    "op": "config.plan"
+  }
+}

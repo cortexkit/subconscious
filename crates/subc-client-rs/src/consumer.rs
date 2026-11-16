@@ -14,7 +14,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use sha2::{Digest, Sha256};
+use sha2::{Digest as _, Sha256};
 pub use subc_control::SupervisorEntry;
 use subc_control::{
     CatalogEntry, ClientControlRequest, ClientControlResponse, ConsumerIdentity, PollKind,
@@ -97,9 +97,15 @@ use slots::*;
 mod reservation;
 pub use reservation::{CorrelationId, PendingReply, RequestBody, RequestReservation};
 mod catalog;
+mod config_ops;
 mod supervisor_ops;
 use catalog::decode_route_open_response;
 pub use catalog::CatalogSubscription;
+pub use config_ops::{
+    ConfigApplyResponse, ConfigEdit, ConfigEditAction, ConfigModule, ConfigModulesResponse,
+    ConfigPlanRefusal, ConfigPlanView, ConfigSchemaResponse, ConfigSettingsLayer,
+    ConfigShowResponse, ConfigSubscription, ConfigThrough, ConfigWatchEvent, Digest,
+};
 
 #[cfg(test)]
 mod reader_skew_tests;

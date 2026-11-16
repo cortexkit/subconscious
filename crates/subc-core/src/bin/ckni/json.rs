@@ -394,12 +394,28 @@ mod tests {
             variant_count(source, "ModuleCommand"),
             "unclassified ModuleCommand variant"
         );
+        // Settings pages send these requests; `ck config` has no command that
+        // produces them, so they have no CLI output to classify. Naming them
+        // keeps the count exact: a new request variant still fails here until
+        // it gets a `ck config` form above or joins this list on purpose.
+        let settings_page_only = [
+            "Modules",
+            "Schema",
+            "Show",
+            "Watch",
+            "PlanGet",
+            "PlanDiscard",
+        ];
+        let config_source = include_str!("../../../../subc-control/src/config.rs");
+        for name in settings_page_only {
+            assert!(
+                config_source.contains(&format!("    {name} {{")),
+                "{name} is not a ConfigControlRequest variant"
+            );
+        }
         assert_eq!(
-            configs.len(),
-            variant_count(
-                include_str!("../../../../subc-control/src/config.rs"),
-                "ConfigControlRequest"
-            ),
+            configs.len() + settings_page_only.len(),
+            variant_count(config_source, "ConfigControlRequest"),
             "unclassified ConfigControlRequest variant"
         );
         let documented = docs

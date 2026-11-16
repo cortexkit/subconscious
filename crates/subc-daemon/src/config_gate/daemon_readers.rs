@@ -71,7 +71,10 @@ impl RuntimeOwner {
         Self::check_authority(&mut state, false)?;
         if !state.recovery_exit_hold && !state.store.status().anchor_pending {
             let captured = self.capture(&mut state)?;
-            state.store.observe(captured.diagnostic.to_store()?)?;
+            let approved = super::super::GateSnapshot::from_store(&state.store.body()?.approved)?;
+            state
+                .store
+                .observe(captured.proposal_snapshot(&approved).to_store()?)?;
         }
         Ok(())
     }

@@ -71,15 +71,21 @@ fn file_object_id(file: &File) -> Result<FileObjectId> {
     });
 }
 
-/// A cheap change detector; bytes are compared only after this metadata changes.
+/// A bounded change detector: timestamps can coalesce same-size writes, so
+/// unchanged metadata must also have an equal content digest on every platform.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct UserFileMetadata {
     identity: FileObjectId,
     length: u64,
     modified: Option<std::time::SystemTime>,
+    content_digest: Option<subc_config::Digest>,
 }
 
 impl UserFileMetadata {
+    pub(crate) fn has_content_digest(&self) -> bool {
+        self.content_digest.is_some()
+    }
+
     pub(crate) fn read(path: &Path) -> Result<Option<Self>> {
         let metadata = match std::fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
@@ -92,21 +98,31 @@ impl UserFileMetadata {
                 "user file must be a regular file",
             ));
         }
-        #[cfg(unix)]
-        let identity = {
-            use std::os::unix::fs::MetadataExt;
-            FileObjectId::Unix {
-                device: metadata.dev(),
-                inode: metadata.ino(),
-            }
+        let file = subc_os::open_regular_nofollow(path).map_err(capture_error)?;
+        let metadata = file.metadata().map_err(capture_error)?;
+        let identity = file_object_id(&file)?;
+        // Hash at most 1 MiB, the same bound as configuration capture. One
+        // extra byte detects growth while reading. Larger or unstable files
+        // have no digest and must never be classified as unchanged.
+        let content_digest = if metadata.len() <= CONFIG_FILE_LIMIT {
+            let mut bytes = Vec::with_capacity(metadata.len() as usize);
+            (&file)
+                .take(CONFIG_FILE_LIMIT + 1)
+                .read_to_end(&mut bytes)
+                .map_err(capture_error)?;
+            let after = file.metadata().map_err(capture_error)?;
+            (bytes.len() as u64 == metadata.len()
+                && after.len() == metadata.len()
+                && after.modified().ok() == metadata.modified().ok())
+            .then(|| subc_config::raw_digest(&bytes))
+        } else {
+            None
         };
-        #[cfg(windows)]
-        let identity =
-            file_object_id(&subc_os::open_regular_nofollow(path).map_err(capture_error)?)?;
         Ok(Some(Self {
             identity,
             length: metadata.len(),
             modified: metadata.modified().ok(),
+            content_digest,
         }))
     }
 }
@@ -140,6 +156,10 @@ fn capture_error(_: impl std::fmt::Display) -> GateError {
 
 impl CapturedFile {
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_read_hook(path, || {})
+    }
+
+    pub(crate) fn open_with_read_hook(path: &Path, after_read: impl FnOnce()) -> Result<Self> {
         if !path.is_absolute() {
             return Err(GateError::new(
                 "path_invalid",
@@ -178,6 +198,7 @@ impl CapturedFile {
             .take(CONFIG_FILE_LIMIT + 1)
             .read_to_end(&mut bytes)
             .map_err(capture_error)?;
+        after_read();
         let after = file.metadata().map_err(capture_error)?;
         let supplied = std::fs::symlink_metadata(path).map_err(capture_error)?;
         let reopened = subc_os::open_regular_nofollow(path).map_err(capture_error)?;
@@ -194,7 +215,7 @@ impl CapturedFile {
             || supplied.file_type().is_symlink()
             || file_object_id(&reopened)? != id
         {
-            return Err(GateError::stale());
+            return Err(GateError::capture_race());
         }
         let digest = subc_config::raw_digest(&serde_json::to_vec(&json!({
             "file": id, "raw": subc_config::raw_digest(&bytes), "length": metadata.len(),
@@ -208,7 +229,7 @@ impl CapturedFile {
         })
     }
 
-    fn parse(&self) -> Result<Value> {
+    pub(super) fn parse(&self) -> Result<Value> {
         match &self.bytes {
             Some(bytes) => {
                 let text = std::str::from_utf8(bytes).map_err(capture_error)?;
@@ -217,6 +238,10 @@ impl CapturedFile {
             }
             None => Ok(json!({})),
         }
+    }
+
+    pub(super) fn take_handles(&mut self) -> Vec<File> {
+        self._file.take().into_iter().collect()
     }
 }
 
@@ -235,6 +260,36 @@ pub struct CapturedConfiguration {
 }
 
 impl CapturedConfiguration {
+    /// Edit candidates bind content before the replacement file has an identity.
+    /// For drift reporting, equal written bytes satisfy that approved digest;
+    /// keep the original capture fingerprints for review and compare-and-swap.
+    pub(crate) fn proposal_snapshot(&self, approved: &GateSnapshot) -> GateSnapshot {
+        let mut snapshot = self.diagnostic.clone();
+        for (key, input) in &mut snapshot.inputs {
+            let InputKey::Layer { module, path } = key else {
+                continue;
+            };
+            let Some(previous) = approved.inputs.get(key) else {
+                continue;
+            };
+            let Some(file) = self.modules.get(module).map(|module| &module.file) else {
+                continue;
+            };
+            if file.path.to_string_lossy() == path.as_str()
+                && input.value == previous.value
+                && file.bytes.as_deref().is_some_and(|bytes| {
+                    previous.state
+                        == InputState::Present {
+                            digest: subc_config::raw_digest(bytes),
+                        }
+                })
+            {
+                input.state = previous.state.clone();
+            }
+        }
+        snapshot
+    }
+
     pub(crate) fn take_handles(&mut self) -> Vec<File> {
         let mut handles = std::mem::take(&mut self._program_handles);
         handles.extend(self.daemon._file.take());
@@ -270,9 +325,16 @@ impl ConfigCapturer {
         &self,
         declarations: &BTreeMap<String, ConfigDeclareRequest>,
     ) -> Result<GateSnapshot> {
+        self.capture_polled_configuration(declarations)
+            .map(|captured| captured.diagnostic)
+    }
+
+    pub(crate) fn capture_polled_configuration(
+        &self,
+        declarations: &BTreeMap<String, ConfigDeclareRequest>,
+    ) -> Result<CapturedConfiguration> {
         let daemon = CapturedFile::open(&self.daemon_path)?;
         self.capture_layers(daemon, declarations, None, false, CapturedFile::open)
-            .map(|captured| captured.diagnostic)
     }
 
     pub fn capture(
@@ -305,6 +367,25 @@ impl ConfigCapturer {
         &self,
         target: &GateSnapshot,
         delivery: &crate::config_store::DeliverySnapshot,
+    ) -> Result<CapturedConfiguration> {
+        self.capture_retained_inner(target, delivery, &delivery.declarations, true)
+    }
+
+    pub(crate) fn capture_retained_declared(
+        &self,
+        target: &GateSnapshot,
+        delivery: &crate::config_store::DeliverySnapshot,
+        declarations: &BTreeMap<String, ConfigDeclareRequest>,
+    ) -> Result<CapturedConfiguration> {
+        self.capture_retained_inner(target, delivery, declarations, false)
+    }
+
+    fn capture_retained_inner(
+        &self,
+        target: &GateSnapshot,
+        delivery: &crate::config_store::DeliverySnapshot,
+        declarations: &BTreeMap<String, ConfigDeclareRequest>,
+        require_identical: bool,
     ) -> Result<CapturedConfiguration> {
         let invalid = || {
             GateError::new(
@@ -354,19 +435,20 @@ impl ConfigCapturer {
             )?;
             files.insert(file.path.clone(), file);
         }
-        let captured = self.capture_layers(daemon, &delivery.declarations, None, true, |path| {
+        let captured = self.capture_layers(daemon, declarations, None, true, |path| {
             files.remove(path).ok_or_else(invalid)
         })?;
         if !files.is_empty()
-            || target
-                .inputs
-                .iter()
-                .filter(|(key, _)| !key.is_program())
-                .ne(captured
-                    .diagnostic
+            || (require_identical
+                && target
                     .inputs
                     .iter()
-                    .filter(|(key, _)| !key.is_program()))
+                    .filter(|(key, _)| !key.is_program())
+                    .ne(captured
+                        .diagnostic
+                        .inputs
+                        .iter()
+                        .filter(|(key, _)| !key.is_program())))
         {
             return Err(invalid());
         }
@@ -699,7 +781,7 @@ pub(crate) fn capture_program_classified(path: &Path) -> Result<(File, CapturedI
     ))
 }
 
-fn refusal_code(code: subc_config::RefusalCode) -> &'static str {
+pub(super) fn refusal_code(code: subc_config::RefusalCode) -> &'static str {
     use subc_config::RefusalCode::*;
     match code {
         SchemaInvalid => "schema_invalid",

@@ -6,6 +6,8 @@ use subc_protocol::config::ConfigGetRequest;
 
 #[path = "daemon_readers_tests.rs"]
 mod daemon_readers;
+#[path = "edit_tests.rs"]
+mod edit_plans;
 #[path = "key_access_tests.rs"]
 mod key_access;
 #[path = "plan_rows_tests.rs"]

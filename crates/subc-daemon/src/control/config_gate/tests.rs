@@ -1,6 +1,10 @@
 use super::*;
 use serde_json::{json, Value};
 
+#[cfg(target_os = "linux")]
+#[path = "plan_vectors_tests.rs"]
+mod plan_vectors;
+
 fn frame(body: Value) -> Frame {
     Frame::build(
         FrameType::Request,
@@ -23,7 +27,13 @@ async fn config_gate_ops_are_explicitly_unprivileged_and_inactive_dispatch_is_na
     };
     for body in [
         json!({"op":"config.status"}),
+        json!({"op":"config.modules"}),
+        json!({"op":"config.schema","module_id":"sample-reader"}),
+        json!({"op":"config.show","module_id":"sample-reader"}),
+        json!({"op":"config.watch"}),
         json!({"op":"config.plan"}),
+        json!({"op":"config.plan_get","digest":subc_config::raw_digest(b"plan")}),
+        json!({"op":"config.plan_discard","digest":subc_config::raw_digest(b"plan")}),
         json!({"op":"config.apply","digest":subc_config::raw_digest(b"plan")}),
         json!({"op":"config.stamp"}),
         json!({"op":"config.unstamp"}),
@@ -227,7 +237,10 @@ async fn config_plan_proceeds_without_an_unavailable_rereview_and_keeps_it_owed(
             &ctx,
             &frame(json!({"op":"config.plan"})),
             owner.clone(),
-            ConfigControlRequest::Plan {},
+            ConfigControlRequest::Plan {
+                base_generations: None,
+                edits: None,
+            },
         )
         .await
         .expect("an unavailable re-review does not fail the plan");

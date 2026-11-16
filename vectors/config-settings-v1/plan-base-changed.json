@@ -1,0 +1,20 @@
+{
+  "reply": {
+    "code": "config_changed_since_review",
+    "message": "a touched module's approved generation changed"
+  },
+  "request": {
+    "base_generations": {
+      "demo": 1
+    },
+    "edits": [
+      {
+        "layer": "user",
+        "module_id": "demo",
+        "path": "/limit",
+        "set": 4
+      }
+    ],
+    "op": "config.plan"
+  }
+}

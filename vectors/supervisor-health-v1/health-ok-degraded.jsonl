@@ -1,0 +1,2 @@
+{"op":"supervisor.health"}
+{"op":"supervisor.health","generation":7,"modules":[{"module_id":"northstar","status":"ok","consecutive_failures":0,"late_answer_count":0,"last_action":null,"last_action_ms":null,"last_probe_ms":1700000000000},{"module_id":"bluebird","status":"degraded","detail":"Queue is growing","metrics":{"queue_depth":12,"workers":2},"consecutive_failures":0,"late_answer_count":0,"last_action":"report","last_action_ms":1700000000100,"last_probe_ms":1700000000100}]}

@@ -142,6 +142,15 @@ const DEFAULT_RESTART_WINDOW: Duration = Duration::from_secs(600);
 /// `supervisor.restart{drain_timeout_ms}` (0 = cut now, for wedge bounces
 /// where a stuck request will never settle).
 pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+// Child admission durably records identity before exec. Disk pressure can make
+// fsync slow without implying a failed child start, so allow a generous budget.
+#[cfg(any(unix, feature = "test-support"))]
+const ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Daemon-side child-admission budget, for integration-test RPC deadlines.
+#[cfg(feature = "test-support")]
+pub const CHILD_ADMISSION_TIMEOUT: Duration = ADMISSION_TIMEOUT;
+
 pub(crate) const DEFAULT_REGISTER_TIMEOUT: Duration = Duration::from_secs(120);
 const REGISTRY_RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
 const REGISTRY_RELEASE_POLL: Duration = Duration::from_millis(10);

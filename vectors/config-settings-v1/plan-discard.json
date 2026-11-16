@@ -1,0 +1,9 @@
+{
+  "reply": {
+    "op": "config.plan_discard"
+  },
+  "request": {
+    "digest": "sha256:6590e0aa80fbbd3ac21151e3a8accb0d7a3fd10772355114273f7b78ee65c68a",
+    "op": "config.plan_discard"
+  }
+}

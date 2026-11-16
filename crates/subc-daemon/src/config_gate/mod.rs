@@ -20,6 +20,18 @@ mod strict_json;
 pub use approval::*;
 pub use snapshot::{CapturedInput, GateSnapshot, InputKey};
 
+/// The settings edit base advances only when a retained generation names the module.
+pub(crate) fn module_base_generation(body: &crate::config_store::StoreBody, module: &str) -> u64 {
+    if !body.stamped {
+        return 0;
+    }
+    body.generations
+        .values()
+        .rev()
+        .find(|entry| entry.tuples.iter().any(|tuple| tuple.module == module))
+        .map_or(0, |entry| entry.generation.id)
+}
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use subc_config::{Changeset, Digest, Generation, Plan};
@@ -31,6 +43,7 @@ use crate::config_store::{CommitKind, ConfigStore, HistoryEntry, StoreError, Sto
 pub struct GateError {
     pub code: String,
     pub detail: String,
+    capture_race: bool,
 }
 type Result<T> = std::result::Result<T, GateError>;
 
@@ -39,6 +52,7 @@ impl GateError {
         Self {
             code: code.into(),
             detail: detail.to_string(),
+            capture_race: false,
         }
     }
     fn invalid(detail: impl ToString) -> Self {
@@ -49,6 +63,19 @@ impl GateError {
             "plan_stale",
             "reviewed inputs or generation changed; plan again",
         )
+    }
+
+    // Observational retries must not also retry stale review or plan decisions
+    // just because those refusals use the same wire code and message.
+    pub(crate) fn capture_race() -> Self {
+        Self {
+            capture_race: true,
+            ..Self::stale()
+        }
+    }
+
+    pub(crate) fn is_capture_race(&self) -> bool {
+        self.capture_race
     }
 
     pub(crate) fn commit_timeout() -> Self {
@@ -133,6 +160,8 @@ impl PlanKind {
 }
 
 struct PendingPlan {
+    creation_sequence: u64,
+    edits: Option<runtime::edits::EditPlan>,
     development_approval: Option<crate::program_origin::DevelopmentApproval>,
     view: ConfigPlanView,
     kind: PlanKind,
@@ -151,9 +180,18 @@ pub struct ConfigGate {
     plans: BTreeMap<Digest, PendingPlan>,
     attempts: BTreeMap<u64, approval::Attempt>,
     next_attempt: u64,
+    next_plan_sequence: u64,
 }
 
 impl ConfigGate {
+    fn pending_file_plan(&self, module: &str) -> Option<Digest> {
+        self.plans
+            .values()
+            .filter(|plan| plan.edits.is_none() && plan.modules.contains(module))
+            .max_by_key(|plan| plan.creation_sequence)
+            .map(|plan| plan.view.digest.clone())
+    }
+
     pub(crate) fn plan_modules(&self, digest: &Digest) -> Result<BTreeSet<String>> {
         self.plans
             .get(digest)
@@ -174,6 +212,7 @@ impl ConfigGate {
             plans: BTreeMap::new(),
             attempts: BTreeMap::new(),
             next_attempt: 0,
+            next_plan_sequence: 0,
         }
     }
 
@@ -210,13 +249,27 @@ impl ConfigGate {
         record: ReviewRecord<'_>,
         review: impl FnOnce(&GateSnapshot, &GateSnapshot) -> Result<Changeset>,
     ) -> Result<ConfigPlanView> {
+        self.plan_reviewed_inner(store, kind, candidate, observed, record, None, review)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn plan_reviewed_inner(
+        &mut self,
+        store: &mut ConfigStore,
+        kind: PlanKind,
+        candidate: GateSnapshot,
+        observed: &GateSnapshot,
+        record: ReviewRecord<'_>,
+        edits: Option<runtime::edits::EditPlan>,
+        review: impl FnOnce(&GateSnapshot, &GateSnapshot) -> Result<Changeset>,
+    ) -> Result<ConfigPlanView> {
         let status = store.status();
         let recovery = matches!(
             status.state,
             StoreState::StoreUnverified | StoreState::StoreMissing
         );
         if (recovery && !matches!(kind, PlanKind::Stamp | PlanKind::Unstamp))
-            || (status.state == StoreState::Unstamped && kind != PlanKind::Stamp)
+            || (status.state == StoreState::Unstamped && kind != PlanKind::Stamp && edits.is_none())
         {
             return Err(GateError::new(
                 "config_gated",
@@ -251,27 +304,35 @@ impl ConfigGate {
                 }
             }
         }
-        let (base_revision, base_generation, approved, active) = if recovery {
-            (0, 0, GateSnapshot::default(), BTreeMap::new())
-        } else {
-            store.delivery_ready()?;
-            let body = store.body()?;
-            let active = body
-                .versions
-                .iter()
-                .filter_map(|(tuple, versions)| {
-                    versions
-                        .active
-                        .map(|id| (serde_json::to_string(tuple).expect("tuple"), id))
-                })
-                .collect();
-            (
-                body.base_revision,
-                body.last_generation,
-                GateSnapshot::from_store(&body.approved)?,
-                active,
-            )
-        };
+        let (base_revision, base_generation, approved, active) =
+            if let Some(edit) = edits.as_ref().filter(|edit| edit.unstamped) {
+                (
+                    status.base_revision,
+                    0,
+                    edit.baseline.clone(),
+                    BTreeMap::new(),
+                )
+            } else if recovery {
+                (0, 0, GateSnapshot::default(), BTreeMap::new())
+            } else {
+                store.delivery_ready()?;
+                let body = store.body()?;
+                let active = body
+                    .versions
+                    .iter()
+                    .filter_map(|(tuple, versions)| {
+                        versions
+                            .active
+                            .map(|id| (serde_json::to_string(tuple).expect("tuple"), id))
+                    })
+                    .collect();
+                (
+                    body.base_revision,
+                    body.last_generation,
+                    GateSnapshot::from_store(&body.approved)?,
+                    active,
+                )
+            };
         let changed: BTreeSet<InputKey> = approved
             .changed_keys(&candidate)
             .into_iter()
@@ -427,6 +488,17 @@ impl ConfigGate {
             changeset.apply_plan[reviewed_build::REVIEWED_PROGRAMS] = serde_json::json!(record);
         }
         apply::bind_plan(&mut changeset)?;
+        if let Some(edit) = &edits {
+            changeset.apply_plan["edit_plan"] = serde_json::json!({
+                "unstamped": edit.unstamped,
+                "write_back": edit.files.iter().map(runtime::edits::WriteBack::intent).collect::<Vec<_>>(),
+            });
+            if !edit.refusals.is_empty() {
+                // Keep refusals bound to the plan digest so apply can reject it;
+                // settings clients read the keyed rows from view.refusals.
+                changeset.apply_plan["edit_refusals"] = serde_json::json!(edit.refusals);
+            }
+        }
         let mut plan = Plan::new(
             base_revision,
             base_generation,
@@ -435,10 +507,19 @@ impl ConfigGate {
             changeset,
         );
         plan.active_generations = active;
-        let view = ConfigPlanView::new(plan).map_err(GateError::invalid)?;
+        let mut view = ConfigPlanView::new(plan).map_err(GateError::invalid)?;
+        if let Some(edit) = &edits {
+            view.refusals = edit.refusals.clone();
+        }
+        self.next_plan_sequence = self
+            .next_plan_sequence
+            .checked_add(1)
+            .ok_or_else(|| GateError::new("config_busy", "plan creation sequence exhausted"))?;
         self.plans.insert(
             view.digest.clone(),
             PendingPlan {
+                creation_sequence: self.next_plan_sequence,
+                edits,
                 development_approval: None,
                 view: view.clone(),
                 kind,

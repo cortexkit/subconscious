@@ -1,0 +1,55 @@
+{
+  "module_id": "sample-reader",
+  "op": "config.schema",
+  "schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "credential": {
+        "description": "Credential reference",
+        "type": "object",
+        "x-ck-apply": "live",
+        "x-ck-kind": "credential_ref",
+        "x-ck-layers": [
+          "user"
+        ],
+        "x-ck-required": true
+      },
+      "group": {
+        "properties": {
+          "enabled": {
+            "default": false,
+            "description": "Enable group",
+            "type": "boolean",
+            "x-ck-apply": "live",
+            "x-ck-layers": [
+              "user"
+            ]
+          }
+        },
+        "type": "object",
+        "unevaluatedProperties": false,
+        "x-ck-apply": "live",
+        "x-ck-layers": [
+          "user"
+        ]
+      },
+      "limit": {
+        "default": 2,
+        "description": "Result limit",
+        "type": "integer",
+        "x-ck-apply": "live",
+        "x-ck-layers": [
+          "user"
+        ]
+      }
+    },
+    "title": "Sample reader",
+    "type": "object",
+    "unevaluatedProperties": false,
+    "x-ck-apply": "live",
+    "x-ck-layers": [
+      "user"
+    ]
+  },
+  "schema_digest": "sha256:6265d0e7a8e4dfe6a8f467df89b3a91a14eeeda16a51a32f16bb54e69ea456aa"
+}

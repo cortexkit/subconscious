@@ -1,0 +1,43 @@
+{
+  "base_generation": 1,
+  "effective": {
+    "credential": {
+      "vault_ref": "sample-reference"
+    },
+    "group": {
+      "enabled": true
+    },
+    "limit": 4
+  },
+  "layers": [
+    {
+      "document": {
+        "group": {
+          "enabled": false
+        },
+        "limit": 2
+      },
+      "layer": "default"
+    },
+    {
+      "document": {
+        "credential": {
+          "vault_ref": "sample-reference"
+        },
+        "group": {
+          "enabled": true
+        },
+        "limit": 4
+      },
+      "layer": "user"
+    }
+  ],
+  "module_id": "sample-reader",
+  "op": "config.show",
+  "sources": {
+    "/credential": "user",
+    "/group/enabled": "user",
+    "/limit": "user"
+  },
+  "stamped": true
+}

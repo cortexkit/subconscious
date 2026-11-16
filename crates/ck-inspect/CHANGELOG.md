@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.6
+
+- Require subc-client-rs 0.41.2 and subc-control 0.42.0 for the settings release.
+
 ## 0.5.5
 
 - Require Rust client 0.41.0 for the public registration-channel adoption API.

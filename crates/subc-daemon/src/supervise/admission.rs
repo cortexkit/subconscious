@@ -5,9 +5,6 @@ use crate::child_roster::{RecordedIdentity, RosterGuard};
 use std::sync::{mpsc, Condvar};
 use subc_os::admission_gate::{AdmissionGate, PlacementBarrier};
 
-// Disk pressure can make fsync slow. A generous bound avoids failing an otherwise
-// healthy start; only the few opted-in modules queue behind this spawn permit.
-const ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
 static SPAWN_PERMIT: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
 
 struct SpawnPermit;

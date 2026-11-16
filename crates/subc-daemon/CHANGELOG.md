@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.50.0
+
+- Retry capture-consistency races when opening or refreshing settings watches;
+  opening retries are bounded, and unrelated refusals keep their existing behavior.
+- `GateError` now has private origin metadata; construct it with its constructors,
+  not Rust struct literals. Wire refusal codes and messages are unchanged.
+- Serve module settings, admitted schemas and approved layer documents without
+  prompting. Unstamped reads explicitly identify current file settings as
+  unreviewed generation zero. Project reads require that project's approved
+  workspace and project layers.
+- Stream settings resyncs and changes with cancellation and reconnect support;
+  publish byte-pinned handler samples and advertise `config.settings/v1`.
+- Plan user-layer edits from approved documents, report field refusals, and read
+  or discard pending plans by digest. Workspace and project edits return
+  `layer_not_served`; daemon settings are not editable through this surface.
+- Serve a plan's field refusals at `view.refusals` (clients read only there),
+  pinned by samples, and publish apply, stale-base and unsupported-layer
+  examples alongside the settings samples.
+- Reconcile approved user edits to their files with comment-preserving edits
+  and atomic replacement, without overwriting concurrent file changes.
+- User-layer write-back keeps the file's mode, but not explicit ACLs or extended
+  attributes. Repository-layer write-back requires stronger path protections.
+- On unstamped installs, edit plans compare and replace the active user files
+  without approval or an approved-store publication.
+- Require subc-control 0.42.0, released alongside.
+- Require subc-os 0.1.42 so Windows write-back can atomically replace a user file
+  while configuration captures and polling readers still hold file handles.
+- Compare content digests on every unstamped user-file poll so same-size edits
+  sharing a timestamp are not missed. Hash at most 1 MiB; larger or unstable
+  files are always treated as changed, never as unchanged.
+- Pin examples of supervisor health and list response serialization for status
+  clients (`vectors/supervisor-health-v1`).
+- Test-only: expose the existing child-admission timeout through the test-support
+  feature so integration RPC deadlines can follow the daemon's spawn budget.
+
 ## 0.49.5
 
 - macOS: use subc-os's data protection keychain for the configuration sealing

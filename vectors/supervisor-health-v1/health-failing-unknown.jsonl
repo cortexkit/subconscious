@@ -1,0 +1,2 @@
+{"op":"supervisor.health"}
+{"op":"supervisor.health","generation":7,"modules":[{"module_id":"sundial","status":"failing","detail":"Storage unavailable","consecutive_failures":0,"late_answer_count":0,"last_action":"report","last_action_ms":1700000000200,"last_probe_ms":1700000000200},{"module_id":"raincloud","status":"unknown","consecutive_failures":0,"late_answer_count":0,"last_action":null,"last_action_ms":null}]}

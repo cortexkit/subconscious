@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.42.0
+
+- Add typed settings reads: `config.modules`, `config.schema`, `config.show`
+  and `config.watch`, including layer documents, leaf sources and replacement
+  resync events. Status strings remain open to future values.
+- Keep existing configuration request and response encodings unchanged.
+- Add optional `base_generations` and `edits` to `config.plan`, optional field
+  refusals to plan views, and digest-addressed `config.plan_get` and
+  `config.plan_discard` requests and replies. Existing bodies are unchanged
+  when the new optional members are absent.
+- Workspace and project edits return `layer_not_served` until their layers are
+  served. Daemon settings are not editable through this surface.
+- Rust callers constructing `ConfigControlRequest::Plan` must supply
+  `base_generations: None, edits: None` for file-based planning.
+
 ## 0.41.0
 
 - Add standalone `scope.watch` request, snapshot and terminal push shapes, with open lifecycle state/event readers. Advertised as a new module control operation.

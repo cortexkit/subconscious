@@ -57,7 +57,10 @@ pub(super) fn parse(tail: &[OsString]) -> Result<Command, CkError> {
         [] | ["help" | "-h" | "--help"] => return Ok(Command::Help(HELP.into())),
         [verb] => match *verb {
             "status" => Request::Status {},
-            "plan" => Request::Plan {},
+            "plan" => Request::Plan {
+                base_generations: None,
+                edits: None,
+            },
             "stamp" => Request::Stamp {},
             "unstamp" => Request::Unstamp {},
             "history" => Request::History {},

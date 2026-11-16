@@ -8,7 +8,11 @@ mod delivery_worker;
 mod phone;
 mod recovery;
 mod route_policy;
+mod settings;
 mod widening;
+
+/// Settings reads and user-layer edit plans are served together.
+pub(super) const CONFIG_SETTINGS_SURFACE_ENABLED: bool = true;
 
 /// Bound each immutable module review so an unanswered request cannot approve a plan.
 const CONFIG_REVIEW_TIMEOUT: Duration = Duration::from_secs(30);
@@ -24,7 +28,13 @@ pub(super) fn is_config_op(op: &str) -> bool {
     matches!(
         op,
         "config.status"
+            | "config.modules"
+            | "config.schema"
+            | "config.show"
+            | "config.watch"
             | "config.plan"
+            | "config.plan_get"
+            | "config.plan_discard"
             | "config.apply"
             | "config.stamp"
             | "config.unstamp"
@@ -45,7 +55,7 @@ impl PrivilegedRequest for ConfigControlRequest {
         // cannot substitute for config approval.
         match self {
             Self::Status {} => None,
-            Self::Plan {} => None,
+            Self::Plan { .. } => None,
             Self::Apply { .. } => None,
             Self::Stamp {} => None,
             Self::Unstamp {} => None,
@@ -467,13 +477,18 @@ impl ControlHandler {
         let probe: ControlOpProbe = serde_json::from_slice(&response.body).ok()?;
         if !matches!(
             probe.op.as_str(),
-            "config.plan" | "config.stamp" | "config.unstamp" | "config.rollback"
+            "config.plan"
+                | "config.plan_get"
+                | "config.stamp"
+                | "config.unstamp"
+                | "config.rollback"
         ) || !matches!(self.config_desktop_identity(connection), Ok(true))
         {
             return None;
         }
         match serde_json::from_slice::<ConfigControlResponse>(&response.body).ok()? {
             ConfigControlResponse::Plan { view }
+            | ConfigControlResponse::PlanGet { view }
             | ConfigControlResponse::Stamp { view }
             | ConfigControlResponse::Unstamp { view }
             | ConfigControlResponse::Rollback { view } => Some(view),
@@ -533,6 +548,8 @@ impl ControlHandler {
         }
     }
 
+    /// Config operations are channel-0 only, so callers are unscoped. Scoped
+    /// access rules must be enforced if a scoped path to these operations is added.
     pub(super) async fn handle_config_gate_request(
         &self,
         ctx: &RouteCtx,
@@ -562,6 +579,11 @@ impl ControlHandler {
                 "owner_required",
                 "configuration control requires a kernel-observed owner-user connection",
             )?]);
+        }
+        if let ConfigControlRequest::Watch { modules } = request {
+            return self
+                .handle_config_settings_watch(ctx, frame, runtime, modules)
+                .await;
         }
         let result = self
             .execute_config_request(ctx, &frame, runtime, request)
@@ -610,6 +632,36 @@ impl ControlHandler {
         request: ConfigControlRequest,
     ) -> std::result::Result<ConfigControlResponse, GateError> {
         match request {
+            ConfigControlRequest::Modules {} => {
+                let known = self.config_settings_known_modules()?;
+                config_work(runtime, move |owner| owner.settings_modules(known)).await
+            }
+            ConfigControlRequest::Schema { module_id } => {
+                let known = self.config_settings_known_modules()?;
+                config_work(runtime, move |owner| {
+                    owner.settings_schema(known, module_id)
+                })
+                .await
+            }
+            ConfigControlRequest::Show {
+                module_id,
+                project_id,
+                through,
+            } => {
+                let known = self.config_settings_known_modules()?;
+                config_work(runtime, move |owner| {
+                    owner.settings_show(known, module_id, project_id, through)
+                })
+                .await
+            }
+            ConfigControlRequest::PlanGet { digest } => {
+                let view = config_work(runtime, move |owner| owner.plan_get(&digest)).await?;
+                Ok(ConfigControlResponse::PlanGet { view })
+            }
+            ConfigControlRequest::PlanDiscard { digest } => {
+                config_work(runtime, move |owner| owner.plan_discard(&digest)).await?;
+                Ok(ConfigControlResponse::PlanDiscard {})
+            }
             ConfigControlRequest::PlaceProgram {
                 module_id,
                 path,
@@ -655,6 +707,17 @@ impl ControlHandler {
                 })
             }
             ConfigControlRequest::Apply { digest } => {
+                let apply_digest = digest.clone();
+                if let Some(generation) = config_work(runtime.clone(), move |owner| {
+                    owner.apply_unstamped_edits(&apply_digest)
+                })
+                .await?
+                {
+                    return Ok(ConfigControlResponse::Applied {
+                        generation,
+                        restart_required: false,
+                    });
+                }
                 let connection = ctx.connection_id;
                 let corr = frame.header.corr;
                 #[cfg(all(test, unix))]
@@ -791,11 +854,34 @@ impl ControlHandler {
                 })
             }
             request => {
-                let kind = match request {
-                    ConfigControlRequest::Plan {} => PlanKind::Change,
-                    ConfigControlRequest::Stamp {} => PlanKind::Stamp,
-                    ConfigControlRequest::Unstamp {} => PlanKind::Unstamp,
-                    ConfigControlRequest::Rollback { generation } => PlanKind::Rollback(generation),
+                let (kind, edits) = match request {
+                    ConfigControlRequest::Plan {
+                        base_generations,
+                        edits,
+                    } => {
+                        if edits.is_none() && base_generations.is_some() {
+                            return Err(GateError::new(
+                                "invalid_params",
+                                "base_generations requires edits",
+                            ));
+                        }
+                        let edits = edits
+                            .map(|edits| {
+                                base_generations.map(|base| (base, edits)).ok_or_else(|| {
+                                    GateError::new(
+                                        "invalid_params",
+                                        "edits requires base_generations",
+                                    )
+                                })
+                            })
+                            .transpose()?;
+                        (PlanKind::Change, edits)
+                    }
+                    ConfigControlRequest::Stamp {} => (PlanKind::Stamp, None),
+                    ConfigControlRequest::Unstamp {} => (PlanKind::Unstamp, None),
+                    ConfigControlRequest::Rollback { generation } => {
+                        (PlanKind::Rollback(generation), None)
+                    }
                     _ => {
                         return Err(GateError::new(
                             "unsupported_control_frame",
@@ -803,9 +889,13 @@ impl ControlHandler {
                         ))
                     }
                 };
-                let mut prepared =
-                    config_work(runtime.clone(), move |owner| owner.prepare(kind)).await?;
+                let mut prepared = config_work(runtime.clone(), move |owner| match edits {
+                    Some((base, edits)) => owner.prepare_edits(base, edits),
+                    None => owner.prepare(kind),
+                })
+                .await?;
                 let mut fields = Vec::new();
+                let mut edit_refusals = Vec::new();
                 let mut unavailable_rereviews = Vec::new();
                 for (module, captured) in &prepared.candidate.modules {
                     if !prepared.review_modules.contains(module) {
@@ -813,6 +903,15 @@ impl ControlHandler {
                     }
                     let base = prepared.bases.get(module);
                     let reply: std::result::Result<Vec<u8>, GateError> = async {
+                        #[cfg(test)]
+                        if let Some(reply) = &self.config_review_test_reply {
+                            return serde_json::to_vec(reply).map_err(|_| {
+                                GateError::new(
+                                    "module_review_invalid",
+                                    "could not encode the fixture review",
+                                )
+                            });
+                        }
                         let registration = self
                             .registry
                             .get_module(module)
@@ -869,12 +968,40 @@ impl ControlHandler {
                         }
                         Err(error) => return Err(error),
                     };
-                    let reply = serde_json::from_slice(&reply).map_err(|_| {
-                        GateError::new(
-                            "module_review_invalid",
-                            format!("{module}: malformed config.review reply"),
-                        )
-                    })?;
+                    let reply: subc_protocol::config::ConfigReviewReply =
+                        serde_json::from_slice(&reply).map_err(|_| {
+                            GateError::new(
+                                "module_review_invalid",
+                                format!("{module}: malformed config.review reply"),
+                            )
+                        })?;
+                    if prepared.is_edit_plan() && !reply.refusals.is_empty() {
+                        let before = edit_refusals.len();
+                        for refusal in &reply.refusals {
+                            for path in refusal
+                                .paths
+                                .iter()
+                                .filter(|path| path.starts_with('/') && path.len() <= 1024)
+                            {
+                                edit_refusals.push(subc_control::config::ConfigPlanRefusal {
+                                    module_id: module.clone(),
+                                    path: path.clone(),
+                                    code: "module_review_refused".into(),
+                                    message: "the module refused this field".into(),
+                                });
+                            }
+                        }
+                        if edit_refusals.len() == before {
+                            edit_refusals.push(subc_control::config::ConfigPlanRefusal {
+                                module_id: module.clone(),
+                                path: String::new(),
+                                code: "module_review_refused".into(),
+                                message: "the module refused the edits".into(),
+                            });
+                        }
+                        fields.extend(prepared.refused_fields(module)?);
+                        continue;
+                    }
                     fields.extend(crate::config_gate::review::checked_fields(
                         module,
                         &captured.schema,
@@ -888,6 +1015,7 @@ impl ControlHandler {
                     prepared.review_modules.remove(&module);
                     prepared.rereview_modules.remove(&module);
                 }
+                prepared.add_edit_refusals(edit_refusals);
                 let view = config_work(runtime, move |owner| {
                     owner.finish_plan(prepared, move |old, new| {
                         let mut changeset = crate::config_gate::runtime::daemon_review(old, new)?;

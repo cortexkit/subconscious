@@ -296,6 +296,12 @@ impl ConfigGate {
             .plans
             .get(digest)
             .ok_or_else(|| GateError::new("plan_unknown", "plan is absent or already applied"))?;
+        if !plan.view.refusals.is_empty() {
+            return Err(GateError::new(
+                "plan_refused",
+                "the plan contains refused edits",
+            ));
+        }
         Self::fresh(plan, store, current)?;
         if !facts.owner_uid {
             return Err(unavailable());

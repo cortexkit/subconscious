@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.42
+
+- Windows: atomically replace files held by delete-sharing readers using POSIX
+  rename semantics, preserving retained identities and publication flushing.
+  Unsupported volumes retain the atomic write-through move and its refusals.
+
 ## 0.1.41
 
 - macOS: keep the configuration sealing key in the data protection keychain,

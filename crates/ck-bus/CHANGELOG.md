@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.7.4
+
+- Require subc-client-rs 0.41.2, subc-control 0.42.0, subc-daemon 0.50.0 and cortexkit-bus-testkit 0.9.4 for the settings release.
+
 ## 0.7.3
 
 - Adopt cortexkit-bus-naming 0.4.4: the `astrocyte.multiplier` bucket takes

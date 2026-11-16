@@ -16,10 +16,13 @@ pub mod test_support;
 pub use activity::*;
 pub use consumer::{
     is_retryable_route_open_code, AppOpenError, CallError, CallOptions, CallReply, CancelHandle,
-    CancelOutcome, CatalogList, CatalogSubscription, CloseRouteOptions, ConnectionFacts,
-    ConnectionState, ConsumerCapabilityError, ConsumerError, ConsumerOptions, ControlPush,
-    CorrelationId, HealthProbeResponse, NotSentCause, OutcomeUnknownCause, PendingReply, PushEvent,
-    RequestBody, RequestReservation, RetryBackoff, ReverseRequestContext, ReverseRequestError,
+    CancelOutcome, CatalogList, CatalogSubscription, CloseRouteOptions, ConfigApplyResponse,
+    ConfigEdit, ConfigEditAction, ConfigModule, ConfigModulesResponse, ConfigPlanRefusal,
+    ConfigPlanView, ConfigSchemaResponse, ConfigSettingsLayer, ConfigShowResponse,
+    ConfigSubscription, ConfigThrough, ConfigWatchEvent, ConnectionFacts, ConnectionState,
+    ConsumerCapabilityError, ConsumerError, ConsumerOptions, ControlPush, CorrelationId, Digest,
+    HealthProbeResponse, NotSentCause, OutcomeUnknownCause, PendingReply, PushEvent, RequestBody,
+    RequestReservation, RetryBackoff, ReverseRequestContext, ReverseRequestError,
     ReverseRequestRegistrationError, ReverseRequestRegistry, RouteCloseDisposition,
     RouteCloseReason, RouteEndReason, RouteOpenTarget, RouteOpenTargetKind, RoutePollResult,
     ScopeBindProofRefusal, ScopeSelector, ServerDescription, SpawnStreamError, SpawnSubscription,

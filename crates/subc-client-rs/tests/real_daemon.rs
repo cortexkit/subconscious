@@ -179,6 +179,150 @@ fn route_option_struct_literals_with_scope_and_default_updates_compile() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_settings_calls_and_watch_use_the_real_daemon_local_connection() {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--features",
+            "test-support",
+            "--message-format=json",
+        ],
+    );
+    let temp_dir = create_short_socket_root();
+    let runtime_dir = temp_dir.0.join("runtime");
+    let config_dir = temp_dir.0.join("config");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    write_empty_config(&config_dir);
+    // Opt in with an isolated store and test key, never the operator's keychain.
+    let child =
+        cortexkit_test_support::dev_command(cortexkit_test_support::ckdev_binary(&daemon_bin))
+            .arg("--config-store-root")
+            .arg(temp_dir.0.join("config-store"))
+            .env_remove(subc_protocol::SUBC_MODULE_ID_ENV)
+            .env_remove(subc_protocol::SUBC_LAUNCH_NONCE_ENV)
+            .env_remove(subc_client_rs::launch_nonce::LAUNCH_NONCE_FD_ENV)
+            .env("XDG_RUNTIME_DIR", &runtime_dir)
+            .env("XDG_CONFIG_HOME", &config_dir)
+            .env("XDG_DATA_HOME", temp_dir.0.join("data"))
+            .env("SUBC_TEST_CONFIG_GATE", "1")
+            .env("SUBC_PORT", "0")
+            .env("SUBC_CGROUP_PLACEMENT", "disabled")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+    let mut daemon = LiveDaemon {
+        child,
+        connection_file: runtime_dir.join("subc-connection.json"),
+        runtime_dir,
+        config_dir,
+    };
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    let consumer = SubcConsumer::connect_local(&daemon.connection_file, fast_consumer_options())
+        .await
+        .unwrap();
+    assert!(consumer
+        .server_describe()
+        .await
+        .unwrap()
+        .capabilities
+        .iter()
+        .any(|capability| capability == "config.settings/v1"));
+    let modules = consumer.config_modules().await.unwrap();
+    assert!(!modules.stamped);
+    assert!(modules.modules.is_empty());
+    assert_eq!(
+        consumer.config_schema("missing").await.unwrap_err().code(),
+        Some("unknown_module")
+    );
+    assert_eq!(
+        consumer
+            .config_show("missing", None, None)
+            .await
+            .unwrap_err()
+            .code(),
+        Some("unknown_module")
+    );
+    let digest = subc_config::raw_digest(b"missing plan");
+    assert_eq!(
+        consumer
+            .config_plan_get(digest.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        Some("unknown_plan")
+    );
+    assert_eq!(
+        consumer
+            .config_plan_discard(digest.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        Some("unknown_plan")
+    );
+    assert_eq!(
+        consumer.config_apply(digest).await.unwrap_err().code(),
+        Some("plan_unknown")
+    );
+    assert_eq!(
+        consumer.config_plan(None, None).await.unwrap_err().code(),
+        Some("config_gated")
+    );
+    let edit = subc_client_rs::ConfigEdit {
+        module_id: "missing".into(),
+        layer: "user".into(),
+        workspace_id: None,
+        project_id: None,
+        path: "/limit".into(),
+        action: subc_client_rs::ConfigEditAction::Set { set: json!(4) },
+    };
+    let view = consumer
+        .config_plan(
+            Some(BTreeMap::from([("missing".into(), 0)])),
+            Some(vec![edit]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(view.refusals[0].code, "unknown_module");
+    assert_eq!(
+        consumer.config_plan_get(view.digest.clone()).await.unwrap(),
+        view
+    );
+    consumer.config_plan_discard(view.digest).await.unwrap();
+    let mut watch = consumer.config_watch(None).await.unwrap();
+    assert!(
+        matches!(timeout(EVENT_TIMEOUT, watch.next()).await.unwrap().unwrap(), Some(subc_client_rs::ConfigWatchEvent::Resync { modules, stamped:false }) if modules.is_empty())
+    );
+    watch.unsubscribe().unwrap();
+    assert_eq!(
+        watch.ended().await,
+        subc_client_rs::SubscriptionEnd::Cancelled
+    );
+    let mut watch = consumer
+        .config_watch(Some(vec!["missing".into()]))
+        .await
+        .unwrap();
+    assert!(matches!(
+        timeout(EVENT_TIMEOUT, watch.next()).await.unwrap().unwrap(),
+        Some(subc_client_rs::ConfigWatchEvent::Resync { .. })
+    ));
+    daemon.kill_and_wait();
+    assert_eq!(
+        timeout(EVENT_TIMEOUT, watch.ended()).await.unwrap(),
+        subc_client_rs::SubscriptionEnd::ConnectionLost
+    );
+    consumer.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn declared_consumer_capabilities_reach_provider_bind_on_real_daemon() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(

@@ -1,0 +1,15 @@
+{
+  "event": "resync",
+  "modules": [
+    {
+      "approved_generation": 1,
+      "display_name": "Sample reader",
+      "gated": true,
+      "module_id": "sample-reader",
+      "schema_digest": "sha256:6265d0e7a8e4dfe6a8f467df89b3a91a14eeeda16a51a32f16bb54e69ea456aa",
+      "status": "pending_activation"
+    }
+  ],
+  "op": "config.watch",
+  "stamped": true
+}

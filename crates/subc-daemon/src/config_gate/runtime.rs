@@ -21,9 +21,15 @@ use crate::{
     ConnectionId,
 };
 
+#[path = "edits.rs"]
+pub(super) mod edits;
+
 #[cfg(test)]
 type UserFileTestIdle =
     tokio::sync::mpsc::UnboundedSender<(ConnectionId, tokio::sync::oneshot::Sender<()>)>;
+
+#[cfg(test)]
+pub(crate) type SettingsProjectionHook = Box<dyn FnMut() -> Result<()> + Send>;
 
 pub struct RuntimeOwner {
     #[cfg(test)]
@@ -34,6 +40,8 @@ pub struct RuntimeOwner {
     pub(crate) content_kill_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     polled_capture_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    pub(crate) settings_projection_hook: Mutex<Option<SettingsProjectionHook>>,
     #[cfg(test)]
     polled_capture_count: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
@@ -68,6 +76,7 @@ pub struct RuntimeOwner {
     startup_overrides: Vec<String>,
     module_gates: Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
     delivery_changed: std::sync::Arc<tokio::sync::Notify>,
+    settings_changed: tokio::sync::watch::Sender<u64>,
     route_policy_authority: std::sync::OnceLock<std::sync::Arc<dyn RoutePolicyAuthority>>,
     mark_publisher: std::sync::OnceLock<std::sync::Arc<dyn mark::MarkPublisher>>,
     binding_retirements: Mutex<BTreeMap<usize, Box<dyn Fn() + Send + Sync>>>,
@@ -629,6 +638,9 @@ impl<'a> OwnerGuard<'a> {
                 approved_daemon,
                 projection,
             });
+            self.owner
+                .settings_changed
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
             if changed {
                 self.owner.delivery_changed.notify_one();
             }
@@ -693,6 +705,7 @@ impl Drop for OwnerGuard<'_> {
 }
 
 pub struct PreparedPlan {
+    edits: Option<edits::EditPlan>,
     pub candidate: CapturedConfiguration,
     pub bases: BTreeMap<String, ConfigView>,
     pub base_schemas: BTreeMap<String, subc_config::Schema>,
@@ -793,6 +806,8 @@ pub(crate) mod unstamped;
 #[path = "widening.rs"]
 mod widening;
 pub(crate) use published::Published;
+#[path = "settings.rs"]
+pub(crate) mod settings;
 #[path = "status_inputs.rs"]
 mod status_inputs;
 pub(crate) use approval_request::{ApprovalRequest, ApprovalRequestGuard, CancelApprovalRequest};
@@ -900,6 +915,8 @@ impl RuntimeOwner {
             #[cfg(test)]
             polled_capture_hook: Mutex::new(None),
             #[cfg(test)]
+            settings_projection_hook: Mutex::new(None),
+            #[cfg(test)]
             config_park_hook: Mutex::new(None),
             #[cfg(test)]
             content_kill_hook: Mutex::new(None),
@@ -971,6 +988,7 @@ impl RuntimeOwner {
             }),
             module_gates: Mutex::new(HashMap::new()),
             delivery_changed,
+            settings_changed: tokio::sync::watch::channel(0).0,
             route_policy_authority: std::sync::OnceLock::new(),
             mark_publisher: std::sync::OnceLock::new(),
             binding_retirements: Mutex::new(BTreeMap::new()),
@@ -1469,7 +1487,10 @@ impl RuntimeOwner {
             ));
         }
         if !state.recovery_exit_hold && state.store.status().state == StoreState::Stamped {
-            state.store.observe(observed.diagnostic.to_store()?)?;
+            let approved = super::GateSnapshot::from_store(&state.store.body()?.approved)?;
+            state
+                .store
+                .observe(observed.proposal_snapshot(&approved).to_store()?)?;
         }
         let rollback = if let PlanKind::Rollback(id) = kind {
             let target = super::GateSnapshot::from_store(&state.store.rollback_configuration(id)?)?;
@@ -1648,6 +1669,7 @@ impl RuntimeOwner {
             }
         }
         Ok(PreparedPlan {
+            edits: None,
             candidate,
             bases,
             base_schemas,
@@ -1685,19 +1707,57 @@ impl RuntimeOwner {
         } else {
             BTreeMap::new()
         };
-        let mut current = self
-            .capture_modules(&mut state, &prepared.touched_modules)
-            .map_err(|_| GateError::stale())?;
+        let mut current = if prepared.edits.is_some() {
+            self.edit_baseline(&mut state, Some(&prepared.touched_modules))
+        } else {
+            self.capture_modules(&mut state, &prepared.touched_modules)
+        }
+        .map_err(|_| GateError::stale())?;
         current
             .capture_programs(&prepared.program_keys)
             .map_err(|_| GateError::stale())?;
-        if state.store.status().base_revision != prepared.base_revision
+        if (prepared.edits.is_none()
+            && state.store.status().base_revision != prepared.base_revision)
             || active_generations != prepared.active_generations
             || !prepared
                 .read_set
                 .matches(&current.diagnostic.read_set(&prepared.touched_modules)?)
         {
-            return Err(GateError::stale());
+            return Err(if prepared.edits.is_some() {
+                GateError::new(
+                    "config_changed_since_review",
+                    "a touched module changed while the edits were reviewed",
+                )
+            } else {
+                GateError::stale()
+            });
+        }
+        if prepared.edits.is_some() {
+            // Carry forward approvals for modules outside the edit set. Changes
+            // to those approvals must neither refuse these edits nor be reverted by them.
+            let touched = &prepared.touched_modules;
+            for (key, input) in &current.diagnostic.inputs {
+                if key.module().is_none_or(|module| !touched.contains(module)) {
+                    prepared
+                        .candidate
+                        .diagnostic
+                        .inputs
+                        .insert(key.clone(), input.clone());
+                }
+            }
+            prepared.candidate.diagnostic.inputs.retain(|key, _| {
+                key.module().is_some_and(|module| touched.contains(module))
+                    || current.diagnostic.inputs.contains_key(key)
+            });
+            prepared
+                .candidate
+                .modules
+                .retain(|module, _| touched.contains(module));
+            for (module, captured) in std::mem::take(&mut current.modules) {
+                if !touched.contains(&module) {
+                    prepared.candidate.modules.insert(module, captured);
+                }
+            }
         }
         let delivery = DeliverySnapshot {
             daemon: Some(ConfigLayerSnapshot::file(
@@ -1726,6 +1786,12 @@ impl RuntimeOwner {
             body.generations
                 .get(&placement::last_approved_generation(body))
                 .and_then(|entry| entry.delivery.clone())
+        } else if prepared.edits.as_ref().is_some_and(|edit| edit.unstamped) {
+            Some(DeliverySnapshot {
+                daemon: delivery.daemon.clone(),
+                modules: prepared.bases.clone(),
+                declarations: delivery.declarations.clone(),
+            })
         } else {
             None
         };
@@ -1767,12 +1833,13 @@ impl RuntimeOwner {
             );
         }
         let OwnerState { gate, store, .. } = &mut *state;
-        let view = gate.plan_reviewed(
+        let view = gate.plan_reviewed_inner(
             store,
             prepared.kind,
             prepared.candidate.diagnostic,
             &current.diagnostic,
             super::ReviewRecord::Reviewed(&prepared.review_modules),
+            prepared.edits,
             |old, new| {
                 let mut changeset = review(old, new)?;
                 layer_file_rows(
@@ -1850,9 +1917,17 @@ impl RuntimeOwner {
         Self::check_authority(&mut state, true)?;
         let modules = state.gate.plan_modules(digest)?;
         let program_keys = state.gate.plan_program_keys(digest)?;
-        let mut current = self
-            .capture_modules(&mut state, &modules)
-            .map_err(|_| GateError::stale())?;
+        let mut current = if state
+            .gate
+            .plans
+            .get(digest)
+            .is_some_and(|plan| plan.edits.is_some())
+        {
+            self.edit_baseline(&mut state, Some(&modules))
+        } else {
+            self.capture_modules(&mut state, &modules)
+        }
+        .map_err(|_| GateError::stale())?;
         current
             .capture_programs(&program_keys)
             .map_err(|_| GateError::stale())?;
@@ -1928,10 +2003,18 @@ impl RuntimeOwner {
         let program_keys = state.gate.plan_program_keys(&digest)?;
         // Reopen inputs after the operator's interactive confirmation, immediately
         // before freshness checking and atomic publication of the saved plan.
+        let edit_plan = state
+            .gate
+            .plans
+            .get(&digest)
+            .and_then(|plan| plan.edits.clone());
         let current = match Self::check_authority(&mut state, true).and_then(|_| {
-            let mut current = self
-                .capture_modules(&mut state, &modules)
-                .map_err(|_| GateError::stale())?;
+            let mut current = if edit_plan.is_some() {
+                self.edit_baseline(&mut state, Some(&modules))
+            } else {
+                self.capture_modules(&mut state, &modules)
+            }
+            .map_err(|_| GateError::stale())?;
             current
                 .capture_programs(&program_keys)
                 .map_err(|_| GateError::stale())?;
@@ -2012,6 +2095,23 @@ impl RuntimeOwner {
             },
         );
         let committed_this_call = state.store.publication_sequence() != publication_before;
+        if committed_this_call {
+            if let Some(edit_plan) = edit_plan {
+                for file in &edit_plan.files {
+                    let _ = file.write_back();
+                }
+                // Publication already succeeded. Refresh drift after reconciliation
+                // without turning a failed diagnostic capture into a failed approval.
+                let _ = (|| -> Result<()> {
+                    let captured = self.capture(&mut state)?;
+                    let approved = super::GateSnapshot::from_store(&state.store.body()?.approved)?;
+                    state
+                        .store
+                        .observe(captured.proposal_snapshot(&approved).to_store()?)?;
+                    Ok(())
+                })();
+            }
+        }
         let stamped_files = committed_this_call
             && (was_unstamped || was_recovery)
             && state.store.body().is_ok_and(|body| {
@@ -2163,7 +2263,10 @@ impl RuntimeOwner {
         {
             let captured = self.capture(&mut state)?;
             current_snapshot = Some(captured.diagnostic.clone());
-            state.store.observe(captured.diagnostic.to_store()?)?;
+            let approved = super::GateSnapshot::from_store(&state.store.body()?.approved)?;
+            state
+                .store
+                .observe(captured.proposal_snapshot(&approved).to_store()?)?;
         }
         let store_status = state.store.status();
         let mut status = subc_control::config::ConfigStatus::default();

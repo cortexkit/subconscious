@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.41.2
+
+- Require subc-control 0.42.0 for typed configuration settings reads and edit plans,
+  and subc-os 0.1.42, released alongside.
+- Add typed consumer calls for configuration settings reads, edit plans, pending
+  plans and apply, plus a watch subscription with explicit terminal outcomes.
+
 ## 0.41.1
 
 - Exit with a failure status when an inherited registration connection ends

@@ -1,0 +1,6 @@
+{
+  "modules": [
+    "sample-reader"
+  ],
+  "op": "config.watch"
+}

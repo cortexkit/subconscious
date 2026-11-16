@@ -48,8 +48,9 @@ pub fn durable_replace(from: &Path, to: &Path) -> Result<(), DurableReplaceError
 }
 
 /// Inject a failure after a real rename. Unix runs the hook before syncing the
-/// directory; Windows preserves its write-through move and classifies the error
-/// from retained file identity, just as it does a failed operating-system call.
+/// directory; Windows flushes the publication, then uses the held source file's
+/// identity to distinguish a failed rename from a visible replacement whose
+/// publication failed to flush.
 #[cfg(feature = "test-support")]
 pub fn durable_replace_with_rename_hook(
     from: &Path,
@@ -178,22 +179,113 @@ fn windows_replace_with_operation(
 }
 
 #[cfg(windows)]
-#[allow(unsafe_code)]
 fn windows_move(from: &Path, to: &Path) -> io::Result<()> {
+    if windows_posix_move(from, to)? {
+        Ok(())
+    } else {
+        // Older systems and some volumes do not support POSIX replacement.
+        // The legacy move is still atomic and write-through, but may refuse
+        // a destination with open readers. Preserve that refusal, not a copy.
+        windows_legacy_move(from, to)
+    }
+}
+
+#[cfg(windows)]
+fn windows_wide(path: &Path) -> io::Result<Vec<u16>> {
     use std::os::windows::ffi::OsStrExt;
+    let mut result: Vec<_> = path.as_os_str().encode_wide().collect();
+    if result.contains(&0) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"));
+    }
+    result.push(0);
+    Ok(result)
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn windows_posix_move(from: &Path, to: &Path) -> io::Result<bool> {
+    use std::{
+        mem::{offset_of, size_of},
+        os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
+    };
+    use windows_sys::Win32::{
+        Foundation::{ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, GENERIC_WRITE},
+        Storage::FileSystem::{
+            FileRenameInfoEx, SetFileInformationByHandle, DELETE, FILE_FLAG_WRITE_THROUGH,
+            FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        },
+        System::WindowsProgramming::{
+            FILE_RENAME_FLAG_POSIX_SEMANTICS, FILE_RENAME_FLAG_REPLACE_IF_EXISTS,
+        },
+    };
+    let destination = windows_wide(&std::path::absolute(to)?)?;
+    let name_bytes = (destination.len() - 1) * size_of::<u16>();
+    let buffer_bytes =
+        offset_of!(FILE_RENAME_INFO, FileName) + destination.len() * size_of::<u16>();
+    let length = u32::try_from(buffer_bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "rename path too long"))?;
+    // usize storage supplies FILE_RENAME_INFO's alignment and room for its
+    // trailing UTF-16 name, including the terminating NUL.
+    let mut buffer = vec![0usize; buffer_bytes.div_ceil(size_of::<usize>())];
+    let information = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    // SAFETY: The zeroed allocation has the header's alignment and enough bytes
+    // for the complete variable-length name; both remain live through the call.
+    unsafe {
+        (*information).Anonymous.Flags =
+            FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
+        (*information).FileNameLength = name_bytes as u32;
+        std::ptr::copy_nonoverlapping(
+            destination.as_ptr(),
+            (*information).FileName.as_mut_ptr(),
+            destination.len(),
+        );
+    }
+    let file = std::fs::OpenOptions::new()
+        .access_mode(DELETE | GENERIC_WRITE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_WRITE_THROUGH)
+        .open(from)?;
+    // Classic replacement refuses even delete-sharing destination readers.
+    // POSIX semantics leave those handles on the old object while new opens
+    // resolve to the replacement, without closing existing file handles.
+    // SAFETY: file owns the source handle and information describes the live,
+    // aligned allocation whose byte length is passed to the synchronous API.
+    if unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileRenameInfoEx,
+            information.cast(),
+            length,
+        )
+    } == 0
+    {
+        let error = io::Error::last_os_error();
+        if matches!(
+            error.raw_os_error().map(|code| code as u32),
+            Some(ERROR_INVALID_PARAMETER | ERROR_NOT_SUPPORTED)
+        ) {
+            // false means unsupported before any rename. A later flush failure
+            // must return its error: the source pathname no longer names the
+            // file we renamed, so retrying could replace unrelated bytes.
+            return Ok(false);
+        }
+        return Err(error);
+    }
+    // Flush the renamed file's data and metadata before reporting publication.
+    // The caller keeps a source handle and compares its file id with both
+    // pathnames to distinguish a failed rename from a visible replacement.
+    file.sync_all()?;
+    Ok(true)
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn windows_legacy_move(from: &Path, to: &Path) -> io::Result<()> {
     use windows_sys::Win32::Storage::FileSystem::{
         MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     };
-    fn wide(path: &Path) -> io::Result<Vec<u16>> {
-        let mut result: Vec<_> = path.as_os_str().encode_wide().collect();
-        if result.contains(&0) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"));
-        }
-        result.push(0);
-        Ok(result)
-    }
-    let from = wide(from)?;
-    let to = wide(to)?;
+    let from = windows_wide(from)?;
+    let to = windows_wide(to)?;
     // SAFETY: Both paths are NUL-terminated and live through the call. There
     // are no borrowed handles. WRITE_THROUGH returns only once the move is
     // flushed; Windows has no directory fsync. Failure is never retried using
@@ -231,6 +323,33 @@ mod tests {
         durable_replace(&from, &to).unwrap();
         assert_eq!(fs::read(&to).unwrap(), b"next");
         assert!(!from.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn durable_replace_windows_replaces_destination_with_readers_open() {
+        use std::{io::Read, os::windows::fs::OpenOptionsExt};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        let root = root();
+        let (from, to) = replacement_files(&root);
+        let mut reader = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&to)
+            .unwrap();
+        let captured = crate::open_regular_nofollow(&to).unwrap();
+        durable_replace(&from, &to).unwrap();
+        assert_eq!(fs::read(&to).unwrap(), b"next");
+        assert!(!from.exists());
+        let mut previous = Vec::new();
+        reader.read_to_end(&mut previous).unwrap();
+        assert_eq!(previous, b"previous");
+        assert_ne!(
+            crate::retained_file_identity(&captured).unwrap(),
+            crate::retained_file_identity(&fs::File::open(&to).unwrap()).unwrap()
+        );
     }
     #[test]
     fn durable_replace_missing_source_is_error() {

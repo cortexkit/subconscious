@@ -16,4 +16,7 @@ crates/agent-token-vectors/vectors/** -text
 crates/*/tests/golden/** -text
 crates/*/tests/fixtures/** -text
 clients/*/tests/golden/** -text
-vectors/app-open-v1/** -text
+# Every top-level vectors folder, including ones added later: the fifth
+# incident was vectors/supervisor-health-v1, whose .jsonl samples got CRLF on
+# Windows because the folder was not listed.
+vectors/** -text

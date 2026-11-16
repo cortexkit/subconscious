@@ -29,7 +29,8 @@ impl RuntimeOwner {
     /// Called on a blocking worker, before acquiring the module's delivery gate.
     /// Anything but `Stopped` means the connection still needs an unstamped
     /// polling timer. An unchanged file costs one plain read of the owner's state and one
-    /// metadata read: no owner guard and no publication.
+    /// bounded file read. It takes no `OwnerGuard` (whose drop rebuilds the admission
+    /// snapshot and wakes the delivery worker) and publishes nothing.
     pub(crate) fn poll_user_file(
         &self,
         connection: ConnectionId,
@@ -66,6 +67,12 @@ impl RuntimeOwner {
         };
         let path = std::path::Path::new(&declaration.user_file);
         let metadata = UserFileMetadata::read(path)?;
+        if metadata
+            .as_ref()
+            .is_some_and(|metadata| !metadata.has_content_digest())
+        {
+            return Ok(UserFilePoll::Observed);
+        }
         let same_view = match (&watch.served, &served) {
             (Some(before), Some(after)) => std::sync::Arc::ptr_eq(before, after),
             (None, None) => true,

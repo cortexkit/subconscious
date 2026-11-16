@@ -1,0 +1,28 @@
+{
+  "base_generation": 1,
+  "effective": {
+    "group": {
+      "enabled": false
+    },
+    "limit": 2
+  },
+  "layers": [
+    {
+      "document": {
+        "group": {
+          "enabled": false
+        },
+        "limit": 2
+      },
+      "layer": "default"
+    }
+  ],
+  "module_id": "sample-reader",
+  "op": "config.show",
+  "sources": {
+    "/group/enabled": "default",
+    "/limit": "default"
+  },
+  "stamped": true,
+  "through": "default"
+}

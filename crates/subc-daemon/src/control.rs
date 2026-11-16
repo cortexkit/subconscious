@@ -140,8 +140,14 @@ const SUBC_CONTROL_OPS: &[&str] = &[
 /// rather than as an unknown op.
 const SUBC_UNADVERTISED_CONTROL_OPS: &[&str] = &[
     ops::SUPERVISOR_RESCAN_CHECKED,
+    "config.modules",
+    "config.schema",
+    "config.show",
+    "config.watch",
     "config.status",
     "config.plan",
+    "config.plan_get",
+    "config.plan_discard",
     "config.apply",
     "config.stamp",
     "config.unstamp",
@@ -471,6 +477,7 @@ pub struct ControlHandler {
     activity: Option<crate::activity::ActivityLedger>,
     activity_streams: Arc<Mutex<HashMap<(ConnectionId, u64), tokio::task::AbortHandle>>>,
     catalog_streams: Arc<Mutex<HashMap<(ConnectionId, u64), tokio::task::AbortHandle>>>,
+    config_settings_streams: Arc<Mutex<HashMap<(ConnectionId, u64), tokio::task::AbortHandle>>>,
     scope_streams: Arc<Mutex<HashMap<(ConnectionId, u64), tokio::task::AbortHandle>>>,
     forwarding: Arc<ForwardingTable>,
     process_liveness: Option<Arc<dyn ModuleProcessLiveness>>,
@@ -554,6 +561,8 @@ pub struct ControlHandler {
     pub(crate) app_open_test_platform: Option<crate::operator_apps::AppOpenPlatform>,
     #[cfg(test)]
     pub(crate) app_open_test_launch: Option<fn() -> Result<u32, crate::app_open::AppOpenRefusal>>,
+    #[cfg(test)]
+    pub(crate) config_review_test_reply: Option<subc_protocol::config::ConfigReviewReply>,
     #[cfg(test)]
     recovery_exit_test_after_step: Option<fn(usize) -> Result<(), crate::config_gate::GateError>>,
     #[cfg(test)]
@@ -1166,6 +1175,7 @@ impl ControlHandler {
             activity: None,
             activity_streams: Arc::new(Mutex::new(HashMap::new())),
             catalog_streams: Arc::new(Mutex::new(HashMap::new())),
+            config_settings_streams: Arc::new(Mutex::new(HashMap::new())),
             scope_streams: Arc::new(Mutex::new(HashMap::new())),
             forwarding,
             process_liveness: None,
@@ -1231,6 +1241,8 @@ impl ControlHandler {
             app_open_test_platform: None,
             #[cfg(test)]
             app_open_test_launch: None,
+            #[cfg(test)]
+            config_review_test_reply: None,
             #[cfg(test)]
             recovery_exit_test_after_step: None,
             #[cfg(test)]
@@ -2528,6 +2540,8 @@ impl ControlHandler {
                         .cancel_spawn_subscription(ctx.connection_id, frame.header.corr)
                     || self.cancel_activity_subscription(ctx, &frame)?
                     || self.cancel_catalog_subscription(ctx.connection_id, frame.header.corr)
+                    || self
+                        .cancel_config_settings_subscription(ctx.connection_id, frame.header.corr)
                     || self.cancel_scope_subscription(ctx.connection_id, frame.header.corr)
                 {
                     Ok(Vec::new())
@@ -2874,6 +2888,7 @@ impl ControlHandler {
         // nonce authority.
         self.agent_declarations.close(connection_id);
         self.close_catalog_subscriptions(connection_id);
+        self.close_config_settings_subscriptions(connection_id);
         self.close_scope_subscriptions(connection_id);
         #[cfg(test)]
         self.pause_cleanup_for_test(0);
@@ -10892,6 +10907,7 @@ pub(crate) fn send_route_control_pushes(
 #[cfg(test)]
 mod tests {
     include!("control/agent_commands_tests.rs");
+    include!("control/supervisor_health_vectors_tests.rs");
     include!("control/resource_revision_tests.rs");
     include!("control/route_open_recovery_tests.rs");
     #[tokio::test]

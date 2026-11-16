@@ -1,0 +1,96 @@
+# Configuration settings v1 samples
+
+## Module settings reads
+
+These JSON bodies come from the daemon's real channel-0 handlers. Frame headers
+are not included. All module identities, settings and credential references are
+invented. The credential reference is a reference, never a secret.
+
+| File | Body |
+| --- | --- |
+| `modules.request.json` | List settings modules |
+| `modules.reply.json` | Stamped module rows before activation |
+| `schema.request.json` | Read the sample module's schema |
+| `schema.reply.json` | Normalized admitted schema and digest |
+| `show.request.json` | Read the complete approved settings |
+| `show.reply.json` | Effective settings, sources and default/user documents |
+| `show-default.request.json` | Read through the default layer |
+| `show-default.reply.json` | Defaults and their sources |
+| `watch.request.json` | Watch only the sample module |
+| `watch.resync.json` | Initial complete replacement state |
+| `watch.change.json` | Activation changed the row's fields |
+| `SHA256SUMS` | SHA-256 of every JSON sample in this directory |
+
+The watch emits StreamData bodies. A resync may arrive at any time, including
+when modules are added or removed or the stamp changes; it replaces all state.
+Reopening a watch always begins with another full resync.
+
+Regenerate with:
+
+```sh
+UPDATE_GOLDEN=1 scripts/test-daemon-lib.sh -- config_settings_vectors_match_real_handler_bytes
+```
+
+Without `UPDATE_GOLDEN`, the same test compares every read sample and its checksum
+row byte for byte, leaving the plan samples' rows intact. JSON keys are sorted before pretty-printing, with one trailing LF,
+independent of Cargo feature unification. The directory is marked `-text` so
+Git never rewrites those bytes on Windows.
+## Edit plans and pending plan operations
+
+The `plan-*.json` and `apply-*.json` samples pair channel-0 request and response bodies from the
+daemon's real configuration handlers. Frame headers are not included. The
+examples use an invented `demo` module and settings. The module reviewer is a
+fixed test reply; the daemon still checks its fields against the admitted schema
+and immutable baseline. No module process is started.
+
+- `plan-edit.json`: a user edit request and its view without refusals.
+- `plan-refused.json`: an edit refused by the schema, retained in the view. Such
+  a plan cannot be applied. Clients read the keyed rows at `view.refusals`, which
+  is absent when empty; the digest-bound plan also retains `edit_refusals` so the
+  daemon can reject an apply of a refused plan.
+- `plan-get.json`: the identical pending view, retrieved by digest.
+- `plan-discard.json`: dropping that pending plan without applying it.
+- `plan-base-changed.json`: `config_changed_since_review` because a touched
+  module's base generation no longer matches.
+- `plan-layer-not-served.json`: a workspace-layer edit with a keyed
+  `layer_not_served` refusal; project-layer edits are likewise not served yet.
+- `apply-unstamped.json`: apply a reviewed digest immediately on an unstamped
+  install, at generation zero, without an operator prompt.
+- `apply-changed.json`: `config_changed_since_review` because the user file
+  changed after review. The reviewed digest is the same as in `plan-edit.json`.
+
+There is no stamped-apply sample: the sample setup has no supervisor to reconcile
+approved configuration, so a stamped apply answers `supervisor_reconcile_unavailable`. A successful stamped
+apply waits for the operator's confirmation prompt; desktop callers should allow
+the operator response budget (290 seconds) in addition to the control-call timeout.
+
+The handler output contains machine-specific capture metadata. The test replaces
+the scratch-root prefix in paths and encoded input keys with `/home/example`,
+sets Unix device/inode decimal strings to `1`, and replaces the following hashes
+with `sha256:` followed by 64 `a` characters:
+
+- `state.digest`: the captured input's fingerprint, including file identity and
+  modification time;
+- `expected.digest`: the file fingerprint that an atomic write-back must match;
+- hashes in `input_vector`: the combined fingerprints of a module's inputs;
+- hashes in `reviewed_programs`: the identities of the programs that reviewed
+  the configuration.
+
+These hashes depend on the temporary files created by the test. The daemon
+incarnation becomes `example-daemon`.
+Content digests, schemas, settings, field rows, refusal rows, and write-back
+intent shapes are not normalized. The test recomputes the full plan digest using
+the real digest function after normalization, and uses that same digest for the
+get and discard request samples. JSON object keys are sorted for consistency
+across workspace feature combinations.
+
+Regenerate on Linux from the repository root, then review the diff:
+
+```sh
+UPDATE_GOLDEN=1 scripts/test-daemon-lib.sh -- config_plan_vectors_match_real_handler_bytes
+```
+
+Without `UPDATE_GOLDEN`, the test compares every plan/apply sample and its rows in
+`SHA256SUMS` byte for byte, leaving other settings samples' checksum rows intact.
+To check the checksums separately, run `sha256sum --check SHA256SUMS` in this
+directory. Git preserves the sample bytes on every platform.

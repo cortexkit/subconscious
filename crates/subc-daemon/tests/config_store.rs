@@ -116,7 +116,7 @@ fn config_store_root_and_all_hooks_reject_non_ckdev_binary() {
     } else {
         "ordinary-store"
     });
-    fs::copy(source, &destination).unwrap();
+    copy_for_exec(source, &destination);
     let output = Command::new(destination)
         .arg("stamp")
         .arg(rig.0.path())
@@ -145,4 +145,25 @@ fn config_store_windows_default_is_profile_local_not_roaming() {
     let rig = Rig::new();
     assert_eq!(Path::new(rig.run("windows-root", false).trim()), expected);
     assert!(!expected.components().any(|c| c.as_os_str() == "Roaming"));
+}
+
+/// Copy a fixture binary that this test is about to execute.
+///
+/// Not `fs::copy` on Unix: the copy's writable descriptor would live in this
+/// multithreaded test process, where a child forked by another test thread can
+/// inherit it until that child execs. Executing the copy inside that window
+/// fails with `ETXTBSY` ("Text file busy"). `cp` keeps the writable descriptor
+/// in its own process, which has exited before this test executes the copy.
+fn copy_for_exec(source: &Path, destination: &Path) {
+    if cfg!(unix) {
+        let status = Command::new("cp")
+            .arg(source)
+            .arg(destination)
+            .stdin(Stdio::null())
+            .status()
+            .expect("start cp for the fixture copy");
+        assert!(status.success(), "cp {} failed: {status}", source.display());
+    } else {
+        fs::copy(source, destination).unwrap();
+    }
 }

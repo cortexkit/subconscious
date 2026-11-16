@@ -181,10 +181,12 @@ async fn config_gate_unstamped_user_file_edit_pushes_and_get_returns_new_bytes()
 
     live.owner.disconnected(INCUMBENT);
     let mut watch = crate::config_gate::runtime::unstamped::UserFileWatch::default();
-    assert!(!live
-        .owner
-        .poll_unstamped_user_file(INCUMBENT, "a", &mut watch)
-        .unwrap());
+    assert_eq!(
+        live.owner
+            .poll_user_file(INCUMBENT, "a", &mut watch)
+            .unwrap(),
+        crate::config_gate::runtime::unstamped::UserFilePoll::Stopped
+    );
     assert!(!live
         .owner
         .lock()
@@ -246,11 +248,11 @@ async fn config_gate_unstamped_user_file_stamp_stops_generation_zero_pushes() {
         live.pushes
     );
     let mut watch = crate::config_gate::runtime::unstamped::UserFileWatch::default();
-    assert!(
-        !live
-            .owner
-            .poll_unstamped_user_file(INCUMBENT, "a", &mut watch)
+    assert_eq!(
+        live.owner
+            .poll_user_file(INCUMBENT, "a", &mut watch)
             .unwrap(),
+        crate::config_gate::runtime::unstamped::UserFilePoll::Stopped,
         "stamped files must not be watched"
     );
 
@@ -302,8 +304,38 @@ async fn config_gate_unstamped_user_file_undeclared_module_gets_no_push() {
         live.pushes
     );
     let mut watch = crate::config_gate::runtime::unstamped::UserFileWatch::default();
-    assert!(!live
-        .owner
-        .poll_unstamped_user_file(UNDECLARED, "c", &mut watch)
-        .unwrap());
+    assert_eq!(
+        live.owner
+            .poll_user_file(UNDECLARED, "c", &mut watch)
+            .unwrap(),
+        crate::config_gate::runtime::unstamped::UserFilePoll::Stopped
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn config_gate_unstamped_user_file_unchanged_tick_takes_no_owner_guard() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let mut live = LiveFiles::new().await;
+    live.real_edit().await;
+    // Let the edit's notifications settle before counting.
+    live.tick().await;
+    live.tick().await;
+    let guards = live.owner.owner_guards.load(SeqCst);
+    let builds = live.owner.projection_builds.load(SeqCst);
+    for _ in 0..3 {
+        live.tick().await;
+    }
+    assert!(live.pushes.is_empty(), "{:?}", live.pushes);
+    assert_eq!(
+        live.owner.owner_guards.load(SeqCst),
+        guards,
+        "an unchanged timer pass must not take an owner guard"
+    );
+    assert_eq!(live.owner.projection_builds.load(SeqCst), builds);
+
+    // A change on the next tick still takes the full pass and pushes.
+    write_limit(&live.rig, 5);
+    live.tick().await;
+    live.expect_edit();
+    assert!(live.owner.owner_guards.load(SeqCst) > guards);
 }

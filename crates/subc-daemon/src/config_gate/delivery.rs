@@ -331,16 +331,19 @@ impl DeliveryState {
         }
     }
 
-    pub(super) fn disconnected(&mut self, connection: ConnectionId) {
-        self.attempts.remove(&connection);
-        self.served.remove(&connection);
-        self.unstamped_views.remove(&connection);
-        self.stamp_running.remove(&connection);
-        self.children.remove(&connection);
+    /// Forget `connection`'s delivery state. Returns whether it had any.
+    pub(super) fn disconnected(&mut self, connection: ConnectionId) -> bool {
+        let mut held = self.attempts.remove(&connection).is_some();
+        held |= self.served.remove(&connection).is_some();
+        held |= self.unstamped_views.remove(&connection).is_some();
+        held |= self.stamp_running.remove(&connection);
+        held |= self.children.remove(&connection).is_some();
+        let observed = self.healthy_children.len() + self.readiness_observed.len();
         self.healthy_children
             .retain(|(child, _)| *child != connection);
         self.readiness_observed
             .retain(|(child, _)| *child != connection);
+        held || self.healthy_children.len() + self.readiness_observed.len() != observed
     }
 
     pub(super) fn remember_stamp_connections(&mut self, connections: Vec<ConnectionId>) {
@@ -764,8 +767,8 @@ impl RuntimeOwner {
 
     pub(crate) fn pending_config_restarts(&self) -> Result<Vec<(String, u64)>> {
         let mut state = self.lock()?;
-        state.store.delivery_ready()?;
-        let body = state.store.body()?;
+        state.store_read(ConfigStore::delivery_ready)?;
+        let body = state.checked_body()?;
         body.versions
             .iter()
             .filter(|(tuple, _)| tuple.project.is_none())
@@ -978,9 +981,13 @@ impl RuntimeOwner {
         }
         self.notify_delivery_changed();
     }
-    pub(super) fn drain_abandoned_spawns(&self, state: &mut OwnerState) {
+    /// Forget spawns abandoned while the owner was busy. Returns whether any
+    /// was queued.
+    pub(super) fn drain_abandoned_spawns(&self, state: &mut OwnerState) -> bool {
+        let mut drained = false;
         if let Ok(mut abandoned) = self.abandoned_spawns.lock() {
             for (spawn, active) in abandoned.drain(..) {
+                drained = true;
                 let key = (spawn.module.clone(), active);
                 if state
                     .delivery
@@ -992,6 +999,7 @@ impl RuntimeOwner {
                 }
             }
         }
+        drained
     }
 
     /// The full authority check and reservation ran on a blocking worker while
@@ -1066,7 +1074,7 @@ impl RuntimeOwner {
         active: bool,
         authority: Option<std::sync::Arc<crate::spawn_authority::SpawnAuthorityRecord>>,
     ) -> Result<Option<DeliverySpawn>> {
-        let mut state = OwnerGuard(
+        let mut state = OwnerGuard::new(
             self.inner.try_lock().map_err(|error| {
                 if matches!(error, std::sync::TryLockError::Poisoned(_)) {
                     return GateError::new("config_unavailable", "configuration owner is poisoned");
@@ -1076,9 +1084,6 @@ impl RuntimeOwner {
                     "configuration publication is busy",
                 )
             })?,
-            &self.published,
-            &self.delivery_changed,
-            &self.module_gates,
             self,
         );
         state.store.check()?;
@@ -1125,7 +1130,12 @@ impl RuntimeOwner {
     pub(crate) fn delivery_take_recoveries(
         &self,
     ) -> Result<Vec<(ConnectionId, String, AppliedDisposition)>> {
-        Ok(std::mem::take(&mut self.lock()?.delivery.recoveries))
+        let mut state = self.lock()?;
+        if state.delivery.recoveries.is_empty() {
+            // Nothing to take: leave the owner unchanged.
+            return Ok(Vec::new());
+        }
+        Ok(std::mem::take(&mut state.delivery.recoveries))
     }
 
     pub(crate) fn delivery_window(

@@ -62,7 +62,7 @@ impl RuntimeOwner {
     }
     pub(crate) fn pending_authority_exit(&self) -> Result<Option<u64>> {
         let mut state = self.lock()?;
-        if state.authority_exit.is_some() && state.store.delivery_ready().is_ok() {
+        if state.authority_exit.is_some() && state.store_read(ConfigStore::delivery_ready).is_ok() {
             Ok(state.authority_exit)
         } else {
             Ok(None)
@@ -79,10 +79,11 @@ impl RuntimeOwner {
     }
 
     /// Called off the async runtime before control dispatch; no snapshot or
-    /// proposal is needed to discover that the store has changed.
+    /// proposal is needed to discover that the store has changed. The store is
+    /// checked on every call; the views are republished only if it changed.
     pub(crate) fn check_recovery(&self) -> Result<bool> {
         let mut state = self.lock()?;
-        let _ = state.store.check();
+        let _ = state.store_read(ConfigStore::check);
         Ok(state.recovery_exit_hold
             || matches!(
                 state.store.loaded_admission_state().0,
@@ -270,8 +271,10 @@ impl RuntimeOwner {
 
     pub(crate) fn take_unstamp_hint(&self, connection: ConnectionId) -> Result<bool> {
         let mut state = self.lock()?;
+        // Test before removing: an absent hint leaves the owner unchanged.
         Ok(state.authority_exit.is_none()
             && state.store.loaded_admission_state().0 == StoreState::Unstamped
+            && state.unstamp_hints.contains(&connection)
             && state.unstamp_hints.remove(&connection))
     }
 
@@ -295,7 +298,10 @@ impl RuntimeOwner {
 
     pub(crate) fn take_anchor_hint(&self, connection: ConnectionId) -> Result<Option<u64>> {
         let mut state = self.lock()?;
-        if state.store.status().anchor_pending || !state.anchor_hints.remove(&connection) {
+        if state.store_read(ConfigStore::status).anchor_pending
+            || !state.anchor_hints.contains(&connection)
+            || !state.anchor_hints.remove(&connection)
+        {
             return Ok(None);
         }
         let Some((module, _)) = state.declarations.get(&connection) else {

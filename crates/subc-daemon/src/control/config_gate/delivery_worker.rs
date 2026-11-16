@@ -241,6 +241,7 @@ impl ControlHandler {
                             .any(|registration| registration.connection_id == *connection);
                         if !current {
                             wake.notify_one();
+                            owner.config_worker_stopped(*connection);
                         }
                         current
                     });
@@ -256,6 +257,7 @@ impl ControlHandler {
                         } else {
                             let wake = Arc::new(Notify::new());
                             wakes.insert(connection, wake.clone());
+                            owner.config_worker_started(connection);
                             tasks.spawn(module_worker(handler.clone(), registration, wake));
                         }
                     }
@@ -415,9 +417,14 @@ async fn module_worker(
     registration: crate::registry::ModuleRegistration,
     wake: Arc<Notify>,
 ) {
-    let mut user_file_watch = crate::config_gate::runtime::unstamped::UserFileWatch::default();
+    use crate::config_gate::runtime::unstamped::{UserFilePoll, UserFileWatch};
+    let mut user_file_watch = UserFileWatch::default();
+    // Whether the pass about to run was started by the two-second user-file
+    // timer, not by a notification or a delivery-window deadline.
+    let mut poll_timer = false;
     loop {
-        let next = {
+        let poll_pass = std::mem::take(&mut poll_timer);
+        let (next, next_is_poll) = {
             let Some(control) = handler.upgrade() else {
                 break;
             };
@@ -427,20 +434,30 @@ async fn module_worker(
             let module = &registration.manifest.module_id;
             let connection = registration.connection_id;
             let watched_module = module.clone();
-            let (watch, unstamped) = owner
+            let (watch, poll) = owner
                 .on_blocking(move |owner| {
                     let mut watch = user_file_watch;
-                    let unstamped = owner
-                        .poll_unstamped_user_file(connection, &watched_module, &mut watch)
-                        .unwrap_or(true);
-                    Ok((watch, unstamped))
+                    let poll = owner
+                        .poll_user_file(connection, &watched_module, &mut watch)
+                        .unwrap_or(UserFilePoll::Observed);
+                    Ok((watch, poll))
                 })
                 .await
-                .unwrap_or_default();
+                .unwrap_or((UserFileWatch::default(), UserFilePoll::Stopped));
             user_file_watch = watch;
+            let unstamped = poll != UserFilePoll::Stopped;
             let next_poll = unstamped.then(|| {
                 Instant::now() + crate::config_gate::runtime::unstamped::USER_FILE_POLL_INTERVAL
             });
+            if poll_pass && poll == UserFilePoll::Unchanged {
+                // Only the timer woke this worker and the file is as last
+                // seen. Every other input to the rest of the pass (hints,
+                // fences, deliveries, registration changes) arrives with a
+                // notification, which runs a full pass.
+                drop(control);
+                poll_timer = wait_for_next_pass(&handler, &registration, &wake, next_poll).await;
+                continue;
+            }
             let Ok(gate) = owner.module_gate(module) else {
                 break;
             };
@@ -678,32 +695,48 @@ async fn module_worker(
                     })
                     .await;
                     owner.notify_delivery_changed();
-                    None
+                    (None, false)
                 }
-                Some(window) => window.deadline,
-                None => next_poll,
+                Some(window) => (window.deadline, false),
+                None => (next_poll, true),
             }
         };
-        #[cfg(test)]
-        {
-            let idle = handler.upgrade().and_then(|control| {
-                control
-                    .config_runtime
-                    .as_ref()
-                    .and_then(|owner| owner.user_file_test_idle.lock().unwrap().clone())
-            });
-            if let Some(idle) = idle {
-                // Tests hold the worker at its timer boundary while editing files.
-                let (resume, released) = tokio::sync::oneshot::channel();
-                if idle.send((registration.connection_id, resume)).is_ok() {
-                    let _ = released.await;
-                }
+        poll_timer = wait_for_next_pass(&handler, &registration, &wake, next).await && next_is_poll;
+    }
+}
+
+/// Wait for this worker's next pass: a notification, or the deadline `next`.
+/// Returns whether the deadline, rather than a notification, ended the wait.
+async fn wait_for_next_pass(
+    handler: &std::sync::Weak<ControlHandler>,
+    registration: &crate::registry::ModuleRegistration,
+    wake: &Notify,
+    next: Option<Instant>,
+) -> bool {
+    #[cfg(test)]
+    {
+        let idle = handler.upgrade().and_then(|control| {
+            control
+                .config_runtime
+                .as_ref()
+                .and_then(|owner| owner.user_file_test_idle.lock().unwrap().clone())
+        });
+        if let Some(idle) = idle {
+            // Tests hold the worker at its timer boundary while editing files.
+            let (resume, released) = tokio::sync::oneshot::channel();
+            if idle.send((registration.connection_id, resume)).is_ok() {
+                let _ = released.await;
             }
         }
-        tokio::select! {
-            _ = wake.notified() => {},
-            _ = async { match next { Some(at) => sleep_until(at).await, None => std::future::pending().await } } => {},
-        }
+    }
+    #[cfg(not(test))]
+    let _ = (handler, registration);
+    tokio::select! {
+        // A notification pass does everything a timer pass does, including
+        // the file poll, so prefer it when both are ready.
+        biased;
+        _ = wake.notified() => false,
+        _ = async { match next { Some(at) => sleep_until(at).await, None => std::future::pending().await } } => true,
     }
 }
 

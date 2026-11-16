@@ -2053,3 +2053,137 @@ fn registration_declaration_polled_status_preserves_gated_declaration_diagnostic
         .iter()
         .any(|module| module == "a"));
 }
+
+fn projection_builds(owner: &RuntimeOwner) -> usize {
+    owner
+        .projection_builds
+        .load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn published_declares(owner: &RuntimeOwner, module: &str) -> bool {
+    owner
+        .polled_snapshot()
+        .unwrap()
+        .projection
+        .config_declarations
+        .contains_key(module)
+}
+
+#[test]
+fn config_owner_read_only_recovery_checks_do_not_rebuild_the_projection() {
+    const CHECKS: usize = 16;
+    let rig = Rig::new();
+    std::fs::write(
+        rig.path.join("cortexkit/a.jsonc"),
+        br#"{"credential":{"vault_ref":"safe-reference"}}"#,
+    )
+    .unwrap();
+    let owner = rig.owner("read-only-recovery");
+    rig.declare(&owner, 10);
+    // Unstamped: the check has no store file to hash.
+    let before = projection_builds(&owner);
+    for _ in 0..CHECKS {
+        assert!(!owner.check_recovery().unwrap());
+    }
+    assert_eq!(
+        projection_builds(&owner),
+        before,
+        "unstamped checks rebuilt"
+    );
+
+    // Stamped: every check still rereads and hashes the store, but an
+    // unchanged store leaves the published views as they are.
+    let generation = rig.stamp(&owner);
+    owner.complete_authority_exit_for_test(generation).unwrap();
+    let before = projection_builds(&owner);
+    for _ in 0..CHECKS {
+        assert!(!owner.check_recovery().unwrap());
+    }
+    assert_eq!(projection_builds(&owner), before, "stamped checks rebuilt");
+    assert!(!owner.is_recovering());
+
+    // A check that finds the store changed moves it into recovery and
+    // publishes that before the next authority use.
+    std::fs::write(rig.path.join("store/approved.json"), b"{}").unwrap();
+    assert!(owner.check_recovery().unwrap());
+    assert_eq!(projection_builds(&owner), before + 1);
+    assert!(owner.is_recovering());
+    assert_eq!(owner.polled_status().unwrap().state, "store_unverified");
+}
+
+#[test]
+fn config_owner_state_changes_publish_on_the_next_guard_release() {
+    let rig = Rig::new();
+    let owner = rig.owner("next-guard-publishes");
+
+    // A change made through a guard publishes when that guard is released.
+    rig.declare(&owner, 10);
+    assert!(published_declares(&owner, "a"));
+
+    // A disconnect queued while the owner was busy is applied, and published,
+    // by the next acquisition, even one that only reads.
+    {
+        let _busy = owner.inner.lock().unwrap();
+        owner.disconnected(ConnectionId::new(10));
+    }
+    assert!(published_declares(&owner, "a"));
+    let before = projection_builds(&owner);
+    assert!(!owner.check_recovery().unwrap());
+    assert_eq!(projection_builds(&owner), before + 1);
+    assert!(!published_declares(&owner, "a"));
+
+    // A disconnect applied without a guard is published by the next one.
+    rig.declare(&owner, 11);
+    assert!(published_declares(&owner, "a"));
+    owner.disconnected(ConnectionId::new(11));
+    let before = projection_builds(&owner);
+    assert!(!owner.check_recovery().unwrap());
+    assert_eq!(projection_builds(&owner), before + 1);
+    assert!(!published_declares(&owner, "a"));
+
+    // Disconnecting a connection that held nothing changes nothing.
+    owner.disconnected(ConnectionId::new(12));
+    assert!(!owner.check_recovery().unwrap());
+    assert_eq!(projection_builds(&owner), before + 1);
+}
+
+#[tokio::test]
+async fn config_owner_only_configuration_connections_wake_delivery_on_disconnect() {
+    // A stored permit means the delivery coordinator would run another pass.
+    async fn woken(changed: &tokio::sync::Notify) -> bool {
+        tokio::time::timeout(Duration::ZERO, changed.notified())
+            .await
+            .is_ok()
+    }
+    let rig = Rig::new();
+    let owner = rig.owner("disconnect-wakes");
+    let changed = owner.delivery_notifications();
+    let _ = woken(&changed).await;
+
+    owner.disconnected(ConnectionId::new(40));
+    assert!(
+        !woken(&changed).await,
+        "a plain client's disconnect must not wake configuration delivery"
+    );
+
+    rig.declare(&owner, 41);
+    let _ = woken(&changed).await;
+    owner.disconnected(ConnectionId::new(41));
+    assert!(woken(&changed).await, "a declared connection held state");
+
+    owner.config_worker_started(ConnectionId::new(42));
+    owner.disconnected(ConnectionId::new(42));
+    assert!(woken(&changed).await, "a config.review worker must retire");
+    owner.config_worker_stopped(ConnectionId::new(42));
+    owner.disconnected(ConnectionId::new(42));
+    assert!(!woken(&changed).await, "a retired worker holds nothing");
+
+    {
+        let _busy = owner.inner.lock().unwrap();
+        owner.disconnected(ConnectionId::new(43));
+    }
+    assert!(
+        woken(&changed).await,
+        "a busy owner cannot rule the connection out, so the queued disconnect wakes"
+    );
+}

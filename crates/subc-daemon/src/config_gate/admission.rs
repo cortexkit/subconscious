@@ -540,6 +540,10 @@ impl RuntimeOwner {
     }
     pub(crate) fn take_admission_transitions(&self) -> Result<(Vec<String>, Vec<String>)> {
         let mut state = self.lock()?;
+        if state.admission_holds.is_empty() && state.admission_releases.is_empty() {
+            // Nothing to take: leave the owner unchanged.
+            return Ok((Vec::new(), Vec::new()));
+        }
         Ok((
             std::mem::take(&mut state.admission_holds),
             std::mem::take(&mut state.admission_releases),
@@ -610,7 +614,7 @@ impl RuntimeOwner {
     /// Run before taking a module gate; hashing and integrity checks may block.
     pub(crate) fn prepare_spawn(&self, spec: &ModuleSpec) -> Result<SpawnAdmission> {
         let authority = {
-            let mut state = OwnerGuard(
+            let mut state = OwnerGuard::new(
                 self.inner.try_lock().map_err(|error| {
                     if matches!(error, std::sync::TryLockError::Poisoned(_)) {
                         return GateError::new(
@@ -623,9 +627,6 @@ impl RuntimeOwner {
                         "configuration publication is busy",
                     )
                 })?,
-                &self.published,
-                &self.delivery_changed,
-                &self.module_gates,
                 self,
             );
             // Store recovery is a launch hold released by the recovery worker.

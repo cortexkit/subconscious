@@ -21,6 +21,19 @@
 - Share immutable route-admission metadata between opens instead of cloning
   every provider manifest. Keep unpublished providers and both processes of a
   provider replacement distinct.
+- The configuration owner republishes its status, admission and approved-daemon
+  views only when something they derive from changed. Read-only recovery checks
+  before each control request still check the store every time, but no longer
+  rebuild the projection when the store is unchanged.
+- A closed connection wakes configuration delivery only when it held
+  configuration state (a declaration, a delivery, an approval or its request,
+  a desktop view, or a wait for the approved store to become readable again)
+  or ran a `config.review` worker. Other client disconnects no longer wake
+  every `config.review` worker.
+- While the config gate is off (no approved configuration stamped), the
+  two-second user-file poll takes no owner lock guard and publishes nothing when the file and the served
+  view are unchanged. A changed file, or any notification, still runs the full
+  delivery pass.
 
 ## 0.49.2
 

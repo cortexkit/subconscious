@@ -15,23 +15,30 @@ pub(super) struct PhoneWithdrawals {
 }
 
 impl OwnerState {
-    pub(super) fn disconnected(&mut self, connection: ConnectionId) {
-        self.invalidate_phone(connection);
-        self.desktop_views.remove(&connection.get());
-        self.delivery.disconnected(connection);
+    /// Clear everything `connection` held. Returns whether it held anything.
+    pub(super) fn disconnected(&mut self, connection: ConnectionId) -> bool {
+        let mut held = self.invalidate_phone(connection);
+        held |= self.desktop_views.remove(&connection.get()).is_some();
+        held |= self.delivery.disconnected(connection);
         for digest in self.gate.connection_approval_digests(connection.get()) {
+            held = true;
             self.reviewed(&digest, Instant::now());
         }
         for attempt in self.gate.cancel_connection_approvals(connection.get()) {
+            held = true;
             self.phone_waiters.remove(&attempt);
         }
+        let requests = self.approval_requests.len();
         self.approval_requests
             .retain(|(caller, _), _| *caller != connection);
-        self.declarations.remove(&connection);
-        self.anchor_waiters.remove(&connection);
-        self.anchor_hints.remove(&connection);
+        held |= self.approval_requests.len() != requests;
+        held |= self.declarations.remove(&connection).is_some();
+        held |= self.anchor_waiters.remove(&connection);
+        held |= self.anchor_hints.remove(&connection);
+        let active = self.active_declarations.len();
         self.active_declarations
             .retain(|_, current| *current != connection);
+        held || self.active_declarations.len() != active
     }
 
     pub(super) fn cancel_approval(&mut self, attempt: u64) {
@@ -44,13 +51,19 @@ impl OwnerState {
             .retain(|_, current| *current != attempt);
     }
 
-    pub(super) fn invalidate_phone(&mut self, connection: ConnectionId) {
+    /// Withdraw phone approvals bound to `connection`. Returns whether any
+    /// was pending.
+    pub(super) fn invalidate_phone(&mut self, connection: ConnectionId) -> bool {
+        let mut held = false;
         for digest in self.gate.phone_approval_digests(connection.get()) {
+            held = true;
             self.reviewed(&digest, Instant::now());
         }
         for attempt in self.gate.invalidate_phone(connection.get()) {
+            held = true;
             self.phone_waiters.remove(&attempt);
         }
+        held
     }
 
     pub(super) fn phone_target_changed(&mut self, module: &str, connection: ConnectionId) {
@@ -93,9 +106,13 @@ impl RuntimeOwner {
     pub(crate) fn set_phone_bind_hook(&self, hook: impl FnOnce() + Send + 'static) {
         *self.phone_bind_hook.lock().unwrap() = Some(Box::new(hook));
     }
-    pub(super) fn drain_canceled_approvals(&self, state: &mut OwnerState) {
+    /// Apply cancellations queued while the owner was busy. Returns whether
+    /// any was queued.
+    pub(super) fn drain_canceled_approvals(&self, state: &mut OwnerState) -> bool {
+        let mut drained = false;
         if let Ok(mut pending) = self.canceled_approvals.lock() {
             for attempt in pending.drain(..) {
+                drained = true;
                 state.cancel_approval(attempt);
             }
         }
@@ -105,14 +122,19 @@ impl RuntimeOwner {
                     || state.approval_requests.get(key) == Some(&request.attempt())
             });
         }
+        drained
     }
 
-    pub(super) fn drain_disconnections(&self, state: &mut OwnerState) {
+    /// Apply disconnects queued while the owner was busy. Returns whether any
+    /// of those connections held state.
+    pub(super) fn drain_disconnections(&self, state: &mut OwnerState) -> bool {
+        let mut held = false;
         if let Ok(mut pending) = self.disconnected_pending.lock() {
             for connection in pending.drain(..) {
-                state.disconnected(connection);
+                held |= state.disconnected(connection);
             }
         }
+        held
     }
 
     /// The active generation's declaration and daemon entry, not a pending edit
@@ -202,6 +224,9 @@ impl RuntimeOwner {
     pub(crate) fn cancel_approval(&self, attempt: u64) {
         if let Ok(mut state) = self.inner.try_lock() {
             state.cancel_approval(attempt);
+            // Changed without an OwnerGuard: the next guard republishes.
+            self.projection_stale
+                .store(true, std::sync::atomic::Ordering::Release);
         } else if let Ok(mut pending) = self.canceled_approvals.lock() {
             pending.push(attempt);
         }
@@ -231,6 +256,9 @@ impl RuntimeOwner {
                 frame,
             });
         }
+        // The published phone entry excludes a withdrawing connection.
+        self.projection_stale
+            .store(true, std::sync::atomic::Ordering::Release);
         self.notify_delivery_changed();
     }
 
@@ -247,6 +275,9 @@ impl RuntimeOwner {
                 *count -= 1;
                 if *count == 0 {
                     queue.withdrawing.remove(&connection);
+                    // The connection's phone entry can be published again.
+                    self.projection_stale
+                        .store(true, std::sync::atomic::Ordering::Release);
                 }
             }
         }

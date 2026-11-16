@@ -51,6 +51,17 @@ pub struct RuntimeOwner {
     #[cfg(test)]
     spawn_exec_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     published: std::sync::RwLock<std::sync::Arc<Published>>,
+    /// Set after state that `published` derives from changed without an
+    /// `OwnerGuard` (a disconnect or cancellation taken with `try_lock`, or a
+    /// phone withdrawal ending). The next guard release republishes.
+    projection_stale: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    projection_builds: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    owner_guards: std::sync::atomic::AtomicUsize,
+    /// Connections with a running `config.review` delivery worker. Closing
+    /// one must wake the delivery coordinator so it retires that worker.
+    config_workers: Mutex<std::collections::HashSet<ConnectionId>>,
     configured_modules: std::sync::RwLock<Option<admission::ConfiguredModuleSnapshot>>,
     inner: Mutex<OwnerState>,
     capturer: ConfigCapturer,
@@ -464,13 +475,15 @@ impl OwnerState {
         }
         checked
     }
-    fn expire_idle(&mut self, now: Instant) {
+    /// Reclaim idle plans. Returns whether any plan expired.
+    fn expire_idle(&mut self, now: Instant) -> bool {
         let expired: Vec<_> = self
             .plan_deadlines
             .iter()
             .filter(|(digest, deadline)| **deadline <= now && !self.gate.has_open_approval(digest))
             .map(|(digest, _)| digest.clone())
             .collect();
+        let any = !expired.is_empty();
         for digest in expired {
             self.plan_deadlines.remove(&digest);
             self.retained_plan_files.remove(&digest);
@@ -482,6 +495,7 @@ impl OwnerState {
                 }
             }
         }
+        any
     }
     fn reviewed(&mut self, digest: &Digest, now: Instant) {
         self.plan_deadlines
@@ -490,75 +504,163 @@ impl OwnerState {
     }
 }
 
-struct OwnerGuard<'a>(
-    std::sync::MutexGuard<'a, OwnerState>,
-    &'a std::sync::RwLock<std::sync::Arc<Published>>,
-    &'a tokio::sync::Notify,
-    &'a Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
-    &'a RuntimeOwner,
-);
+/// The owner's state, held exclusively. Releasing it republishes the polled
+/// projection, admission and approved-daemon views when anything they derive
+/// from could have changed: any mutable access through this guard, a store
+/// check that moved the store, or a change made outside a guard that set
+/// `RuntimeOwner::projection_stale`. A guard used only to read publishes
+/// nothing, so read-like authority checks do not rebuild the projection.
+struct OwnerGuard<'a> {
+    state: std::sync::MutexGuard<'a, OwnerState>,
+    owner: &'a RuntimeOwner,
+    changed: bool,
+}
 impl std::ops::Deref for OwnerGuard<'_> {
     type Target = OwnerState;
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.state
     }
 }
 impl std::ops::DerefMut for OwnerGuard<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        // Any mutable access may change a published input. Read-only store
+        // checks use `OwnerGuard::store_read` so they republish only when the
+        // check itself changed the store.
+        self.changed = true;
+        &mut self.state
     }
 }
-impl Drop for OwnerGuard<'_> {
-    fn drop(&mut self) {
+
+/// The parts of a store that a read-only integrity check can change and that
+/// feed the published views: its state (a failed check moves it into
+/// recovery), its atomic publications and its pending anchor.
+fn store_witness(store: &ConfigStore) -> (StoreState, u64, bool) {
+    (
+        store.loaded_admission_state().0,
+        store.publication_sequence(),
+        store.loaded_anchor_pending(),
+    )
+}
+
+impl<'a> OwnerGuard<'a> {
+    fn new(state: std::sync::MutexGuard<'a, OwnerState>, owner: &'a RuntimeOwner) -> Self {
+        #[cfg(test)]
+        owner
+            .owner_guards
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self {
+            state,
+            owner,
+            changed: false,
+        }
+    }
+
+    /// Run a store integrity read (`check`, `status`, `delivery_ready`) and
+    /// mark the guard changed only if the read changed what the store
+    /// publishes. Every caller still checks authority on every call.
+    fn store_read<T>(&mut self, read: impl FnOnce(&mut ConfigStore) -> T) -> T {
+        let before = store_witness(&self.state.store);
+        let result = read(&mut self.state.store);
+        if store_witness(&self.state.store) != before {
+            self.changed = true;
+        }
+        result
+    }
+
+    /// `ConfigStore::body` without marking the guard changed when the check
+    /// it performs leaves the store as it was.
+    fn checked_body(
+        &mut self,
+    ) -> std::result::Result<&crate::config_store::StoreBody, crate::config_store::StoreError> {
+        self.store_read(ConfigStore::check)?;
+        Ok(self.state.store.loaded_admission_state().1)
+    }
+
+    fn publish(&mut self) {
+        #[cfg(test)]
+        self.owner
+            .projection_builds
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // Project committed or invalidated authority before releasing its owner.
         // Parse changed generations outside the cheap reader lock, then publish
         // only the Arc; list polling never waits for store or keychain work.
         let previous = self
-            .1
+            .owner
+            .published
             .read()
             .map(|view| view.approved_daemon.clone())
             .unwrap_or(ApprovedDaemonView::Unavailable);
-        let approved_daemon =
-            ApprovedDaemonView::from_store(&self.0.store, self.0.recovery_exit_hold, &previous);
+        let approved_daemon = ApprovedDaemonView::from_store(
+            &self.state.store,
+            self.state.recovery_exit_hold,
+            &previous,
+        );
         // Volatile holds follow the same lifetime as their durable records.
         // Approving another program identity retires the previous identity's
         // volatile hold, even if that previous identity is later approved again.
-        let (_, body) = self.0.store.loaded_admission_state();
+        let (_, body) = self.state.store.loaded_admission_state();
         let valid: std::collections::BTreeSet<_> = body
             .program_refusals
             .iter()
             .map(|refusal| (refusal.module.clone(), refusal.approved_base.clone()))
             .collect();
-        self.0
+        self.state
             .refused_generations
             .retain(|module, base| valid.contains(&(module.clone(), base.clone())));
-        let next = admission::AdmissionCache::from_state(&self.0);
+        let next = admission::AdmissionCache::from_state(&self.state);
         // Lower the marks this state rules out (an unstamp, an ungated
         // module, an active generation the spawn never acknowledged) before
         // the owner is released: delivery, then record, then forwarding.
-        mark::sweep(self.4, &mut self.0, &next);
-        let observed = self.0.observed_snapshot.clone();
-        let projection = self.4.status_projection(&mut self.0, observed, &next);
-        if let Ok(mut cache) = self.1.write() {
+        mark::sweep(self.owner, &mut self.state, &next);
+        let observed = self.state.observed_snapshot.clone();
+        let projection = self
+            .owner
+            .status_projection(&mut self.state, observed, &next);
+        if let Ok(mut cache) = self.owner.published.write() {
             let (holds, releases) = next.transitions_from(&cache);
             let changed = next.is_recovering() != cache.is_recovering()
                 || !holds.is_empty()
                 || !releases.is_empty();
-            self.0.admission_holds.extend(holds);
-            self.0.admission_releases.extend(releases);
+            self.state.admission_holds.extend(holds);
+            self.state.admission_releases.extend(releases);
             *cache = std::sync::Arc::new(Published {
                 admission: next,
                 approved_daemon,
                 projection,
             });
             if changed {
-                self.2.notify_one();
+                self.owner.delivery_changed.notify_one();
             }
         }
-        let Some(ledger) = self.0.activity.clone() else {
+    }
+}
+impl Drop for OwnerGuard<'_> {
+    fn drop(&mut self) {
+        // Clear the outside-change flag even when this guard publishes anyway.
+        let stale = self
+            .owner
+            .projection_stale
+            .swap(false, std::sync::atomic::Ordering::AcqRel);
+        let published = (!(self.changed || stale))
+            .then(|| {
+                self.owner
+                    .published
+                    .read()
+                    .ok()
+                    .map(|view| std::sync::Arc::clone(&view))
+            })
+            .flatten();
+        match published {
+            // Nothing published here changed, so the published admission is
+            // what a rebuild would produce. Spawn records still carry their
+            // own mark facts, so sweep them against it on every release.
+            Some(published) => mark::sweep(self.owner, &mut self.state, &published.admission),
+            None => self.publish(),
+        }
+        let Some(ledger) = self.state.activity.clone() else {
             return;
         };
-        let Ok(gates) = self.3.try_lock() else {
+        let Ok(gates) = self.owner.module_gates.try_lock() else {
             return;
         };
         let held: Vec<_> = gates
@@ -568,11 +670,11 @@ impl Drop for OwnerGuard<'_> {
             .collect();
         drop(gates);
         if held.is_empty() {
-            for activity in self.0.store.take_activities() {
+            for activity in self.state.store.take_activities() {
                 ledger.config_store_activity(activity);
             }
         } else if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            let activities = self.0.store.take_activities();
+            let activities = self.state.store.take_activities();
             if !activities.is_empty() {
                 runtime.spawn(async move {
                     // No store mutex follows the activity into this task. Drop
@@ -817,6 +919,13 @@ impl RuntimeOwner {
             #[cfg(test)]
             spawn_exec_hook: Mutex::new(None),
             published,
+            // The first guard release below builds the initial projection.
+            projection_stale: std::sync::atomic::AtomicBool::new(true),
+            #[cfg(test)]
+            projection_builds: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            owner_guards: std::sync::atomic::AtomicUsize::new(0),
+            config_workers: Mutex::new(std::collections::HashSet::new()),
             configured_modules: std::sync::RwLock::new(None),
             inner: Mutex::new(OwnerState {
                 authority_incarnation: std::sync::Arc::new(()),
@@ -946,24 +1055,21 @@ impl RuntimeOwner {
         let mut guard = self
             .inner
             .lock()
-            .map(|guard| {
-                OwnerGuard(
-                    guard,
-                    &self.published,
-                    &self.delivery_changed,
-                    &self.module_gates,
-                    self,
-                )
-            })
+            .map(|state| OwnerGuard::new(state, self))
             .map_err(|_| {
                 GateError::new("config_unavailable", "configuration owner lock is poisoned")
             })?;
+        // The test seam only arms a backend failure; nothing published reads it.
         #[cfg(feature = "test-support")]
-        guard.store.refresh_test_anchor_failure();
-        self.drain_canceled_approvals(&mut guard);
-        self.drain_disconnections(&mut guard);
-        self.drain_abandoned_spawns(&mut guard);
-        guard.expire_idle(Instant::now());
+        guard.state.store.refresh_test_anchor_failure();
+        // Deferred cancellations, disconnects and abandoned spawns, and idle
+        // plan expiry, change the owner only when they had work. Each runs on
+        // every acquisition, and work done here publishes on release.
+        let drained = self.drain_canceled_approvals(&mut guard.state)
+            | self.drain_disconnections(&mut guard.state)
+            | self.drain_abandoned_spawns(&mut guard.state)
+            | guard.state.expire_idle(Instant::now());
+        guard.changed |= drained;
         Ok(guard)
     }
 
@@ -976,13 +1082,7 @@ impl RuntimeOwner {
         })?;
         Ok(SwapConfiguration {
             owner: self,
-            state: OwnerGuard(
-                state,
-                &self.published,
-                &self.delivery_changed,
-                &self.module_gates,
-                self,
-            ),
+            state: OwnerGuard::new(state, self),
         })
     }
 
@@ -1061,23 +1161,70 @@ impl RuntimeOwner {
         Ok(())
     }
 
+    /// Clear everything `connection` held in the configuration owner. The
+    /// delivery coordinator wakes only when the connection held configuration
+    /// state (a declaration, a delivery, an approval or its request, a desktop
+    /// view, an anchor wait) or ran a `config.review` worker. Unrelated client
+    /// disconnects do not wake it.
     pub fn disconnected(&self, connection: ConnectionId) {
+        let mut held = false;
         if let Ok(mut index) = self.approval_request_index.lock() {
             index.retain(|(caller, _), request| {
                 if *caller == connection {
                     request.cancel();
+                    held = true;
                     false
                 } else {
                     true
                 }
             });
         }
-        self.notify_delivery_changed();
-        if let Ok(mut state) = self.inner.try_lock() {
-            state.disconnected(connection);
-        } else if let Ok(mut pending) = self.disconnected_pending.lock() {
-            pending.push(connection);
+        match self.inner.try_lock() {
+            Ok(mut state) => {
+                if state.disconnected(connection) {
+                    held = true;
+                    // This change bypassed an OwnerGuard. Flag it before the
+                    // owner is released so the next guard republishes it.
+                    self.projection_stale
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
+            Err(_) => {
+                if let Ok(mut pending) = self.disconnected_pending.lock() {
+                    pending.push(connection);
+                }
+                // The busy owner cannot say whether this connection held
+                // state. Wake the coordinator so its next owner acquisition
+                // applies the queued disconnect promptly.
+                held = true;
+            }
         }
+        if held || self.runs_config_worker(connection) {
+            self.notify_delivery_changed();
+        }
+    }
+
+    /// The delivery coordinator started a `config.review` worker for
+    /// `connection`.
+    pub(crate) fn config_worker_started(&self, connection: ConnectionId) {
+        self.config_workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(connection);
+    }
+
+    /// The delivery coordinator retired `connection`'s worker.
+    pub(crate) fn config_worker_stopped(&self, connection: ConnectionId) {
+        self.config_workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&connection);
+    }
+
+    fn runs_config_worker(&self, connection: ConnectionId) -> bool {
+        self.config_workers
+            .lock()
+            .map_or(true, |workers| workers.contains(&connection))
     }
 
     pub fn module_get(

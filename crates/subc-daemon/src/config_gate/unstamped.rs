@@ -12,22 +12,43 @@ pub(crate) struct UserFileWatch {
     served: Option<std::sync::Arc<ConfigView>>,
 }
 
+/// What one poll of a connection's declared user file found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UserFilePoll {
+    /// The file is not watched: the store is not unstamped, an authority exit
+    /// is pending, or the connection has no matching declaration.
+    Stopped,
+    /// The file's metadata and the served view match the last observation.
+    Unchanged,
+    /// Something differed from the last observation, or it could not be
+    /// compared. The file stays watched.
+    Observed,
+}
+
 impl RuntimeOwner {
     /// Called on a blocking worker, before acquiring the module's delivery gate.
-    /// Return whether this connection still needs an unstamped polling timer.
-    pub(crate) fn poll_unstamped_user_file(
+    /// Anything but `Stopped` means the connection still needs an unstamped
+    /// polling timer. An unchanged file costs one plain read of the owner's state and one
+    /// metadata read: no owner guard and no publication.
+    pub(crate) fn poll_user_file(
         &self,
         connection: ConnectionId,
         module: &str,
         watch: &mut UserFileWatch,
-    ) -> Result<bool> {
+    ) -> Result<UserFilePoll> {
         let (declaration, served, incarnation) = {
-            let state = self.lock()?;
+            // Only read here. Queued disconnects are not applied, so a closed
+            // connection's declaration may still be seen; the guarded recheck
+            // below runs before any hint is queued.
+            crate::forwarding::assert_forwarding_unlocked("the configuration owner's state");
+            let state = self.inner.lock().map_err(|_| {
+                GateError::new("config_unavailable", "configuration owner lock is poisoned")
+            })?;
             if state.store.loaded_admission_state().0 != StoreState::Unstamped
                 || state.authority_exit.is_some()
             {
                 *watch = UserFileWatch::default();
-                return Ok(false);
+                return Ok(UserFilePoll::Stopped);
             }
             let Some((_, declaration)) = state
                 .declarations
@@ -35,7 +56,7 @@ impl RuntimeOwner {
                 .filter(|(id, _)| id == module)
             else {
                 *watch = UserFileWatch::default();
-                return Ok(false);
+                return Ok(UserFilePoll::Stopped);
             };
             (
                 declaration.clone(),
@@ -51,7 +72,7 @@ impl RuntimeOwner {
             _ => false,
         };
         if watch.metadata.as_ref() == Some(&metadata) && same_view {
-            return Ok(true);
+            return Ok(UserFilePoll::Unchanged);
         }
         let declarations = BTreeMap::from([(module.to_owned(), declaration.clone())]);
         let mut captured = self
@@ -64,7 +85,7 @@ impl RuntimeOwner {
             .view;
         // Do not cache a fingerprint for bytes read across an atomic replacement.
         if UserFileMetadata::read(path)? != metadata {
-            return Ok(true);
+            return Ok(UserFilePoll::Observed);
         }
         let mut state = self.lock()?;
         if state.store.loaded_admission_state().0 != StoreState::Unstamped
@@ -73,7 +94,7 @@ impl RuntimeOwner {
             || state.declarations.get(&connection) != Some(&(module.to_owned(), declaration))
         {
             *watch = UserFileWatch::default();
-            return Ok(false);
+            return Ok(UserFilePoll::Stopped);
         }
         let current = state.delivery.unstamped_views.get(&connection);
         let same_receipt = match (&served, current) {
@@ -84,7 +105,7 @@ impl RuntimeOwner {
         if !same_receipt {
             // A config.get completed during the capture. Retry the comparison
             // against the view that get recorded as delivered.
-            return Ok(true);
+            return Ok(UserFilePoll::Observed);
         }
         watch.metadata = Some(metadata);
         watch.served = served.clone();
@@ -92,6 +113,6 @@ impl RuntimeOwner {
             state.unstamp_hints.insert(connection);
             self.notify_delivery_changed();
         }
-        Ok(true)
+        Ok(UserFilePoll::Observed)
     }
 }

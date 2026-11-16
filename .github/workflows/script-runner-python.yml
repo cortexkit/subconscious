@@ -58,9 +58,13 @@ jobs:
           # The shared checker requires the complete Core set. Copies of the
           # runner stand in for the other binaries in this runner-only job.
           mkdir -p target/python-glibc-check
-          for binary in ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python; do
+          for binary in ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python ck-nats-server; do
             cp target/${{ matrix.target }}/release/ck-script-runner-python target/python-glibc-check/$binary
           done
+          # Only ELF linkage is checked, so a freestanding static executable
+          # stands in for the engine, which has no C dependencies, without building NATS here.
+          printf 'void entry(void) {}\n' > target/python-glibc-check/static.c
+          cc -static -nostdlib -Wl,-e,entry target/python-glibc-check/static.c -o target/python-glibc-check/ck-nats-engine
           bash scripts/release/check-glibc.sh target/python-glibc-check
       - name: Size
         shell: bash

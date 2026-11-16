@@ -4,6 +4,7 @@ mod ckni;
 mod components;
 mod config;
 mod conversion;
+mod daemon_bundle;
 mod definition;
 mod detection;
 mod file_modes;
@@ -11,8 +12,10 @@ mod inventory;
 mod managed_replace;
 mod mc_detection;
 mod model;
+mod nats_migration;
 mod planner;
 mod release_index;
+mod retained_binary;
 mod runtime;
 mod self_update;
 #[cfg(unix)]

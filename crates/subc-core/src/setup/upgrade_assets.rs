@@ -174,6 +174,23 @@ pub fn prepare_upgrade_asset<F: UpgradeAssetFetcher>(
     target: UpgradeTarget,
     platform: AlphaTarget,
 ) -> Result<PreparedUpgradeAsset, UpgradeAssetError> {
+    prepare_upgrade_asset_with_runner(
+        fetcher,
+        target,
+        platform,
+        &mut super::runtime::SystemCommandRunner,
+    )
+}
+
+pub(super) fn prepare_upgrade_asset_with_runner<
+    F: UpgradeAssetFetcher,
+    R: super::runtime::CommandRunner,
+>(
+    fetcher: &mut F,
+    target: UpgradeTarget,
+    platform: AlphaTarget,
+    runner: &mut R,
+) -> Result<PreparedUpgradeAsset, UpgradeAssetError> {
     let names = convention_asset_names(target, platform);
     let workspace = WorkspaceGuard(temporary_workspace(target)?);
     let archive = workspace.0.join(&names.archive);
@@ -206,11 +223,23 @@ pub fn prepare_upgrade_asset<F: UpgradeAssetFetcher>(
         asset: names.archive.clone(),
         reason,
     })?;
-    extract(&archive, &extracted).map_err(|reason| UpgradeAssetError::Extraction {
+    let bundle = platform == AlphaTarget::DarwinArm64 && target.is_daemon();
+    let extraction = if bundle {
+        super::daemon_bundle::extract(&archive, &extracted, runner)
+    } else {
+        extract(&archive, &extracted)
+    };
+    extraction.map_err(|reason| UpgradeAssetError::Extraction {
         asset: names.archive.clone(),
         reason,
     })?;
-    let candidate = extracted.join(&names.binary);
+    let candidate = if bundle {
+        extracted
+            .join(super::daemon_bundle::NAME)
+            .join("Contents/MacOS/ck-subc")
+    } else {
+        extracted.join(&names.binary)
+    };
     if !candidate.is_file() {
         return Err(UpgradeAssetError::Extraction {
             asset: names.archive,

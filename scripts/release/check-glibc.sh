@@ -6,8 +6,21 @@ export LC_ALL=C
 SOURCE_DIR="${1:?usage: $0 <binary-dir>}"
 MAX_GLIBC=2.28
 
-for binary in ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python; do
+for binary in ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python ck-nats-server ck-nats-engine; do
   path="${SOURCE_DIR}/${binary}"
+  if [[ "$binary" == ck-nats-engine ]]; then
+    # The engine build disables Go's C interop (CGO_ENABLED=0). Refuse any interpreter or shared
+    # library dependency instead of inferring static linkage from version text.
+    readelf --file-header "$path" >/dev/null
+    segments=$(readelf --program-headers --wide "$path")
+    dynamic=$(readelf --dynamic --wide "$path")
+    if printf '%s\n%s\n' "$segments" "$dynamic" | grep -Eq 'INTERP|\(NEEDED\)'; then
+      echo "${binary}: expected a static ELF (no interpreter or shared libraries)" >&2
+      exit 1
+    fi
+    echo "${binary}: static ELF (no interpreter or shared libraries)"
+    continue
+  fi
   if ! versions=$(readelf --version-info --wide "$path"); then
     echo "${binary}: cannot read ELF version requirements: ${path}" >&2
     exit 1

@@ -1,9 +1,9 @@
 //! Health-checking an existing nats-server.
 //!
-//! `ck setup` does not install the message bus: nats-server and ck-bus are still placed
-//! with ck-bus's own install tooling (`ck-bus install-plan` and `install-apply`, which
-//! need the root signing ceremony). What setup does is upgrade an install it finds
-//! already declared in `subc.jsonc`, so the daemon can health-check nats-server:
+//! `ck setup` installs the NATS executables, but creating a message bus still
+//! requires running ck-bus's `install-plan` and `install-apply` commands.
+//! For an existing stock server declared in `subc.jsonc`, this helper adds
+//! monitoring so the daemon can health-check it:
 //!
 //! 1. nats-server's `server.conf` gets the loopback monitoring listener
 //!    (`http: "127.0.0.1:18222"`). The file is changed by ck-bus itself, through
@@ -19,9 +19,10 @@
 //! so setup tells the operator to restart nats-server and then rescan. Setup itself
 //! restarts neither.
 //!
-//! An install is recognised only when nats-server is declared with `protocol: "none"`
-//! and `-c <absolute path>/server.conf`, and ck-bus is declared with an absolute
-//! `program`. Anything else is reported and skipped; setup never guesses a path.
+//! The migrated `ck-nats-server` wrapper serves `health.check` itself. Conf-only
+//! updates still keep its monitoring listener, but never add a daemon HTTP probe.
+//! Both forms must name `-c <absolute path>/server.conf` and an absolute ck-bus
+//! program. Anything else is reported and skipped; setup never guesses a path.
 
 use std::{
     fmt,
@@ -243,11 +244,24 @@ fn desired_health(health_url: &str) -> Value {
 }
 
 fn health_state(document: &Value, health_url: &str) -> HealthState {
+    if wrapper_entry(document) {
+        return HealthState::Matching;
+    }
     match config::existing_value(document, HEALTH_KEY) {
         None => HealthState::Missing,
         Some(existing) if *existing == desired_health(health_url) => HealthState::Matching,
         Some(_) => HealthState::Kept,
     }
+}
+
+fn wrapper_entry(document: &Value) -> bool {
+    let nats = &document["modules"][NATS_SERVER_MODULE];
+    nats["protocol"] == "subc"
+        && nats["registration_channel"] == true
+        && nats["program"]
+            .as_str()
+            .and_then(|p| Path::new(p).file_stem())
+            .is_some_and(|name| name == "ck-nats-server")
 }
 
 /// Finds the declared install, or why it cannot be upgraded.
@@ -256,7 +270,7 @@ fn declared_target(document: &Value) -> Result<Option<BusTarget>, String> {
     else {
         return Ok(None);
     };
-    if nats.get("protocol").and_then(Value::as_str) != Some("none") {
+    if nats.get("protocol").and_then(Value::as_str) != Some("none") && !wrapper_entry(document) {
         return Err(format!(
             "modules.{NATS_SERVER_MODULE} is not declared with protocol \"none\", and a health.http check is valid only for that protocol"
         ));
@@ -388,29 +402,34 @@ pub fn apply(
         ),
     }];
 
-    let health_added = match config::plan_missing_value(
-        config_path,
-        HEALTH_KEY,
-        desired_health(&report.health_url),
-    )? {
-        Some(change) => {
-            config::apply(&change)?;
-            lines.push(format!(
-                "added the nats-server health check ({}) to {}",
-                report.health_url,
-                config_path.display()
-            ));
-            true
-        }
-        None => {
-            let (_, document) = subc_jsonc::read_document(config_path)?;
-            if health_state(&document, &report.health_url) == HealthState::Kept {
+    let (_, document) = subc_jsonc::read_document(config_path)?;
+    let health_added = if wrapper_entry(&document) {
+        false
+    } else {
+        match config::plan_missing_value(
+            config_path,
+            HEALTH_KEY,
+            desired_health(&report.health_url),
+        )? {
+            Some(change) => {
+                config::apply(&change)?;
                 lines.push(format!(
-                    "kept your setting: {HEALTH_KEY} in {} is left as it is",
+                    "added the nats-server health check ({}) to {}",
+                    report.health_url,
                     config_path.display()
                 ));
+                true
             }
-            false
+            None => {
+                let (_, document) = subc_jsonc::read_document(config_path)?;
+                if health_state(&document, &report.health_url) == HealthState::Kept {
+                    lines.push(format!(
+                        "kept your setting: {HEALTH_KEY} in {} is left as it is",
+                        config_path.display()
+                    ));
+                }
+                false
+            }
         }
     };
 
@@ -433,6 +452,27 @@ pub fn apply(
 mod tests {
     use super::*;
     use cortexkit_test_support::ScratchDir;
+
+    #[test]
+    fn migrated_wrapper_keeps_conf_only_without_readding_http_probe() {
+        let install = install(None, "");
+        let text = std::fs::read_to_string(&install.config_path)
+            .unwrap()
+            .replace("/opt/homebrew/bin/nats-server", "/managed/ck-nats-server")
+            .replace(
+                "\"protocol\": \"none\"",
+                "\"protocol\": \"subc\", \"registration_channel\": true, \"reserved\": true",
+            );
+        std::fs::write(&install.config_path, text).unwrap();
+        let mut tool = FakeCkBus::new(&install.config_path);
+        let bus = observed(observe(&install.config_path, &mut tool));
+        apply(&install.config_path, &bus.target, &mut tool).unwrap();
+        assert!(health(&install).is_none());
+        assert!(std::fs::read_to_string(&install.conf_path)
+            .unwrap()
+            .contains("http: \"127.0.0.1:18222\""));
+        assert_eq!(tool.calls, [true, false]);
+    }
 
     /// A stand-in for ck-bus. It follows `install-apply --conf-only --keep-existing`
     /// for the files these tests write: a `server.conf` without an `http:` line gets the

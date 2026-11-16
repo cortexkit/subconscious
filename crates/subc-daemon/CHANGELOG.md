@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.49.5
+
+- macOS: use subc-os's data protection keychain for the configuration sealing
+  key and classify a missing access-group entitlement as unavailable key access.
+  The old login-keychain item is left in place and never read again.
+
 ## 0.49.4
 
 - Let unstamped macOS installs run modules when the configuration sealing key

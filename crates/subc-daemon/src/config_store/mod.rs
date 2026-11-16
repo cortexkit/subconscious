@@ -311,6 +311,7 @@ fn key_access_error(error: &KeychainError) -> StoreError {
         KeychainError::Unsupported => "Unsupported",
         KeychainError::Unavailable => "Unavailable",
         KeychainError::Denied => "Denied",
+        KeychainError::NotEntitled => "NotEntitled",
         KeychainError::Missing => "Missing",
         KeychainError::AlreadyExists => "AlreadyExists",
         KeychainError::InvalidData => "InvalidData",

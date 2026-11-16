@@ -52,6 +52,10 @@ pub trait ArtifactSource {
         verify_acceptance(destination, acceptance)
     }
 
+    fn rollback_install(&mut self, destination: &Path) -> Result<(), String> {
+        remove_placed_binary(destination).map_err(|error| error.to_string())
+    }
+
     /// A binary already at `destination` that no inventory row owns: are its
     /// bytes exactly the release's? `Some(digests)` adopts it without writing;
     /// `None` leaves the refusal in place. The default adopts nothing, so a
@@ -71,6 +75,8 @@ pub trait ArtifactSource {
 /// managed home. The sidecar files on GitHub are not fetched: the index is
 /// the digest source.
 pub struct ReleaseArtifactSource {
+    pub(super) runner: Box<dyn super::runtime::CommandRunner>,
+    pub(super) daemon_replacement: Option<super::daemon_bundle::Replacement>,
     target: AlphaTarget,
     index_url: String,
     index: Option<Result<ReleaseIndex, IndexRefusal>>,
@@ -87,6 +93,8 @@ pub(super) struct ComponentReleaseSummary {
 impl ReleaseArtifactSource {
     pub fn current() -> Self {
         Self {
+            runner: Box::new(super::runtime::SystemCommandRunner),
+            daemon_replacement: None,
             target: host_alpha_target(),
             index_url: release_index::index_url(),
             index: None,
@@ -98,6 +106,8 @@ impl ReleaseArtifactSource {
     #[cfg(test)]
     pub fn from_index(index: ReleaseIndex, target: AlphaTarget) -> Self {
         Self {
+            runner: Box::new(super::runtime::SystemCommandRunner),
+            daemon_replacement: None,
             target,
             index_url: String::new(),
             index: Some(Ok(index)),
@@ -276,11 +286,21 @@ impl ReleaseArtifactSource {
         component: Component,
         binary: &str,
     ) -> Result<FetchedCandidate, String> {
+        let bundle = self.target == AlphaTarget::DarwinArm64 && binary == "ck-subc";
         let binary_name = platform_binary(binary);
         let archive_name = format!("{}-{}.zip", binary, self.target.label());
         let asset = self.lookup_asset(component, binary)?;
+        let sequence = if bundle {
+            static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            format!(
+                "-{}",
+                SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            )
+        } else {
+            String::new()
+        };
         let temp = std::env::temp_dir().join(format!(
-            "ck-setup-{binary}-{}-{}",
+            "ck-setup-{binary}-{}-{}{sequence}",
             process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -311,8 +331,18 @@ impl ReleaseArtifactSource {
         let extracted = temp.join("extracted");
         #[cfg(unix)]
         file_modes::create_private_directory(&extracted)?;
-        extract(&archive, &extracted)?;
-        let candidate = extracted.join(&binary_name);
+        if bundle {
+            super::daemon_bundle::extract(&archive, &extracted, &mut self.runner)?;
+        } else {
+            extract(&archive, &extracted)?;
+        }
+        let candidate = if bundle {
+            extracted
+                .join(super::daemon_bundle::NAME)
+                .join("Contents/MacOS/ck-subc")
+        } else {
+            extracted.join(&binary_name)
+        };
         if !candidate.is_file() {
             return Err(format!(
                 "{archive_name} did not contain {binary_name} at its archive root"
@@ -337,6 +367,16 @@ impl ArtifactSource for ReleaseArtifactSource {
         let binary_name = platform_binary(binary);
         let fetched = self.fetch_candidate(component, binary)?;
         let candidate = fetched.candidate.clone();
+        if self.target == AlphaTarget::DarwinArm64 && binary == "ck-subc" {
+            let home = super::daemon_bundle::binary_home(destination)?;
+            let replacement =
+                super::daemon_bundle::Replacement::place(&candidate, &home, &mut self.runner)?;
+            self.daemon_replacement = Some(replacement);
+            return Ok(PlacementDigests {
+                binary_sha256: digest_file(destination)?,
+                archive_sha256: fetched.archive_sha256.clone(),
+            });
+        }
         let parent = destination.parent().ok_or_else(|| {
             format!(
                 "managed binary destination {} has no parent",
@@ -401,6 +441,15 @@ impl ArtifactSource for ReleaseArtifactSource {
         }
         verify_acceptance(destination, acceptance)
     }
+
+    fn rollback_install(&mut self, destination: &Path) -> Result<(), String> {
+        if super::daemon_bundle::containing_bundle(destination).is_some() {
+            if let Some(mut replacement) = self.daemon_replacement.take() {
+                return replacement.rollback();
+            }
+        }
+        remove_placed_binary(destination).map_err(|error| error.to_string())
+    }
 }
 
 pub fn component_binaries(component: Component) -> &'static [&'static str] {
@@ -458,6 +507,8 @@ pub fn component_binaries_for_target(
             "ck-subc-mcp",
             "ck-script-runner-bun",
             "ck-script-runner-python",
+            "ck-nats-engine",
+            "ck-nats-server",
         ],
         // The managed name is the daemon-placed name (`ck-aft`), not the
         // crate's own binary name: the spec inventory, `ck upgrade`, and the
@@ -498,8 +549,24 @@ pub fn component_binaries_for_target(
 pub fn component_binary_paths(component: Component, binary_home: &Path) -> Vec<std::path::PathBuf> {
     component_binaries(component)
         .iter()
-        .map(|binary| binary_home.join(platform_binary(binary)))
+        .map(|binary| installed_binary_path(binary_home, binary))
         .collect()
+}
+
+fn desired_binary_path(binary_home: &Path, binary: &str) -> PathBuf {
+    if cfg!(target_os = "macos") && binary == "ck-subc" {
+        super::daemon_bundle::executable(binary_home)
+    } else {
+        binary_home.join(platform_binary(binary))
+    }
+}
+
+fn installed_binary_path(binary_home: &Path, binary: &str) -> PathBuf {
+    let desired = desired_binary_path(binary_home, binary);
+    if cfg!(target_os = "macos") && binary == "ck-subc" && !desired.is_file() {
+        return binary_home.join("ck-subc");
+    }
+    desired
 }
 
 /// Whether setup considers `component` installed: every binary on disk and
@@ -509,7 +576,7 @@ pub fn component_binary_paths(component: Component, binary_home: &Path) -> Vec<s
 /// core reinstall it then refused.
 pub fn is_installed(component: Component, binary_home: &Path, inventory: &Inventory) -> bool {
     component_is_owned(component, binary_home, inventory)
-        && component_binary_paths(component, binary_home)
+        && installation_binary_paths(component, binary_home)
             .iter()
             .all(|path| {
                 path.is_file()
@@ -517,6 +584,13 @@ pub fn is_installed(component: Component, binary_home: &Path, inventory: &Invent
                         .iter()
                         .any(|kind| inventory.owns_path(kind, path))
             })
+}
+
+pub(super) fn installation_binary_paths(component: Component, binary_home: &Path) -> Vec<PathBuf> {
+    component_binaries(component)
+        .iter()
+        .map(|binary| desired_binary_path(binary_home, binary))
+        .collect()
 }
 
 pub(super) fn observe_unowned_binaries(
@@ -561,7 +635,7 @@ pub(super) fn unowned_binary_paths<'a>(
     binaries
         .iter()
         .filter_map(|&binary| {
-            let path = binary_home.join(platform_binary(binary));
+            let path = installed_binary_path(binary_home, binary);
             (fs::symlink_metadata(&path).is_ok()
                 && !OWNED_BINARY_KINDS
                     .iter()
@@ -605,7 +679,13 @@ pub fn owned_binary_paths(inventory: &Inventory) -> Vec<PathBuf> {
 /// for recognizing an older installation. Setup still requires the full set.
 pub(super) fn is_later_companion(component: Component, binary: &str) -> bool {
     component == Component::Core
-        && matches!(binary, "ck-script-runner-bun" | "ck-script-runner-python")
+        && matches!(
+            binary,
+            "ck-script-runner-bun"
+                | "ck-script-runner-python"
+                | "ck-nats-engine"
+                | "ck-nats-server"
+        )
 }
 
 /// Whether the original binaries of `component` are on disk and inventory-owned.
@@ -614,7 +694,7 @@ pub fn component_is_owned(component: Component, binary_home: &Path, inventory: &
     let paths = component_binaries(component)
         .iter()
         .filter(|binary| !is_later_companion(component, binary))
-        .map(|binary| binary_home.join(platform_binary(binary)))
+        .map(|binary| installed_binary_path(binary_home, binary))
         .collect::<Vec<_>>();
     // A component with no binaries on this target (MC on Windows) has nothing
     // to own, and `all` over nothing is true; it must read as not installed.
@@ -630,7 +710,14 @@ pub fn component_is_owned(component: Component, binary_home: &Path, inventory: &
 pub fn installed_components(inventory: &Inventory) -> Vec<Component> {
     let binary_homes = owned_binary_paths(inventory)
         .into_iter()
-        .filter_map(|path| path.parent().map(Path::to_path_buf))
+        .filter_map(|path| {
+            if cfg!(target_os = "macos") && super::daemon_bundle::containing_bundle(&path).is_some()
+            {
+                super::daemon_bundle::binary_home(&path).ok()
+            } else {
+                path.parent().map(Path::to_path_buf)
+            }
+        })
         .collect::<BTreeSet<_>>();
     Component::ALL
         .into_iter()
@@ -662,6 +749,15 @@ pub fn upgrade_roster(
     // manifest is the premise this order stands on. ck goes last because it
     // is the process running the ladder.
     if installed.contains(&Component::Core) {
+        // Place both NATS companions before restarting the daemon, which
+        // launches ck-nats-server in place of the stock nats-server process.
+        for binary in ["ck-nats-engine", "ck-nats-server"] {
+            roster.push(UpgradeTarget {
+                component: Component::Core,
+                binary,
+                module_id: None,
+            });
+        }
         let daemon = component_binaries(Component::Core)
             .iter()
             .copied()
@@ -679,7 +775,9 @@ pub fn upgrade_roster(
             continue;
         }
         for binary in component_binaries(component) {
-            if component == Component::Core && *binary == "ck-subc" {
+            if component == Component::Core
+                && matches!(*binary, "ck-subc" | "ck-nats-engine" | "ck-nats-server")
+            {
                 continue;
             }
             roster.push(UpgradeTarget {
@@ -707,7 +805,10 @@ pub fn install_component<S: ArtifactSource>(
     source: &mut S,
 ) -> Result<(), String> {
     for binary in component_binaries(component) {
-        let destination = binary_home.join(platform_binary(binary));
+        let destination = desired_binary_path(binary_home, binary);
+        if cfg!(target_os = "macos") && *binary == "ck-subc" {
+            super::daemon_bundle::check_destination(&destination, inventory)?;
+        }
         if destination.is_file()
             && OWNED_BINARY_KINDS
                 .iter()
@@ -744,7 +845,7 @@ pub fn install_component<S: ArtifactSource>(
             .acceptance(component, binary)
             .and_then(|acceptance| source.verify(&destination, &acceptance));
         if let Err(error) = accepted {
-            match fs::remove_file(&destination) {
+            match source.rollback_install(&destination) {
                 Ok(()) => return Err(error),
                 Err(cleanup) => {
                     return Err(format!(
@@ -758,6 +859,15 @@ pub fn install_component<S: ArtifactSource>(
         println!("  placed {}", display_home_path(&destination));
     }
     Ok(())
+}
+
+pub(super) fn remove_placed_binary(destination: &Path) -> std::io::Result<()> {
+    if cfg!(target_os = "macos") {
+        if let Some(bundle) = super::daemon_bundle::containing_bundle(destination) {
+            return fs::remove_dir_all(bundle);
+        }
+    }
+    fs::remove_file(destination)
 }
 
 fn record_placement(
@@ -1066,6 +1176,36 @@ mod tests {
     use super::*;
     use cortexkit_test_support::ScratchDir;
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_bundle_discovery_accepts_both_shapes_but_not_absence() {
+        for bundled in [false, true] {
+            let root = ScratchDir::new("bundle-discovery");
+            let bin = root.join("bin");
+            fs::create_dir_all(&bin).unwrap();
+            let daemon = if bundled {
+                root.join("apps/CortexKit Daemon.app/Contents/MacOS/ck-subc")
+            } else {
+                bin.join("ck-subc")
+            };
+            fs::create_dir_all(daemon.parent().unwrap()).unwrap();
+            let mut inventory =
+                Inventory::load(root.join("manifest.json"), "darwin-arm64").unwrap();
+            for path in [&daemon, &bin.join("ck-subc-mcp")] {
+                fs::write(path, "owned executable").unwrap();
+                inventory.record("managed-binary", path, Map::new());
+            }
+            assert!(
+                component_is_owned(Component::Core, &bin, &inventory),
+                "bundled={bundled}"
+            );
+            assert!(installed_components(&inventory).contains(&Component::Core));
+            fs::remove_file(&daemon).unwrap();
+            assert!(!component_is_owned(Component::Core, &bin, &inventory));
+            assert!(!installed_components(&inventory).contains(&Component::Core));
+        }
+    }
+
     /// On unix the fake is a real shell script and the default `--version`
     /// execution runs unchanged, so the install path is exercised end to end.
     /// Windows cannot execute a script named `.exe`, so there the fake answers
@@ -1085,7 +1225,10 @@ mod tests {
             // On unix the default verification executes this script, so it is
             // written through a child process; see `test_exec` for why.
             #[cfg(unix)]
-            crate::setup::test_exec::write_executable(destination, script.as_bytes());
+            {
+                fs::create_dir_all(destination.parent().unwrap()).unwrap();
+                crate::setup::test_exec::write_executable(destination, script.as_bytes());
+            }
             #[cfg(not(unix))]
             fs::write(destination, script).map_err(|error| error.to_string())?;
             fake_placement_digests(destination)
@@ -1146,7 +1289,10 @@ mod tests {
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_default(),
             );
-            crate::setup::test_exec::write_executable(destination, script.as_bytes());
+            {
+                fs::create_dir_all(destination.parent().unwrap()).unwrap();
+                crate::setup::test_exec::write_executable(destination, script.as_bytes());
+            }
             fake_placement_digests(destination)
         }
 
@@ -1161,6 +1307,12 @@ mod tests {
 
     fn fixture_dir(name: &str) -> ScratchDir {
         ScratchDir::new(name)
+    }
+
+    fn fixture_binary_path(binary_home: &Path, binary: &str) -> PathBuf {
+        let path = desired_binary_path(binary_home, binary);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        path
     }
 
     fn fake_placement_digests(destination: &Path) -> Result<PlacementDigests, String> {
@@ -1241,7 +1393,7 @@ mod tests {
             .expect("inventory");
             for component in components {
                 for binary in component_binaries(*component) {
-                    let path = binary_home.join(platform_binary(binary));
+                    let path = fixture_binary_path(&binary_home, binary);
                     fs::write(&path, binary).expect("fixture binary");
                     inventory.record("managed-binary", &path, Map::new());
                 }
@@ -1269,12 +1421,14 @@ mod tests {
             .iter()
             .map(|target| target.label())
             .collect::<Vec<_>>();
-        let mut expected = vec!["ck-subc"];
+        let mut expected = vec!["ck-nats-engine", "ck-nats-server", "ck-subc"];
         expected.extend(
             component_binaries(Component::Core)
                 .iter()
                 .copied()
-                .filter(|binary| *binary != "ck-subc"),
+                .filter(|binary| {
+                    !matches!(*binary, "ck-subc" | "ck-nats-engine" | "ck-nats-server")
+                }),
         );
         expected.extend(component_binaries(Component::Claustrum).iter().copied());
         expected.extend(component_binaries(Component::Synapse).iter().copied());
@@ -1284,7 +1438,7 @@ mod tests {
         for binary in component_binaries(Component::Synapse) {
             assert!(labels.contains(binary), "missing synapse binary {binary}");
         }
-        assert_eq!(labels.first(), Some(&"ck-subc"));
+        assert_eq!(labels.first(), Some(&"ck-nats-engine"));
         assert_eq!(labels.last(), Some(&"ck"));
 
         // A component with an empty binary set on this target is not
@@ -1317,7 +1471,7 @@ mod tests {
         )
         .expect("inventory");
         for binary in component_binaries(Component::Core) {
-            let path = binary_home.join(platform_binary(binary));
+            let path = fixture_binary_path(&binary_home, binary);
             fs::write(&path, binary).expect("fixture binary");
             placed.record("binary-placement", &path, Map::new());
         }
@@ -1330,6 +1484,8 @@ mod tests {
                 .map(|target| target.label())
                 .collect::<Vec<_>>(),
             [
+                "ck-nats-engine",
+                "ck-nats-server",
                 "ck-subc",
                 "ck-subc-mcp",
                 "ck-script-runner-bun",
@@ -1386,8 +1542,8 @@ mod tests {
         assert!(is_installed(Component::Core, &binary_home, &inventory));
         install_component(Component::Core, &binary_home, &mut inventory, &mut source)
             .expect("repeat core install");
-        assert_eq!(inventory.paths_for_kind("managed-binary").len(), 4);
-        let placed = binary_home.join(platform_binary("ck-subc"));
+        assert_eq!(inventory.paths_for_kind("managed-binary").len(), 6);
+        let placed = desired_binary_path(&binary_home, "ck-subc");
         let entry = inventory
             .entry_for_path("managed-binary", &placed)
             .expect("owned ck-subc");
@@ -1408,7 +1564,7 @@ mod tests {
         fs::create_dir_all(&bin).unwrap();
         let mut inventory = Inventory::load(root.join("inventory.json"), "linux-x64").unwrap();
         for binary in ["ck-subc", "ck-subc-mcp"] {
-            let path = bin.join(platform_binary(binary));
+            let path = fixture_binary_path(&bin, binary);
             fs::write(&path, binary).unwrap();
             inventory.record("managed-binary", &path, Map::new());
         }
@@ -1514,7 +1670,7 @@ mod tests {
         );
         assert!(is_installed(Component::Claustrum, &binary_home, &inventory));
         for binary in component_binaries(Component::Claustrum) {
-            let path = binary_home.join(platform_binary(binary));
+            let path = fixture_binary_path(&binary_home, binary);
             assert_eq!(
                 fs::read(&path).unwrap(),
                 release,
@@ -1566,7 +1722,7 @@ mod tests {
         let mut inventory =
             Inventory::load(root.join("installer-manifest.json"), "linux-x64").expect("inventory");
         for binary in component_binaries(Component::Core) {
-            let path = binary_home.join(platform_binary(binary));
+            let path = fixture_binary_path(&binary_home, binary);
             fs::write(&path, binary).unwrap();
             inventory.record("binary-placement", &path, Map::new());
         }
@@ -1629,7 +1785,7 @@ mod tests {
             error.contains("9.9.9"),
             "refusal names the expected version: {error}"
         );
-        let placed = binary_home.join(platform_binary("ck-subc"));
+        let placed = desired_binary_path(&binary_home, "ck-subc");
         assert!(
             !placed.exists(),
             "refused binary must not survive at {}",
@@ -1707,14 +1863,14 @@ mod tests {
             .expect_err("second binary must be refused");
             // Deliberately NOT saving here: the record must already be on disk.
         }
-        assert!(binary_home.join(platform_binary("ck-subc")).is_file());
+        assert!(desired_binary_path(&binary_home, "ck-subc").is_file());
         assert!(!binary_home.join(platform_binary("ck-subc-mcp")).exists());
 
         let mut reloaded = Inventory::load(manifest_path, "linux-x64").expect("reload from disk");
         assert!(
             reloaded.owns_path(
                 "managed-binary",
-                &binary_home.join(platform_binary("ck-subc"))
+                &desired_binary_path(&binary_home, "ck-subc")
             ),
             "the accepted binary's ownership record must have survived on disk"
         );
@@ -1727,7 +1883,7 @@ mod tests {
         )
         .expect("re-run after a partial refusal installs the rest cleanly");
         assert!(is_installed(Component::Core, &binary_home, &reloaded));
-        assert_eq!(reloaded.paths_for_kind("managed-binary").len(), 4);
+        assert_eq!(reloaded.paths_for_kind("managed-binary").len(), 6);
     }
 
     #[test]
@@ -1765,7 +1921,7 @@ mod tests {
         fs::create_dir_all(&bin).unwrap();
         let mut inventory = Inventory::load(root.join("inventory.json"), "linux-x64").unwrap();
         for binary in ["ck-subc", "ck-subc-mcp", "ck-script-runner-bun"] {
-            let path = bin.join(platform_binary(binary));
+            let path = fixture_binary_path(&bin, binary);
             fs::write(&path, binary).unwrap();
             inventory.record("managed-binary", &path, Map::new());
         }
@@ -1789,6 +1945,8 @@ mod tests {
         binaries.insert("ck-subc-mcp".to_string(), asset(None));
         binaries.insert("ck-script-runner-bun".to_string(), asset(None));
         binaries.insert("ck-script-runner-python".to_string(), asset(None));
+        binaries.insert("ck-nats-engine".to_string(), asset(None));
+        binaries.insert("ck-nats-server".to_string(), asset(None));
         let mut targets = std::collections::BTreeMap::new();
         targets.insert("linux-x64".to_string(), binaries);
         let mut components = std::collections::BTreeMap::new();

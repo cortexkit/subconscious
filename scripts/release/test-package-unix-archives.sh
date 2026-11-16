@@ -16,12 +16,14 @@ finish() {
 trap finish EXIT
 
 mkdir -p "$FIXTURE_DIR/source" "$FIXTURE_DIR/dist"
-for binary in ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python; do
+for binary in ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python ck-nats-server ck-nats-engine; do
   printf '%s fixture\n' "$binary" > "$FIXTURE_DIR/source/$binary"
 done
 # ck must answer for its own build shape; the packager refuses a ck that
 # carries the test-only release-index key path.
 write_ck_fixture() {
+  # Emit a literal $1 for the fixture script to inspect when it runs.
+  # shellcheck disable=SC2016
   printf '#!/bin/sh\ncase "$1" in --ck-build-shape) echo "test-support: %s";; esac\n' "$1" \
     > "$FIXTURE_DIR/source/ck"
   chmod 755 "$FIXTURE_DIR/source/ck"
@@ -37,7 +39,7 @@ fi
 write_ck_fixture off
 "${SCRIPT_DIR}/package-unix-archives.sh" linux x64 "$FIXTURE_DIR/source" "$FIXTURE_DIR/dist"
 
-for binary in ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python; do
+for binary in ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python ck-nats-server ck-nats-engine; do
   archive_name="${binary}-linux-x64.zip"
   archive_path="$FIXTURE_DIR/dist/$archive_name"
   sidecar_path="${archive_path}.sha256"
@@ -50,5 +52,33 @@ for binary in ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-pytho
     shasum -a 256 -c "${archive_name}.sha256"
   )
 done
-printf 'Unix package fixtures passed (5 archives and sidecars, test-support refusal)\n'
+printf 'Unix package fixtures passed (7 archives and sidecars, test-support refusal)\n'
+if command -v ditto >/dev/null; then
+  bundle="$FIXTURE_DIR/source/CortexKit Daemon.app"
+  mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/_CodeSignature"
+  cp "$FIXTURE_DIR/source/ck-subc" "$bundle/Contents/MacOS/ck-subc"
+  printf 'info fixture\n' > "$bundle/Contents/Info.plist"
+  printf 'profile fixture\n' > "$bundle/Contents/embedded.provisionprofile"
+  printf 'seal fixture\n' > "$bundle/Contents/_CodeSignature/CodeResources"
+  "${SCRIPT_DIR}/package-unix-archives.sh" darwin arm64 "$FIXTURE_DIR/source" "$FIXTURE_DIR/dist"
+  for binary in ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python ck-nats-server ck-nats-engine; do
+    archive_name="$binary-darwin-arm64.zip"
+    archive_path="$FIXTURE_DIR/dist/$archive_name"
+    if [[ "$binary" == ck-subc ]]; then
+      unzip -Z1 "$archive_path" > "$FIXTURE_DIR/entries"
+      grep -Fxq 'CortexKit Daemon.app/Contents/MacOS/ck-subc' "$FIXTURE_DIR/entries"
+      grep -Fxq 'CortexKit Daemon.app/Contents/embedded.provisionprofile' "$FIXTURE_DIR/entries"
+      grep -Fxq 'CortexKit Daemon.app/Contents/_CodeSignature/CodeResources' "$FIXTURE_DIR/entries"
+      if grep -Fxq ck-subc "$FIXTURE_DIR/entries"; then
+        echo 'darwin daemon archive included the bare binary' >&2; exit 1
+      fi
+    else
+      [[ "$(unzip -Z1 "$archive_path")" == "$binary" ]]
+    fi
+    (cd "$FIXTURE_DIR/dist" && shasum -a 256 -c "$archive_name.sha256")
+  done
+  printf 'Darwin package fixtures passed (7 archives and sidecars, bundle contents)\n'
+else
+  printf 'Darwin package fixtures skipped: native ditto not available\n'
+fi
 finished=1

@@ -286,10 +286,16 @@ pub fn discover_managed_upgrade_targets(
                         name == super::components::platform_binary("ck-subc").as_str()
                     })
                 }) {
-                    let destination = daemon
-                        .parent()
-                        .expect("owned daemon has a parent")
-                        .join(super::components::platform_binary(target.binary));
+                    let binary_home = if cfg!(target_os = "macos") {
+                        super::daemon_bundle::binary_home(daemon)?
+                    } else {
+                        daemon
+                            .parent()
+                            .expect("owned daemon has a parent")
+                            .to_path_buf()
+                    };
+                    let destination =
+                        binary_home.join(super::components::platform_binary(target.binary));
                     // An occupied path is never adopted or executed by upgrade.
                     // The ownership gate reports it as an unowned binary.
                     if fs::symlink_metadata(&destination)
@@ -408,10 +414,15 @@ pub fn observed_upgrade_targets(
 /// surface. Daemon activation deliberately uses the OS service manager rather
 /// than a supervisor restart request.
 pub struct SystemUpgradeBackend {
+    runner: Box<dyn super::runtime::CommandRunner>,
+    bundle_migration: Option<super::daemon_bundle::Migration>,
+    core_cut: CoreCut,
     platform: AlphaTarget,
     targets: BTreeMap<String, ManagedUpgradeTarget>,
     executable: PathBuf,
     subc: Option<PathBuf>,
+    /// Fixed at construction so inventory changes cannot redirect config writes.
+    config_path: PathBuf,
     assets: ReleaseUpgradeAssetFetcher,
     inventory: Inventory,
     prepared: BTreeMap<String, PreparedUpgradeAsset>,
@@ -442,6 +453,27 @@ pub struct SystemUpgradeBackend {
     supervised_modules: BTreeSet<String>,
     /// Where the backend's own lines go, fixed when it is built.
     lines: Lines,
+}
+
+#[derive(Default)]
+struct CoreCut {
+    captured: bool,
+    nats: Option<super::nats_migration::Migration>,
+    deferred: BTreeSet<String>,
+    rolling_back: bool,
+}
+
+fn nats_companion(target: UpgradeTarget) -> bool {
+    target.component == Component::Core
+        && matches!(target.binary, "ck-nats-engine" | "ck-nats-server")
+}
+
+fn default_upgrade_config_path() -> PathBuf {
+    // Unit tests must supply an explicit config path instead of consulting user config.
+    #[cfg(test)]
+    panic!("an upgrade test backend must receive an explicit config path");
+    #[cfg(not(test))]
+    subc_daemon::daemon_config::default_config_path()
 }
 
 /// Where [`SystemUpgradeBackend`] sends its own lines: the completion line
@@ -504,6 +536,33 @@ impl Lines {
 }
 
 impl SystemUpgradeBackend {
+    fn capture_core_cut(&mut self, target: UpgradeTarget) -> Result<(), String> {
+        if !target.is_daemon() && !nats_companion(target) {
+            return Ok(());
+        }
+        if !self.core_cut.captured {
+            let daemon = self
+                .targets
+                .values()
+                .find(|t| t.target.is_daemon())
+                .map(|t| t.destination.as_path())
+                .unwrap_or(&self.target(target)?.destination);
+            let home = super::daemon_bundle::binary_home(daemon)?;
+            let connection = self
+                .subc
+                .clone()
+                .unwrap_or_else(subc_daemon::bootstrap::connection_file_path);
+            self.core_cut.nats = super::nats_migration::Migration::capture(
+                &self.config_path,
+                &home,
+                &connection,
+                &self.inventory,
+            )?;
+            self.core_cut.captured = true;
+        }
+        Ok(())
+    }
+
     pub fn new(
         executable: impl Into<PathBuf>,
         subc: Option<PathBuf>,
@@ -524,18 +583,32 @@ impl SystemUpgradeBackend {
         let data_dir = load_current_inventory_root()?;
         let inventory = load_current_inventory()?;
         tighten_upgrade_permissions(&data_dir, &inventory)?;
-        Ok(Self::with_inventory(
-            platform, executable, subc, targets, index, inventory, output,
-        ))
+        let config_path = inventory
+            .paths_for_kind("configuration")
+            .into_iter()
+            .next()
+            .unwrap_or_else(default_upgrade_config_path);
+        let mut backend = Self::with_inventory(
+            platform,
+            executable,
+            config_path,
+            targets,
+            index,
+            inventory,
+            output,
+        );
+        backend.subc = subc;
+        Ok(backend)
     }
 
     /// Builds the backend over an inventory already loaded, first sweeping
     /// the previous images earlier replacements left behind. Their warnings
-    /// go where `output` sends every other line.
+    /// go where `output` sends every other line. The configuration path is
+    /// explicit even when the inventory has no record of that file.
     fn with_inventory(
         platform: AlphaTarget,
         executable: impl Into<PathBuf>,
-        subc: Option<PathBuf>,
+        config_path: impl Into<PathBuf>,
         targets: Vec<ManagedUpgradeTarget>,
         index: ReleaseIndex,
         mut inventory: Inventory,
@@ -567,12 +640,16 @@ impl SystemUpgradeBackend {
             .collect();
         Self {
             platform,
+            runner: Box::new(crate::setup::runtime::SystemCommandRunner),
+            bundle_migration: None,
+            core_cut: CoreCut::default(),
             targets: targets
                 .into_iter()
                 .map(|item| (item.target.label().to_string(), item))
                 .collect(),
             executable: executable.into(),
-            subc,
+            subc: None,
+            config_path: config_path.into(),
             assets: ReleaseUpgradeAssetFetcher::from_index(index),
             inventory,
             prepared: BTreeMap::new(),
@@ -958,18 +1035,98 @@ impl SystemUpgradeBackend {
             .map(String::as_str)
             .ok_or_else(|| format!("no expected release version recorded for {target}"))
     }
+
+    fn place_daemon_bundle(
+        &mut self,
+        target: UpgradeTarget,
+        prepared: &PreparedUpgradeAsset,
+    ) -> Result<String, String> {
+        let old = self.target(target)?.destination.clone();
+        let home = super::daemon_bundle::binary_home(&old)?;
+        let mut paths = if let Some(snapshot) = &self.daemon_definition_snapshot {
+            snapshot.paths().clone()
+        } else {
+            super::runtime::runtime_paths(
+                super::runtime::RuntimePlatform::Macos,
+                &home,
+                &super::apply::user_home()?,
+            )
+        };
+        paths.daemon = super::daemon_bundle::executable(&home);
+        let mut migration =
+            super::daemon_bundle::Migration::capture(&paths, &old, &self.inventory)?;
+        let replacement =
+            super::daemon_bundle::Replacement::place(&prepared.candidate, &home, &mut self.runner)?;
+        migration.attach(replacement);
+        let destination = paths.daemon;
+        self.bundle_migration = Some(migration);
+        self.targets.get_mut(target.label()).unwrap().destination = destination.clone();
+        if old != destination {
+            for kind in super::components::OWNED_BINARY_KINDS {
+                if let Some(fields) = self
+                    .inventory
+                    .entry_for_path(kind, &old)
+                    .and_then(Value::as_object)
+                    .cloned()
+                {
+                    self.inventory.record(kind, &destination, fields);
+                }
+            }
+        }
+        let result = (|| {
+            self.activated_inodes
+                .insert(target.label().into(), destination_inode(&destination)?);
+            self.record_replacement_digest(target, &destination, Some(&prepared.archive_sha256))?;
+            Ok("verified daemon bundle replaced as a unit".into())
+        })();
+        if result.is_err() {
+            self.rollback(target)?;
+        }
+        result
+    }
 }
 
 impl UpgradeExecutionBackend for SystemUpgradeBackend {
+    fn failure_rollback_target(&self) -> Option<UpgradeTarget> {
+        if !self.core_cut.captured || self.core_cut.rolling_back {
+            return None;
+        }
+        self.targets
+            .values()
+            .map(|item| item.target)
+            .filter(|t| {
+                (t.is_daemon() || nats_companion(*t))
+                    && self.activated_inodes.contains_key(t.label())
+            })
+            .min_by_key(|t| !t.is_daemon())
+    }
     fn download_and_verify(&mut self, target: UpgradeTarget) -> Result<String, String> {
-        let prepared = prepare_upgrade_asset(&mut self.assets, target, self.platform)
-            .map_err(|error| error.to_string())?;
+        let prepared = if self.platform == AlphaTarget::DarwinArm64 && target.is_daemon() {
+            super::upgrade_assets::prepare_upgrade_asset_with_runner(
+                &mut self.assets,
+                target,
+                self.platform,
+                &mut self.runner,
+            )
+        } else {
+            prepare_upgrade_asset(&mut self.assets, target, self.platform)
+        }
+        .map_err(|error| error.to_string())?;
         let detail = format!("archive={} SHA-256=verified", prepared.names.archive);
         self.prepared.insert(target.label().to_string(), prepared);
         Ok(detail)
     }
 
     fn create_rollback_copy(&mut self, target: UpgradeTarget) -> Result<String, String> {
+        self.capture_core_cut(target)?;
+        if self.platform == AlphaTarget::DarwinArm64 && target.is_daemon() {
+            if !self.target(target)?.destination.is_file() {
+                return Err("installed daemon is missing".into());
+            }
+            return Ok(
+                "the verified replacement will retain the previous bundle or bare daemon".into(),
+            );
+        }
         let (destination, rollback) = self.target_mutable_paths(target)?;
         if self.new_companions.contains(target.label()) {
             match fs::symlink_metadata(&destination) {
@@ -1015,8 +1172,27 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
             .prepared
             .remove(target.label())
             .ok_or_else(|| format!("no verified candidate was prepared for {target}"))?;
+        if self.platform == AlphaTarget::DarwinArm64 && target.is_daemon() {
+            let result = self.place_daemon_bundle(target, &prepared);
+            prepared.cleanup();
+            return result.and_then(|detail| {
+                if let Some(nats) = self.core_cut.nats.as_mut() {
+                    nats.apply()?;
+                }
+                Ok(detail)
+            });
+        }
         let prior_identity = destination_inode(&destination).ok();
-        let result = self.place_candidate(target, &destination, &prepared);
+        let result = self
+            .place_candidate(target, &destination, &prepared)
+            .and_then(|detail| {
+                if target.is_daemon() {
+                    if let Some(nats) = self.core_cut.nats.as_mut() {
+                        nats.apply()?;
+                    }
+                }
+                Ok(detail)
+            });
         prepared.cleanup();
         if result.is_err()
             && self.new_companions.contains(target.label())
@@ -1098,6 +1274,13 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
         &mut self,
         drain_timeout: Duration,
     ) -> Result<String, String> {
+        if let Some(migration) = &self.bundle_migration {
+            migration.activate(&mut self.runner, &mut self.inventory, self.subc.as_deref())?;
+            return Ok(format!(
+                "daemon bundle activated; drain budget={}s",
+                drain_timeout.as_secs()
+            ));
+        }
         let platform = super::runtime::RuntimePlatform::current();
         let root = load_current_inventory_root()?;
         let paths =
@@ -1110,7 +1293,7 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
         let detail = super::runtime::restart_with_definition_at(
             platform,
             &paths,
-            &mut super::runtime::SystemCommandRunner,
+            &mut self.runner,
             &mut self.inventory,
             self.subc.as_deref(),
         )?;
@@ -1214,6 +1397,15 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
                 super::upgrade_verification::target_verification_label(target)
             )
         })?;
+        if target.is_daemon() {
+            if let Some(nats) = &self.core_cut.nats {
+                nats.verify(
+                    &self.executable,
+                    &mut self.runner,
+                    super::upgrade_executor::RESTART_COMPLETION_TIMEOUT,
+                )?;
+            }
+        }
         if target.module_id().is_some() && !is_supervised_module {
             Ok(format!(
                 "{detail}; module is not supervised on this host and was verified by binary version only"
@@ -1224,6 +1416,36 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
     }
 
     fn completed(&mut self, target: UpgradeTarget) {
+        if nats_companion(target) && self.core_cut.captured {
+            self.core_cut.deferred.insert(target.label().into());
+            return;
+        }
+        if target.is_daemon() {
+            if let Some(nats) = self.core_cut.nats.as_mut() {
+                if let Err(error) = nats.complete(&mut self.inventory) {
+                    self.warn(format!(
+                        "warning: NATS verified but legacy cleanup failed: {error}"
+                    ));
+                    return;
+                }
+            }
+            let cut = std::mem::take(&mut self.core_cut);
+            for label in cut.deferred {
+                if let Some(item) = self.targets.get(&label) {
+                    self.completed(item.target);
+                }
+            }
+        }
+        if target.is_daemon() {
+            if let Some(mut migration) = self.bundle_migration.take() {
+                if let Err(error) = migration.complete(&mut self.inventory) {
+                    self.warn(format!(
+                        "warning: daemon verified but bundle cleanup failed: {error}"
+                    ));
+                    self.bundle_migration = Some(migration);
+                }
+            }
+        }
         if target.is_daemon() {
             self.daemon_definition_snapshot = None;
         }
@@ -1258,6 +1480,9 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
     }
 
     fn rollback_decision(&mut self, _target: UpgradeTarget) -> RollbackDecision {
+        if self.failure_rollback_target().is_some() {
+            return RollbackDecision::Accepted;
+        }
         match env::var("CK_UPGRADE_ROLLBACK") {
             Ok(value) if matches!(value.as_str(), "accept" | "accepted" | "yes") => {
                 RollbackDecision::Accepted
@@ -1267,6 +1492,51 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
     }
 
     fn rollback(&mut self, target: UpgradeTarget) -> Result<String, String> {
+        if !self.core_cut.rolling_back
+            && self.core_cut.captured
+            && (target.is_daemon() || nats_companion(target))
+        {
+            if let Some(nats) = self.core_cut.nats.as_mut() {
+                nats.rollback(&mut self.inventory)?;
+            }
+            self.core_cut.rolling_back = true;
+            let mut targets = self
+                .targets
+                .values()
+                .map(|item| item.target)
+                .filter(|t| {
+                    (t.is_daemon() || nats_companion(*t))
+                        && self.activated_inodes.contains_key(t.label())
+                })
+                .collect::<Vec<_>>();
+            targets.sort_by_key(|t| !t.is_daemon());
+            let result = targets
+                .into_iter()
+                .try_for_each(|t| self.rollback(t).map(|_| ()));
+            self.core_cut.rolling_back = false;
+            result?;
+            self.core_cut = CoreCut::default();
+            return Ok(
+                "accepted; restored daemon, NATS entry and previous companion binaries".into(),
+            );
+        }
+        if target.is_daemon() {
+            if let Some(mut migration) = self.bundle_migration.take() {
+                let old = migration.old_destination().to_path_buf();
+                if let Err(error) =
+                    migration.rollback(&mut self.runner, &mut self.inventory, self.subc.as_deref())
+                {
+                    self.bundle_migration = Some(migration);
+                    return Err(error);
+                }
+                self.targets.get_mut(target.label()).unwrap().destination = old;
+                self.daemon_definition_snapshot = None;
+                self.activated_inodes.remove(target.label());
+                return Ok(
+                    "accepted; restored previous daemon installation and launch agent".into(),
+                );
+            }
+        }
         let destination = self.target(target)?.destination.clone();
         if self.new_companions.contains(target.label()) {
             if self.activated_inodes.get(target.label()) != Some(&destination_inode(&destination)?)
@@ -1314,11 +1584,7 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
         self.record_replacement_digest(target, &destination, previous_archive.as_deref())?;
         if target.is_daemon() {
             if let Some(snapshot) = &self.daemon_definition_snapshot {
-                snapshot.restore(
-                    &mut super::runtime::SystemCommandRunner,
-                    &mut self.inventory,
-                    self.subc.as_deref(),
-                )?;
+                snapshot.restore(&mut self.runner, &mut self.inventory, self.subc.as_deref())?;
                 self.daemon_definition_snapshot = None;
             }
         }
@@ -1341,6 +1607,7 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
             )
         })?;
         self.rollback_paths.remove(target.label());
+        self.activated_inodes.remove(target.label());
         let aside_note = moved_aside
             .map(|aside| {
                 format!(
@@ -1471,6 +1738,9 @@ fn process_id() -> u32 {
 
 #[cfg(test)]
 pub(super) mod tests {
+    include!("upgrade/nats_tests.rs");
+    #[cfg(target_os = "macos")]
+    include!("upgrade/bundle_tests.rs");
     use serde_json::Map;
     #[cfg(unix)]
     use serde_json::Value;
@@ -1570,6 +1840,9 @@ pub(super) mod tests {
     fn isolated_backend(root: &Path, target: UpgradeTarget) -> SystemUpgradeBackend {
         SystemUpgradeBackend {
             platform: AlphaTarget::LinuxX64,
+            runner: Box::new(crate::setup::runtime::SystemCommandRunner),
+            bundle_migration: None,
+            core_cut: CoreCut::default(),
             targets: [(
                 target.label().to_string(),
                 ManagedUpgradeTarget {
@@ -1583,6 +1856,7 @@ pub(super) mod tests {
             .collect(),
             executable: root.join("ck"),
             subc: None,
+            config_path: root.join("subc.jsonc"),
             assets: ReleaseUpgradeAssetFetcher::from_index(ReleaseIndex {
                 schema: 1,
                 channel: "alpha".into(),
@@ -1823,6 +2097,9 @@ pub(super) mod tests {
         inventory.save().unwrap();
         SystemUpgradeBackend {
             platform: AlphaTarget::LinuxX64,
+            runner: Box::new(crate::setup::runtime::SystemCommandRunner),
+            bundle_migration: None,
+            core_cut: CoreCut::default(),
             targets: BTreeMap::from([(
                 target.label().to_string(),
                 ManagedUpgradeTarget {
@@ -1834,6 +2111,7 @@ pub(super) mod tests {
             )]),
             executable: root.join("ck"),
             subc: None,
+            config_path: root.join("subc.jsonc"),
             assets: ReleaseUpgradeAssetFetcher::from_index(ReleaseIndex {
                 schema: 1,
                 channel: "alpha".into(),
@@ -2238,6 +2516,9 @@ pub(super) mod tests {
         inventory.record("managed-binary", &destination, Map::new());
         let mut backend = SystemUpgradeBackend {
             platform: AlphaTarget::LinuxX64,
+            runner: Box::new(crate::setup::runtime::SystemCommandRunner),
+            bundle_migration: None,
+            core_cut: CoreCut::default(),
             targets: BTreeMap::from([(
                 aft.label().to_string(),
                 ManagedUpgradeTarget {
@@ -2249,6 +2530,7 @@ pub(super) mod tests {
             )]),
             executable: destination.clone(),
             subc: None,
+            config_path: root.join("subc.jsonc"),
             assets: ReleaseUpgradeAssetFetcher::from_index(ReleaseIndex {
                 schema: 1,
                 channel: "alpha".to_string(),
@@ -2319,6 +2601,8 @@ pub(super) mod tests {
                 .map(|item| item.target.label())
                 .collect::<Vec<_>>(),
             [
+                "ck-nats-engine",
+                "ck-nats-server",
                 "ck-subc",
                 "ck-subc-mcp",
                 "ck-script-runner-bun",
@@ -2329,13 +2613,15 @@ pub(super) mod tests {
             ]
         );
         // Every version names its installed binary, not the daemon library.
-        assert_eq!(targets[0].installed_version, "1.3.0");
-        assert_eq!(targets[1].installed_version, "1.1.0");
-        assert_eq!(targets[2].installed_version, "");
-        assert_eq!(targets[3].installed_version, "");
-        assert_eq!(targets[4].installed_version, "1.2.0");
-        assert_eq!(targets[5].installed_version, "99.0.0");
-        assert_eq!(targets[6].installed_version, "1.0.0");
+        assert_eq!(targets[0].installed_version, "");
+        assert_eq!(targets[1].installed_version, "");
+        assert_eq!(targets[2].installed_version, "1.3.0");
+        assert_eq!(targets[3].installed_version, "1.1.0");
+        assert_eq!(targets[4].installed_version, "");
+        assert_eq!(targets[5].installed_version, "");
+        assert_eq!(targets[6].installed_version, "1.2.0");
+        assert_eq!(targets[7].installed_version, "99.0.0");
+        assert_eq!(targets[8].installed_version, "1.0.0");
     }
 
     #[cfg(unix)]
@@ -2357,7 +2643,14 @@ pub(super) mod tests {
         for catalog in [Some(&catalog), None] {
             let targets =
                 discover_managed_upgrade_targets(&inventory, &root.join("ck"), catalog).unwrap();
-            assert_eq!(targets[0].installed_version, "0.20.83");
+            assert_eq!(
+                targets
+                    .iter()
+                    .find(|t| t.target.is_daemon())
+                    .unwrap()
+                    .installed_version,
+                "0.20.83"
+            );
         }
     }
 
@@ -2602,6 +2895,9 @@ exit 1
 
         let mut backend = SystemUpgradeBackend {
             platform: AlphaTarget::LinuxX64,
+            runner: Box::new(crate::setup::runtime::SystemCommandRunner),
+            bundle_migration: None,
+            core_cut: CoreCut::default(),
             targets: [(
                 aft.label().to_string(),
                 ManagedUpgradeTarget {
@@ -2615,6 +2911,7 @@ exit 1
             .collect(),
             executable: ck,
             subc: None,
+            config_path: root.join("subc.jsonc"),
             assets: ReleaseUpgradeAssetFetcher::from_index(ReleaseIndex {
                 schema: 1,
                 channel: "alpha".to_string(),
@@ -2655,6 +2952,9 @@ exit 1
             Inventory::load(root.join("installer-manifest.json"), "linux-x64").expect("inventory");
         let mut backend = SystemUpgradeBackend {
             platform: AlphaTarget::LinuxX64,
+            runner: Box::new(crate::setup::runtime::SystemCommandRunner),
+            bundle_migration: None,
+            core_cut: CoreCut::default(),
             targets: [(
                 mcp.label().to_string(),
                 ManagedUpgradeTarget {
@@ -2668,6 +2968,7 @@ exit 1
             .collect(),
             executable: root.join("ck"),
             subc: None,
+            config_path: root.join("subc.jsonc"),
             assets: ReleaseUpgradeAssetFetcher::from_index(ReleaseIndex {
                 schema: 1,
                 channel: "alpha".to_string(),
@@ -2726,7 +3027,7 @@ exit 1
         let mut backend = SystemUpgradeBackend::with_inventory(
             AlphaTarget::LinuxX64,
             root.join("ck"),
-            None,
+            root.join("subc.jsonc"),
             vec![ManagedUpgradeTarget {
                 target,
                 destination,

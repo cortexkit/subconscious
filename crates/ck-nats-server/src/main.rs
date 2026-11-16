@@ -1,5 +1,8 @@
 use std::{ffi::OsString, path::PathBuf};
 
+const USAGE: &str =
+    "usage: ck-nats-server --version | -c <server.conf> --subc <connection file> [--engine <path>]";
+
 fn arguments() -> Result<(PathBuf, PathBuf, PathBuf), String> {
     let mut config = None;
     let mut engine = None;
@@ -21,7 +24,7 @@ fn arguments() -> Result<(PathBuf, PathBuf, PathBuf), String> {
             _ => return Err(format!("unknown argument: {}", arg.to_string_lossy())),
         }
     }
-    let config = config.ok_or("usage: ck-nats-server -c <server.conf> [--engine <path>]")?;
+    let config = config.ok_or(USAGE)?;
     let engine = match engine {
         Some(path) => path,
         None => std::env::current_exe()
@@ -41,6 +44,14 @@ fn arguments() -> Result<(PathBuf, PathBuf, PathBuf), String> {
 
 #[tokio::main]
 async fn main() {
+    if std::env::args_os().any(|arg| arg == "--version") {
+        println!("ck-nats-server {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    if std::env::args_os().any(|arg| arg == "--help" || arg == "-h") {
+        println!("{USAGE}");
+        return;
+    }
     let result = async {
         let (config, engine, connection) = arguments()?;
         // Consume the launch-secret pipe before the engine can inherit it.
@@ -49,7 +60,7 @@ async fn main() {
     }
     .await;
     if let Err(error) = result {
-        eprintln!("ck-nats-server: {error}");
+        eprintln!("ck-nats-server: {error}\n{USAGE}");
         std::process::exit(1);
     }
 }

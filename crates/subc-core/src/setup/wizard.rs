@@ -443,7 +443,14 @@ impl<B: UpgradeExecutionBackend> UpgradeExecutionBackend for Reporting<'_, B> {
         );
     }
 
+    fn failure_rollback_target(&self) -> Option<UpgradeTarget> {
+        self.inner.failure_rollback_target()
+    }
+
     fn rollback_decision(&mut self, target: UpgradeTarget) -> RollbackDecision {
+        if self.inner.failure_rollback_target().is_some() {
+            return self.inner.rollback_decision(target);
+        }
         let label = target.label();
         let question = RollbackQuestion {
             component: label.to_string(),
@@ -542,6 +549,9 @@ mod tests {
     fn observed() -> UpgradeObserved {
         let mut observed =
             UpgradeObserved::for_roster(upgrade_roster([Component::Core, Component::Aft]));
+        observed
+            .roster
+            .retain(|t| !matches!(t.binary, "ck-nats-engine" | "ck-nats-server"));
         observed.supervised_modules.insert("subc-mcp".to_string());
         observed.supervised_modules.insert("aft".to_string());
         for target in observed.roster.clone() {

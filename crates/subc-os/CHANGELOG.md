@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.41
+
+- macOS: keep the configuration sealing key in the data protection keychain,
+  restricted to the daemon's provisioned access group and available after the
+  first unlock on this device only. Report a missing entitlement separately
+  from denied access. The old login-keychain item is left in place and never
+  read again.
+
 ## 0.1.40
 
 - macOS: accept a registration channel whose inode the daemon read as zero while

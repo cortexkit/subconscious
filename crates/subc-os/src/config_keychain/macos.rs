@@ -1,9 +1,9 @@
 #![allow(unsafe_code)]
 
-// The deprecated file-based keychain ACL APIs are the public route for a
-// non-sandboxed command-line daemon without the provisioning profile needed
-// for a data-protection keychain access group. No private framework interfaces
-// are used here.
+// The data protection keychain restricts the sealing key to the daemon's
+// provisioned access group. File-keychain ACLs cannot prevent another program
+// from replacing or deleting the item, so the old login-keychain item is never
+// queried here.
 use super::{requirement, AnchorState, KeychainError, KeychainState, StoreKey};
 use std::{
     ffi::{c_char, c_void, CStr},
@@ -26,9 +26,7 @@ struct Api {
     string_create: unsafe extern "C" fn(Ref, *const u8, isize, u32, u8) -> Ref,
     string_c: unsafe extern "C" fn(Ref, *mut c_char, isize, u32) -> u8,
     array_type: unsafe extern "C" fn() -> usize,
-    array_create: unsafe extern "C" fn(Ref, *const Ref, isize, *const c_void) -> Ref,
     array_len: unsafe extern "C" fn(Ref) -> isize,
-    array_get: unsafe extern "C" fn(Ref, isize) -> Ref,
     dict_create: unsafe extern "C" fn(
         Ref,
         *const Ref,
@@ -46,18 +44,10 @@ struct Api {
     code_info: unsafe extern "C" fn(Ref, u32, *mut Ref) -> Status,
     code_requirement: unsafe extern "C" fn(Ref, u32, *mut Ref) -> Status,
     requirement_data: unsafe extern "C" fn(Ref, u32, *mut Ref) -> Status,
-    keychain_default: unsafe extern "C" fn(*mut Ref) -> Status,
-    trusted_self: unsafe extern "C" fn(*const c_char, *mut Ref) -> Status,
-    access_create: unsafe extern "C" fn(Ref, Ref, *mut Ref) -> Status,
-    access_acls: unsafe extern "C" fn(Ref, *mut Ref) -> Status,
-    acl_remove: unsafe extern "C" fn(Ref) -> Status,
-    acl_create: unsafe extern "C" fn(Ref, Ref, Ref, u32, *mut Ref) -> Status,
-    acl_authorizations: unsafe extern "C" fn(Ref, Ref) -> Status,
     item_add: unsafe extern "C" fn(Ref, *mut Ref) -> Status,
     item_copy: unsafe extern "C" fn(Ref, *mut Ref) -> Status,
     item_update: unsafe extern "C" fn(Ref, Ref) -> Status,
     item_delete: unsafe extern "C" fn(Ref) -> Status,
-    array_callbacks: *const c_void,
     key_callbacks: *const c_void,
     value_callbacks: *const c_void,
     true_value: Ref,
@@ -67,14 +57,14 @@ struct Api {
     service: Ref,
     account: Ref,
     synchronizable: Ref,
-    access: Ref,
+    access_group: Ref,
+    accessible: Ref,
+    after_first_unlock_this_device_only: Ref,
     value_data: Ref,
     return_data: Ref,
     use_ui: Ref,
     fail_ui: Ref,
-    use_keychain: Ref,
-    search_list: Ref,
-    auth_any: Ref,
+    use_data_protection_keychain: Ref,
     team: Ref,
     identifier: Ref,
     flags: Ref,
@@ -110,9 +100,7 @@ fn load() -> Option<Api> {
             string_create: function(cf, c"CFStringCreateWithBytes")?,
             string_c: function(cf, c"CFStringGetCString")?,
             array_type: function(cf, c"CFArrayGetTypeID")?,
-            array_create: function(cf, c"CFArrayCreate")?,
             array_len: function(cf, c"CFArrayGetCount")?,
-            array_get: function(cf, c"CFArrayGetValueAtIndex")?,
             dict_create: function(cf, c"CFDictionaryCreate")?,
             dict_type: function(cf, c"CFDictionaryGetTypeID")?,
             dict_get: function(cf, c"CFDictionaryGetValue")?,
@@ -123,18 +111,10 @@ fn load() -> Option<Api> {
             code_info: function(sec, c"SecCodeCopySigningInformation")?,
             code_requirement: function(sec, c"SecCodeCopyDesignatedRequirement")?,
             requirement_data: function(sec, c"SecRequirementCopyData")?,
-            keychain_default: function(sec, c"SecKeychainCopyDefault")?,
-            trusted_self: function(sec, c"SecTrustedApplicationCreateFromPath")?,
-            access_create: function(sec, c"SecAccessCreate")?,
-            access_acls: function(sec, c"SecAccessCopyACLList")?,
-            acl_remove: function(sec, c"SecACLRemove")?,
-            acl_create: function(sec, c"SecACLCreateWithSimpleContents")?,
-            acl_authorizations: function(sec, c"SecACLUpdateAuthorizations")?,
             item_add: function(sec, c"SecItemAdd")?,
             item_copy: function(sec, c"SecItemCopyMatching")?,
             item_update: function(sec, c"SecItemUpdate")?,
             item_delete: function(sec, c"SecItemDelete")?,
-            array_callbacks: symbol(cf, c"kCFTypeArrayCallBacks")?,
             key_callbacks: symbol(cf, c"kCFTypeDictionaryKeyCallBacks")?,
             value_callbacks: symbol(cf, c"kCFTypeDictionaryValueCallBacks")?,
             true_value: constant(cf, c"kCFBooleanTrue")?,
@@ -144,14 +124,17 @@ fn load() -> Option<Api> {
             service: constant(sec, c"kSecAttrService")?,
             account: constant(sec, c"kSecAttrAccount")?,
             synchronizable: constant(sec, c"kSecAttrSynchronizable")?,
-            access: constant(sec, c"kSecAttrAccess")?,
+            access_group: constant(sec, c"kSecAttrAccessGroup")?,
+            accessible: constant(sec, c"kSecAttrAccessible")?,
+            after_first_unlock_this_device_only: constant(
+                sec,
+                c"kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly",
+            )?,
             value_data: constant(sec, c"kSecValueData")?,
             return_data: constant(sec, c"kSecReturnData")?,
             use_ui: constant(sec, c"kSecUseAuthenticationUI")?,
             fail_ui: constant(sec, c"kSecUseAuthenticationUIFail")?,
-            use_keychain: constant(sec, c"kSecUseKeychain")?,
-            search_list: constant(sec, c"kSecMatchSearchList")?,
-            auth_any: constant(sec, c"kSecACLAuthorizationAny")?,
+            use_data_protection_keychain: constant(sec, c"kSecUseDataProtectionKeychain")?,
             team: constant(sec, c"kSecCodeInfoTeamIdentifier")?,
             identifier: constant(sec, c"kSecCodeInfoIdentifier")?,
             flags: constant(sec, c"kSecCodeInfoFlags")?,
@@ -213,6 +196,7 @@ fn status(value: Status) -> Result<(), KeychainError> {
         -25300 => Err(KeychainError::Missing),
         -25293 | -25308 | -128 | -25294 | -25315 => Err(KeychainError::Denied),
         -25291 => Err(KeychainError::Unavailable),
+        -34018 => Err(KeychainError::NotEntitled),
         other => Err(KeychainError::OsStatus(other)),
     }
 }
@@ -234,18 +218,6 @@ impl Api {
         // SAFETY: UTF-8 bytes remain live throughout the copying Create call.
         Owned::new(self, unsafe {
             (self.string_create)(null(), value.as_ptr(), value.len() as isize, 0x0800_0100, 0)
-        })
-    }
-
-    fn array(&'static self, values: &[Ref]) -> Result<Owned, KeychainError> {
-        // SAFETY: callbacks retain the live CF objects in values.
-        Owned::new(self, unsafe {
-            (self.array_create)(
-                null(),
-                values.as_ptr(),
-                values.len() as isize,
-                self.array_callbacks,
-            )
         })
     }
 
@@ -368,30 +340,32 @@ impl Api {
         status(unsafe { (self.code_valid)(code.value, 0, requirement.value) })
     }
 
-    fn access_for_self(&'static self) -> Result<Owned, KeychainError> {
-        // SAFETY: NULL means the calling process, not any application. Security
-        // captures its designated requirement, allowing same-identity upgrades.
-        let app = self.copied(|out| unsafe { (self.trusted_self)(null(), out) })?;
-        let apps = self.array(&[app.value])?;
-        let label = self.string("Configuration store sealing key and revision anchor")?;
-        let access =
-            self.copied(|out| unsafe { (self.access_create)(label.value, apps.value, out) })?;
-        let defaults = self.copied(|out| unsafe { (self.access_acls)(access.value, out) })?;
-        // SecAccessCreate's default safe ACL trusts all applications for some
-        // operations. Remove every default, not just its restricted read entry.
-        // SAFETY: CopyACLList returns a CFArray of live SecACL references.
-        unsafe {
-            for index in 0..(self.array_len)(defaults.value) {
-                status((self.acl_remove)((self.array_get)(defaults.value, index)))?;
-            }
+    fn query(
+        &'static self,
+        service: Ref,
+        account: Ref,
+        read: bool,
+        add: bool,
+        extra: &[(Ref, Ref)],
+    ) -> Result<Owned, KeychainError> {
+        let access_group = self.string("5R5846NBPW.io.cortexkit.daemon")?;
+        let mut pairs = vec![
+            (self.class, self.generic_password),
+            (self.service, service),
+            (self.account, account),
+            (self.synchronizable, self.false_value),
+            (self.use_ui, self.fail_ui),
+            (self.use_data_protection_keychain, self.true_value),
+            (self.access_group, access_group.value),
+        ];
+        if add {
+            pairs.push((self.accessible, self.after_first_unlock_this_device_only));
         }
-        let acl = self.copied(|out| unsafe {
-            (self.acl_create)(access.value, apps.value, label.value, 1, out)
-        })?;
-        let any = self.array(&[self.auth_any])?;
-        // SAFETY: the new ACL is live and the array contains an authorization.
-        status(unsafe { (self.acl_authorizations)(acl.value, any.value) })?;
-        Ok(access)
+        if read {
+            pairs.push((self.return_data, self.true_value));
+        }
+        pairs.extend_from_slice(extra);
+        self.dictionary(&pairs)
     }
 }
 
@@ -399,12 +373,10 @@ pub(super) struct Store {
     api: &'static Api,
     service: Owned,
     account: Owned,
-    keychain: Owned,
-    search: Owned,
 }
 
-// SAFETY: the retained strings and search array are immutable, SecKeychain
-// supports concurrent calls, and the loaded API lives for the process lifetime.
+// SAFETY: the retained strings are immutable, SecItem supports concurrent calls,
+// and the loaded API lives for the process lifetime.
 // Logical read/modify/write serialization remains the caller's responsibility.
 unsafe impl Send for Store {}
 unsafe impl Sync for Store {}
@@ -416,37 +388,16 @@ impl Store {
         if service.is_empty() || service.len() > 1024 || service.contains('\0') {
             return Err(KeychainError::InvalidData);
         }
-        // SAFETY: valid writable out-pointer, Copy reference adopted below.
-        let keychain = api.copied(|out| unsafe { (api.keychain_default)(out) })?;
-        let search = api.array(&[keychain.value])?;
         Ok(Self {
             api,
             service: api.string(service)?,
             account: api.string("config-gate-v1")?,
-            keychain,
-            search,
         })
     }
 
     fn query(&self, read: bool, add: bool, extra: &[(Ref, Ref)]) -> Result<Owned, KeychainError> {
-        let a = self.api;
-        let mut pairs = vec![
-            (a.class, a.generic_password),
-            (a.service, self.service.value),
-            (a.account, self.account.value),
-            (a.synchronizable, a.false_value),
-            (a.use_ui, a.fail_ui),
-        ];
-        pairs.push(if add {
-            (a.use_keychain, self.keychain.value)
-        } else {
-            (a.search_list, self.search.value)
-        });
-        if read {
-            pairs.push((a.return_data, a.true_value));
-        }
-        pairs.extend_from_slice(extra);
-        a.dictionary(&pairs)
+        self.api
+            .query(self.service.value, self.account.value, read, add, extra)
     }
 
     pub(super) fn load(&self) -> Result<Option<KeychainState>, KeychainError> {
@@ -471,21 +422,13 @@ impl Store {
     }
 
     pub(super) fn create(&self, key: StoreKey) -> Result<(), KeychainError> {
-        // Recheck before creating an ACL, even for a long-lived handle.
+        // Recheck the daemon's signing identity before adding a key, even for a long-lived handle.
         self.api.signing_identity()?;
-        let access = self.api.access_for_self()?;
         let data = self.encoded(&KeychainState {
             key,
             anchor: AnchorState::default(),
         })?;
-        let query = self.query(
-            false,
-            true,
-            &[
-                (self.api.access, access.value),
-                (self.api.value_data, data.value),
-            ],
-        )?;
+        let query = self.query(false, true, &[(self.api.value_data, data.value)])?;
         // SAFETY: all inputs remain live and no result is requested.
         status(unsafe { (self.api.item_add)(query.value, null_mut()) })
     }
@@ -494,13 +437,85 @@ impl Store {
         let data = self.encoded(state)?;
         let query = self.query(false, false, &[])?;
         let attributes = self.api.dictionary(&[(self.api.value_data, data.value)])?;
-        // SAFETY: live dictionaries; data-only update preserves the original ACL.
+        // SAFETY: live dictionaries; data-only update preserves access attributes.
         status(unsafe { (self.api.item_update)(query.value, attributes.value) })
     }
 
     pub(super) fn delete(&self) -> Result<(), KeychainError> {
         let query = self.query(false, false, &[])?;
-        // SAFETY: unique class/service/account query, pinned to one keychain.
+        // SAFETY: unique class/service/account query, pinned to the access group.
         status(unsafe { (self.api.item_delete)(query.value) })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn queries_use_daemon_data_protection_access_group() {
+        let a = api().expect("public Security and CoreFoundation APIs");
+        let service = a.string("config-query-test").unwrap();
+        let account = a.string("config-gate-v1").unwrap();
+        let sec = open(c"/System/Library/Frameworks/Security.framework/Security").unwrap();
+        // SAFETY: the framework is live and these are public CFTypeRef constants.
+        let (file_keychain, search_list) = unsafe {
+            (
+                constant(sec, c"kSecUseKeychain").unwrap(),
+                constant(sec, c"kSecMatchSearchList").unwrap(),
+            )
+        };
+        for (operation, read, add) in [
+            ("load", true, false),
+            ("create", false, true),
+            ("replace", false, false),
+            ("delete", false, false),
+        ] {
+            let query = a
+                .query(service.value, account.value, read, add, &[])
+                .unwrap();
+            for (key, value) in [
+                (a.class, a.generic_password),
+                (a.service, service.value),
+                (a.account, account.value),
+                (a.synchronizable, a.false_value),
+                (a.use_ui, a.fail_ui),
+                (a.use_data_protection_keychain, a.true_value),
+            ] {
+                assert_eq!(a.dict_value(&query, key), value, "{operation}");
+            }
+            assert_eq!(
+                a.text(a.dict_value(&query, a.access_group)).unwrap(),
+                "5R5846NBPW.io.cortexkit.daemon",
+                "{operation}"
+            );
+            assert_eq!(
+                a.dict_value(&query, a.accessible),
+                if add {
+                    a.after_first_unlock_this_device_only
+                } else {
+                    null()
+                },
+                "{operation}"
+            );
+            assert_eq!(
+                a.dict_value(&query, a.return_data),
+                if read { a.true_value } else { null() },
+                "{operation}"
+            );
+            assert!(a.dict_value(&query, file_keychain).is_null(), "{operation}");
+            assert!(a.dict_value(&query, search_list).is_null(), "{operation}");
+        }
+    }
+
+    #[test]
+    fn missing_entitlement_has_its_own_error_class() {
+        assert!(matches!(status(-34018), Err(KeychainError::NotEntitled)));
+        assert!(matches!(status(-25293), Err(KeychainError::Denied)));
+        assert!(matches!(status(-25300), Err(KeychainError::Missing)));
+        assert!(matches!(status(-25299), Err(KeychainError::AlreadyExists)));
+        assert!(matches!(status(-25291), Err(KeychainError::Unavailable)));
+        assert!(matches!(status(-1), Err(KeychainError::OsStatus(-1))));
+        assert!(status(0).is_ok());
     }
 }

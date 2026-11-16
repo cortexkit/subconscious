@@ -68,6 +68,10 @@ pub trait UpgradeExecutionBackend {
 
     fn completed(&mut self, _target: UpgradeTarget) {}
 
+    fn failure_rollback_target(&self) -> Option<UpgradeTarget> {
+        None
+    }
+
     fn rollback_decision(&mut self, target: UpgradeTarget) -> RollbackDecision;
     fn rollback(&mut self, target: UpgradeTarget) -> Result<String, String>;
 }
@@ -100,6 +104,16 @@ pub fn execute_upgrade<B: UpgradeExecutionBackend>(
     backend: &mut B,
 ) -> Result<UpgradeExecutionReport, UpgradeExecutionFailure> {
     let mut report = UpgradeExecutionReport::default();
+    if let Some(target) = unpaired_nats_upgrade(plan) {
+        return Err(UpgradeExecutionFailure {
+            target,
+            stage: "planning",
+            reason:
+                "the message server is upgraded together with the daemon; upgrade Core together"
+                    .into(),
+            report,
+        });
+    }
     let mut replaced = BTreeSet::new();
     for operation in &plan.operations {
         let (target, stage, result) = match operation {
@@ -150,7 +164,8 @@ pub fn execute_upgrade<B: UpgradeExecutionBackend>(
                         stage: "post-verification",
                         detail: format!("failed: {reason}"),
                     });
-                    offer_rollback(backend, &mut report, *target);
+                    let rollback = backend.failure_rollback_target().unwrap_or(*target);
+                    offer_rollback(backend, &mut report, rollback);
                     return Err(UpgradeExecutionFailure {
                         target: *target,
                         stage: "post-verification",
@@ -175,8 +190,9 @@ pub fn execute_upgrade<B: UpgradeExecutionBackend>(
                 });
             }
             Err(reason) => {
-                if replaced.contains(&target) {
-                    offer_rollback(backend, &mut report, target);
+                if replaced.contains(&target) || backend.failure_rollback_target().is_some() {
+                    let rollback = backend.failure_rollback_target().unwrap_or(target);
+                    offer_rollback(backend, &mut report, rollback);
                 }
                 return Err(UpgradeExecutionFailure {
                     target,
@@ -188,6 +204,22 @@ pub fn execute_upgrade<B: UpgradeExecutionBackend>(
         }
     }
     Ok(report)
+}
+
+pub(super) fn unpaired_nats_upgrade(plan: &UpgradePlan) -> Option<UpgradeTarget> {
+    let pair = plan.operations.iter().find_map(|op| match op {
+        UpgradeOperation::ReplaceDestination { target }
+            if matches!(target.binary, "ck-nats-server" | "ck-nats-engine") =>
+        {
+            Some(*target)
+        }
+        _ => None,
+    })?;
+    let daemon = plan
+        .operations
+        .iter()
+        .any(|op| matches!(op, UpgradeOperation::PostVerify { target } if target.is_daemon()));
+    (!daemon).then_some(pair)
 }
 
 fn offer_rollback<B: UpgradeExecutionBackend>(
@@ -230,6 +262,22 @@ mod tests {
         fail_activation: bool,
         fail_verify: bool,
         rollback: bool,
+    }
+
+    #[test]
+    fn nats_partial_upgrade_refuses_before_any_backend_write() {
+        let target = upgrade_target("ck-nats-engine");
+        let plan = UpgradePlan {
+            operations: vec![
+                UpgradeOperation::DownloadAndVerify { target },
+                UpgradeOperation::ReplaceDestination { target },
+            ],
+            outcomes: vec![],
+        };
+        let mut backend = RecordingBackend::default();
+        let error = execute_upgrade(&plan, &mut backend).unwrap_err();
+        assert!(error.reason.contains("upgrade Core together"), "{error}");
+        assert!(backend.calls.is_empty(), "{:?}", backend.calls);
     }
 
     impl UpgradeExecutionBackend for RecordingBackend {
@@ -363,9 +411,9 @@ mod tests {
             ..Default::default()
         };
         let failure = execute_upgrade(&update_plan(), &mut backend).expect_err("warm failure");
-        // The daemon is the first target on the ladder, so its warm failure
-        // stops everything before any module is touched.
-        assert_eq!(failure.target, upgrade_target("ck-subc"));
+        // Companions are placed before restarting the daemon; a failed companion
+        // probe stops the ladder before any process is restarted.
+        assert_eq!(failure.target, upgrade_target("ck-nats-engine"));
         assert_eq!(backend.calls, ["download", "copy", "replace", "warm"]);
         assert!(failure
             .report

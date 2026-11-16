@@ -86,7 +86,7 @@ jobs:
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
               --draft \
               --title "$TAG" \
-              --notes "Subconscious alpha archives: ck, ck-subc, ck-subc-mcp, ck-script-runner-bun, and ck-script-runner-python."
+              --notes "Subconscious alpha archives: ck, ck-subc, ck-subc-mcp, ck-script-runner-bun, ck-script-runner-python, ck-nats-server, and ck-nats-engine."
           fi
 
   linux-binaries:
@@ -128,7 +128,13 @@ jobs:
           sudo apt-get install -y binutils zstd
 
       - name: Build release binaries for glibc 2.28
-        run: cargo zigbuild --release --locked --target ${{ matrix.target }}.2.28 -p subc-core -p subc-mcp --bin ck --bin ck-subc --bin ck-subc-mcp
+        run: cargo zigbuild --release --locked --target ${{ matrix.target }}.2.28 -p subc-core -p subc-mcp -p ck-nats-server --bin ck --bin ck-subc --bin ck-subc-mcp --bin ck-nats-server
+
+      - name: Build static NATS engine with checksum-verified Go
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.arch == 'x64' && 'amd64' || 'arm64' }}
+        run: bash scripts/go-toolchain.sh bash scripts/build-nats-engine.sh target/${{ matrix.target }}/release/ck-nats-engine
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -149,7 +155,7 @@ jobs:
           docker run --rm --network none \
             -v "$PWD/target/${{ matrix.target }}/release:/binaries:ro" \
             debian:10 sh -ec '
-              for binary in ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python; do
+              for binary in ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python ck-nats-server ck-nats-engine; do
                 timeout 15s "/binaries/$binary" --version
               done
             '
@@ -193,7 +199,14 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build release binaries
-        run: cargo build --release --locked --target ${{ matrix.target }} -p subc-core -p subc-mcp --bin ck --bin ck-subc --bin ck-subc-mcp
+        run: cargo build --release --locked --target ${{ matrix.target }} -p subc-core -p subc-mcp -p ck-nats-server --bin ck --bin ck-subc --bin ck-subc-mcp --bin ck-nats-server
+
+      - name: Build NATS engine with checksum-verified Go
+        shell: bash
+        env:
+          GOOS: windows
+          GOARCH: ${{ matrix.arch == 'x64' && 'amd64' || 'arm64' }}
+        run: bash scripts/go-toolchain.sh bash scripts/build-nats-engine.sh ${{ matrix.source }}/ck-nats-engine.exe
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -239,7 +252,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Build release binaries
-        run: cargo build --release --locked -p subc-core -p subc-mcp --bin ck --bin ck-subc --bin ck-subc-mcp
+        run: cargo build --release --locked -p subc-core -p subc-mcp -p ck-nats-server --bin ck --bin ck-subc --bin ck-subc-mcp --bin ck-nats-server
+
+      - name: Build NATS engine with checksum-verified Go
+        env:
+          GOOS: darwin
+          GOARCH: arm64
+        run: bash scripts/go-toolchain.sh bash scripts/build-nats-engine.sh target/release/ck-nats-engine
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -248,13 +267,11 @@ jobs:
       - name: Install Python archive decompressor
         run: brew install zstd
 
-      # Alpha arm, explicit by repository variable: package adhoc-signed archives
-      # when the Developer ID secrets are not provisioned in this repo. The
-      # Developer ID identity currently lives only in magic-context's CI; signed
-      # and notarized replacements are produced through its sign-notarize
-      # dispatch workflow and re-uploaded over these assets. This arm never
-      # engages silently: it requires ALPHA_DARWIN_UNSIGNED=true and stamps the
-      # asset provenance into the release notes.
+      # Explicit fallback for a repository without Developer ID secrets; the
+      # signed arm below is the current release path. This alpha arm requires
+      # ALPHA_DARWIN_UNSIGNED=true and records its ad hoc provenance. Its daemon
+      # bundle has no profile or restricted entitlements, so it runs, but ck
+      # setup and ck upgrade refuse to install it: use it for test builds only.
       - name: Package adhoc-signed archives (declared alpha arm)
         if: vars.ALPHA_DARWIN_UNSIGNED == 'true'
         env:
@@ -265,18 +282,24 @@ jobs:
           cp target/aarch64-apple-darwin/release/ck-script-runner-bun target/release/
           cp target/aarch64-apple-darwin/release/ck-script-runner-python target/release/
           mkdir -p dist
-          for bin in ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python; do
+          for bin in ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python ck-nats-server ck-nats-engine; do
             if [ "$bin" = ck-script-runner-bun ]; then
               codesign --force --options runtime --sign - --identifier "$bin" --entitlements clients/script-runner/entitlements.plist "target/release/$bin"
               codesign -d --entitlements :- "target/release/$bin" 2>/dev/null | python3 scripts/release/check-runner-entitlements.py
+            elif [ "$bin" = ck-subc ]; then
+              bash scripts/release/macos-daemon-bundle.sh --unentitled "target/release/$bin" target/release
             elif [ "$bin" = ck-script-runner-python ]; then
               codesign --force --options runtime --sign - --identifier "$bin" "target/release/$bin"
               entitlements=$(codesign -d --entitlements :- "target/release/$bin" 2>/dev/null)
               [ -z "$entitlements" ] || { echo "Python runner must not carry entitlements" >&2; exit 1; }
             else
-              codesign --force --sign - --identifier "$bin" "target/release/$bin"
+              codesign --force --options runtime --sign - --identifier "$bin" "target/release/$bin"
             fi
-            (cd target/release && zip -q -X "../../dist/$bin-darwin-arm64.zip" "$bin")
+            if [ "$bin" = ck-subc ]; then
+              ditto -c -k --keepParent "target/release/CortexKit Daemon.app" "dist/$bin-darwin-arm64.zip"
+            else
+              (cd target/release && zip -q -X "../../dist/$bin-darwin-arm64.zip" "$bin")
+            fi
             # shasum output format (hex, two spaces, filename) per the sidecar
             # grammar; bare hex breaks `shasum -c` consumers.
             (cd dist && shasum -a 256 "$bin-darwin-arm64.zip" > "$bin-darwin-arm64.zip.sha256")
@@ -284,7 +307,7 @@ jobs:
           ls -la dist/
           gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --clobber
           gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-            --notes "Subconscious alpha archives: ck, ck-subc, ck-subc-mcp, ck-script-runner-bun, and ck-script-runner-python. darwin-arm64 assets are adhoc-signed pending notarized replacements via the signing dispatch."
+            --notes "Subconscious alpha archives: ck, ck-subc, ck-subc-mcp, ck-script-runner-bun, ck-script-runner-python, ck-nats-server, and ck-nats-engine. darwin-arm64 assets are adhoc-signed via the explicit alpha fallback; the daemon bundle is unentitled and is not notarized."
 
       - name: Import Developer ID Application certificate
         if: vars.ALPHA_DARWIN_UNSIGNED != 'true'
@@ -341,10 +364,28 @@ jobs:
       - name: Sign, notarize, and package macOS archives
         if: vars.ALPHA_DARWIN_UNSIGNED != 'true'
         env:
+          MACOS_DAEMON_PROFILE_B64: ${{ secrets.MACOS_DAEMON_PROFILE_B64 }}
           APP_STORE_CONNECT_API_KEY_PATH: ${{ runner.temp }}/AuthKey_${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}.p8
           APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
           APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
         run: |
+          if [ -z "$MACOS_DAEMON_PROFILE_B64" ]; then
+            echo "::error::Daemon Developer ID provisioning profile secret is required"
+            exit 1
+          fi
+          umask 077
+          MACOS_DAEMON_PROFILE_PATH=$(mktemp "$RUNNER_TEMP/daemon-profile.XXXXXX")
+          export MACOS_DAEMON_PROFILE_PATH
+          trap 'rm -f "$MACOS_DAEMON_PROFILE_PATH"' EXIT
+          python3 - <<'PY'
+          import base64
+          import os
+          from pathlib import Path
+
+          Path(os.environ["MACOS_DAEMON_PROFILE_PATH"]).write_bytes(
+              base64.b64decode(os.environ["MACOS_DAEMON_PROFILE_B64"], validate=True)
+          )
+          PY
           identity=$(bash scripts/release/macos-sign-notarize.sh target/release dist --print-identity)
           DEVELOPER_ID_APPLICATION_IDENTITY="$identity" bash scripts/release/build-script-runner.sh aarch64-apple-darwin darwin arm64
           DEVELOPER_ID_APPLICATION_IDENTITY="$identity" bash scripts/release/build-script-runner-python.sh aarch64-apple-darwin --sign
@@ -373,13 +414,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${GITHUB_REF_NAME}"
-          # Every tuple the lanes above build, times the five binaries, plus
+          # Every tuple the lanes above build, times the seven binaries, plus
           # a sidecar each. A missing name refuses the publish by name; the
           # draft stays for inspection and nothing reaches an installer.
           expected=0; missing=""
           assets=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
           for tuple in darwin-arm64 linux-x64 linux-arm64 windows-x64 windows-arm64; do
-            for bin in ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python; do
+            for bin in ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python ck-nats-server ck-nats-engine; do
               for name in "$bin-$tuple.zip" "$bin-$tuple.zip.sha256"; do
                 expected=$((expected+1))
                 if ! printf '%s\n' "$assets" | grep -qxF "$name"; then missing="$missing $name"; fi

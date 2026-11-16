@@ -55,7 +55,7 @@ write_release() {
 
 subconscious_release="$test_root/subconscious"
 aft_release="$test_root/aft"
-write_release "$subconscious_release" ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python
+write_release "$subconscious_release" ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python ck-nats-server ck-nats-engine
 write_release "$aft_release" ck-aft
 
 pass_output="$test_root/pass-output"
@@ -93,6 +93,18 @@ fi
 grep -Fq 'release-incomplete: component=ck-script-runner-python lane=subconscious missing=ck-script-runner-python-windows-arm64.zip' "$test_root/missing-python-output" \
   || fail 'missing Python runner archive did not block the inventory by name'
 write_asset "$subconscious_release" 'ck-script-runner-python-windows-arm64.zip'
+
+for binary in ck-nats-server ck-nats-engine; do
+  archive="$binary-linux-arm64.zip"
+  rm -f "$subconscious_release/$archive"
+  if bash "$gate" --subconscious-release-url "file://${subconscious_release}" \
+    --aft-release-url "file://${aft_release}" >"$test_root/missing-nats-output" 2>&1; then
+    fail "missing $binary archive unexpectedly passed"
+  fi
+  grep -Fq "release-incomplete: component=$binary lane=subconscious missing=$archive" "$test_root/missing-nats-output" \
+    || fail "missing $binary archive did not block the inventory by name"
+  write_asset "$subconscious_release" "$archive"
+done
 
 rm -f "$aft_release/ck-aft-windows-x64.zip"
 missing_aft_output="$test_root/missing-aft-output"

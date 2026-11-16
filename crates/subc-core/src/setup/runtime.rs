@@ -210,7 +210,11 @@ pub fn runtime_paths(
     binary_home: &Path,
     user_home: &Path,
 ) -> RuntimePaths {
-    let daemon = binary_home.join(platform_binary("ck-subc"));
+    let daemon = if platform == RuntimePlatform::Macos {
+        super::daemon_bundle::executable(binary_home)
+    } else {
+        binary_home.join(platform_binary("ck-subc"))
+    };
     let config_store_root = binary_home
         .parent()
         .unwrap_or(binary_home)
@@ -629,6 +633,18 @@ fn legacy_definitions(
                 .map(|text| text.replace(&encoded, &raw)),
         );
     }
+    if platform == RuntimePlatform::Macos {
+        if let Ok(binary_home) = super::daemon_bundle::binary_home(&paths.daemon) {
+            let bundled = xml_text(&paths.daemon.to_string_lossy());
+            let bare = xml_text(&binary_home.join("ck-subc").to_string_lossy());
+            definitions.extend(
+                definitions
+                    .clone()
+                    .iter()
+                    .map(|text| text.replace(&bundled, &bare)),
+            );
+        }
+    }
     // Before config-store-root was installed, these same templates launched
     // the daemon without arguments. Keep recognizing owned legacy definitions.
     definitions.extend(
@@ -998,8 +1014,34 @@ pub(crate) fn restart_with_definition_at<R: CommandRunner>(
     inventory: &mut Inventory,
     connection: Option<&Path>,
 ) -> Result<String, String> {
+    restart_with_definition_from_at(
+        platform,
+        paths,
+        &paths.daemon,
+        runner,
+        inventory,
+        connection,
+    )
+}
+
+pub(super) fn restart_with_definition_from_at<R: CommandRunner>(
+    platform: RuntimePlatform,
+    paths: &RuntimePaths,
+    previous_daemon: &Path,
+    runner: &mut R,
+    inventory: &mut Inventory,
+    connection: Option<&Path>,
+) -> Result<String, String> {
     let desired = desired_definition_checked(platform, paths)?;
-    restart_with_definition_text_at(platform, paths, runner, inventory, connection, &desired)
+    restart_with_definition_text_at(
+        platform,
+        paths,
+        previous_daemon,
+        runner,
+        inventory,
+        connection,
+        &desired,
+    )
 }
 
 pub(super) struct DefinitionSnapshot {
@@ -1009,6 +1051,9 @@ pub(super) struct DefinitionSnapshot {
 }
 
 impl DefinitionSnapshot {
+    pub(super) fn paths(&self) -> &RuntimePaths {
+        &self.paths
+    }
     pub(super) fn capture(platform: RuntimePlatform, paths: &RuntimePaths) -> Result<Self, String> {
         let text = match fs::read_to_string(&paths.definition) {
             Ok(text) => text,
@@ -1040,9 +1085,20 @@ impl DefinitionSnapshot {
         inventory: &mut Inventory,
         connection: Option<&Path>,
     ) -> Result<String, String> {
+        self.restore_from(runner, inventory, connection, &self.paths.daemon)
+    }
+
+    pub(super) fn restore_from<R: CommandRunner>(
+        &self,
+        runner: &mut R,
+        inventory: &mut Inventory,
+        connection: Option<&Path>,
+        previous_daemon: &Path,
+    ) -> Result<String, String> {
         restart_with_definition_text_at(
             self.platform,
             &self.paths,
+            previous_daemon,
             runner,
             inventory,
             connection,
@@ -1054,6 +1110,7 @@ impl DefinitionSnapshot {
 fn restart_with_definition_text_at<R: CommandRunner>(
     platform: RuntimePlatform,
     paths: &RuntimePaths,
+    previous_daemon: &Path,
     runner: &mut R,
     inventory: &mut Inventory,
     connection: Option<&Path>,
@@ -1066,7 +1123,7 @@ fn restart_with_definition_text_at<R: CommandRunner>(
         return Err(format!("refusal: {reason}"));
     }
     let old = if platform != RuntimePlatform::Linux {
-        connected_daemon(runner, &paths.daemon, connection)?
+        connected_daemon(runner, previous_daemon, connection)?
     } else {
         None
     };
@@ -1515,6 +1572,22 @@ mod tests {
 
     fn fixture_dir(name: &str) -> ScratchDir {
         ScratchDir::new(name)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_bundle_runtime_paths_and_launch_agent_use_the_bundle() {
+        let root = fixture_dir("bundle-runtime-paths");
+        let paths = runtime_paths(RuntimePlatform::Macos, &root.join("bin"), root.path());
+        let executable = root.join("apps/CortexKit Daemon.app/Contents/MacOS/ck-subc");
+        assert_eq!(paths.daemon, executable);
+        let definition = desired_definition_for_user(RuntimePlatform::Macos, &paths, "user");
+        assert!(definition.contains(&format!(
+            "<string>{}</string>",
+            xml_text(&executable.to_string_lossy())
+        )));
+        assert!(!definition.contains(&root.join("bin/ck-subc").to_string_lossy().into_owned()));
+        assert_eq!(paths.config_store_root, root.join("config-store"));
     }
 
     #[test]

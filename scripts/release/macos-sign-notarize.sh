@@ -5,7 +5,7 @@ set -euo pipefail
 SOURCE_DIR="${1:?usage: $0 <source-dir> <dist-dir>}"
 DIST_DIR="${2:?usage: $0 <source-dir> <dist-dir>}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BINARIES=(ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python)
+BINARIES=(ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python ck-nats-server ck-nats-engine)
 
 fail() {
   echo "$*" >&2
@@ -43,11 +43,16 @@ if [[ "${3:-}" == --print-identity ]]; then
   exit 0
 fi
 
+: "${MACOS_DAEMON_PROFILE_PATH:?Daemon provisioning profile path is required}"
+
 for binary in "${BINARIES[@]}"; do # nonempty-array: literal release binaries
   binary_path="${SOURCE_DIR}/${binary}"
   [[ -f "$binary_path" ]] || fail "missing release binary: ${binary_path}"
 
-  if [[ "$binary" == ck-script-runner-bun ]]; then
+  if [[ "$binary" == ck-subc ]]; then
+    "$SCRIPT_DIR/macos-daemon-bundle.sh" "$binary_path" "$MACOS_DAEMON_PROFILE_PATH" "$identity" "$SOURCE_DIR"
+    binary_path="$SOURCE_DIR/CortexKit Daemon.app"
+  elif [[ "$binary" == ck-script-runner-bun ]]; then
     codesign --force --options runtime --timestamp --entitlements "$SCRIPT_DIR/../../clients/script-runner/entitlements.plist" --sign "$identity" "$binary_path"
     codesign -d --entitlements :- "$binary_path" 2>/dev/null | python3 "$SCRIPT_DIR/check-runner-entitlements.py"
   else
@@ -61,17 +66,22 @@ for binary in "${BINARIES[@]}"; do # nonempty-array: literal release binaries
 
   # Execute the signed binary: the hardened runtime can break a binary whose
   # signature still verifies perfectly, and nothing else runs the bytes that
-  # actually ship. It runs as a copy named ckdev-<name> (ck becomes ckdev-ck):
-  # the same bytes and signature, but a smoke process is never listed under a
-  # production ck-* name next to an installed daemon. A copy, not a hard link:
-  # macOS reports one cached path for every process running an inode, so a
-  # process started through one link can be listed under another link's name.
+  # actually ship. Use a separate ckdev-<name> path (a renamed bundle for the
+  # daemon) to distinguish smoke runs from installed production executables.
+  # A copy, not a hard link: macOS caches one executable path for each inode.
   smoke_name="ckdev-${binary#ck-}"
   # Under /tmp, not $TMPDIR: a fresh executable under the per-user TMPDIR can
   # stall its first system-policy evaluation for many minutes on macOS.
   smoke_dir="$(mktemp -d /tmp/subc-smoke.XXXXXX)"
   smoke_path="${smoke_dir}/${smoke_name}"
-  cp -p "$binary_path" "$smoke_path"
+  if [[ "$binary" == ck-subc ]]; then
+    # Restricted entitlements require the adjacent embedded profile, so run
+    # the executable inside a renamed copy of the entire signed bundle.
+    ditto "$binary_path" "$smoke_path.app"
+    smoke_path="$smoke_path.app/Contents/MacOS/ck-subc"
+  else
+    cp -p "$binary_path" "$smoke_path"
+  fi
   version_output="$("$smoke_path" --version)" || { rm -rf "$smoke_dir"; fail "signed binary refuses to run: ${binary}"; }
   rm -rf "$smoke_dir"
   [[ -n "$version_output" ]] || fail "signed binary produced no --version output: ${binary}"
@@ -120,10 +130,15 @@ for binary in "${BINARIES[@]}"; do # nonempty-array: literal release binaries
     --issuer "$APP_STORE_CONNECT_API_ISSUER_ID" \
     --wait
 
-  # Zip assets cannot always receive a ticket immediately. Submission already
-  # completed successfully, so an unavailable staple is recorded but does not
-  # block the allowed notarized-and-unstapled alpha distribution.
-  if ! xcrun stapler staple "$archive"; then
+  if [[ "$binary" == ck-subc ]]; then
+    # Staple the app, not its transport zip, then publish the stapled bytes.
+    xcrun stapler staple "$SOURCE_DIR/CortexKit Daemon.app"
+    xcrun stapler validate "$SOURCE_DIR/CortexKit Daemon.app"
+    rm -f "$archive"
+    ditto -c -k --keepParent "$SOURCE_DIR/CortexKit Daemon.app" "$archive"
+  # Other binaries keep their existing notarized-but-unstapled fallback:
+  # transport zips cannot always receive a ticket immediately.
+  elif ! xcrun stapler staple "$archive"; then
     record_staple_pending "$archive"
   fi
 

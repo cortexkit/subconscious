@@ -8,7 +8,7 @@ finished=
 readonly DEFAULT_SUBCONSCIOUS_RELEASE_URL="https://github.com/cortexkit/subconscious/releases/latest/download"
 readonly DEFAULT_AFT_RELEASE_URL="https://github.com/cortexkit/aft/releases/latest/download"
 readonly SUPPORTED_TUPLES=("darwin-arm64" "linux-x64" "linux-arm64" "windows-x64" "windows-arm64")
-readonly SUBCONSCIOUS_BINARIES=("ck" "ck-subc" "ck-subc-mcp" "ck-script-runner-bun" "ck-script-runner-python")
+readonly SUBCONSCIOUS_BINARIES=("ck" "ck-subc" "ck-subc-mcp" "ck-script-runner-bun" "ck-script-runner-python" "ck-nats-server" "ck-nats-engine")
 readonly AFT_BINARIES=("ck-aft")
 
 subconscious_release_url="${CK_SUBCONSCIOUS_RELEASE_URL:-$DEFAULT_SUBCONSCIOUS_RELEASE_URL}"

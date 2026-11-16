@@ -490,6 +490,8 @@ mod tests {
             "ck-subc-mcp": asset("ck-subc-mcp", None),
             "ck-script-runner-bun": asset("ck-script-runner-bun", None),
             "ck-script-runner-python": asset("ck-script-runner-python", None),
+            "ck-nats-engine": asset("ck-nats-engine", Some("0.1.1")),
+            "ck-nats-server": asset("ck-nats-server", Some("0.1.1")),
         });
         json!({
             "schema": 1,

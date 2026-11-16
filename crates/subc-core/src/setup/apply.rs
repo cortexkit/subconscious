@@ -46,6 +46,9 @@ pub struct SetupBackend {
 
 #[derive(Default)]
 struct ComponentSteps {
+    daemon_migration: Option<super::daemon_bundle::Migration>,
+    nats_migration: Option<super::nats_migration::Migration>,
+    nats_definition: Option<runtime::DefinitionSnapshot>,
     placed_binaries: Vec<PathBuf>,
     /// Files that existed before this run and were adopted as the release's
     /// bytes; rollback un-records them and never deletes them.
@@ -216,6 +219,14 @@ impl SetupBackend {
                     .map(|floor| (component, floor))
             })
             .collect::<BTreeMap<_, _>>();
+        let nats_pending = !request.uninstall
+            && super::nats_migration::Migration::capture(
+                &self.paths.config_path,
+                &self.paths.binary_home,
+                &subc_daemon::bootstrap::connection_file_path(),
+                &self.inventory,
+            )?
+            .is_some_and(|m| m.needs_rewrite());
         for component in Component::ALL {
             if matches!(
                 PlatformObservation::current(),
@@ -242,7 +253,7 @@ impl SetupBackend {
                 // be rewritten while another component is being added.
                 Err(_) if !selected.contains(&component) => false,
                 Err(error) => return Err(error),
-            };
+            } && !(component == Component::Core && nats_pending);
             let binary_ok =
                 components::is_installed(component, &self.paths.binary_home, &self.inventory);
             if !request.uninstall && selected.contains(&component) && !binary_ok {
@@ -339,6 +350,9 @@ impl SetupBackend {
         .unwrap_or_default();
         observed.restart_required =
             config::restart_required_from_pending_keys(self.runtime_status.live, &pending_keys);
+        if nats_pending && self.runtime_status.live {
+            observed.restart_required.push("modules.nats-server".into());
+        }
         observed.inventory_owned_paths = [
             "runtime-registration",
             "runtime-definition",
@@ -499,7 +513,9 @@ impl SetupBackend {
         if let Some(key_path) = &request.claustrum_key_path {
             self.paths.claustrum_key_path = Some(key_path.clone());
         }
-        execute_setup(plan, ExecutionMode::Apply, self)?;
+        if let Err(error) = execute_setup(plan, ExecutionMode::Apply, self) {
+            return self.finish_daemon_migration(Err(error));
+        }
         self.inventory.save()?;
         if request.uninstall {
             let report =
@@ -529,7 +545,8 @@ impl SetupBackend {
         let mut validator = CkValidator {
             executable: &self.executable,
         };
-        validation::validate_selected(&mut validator, &selected)?;
+        let verified = validation::validate_selected(&mut validator, &selected);
+        self.finish_daemon_migration(verified)?;
         for operation in &plan.operations {
             if let SetupOperation::EnableComponent { component } = operation {
                 let module_id = component
@@ -552,6 +569,60 @@ impl SetupBackend {
         }) {
             println!("{}", validation::MCP_HARNESS_NEXT);
         }
+        Ok(())
+    }
+
+    fn finish_daemon_migration(&mut self, verified: Result<(), String>) -> Result<(), String> {
+        let migrating = self
+            .component_steps
+            .get(&Component::Core)
+            .is_some_and(|steps| {
+                steps.daemon_migration.is_some() || steps.nats_migration.is_some()
+            });
+        if !migrating {
+            return verified;
+        }
+        let verified = verified.and_then(|()| {
+            if let Some(migration) = self
+                .component_steps
+                .get(&Component::Core)
+                .and_then(|s| s.nats_migration.as_ref())
+            {
+                migration.verify(
+                    &self.executable,
+                    &mut self.runner,
+                    super::upgrade_executor::RESTART_COMPLETION_TIMEOUT,
+                )?;
+            }
+            Ok(())
+        });
+        if let Err(error) = verified {
+            self.rollback_component(Component::Core)
+                .map_err(|rollback| format!("{error}; daemon rollback failed: {rollback}"))?;
+            return Err(error);
+        }
+        if let Some(migration) = self
+            .component_steps
+            .get_mut(&Component::Core)
+            .and_then(|s| s.nats_migration.as_mut())
+        {
+            migration.complete(&mut self.inventory)?;
+        }
+        if let Some(migration) = self
+            .component_steps
+            .get_mut(&Component::Core)
+            .and_then(|steps| steps.daemon_migration.as_mut())
+        {
+            migration.complete(&mut self.inventory)?;
+        }
+        self.component_steps
+            .get_mut(&Component::Core)
+            .unwrap()
+            .daemon_migration = None;
+        self.component_steps
+            .get_mut(&Component::Core)
+            .unwrap()
+            .nats_migration = None;
         Ok(())
     }
 
@@ -987,7 +1058,23 @@ impl SetupExecutor for SetupBackend {
                     release.release,
                     release.target
                 );
-                let paths = components::component_binary_paths(*component, &self.paths.binary_home);
+                let paths =
+                    components::installation_binary_paths(*component, &self.paths.binary_home);
+                let mut migration =
+                    if self.platform == RuntimePlatform::Macos && *component == Component::Core {
+                        let old =
+                            components::component_binary_paths(*component, &self.paths.binary_home)
+                                .into_iter()
+                                .next()
+                                .expect("Core has a daemon");
+                        Some(super::daemon_bundle::Migration::capture(
+                            &self.paths.runtime_paths,
+                            &old,
+                            &self.inventory,
+                        )?)
+                    } else {
+                        None
+                    };
                 // Rollback may delete only files this run wrote. A file that
                 // already existed and was ADOPTED (byte-identical to the
                 // release) belongs to the operator's machine before setup ran;
@@ -999,13 +1086,23 @@ impl SetupExecutor for SetupBackend {
                     .iter()
                     .map(|path| self.inventory.owns_path("managed-binary", path))
                     .collect::<Vec<_>>();
-                components::install_component(
+                let installed = components::install_component(
                     *component,
                     &self.paths.binary_home,
                     &mut self.inventory,
                     &mut self.artifacts,
-                )?;
+                );
+                if installed.is_err() && self.artifacts.daemon_replacement.is_none() {
+                    return installed;
+                }
                 let steps = self.component_steps.entry(*component).or_default();
+                if let Some(replacement) = self.artifacts.daemon_replacement.take() {
+                    migration
+                        .as_mut()
+                        .expect("bundle placement has a macOS migration")
+                        .attach(replacement);
+                    steps.daemon_migration = migration.take();
+                }
                 for ((path, owned_before), existed_before) in
                     paths.into_iter().zip(owned_before).zip(existed_before)
                 {
@@ -1018,9 +1115,23 @@ impl SetupExecutor for SetupBackend {
                         steps.placed_binaries.push(path);
                     }
                 }
+                if let Err(error) = installed {
+                    self.rollback_component(*component)?;
+                    return Err(error);
+                }
                 Ok(())
             }
             SetupOperation::ConfigureComponent { component } => {
+                let mut nats = if *component == Component::Core {
+                    super::nats_migration::Migration::capture(
+                        &self.paths.config_path,
+                        &self.paths.binary_home,
+                        &subc_daemon::bootstrap::connection_file_path(),
+                        &self.inventory,
+                    )?
+                } else {
+                    None
+                };
                 let configuration_inventory_created = !self
                     .inventory
                     .owns_path("configuration", &self.paths.config_path);
@@ -1034,6 +1145,20 @@ impl SetupExecutor for SetupBackend {
                     let steps = self.component_steps.entry(*component).or_default();
                     steps.config_change = Some(change);
                     steps.configuration_inventory_created = configuration_inventory_created;
+                }
+                if let Some(migration) = nats.as_mut() {
+                    let definition = if self.paths.runtime_paths.definition.is_file() {
+                        Some(runtime::DefinitionSnapshot::capture(
+                            self.platform,
+                            &self.paths.runtime_paths,
+                        )?)
+                    } else {
+                        None
+                    };
+                    migration.apply()?;
+                    let steps = self.component_steps.entry(*component).or_default();
+                    steps.nats_migration = nats;
+                    steps.nats_definition = definition;
                 }
                 Ok(())
             }
@@ -1061,11 +1186,27 @@ impl SetupExecutor for SetupBackend {
                     .expect("only modules are enabled by setup"),
             ]),
             SetupOperation::RestartRuntime { sections } => {
+                if let Some(migration) = self
+                    .component_steps
+                    .get(&Component::Core)
+                    .and_then(|steps| steps.daemon_migration.as_ref())
+                {
+                    migration.activate(&mut self.runner, &mut self.inventory, None)?;
+                    return Ok(());
+                }
                 self.restart_runtime(sections)?;
                 println!("  restarted the daemon");
                 Ok(())
             }
             SetupOperation::RegisterRuntime => {
+                if let Some(migration) = self
+                    .component_steps
+                    .get(&Component::Core)
+                    .and_then(|steps| steps.daemon_migration.as_ref())
+                {
+                    migration.activate(&mut self.runner, &mut self.inventory, None)?;
+                    return Ok(());
+                }
                 runtime::ensure(
                     self.platform,
                     &self.paths.runtime_paths,
@@ -1077,6 +1218,14 @@ impl SetupExecutor for SetupBackend {
                 Ok(())
             }
             SetupOperation::UpdateRuntimeDefinition { restart } => {
+                if let Some(migration) = self
+                    .component_steps
+                    .get(&Component::Core)
+                    .and_then(|steps| steps.daemon_migration.as_ref())
+                {
+                    migration.activate(&mut self.runner, &mut self.inventory, None)?;
+                    return Ok(());
+                }
                 let status = runtime::observe(self.platform, &mut self.runner)?;
                 if self.platform == RuntimePlatform::Macos && status.registered && status.live {
                     if !restart {
@@ -1149,12 +1298,20 @@ impl SetupExecutor for SetupBackend {
     }
 
     fn rollback_component(&mut self, component: Component) -> Result<(), Self::Error> {
-        let Some(steps) = self.component_steps.remove(&component) else {
+        let Some(mut steps) = self.component_steps.remove(&component) else {
             return Ok(());
         };
+        if let Some(migration) = &mut steps.nats_migration {
+            migration.rollback(&mut self.inventory)?;
+        }
+        if let Some(migration) = &mut steps.daemon_migration {
+            migration.rollback(&mut self.runner, &mut self.inventory, None)?;
+        } else if let Some(definition) = &steps.nats_definition {
+            definition.restore(&mut self.runner, &mut self.inventory, None)?;
+        }
         for path in steps.placed_binaries.into_iter().rev() {
             if self.inventory.owns_path("managed-binary", &path) {
-                match fs::remove_file(&path) {
+                match components::remove_placed_binary(&path) {
                     Ok(()) => println!("rolled back: {}", path.display()),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => {
@@ -1324,7 +1481,35 @@ pub(super) fn user_home() -> Result<PathBuf, String> {
 
 #[cfg(test)]
 mod tests {
+    include!("apply/nats_tests.rs");
+    #[cfg(target_os = "macos")]
+    include!("apply/bundle_tests.rs");
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_bundle_fresh_setup_rollback_removes_the_whole_app() {
+        let root = cortexkit_test_support::ScratchDir::new("bundle-setup-rollback");
+        let mut backend = backend_without_user_manager(&root);
+        backend.platform = RuntimePlatform::Macos;
+        let app = root.join("apps/CortexKit Daemon.app");
+        let daemon = app.join("Contents/MacOS/ck-subc");
+        fs::create_dir_all(daemon.parent().unwrap()).unwrap();
+        fs::write(&daemon, "new daemon").unwrap();
+        fs::write(app.join("Contents/Info.plist"), "new metadata").unwrap();
+        backend
+            .inventory
+            .record("managed-binary", &daemon, Map::new());
+        backend
+            .component_steps
+            .entry(Component::Core)
+            .or_default()
+            .placed_binaries
+            .push(daemon.clone());
+        backend.rollback_component(Component::Core).unwrap();
+        assert!(!app.exists());
+        assert!(!backend.inventory.owns_path("managed-binary", &daemon));
+    }
     use cortexkit_test_support::ScratchDir;
 
     struct UnavailableUserManager;

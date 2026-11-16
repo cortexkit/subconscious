@@ -1,5 +1,8 @@
 # ck-nats-engine
 
+Version 0.1.1 adds `ck-nats-engine --version`, which prints the build version
+without reading configuration or opening the store.
+
 The private child of `ck-nats-server`. It reads the existing NATS configuration
 and owns the embedded server. Standard input and output are exclusively the v1
 newline-delimited JSON channel; server logs go to standard error. Closing stdin
@@ -29,8 +32,9 @@ the pinned upstream module into a temporary build directory, applies the single
 `reload-signaturecb.patch` with zero fuzz, and builds through a temporary module
 replacement. It never modifies the module cache or commits upstream source.
 Tests must use the same script so they exercise the carried patch.
-Linux jobs without Go can prefix the command with
-`bash scripts/go-toolchain.sh`; the helper downloads the official toolchain into
+Release hosts without the pinned Go version can run
+`bash scripts/go-toolchain.sh bash scripts/build-nats-engine.sh` (or append
+`--test` and the test filter). The helper downloads the official toolchain into
 `target/`, verifies a pinned SHA-256, and changes `PATH` only for that command.
 
 The patch only excludes `SignatureCB` from remote reload equality: Go callbacks

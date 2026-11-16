@@ -1262,6 +1262,8 @@ impl SetupFixture {
             &tools.join(service_manager_program()),
             service_manager_script(),
         );
+        #[cfg(target_os = "macos")]
+        write_bundle_verifier_tools(&tools);
 
         if installed {
             let binaries = [
@@ -1269,6 +1271,8 @@ impl SetupFixture {
                 ("core", "ck-subc-mcp"),
                 ("core", "ck-script-runner-bun"),
                 ("core", "ck-script-runner-python"),
+                ("core", "ck-nats-engine"),
+                ("core", "ck-nats-server"),
                 ("aft", "ck-aft"),
                 ("claustrum", "ck-claustrum"),
                 ("claustrum", "ck-auth"),
@@ -1277,8 +1281,12 @@ impl SetupFixture {
             let mut mutations = binaries
                 .iter()
                 .map(|(component, binary)| {
-                    let path = bin.join(platform_binary(binary));
-                    fs::write(&path, binary).unwrap();
+                    let path = fixture_binary_path(&bin, binary);
+                    if cfg!(target_os = "macos") && *binary == "ck-subc" {
+                        write_fixture_daemon(&bin, "0.17.9");
+                    } else {
+                        fs::write(&path, binary).unwrap();
+                    }
                     json!({
                         "kind": "managed-binary",
                         "path": path,
@@ -1340,11 +1348,7 @@ impl SetupFixture {
         let path = runtime_definition(&self.home);
         // Each component needs its own join: a slash embedded in a component
         // survives Windows stringification, unlike the inventory's separators.
-        let daemon = self
-            .data_home
-            .join("cortexkit")
-            .join("bin")
-            .join(platform_binary("ck-subc"));
+        let daemon = fixture_binary_path(&self.data_home.join("cortexkit").join("bin"), "ck-subc");
         let raw = daemon.to_string_lossy();
         let escape_xml = |text: &str| {
             text.replace('&', "&amp;")
@@ -1528,6 +1532,24 @@ fn serve_signed_index(
     }
 }
 
+#[cfg(unix)]
+fn nats_fixture_archives(fixture: &SetupFixture) -> (Vec<u8>, Vec<u8>) {
+    (
+        fixture_archive(
+            fixture._root.path(),
+            "ck-nats-engine",
+            "ck-nats-engine 0.1.1",
+            0,
+        ),
+        fixture_archive(
+            fixture._root.path(),
+            "ck-nats-server",
+            "ck-nats-server 0.1.1",
+            0,
+        ),
+    )
+}
+
 fn setup_index(base: &str, mc_archive: Option<&[u8]>) -> (Value, BTreeMap<String, Vec<u8>>) {
     let target = host_target();
     let dummy = fixture_asset(format!("{base}/unused.zip"), "00".repeat(32), 1, None);
@@ -1543,6 +1565,8 @@ fn setup_index(base: &str, mc_archive: Option<&[u8]>) -> (Value, BTreeMap<String
                 ("ck-subc-mcp", dummy.clone()),
                 ("ck-script-runner-bun", dummy.clone()),
                 ("ck-script-runner-python", dummy.clone()),
+                ("ck-nats-engine", dummy.clone()),
+                ("ck-nats-server", dummy.clone()),
             ],
         ),
     );
@@ -1611,6 +1635,21 @@ fn fixture_asset(url: String, sha256: String, bytes: u64, reports: Option<&str>)
 fn fixture_archive(_root: &Path, binary: &str, version_line: &str, filler_bytes: u64) -> Vec<u8> {
     let script = format!("#!/bin/sh\necho '{version_line}'\n").into_bytes();
     let filler = vec![0; filler_bytes.try_into().unwrap()];
+    #[cfg(target_os = "macos")]
+    if binary == "ck-subc" {
+        return stored_zip(&[
+            ("CortexKit Daemon.app/Contents/MacOS/ck-subc", &script),
+            (
+                "CortexKit Daemon.app/Contents/Info.plist",
+                b"fixture metadata",
+            ),
+            (
+                "CortexKit Daemon.app/Contents/embedded.provisionprofile",
+                b"signed profile fixture",
+            ),
+            ("fixture-padding", &filler),
+        ]);
+    }
     let archived_binary = platform_binary(binary);
     stored_zip(&[
         (archived_binary.as_str(), script.as_slice()),
@@ -1749,7 +1788,14 @@ fn service_manager_program() -> &'static str {
 }
 
 fn service_manager_script() -> &'static str {
-    "#!/bin/sh\necho 'state = running'\nexit 0\n"
+    #[cfg(target_os = "macos")]
+    {
+        "#!/bin/sh\nif [ \"$1\" = print ] && [ ! -f \"$HOME/Library/LaunchAgents/cortexkit.subc.plist\" ]; then exit 1; fi\necho 'state = running'\nexit 0\n"
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "#!/bin/sh\necho 'state = running'\nexit 0\n"
+    }
 }
 
 fn runtime_definition(home: &Path) -> PathBuf {
@@ -1768,6 +1814,92 @@ fn platform_binary(name: &str) -> String {
     } else {
         name.to_string()
     }
+}
+
+fn fixture_binary_path(binary_home: &Path, binary: &str) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    if binary == "ck-subc" {
+        return binary_home
+            .parent()
+            .unwrap()
+            .join("apps/CortexKit Daemon.app/Contents/MacOS/ck-subc");
+    }
+    binary_home.join(platform_binary(binary))
+}
+
+fn write_fixture_daemon(binary_home: &Path, version: &str) {
+    let daemon = fixture_binary_path(binary_home, "ck-subc");
+    fs::create_dir_all(daemon.parent().unwrap()).unwrap();
+    write_executable(&daemon, &format!("#!/bin/sh\necho 'ck-subc {version}'\n"));
+    #[cfg(target_os = "macos")]
+    {
+        let contents = daemon.parent().unwrap().parent().unwrap();
+        fs::write(contents.join("Info.plist"), format!("metadata {version}")).unwrap();
+        fs::write(
+            contents.join("embedded.provisionprofile"),
+            "signed profile fixture",
+        )
+        .unwrap();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn write_bundle_verifier_tools(tools: &Path) {
+    // Like the setup bundle unit tests' CommandRunner, these stand-ins verify
+    // the candidate's shape and supply the expected profile identity. Keep
+    // ditto and PlistBuddy real so extraction, copying and plist parsing run.
+    write_executable(
+        &tools.join("codesign"),
+        "#!/bin/sh\nset -eu\n[ \"$1\" = --verify ]\n[ \"$2\" = --strict ]\n[ -f \"$3/Contents/MacOS/ck-subc\" ]\n[ -f \"$3/Contents/Info.plist\" ]\n[ -f \"$3/Contents/embedded.provisionprofile\" ]\n",
+    );
+    write_executable(
+        &tools.join("security"),
+        r#"#!/bin/sh
+set -eu
+[ "$1" = cms ]
+[ "$2" = -D ]
+[ "$3" = -i ]
+[ -f "$4" ]
+printf '%s\n' '<?xml version="1.0"?><plist version="1.0"><dict><key>Entitlements</key><dict><key>com.apple.application-identifier</key><string>5R5846NBPW.io.cortexkit.daemon</string></dict></dict></plist>'
+"#,
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn setup_macos_daemon_fixtures_include_bundle_metadata() {
+    let fixture = SetupFixture::installed("setup-daemon-bundle-fixtures");
+    let data = fixture.data_home.join("cortexkit");
+    let archive = fixture._root.join("daemon.zip");
+    fs::write(
+        &archive,
+        fixture_archive(fixture._root.path(), "ck-subc", "ck-subc 0.17.10", 0),
+    )
+    .unwrap();
+    let extracted = fixture._root.join("extracted");
+    let output = Command::new("/usr/bin/ditto")
+        .args(["-x", "-k"])
+        .arg(&archive)
+        .arg(&extracted)
+        .output()
+        .unwrap();
+    assert_exit(&output, 0);
+    for root in [data.join("apps"), extracted] {
+        let app = root.join("CortexKit Daemon.app");
+        for file in [
+            "Contents/MacOS/ck-subc",
+            "Contents/Info.plist",
+            "Contents/embedded.provisionprofile",
+        ] {
+            assert!(
+                app.join(file).is_file(),
+                "missing {file} in {}",
+                app.display()
+            );
+        }
+        assert!(!root.join("ck-subc").exists());
+    }
+    assert!(!data.join("bin/ck-subc").exists());
 }
 
 fn host_target() -> String {
@@ -1884,7 +2016,7 @@ fn setup_core_drift_floor_refusal_is_actionable_and_never_mutates() {
     let binary_home = fixture.data_home.join("cortexkit/bin");
     fs::remove_file(binary_home.join("ck-aft")).unwrap();
     write_executable(
-        &binary_home.join("ck-subc"),
+        &fixture_binary_path(&binary_home, "ck-subc"),
         "#!/bin/sh\necho 'ck-subc 0.17.19'\n",
     );
     write_executable(
@@ -1961,7 +2093,7 @@ fn setup_unowned_refusals_match_dry_run_without_downloads_or_changes() {
             assert!(!text(&output.stdout).contains("Continue?"));
             outputs.push(text(&output.stdout));
             assert_eq!(fs::read(&binary).unwrap(), script.as_bytes());
-            assert!(!binary_home.join("ck-subc").exists());
+            assert!(!fixture_binary_path(&binary_home, "ck-subc").exists());
             assert!(!fixture
                 .data_home
                 .join("cortexkit/installer-manifest.json")
@@ -1989,7 +2121,7 @@ fn setup_unowned_refusals_match_dry_run_without_downloads_or_changes() {
 fn setup_owned_newer_daemon_refuses_even_when_configuration_is_correct() {
     let fixture = SetupFixture::installed("setup-owned-newer-daemon");
     write_executable(
-        &fixture.data_home.join("cortexkit/bin/ck-subc"),
+        &fixture_binary_path(&fixture.data_home.join("cortexkit/bin"), "ck-subc"),
         "#!/bin/sh\necho 'ck-subc 0.20.98+local'\n",
     );
     let config = fixture.config_home.join("cortexkit/subc.jsonc");
@@ -2059,7 +2191,7 @@ fn setup_live_daemon_uses_core_release_not_connection_library_version() {
 
     let fixture = SetupFixture::installed("setup-live-core-version");
     write_executable(
-        &fixture.data_home.join("cortexkit/bin/ck-subc"),
+        &fixture_binary_path(&fixture.data_home.join("cortexkit/bin"), "ck-subc"),
         "#!/bin/sh\necho 'ck-subc 0.20.83'\n",
     );
     set_setup_managed_modes(&fixture);
@@ -2515,7 +2647,7 @@ fn set_setup_managed_modes(fixture: &SetupFixture) {
         "ck-insula",
     ] {
         fs::set_permissions(
-            cortexkit.join("bin").join(platform_binary(binary)),
+            fixture_binary_path(&binary_dir, binary),
             fs::Permissions::from_mode(0o755),
         )
         .unwrap();
@@ -2851,6 +2983,9 @@ fn fresh_setup_installs_runner_and_prints_the_pasteable_claude_code_command() {
             0,
         );
         assets.insert("/python.zip".to_string(), python.clone());
+        let (nats_engine, nats_server) = nats_fixture_archives(&fixture);
+        assets.insert("/nats-engine.zip".to_string(), nats_engine.clone());
+        assets.insert("/nats-server.zip".to_string(), nats_server.clone());
         (
             json!({
                 "schema": 1,
@@ -2866,6 +3001,8 @@ fn fresh_setup_installs_runner_and_prints_the_pasteable_claude_code_command() {
                             ("ck-subc-mcp", fixture_asset(format!("{base}/ck-subc-mcp.zip"), sha256_hex(&mcp), mcp.len() as u64, Some("0.17.10"))),
                             ("ck-script-runner-bun", fixture_asset(format!("{base}/runner.zip"), sha256_hex(&runner), runner.len() as u64, None)),
                             ("ck-script-runner-python", fixture_asset(format!("{base}/python.zip"), sha256_hex(&python), python.len() as u64, None)),
+                            ("ck-nats-engine", fixture_asset(format!("{base}/nats-engine.zip"), sha256_hex(&nats_engine), nats_engine.len() as u64, None)),
+                            ("ck-nats-server", fixture_asset(format!("{base}/nats-server.zip"), sha256_hex(&nats_server), nats_server.len() as u64, None)),
                         ],
                     ),
                 },
@@ -2953,11 +3090,25 @@ case "$archive" in
   *ck-subc-mcp-*.zip) binary=ck-subc-mcp ;;
   *ck-script-runner-bun-*.zip) binary=ck-script-runner-bun ;;
   *ck-script-runner-python-*.zip) binary=ck-script-runner-python ;;
+  *ck-nats-engine-*.zip) binary=ck-nats-engine ;;
+  *ck-nats-server-*.zip) binary=ck-nats-server ;;
   *ck-subc-*.zip) binary=ck-subc ;;
   *) exit 2 ;;
 esac
 printf '#!/bin/sh\necho "%s 0.17.10"\n' "$binary" >"$destination/$binary"
 "##,
+    );
+    #[cfg(target_os = "macos")]
+    write_executable(
+        &fixture.tools.join("ditto"),
+        r#"#!/bin/sh
+set -eu
+if [ "$1" = -x ]; then
+  mode_of() { stat -f '%Lp' "$1"; }
+  printf '%s %s %s\n' "$(mode_of "$(dirname "$3")")" "$(mode_of "$4")" "$(mode_of "$3")" >>"$CK_TEST_STAGE_REPORT"
+fi
+exec /usr/bin/ditto "$@"
+"#,
     );
 
     let subc = fixture_archive(fixture._root.path(), "ck-subc", "ck-subc 0.17.10", 0);
@@ -2986,6 +3137,9 @@ printf '#!/bin/sh\necho "%s 0.17.10"\n' "$binary" >"$destination/$binary"
             0,
         );
         assets.insert("/python.zip".to_string(), python.clone());
+        let (nats_engine, nats_server) = nats_fixture_archives(&fixture);
+        assets.insert("/nats-engine.zip".to_string(), nats_engine.clone());
+        assets.insert("/nats-server.zip".to_string(), nats_server.clone());
         (
             json!({
                 "schema": 1,
@@ -3001,6 +3155,8 @@ printf '#!/bin/sh\necho "%s 0.17.10"\n' "$binary" >"$destination/$binary"
                             ("ck-subc-mcp", fixture_asset(format!("{base}/ck-subc-mcp.zip"), sha256_hex(&mcp), mcp.len() as u64, Some("0.17.10"))),
                             ("ck-script-runner-bun", fixture_asset(format!("{base}/runner.zip"), sha256_hex(&runner), runner.len() as u64, None)),
                             ("ck-script-runner-python", fixture_asset(format!("{base}/python.zip"), sha256_hex(&python), python.len() as u64, None)),
+                            ("ck-nats-engine", fixture_asset(format!("{base}/nats-engine.zip"), sha256_hex(&nats_engine), nats_engine.len() as u64, None)),
+                            ("ck-nats-server", fixture_asset(format!("{base}/nats-server.zip"), sha256_hex(&nats_server), nats_server.len() as u64, None)),
                         ],
                     ),
                 },
@@ -3018,7 +3174,7 @@ printf '#!/bin/sh\necho "%s 0.17.10"\n' "$binary" >"$destination/$binary"
     assert_exit(&output, 0);
     assert_mode(&cortexkit, 0o700);
     assert_mode(&bin, 0o755);
-    assert_mode(&bin.join(platform_binary("ck-subc")), 0o755);
+    assert_mode(&fixture_binary_path(&bin, "ck-subc"), 0o755);
     assert_mode(&bin.join(platform_binary("ck-subc-mcp")), 0o755);
     assert_mode(&cortexkit.join("installer-manifest.json"), 0o644);
     let config = fixture.config_home.join("cortexkit");
@@ -3026,7 +3182,7 @@ printf '#!/bin/sh\necho "%s 0.17.10"\n' "$binary" >"$destination/$binary"
     assert_mode(&config.join("subc.jsonc"), 0o600);
     assert_mode(&runtime_definition(&fixture.home), 0o644);
     let stage_modes = fs::read_to_string(stage_report).expect("staging mode report");
-    assert_eq!(stage_modes.lines().count(), 4, "{stage_modes}");
+    assert_eq!(stage_modes.lines().count(), 6, "{stage_modes}");
     for modes in stage_modes.lines() {
         assert_eq!(modes, "700 700 600", "unexpected staging modes: {modes}");
     }
@@ -3065,7 +3221,7 @@ fn setup_tightens_existing_owned_modes_on_a_noop_plan_without_chmodding_unowned_
         "ck-insula",
     ] {
         fs::set_permissions(
-            bin.join(platform_binary(binary)),
+            fixture_binary_path(&bin, binary),
             fs::Permissions::from_mode(0o777),
         )
         .unwrap();
@@ -3097,7 +3253,7 @@ fn setup_tightens_existing_owned_modes_on_a_noop_plan_without_chmodding_unowned_
         "ck-auth",
         "ck-insula",
     ] {
-        assert_mode(&bin.join(platform_binary(binary)), 0o755);
+        assert_mode(&fixture_binary_path(&bin, binary), 0o755);
     }
 }
 
@@ -3136,7 +3292,10 @@ fn setup_keeps_bootstrapped_claustrum_key_owner_only_under_zero_umask() {
             "ck-script-runner-python 0.1.0",
             0,
         );
+        let (nats_engine, nats_server) = nats_fixture_archives(&fixture);
         for (name, archive) in [
+            ("ck-nats-engine", &nats_engine),
+            ("ck-nats-server", &nats_server),
             ("ck-subc", &core_daemon),
             ("ck-subc-mcp", &core_mcp),
             ("ck-script-runner-bun", &runner),
@@ -3161,6 +3320,9 @@ fn setup_keeps_bootstrapped_claustrum_key_owner_only_under_zero_umask() {
                             ("ck-subc-mcp", fixture_asset(format!("{base}/ck-subc-mcp.zip"), sha256_hex(&core_mcp), core_mcp.len() as u64, Some("0.17.10"))),
                             ("ck-script-runner-bun", fixture_asset(format!("{base}/ck-script-runner-bun.zip"), sha256_hex(&runner), runner.len() as u64, None)),
                             ("ck-script-runner-python", fixture_asset(format!("{base}/ck-script-runner-python.zip"), sha256_hex(&python), python.len() as u64, None)),
+                            ("ck-nats-engine", fixture_asset(format!("{base}/ck-nats-engine.zip"), sha256_hex(&nats_engine), nats_engine.len() as u64, None)),
+                            ("ck-nats-server", fixture_asset(format!("{base}/ck-nats-server.zip"), sha256_hex(&nats_server), nats_server.len() as u64, None)),
+
                         ],
                     ),
                     "claustrum": index_component(
@@ -3215,18 +3377,28 @@ impl UpgradeFixture {
         let cortexkit = home.join(".local/share/cortexkit");
         let bin = cortexkit.join("bin");
         fs::create_dir_all(&bin).unwrap();
+        #[cfg(target_os = "macos")]
+        {
+            let tools = root.join("tools");
+            fs::create_dir_all(&tools).unwrap();
+            write_bundle_verifier_tools(&tools);
+        }
         let aft = bin.join(platform_binary("ck-aft"));
-        let daemon = bin.join(platform_binary("ck-subc"));
+        let daemon = fixture_binary_path(&bin, "ck-subc");
         let mcp = bin.join(platform_binary("ck-subc-mcp"));
         let runner = bin.join(platform_binary("ck-script-runner-bun"));
         let python = bin.join(platform_binary("ck-script-runner-python"));
+        let nats_engine = bin.join(platform_binary("ck-nats-engine"));
+        let nats_server = bin.join(platform_binary("ck-nats-server"));
         let claustrum = bin.join(platform_binary("ck-claustrum"));
         let auth = bin.join(platform_binary("ck-auth"));
         write_executable(&aft, "#!/bin/sh\necho 'ck-aft 0.55.1'\n");
-        write_executable(&daemon, "#!/bin/sh\necho 'ck-subc 0.17.9'\n");
+        write_fixture_daemon(&bin, "0.17.9");
         write_executable(&mcp, "#!/bin/sh\necho 'ck-subc-mcp 0.17.9'\n");
         write_executable(&runner, "#!/bin/sh\necho 'ck-script-runner-bun 0.1.0'\n");
         write_executable(&python, "#!/bin/sh\necho 'ck-script-runner-python 0.1.0'\n");
+        write_executable(&nats_engine, "#!/bin/sh\necho 'ck-nats-engine 0.1.1'\n");
+        write_executable(&nats_server, "#!/bin/sh\necho 'ck-nats-server 0.1.1'\n");
         write_executable(&claustrum, "#!/bin/sh\necho 'ck-claustrum 0.8.0'\n");
         write_executable(&auth, "#!/bin/sh\necho 'ck-auth 0.8.0'\n");
         // The manifest names the `ck` this fixture's commands run: the test
@@ -3244,6 +3416,8 @@ impl UpgradeFixture {
             (auth, "66".repeat(32)),
             (runner, "77".repeat(32)),
             (python, "88".repeat(32)),
+            (nats_engine, "99".repeat(32)),
+            (nats_server, "ab".repeat(32)),
         ]
         .into_iter()
         .map(|(path, archive_sha256)| {
@@ -3309,6 +3483,8 @@ impl UpgradeFixture {
             .env("CK_TEST_SUBC_MCP_VERSION", "0.17.9")
             .env("CK_TEST_SCRIPT_RUNNER_BUN_VERSION", "0.1.0")
             .env("CK_TEST_SCRIPT_RUNNER_PYTHON_VERSION", "0.1.0")
+            .env("CK_TEST_NATS_ENGINE_VERSION", "0.1.1")
+            .env("CK_TEST_NATS_SERVER_VERSION", "0.1.1")
             .env("CK_TEST_AFT_VERSION", "0.55.1")
             .env("CK_TEST_CLAUSTRUM_VERSION", "0.8.0")
             .env("CK_TEST_AUTH_VERSION", "0.8.0")
@@ -3319,19 +3495,21 @@ impl UpgradeFixture {
             );
         #[cfg(windows)]
         command.env("CK_TEST_SUBC_VERSION", self.core_version.borrow().as_str());
+        #[cfg(target_os = "macos")]
+        command.env(
+            "PATH",
+            std::env::join_paths(std::iter::once(self._root.join("tools")).chain(
+                std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+            ))
+            .unwrap(),
+        );
         command
     }
 
     fn set_core_version(&self, version: &str) {
         #[cfg(windows)]
         self.core_version.replace(version.to_string());
-        write_executable(
-            &self
-                .home
-                .join(".local/share/cortexkit/bin")
-                .join(platform_binary("ck-subc")),
-            &format!("#!/bin/sh\necho 'ck-subc {version}'\n"),
-        );
+        write_fixture_daemon(&self.home.join(".local/share/cortexkit/bin"), version);
         let path = self
             .home
             .join(".local/share/cortexkit/installer-manifest.json");
@@ -3374,6 +3552,8 @@ fn upgrade_index(
                         ("ck-subc", fixture_asset(format!("{base}/daemon.zip"), "33".repeat(32), 1, Some("0.17.9"))),
                         ("ck-script-runner-bun", fixture_asset(format!("{base}/runner.zip"), "77".repeat(32), 1, None)),
                         ("ck-script-runner-python", fixture_asset(format!("{base}/python.zip"), "88".repeat(32), 1, None)),
+                        ("ck-nats-engine", fixture_asset(format!("{base}/nats-engine.zip"), "99".repeat(32), 1, Some("0.1.1"))),
+                        ("ck-nats-server", fixture_asset(format!("{base}/nats-server.zip"), "ab".repeat(32), 1, Some("0.1.1"))),
                         ("ck", fixture_asset(format!("{base}/ck.zip"), ck_digest.to_string(), 1, Some(ck_version))),
                     ],
                 ),
@@ -3432,7 +3612,7 @@ fn upgrade_and_check_say_everything_is_current_in_one_line() {
         )
     });
     let expected =
-        "Everything is up to date (ck 0.17.9 · ck-subc 0.17.9 · ck-subc-mcp · ck-script-runner-bun 0.1.0 · ck-script-runner-python 0.1.0 · ck-aft 0.55.1 · ck-claustrum 0.8.0 · ck-auth 0.8.0).\n";
+        "Everything is up to date (ck 0.17.9 · ck-nats-engine 0.1.1 · ck-nats-server 0.1.1 · ck-subc 0.17.9 · ck-subc-mcp · ck-script-runner-bun 0.1.0 · ck-script-runner-python 0.1.0 · ck-aft 0.55.1 · ck-claustrum 0.8.0 · ck-auth 0.8.0).\n";
 
     for args in [&["upgrade"][..], &["upgrade", "--check"][..]] {
         let output = fixture.command(&index, args).output().unwrap();
@@ -3630,6 +3810,8 @@ fn empty_install_record_does_not_claim_an_upgrade_check_for_ck_or_ckni() {
     let fixture = UpgradeFixture::new("empty-upgrade-check");
     let cortexkit = fixture.home.join(".local/share/cortexkit");
     fs::remove_dir_all(cortexkit.join("bin")).unwrap();
+    #[cfg(target_os = "macos")]
+    fs::remove_dir_all(cortexkit.join("apps")).unwrap();
     fs::write(
         cortexkit.join("installer-manifest.json"),
         br#"{"schema_version":1,"mutations":[]}"#,

@@ -6,7 +6,7 @@ OS="${1:?usage: $0 <darwin|linux> <arm64|x64> <source-dir> <dist-dir>}"
 ARCH="${2:?usage: $0 <darwin|linux> <arm64|x64> <source-dir> <dist-dir>}"
 SOURCE_DIR="${3:?usage: $0 <darwin|linux> <arm64|x64> <source-dir> <dist-dir>}"
 DIST_DIR="${4:?usage: $0 <darwin|linux> <arm64|x64> <source-dir> <dist-dir>}"
-BINARIES=(ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python)
+BINARIES=(ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python ck-nats-server ck-nats-engine)
 
 case "$OS" in
   darwin|linux) ;;
@@ -32,6 +32,12 @@ command -v shasum >/dev/null || {
   echo "shasum is required to create release digest sidecars" >&2
   exit 1
 }
+if [[ "$OS" == darwin ]]; then
+  command -v ditto >/dev/null || {
+    echo "ditto is required to preserve macOS bundle signatures" >&2
+    exit 1
+  }
+fi
 
 # The shipped ck must not carry the test-only release-index key path: a build
 # whose feature set was unified from a test invocation would honour an
@@ -49,13 +55,23 @@ for binary in "${BINARIES[@]}"; do # nonempty-array: literal release binaries
   archive_name="${binary}-${OS}-${ARCH}.zip"
   archive_path="${DIST_DIR}/${archive_name}"
 
-  if [[ ! -f "$source_path" ]]; then
+  if [[ "$OS" == darwin && "$binary" == ck-subc ]]; then
+    source_path="${SOURCE_DIR}/CortexKit Daemon.app"
+    [[ -f "$source_path/Contents/MacOS/ck-subc" && -f "$source_path/Contents/Info.plist" ]] || {
+      echo "missing daemon bundle: ${source_path}" >&2
+      exit 1
+    }
+  elif [[ ! -f "$source_path" ]]; then
     echo "missing release binary: ${source_path}" >&2
     exit 1
   fi
 
   rm -f "$archive_path" "${archive_path}.sha256"
-  zip -q -j "$archive_path" "$source_path"
+  if [[ "$OS" == darwin && "$binary" == ck-subc ]]; then
+    ditto -c -k --keepParent "$source_path" "$archive_path"
+  else
+    zip -q -j "$archive_path" "$source_path"
+  fi
   # Generate from within dist so `shasum -c` receives the exact published name,
   # not a runner-local directory prefix.
   (

@@ -26,10 +26,12 @@ for version in 2.28 2.29; do
   cc -shared -nostdlib "$fixture/provider.c" -Wl,--version-script="$fixture/versions.map" -o "$fixture/libfixture.so"
   cc -shared -nostdlib "$fixture/consumer.c" -L"$fixture" -lfixture -o "$fixture/import-$version"
 done
-for binary in ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python; do
+for binary in ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python ck-nats-server; do
   cp "$fixture/import-2.28" "$fixture/bin/$binary"
 done
+cc -static -nostdlib "$fixture/provider.c" -Wl,-e,fixture -o "$fixture/bin/ck-nats-engine"
 bash "$SCRIPT_DIR/check-glibc.sh" "$fixture/bin" > "$fixture/output" 2>&1
+grep -Fq 'ck-nats-engine: static ELF (no interpreter or shared libraries)' "$fixture/output"
 grep -Fq 'ck-script-runner-python: highest required GLIBC_2.28 <= GLIBC_2.28' "$fixture/output"
 
 cp "$fixture/import-2.29" "$fixture/bin/ck-script-runner-python"
@@ -46,5 +48,11 @@ if bash "$SCRIPT_DIR/check-glibc.sh" "$fixture/bin" > "$fixture/output" 2>&1; th
   exit 1
 fi
 grep -Fq 'ck-script-runner-python: cannot read ELF version requirements' "$fixture/output"
-printf 'check-glibc: passed (3 checks)\n'
+cp "$fixture/import-2.28" "$fixture/bin/ck-script-runner-python"
+cp "$fixture/import-2.28" "$fixture/bin/ck-nats-engine"
+if bash "$SCRIPT_DIR/check-glibc.sh" "$fixture/bin" > "$fixture/output" 2>&1; then
+  echo 'dynamic NATS engine unexpectedly passed' >&2; exit 1
+fi
+grep -Fq 'ck-nats-engine: expected a static ELF' "$fixture/output"
+printf 'check-glibc: passed (4 checks)\n'
 finished=1

@@ -709,6 +709,13 @@ pub fn plan_upgrade(observed: &UpgradeObserved) -> UpgradePlan {
             }
         }
     }
+    if super::upgrade_executor::unpaired_nats_upgrade(&plan).is_some() {
+        plan.outcomes.push(PlanOutcome::Refusal {
+            reason:
+                "the message server is upgraded together with the daemon; upgrade Core together"
+                    .into(),
+        });
+    }
     plan
 }
 

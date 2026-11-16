@@ -1,6 +1,8 @@
 exit: 0
 stdout:
 ck-aft 0.55.1 → 0.55.2. Run ck upgrade.
+  outcome: no-op: ck-nats-engine is already current
+  outcome: no-op: ck-nats-server is already current
   outcome: no-op: ck-subc is already current
   outcome: no-op: ck-subc-mcp is already current
   outcome: no-op: ck-script-runner-bun is already current

@@ -12,7 +12,7 @@ import (
 	"github.com/nats-io/nats-server/v2/server"
 )
 
-const version = "0.1.0"
+const version = "0.1.1"
 const patchID = "reload-signaturecb-1"
 
 type terminal struct {
@@ -21,10 +21,20 @@ type terminal struct {
 }
 
 func main() {
+	for _, arg := range os.Args[1:] {
+		if arg == "--version" {
+			fmt.Printf("ck-nats-engine %s\n", version)
+			return
+		}
+	}
+	flag.Usage = func() {
+		fmt.Fprintln(os.Stderr, "usage: ck-nats-engine --version | -c <server.conf>")
+		flag.PrintDefaults()
+	}
 	config := flag.String("c", "", "path to server.conf")
 	flag.Parse()
 	if *config == "" || flag.NArg() != 0 {
-		fmt.Fprintln(os.Stderr, "usage: ck-nats-engine -c <server.conf>")
+		flag.Usage()
 		os.Exit(1)
 	}
 	os.Exit(run(*config, os.Stdin, os.Stdout))

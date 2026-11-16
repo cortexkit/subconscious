@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.21.22
+
+- Test-only: compare NATS executable paths with native path components and construct operator-program fixtures through JSON fields so Windows separators cannot bypass the intended refusal assertion. Run the macOS bundle LaunchAgent path test only on macOS.
+
+## 0.21.21
+
+- Keep the daemon configuration path fixed when constructing an upgrade backend. Isolated installations and tests no longer fall back to the current user's configuration when their inventory has no configuration record.
+
+## 0.21.20
+
+- Install the paired NATS wrapper and engine with Core. Setup does not create a message bus; an existing one moves to the new server without moving its config or JetStream store. Restore the previous entry and stock server on rollback.
+- Require the co-shipped daemon 0.49.5 and OS helpers 0.1.41 for the managed daemon installation and lifecycle paths.
+
+## 0.21.19
+
+- On macOS, `ck setup` and `ck upgrade` install the daemon as a signed app bundle in the data directory's `apps` folder. Verify its signature and embedded application identifier before replacement, remove the legacy bare executable only after the new daemon passes verification, and restore the previous bundle or bare binary and LaunchAgent if activation fails. Linux and Windows retain their existing executable paths.
+
 ## 0.21.18
 
 - Test-only: the `ck module check-script` tests write their fake runners through a short-lived

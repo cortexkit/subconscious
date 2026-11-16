@@ -21,6 +21,31 @@ func TestEngineChild(t *testing.T) {
 	os.Exit(run(os.Getenv("CK_NATS_ENGINE_TEST_CONFIG"), os.Stdin, os.Stdout))
 }
 
+func TestEngineVersionProcess(t *testing.T) {
+	if os.Getenv("CK_NATS_ENGINE_VERSION_CHILD") != "1" {
+		t.Skip("subprocess entry point")
+	}
+	os.Args = []string{"ck-nats-engine", "--version", "--unknown"}
+	main()
+	os.Exit(0)
+}
+
+func TestVersionExitsBeforeConfigOrStoreAccess(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(executable, "-test.run=^TestEngineVersionProcess$")
+	cmd.Env = append(os.Environ(), "CK_NATS_ENGINE_VERSION_CHILD=1")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("--version failed: %v: %s", err, output)
+	}
+	if string(output) != "ck-nats-engine 0.1.1\n" {
+		t.Fatalf("unexpected version output: %q", output)
+	}
+}
+
 type engineChild struct {
 	input  io.WriteCloser
 	frames chan map[string]any
@@ -122,7 +147,7 @@ func (c engineChild) wait(t *testing.T, code int) {
 func TestEngineLifecycle(t *testing.T) {
 	c := startEngine(t)
 	ready := c.next(t, "ready")
-	if ready["version"] != "0.1.0" || ready["nats_version"] != "2.15.3" || ready["patch"] != "reload-signaturecb-1" {
+	if ready["version"] != version || ready["nats_version"] != "2.15.3" || ready["patch"] != "reload-signaturecb-1" {
 		t.Fatalf("unexpected ready: %+v", ready)
 	}
 	status := c.next(t, "status")

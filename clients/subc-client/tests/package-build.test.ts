@@ -1,11 +1,12 @@
 import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { removeScratch } from "./remove-scratch";
 
-test("publish build keeps JavaScript, declarations and package exports at their published paths", () => {
+test("publish build keeps JavaScript, declarations and package exports at their published paths", async () => {
   const packageDir = fileURLToPath(new URL("..", import.meta.url));
   mkdirSync(resolve("target/scratch"), { recursive: true });
   const dir = mkdtempSync(resolve("target/scratch/package-build-"));
@@ -42,5 +43,5 @@ test("publish build keeps JavaScript, declarations and package exports at their 
       const imported = spawnSync("node", [...conditions, "--input-type=module", "-e", probe], { cwd: dir, encoding: "utf8" });
       expect({ code: imported.status, out: imported.stdout, err: imported.stderr }).toEqual({ code: 0, out: "PUBLISHED_EXPORTS_RESOLVE\n", err: "" });
     }
-  } finally { rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
+  } finally { await removeScratch(dir); }
 }, 30000);

@@ -1,7 +1,8 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { resolve, join } from "node:path";
+import { removeScratch } from "./remove-scratch";
 
 let dir: string;
 let executable: string;
@@ -23,7 +24,7 @@ beforeAll(async () => {
   expect({ code, diagnostics: code ? out + err : "" }).toEqual({ code: 0, diagnostics: "" });
 }, 60000);
 
-afterAll(() => rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }));
+afterAll(() => removeScratch(dir));
 
 test("version probe runs without a script pipe", async () => {
   const child = Bun.spawn([executable, "--version"], { env, stdout: "pipe", stderr: "pipe" });
@@ -188,7 +189,9 @@ for (const fault of ["wrong-identity", "short-header", "short-body", "extra-byte
     expect(result.code).not.toBe(0);
     expect(result.out).toBe("");
     expect(result.err).toContain("script_pipe_refused:");
-  });
+    // The oversized case pushes 32 MiB through the Python launcher's pipe,
+    // which takes longer than Bun's 5-second default on slow runners.
+  }, 30000);
 }
 
 test("check mode lists every refused literal without evaluation", async () => {

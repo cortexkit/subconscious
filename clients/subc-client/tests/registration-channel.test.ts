@@ -6,6 +6,7 @@ import { join, resolve } from "node:path";
 import { SubcSocket, SocketClosedError } from "../src/socket";
 import { computeProof, SERVER_PROOF_DOMAIN, CLIENT_AUTH_DOMAIN } from "../src/auth";
 import { buildFrame, encodeFrame, FrameType, PROTOCOL_VERSION } from "../src/envelope";
+import { removeScratch } from "./remove-scratch";
 
 const key = new Uint8Array(32).fill(71), id = new Uint8Array(16).fill(17), nonce = new Uint8Array(32).fill(39);
 const fixture = fileURLToPath(new URL("fixtures/registration-child.ts", import.meta.url));
@@ -273,7 +274,7 @@ test("adopt fails closed when a named registration channel cannot load its helpe
       expect({code, err}).toEqual({code: 0, err: ""});
       expect(out).toBe("ADOPTION_CHECKED\n");
     }
-  } finally { rmSync(dir, {recursive: true, force: true, maxRetries: 10, retryDelay: 100}); }
+  } finally { await removeScratch(dir); }
 });
 
 test("import neither loads the native helper nor validates inherited registration metadata", async () => {

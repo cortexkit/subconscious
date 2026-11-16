@@ -3,6 +3,7 @@ import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type AddressInfo, type Socket } from "node:net";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { removeScratch } from "./remove-scratch";
 
 test("bun build --compile embeds the registration helper", async () => {
   mkdirSync(resolve("target/scratch"), {recursive: true});
@@ -49,7 +50,6 @@ test("bun build --compile embeds the registration helper", async () => {
   } finally {
     for (const socket of sockets) socket.destroy();
     server.close();
-    // Windows can keep a just-exited executable locked for a moment.
-    rmSync(dir, {recursive: true, force: true, maxRetries: 20, retryDelay: 100});
+    await removeScratch(dir);
   }
 }, 60000);

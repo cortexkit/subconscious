@@ -36,8 +36,13 @@ jobs:
       - uses: actions/checkout@v5
       - id: classify
         run: |
+          # A vector folder's name already ends in -v<n>, so a set is tagged
+          # either `<folder>-v<version>` or with the folder's own name.
           name="${GITHUB_REF_NAME%-v*}"
-          if [ -d "vectors/$name" ]; then
+          if [ -d "vectors/$GITHUB_REF_NAME" ]; then
+            echo "::notice::$GITHUB_REF_NAME is a test-vector tag (vectors/$GITHUB_REF_NAME); nothing to release."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          elif [ -d "vectors/$name" ]; then
             echo "::notice::$GITHUB_REF_NAME is a test-vector tag (vectors/$name); nothing to release."
             echo "release=false" >> "$GITHUB_OUTPUT"
           else

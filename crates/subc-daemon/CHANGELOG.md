@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.50.5
+
+- Accept the new federated stamp members (origin principal, peer box id, project, run id on run
+  claims, owning agent on flow claims, the `app` peer class); require subc-protocol 0.37.4.
+- Validate, freeze per epoch and stamp a typed repository root key beside the project id.
+
 ## 0.50.4
 
 - Retry settings rows when write-back status changes during file capture, keeping watches on their last consistent observation without advancing file-error grace.

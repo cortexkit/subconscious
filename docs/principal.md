@@ -12,7 +12,7 @@ same-user key possession is the accepted floor). Its real job: distinguish
 containable) from **first-party-direct** (host plugins, runner) — attested by
 mechanisms that already exist (reserved module ids + launch nonces).
 
-Three consumers use this principal contract: AFT trust enforcement, federation's
+Three consumers use this principal contract: receiving-module trust enforcement, federation's
 separation of caller identity from target selection, and the tool-surface
 policy's identity axis (docs/mcp-gateway.md §2.4).
 
@@ -77,13 +77,30 @@ spoof attempt or a deploy bug; both must surface).
 ### 2.4 Reserved-id vocabulary
 
 The principal's `module_id` is the daemon's supervised-module id, verbatim
-(`subc-mcp`, `llm-runner`, `aft`, `ai-provider-quota`, ...). No separate
+(`subc-mcp`, `llm-runner`, ...). No separate
 principal namespace — the subc.jsonc module id IS the vocabulary. Stable and
 documented; modules policy-map these strings.
 
+### 2.5 Federated origin principal
+
+The local bind's `principal` still identifies the local caller. Separately,
+`scope.attributes.federated.origin_principal` optionally carries the principal the
+sending computer's daemon stamped on the route that opened the call, relayed by
+the pairing module. It sits beside `remote_claim` because module-to-module calls
+have no claim. Only `{"kind":"reserved","module_id":"…"}` identifies a
+launch-verified sending module; `{"kind":"direct"}` is also valid, while
+`unverified` is refused. Module ids use the registration validator. A receiving
+module applies its own policy to this remote identity, not to a display name.
+
+This is part of the protocol 0.37.4 readers-first federated stamp extension,
+alongside `peer_box_id`, portable `project` (project id and typed root key), run-claim `run_id`, flow-claim `agent_id` and peer class
+`app` (see [Federated identity](scopes.md#federated-identity)). Absent fields stay
+omitted. Senders must not emit any addition until every receiver they reach runs
+0.37.4. The origin principal is identity-bearing, including when no claim exists.
+
 ## 3. Module-side policy
 
-subc provides the fact; the module owns the mapping. The AFT tool module applies this policy:
+subc provides the fact; the receiving module owns the mapping. For example:
 - `direct` → trusted (first-party host plugins; opencode/pi/runner equally).
 - `reserved:<id>` → per-id allowlist over daemon-spawned, spawn-attested module
   ids (trust `llm-runner`; UNTRUST `subc-mcp` — the facade is the remote-model

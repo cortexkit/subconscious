@@ -103,7 +103,7 @@ export {
   type ConfigAvailability, type ModuleConfigState, type ModuleConfigOptions,
 } from "./config.js";
 export type {
-  ScopeAttributes, FederatedAttributes, RemoteClaim, ScopeParent, ScopeCarrier, ScopeRecord, ScopeEnd,
+  ScopeAttributes, FederatedAttributes, FederatedProject, RootKey, RemoteClaim, ScopeParent, ScopeCarrier, ScopeRecord, ScopeEnd,
   ScopeRecordResult, ScopeEndResult, ScopeEnded, ScopeSyncReply, ScopeApplyReply,
 } from "./scope.js";
 export {

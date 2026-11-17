@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::Principal;
 
 mod federated;
-pub use federated::{FederatedAttributes, FederatedPeerClass, RemoteClaim};
+pub use federated::{FederatedAttributes, FederatedPeerClass, FederatedProject, RemoteClaim};
 mod authorize;
 pub use authorize::{
     RouteAuthorizeExpected, RouteAuthorizeOutcome, RouteAuthorizeResponse, RouteAuthorizeScope,
@@ -448,6 +448,46 @@ pub fn validate_project_id(value: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Namespace of a portable root key: an owned GitHub remote or an operator label.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RootKeyKind {
+    Remote,
+    Label,
+}
+
+/// Repository key of a session folder's root within its project. Attribution
+/// only, fixed per epoch like `project_id`; the owner fills it from its project
+/// registry at registration. Labels and remote names are distinct namespaces.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct RootKey {
+    pub kind: RootKeyKind,
+    pub key: String,
+}
+
+impl RootKey {
+    pub fn new(kind: RootKeyKind, key: impl Into<String>) -> Self {
+        Self {
+            kind,
+            key: key.into(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        validate_root_key(&self.key)
+    }
+}
+
+/// Check a root key's text using the project-id token bounds, without interpreting it.
+pub fn validate_root_key(value: &str) -> Result<(), &'static str> {
+    validate_project_id(value).map_err(|error| match error {
+        "project_id must contain 1 to 128 bytes" => "root_key must contain 1 to 128 bytes",
+        _ => "root_key must be printable ASCII without whitespace",
+    })
+}
+
 /// One scope as its owner registers it in `scope.sync` or `scope.apply`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -467,6 +507,11 @@ pub struct ScopeRecord {
     /// Opaque Entorhinal project id, fixed per epoch and never authority-gated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
+    /// Repository key of the session folder's root within the project.
+    /// Attribution only, fixed per epoch; the owner fills it from its project
+    /// registry at registration. Requires `project_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_key: Option<RootKey>,
     /// Only the holder of the scope's bind proof can bind it when this hash is
     /// present. Without a hash, admission is unchanged and proofs are ignored.
     #[serde(
@@ -510,6 +555,7 @@ impl ScopeRecord {
             kind,
             workdir: None,
             project_id: None,
+            root_key: None,
             bind_proof_sha256: None,
             replace_only_if_idle: false,
             expires_at_ms: None,
@@ -529,6 +575,12 @@ impl ScopeRecord {
     #[must_use]
     pub fn with_project_id(mut self, project_id: Option<String>) -> Self {
         self.project_id = project_id;
+        self
+    }
+
+    #[must_use]
+    pub fn with_root_key(mut self, root_key: Option<RootKey>) -> Self {
+        self.root_key = root_key;
         self
     }
 
@@ -792,6 +844,11 @@ pub struct ScopeStamp {
     /// Entorhinal project id for attribution, never authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
+    /// Repository key of the session folder's root within the project.
+    /// Attribution only, fixed per epoch like `project_id`; the owner supplies
+    /// it from its project registry at registration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_key: Option<RootKey>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<ScopeParent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -825,6 +882,7 @@ impl ScopeStamp {
             kind,
             workdir: None,
             project_id: None,
+            root_key: None,
             parent: None,
             parent_state: None,
             attributes: ScopeAttributes::new(),
@@ -842,6 +900,12 @@ impl ScopeStamp {
     #[must_use]
     pub fn with_project_id(mut self, project_id: Option<String>) -> Self {
         self.project_id = project_id;
+        self
+    }
+
+    #[must_use]
+    pub fn with_root_key(mut self, root_key: Option<RootKey>) -> Self {
+        self.root_key = root_key;
         self
     }
 
@@ -880,6 +944,75 @@ impl ScopeStamp {
 mod tests {
     use super::*;
     use crate::tool_call::OpaqueFieldError;
+
+    #[test]
+    fn scope_root_key_roundtrips_namespaces_and_enforces_key_bounds() {
+        for kind in [RootKeyKind::Remote, RootKeyKind::Label] {
+            for key in ["p", "!~owner/repo", &"p".repeat(128)] {
+                let root = RootKey::new(kind, key);
+                root.validate().unwrap();
+                let wire = serde_json::to_value(&root).unwrap();
+                assert_eq!(serde_json::from_value::<RootKey>(wire).unwrap(), root);
+            }
+        }
+        assert_ne!(
+            RootKey::new(RootKeyKind::Remote, "owner/repo"),
+            RootKey::new(RootKeyKind::Label, "owner/repo")
+        );
+        for key in ["", "has space", "a\n", "é", "\u{007f}", &"a".repeat(129)] {
+            let error = RootKey::new(RootKeyKind::Remote, key)
+                .validate()
+                .unwrap_err();
+            assert!(error.starts_with("root_key"));
+            assert_eq!(validate_root_key(key), Err(error));
+        }
+        for wire in [
+            serde_json::json!({"kind":"future", "key":"owner/repo"}),
+            serde_json::json!({"kind":"remote", "key":"owner/repo", "extra":true}),
+            serde_json::json!({"key":"owner/repo"}),
+            serde_json::json!({"kind":"label"}),
+            serde_json::json!("owner/repo"),
+        ] {
+            assert!(serde_json::from_value::<RootKey>(wire).is_err());
+        }
+    }
+
+    #[test]
+    fn scope_root_key_is_optional_on_records_and_stamps_and_old_stamp_readers_ignore_it() {
+        let record = ScopeRecord::new("session", 1, ScopeKind::Head);
+        assert!(serde_json::to_value(&record)
+            .unwrap()
+            .get("root_key")
+            .is_none());
+        let record = record
+            .with_project_id(Some("project".into()))
+            .with_root_key(Some(RootKey::new(RootKeyKind::Remote, "owner/repo")));
+        let wire = serde_json::to_value(&record).unwrap();
+        assert_eq!(
+            wire["root_key"],
+            serde_json::json!({"kind":"remote", "key":"owner/repo"})
+        );
+        assert_eq!(serde_json::from_value::<ScopeRecord>(wire).unwrap(), record);
+        let stamp = ScopeStamp::new(Principal::Direct, "session", 1, ScopeKind::Head);
+        assert!(serde_json::to_value(&stamp)
+            .unwrap()
+            .get("root_key")
+            .is_none());
+        let stamp = stamp
+            .with_project_id(record.project_id)
+            .with_root_key(record.root_key);
+        let wire = serde_json::to_value(&stamp).unwrap();
+        assert_eq!(
+            serde_json::from_value::<ScopeStamp>(wire.clone()).unwrap(),
+            stamp
+        );
+        #[derive(Deserialize)]
+        struct OldStamp {
+            project_id: Option<String>,
+        }
+        let old: OldStamp = serde_json::from_value(wire).unwrap();
+        assert_eq!(old.project_id.as_deref(), Some("project"));
+    }
 
     #[test]
     fn project_id_is_an_opaque_non_space_ascii_token_of_at_most_128_bytes() {

@@ -1,6 +1,6 @@
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
-use subc_protocol::scope::{ScopeAttributes, ScopeCarrier, ScopeKind};
+use subc_protocol::scope::{RootKey, RootKeyKind, ScopeAttributes, ScopeCarrier, ScopeKind};
 
 const OWNER: &str = "owner";
 const OTHER: &str = "other";
@@ -1036,6 +1036,141 @@ fn scope_workdir_and_project_are_immutable_including_absence_until_a_new_epoch()
             assert_eq!(stamp.workdir, next.workdir);
             assert_eq!(stamp.project_id, next.project_id);
         }
+    }
+}
+
+#[test]
+fn scope_root_key_validation_refuses_sync_and_apply() {
+    let mut table = ScopeTable::new([]);
+    sync(&mut table, OWNER, 1, vec![record("s", 1)]);
+    let mut invalid =
+        vec![record("s", 2).with_root_key(Some(RootKey::new(RootKeyKind::Remote, "owner/repo")))];
+    invalid.extend(
+        ["", "has space", "a\n", "é", "\u{007f}", &"a".repeat(129)]
+            .into_iter()
+            .map(|key| {
+                record("s", 2)
+                    .with_project_id(Some("project".into()))
+                    .with_root_key(Some(RootKey::new(RootKeyKind::Label, key)))
+            }),
+    );
+    for scope in invalid {
+        assert_eq!(
+            table
+                .sync(
+                    OWNER,
+                    ConnectionId::new(1),
+                    |_| true,
+                    2,
+                    vec![scope.clone()]
+                )
+                .unwrap_err()
+                .code,
+            INVALID_CONTROL_BODY
+        );
+        assert_eq!(
+            table
+                .apply(
+                    OWNER,
+                    ConnectionId::new(1),
+                    |_| true,
+                    2,
+                    vec![scope],
+                    vec![]
+                )
+                .unwrap_err()
+                .code,
+            INVALID_CONTROL_BODY
+        );
+        assert_eq!(table.describe(&reserved(OWNER), "s").scope_epoch, Some(1));
+    }
+}
+
+#[test]
+fn scope_root_key_is_immutable_including_absence_and_namespace_until_a_new_epoch() {
+    for delta in [false, true] {
+        for original_root in [None, Some(RootKey::new(RootKeyKind::Remote, "owner/repo"))] {
+            let mut table = ScopeTable::new([]);
+            let original = record("s", 1)
+                .with_project_id(Some("project".into()))
+                .with_root_key(original_root.clone());
+            sync(&mut table, OWNER, 1, vec![original.clone()]);
+            let mut generation = 1;
+            for root_key in [
+                None,
+                Some(RootKey::new(RootKeyKind::Remote, "other/repo")),
+                Some(RootKey::new(RootKeyKind::Remote, "owner/repo")),
+                Some(RootKey::new(RootKeyKind::Label, "owner/repo")),
+            ] {
+                if root_key == original_root {
+                    continue;
+                }
+                generation += 1;
+                let proposed = original.clone().with_root_key(root_key);
+                let result = if delta {
+                    apply(&mut table, generation, vec![proposed], vec![])
+                } else {
+                    sync(&mut table, OWNER, generation, vec![proposed])
+                };
+                assert_eq!(code(&result), Some(error_codes::SCOPE_PROJECT_CHANGED));
+                assert_eq!(
+                    table
+                        .describe(&reserved(OWNER), "s")
+                        .stamp
+                        .unwrap()
+                        .root_key,
+                    original_root
+                );
+            }
+            let next_root = if original_root.is_some() {
+                None
+            } else {
+                Some(RootKey::new(RootKeyKind::Label, "owner/repo"))
+            };
+            let mut next = original.with_root_key(next_root.clone());
+            next.scope_epoch = 2;
+            let result = if delta {
+                apply(&mut table, generation + 1, vec![next], vec![])
+            } else {
+                sync(&mut table, OWNER, generation + 1, vec![next])
+            };
+            assert_eq!(code(&result), None);
+            assert_eq!(
+                table
+                    .describe(&reserved(OWNER), "s")
+                    .stamp
+                    .unwrap()
+                    .root_key,
+                next_root
+            );
+        }
+    }
+}
+
+#[test]
+fn scope_root_key_is_copied_to_admission_and_describe_stamps() {
+    for root_key in [
+        None,
+        Some(RootKey::new(RootKeyKind::Remote, "owner/repo")),
+        Some(RootKey::new(RootKeyKind::Label, "root")),
+    ] {
+        let mut table = ScopeTable::new([]);
+        let scope = record("s", 1)
+            .with_project_id(Some("project".into()))
+            .with_root_key(root_key.clone());
+        sync(&mut table, OWNER, 1, vec![scope]);
+        let selector = ScopeSelector::new(reserved(OWNER), "s", Some(1));
+        let admission =
+            ScopeTable::admission_stamp(OWNER, &table.owners[OWNER].live["s"], &selector);
+        assert_eq!(admission.stamp.root_key, root_key);
+        assert_eq!(
+            table
+                .describe(&reserved(OWNER), "s")
+                .stamp
+                .unwrap()
+                .root_key,
+            root_key
+        );
     }
 }
 

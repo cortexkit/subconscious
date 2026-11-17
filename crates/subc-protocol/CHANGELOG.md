@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.37.4
+
+- Accept optional federated origin principals, stable peer machine ids, portable
+  project/root identity pairs, run ids, flow owner agent ids and the `app` peer class. Roll out
+  readers first: no sender may emit these members
+  until every receiver it reaches runs 0.37.4.
+- Add optional typed `root_key` attribution to local scope records and stamps.
+  Strict record readers require a daemon upgrade before an owner sends it;
+  older stamp readers ignore it. Root keys distinguish `remote` repository names
+  from operator `label`s and remain fixed within an epoch, like `project_id`.
+
 ## 0.37.3
 
 - Add the optional declaration_pending config.get marker and client-only view

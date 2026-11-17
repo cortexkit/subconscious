@@ -1554,6 +1554,18 @@ impl ScopeTable {
                     }
                 })?;
             }
+            if let Some(root_key) = &record.root_key {
+                root_key.validate().map_err(|message| SyncRefusal {
+                    code: INVALID_CONTROL_BODY,
+                    message: message.to_string(),
+                })?;
+                if record.project_id.is_none() {
+                    return Err(SyncRefusal {
+                        code: INVALID_CONTROL_BODY,
+                        message: "root_key requires project_id".to_string(),
+                    });
+                }
+            }
             if let Some(hash) = &record.bind_proof_sha256 {
                 subc_protocol::scope::validate_bind_proof_sha256(hash).map_err(|message| {
                     SyncRefusal {
@@ -1838,11 +1850,13 @@ impl ScopeTable {
                 ))
             }
             Some(held)
-                if epoch == held.record.scope_epoch && record.project_id != held.record.project_id =>
+                if epoch == held.record.scope_epoch
+                    && (record.project_id != held.record.project_id
+                        || record.root_key != held.record.root_key) =>
             {
                 Some((
                     error_codes::SCOPE_PROJECT_CHANGED,
-                    format!("project_id is fixed for scope_epoch {epoch}; use a higher epoch to change it"),
+                    format!("project_id and root_key are fixed for scope_epoch {epoch}; use a higher epoch to change them"),
                 ))
             }
             Some(_) => None,
@@ -2391,6 +2405,7 @@ impl ScopeTable {
             )
             .with_workdir(scope.record.workdir.clone())
             .with_project_id(scope.record.project_id.clone())
+            .with_root_key(scope.record.root_key.clone())
             .with_parent(scope.record.parent.clone())
             .with_parent_state(scope.parent_state)
             .with_attributes(attributes)
@@ -2463,6 +2478,7 @@ impl ScopeTable {
                     )
                     .with_workdir(scope.record.workdir.clone())
                     .with_project_id(scope.record.project_id.clone())
+                    .with_root_key(scope.record.root_key.clone())
                     .with_parent(scope.record.parent.clone())
                     .with_parent_state(scope.parent_state)
                     .with_attributes(scope.record.attributes.clone())

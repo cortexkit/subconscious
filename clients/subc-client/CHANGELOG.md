@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.26.6
+
+- Accept federated `app` peers and optional origin principals, stable peer machine
+  ids, portable project/root identity pairs, run ids and flow owner agent ids with strict validation. Readers ship first:
+  senders must not emit these until every receiver they reach runs protocol 0.37.4.
+- Add typed `root_key` attribution to scope record inputs, distinguishing
+  repository remotes from operator labels. Upgrade daemons before sending records
+  with this member. The SDK's generic management replies remain unchanged.
+
 ## 0.26.5
 
 - Expose pending declaration metadata while applying and acknowledging the

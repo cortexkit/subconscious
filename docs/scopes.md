@@ -66,6 +66,15 @@ Fields:
   Both fields are fixed for the epoch: adding, changing or removing either is
   `scope_workdir_changed` or `scope_project_changed`, respectively. Canonical spellings
   of the same folder compare equal. Use a higher epoch to change them.
+- `root_key`: optional strict object `{"kind":"remote","key":"owner/repo"}` or
+  `{"kind":"label","key":"operator-label"}`. The key is 1–128 printable
+  non-space ASCII bytes; unknown kinds and members are refused. It identifies
+  the session folder's repository root within its project, distinguishing an
+  owned GitHub remote from an operator label even when their text matches.
+  Attribution only, fixed for the epoch like `project_id`; the owner fills it
+  from its project registry at registration. It requires `project_id`.
+  Protocol 0.37.4 adds it to records and stamps: strict record readers require
+  the daemon to ship before an owner sends it; older stamp readers ignore it.
 - `expires_at_ms`: optional absolute Unix wall-clock milliseconds, fixed for the life of an
   epoch. Omitted means no daemon-enforced expiry. It is a record field, not an attribute;
   any owner may set it, for any kind (see the expiry subsection).
@@ -122,9 +131,9 @@ no live route keeps an `owner_authorized` stamp its owner has lost. Providers re
 
 ### Federated identity
 
-A federated scope represents a program on a paired computer, phone or simulator, never a
+A federated scope represents a program on a paired computer, desktop app, phone or simulator, never a
 local agent. The daemon setting `federated_scope_owner` names its exclusive reserved module
-owner (default `callosum`). It is restart-required, like `scope_authority_owners`; rescans
+owner (the pairing module). It is restart-required, like `scope_authority_owners`; rescans
 report a change but do not apply it. The owner is not added to `scope_authority_owners`.
 Even if an operator lists it there, its federated stamps always have `owner_authorized: false`.
 
@@ -141,18 +150,40 @@ list explicit `targets`; an untargeted entry is `scope_carrier_targets_invalid`.
 
 | Member | Type and bounds |
 |---|---|
-| `peer_class` | `computer`, `phone`, `sim` or `unknown` |
+| `peer_class` | `computer`, `app`, `phone`, `sim` or `unknown` |
 | `peer_fingerprint` | exactly 32 lowercase hexadecimal characters |
+| `peer_box_id` | optional paired computer's stable daemon machine id, exactly 32 lowercase hex, as printed by `ck machine show`; from the pairing roster, absent for phones and simulators |
 | `pairing_id` | non-secret opaque token, new for each pairing |
 | `peer_name` | 1–80 Unicode scalar values of plain text, no controls or bidi formatting characters; from the local roster, not the peer's hello |
+| `origin_principal` | optional sending daemon's route principal: `{"kind":"reserved","module_id":"…"}` with a valid registered module id, or `{"kind":"direct"}`; `unverified` is refused |
+| `project` | optional strict object with required `project_id` (portable project key, opaque token) and `root_key` (`{"kind":"remote","key":"owner/repo"}` or `{"kind":"label","key":"operator-label"}`); root keys are 1–128 printable non-space ASCII bytes |
 | `remote_claim` | optional strict object, tagged by `kind`, as below |
 
 | Claim kind | Required members | Optional members |
 |---|---|---|
 | `agent` | `agent_id`: opaque token | `agent_name`: claimed agent's display name |
 | `worker` | `owner_module_id`: registered module-id syntax; `worker_ref`: exactly 64 lowercase hex | `on_behalf_of`: opaque token, display only; `agent_name`: display name of the agent identified by `on_behalf_of`, not the worker |
-| `run` | `agent_id`: opaque token | `agent_name`: claimed agent's display name |
-| `flow` | `flow_id`, `flow_install_id`: opaque tokens; `flow_version`: integer 1..9007199254740991; `flow_code_hash`: exactly 64 lowercase hex | `flow_name`: flow's display name |
+| `run` | `agent_id`: opaque token | `run_id`: opaque token for the sending run; `agent_name`: claimed agent's display name |
+| `flow` | `flow_id`, `flow_install_id`: opaque tokens; `flow_version`: integer 1..9007199254740991; `flow_code_hash`: exactly 64 lowercase hex | `agent_id`: owning agent's opaque token from the sending flow scope, absent for operator-installed global flows; `flow_name`: flow's display name |
+
+The pairing module carries `origin_principal` from the sending computer's daemon stamp
+on the route that opened the call. It sits beside `remote_claim` because a module-to-module
+call has no claim; only `reserved` names a launch-verified sending module. A receiving
+module must not confuse this remote fact with the local bind's principal. Unlike
+`peer_fingerprint`, `peer_box_id` survives a re-key, so receivers comparing residence
+records (which computer hosts a resource) use the stable machine id.
+
+The pairing module carries `project` from the sending computer's scope stamp.
+Together, `project_id` and the typed `root_key` name a folder portably. A receiving
+module resolves the pair through its own project registry; it never uses a path
+from another computer. Remote repository names and operator labels remain distinct
+even when their key text matches; unknown root-key kinds or members are refused.
+
+Protocol 0.37.4 is a readers-first release: decoders accept these optional fields and `app`
+now, but no sender may emit them until every receiver it reaches runs 0.37.4. Older strict
+readers reject each addition. Old senders remain valid; absent optional fields are omitted,
+not emitted as null. Origin principal, peer machine id, project/root pair, run id and flow owner agent id are
+identity-bearing, not display metadata.
 
 Opaque tokens use subc's 1–256 printable non-space ASCII byte rule. Module ids use the same
 validation as registration: nonempty, at most 255 UTF-8 bytes, not `.` or `..`, no path

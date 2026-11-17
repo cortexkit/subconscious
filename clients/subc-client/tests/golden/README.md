@@ -24,3 +24,9 @@ TypeScript encoder being tested.
 Federated claim fixtures include `agent_name` or `flow_name` on each named claim
 kind. Their identity fields are unchanged; the names were added to the harness
 inputs and serialized through Rust again. Claimless fixtures remain unchanged.
+
+The `federated-extended-run` and `federated-extended-flow` samples cover the
+readers-first additions: `app`, `peer_box_id`, `origin_principal`, the portable
+`project` pair with a typed root key, and the claim's run id or owning agent id.
+They are constructed and serialized by a scratch Rust harness; the older samples
+remain unchanged to pin omission compatibility with old senders.

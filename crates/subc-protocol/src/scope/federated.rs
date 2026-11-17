@@ -1,11 +1,15 @@
 use serde::{Deserialize, Serialize};
 
+use super::RootKey;
+use crate::Principal;
+
 /// The paired peer's class, attested by the configured federated owner.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum FederatedPeerClass {
     Computer,
+    App,
     Phone,
     Sim,
     Unknown,
@@ -60,6 +64,8 @@ pub enum RemoteClaim {
     #[non_exhaustive]
     Run {
         agent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
         #[serde(
             default,
             deserialize_with = "deserialize_name",
@@ -78,6 +84,10 @@ pub enum RemoteClaim {
         flow_version: u64,
         flow_install_id: String,
         flow_code_hash: String,
+        /// The flow's owning agent from the sending flow scope; absent for
+        /// operator-installed global flows.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
         #[serde(
             default,
             deserialize_with = "deserialize_name",
@@ -129,6 +139,7 @@ impl RemoteClaim {
     pub fn run(agent_id: impl Into<String>) -> Self {
         Self::Run {
             agent_id: agent_id.into(),
+            run_id: None,
             agent_name: None,
         }
     }
@@ -144,6 +155,7 @@ impl RemoteClaim {
             flow_version,
             flow_install_id: flow_install_id.into(),
             flow_code_hash: flow_code_hash.into(),
+            agent_id: None,
             flow_name: None,
         }
     }
@@ -171,6 +183,27 @@ impl RemoteClaim {
         self
     }
 
+    /// Set the run id. Has no effect on agent, worker or flow claims.
+    #[must_use]
+    pub fn with_run_id(mut self, run_id: impl Into<String>) -> Self {
+        if let Self::Run { run_id: value, .. } = &mut self {
+            *value = Some(run_id.into());
+        }
+        self
+    }
+
+    /// Set the flow's owning agent. Has no effect on agent, run or worker claims.
+    #[must_use]
+    pub fn with_flow_agent(mut self, agent_id: impl Into<String>) -> Self {
+        if let Self::Flow {
+            agent_id: value, ..
+        } = &mut self
+        {
+            *value = Some(agent_id.into());
+        }
+        self
+    }
+
     /// Check identity fields, including the shared opaque-token bounds.
     /// Display names never invalidate a claim; decoders drop invalid names.
     pub fn validate(&self) -> Result<(), String> {
@@ -178,8 +211,15 @@ impl RemoteClaim {
             crate::tool_call::validate_opaque_field(name, value).map_err(|e| e.to_string())
         };
         match self {
-            Self::Agent { agent_id, .. } | Self::Run { agent_id, .. } => {
-                token("agent_id", agent_id)
+            Self::Agent { agent_id, .. } => token("agent_id", agent_id),
+            Self::Run {
+                agent_id, run_id, ..
+            } => {
+                token("agent_id", agent_id)?;
+                if let Some(run_id) = run_id {
+                    super::validate_run_id(run_id).map_err(|e| e.to_string())?;
+                }
+                Ok(())
             }
             Self::Worker {
                 owner_module_id,
@@ -199,11 +239,15 @@ impl RemoteClaim {
                 flow_version,
                 flow_install_id,
                 flow_code_hash,
+                agent_id,
                 ..
             } => {
                 token("flow_id", flow_id)?;
                 super::validate_flow_version(*flow_version).map_err(str::to_string)?;
                 token("flow_install_id", flow_install_id)?;
+                if let Some(agent_id) = agent_id {
+                    token("agent_id", agent_id)?;
+                }
                 hex("flow_code_hash", flow_code_hash, 64)
             }
         }
@@ -223,6 +267,33 @@ fn deserialize_name<'de, D: serde::Deserializer<'de>>(
     Ok(value.as_str().and_then(|name| valid_name(name.to_owned())))
 }
 
+/// Portable project key and repository root key from the sending scope stamp,
+/// carried by the pairing module. Together they name a folder portably:
+/// receivers resolve the pair through their own project registry and never use
+/// a path from another computer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct FederatedProject {
+    pub project_id: String,
+    pub root_key: RootKey,
+}
+
+impl FederatedProject {
+    pub fn new(project_id: impl Into<String>, root_key: RootKey) -> Self {
+        Self {
+            project_id: project_id.into(),
+            root_key,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        crate::tool_call::validate_opaque_field("project_id", &self.project_id)
+            .map_err(|e| e.to_string())?;
+        self.root_key.validate().map_err(str::to_string)
+    }
+}
+
 /// Facts from the local pairing roster. Fixed for the scope's epoch.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -234,8 +305,27 @@ pub struct FederatedAttributes {
     pub stamp_required: bool,
     pub peer_class: FederatedPeerClass,
     pub peer_fingerprint: String,
+    /// Stable paired computer machine id from the pairing roster, absent for
+    /// phones and simulators. Unlike `peer_fingerprint`, it survives a re-key,
+    /// so receivers comparing records of which computer hosts a resource use
+    /// this id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_box_id: Option<String>,
     pub pairing_id: String,
     pub peer_name: String,
+    /// The principal the sending computer's daemon stamped on the route that
+    /// opened this call, carried by the pairing module. It sits beside the claim
+    /// because a module-to-module call carries no claim. Only `reserved` names
+    /// a launch-verified module.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_origin_principal",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub origin_principal: Option<Principal>,
+    /// Portable project and root keys from the sending session's scope stamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<FederatedProject>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_claim: Option<RemoteClaim>,
 }
@@ -263,8 +353,11 @@ impl FederatedAttributes {
             peer_class,
             stamp_required: false,
             peer_fingerprint,
+            peer_box_id: None,
             pairing_id,
             peer_name,
+            origin_principal: None,
+            project: None,
             remote_claim: None,
         }
     }
@@ -275,9 +368,34 @@ impl FederatedAttributes {
         self
     }
 
+    #[must_use]
+    pub fn with_origin_principal(mut self, principal: Option<Principal>) -> Self {
+        self.origin_principal = principal;
+        self
+    }
+
+    #[must_use]
+    pub fn with_project(mut self, project: Option<FederatedProject>) -> Self {
+        self.project = project;
+        self
+    }
+
     /// Validate both decoded and programmatically constructed attributes.
     pub fn validate(&self) -> Result<(), String> {
         hex("peer_fingerprint", &self.peer_fingerprint, 32)?;
+        if let Some(peer_box_id) = &self.peer_box_id {
+            hex("peer_box_id", peer_box_id, 32)?;
+        }
+        match &self.origin_principal {
+            Some(Principal::Reserved { module_id }) => {
+                crate::manifest::validate_module_id(module_id).map_err(|e| e.to_string())?;
+            }
+            Some(Principal::Unverified) => return Err("origin_principal is unverified".into()),
+            Some(Principal::Direct) | None => {}
+        }
+        if let Some(project) = &self.project {
+            project.validate()?;
+        }
         crate::tool_call::validate_opaque_field("pairing_id", &self.pairing_id)
             .map_err(|e| e.to_string())?;
         crate::manifest::validate_plain_text(&self.peer_name, 80)
@@ -302,9 +420,17 @@ fn hex(name: &str, value: &str, length: usize) -> Result<(), String> {
     Ok(())
 }
 
+fn deserialize_origin_principal<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Principal>, D::Error> {
+    Option::<super::ScopePrincipal>::deserialize(deserializer)
+        .map(|principal| principal.map(Into::into))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scope::RootKeyKind;
     use serde_json::json;
 
     fn attributes() -> FederatedAttributes {
@@ -425,6 +551,7 @@ mod tests {
             },
             RemoteClaim::Run {
                 agent_id: "a".repeat(256),
+                run_id: None,
                 agent_name: None,
             },
             RemoteClaim::Worker {
@@ -438,6 +565,7 @@ mod tests {
                 flow_version: 9_007_199_254_740_991,
                 flow_install_id: "b".repeat(256),
                 flow_code_hash: "f".repeat(64),
+                agent_id: None,
                 flow_name: None,
             },
         ] {
@@ -516,6 +644,7 @@ mod tests {
     fn federated_attributes_roundtrip_classes_and_enforce_limits_and_unknown_members() {
         for class in [
             FederatedPeerClass::Computer,
+            FederatedPeerClass::App,
             FederatedPeerClass::Phone,
             FederatedPeerClass::Sim,
             FederatedPeerClass::Unknown,
@@ -564,6 +693,370 @@ mod tests {
         let mut facts = attributes();
         facts.pairing_id = "x".repeat(256);
         facts.validate().unwrap();
+    }
+
+    #[test]
+    fn federated_new_members_roundtrip_and_old_senders_decode_unchanged() {
+        let old = json!({
+            "peer_class": "computer", "peer_fingerprint": "a".repeat(32),
+            "pairing_id": "pairing", "peer_name": "Peer"
+        });
+        let decoded: FederatedAttributes = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(decoded, attributes());
+        assert_eq!(serde_json::to_value(decoded).unwrap(), old);
+        for claim in [
+            RemoteClaim::run("agent"),
+            RemoteClaim::flow("flow", 1, "install", "b".repeat(64)),
+        ] {
+            let value = serde_json::to_value(&claim).unwrap();
+            assert!(value.get("run_id").is_none());
+            if matches!(claim, RemoteClaim::Flow { .. }) {
+                assert!(value.get("agent_id").is_none());
+            }
+            assert_eq!(serde_json::from_value::<RemoteClaim>(value).unwrap(), claim);
+        }
+        for principal in [
+            Principal::Direct,
+            Principal::Reserved {
+                module_id: "origin-module".into(),
+            },
+        ] {
+            for claim in [
+                RemoteClaim::run("agent").with_run_id("run-1"),
+                RemoteClaim::flow("flow", 1, "install", "b".repeat(64)).with_flow_agent("agent"),
+            ] {
+                let mut facts = attributes()
+                    .with_origin_principal(Some(principal.clone()))
+                    .with_remote_claim(Some(claim));
+                facts.peer_class = FederatedPeerClass::App;
+                facts.peer_box_id = Some("0123456789abcdef".repeat(2));
+                facts = facts.with_project(Some(FederatedProject::new(
+                    "project",
+                    RootKey::new(RootKeyKind::Remote, "owner/repo"),
+                )));
+                facts.validate().unwrap();
+                let wire = serde_json::to_value(&facts).unwrap();
+                assert_eq!(wire["peer_class"], "app");
+                assert_eq!(
+                    wire["origin_principal"],
+                    serde_json::to_value(&principal).unwrap()
+                );
+                assert_eq!(wire["peer_box_id"], "0123456789abcdef".repeat(2));
+                assert_eq!(
+                    wire["project"],
+                    json!({"project_id":"project", "root_key":{"kind":"remote", "key":"owner/repo"}})
+                );
+                assert_eq!(
+                    serde_json::from_value::<FederatedAttributes>(wire).unwrap(),
+                    facts
+                );
+            }
+        }
+        assert_eq!(
+            RemoteClaim::agent("agent")
+                .with_run_id("run")
+                .with_flow_agent("owner"),
+            RemoteClaim::agent("agent")
+        );
+        assert_eq!(
+            RemoteClaim::run("agent").with_flow_agent("owner"),
+            RemoteClaim::run("agent")
+        );
+        let flow = RemoteClaim::flow("flow", 1, "install", "b".repeat(64));
+        assert_eq!(flow.clone().with_run_id("run"), flow);
+        let worker = RemoteClaim::worker("owner", "b".repeat(64), None);
+        assert_eq!(
+            worker.clone().with_run_id("run").with_flow_agent("owner"),
+            worker
+        );
+    }
+
+    #[test]
+    fn federated_new_identity_members_enforce_bounds() {
+        for module_id in [
+            "".into(),
+            ".".into(),
+            "..".into(),
+            "a/b".into(),
+            "a\\b".into(),
+            "\n".into(),
+            "x".repeat(256),
+        ] {
+            assert!(attributes()
+                .with_origin_principal(Some(Principal::Reserved { module_id }))
+                .validate()
+                .is_err());
+        }
+        attributes()
+            .with_origin_principal(Some(Principal::Reserved {
+                module_id: "x".repeat(255),
+            }))
+            .validate()
+            .unwrap();
+        attributes()
+            .with_origin_principal(Some(Principal::Direct))
+            .validate()
+            .unwrap();
+        assert!(attributes()
+            .with_origin_principal(Some(Principal::Unverified))
+            .validate()
+            .is_err());
+        for value in [
+            "".into(),
+            "x".repeat(257),
+            "has space".into(),
+            "\n".into(),
+            "é".into(),
+            "\u{007f}".into(),
+        ] {
+            assert!(RemoteClaim::run("agent")
+                .with_run_id(&value)
+                .validate()
+                .is_err());
+            assert!(RemoteClaim::flow("flow", 1, "install", "b".repeat(64))
+                .with_flow_agent(&value)
+                .validate()
+                .is_err());
+            assert!(attributes()
+                .with_project(Some(FederatedProject::new(
+                    &value,
+                    RootKey::new(RootKeyKind::Remote, "owner/repo")
+                )))
+                .validate()
+                .is_err());
+            assert!(attributes()
+                .with_project(Some(FederatedProject::new(
+                    "project",
+                    RootKey::new(RootKeyKind::Label, &value)
+                )))
+                .validate()
+                .is_err());
+        }
+        for value in ["!".to_owned(), "~".repeat(256)] {
+            RemoteClaim::run("agent")
+                .with_run_id(&value)
+                .validate()
+                .unwrap();
+            RemoteClaim::flow("flow", 1, "install", "b".repeat(64))
+                .with_flow_agent(&value)
+                .validate()
+                .unwrap();
+            attributes()
+                .with_project(Some(FederatedProject::new(
+                    &value,
+                    RootKey::new(RootKeyKind::Label, "root"),
+                )))
+                .validate()
+                .unwrap();
+        }
+        for value in [
+            "".into(),
+            "a".repeat(31),
+            "a".repeat(33),
+            "A".repeat(32),
+            "g".repeat(32),
+        ] {
+            let mut facts = attributes();
+            facts.peer_box_id = Some(value);
+            assert!(facts.validate().is_err());
+        }
+        for principal in [
+            json!({"kind":"reserved", "module_id":"origin", "extra":true}),
+            json!({"kind":"direct", "extra":true}),
+            json!({"kind":"future"}),
+        ] {
+            let mut wire = serde_json::to_value(attributes()).unwrap();
+            wire["origin_principal"] = principal;
+            assert!(serde_json::from_value::<FederatedAttributes>(wire).is_err());
+        }
+    }
+
+    #[test]
+    fn federated_project_requires_both_keys_and_refuses_unknown_members() {
+        for kind in [RootKeyKind::Remote, RootKeyKind::Label] {
+            let project = FederatedProject::new("project", RootKey::new(kind, "~".repeat(128)));
+            project.validate().unwrap();
+            let wire = serde_json::to_value(&project).unwrap();
+            assert_eq!(
+                serde_json::from_value::<FederatedProject>(wire).unwrap(),
+                project
+            );
+        }
+        assert!(FederatedProject::new(
+            "project",
+            RootKey::new(RootKeyKind::Remote, "x".repeat(129))
+        )
+        .validate()
+        .is_err());
+        for project in [
+            json!({}),
+            json!({"project_id":"project"}),
+            json!({"root_key":{"kind":"remote", "key":"owner/repo"}}),
+            json!({"project_id":"project", "root_key":"owner/repo"}),
+            json!({"project_id":"project", "root_key":{"kind":"future", "key":"owner/repo"}}),
+            json!({"project_id":"project", "root_key":{"kind":"remote", "key":"owner/repo", "extra":true}}),
+            json!({"project_id":"project", "root_key":{"kind":"remote", "key":"owner/repo"}, "extra":true}),
+        ] {
+            let mut wire = serde_json::to_value(attributes()).unwrap();
+            wire["project"] = project;
+            assert!(serde_json::from_value::<FederatedAttributes>(wire).is_err());
+        }
+    }
+
+    #[test]
+    fn federated_same_identity_counts_every_new_member() {
+        let base = attributes();
+        let mut with_box = base.clone();
+        with_box.peer_box_id = Some("b".repeat(32));
+        let mut app = base.clone();
+        app.peer_class = FederatedPeerClass::App;
+        let project = base.clone().with_project(Some(FederatedProject::new(
+            "project-one",
+            RootKey::new(RootKeyKind::Remote, "owner/repo"),
+        )));
+        for changed in [
+            with_box.clone(),
+            project.clone(),
+            app,
+            base.clone().with_origin_principal(Some(Principal::Direct)),
+        ] {
+            assert!(!base.same_identity(&changed));
+        }
+        let mut other_box = with_box.clone();
+        other_box.peer_box_id = Some("c".repeat(32));
+        assert!(!with_box.same_identity(&other_box));
+        for other_project in [
+            FederatedProject::new(
+                "project-two",
+                RootKey::new(RootKeyKind::Remote, "owner/repo"),
+            ),
+            FederatedProject::new(
+                "project-one",
+                RootKey::new(RootKeyKind::Remote, "other/repo"),
+            ),
+            FederatedProject::new(
+                "project-one",
+                RootKey::new(RootKeyKind::Label, "owner/repo"),
+            ),
+        ] {
+            assert!(!project.same_identity(&base.clone().with_project(Some(other_project))));
+        }
+        assert!(!base
+            .clone()
+            .with_origin_principal(Some(Principal::Direct))
+            .same_identity(
+                &base
+                    .clone()
+                    .with_origin_principal(Some(Principal::Reserved {
+                        module_id: "origin".into()
+                    }))
+            ));
+        for (old, new, other) in [
+            (
+                RemoteClaim::run("agent"),
+                RemoteClaim::run("agent").with_run_id("one"),
+                RemoteClaim::run("agent").with_run_id("two"),
+            ),
+            (
+                RemoteClaim::flow("flow", 1, "install", "b".repeat(64)),
+                RemoteClaim::flow("flow", 1, "install", "b".repeat(64)).with_flow_agent("one"),
+                RemoteClaim::flow("flow", 1, "install", "b".repeat(64)).with_flow_agent("two"),
+            ),
+        ] {
+            assert!(!old.same_identity(&new));
+            assert!(!new.same_identity(&other));
+            assert!(!base
+                .clone()
+                .with_remote_claim(Some(old))
+                .same_identity(&base.clone().with_remote_claim(Some(new.clone()))));
+            assert!(new.same_identity(&new.clone().with_agent_name("Name").with_flow_name("Name")));
+        }
+    }
+
+    #[test]
+    fn federated_readers_first_rollout_new_members_are_refused_by_strict_0373_readers() {
+        // Freeze the 0.37.3 shapes: senders must wait until receivers have the
+        // new readers, because each addition is refused by the old schema.
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Peer0373 {
+            Computer,
+            Phone,
+            Sim,
+            Unknown,
+        }
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+        #[allow(dead_code)]
+        enum Claim0373 {
+            Agent {
+                agent_id: String,
+                #[serde(default, deserialize_with = "deserialize_name")]
+                agent_name: Option<String>,
+            },
+            Worker {
+                owner_module_id: String,
+                worker_ref: String,
+                #[serde(default)]
+                on_behalf_of: Option<String>,
+                #[serde(default, deserialize_with = "deserialize_name")]
+                agent_name: Option<String>,
+            },
+            Run {
+                agent_id: String,
+                #[serde(default, deserialize_with = "deserialize_name")]
+                agent_name: Option<String>,
+            },
+            Flow {
+                flow_id: String,
+                flow_version: u64,
+                flow_install_id: String,
+                flow_code_hash: String,
+                #[serde(default, deserialize_with = "deserialize_name")]
+                flow_name: Option<String>,
+            },
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        #[allow(dead_code)]
+        struct Attributes0373 {
+            #[serde(default)]
+            stamp_required: bool,
+            peer_class: Peer0373,
+            peer_fingerprint: String,
+            pairing_id: String,
+            peer_name: String,
+            #[serde(default)]
+            remote_claim: Option<Claim0373>,
+        }
+        let base = serde_json::to_value(attributes()).unwrap();
+        serde_json::from_value::<Attributes0373>(base.clone()).unwrap();
+        for (field, value) in [
+            ("peer_class", json!("app")),
+            ("peer_box_id", json!("b".repeat(32))),
+            (
+                "project",
+                json!({"project_id":"project", "root_key":{"kind":"remote", "key":"owner/repo"}}),
+            ),
+            ("origin_principal", json!({"kind":"direct"})),
+            (
+                "remote_claim",
+                json!({"kind":"run", "agent_id":"agent", "run_id":"run"}),
+            ),
+            (
+                "remote_claim",
+                json!({"kind":"flow", "flow_id":"flow", "flow_version":1, "flow_install_id":"install", "flow_code_hash":"b".repeat(64), "agent_id":"agent"}),
+            ),
+        ] {
+            let mut wire = base.clone();
+            wire[field] = value;
+            let new: FederatedAttributes = serde_json::from_value(wire.clone()).unwrap();
+            new.validate().unwrap();
+            assert!(
+                serde_json::from_value::<Attributes0373>(wire).is_err(),
+                "{field}"
+            );
+        }
     }
 
     #[test]

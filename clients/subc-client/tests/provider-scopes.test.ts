@@ -39,12 +39,20 @@ function withClaim(remote_claim: RemoteClaim | null | undefined): ScopeRecord {
   return { ...federated, attributes: { federated: { ...federated.attributes!.federated!, remote_claim } } };
 }
 const federatedNull = withClaim(null);
+const federatedExtended = (claim: RemoteClaim): ScopeRecord => ({
+  ...federated, attributes: { federated: {
+    ...federated.attributes!.federated!, peer_class: "app", peer_box_id: "d".repeat(32),
+    origin_principal: { kind: "reserved", module_id: "origin-module" }, project: { project_id: "project", root_key: { kind: "remote", key: "owner/repo" } }, remote_claim: claim,
+  } },
+});
 const federatedClaimCases = [
   ["federated-agent", withClaim({ kind: "agent", agent_id: "remote-agent", agent_name: "Remote Agent" })],
   ["federated-worker", withClaim({ kind: "worker", owner_module_id: "worker-owner", worker_ref: "c".repeat(64), on_behalf_of: "remote-agent", agent_name: "Delegating Agent" })],
   ["federated-run", withClaim({ kind: "run", agent_id: "remote-agent", agent_name: "Remote Agent" })],
   ["federated-claimless", withClaim(undefined)],
   ["federated-claimless", federatedNull],
+  ["federated-extended-run", federatedExtended({ kind: "run", agent_id: "remote-agent", run_id: "run-1" })],
+  ["federated-extended-flow", federatedExtended({ kind: "flow", flow_id: "flow", flow_version: 1, flow_install_id: "install", flow_code_hash: "b".repeat(64), agent_id: "remote-agent" })],
 ] as const;
 const defaulted: ScopeRecord = {
   ...minimal, workdir: null, project_id: null, bind_proof_sha256: null,
@@ -90,6 +98,68 @@ async function sent(writes: Frame[], count = 1) {
 }
 
 describe("provider scope control", () => {
+  test("local root keys are optional typed attribution requiring a project", () => {
+    const encode = (patch: object) => JSON.parse(JSON.stringify(scopeRecordWire({ ...minimal, ...patch } as ScopeRecord)));
+    const old = encode({});
+    expect(old).not.toHaveProperty("root_key");
+    expect(encode({ root_key: null })).toEqual(old);
+    for (const kind of ["remote", "label"] as const) {
+      for (const key of ["!", "owner/repo", "~".repeat(128)]) {
+        expect(encode({ project_id: "project", root_key: { kind, key } })).toMatchObject({ project_id: "project", root_key: { kind, key } });
+      }
+    }
+    for (const root_key of [
+      "owner/repo", false, [], {}, { kind: "future", key: "root" },
+      { kind: "remote" }, { key: "root" }, { kind: "label", key: "root", extra: true },
+      ...["", "x".repeat(129), "has space", "valid\n", "é", "\u007f", null, 1, {}].map((key) => ({ kind: "remote", key })),
+    ]) expect(() => encode({ project_id: "project", root_key })).toThrow(TypeError);
+    for (const project_id of [undefined, null]) expect(() => encode({ project_id, root_key: { kind: "remote", key: "owner/repo" } })).toThrow("root_key requires project_id");
+  });
+  test("federated optional identity members preserve old senders and direct claimless origins", () => {
+    const encode = (patch: object) => JSON.parse(JSON.stringify(scopeRecordWire({
+      ...federated, attributes: { federated: { ...federated.attributes!.federated!, ...patch } },
+    }))).attributes.federated;
+    const old = encode({});
+    expect(old).not.toHaveProperty("peer_box_id");
+    expect(old).not.toHaveProperty("origin_principal");
+    expect(old).not.toHaveProperty("project");
+    expect(encode({ peer_box_id: null, origin_principal: null, project: null })).toEqual(old);
+    for (const value of ["!", "~".repeat(256)]) expect(encode({ project: { project_id: value, root_key: { kind: "label", key: "root" } } }).project.project_id).toBe(value);
+    for (const value of ["", "x".repeat(257), "has space", "\n", "valid\n", "é", "\u007f", 1, {}]) expect(() => encode({ project: { project_id: value, root_key: { kind: "remote", key: "owner/repo" } } })).toThrow(TypeError);
+    for (const value of ["!", "~".repeat(128)]) expect(encode({ project: { project_id: "project", root_key: { kind: "label", key: value } } }).project.root_key.key).toBe(value);
+    for (const value of ["", "x".repeat(129), "has space", "\n", "valid\n", "é", "\u007f", 1, {}]) expect(() => encode({ project: { project_id: "project", root_key: { kind: "remote", key: value } } })).toThrow(TypeError);
+    for (const project of [false, [], {}, { project_id: "project" }, { root_key: { kind: "label", key: "root" } }, { project_id: "project", root_key: { kind: "future", key: "root" } }, { project_id: "project", root_key: { kind: "label", key: "root", extra: true } }, { project_id: "project", root_key: { kind: "label", key: "root" }, extra: true }]) expect(() => encode({ project })).toThrow(TypeError);
+    expect(encode({ origin_principal: { kind: "direct" }, remote_claim: null })).toEqual({
+      peer_class: "computer", peer_fingerprint: "a".repeat(32), pairing_id: "pair:1", peer_name: "Peer", origin_principal: { kind: "direct" },
+    });
+    for (const [claim, key] of [
+      [{ kind: "run", agent_id: "agent" }, "run_id"],
+      [{ kind: "flow", flow_id: "flow", flow_version: 1, flow_install_id: "install", flow_code_hash: "a".repeat(64) }, "agent_id"],
+    ] as const) {
+      expect(encode({ remote_claim: claim }).remote_claim).not.toHaveProperty(key);
+      expect(encode({ remote_claim: { ...claim, [key]: null } }).remote_claim).toEqual(claim);
+      for (const value of ["!", "~".repeat(256)]) expect(encode({ remote_claim: { ...claim, [key]: value } }).remote_claim[key]).toBe(value);
+      for (const value of ["", "x".repeat(257), "has space", "\n", "valid\n", "é", "\u007f", 1, {}]) {
+        expect(() => encode({ remote_claim: { ...claim, [key]: value } })).toThrow(TypeError);
+      }
+    }
+  });
+  test("federated new identity members validate machine ids and origin principals strictly", () => {
+    const encode = (patch: object) => scopeRecordWire({
+      ...federated, attributes: { federated: { ...federated.attributes!.federated!, ...patch } },
+    } as ScopeRecord);
+    expect(encode({ peer_class: "app", peer_box_id: "0123456789abcdef".repeat(2) })).toMatchObject({ attributes: { federated: { peer_class: "app", peer_box_id: "0123456789abcdef".repeat(2) } } });
+    for (const value of ["", "a".repeat(31), "a".repeat(33), "A".repeat(32), "g".repeat(32), `${"a".repeat(32)}\n`, 1, {}]) expect(() => encode({ peer_box_id: value })).toThrow(TypeError);
+    for (const module_id of ["x".repeat(255), "é".repeat(127), "mcp:module"]) expect(() => encode({ origin_principal: { kind: "reserved", module_id } })).not.toThrow();
+    for (const module_id of ["", ".", "..", "a/b", "a\\b", "\n", "x".repeat(256), "é".repeat(128), "\ud800"]) expect(() => encode({ origin_principal: { kind: "reserved", module_id } })).toThrow(TypeError);
+    for (const origin_principal of [{ kind: "unverified" }, { kind: "future" }, { kind: "direct", extra: true }, { kind: "reserved", module_id: "origin", extra: true }, false, 1, "direct", []]) expect(() => encode({ origin_principal })).toThrow(TypeError);
+    for (const patch of [
+      { peer_class: "future" }, { extra: true },
+      { remote_claim: { kind: "agent", agent_id: "agent", run_id: "run" } },
+      { remote_claim: { kind: "run", agent_id: "agent", extra: true } },
+      { remote_claim: { kind: "flow", flow_id: "flow", flow_version: 1, flow_install_id: "install", flow_code_hash: "a".repeat(64), run_id: "run" } },
+    ]) expect(() => encode(patch)).toThrow(TypeError);
+  });
   test("federated names are optional and invalid display names are dropped on every claim kind", () => {
     for (const claim of [
       { kind: "agent", agent_id: "agent" }, { kind: "run", agent_id: "agent" },

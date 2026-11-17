@@ -1875,3 +1875,63 @@ fn federated_scope_requests_match_typescript_goldens() {
         }
     }
 }
+
+#[test]
+fn federated_extended_scope_requests_match_typescript_goldens() {
+    use subc_protocol::scope::{
+        FederatedAttributes, FederatedPeerClass, FederatedProject, RemoteClaim, RootKey,
+        RootKeyKind, ScopeAttributes, ScopeEnd, ScopeKind, ScopeRecord,
+    };
+    use subc_protocol::session::ModuleControlRequestFromModule;
+    for (name, claim) in [
+        ("run", RemoteClaim::run("remote-agent").with_run_id("run-1")),
+        (
+            "flow",
+            RemoteClaim::flow("flow", 1, "install", "b".repeat(64)).with_flow_agent("remote-agent"),
+        ),
+    ] {
+        let mut facts = FederatedAttributes::new(
+            FederatedPeerClass::App,
+            "a".repeat(32),
+            "pair:1".into(),
+            "Peer".into(),
+        )
+        .with_origin_principal(Some(subc_protocol::Principal::Reserved {
+            module_id: "origin-module".into(),
+        }))
+        .with_project(Some(FederatedProject::new(
+            "project",
+            RootKey::new(RootKeyKind::Remote, "owner/repo"),
+        )))
+        .with_remote_claim(Some(claim));
+        facts.peer_box_id = Some("d".repeat(32));
+        facts.validate().unwrap();
+        let record = ScopeRecord::new("peer", 1, ScopeKind::Federated)
+            .with_attributes(ScopeAttributes::new().with_federated(Some(facts)));
+        for (op, request) in [
+            (
+                "sync",
+                ModuleControlRequestFromModule::ScopeSync {
+                    generation: 7,
+                    scopes: vec![record.clone()],
+                },
+            ),
+            (
+                "apply",
+                ModuleControlRequestFromModule::ScopeApply {
+                    generation: 8,
+                    upsert: vec![record],
+                    end: vec![ScopeEnd::new("old", 1)],
+                },
+            ),
+        ] {
+            let fixture = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("../../clients/subc-client/tests/golden/scope-{op}-federated-extended-{name}.json"))).unwrap();
+            assert_eq!(serde_json::to_string(&request).unwrap(), fixture);
+            assert_eq!(
+                serde_json::from_str::<ModuleControlRequestFromModule>(&fixture).unwrap(),
+                request
+            );
+        }
+    }
+}

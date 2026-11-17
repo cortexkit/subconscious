@@ -8,6 +8,80 @@ pub(crate) struct SettingsRig {
 }
 
 #[test]
+fn config_settings_retries_status_change_during_capture() {
+    for repair in [true, false] {
+        let rig = SettingsRig::new();
+        rig.stamp();
+        rig.activate();
+        let approved = rig.edit_limit(8);
+        rig.activate_generation(2);
+        if repair {
+            rig.write(b"{");
+        }
+        let path = rig.root.join("cortexkit/sample-reader.jsonc");
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = attempts.clone();
+        *rig.owner.settings_status_hook.lock().unwrap() = Some(Box::new(move || {
+            if counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                // Change the write-back status after its first read but before
+                // capture, exercising both a repair and a newly broken file.
+                std::fs::write(&path, if repair { &approved[..] } else { b"{" }).unwrap();
+            }
+            Ok(())
+        }));
+        let ConfigControlResponse::Modules { modules, .. } =
+            rig.owner.settings_modules(BTreeSet::new()).unwrap()
+        else {
+            panic!("expected module rows")
+        };
+        assert_eq!(
+            modules[0].status,
+            if repair {
+                "adopted"
+            } else {
+                "write_back_behind"
+            }
+        );
+        assert_eq!(modules[0].file_error.is_none(), repair);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+}
+
+#[test]
+fn config_settings_status_changes_have_bounded_retries_and_transient_refusal() {
+    let rig = SettingsRig::new();
+    rig.stamp();
+    rig.activate();
+    let approved = rig.edit_limit(8);
+    rig.activate_generation(2);
+    let path = rig.root.join("cortexkit/sample-reader.jsonc");
+    let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = attempts.clone();
+    *rig.owner.settings_status_hook.lock().unwrap() = Some(Box::new(move || {
+        let attempt = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::fs::write(
+            &path,
+            if attempt.is_multiple_of(2) {
+                b"{"
+            } else {
+                &approved[..]
+            },
+        )
+        .unwrap();
+        Ok(())
+    }));
+    assert!(rig
+        .owner
+        .observe_settings_modules(BTreeSet::new())
+        .unwrap()
+        .is_none());
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+    let error = rig.owner.settings_modules(BTreeSet::new()).err().unwrap();
+    assert!(error.is_capture_race());
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 6);
+}
+
+#[test]
 fn config_settings_file_error_is_per_module_and_does_not_relax_planning() {
     let rig = SettingsRig::new();
     rig.declare("sample-extra", 11, true);

@@ -155,7 +155,14 @@ impl ControlHandler {
                     .config_settings_rows(runtime.clone(), &modules)
                     .await;
                 let (mut rows, next_stamped) = match next {
-                    Ok(next) => next,
+                    Ok(Some(next)) => next,
+                    Ok(None) => {
+                        // No consistent observation was made. Keep the stream
+                        // open without advancing the file-error grace period.
+                        retry_capture = true;
+                        file_grace.pending.clear();
+                        continue;
+                    }
                     Err(error) if error.is_capture_race() => {
                         // A read interrupted by a file edit is not a new state.
                         // Keep the last snapshot and retry on the next poll tick.
@@ -194,8 +201,10 @@ impl ControlHandler {
         filter: &Option<Vec<String>>,
     ) -> std::result::Result<(Vec<ConfigModule>, bool), GateError> {
         let error = match self.config_settings_rows(runtime.clone(), filter).await {
+            Ok(Some(rows)) => return Ok(rows),
+            Ok(None) => GateError::capture_race(),
             Err(error) if error.is_capture_race() => error,
-            result => return result,
+            Err(error) => return Err(error),
         };
         // Give a competing writer a few short retries, but do not leave an
         // opening subscriber waiting indefinitely without its first resync.
@@ -205,8 +214,10 @@ impl ControlHandler {
             for delay in [50, 100, 200] {
                 tokio::time::sleep(Duration::from_millis(delay)).await;
                 match self.config_settings_rows(runtime.clone(), filter).await {
+                    Ok(Some(rows)) => return Ok(rows),
+                    Ok(None) => last = GateError::capture_race(),
                     Err(error) if error.is_capture_race() => last = error,
-                    result => return result,
+                    Err(error) => return Err(error),
                 }
             }
             Err(last)
@@ -219,10 +230,10 @@ impl ControlHandler {
         &self,
         runtime: Arc<crate::config_gate::runtime::RuntimeOwner>,
         filter: &Option<Vec<String>>,
-    ) -> std::result::Result<(Vec<ConfigModule>, bool), GateError> {
+    ) -> std::result::Result<Option<(Vec<ConfigModule>, bool)>, GateError> {
         let known = self.config_settings_known_modules()?;
         let response = config_work(runtime, move |owner| {
-            let response = owner.settings_modules(known);
+            let response = owner.observe_settings_modules(known);
             #[cfg(test)]
             if let Some(hook) = owner.settings_observation_hook.lock().unwrap().as_mut() {
                 hook();
@@ -230,6 +241,9 @@ impl ControlHandler {
             response
         })
         .await?;
+        let Some(response) = response else {
+            return Ok(None);
+        };
         let ConfigControlResponse::Modules {
             mut modules,
             stamped,
@@ -240,7 +254,7 @@ impl ControlHandler {
         if let Some(filter) = filter {
             modules.retain(|module| filter.contains(&module.module_id));
         }
-        Ok((modules, stamped))
+        Ok(Some((modules, stamped)))
     }
 
     pub(in crate::control) fn cancel_config_settings_subscription(

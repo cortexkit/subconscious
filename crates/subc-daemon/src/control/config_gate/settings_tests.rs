@@ -587,31 +587,7 @@ async fn config_settings_watch_reports_persistent_file_error_and_recovers() {
     let recovered = event(&mut rx).await;
     assert_eq!(recovered["event"], "change");
     assert!(recovered.get("file_error").is_none());
-    if recovered["status"] != "adopted" {
-        assert_eq!(recovered["status"], "write_back_behind");
-        tokio::time::timeout(Duration::from_secs(4), async {
-            loop {
-                let next = event(&mut rx).await;
-                let ConfigWatchEvent::Change {
-                    module_id,
-                    status,
-                    file_error,
-                    ..
-                } = serde_json::from_value(next).unwrap()
-                else {
-                    panic!("recovery must remain a module change");
-                };
-                assert_eq!(module_id, "sample-reader");
-                assert!(file_error.is_none());
-                if status == "adopted" {
-                    break;
-                }
-                assert_eq!(status, "write_back_behind");
-            }
-        })
-        .await
-        .unwrap();
-    }
+    assert_eq!(recovered["status"], "adopted");
     assert!(handler.cancel_config_settings_subscription(ctx.connection_id, 91));
     rig.write(b"{");
     assert!(handler
@@ -622,6 +598,62 @@ async fn config_settings_watch_reports_persistent_file_error_and_recovers() {
     let opened = event(&mut rx).await;
     assert_eq!(opened["event"], "resync");
     assert_eq!(opened["modules"][0]["file_error"]["code"], "value_invalid");
+    handler.cleanup_connection(ctx.connection_id).unwrap();
+}
+
+#[tokio::test]
+async fn config_settings_watch_skips_unstable_status_without_aging_file_error() {
+    let rig = SettingsRig::new();
+    rig.stamp();
+    rig.activate();
+    let approved = rig.edit_limit(8);
+    rig.activate_generation(2);
+    let handler = handler(&rig);
+    let (ctx, mut rx) = context();
+    handler
+        .handle_control_frame(&ctx, request(json!({"op":"config.watch"})))
+        .await
+        .unwrap();
+    assert_eq!(event(&mut rx).await["modules"][0]["status"], "adopted");
+    let path = rig.root.join("cortexkit/sample-reader.jsonc");
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = attempts.clone();
+    *rig.owner.settings_status_hook.lock().unwrap() = Some(Box::new(move || {
+        let attempt = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::fs::write(
+            &path,
+            if attempt.is_multiple_of(2) {
+                b"{"
+            } else {
+                &approved[..]
+            },
+        )
+        .unwrap();
+        Ok(())
+    }));
+    let (observed, mut observations) = tokio::sync::mpsc::unbounded_channel();
+    *rig.owner.settings_observation_hook.lock().unwrap() = Some(Box::new(move || {
+        observed.send(()).unwrap();
+    }));
+    // Let inconsistent captures span a full grace interval. They must neither
+    // publish a warning nor help a later, genuinely bad file pass the grace.
+    for _ in 0..2 {
+        tokio::time::timeout(Duration::from_secs(5), observations.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 6);
+    assert!(matches!(
+        rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    *rig.owner.settings_status_hook.lock().unwrap() = None;
+    rig.write(b"{");
+    let since = tokio::time::Instant::now();
+    let failed = event(&mut rx).await;
+    assert_eq!(failed["file_error"]["code"], "value_invalid");
+    assert!(since.elapsed() >= Duration::from_secs(2));
     handler.cleanup_connection(ctx.connection_id).unwrap();
 }
 

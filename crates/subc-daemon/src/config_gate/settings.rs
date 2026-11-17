@@ -89,17 +89,41 @@ impl RuntimeOwner {
         &self,
         known: BTreeSet<String>,
     ) -> Result<ConfigControlResponse> {
+        self.observe_settings_modules(known)?
+            .ok_or_else(GateError::capture_race)
+    }
+
+    // None means that concurrent edits prevented a consistent observation, not
+    // that a settings file is invalid. Watches retain their previous rows.
+    pub(crate) fn observe_settings_modules(
+        &self,
+        known: BTreeSet<String>,
+    ) -> Result<Option<ConfigControlResponse>> {
         #[cfg(test)]
         if let Some(hook) = self.settings_projection_hook.lock().unwrap().as_mut() {
             hook()?;
         }
         let snapshot = self.settings_snapshot(known)?;
         let approved = GateSnapshot::from_store(&snapshot.body.approved)?;
-        // Write-back status and capture read the file separately, so a concurrent
-        // edit can make their diagnostics disagree for one tick. Approved values
-        // stay store-backed, and the next poll reconciles the observations.
-        let write_back = self.write_back_status()?;
-        let captured = self.capturer.capture_settings(&snapshot.declarations)?;
+        let mut observation = None;
+        for _ in 0..3 {
+            let write_back = self.write_back_status()?;
+            #[cfg(test)]
+            if let Some(hook) = self.settings_status_hook.lock().unwrap().as_mut() {
+                hook()?;
+            }
+            let captured = self.capturer.capture_settings(&snapshot.declarations)?;
+            // External editors do not take the owner lock. Bracket the file
+            // capture with status reads so a repair or write-back cannot pair
+            // fresh bytes with an obsolete write-back warning (or the reverse).
+            if write_back == self.write_back_status()? {
+                observation = Some((write_back, captured));
+                break;
+            }
+        }
+        let Some((write_back, captured)) = observation else {
+            return Ok(None);
+        };
         let file_errors = captured.file_errors;
         let observed = if snapshot.body.stamped {
             Some(captured.configuration.proposal_snapshot(&approved))
@@ -186,10 +210,10 @@ impl RuntimeOwner {
             }
             modules.push(row);
         }
-        Ok(ConfigControlResponse::Modules {
+        Ok(Some(ConfigControlResponse::Modules {
             modules,
             stamped: snapshot.body.stamped,
-        })
+        }))
     }
 
     pub(crate) fn settings_schema(

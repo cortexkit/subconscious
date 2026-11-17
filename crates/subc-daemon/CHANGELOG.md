@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.50.4
+
+- Retry settings rows when write-back status changes during file capture, keeping watches on their last consistent observation without advancing file-error grace.
+
 ## 0.50.3
 
 - Serve the last approved active configuration while a newer module declaration

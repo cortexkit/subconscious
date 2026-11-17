@@ -1,7 +1,7 @@
 //! Agent durables (spec ruling R15): prefrontal owns where each agent resides, and it
 //! creates, removes and reads each agent's durables through ops on ck-bus's management
-//! surface. ck-bus accepts them only from `reserved:prefrontal-core` or
-//! `reserved:prefrontal`; any other caller,
+//! surface. ck-bus accepts them only from `reserved:prefrontal` or
+//! `reserved:prefrontal-core`; any other caller,
 //! a `Direct` one included, is refused `ckbus_caller_not_permitted`.
 //!
 //! An agent has one durable, `consumer_name(agent_id)` (`c_{agent_id}`), on each of the
@@ -61,7 +61,7 @@ pub const OPERATIONS: [(&str, bool); 4] = [
     (EFFECTS_PENDING_OP, false),
 ];
 
-/// The legacy authority id; the readers-first rename also admits its new id.
+/// The current authority id; admission also accepts the old id for rollback.
 pub const AUTHORIZED_MODULE: &str = crate::grants::DELIVERY_AUTHORITY_MODULE;
 
 pub mod code {
@@ -97,10 +97,10 @@ pub fn ckbus_owned_durables() -> impl Iterator<Item = (StreamKind, &'static str)
     [
         (StreamKind::EffectDead, "c_ckbus_dead"),
         (StreamKind::DeliveryDead, "c_ckbus_dead"),
-        (StreamKind::Inbox, "m_prefrontal-core"),
-        (StreamKind::CoreWork, "m_prefrontal-core"),
+        (StreamKind::Inbox, "m_prefrontal"),
+        (StreamKind::CoreWork, "m_prefrontal"),
         (StreamKind::Event, "m_basal"),
-        (StreamKind::Room, "m_prefrontal-core"),
+        (StreamKind::Room, "m_prefrontal"),
     ]
     .into_iter()
     .chain(
@@ -302,7 +302,7 @@ pub fn authorize(principal: Option<&Principal>, method: &str) -> Result<(), Refu
         other => Err(Refusal::new(
             code::CALLER_NOT_PERMITTED,
             format!(
-                "{method} answers only reserved:{AUTHORIZED_MODULE} or reserved:prefrontal; this route arrived as {}",
+                "{method} answers only reserved:{AUTHORIZED_MODULE} or reserved:prefrontal-core; this route arrived as {}",
                 principal_label(other)
             ),
         )),

@@ -281,13 +281,13 @@ fn both_prefrontal_ids_receive_canonical_authority_grants() {
     assert_eq!(legacy.role(), grants::GrantRole::DeliveryAuthority);
     assert!(legacy
         .publish_allow()
-        .contains("$JS.API.CONSUMER.MSG.NEXT.CK_BOX_RENAMEGRANTS_ROOM.m_prefrontal-core"));
+        .contains("$JS.API.CONSUMER.MSG.NEXT.CK_BOX_RENAMEGRANTS_ROOM.m_prefrontal"));
     assert!(legacy
         .publish_allow()
-        .contains("$JS.API.CONSUMER.MSG.NEXT.CK_BOX_RENAMEGRANTS_EVENT.m_prefrontal-core"));
+        .contains("$JS.API.CONSUMER.MSG.NEXT.CK_BOX_RENAMEGRANTS_EVENT.m_prefrontal"));
     assert!(legacy
         .publish_allow()
-        .contains("$KV.CK_BOX_RENAMEGRANTS_PREFRONTAL_CORE_SESSION_LIVENESS.>"));
+        .contains("$KV.CK_BOX_RENAMEGRANTS_PREFRONTAL_SESSION_LIVENESS.>"));
     for module_id in ["prefrontal", "prefrontal-core"] {
         let authority = grants::issued_grant(&names, module_id, "credential", &[]).unwrap();
         assert_eq!(
@@ -312,11 +312,11 @@ fn both_prefrontal_ids_receive_canonical_authority_grants() {
             .chain(authority.subscribe_allow())
         {
             assert!(
-                !subject.split('.').any(|token| token == "m_prefrontal"),
+                !subject.split('.').any(|token| token == "m_prefrontal-core"),
                 "{subject}"
             );
             assert!(
-                !subject.contains("PREFRONTAL_SESSION_LIVENESS"),
+                !subject.contains("PREFRONTAL_CORE_SESSION_LIVENESS"),
                 "{subject}"
             );
         }
@@ -492,9 +492,9 @@ fn prefrontal_core_grant_carries_the_room_binding_and_its_room_durable() {
     let room = &names.streams().room;
     for subject in [
         names.room_binding(),
-        format!("$JS.API.CONSUMER.MSG.NEXT.{room}.m_prefrontal-core"),
-        format!("$JS.API.CONSUMER.INFO.{room}.m_prefrontal-core"),
-        format!("$JS.ACK.{room}.m_prefrontal-core.>"),
+        format!("$JS.API.CONSUMER.MSG.NEXT.{room}.m_prefrontal"),
+        format!("$JS.API.CONSUMER.INFO.{room}.m_prefrontal"),
+        format!("$JS.ACK.{room}.m_prefrontal.>"),
         names.event_publish_grant(PREFRONTAL).unwrap(),
     ] {
         assert!(
@@ -508,7 +508,7 @@ fn prefrontal_core_grant_carries_the_room_binding_and_its_room_durable() {
     ));
     assert!(!publishes(
         &authority,
-        &format!("$JS.API.CONSUMER.DURABLE.CREATE.{room}.m_prefrontal-core")
+        &format!("$JS.API.CONSUMER.DURABLE.CREATE.{room}.m_prefrontal")
     ));
     // The durable bootstrap creates is the one the grant names.
     let planned = bootstrap::module_durables::planned(&names).unwrap();
@@ -516,7 +516,7 @@ fn prefrontal_core_grant_carries_the_room_binding_and_its_room_durable() {
         .iter()
         .find(|durable| &durable.stream == room)
         .expect("bootstrap plans a ROOM durable");
-    assert_eq!(on_room.durable, "m_prefrontal-core");
+    assert_eq!(on_room.durable, "m_prefrontal");
     assert_eq!(on_room.filter_subjects, vec![names.room_binding()]);
 }
 

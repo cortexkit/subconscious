@@ -48,13 +48,38 @@ fn regenerate_local_permission_fixture() {
 }
 
 #[test]
+fn retired_liveness_delete_is_scoped_to_ckbus_and_the_old_bucket() {
+    let account = grants::derive_account("box_retiregrant").unwrap();
+    let bus = grants::bus_module_grant(&account, "credential").unwrap();
+    let old = "$JS.API.STREAM.DELETE.KV_CK_BOX_RETIREGRANT_PREFRONTAL_CORE_SESSION_LIVENESS";
+    assert!(bus.publish_allow().contains(old));
+    assert_eq!(
+        bus.publish_allow()
+            .iter()
+            .filter(|subject| subject.starts_with("$JS.API.STREAM.DELETE.KV_"))
+            .count(),
+        1
+    );
+    for module in ["prefrontal", "prefrontal-core", "entorhinal", "other"] {
+        let grant = grants::issued_grant(&account, module, "credential", &[]).unwrap();
+        assert!(
+            !grant
+                .publish_allow()
+                .iter()
+                .any(|pattern| subject_matches(pattern, old)),
+            "{module}"
+        );
+    }
+}
+
+#[test]
 fn module_bucket_only_principal_is_in_the_validated_permission_golden() {
     let fixture = PINNED_GOLDEN_FIXTURE;
     let names = grants::derive_account(fixture.account).unwrap();
     let golden = extended_golden();
     grants::validate_document(&golden, &names).unwrap();
     let writes = "$KV.CK_BOX_GOLDENFIXTURE_ENTORHINAL_CHANGES.>";
-    let watch = "$JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_PREFRONTAL_CORE_SESSION_LIVENESS";
+    let watch = "$JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_PREFRONTAL_SESSION_LIVENESS";
     let allowed = golden_allows(
         &golden,
         Principal::EventConsumer("entorhinal"),
@@ -62,7 +87,7 @@ fn module_bucket_only_principal_is_in_the_validated_permission_golden() {
     );
     assert!(allowed.contains(writes));
     assert!(allowed.contains(watch));
-    assert!(!allowed.contains("$KV.CK_BOX_GOLDENFIXTURE_PREFRONTAL_CORE_SESSION_LIVENESS.>"));
+    assert!(!allowed.contains("$KV.CK_BOX_GOLDENFIXTURE_PREFRONTAL_SESSION_LIVENESS.>"));
 }
 
 #[test]
@@ -245,15 +270,15 @@ fn reliable_delivery_grants_are_authority_only_and_scoped_to_its_durables() {
     }
     for stream in ["INBOX", "CORE_WORK"] {
         for subject in [
-            format!("$JS.ACK.CK_BOX_DELIVERYGRANTS_{stream}.m_prefrontal-core.1"),
-            format!("$JS.API.CONSUMER.MSG.NEXT.CK_BOX_DELIVERYGRANTS_{stream}.m_prefrontal-core"),
-            format!("$JS.API.CONSUMER.INFO.CK_BOX_DELIVERYGRANTS_{stream}.m_prefrontal-core"),
+            format!("$JS.ACK.CK_BOX_DELIVERYGRANTS_{stream}.m_prefrontal.1"),
+            format!("$JS.API.CONSUMER.MSG.NEXT.CK_BOX_DELIVERYGRANTS_{stream}.m_prefrontal"),
+            format!("$JS.API.CONSUMER.INFO.CK_BOX_DELIVERYGRANTS_{stream}.m_prefrontal"),
         ] {
             assert!(permits(&authority, &subject), "{subject}");
             assert!(!permits(&participant, &subject), "{subject}");
             assert!(!permits(
                 &authority,
-                &subject.replace("m_prefrontal-core", "m_other")
+                &subject.replace("m_prefrontal", "m_other")
             ));
         }
         assert!(!permits(
@@ -723,9 +748,9 @@ fn vendored_foundation_and_golden_match_their_source_record() {
     // so it moves with the pin in Cargo.toml.
     assert_eq!(
         field("golden_commit"),
-        "f08a85f388140c0883ac21726651347f7a9e6d23"
+        "25e0d5d01323ee5af94dec8dec5d41d25bb3c1f5"
     );
-    assert_eq!(field("golden_crate_version"), "cortexkit-bus-naming 0.4.8");
+    assert_eq!(field("golden_crate_version"), "cortexkit-bus-naming 0.5.0");
     for (file, digest_field) in [
         ("nats-message-plane-foundation.md", "source_sha256"),
         ("permission_golden.txt", "golden_sha256"),

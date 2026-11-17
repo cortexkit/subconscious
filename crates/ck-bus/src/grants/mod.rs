@@ -36,8 +36,8 @@ pub const GENERATOR_HEADER: &str =
 pub enum GrantRole {
     /// A supervised participant's per-process user in the box account.
     Participant,
-    /// prefrontal-core's per-process user: the participant set plus publish on every
-    /// agent stream's binding and on the ROOM binding, and its one ROOM durable (R15).
+    /// prefrontal's per-process user: the participant set plus publish on every
+    /// agent stream's binding and on the ROOM binding, and its one ROOM durable.
     DeliveryAuthority,
     /// The flow engine's (basal's) per-process user: its own durable on the event
     /// stream, ephemeral ordered consumers there for dry-run replay, census read and the
@@ -239,15 +239,15 @@ pub fn participant_grant(
 /// Prefrontal's per-process grant: the participant set plus publish on each agent
 /// stream's own binding and on the ROOM binding, since it is the only producer of wakes,
 /// peer deliveries, effect intents and room posts, and pull, ack and info on its one
-/// ROOM durable `m_prefrontal-core`, which bootstrap creates.
+/// ROOM durable `m_prefrontal`, which bootstrap creates.
 pub fn delivery_authority_grant(
     account: &AccountNames,
     credential_public: &str,
     module_id: &str,
     bound_rooms: &[&str],
 ) -> Result<Grant, GrantRefusal> {
-    // Resources retain their old names during the readers-first rename. Only the
-    // process's own event and live publications follow its attested module id.
+    // Both authority ids use the current readers and bucket. Only the process's
+    // own event and live publications follow its attested module id.
     let resource_module = if is_delivery_authority_module(module_id) {
         DELIVERY_AUTHORITY_MODULE
     } else {
@@ -372,14 +372,14 @@ fn add_live_permissions(
     Ok(())
 }
 
-/// The legacy delivery-authority id, retained for its existing resource names.
-pub const DELIVERY_AUTHORITY_MODULE: &str = "prefrontal-core";
+/// The delivery-authority module whose readers bootstrap provisions.
+pub const DELIVERY_AUTHORITY_MODULE: &str = "prefrontal";
 
-/// Accept both attested module ids because the rename is readers-first. The rename
+/// Accept both attested module ids so the old process can resume after a rollback. The rename
 /// procedure stops the old process before starting the new one; they do not run
 /// concurrently. Callers must first require a daemon-attested reserved principal.
 pub fn is_delivery_authority_module(module_id: &str) -> bool {
-    matches!(module_id, DELIVERY_AUTHORITY_MODULE | "prefrontal")
+    matches!(module_id, DELIVERY_AUTHORITY_MODULE | "prefrontal-core")
 }
 
 /// The module whose attested credential carries the flow-engine grant: basal runs flows
@@ -411,7 +411,8 @@ pub fn issued_grant(
 
 /// ck-bus's own box-account grant: census read and write, management of the nine
 /// streams and their consumers (the dead-letter durable and the module durables among
-/// them), and the sentinel subjects. No workload publish.
+/// them), deletion of the retired prefrontal-core liveness bucket, and the sentinel
+/// subjects. No workload publish.
 pub fn bus_module_grant(
     account: &AccountNames,
     credential_public: &str,
@@ -442,6 +443,16 @@ pub fn bus_module_grant(
             });
         }
     }
+    // Retiring the old liveness store needs one exact stream delete, not
+    // permission to delete current module buckets or arbitrary streams.
+    entries.push(AllowEntry {
+        principal: Principal::Bus,
+        operation: Operation::Publish,
+        subject: format!(
+            "$JS.API.STREAM.DELETE.KV_{}",
+            account.module_bucket_name("prefrontal-core", "session-liveness")?
+        ),
+    });
     Grant::from_entries(GrantRole::BusModule, account, entries)
 }
 

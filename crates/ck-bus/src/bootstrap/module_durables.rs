@@ -4,10 +4,10 @@
 //! - `m_basal` on the event stream, filtered on every module event
 //!   (`ck.{acct}.event.>`): the flow engine reads all of them through one cursor and
 //!   drops the events no installed flow wants.
-//! - The naming crate's closed event-consumer table, including prefrontal-core's
+//! - The naming crate's closed event-consumer table, including prefrontal's
 //!   broca reader and astrocyte's insula reader, on the event stream.
-//! - `m_prefrontal-core` on the ROOM stream, filtered on the ROOM binding
-//!   (`ck.{acct}.room.*.post`): prefrontal-core is the only consumer of room posts.
+//! - `m_prefrontal` on the ROOM stream, filtered on the ROOM binding
+//!   (`ck.{acct}.room.*.post`): prefrontal is the only consumer of room posts.
 //!
 //! All are ensured at every boot, before any module's first credential, so events and
 //! posts published before the module first connects are kept for it. Modules hold pull, ack and info

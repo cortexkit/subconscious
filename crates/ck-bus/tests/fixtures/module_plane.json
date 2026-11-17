@@ -98,12 +98,12 @@
       "max_msg_size": 1024,
       "max_msgs": -1,
       "max_msgs_per_subject": 1,
-      "name": "KV_CK_BOX_UPGRADEGOLDEN_PREFRONTAL_CORE_SESSION_LIVENESS",
+      "name": "KV_CK_BOX_UPGRADEGOLDEN_PREFRONTAL_SESSION_LIVENESS",
       "num_replicas": 1,
       "retention": "limits",
       "storage": "file",
       "subjects": [
-        "$KV.CK_BOX_UPGRADEGOLDEN_PREFRONTAL_CORE_SESSION_LIVENESS.>"
+        "$KV.CK_BOX_UPGRADEGOLDEN_PREFRONTAL_SESSION_LIVENESS.>"
       ]
     },
     {
@@ -162,7 +162,7 @@
     },
     {
       "ack_wait_secs": 30,
-      "durable": "m_prefrontal-core",
+      "durable": "m_prefrontal",
       "filter_subjects": [
         "ck.box_upgradegolden.event.broca.>",
         "ck.box_upgradegolden.event.basal.flow_instance_created.v1",
@@ -170,12 +170,12 @@
         "ck.box_upgradegolden.event.basal.flow_instance_ended.v1",
         "ck.box_upgradegolden.event.basal.flow_instance_expired.v1",
         "ck.box_upgradegolden.event.basal.flow_instance_rescheduled.v1",
-        "ck.box_upgradegolden.event.aft.late_result_ready.v1.prefrontal-core",
-        "ck.box_upgradegolden.event.basal.late_result_ready.v1.prefrontal-core",
-        "ck.box_upgradegolden.event.cerebellum.late_result_ready.v1.prefrontal-core",
+        "ck.box_upgradegolden.event.aft.late_result_ready.v1.prefrontal",
+        "ck.box_upgradegolden.event.basal.late_result_ready.v1.prefrontal",
+        "ck.box_upgradegolden.event.cerebellum.late_result_ready.v1.prefrontal",
         "ck.box_upgradegolden.event.fusiform.catalog_changed.v1",
         "ck.box_upgradegolden.event.basal.flow_owner_notice.v1",
-        "ck.box_upgradegolden.event.cingulate.card_settled.v1.prefrontal-core"
+        "ck.box_upgradegolden.event.cingulate.card_settled.v1.prefrontal"
       ],
       "max_ack_pending": 1000,
       "max_deliver": -1,
@@ -405,7 +405,7 @@
     },
     {
       "ack_wait_secs": 30,
-      "durable": "m_prefrontal-core",
+      "durable": "m_prefrontal",
       "filter_subjects": [
         "ck.box_upgradegolden.room.*.post"
       ],
@@ -415,7 +415,7 @@
     },
     {
       "ack_wait_secs": 30,
-      "durable": "m_prefrontal-core",
+      "durable": "m_prefrontal",
       "filter_subjects": [
         "ck.box_upgradegolden.inbox.head.*.ready",
         "ck.box_upgradegolden.inbox.worker.*.ready"
@@ -426,7 +426,7 @@
     },
     {
       "ack_wait_secs": 30,
-      "durable": "m_prefrontal-core",
+      "durable": "m_prefrontal",
       "filter_subjects": [
         "ck.box_upgradegolden.core_work.effect.*.run",
         "ck.box_upgradegolden.core_work.consult.*.run",

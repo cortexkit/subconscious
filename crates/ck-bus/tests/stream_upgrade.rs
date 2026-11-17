@@ -10,8 +10,8 @@
 //!   withheld), store one message on each stream, then boot the current ck-bus.
 //!   The five streams retain their creation times and messages, EFFECT updates in
 //!   place, the new streams exist with their limits, and
-//!   `m_basal` and `m_prefrontal-core` exist with the shipped durable configuration. The
-//!   room post published before `m_prefrontal-core` existed is pending on it. A further
+//!   `m_basal` and `m_prefrontal` exist with the shipped durable configuration. The
+//!   room post published before `m_prefrontal` existed is pending on it. A further
 //!   boot leaves all nine streams and all module durables unchanged. Further cases cover
 //!   an existing event stream's cap and readers whose acknowledgement floors must survive.
 
@@ -29,6 +29,9 @@ mod harness;
 #[allow(dead_code)]
 #[path = "../src/runtime/seams.rs"]
 mod runtime;
+
+#[path = "stream_upgrade/prefrontal_rename.rs"]
+mod prefrontal_rename;
 
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
@@ -335,6 +338,14 @@ struct FiveStreamBox(Arc<dyn BoxPlane>);
 
 #[async_trait]
 impl BoxPlane for FiveStreamBox {
+    async fn delete_module_bucket(
+        &self,
+        _account: &AccountNames,
+        _owner: &str,
+        _name: &str,
+    ) -> Result<bool, PlaneError> {
+        Ok(false)
+    }
     async fn ensure_module_bucket(
         &self,
         _account: &AccountNames,
@@ -396,6 +407,10 @@ impl BoxPlane for FiveStreamBox {
         stream: &str,
         durable: &str,
     ) -> Result<Option<ConsumerState>, PlaneError> {
+        if durable == "m_prefrontal-core" {
+            // This wrapper models a build before delivery readers were provisioned.
+            return Ok(None);
+        }
         self.0.consumer_state(stream, durable).await
     }
     async fn delete_durable(&self, stream: &str, durable: &str) -> Result<bool, PlaneError> {
@@ -640,8 +655,8 @@ async fn a_five_stream_plane_upgrades_in_place_to_nine_streams_and_the_module_du
         assert_eq!(config["max_ack_pending"], pending, "{durable}");
         assert!(config.get("deliver_subject").is_none(), "{durable} is pull");
     }
-    // The room post stored before `m_prefrontal-core` existed is waiting for it.
-    let (_, _, room_pending) = consumer_state(&js, &streams.room, "m_prefrontal-core").await;
+    // The room post stored before `m_prefrontal` existed is waiting for it.
+    let (_, _, room_pending) = consumer_state(&js, &streams.room, "m_prefrontal").await;
     assert_eq!(
         room_pending, 1,
         "a post made before the durable existed is kept"
@@ -950,7 +965,7 @@ async fn second_bootstrap_keeps_event_durable_creation_times_and_ack_floors() {
     plane.store_event("thalamus-harness", "turn_ended").await;
     let durables = [
         "m_basal",
-        "m_prefrontal-core",
+        "m_prefrontal",
         "m_astrocyte",
         "m_striatum",
         "m_magic-context",
@@ -983,10 +998,10 @@ async fn bootstrap_updates_event_filters_and_limits_in_place_preserving_ack_floo
     };
     drop(plane.bootstrap().await);
     let sequence = plane.store_event("broca", "run.started").await;
-    assert_eq!(plane.ack_one("m_prefrontal-core").await, sequence);
-    let before = plane.cursor("m_prefrontal-core").await;
+    assert_eq!(plane.ack_one("m_prefrontal").await, sequence);
+    let before = plane.cursor("m_prefrontal").await;
     let mut old = plane
-        .consumer("m_prefrontal-core")
+        .consumer("m_prefrontal")
         .await
         .cached_info()
         .config
@@ -1001,7 +1016,7 @@ async fn bootstrap_updates_event_filters_and_limits_in_place_preserving_ack_floo
         .await
         .unwrap();
     drop(plane.bootstrap().await);
-    assert_eq!(plane.cursor("m_prefrontal-core").await, before);
+    assert_eq!(plane.cursor("m_prefrontal").await, before);
     plane.server.stop().await;
 }
 
@@ -1080,14 +1095,14 @@ async fn bootstrap_refuses_immutable_event_config_without_deleting_an_acked_dura
     drop(plane.bootstrap().await);
     plane
         .js
-        .delete_consumer_from_stream("m_prefrontal-core", &plane.names.streams().event)
+        .delete_consumer_from_stream("m_prefrontal", &plane.names.streams().event)
         .await
         .unwrap();
     plane
         .js
         .create_consumer_on_stream(
             pull::Config {
-                durable_name: Some("m_prefrontal-core".to_string()),
+                durable_name: Some("m_prefrontal".to_string()),
                 filter_subject: format!("ck.{}.event.broca.>", plane.names.account()),
                 ack_policy: jetstream::consumer::AckPolicy::All,
                 ..Default::default()
@@ -1097,8 +1112,8 @@ async fn bootstrap_refuses_immutable_event_config_without_deleting_an_acked_dura
         .await
         .unwrap();
     plane.store_event("broca", "run.started").await;
-    assert!(plane.ack_one("m_prefrontal-core").await > 0);
-    let before = plane.cursor("m_prefrontal-core").await;
+    assert!(plane.ack_one("m_prefrontal").await > 0);
+    let before = plane.cursor("m_prefrontal").await;
     let failure = match boot(
         Some(&plane.machine_id),
         BrokerInputs {
@@ -1114,11 +1129,11 @@ async fn bootstrap_refuses_immutable_event_config_without_deleting_an_acked_dura
     };
     assert_eq!(failure.cause, bootstrap::cause::MODULE_DURABLES_UNAVAILABLE);
     assert!(
-        failure.message.contains("m_prefrontal-core"),
+        failure.message.contains("m_prefrontal"),
         "{}",
         failure.message
     );
-    assert_eq!(plane.cursor("m_prefrontal-core").await, before);
+    assert_eq!(plane.cursor("m_prefrontal").await, before);
     plane.server.stop().await;
 }
 
@@ -1172,7 +1187,7 @@ async fn prefrontal_event_grant_pulls_and_acks_seven_token_events_but_refuses_ot
     let sequence = plane.store_event("broca", "run.started").await;
     let js = jetstream::new(client.client.clone());
     let consumer: jetstream::consumer::Consumer<pull::Config> = js
-        .get_consumer_from_stream("m_prefrontal-core", &plane.names.streams().event)
+        .get_consumer_from_stream("m_prefrontal", &plane.names.streams().event)
         .await
         .expect("prefrontal-core may inspect its event durable");
     let message = consumer
@@ -1193,7 +1208,7 @@ async fn prefrontal_event_grant_pulls_and_acks_seven_token_events_but_refuses_ot
     for verb in ["INFO", "MSG.NEXT"] {
         client
             .expect_allowed(&format!(
-                "$JS.API.CONSUMER.{verb}.{}.m_prefrontal-core",
+                "$JS.API.CONSUMER.{verb}.{}.m_prefrontal",
                 plane.names.streams().event
             ))
             .await;
@@ -1223,7 +1238,7 @@ async fn prefrontal_event_grant_pulls_and_acks_seven_token_events_but_refuses_ot
             client.publish(&subject, b"{}").await;
             client.expect_denied(&subject).await;
         }
-        let subject = ack.replace(".m_prefrontal-core.", &format!(".{durable}."));
+        let subject = ack.replace(".m_prefrontal.", &format!(".{durable}."));
         assert_ne!(subject, ack);
         client.publish(&subject, b"").await;
         client.expect_denied(&subject).await;
@@ -1231,11 +1246,11 @@ async fn prefrontal_event_grant_pulls_and_acks_seven_token_events_but_refuses_ot
     for subject in [
         format!("$JS.API.CONSUMER.CREATE.{}", plane.names.streams().event),
         format!(
-            "$JS.API.CONSUMER.CREATE.{}.m_prefrontal-core",
+            "$JS.API.CONSUMER.CREATE.{}.m_prefrontal",
             plane.names.streams().event
         ),
         format!(
-            "$JS.API.CONSUMER.DURABLE.CREATE.{}.m_prefrontal-core",
+            "$JS.API.CONSUMER.DURABLE.CREATE.{}.m_prefrontal",
             plane.names.streams().event
         ),
     ] {

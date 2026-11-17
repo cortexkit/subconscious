@@ -247,6 +247,15 @@ pub trait BoxPlane: Send + Sync {
     ) -> Result<(), PlaneError> {
         Err(PlaneError::new("this plane cannot ensure module buckets"))
     }
+    /// Deletes a module bucket's backing stream, returning false if already absent.
+    async fn delete_module_bucket(
+        &self,
+        _account: &AccountNames,
+        _owner: &str,
+        _name: &str,
+    ) -> Result<bool, PlaneError> {
+        Err(PlaneError::new("this plane cannot delete module buckets"))
+    }
     async fn ensure_stream(&self, spec: &StreamSpec) -> Result<(), PlaneError>;
     async fn publish(&self, subject: &str, payload: Vec<u8>) -> Result<(), PlaneError>;
     /// A projection may checkpoint only after JetStream acknowledges storage.
@@ -1064,6 +1073,26 @@ impl BoxPlane for NatsBox {
             )
             .await?;
         if api_error_code(&reply) == Some(CONSUMER_NOT_FOUND) {
+            return Ok(false);
+        }
+        api_refusal(&reply, &what)?;
+        Ok(true)
+    }
+
+    async fn delete_module_bucket(
+        &self,
+        account: &AccountNames,
+        owner: &str,
+        name: &str,
+    ) -> Result<bool, PlaneError> {
+        let bucket = account
+            .module_bucket_name(owner, name)
+            .map_err(|error| PlaneError::new(error.to_string()))?;
+        let what = format!("delete module bucket {owner}.{name} ({bucket})");
+        let reply = self
+            .api(format!("STREAM.DELETE.KV_{bucket}"), json!({}), &what)
+            .await?;
+        if api_error_code(&reply) == Some(STREAM_NOT_FOUND) {
             return Ok(false);
         }
         api_refusal(&reply, &what)?;

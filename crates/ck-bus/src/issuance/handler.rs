@@ -72,7 +72,7 @@ pub fn advertise(builder: ModuleManifestBuilder) -> ModuleManifest {
             } else {
                 ManagementOperationKind::Query
             },
-            "agent durables, for reserved:prefrontal-core or reserved:prefrontal only",
+            "agent durables, for reserved:prefrontal or reserved:prefrontal-core only",
         )
     });
     let operations = issuance

@@ -17,13 +17,17 @@
 //!    reads it back through the claims lookup before treating it as applied;
 //! 4. signs its box-account user with the box account root, connects, creates the
 //!    census and module buckets and nine message streams if absent, reconciles module
-//!    durables without deleting their cursors, writes its own census key
+//!    durables without deleting their cursors (except empty, retired prefrontal
+//!    delivery readers), writes its own census key
 //!    (the single census entry ck-bus writes for itself), and publishes on its sentinel
 //!    subject.
 //!
 //! A plane an earlier ck-bus built with five streams is upgraded in place: existing
 //! messages are kept, reviewed limits update without recreation, and missing streams,
 //! buckets and module durables are added.
+//! The prefrontal rename first removes empty old delivery readers because those
+//! streams allow one reader per subject. Busy readers refuse startup and keep the
+//! old liveness bucket for rollback; after successful provisioning it is deleted.
 //!
 //! Both users' JWTs expire 15 minutes after issue; a renewal task per user
 //! (`credentials::renewal`) re-signs the same key before then, and each connection
@@ -47,6 +51,7 @@ pub mod config;
 pub(crate) mod grant_changes;
 pub mod module_durables;
 pub mod plane;
+mod prefrontal_rename;
 pub mod store;
 
 use std::{
@@ -105,6 +110,8 @@ pub mod cause {
     /// A module durable could not be planned or reconciled, or its stream could not be
     /// inspected for orphans. Immutable mismatches leave the cursor in place.
     pub const MODULE_DURABLES_UNAVAILABLE: &str = "module-durables-unavailable";
+    /// An old delivery reader still has work and cannot safely be replaced.
+    pub const DELIVERY_DURABLE_MOVE_REFUSED: &str = "delivery-durable-move-refused";
     /// ck-bus's own census key could not be written: its spawn generation could not be
     /// read, or the census write failed.
     pub const OWN_CENSUS_UNWRITTEN: &str = "own-census-unwritten";
@@ -516,12 +523,14 @@ pub async fn boot(
     // rather than deleting a module's cursor.
     let durables = module_durables::planned(&names)
         .map_err(|error| Failure::stop(cause::MODULE_DURABLES_UNAVAILABLE, error))?;
+    prefrontal_rename::remove_empty_delivery_readers(&names, box_plane.as_ref()).await?;
     for durable in &durables {
         box_plane
             .ensure_module_durable(durable)
             .await
             .map_err(|error| Failure::retry(cause::MODULE_DURABLES_UNAVAILABLE, error.message))?;
     }
+    prefrontal_rename::remove_stale_liveness(&names, box_plane.as_ref()).await?;
     let plan = module_durables::plan_output(&names, box_plane.as_ref(), &durables)
         .await
         .map_err(|error| Failure::retry(cause::MODULE_DURABLES_UNAVAILABLE, error.message))?;
@@ -766,7 +775,19 @@ pub struct BootstrapHealth {
     state: Arc<Mutex<BootState>>,
 }
 
+impl Default for BootstrapHealth {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(BootState::Starting)),
+        }
+    }
+}
+
 impl BootstrapHealth {
+    pub(crate) fn record_failure(&self, failure: Failure) {
+        self.set(BootState::Down(failure));
+    }
+
     fn set(&self, state: BootState) {
         *self
             .state
@@ -783,6 +804,12 @@ impl SentinelHealth for BootstrapHealth {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
+        let detail = match &state {
+            BootState::Down(failure) if failure.cause == cause::DELIVERY_DURABLE_MOVE_REFUSED => {
+                format!("Message bus is down. {}", failure.message)
+            }
+            _ => "Message bus is down.".to_string(),
+        };
         let metrics = match state {
             BootState::Starting => json!({
                 "class": "Unavailable",
@@ -807,7 +834,7 @@ impl SentinelHealth for BootstrapHealth {
         };
         Ok(HealthReport {
             status: HealthStatus::Failing,
-            detail: Some("Message bus is down.".to_string()),
+            detail: Some(detail),
             metrics: Some(metrics),
         })
     }
@@ -828,9 +855,7 @@ impl Bootstrap {
         Self {
             deps,
             period,
-            health: BootstrapHealth {
-                state: Arc::new(Mutex::new(BootState::Starting)),
-            },
+            health: BootstrapHealth::default(),
             ready: tokio::sync::watch::Sender::new(None),
         }
     }
@@ -918,7 +943,7 @@ impl Bootstrap {
                         }),
                     );
                     let retry = failure.retry;
-                    self.health.set(BootState::Down(failure));
+                    self.health.record_failure(failure);
                     if !retry {
                         return;
                     }

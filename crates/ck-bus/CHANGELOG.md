@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.9.0
+
+- Require cortexkit-bus-naming 0.5.0: prefrontal owns the delivery and EVENT
+  readers and session-liveness bucket. Keep accepting both attested authority ids
+  for rollback, and keep other modules' filters on both publisher names.
+- Move empty `m_prefrontal-core` delivery readers to `m_prefrontal` on INBOX,
+  CORE_WORK and ROOM. Refuse startup with the stream and pending/ack-pending
+  counts in health if any old reader still has work; leave its cursor intact.
+- After all delivery readers are provisioned, delete the retired
+  `prefrontal-core.session-liveness` bucket. A refused move leaves the old bucket
+  and its entries untouched. Keep the old EVENT durable for later retirement.
+- Refresh the permission and provisioning goldens from naming 0.5.0; resolve
+  cortexkit-bus-nats 0.5.2 and cortexkit-bus-inmemory 0.4.1 for its naming support.
+
 ## 0.8.1
 
 - Require cortexkit-bus-naming 0.4.8 so event and live readers accept both

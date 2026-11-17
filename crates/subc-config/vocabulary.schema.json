@@ -12,6 +12,19 @@
     "x-ck-ordering": { "type": "array", "minItems": 2, "uniqueItems": true, "items": { "type": ["string", "boolean", "number"] } },
     "x-ck-section": { "type": "string" },
     "x-ck-order": { "type": "number" },
+    "x-ck-setup": {
+      "type": "object",
+      "required": ["feature", "order", "recommended"],
+      "properties": {
+        "feature": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$" },
+        "order": { "type": "integer" },
+        "recommended": {
+          "type": "object",
+          "propertyNames": { "pattern": "^(?:/(?:[^~/]|~[01])*)*$" }
+        }
+      },
+      "additionalProperties": false
+    },
     "x-ck-options": {
       "type": "object",
       "required": ["source", "items_pointer", "value_pointer", "label_pointer", "depends_on", "closed"],

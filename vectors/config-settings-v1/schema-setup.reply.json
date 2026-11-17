@@ -1,0 +1,70 @@
+{
+  "module_id": "sample-setup",
+  "op": "config.schema",
+  "schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "archive": {
+        "description": "Write entries to an archive.",
+        "properties": {
+          "write": {
+            "default": false,
+            "description": "Write entries",
+            "type": "boolean",
+            "x-ck-apply": "live",
+            "x-ck-layers": [
+              "user"
+            ]
+          }
+        },
+        "title": "Archive writes",
+        "type": "object",
+        "unevaluatedProperties": false,
+        "x-ck-apply": "live",
+        "x-ck-layers": [
+          "user"
+        ],
+        "x-ck-setup": {
+          "feature": "archive_writes",
+          "order": 20,
+          "recommended": {}
+        }
+      },
+      "journal": {
+        "description": "Read entries from a journal.",
+        "properties": {
+          "read": {
+            "default": false,
+            "description": "Read entries",
+            "type": "boolean",
+            "x-ck-apply": "live",
+            "x-ck-layers": [
+              "user"
+            ]
+          }
+        },
+        "title": "Journal reads",
+        "type": "object",
+        "unevaluatedProperties": false,
+        "x-ck-apply": "live",
+        "x-ck-layers": [
+          "user"
+        ],
+        "x-ck-setup": {
+          "feature": "journal_reads",
+          "order": 10,
+          "recommended": {
+            "/journal/read": true
+          }
+        }
+      }
+    },
+    "type": "object",
+    "unevaluatedProperties": false,
+    "x-ck-apply": "live",
+    "x-ck-layers": [
+      "user"
+    ]
+  },
+  "schema_digest": "sha256:5ad614b412423a94a2d9571c34b799b2cde84aaf58030c1c82f5b1412d8033c2"
+}

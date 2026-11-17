@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.1
+
+- Admit `x-ck-setup` on top-level settings sections, validating unique feature ids,
+  root-relative recommended values and credential-free targets without applying
+  recommendations as defaults.
+
 ## 0.1.0
 
 - First release of shared configuration schemas, layer and bound validation,

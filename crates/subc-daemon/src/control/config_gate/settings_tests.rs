@@ -717,6 +717,65 @@ async fn config_settings_vectors_match_real_handler_bytes() {
     assert_eq!(shown["effective"]["limit"], 4);
     samples.push(("show.file-error.reply.json".into(), shown));
     handler.cleanup_connection(ctx.connection_id).unwrap();
+
+    let setup_rig = SettingsRig::new();
+    let setup_schema = json!({
+        "$schema":"https://json-schema.org/draft/2020-12/schema",
+        "type":"object","unevaluatedProperties":false,
+        "x-ck-layers":["user"],"x-ck-apply":"live",
+        "properties":{
+            "journal":{
+                "type":"object","title":"Journal reads",
+                "description":"Read entries from a journal.","unevaluatedProperties":false,
+                "x-ck-setup":{"feature":"journal_reads","order":10,
+                    "recommended":{"/journal/read":true}},
+                "properties":{"read":{"type":"boolean","description":"Read entries","default":false}}
+            },
+            "archive":{
+                "type":"object","title":"Archive writes",
+                "description":"Write entries to an archive.","unevaluatedProperties":false,
+                "x-ck-setup":{"feature":"archive_writes","order":20,"recommended":{}},
+                "properties":{"write":{"type":"boolean","description":"Write entries","default":false}}
+            }
+        }
+    });
+    let declare = |schema| {
+        setup_rig.owner.declare(
+            ConnectionId::new(12),
+            "sample-setup",
+            subc_protocol::config::ConfigDeclareRequest::new(
+                schema,
+                setup_rig
+                    .root
+                    .join("cortexkit/sample-setup.jsonc")
+                    .to_string_lossy(),
+                vec![],
+            ),
+            true,
+        )
+    };
+    let mut invalid = setup_schema.clone();
+    invalid["properties"]["journal"]["x-ck-setup"]["feature"] = json!("archive_writes");
+    let refusal = declare(invalid).unwrap_err();
+    assert_eq!(refusal.code, "schema_invalid");
+    assert!(refusal.detail.contains("/journal"));
+    declare(setup_schema.clone()).unwrap();
+    let setup_handler = self::handler(&setup_rig);
+    let body = json!({"op":"config.schema","module_id":"sample-setup"});
+    let reply = setup_handler
+        .handle_control_frame(&ctx, request(body.clone()))
+        .await
+        .unwrap();
+    assert_eq!(reply[0].header.ty, FrameType::Response);
+    let reply: Value = serde_json::from_slice(&reply[0].body).unwrap();
+    for section in ["journal", "archive"] {
+        assert_eq!(
+            reply["schema"]["properties"][section]["x-ck-setup"],
+            setup_schema["properties"][section]["x-ck-setup"]
+        );
+    }
+    samples.push(("schema-setup.request.json".into(), body));
+    samples.push(("schema-setup.reply.json".into(), reply));
     let directory =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vectors/config-settings-v1");
     let update = std::env::var_os("UPDATE_GOLDEN").is_some();

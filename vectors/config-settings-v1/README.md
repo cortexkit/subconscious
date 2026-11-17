@@ -12,6 +12,8 @@ invented. The credential reference is a reference, never a secret.
 | `modules.reply.json` | Stamped module rows before activation |
 | `schema.request.json` | Read the sample module's schema |
 | `schema.reply.json` | Normalized admitted schema and digest |
+| `schema-setup.request.json` | Read the invented setup module's schema |
+| `schema-setup.reply.json` | Two sections carrying unchanged `x-ck-setup` annotations |
 | `show.request.json` | Read the complete approved settings |
 | `show.reply.json` | Effective settings, sources and default/user documents |
 | `show.file-error.reply.json` | Approved settings retained alongside an invalid user-file diagnostic |
@@ -26,6 +28,11 @@ invented. The credential reference is a reference, never a secret.
 The watch emits StreamData bodies. A resync may arrive at any time, including
 when modules are added or removed or the stamp changes; it replaces all state.
 Reopening a watch always begins with another full resync.
+
+The setup schema groups journal reads and archive writes into separate features.
+Its recommendations are root-relative field values for the wizard to propose,
+not daemon defaults: the journal's `read` default remains false even though its
+recommended value is true. An empty recommendation object is valid.
 
 `file_error: {code, message}` is an optional fact separate from status. Watch
 events expose a matching failure only after the save-settling grace, and omit

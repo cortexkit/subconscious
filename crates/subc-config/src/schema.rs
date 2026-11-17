@@ -80,6 +80,7 @@ impl Schema {
         // A malformed or out-of-picker default is a declaration error, not a late
         // runtime surprise. Dynamic closed sets are checked when supplied to review.
         validate_defaults(&result.normalized, "")?;
+        validate_setup(&result.normalized, "", 0, false, &mut BTreeSet::new())?;
         Ok(result)
     }
     pub fn normalized(&self) -> &Value {
@@ -516,6 +517,133 @@ fn validate_defaults(s: &Value, path: &str) -> Result<(), Refusal> {
         }
     }
     Ok(())
+}
+
+fn validate_setup(
+    s: &Value,
+    path: &str,
+    depth: usize,
+    named_property: bool,
+    features: &mut BTreeSet<String>,
+) -> Result<(), Refusal> {
+    if let Some(setup) = s.get("x-ck-setup") {
+        // Only top-level named objects are features, so one feature's section can
+        // never contain another's. Allowing nested sections later only admits
+        // schemas that are refused today, so a client built for top-level
+        // features keeps reading every schema it can read now.
+        if depth != 1
+            || !named_property
+            || s.get("type").and_then(Value::as_str) != Some("object")
+            || s.get("oneOf").is_some()
+            || credential(s)
+        {
+            return Err(schema_error(path));
+        }
+        let setup = setup.as_object().ok_or_else(|| schema_error(path))?;
+        let feature = setup
+            .get("feature")
+            .and_then(Value::as_str)
+            .filter(|f| {
+                Regex::new("^[a-z][a-z0-9_]{0,63}$")
+                    .expect("feature pattern")
+                    .is_match(f)
+            })
+            .ok_or_else(|| schema_error(path))?;
+        if setup.len() != 3
+            || setup
+                .keys()
+                .any(|key| !["feature", "order", "recommended"].contains(&key.as_str()))
+            || !setup.get("order").is_some_and(|n| n.is_i64() || n.is_u64())
+            || !features.insert(feature.to_owned())
+        {
+            return Err(schema_error(path));
+        }
+        let recommended = setup
+            .get("recommended")
+            .and_then(Value::as_object)
+            .ok_or_else(|| schema_error(path))?;
+        for (target, value) in recommended {
+            let relative = target
+                .strip_prefix(path)
+                .filter(|p| p.starts_with('/'))
+                .filter(|_| valid_pointer(target))
+                .ok_or_else(|| schema_error(path))?;
+            let mut field = s;
+            for token in relative[1..].split('/') {
+                if field.get("type").and_then(Value::as_str) != Some("object")
+                    || field.get("oneOf").is_some()
+                    || credential(field)
+                {
+                    return Err(schema_error(path));
+                }
+                let key = token.replace("~1", "/").replace("~0", "~");
+                field = field
+                    .get("properties")
+                    .and_then(|props| props.get(&key))
+                    .ok_or_else(|| schema_error(path))?;
+            }
+            if field.get("type").and_then(Value::as_str) == Some("object")
+                || field.get("oneOf").is_some()
+                || schema_contains_credential(field)
+            {
+                return Err(schema_error(path));
+            }
+            // Like defaults, recommendations do not check membership in dynamic
+            // x-ck-options catalogs at declaration. They are wizard proposals,
+            // never daemon-applied default values.
+            let mut declaration_schema = field.clone();
+            strip_options(&mut declaration_schema);
+            validate(
+                &declaration_schema,
+                value,
+                target,
+                None,
+                false,
+                &ValidationContext::default(),
+            )
+            .map_err(|_| schema_error(path))?;
+        }
+    }
+    for keyword in ["properties", "patternProperties"] {
+        if let Some(properties) = s.get(keyword).and_then(Value::as_object) {
+            // Visit keys in sorted order: serde_json keeps document order when
+            // another crate in the build enables `preserve_order`, and the
+            // duplicate-feature refusal must name the same section either way.
+            let mut sorted: Vec<_> = properties.iter().collect();
+            sorted.sort_unstable_by(|left, right| left.0.cmp(right.0));
+            for (key, child) in sorted {
+                validate_setup(
+                    child,
+                    &pointer(path, key),
+                    depth + 1,
+                    keyword == "properties",
+                    features,
+                )?;
+            }
+        }
+    }
+    if let Some(items) = s.get("items") {
+        validate_setup(items, path, depth + 1, false, features)?;
+    }
+    if let Some(branches) = s.get("oneOf").and_then(Value::as_array) {
+        for branch in branches {
+            validate_setup(branch, path, depth + 1, false, features)?;
+        }
+    }
+    Ok(())
+}
+
+fn schema_contains_credential(s: &Value) -> bool {
+    credential(s)
+        || ["properties", "patternProperties"].iter().any(|key| {
+            s.get(*key)
+                .and_then(Value::as_object)
+                .is_some_and(|props| props.values().any(schema_contains_credential))
+        })
+        || s.get("items").is_some_and(schema_contains_credential)
+        || s.get("oneOf")
+            .and_then(Value::as_array)
+            .is_some_and(|branches| branches.iter().any(schema_contains_credential))
 }
 
 fn validate(

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.50.2
+
+- Require subc-config 0.1.1 to admit setup feature annotations at declaration and
+  preserve them in `config.schema`; add real-handler setup schema samples.
+
 ## 0.50.1
 
 - Keep settings watches alive through invalid user-file saves, settle matching file failures before reporting `file_error`, and expose the same diagnostic alongside approved show values; require subc-control 0.42.1.

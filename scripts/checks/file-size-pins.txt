@@ -1,0 +1,7 @@
+# Path, counted lines, reason. Lower a pin when the file shrinks; remove it below 5000.
+# Raising a pin breaks the rule and needs a maintainer's explicit approval in review.
+crates/subc-client-rs/src/consumer.rs 7919 Rust client consumer; split by responsibility when next worked in
+crates/subc-core/src/bin/ck.rs 9222 Main command-line entry point; split commands into modules
+crates/subc-daemon/src/control.rs 10666 Daemon control service; split by request area when next worked in
+crates/subc-daemon/src/supervise.rs 16823 Daemon supervisor; split by responsibility when next worked in
+crates/subc-mcp/src/main.rs 8166 MCP server entry point; split by operation

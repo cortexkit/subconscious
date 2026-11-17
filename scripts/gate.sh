@@ -13,9 +13,9 @@ Usage: scripts/gate.sh {fast|lint|test|swift|ts|all} [check]
   fast   Formatting; committed crate versions; offline locked Cargo metadata;
          path-dependency policy and its tests; CortexKit layout (including
          git ls-files -ci --exclude-standard -- .cortexkit); Markdown links and
-         test citations; every wire-vector generator and SHA256SUMS; installer
-         ShellCheck, Unix installer contract, and shell self-tests for release
-         and placement scripts. Fails at the first bad check.
+         test citations; source-file size pins; every wire-vector generator and
+         SHA256SUMS; installer ShellCheck, Unix installer contract, and shell
+         self-tests for release and placement scripts. Fails at the first bad check.
   lint   CI's workspace all-targets and release clippy, subc-core all-targets
          clippy, then both workspace invocations for x86_64-pc-windows-gnu.
          The untargeted checks use the host: run on Linux for CI's Linux verdict.
@@ -59,8 +59,8 @@ Version comparisons:
 
 CI adapters (optional [check], for the existing job boundaries and conditions):
   fast: fmt, versions, metadata, metadata-online, paths, layout, links,
-        citations, unbound, vectors, vector <vectors/name/>, shellcheck, installer,
-        shell-tests
+        citations, file-size, unbound, vectors, vector <vectors/name/>, shellcheck,
+        installer, shell-tests
   lint: workspace, release, alpha, windows, windows-release
   test: workspace, docs, alpha-setup, alpha-cli, alpha-inode
   swift: test, ios, macos
@@ -197,6 +197,9 @@ fast_check() {
     layout) step 'CortexKit layout and tracked ignored files' bash scripts/check-cortexkit-layout.sh ;;
     links) step 'Markdown links' python3 scripts/checks/check-md-links.py ;;
     citations) step 'Documentation test citations' python3 scripts/checks/check-doc-test-citations.py ;;
+    file-size)
+      step 'Source file size checker tests' python3 scripts/checks/test_file_size.py
+      step 'Source file size pins' python3 scripts/checks/check-file-size.py ;;
     unbound)
       step 'Unbound-variable fail-open hazards' bash scripts/checks/no-unbound-fail-open.sh
       step 'Unbound-variable checker tests' bash scripts/checks/no-unbound-fail-open.test.sh ;;
@@ -385,7 +388,7 @@ case "$STAGE" in
   fast)
     if [ -n "$CHECK" ]; then fast_check "$CHECK" "${3:-}"; else
       step 'Pinned vector Python prerequisite' require_vector_python
-      for check in fmt versions metadata paths layout links citations unbound vectors shellcheck installer shell-tests; do fast_check "$check"; done
+      for check in fmt versions metadata paths layout links citations file-size unbound vectors shellcheck installer shell-tests; do fast_check "$check"; done
     fi ;;
   lint)
     if [ -n "$CHECK" ]; then lint_check "$CHECK"; else collect workspace release alpha windows windows-release; fi ;;

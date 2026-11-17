@@ -263,6 +263,10 @@ jobs:
         if: ${{ matrix.os == 'ubuntu' }}
         run: bash scripts/gate.sh fast citations
 
+      - name: Check source file size pins
+        if: ${{ matrix.os == 'ubuntu' }}
+        run: bash scripts/gate.sh fast file-size
+
       - name: Format check
         run: bash scripts/gate.sh fast fmt
 

@@ -52,7 +52,12 @@ async fn event(rx: &mut tokio::sync::mpsc::Receiver<crate::router::OutboundFrame
         .unwrap()
         .unwrap()
         .frame;
-    assert_eq!(frame.header.ty, FrameType::StreamData);
+    assert_eq!(
+        frame.header.ty,
+        FrameType::StreamData,
+        "unexpected settings watch frame body: {}",
+        String::from_utf8_lossy(&frame.body)
+    );
     assert_eq!(frame.header.corr, 91);
     serde_json::from_slice(&frame.body).unwrap()
 }
@@ -399,6 +404,228 @@ async fn config_settings_watch_does_not_retry_other_refusals() {
 }
 
 #[tokio::test]
+async fn config_settings_watch_survives_truncated_save() {
+    probe_save_window(false).await;
+}
+
+#[test]
+fn config_settings_watch_file_error_grace_uses_matching_spaced_observations() {
+    let mut good = ConfigModule::default();
+    good.module_id = "sample".into();
+    good.status = "adopted".into();
+    let mut bad = good.clone();
+    bad.file_error = Some(ConfigFileError::new("value_invalid", "invalid JSON"));
+    let start = tokio::time::Instant::now();
+    let mut grace = SettingsFileGrace::default();
+    for age in [0, 1] {
+        let mut rows = vec![bad.clone()];
+        grace.settle(&[good.clone()], &mut rows, start + Duration::from_secs(age));
+        assert_eq!(rows, vec![good.clone()]);
+    }
+    let mut rows = vec![bad.clone()];
+    grace.settle(&[good.clone()], &mut rows, start + Duration::from_secs(2));
+    assert_eq!(rows, vec![bad.clone()]);
+    let mut changed_error = bad.clone();
+    changed_error.file_error = Some(ConfigFileError::new(
+        "input_unavailable",
+        "unreadable JSONC",
+    ));
+    let mut rows = vec![changed_error.clone()];
+    grace.settle(&[bad.clone()], &mut rows, start + Duration::from_secs(3));
+    assert_eq!(rows, vec![bad.clone()]);
+    let mut rows = vec![changed_error.clone()];
+    grace.settle(&[bad], &mut rows, start + Duration::from_secs(5));
+    assert_eq!(rows, vec![changed_error]);
+    let mut rows = vec![good.clone()];
+    grace.settle(&[], &mut rows, start + Duration::from_secs(6));
+    assert_eq!(rows, vec![good]);
+    assert!(grace.pending.is_empty());
+}
+
+#[tokio::test]
+async fn config_settings_watch_unstamped_file_error_does_not_invent_values() {
+    let rig = SettingsRig::new();
+    rig.write(b"{");
+    let handler = handler(&rig);
+    let (ctx, mut rx) = context();
+    assert!(handler
+        .handle_control_frame(&ctx, request(json!({"op":"config.watch"})))
+        .await
+        .unwrap()
+        .is_empty());
+    let initial = event(&mut rx).await;
+    assert_eq!(initial["stamped"], false);
+    let row = &initial["modules"][0];
+    assert_eq!(row["file_error"]["code"], "value_invalid");
+    assert!(row.get("effective").is_none());
+    assert!(row.get("layers").is_none());
+    let show = handler
+        .handle_control_frame(
+            &ctx,
+            request(json!({"op":"config.show","module_id":"sample-reader"})),
+        )
+        .await
+        .unwrap();
+    assert_eq!(show[0].header.ty, FrameType::Error);
+    let refused: Value = serde_json::from_slice(&show[0].body).unwrap();
+    assert_eq!(refused, row["file_error"]);
+    rig.write(br#"{"limit":9,"credential":{"vault_ref":"sample-reference"}}"#);
+    let recovered = event(&mut rx).await;
+    assert!(recovered.get("file_error").is_none());
+    let show = handler
+        .handle_control_frame(
+            &ctx,
+            request(json!({"op":"config.show","module_id":"sample-reader"})),
+        )
+        .await
+        .unwrap();
+    let show: Value = serde_json::from_slice(&show[0].body).unwrap();
+    assert_eq!(show["effective"]["limit"], 9);
+    assert_eq!(show["base_generation"], 0);
+    handler.cleanup_connection(ctx.connection_id).unwrap();
+}
+
+#[tokio::test]
+async fn config_settings_watch_survives_partial_save() {
+    probe_save_window(true).await;
+}
+
+async fn probe_save_window(partial: bool) {
+    use std::io::Write;
+    let rig = SettingsRig::new();
+    rig.stamp();
+    rig.activate();
+    rig.edit_limit(8);
+    rig.activate_generation(2);
+    let handler = handler(&rig);
+    let (ctx, mut rx) = context();
+    handler
+        .handle_control_frame(&ctx, request(json!({"op":"config.watch"})))
+        .await
+        .unwrap();
+    assert_eq!(event(&mut rx).await["modules"][0]["status"], "adopted");
+    let target = br#"{"limit":99,"credential":{"vault_ref":"sample-reference"}}"#.to_vec();
+    let path = rig.root.join("cortexkit/sample-reader.jsonc");
+    let writer = Arc::new(std::sync::Mutex::new(None));
+    let held = writer.clone();
+    let prefix_len = if partial { target.len() / 2 } else { 0 };
+    let bytes = target.clone();
+    let mut injected = false;
+    *rig.owner.settings_projection_hook.lock().unwrap() = Some(Box::new(move || {
+        if !injected {
+            injected = true;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(&bytes[..prefix_len]).unwrap();
+            *held.lock().unwrap() = Some(file);
+        }
+        Ok(())
+    }));
+    let held = writer.clone();
+    let suffix = target[prefix_len..].to_vec();
+    let mut finished = false;
+    *rig.owner.settings_observation_hook.lock().unwrap() = Some(Box::new(move || {
+        if !finished {
+            if let Some(file) = held.lock().unwrap().as_mut() {
+                // Finish the save only after the observation has copied and
+                // rejected the incomplete bytes, not before its capture read.
+                file.write_all(&suffix).unwrap();
+                finished = true;
+            }
+        }
+    }));
+    let changed = event(&mut rx).await;
+    assert_eq!(changed["event"], "change");
+    assert_eq!(changed["status"], "write_back_behind");
+    assert!(changed.get("file_error").is_none());
+    assert_eq!(
+        std::fs::read(rig.root.join("cortexkit/sample-reader.jsonc")).unwrap(),
+        target
+    );
+    handler.cleanup_connection(ctx.connection_id).unwrap();
+}
+
+#[tokio::test]
+async fn config_settings_watch_reports_persistent_file_error_and_recovers() {
+    let rig = SettingsRig::new();
+    rig.stamp();
+    rig.activate();
+    let approved = rig.edit_limit(8);
+    rig.activate_generation(2);
+    let handler = handler(&rig);
+    let (ctx, mut rx) = context();
+    handler
+        .handle_control_frame(&ctx, request(json!({"op":"config.watch"})))
+        .await
+        .unwrap();
+    assert_eq!(event(&mut rx).await["modules"][0]["status"], "adopted");
+    let since = tokio::time::Instant::now();
+    rig.write(b"{");
+    let failed = event(&mut rx).await;
+    assert_eq!(failed["event"], "change");
+    assert_eq!(failed["file_error"]["code"], "value_invalid");
+    assert_eq!(
+        failed["file_error"]["message"],
+        "configuration must be JSON with unique keys and lossless finite numbers"
+    );
+    assert!(since.elapsed() >= Duration::from_secs(2));
+    let show = handler
+        .handle_control_frame(
+            &ctx,
+            request(json!({"op":"config.show","module_id":"sample-reader"})),
+        )
+        .await
+        .unwrap();
+    let show: Value = serde_json::from_slice(&show[0].body).unwrap();
+    assert_eq!(show["effective"]["limit"], 8);
+    assert_eq!(show["base_generation"], 2);
+    assert_eq!(show["file_error"], failed["file_error"]);
+    rig.write(&approved);
+    let recovered = event(&mut rx).await;
+    assert_eq!(recovered["event"], "change");
+    assert!(recovered.get("file_error").is_none());
+    if recovered["status"] != "adopted" {
+        assert_eq!(recovered["status"], "write_back_behind");
+        tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                let next = event(&mut rx).await;
+                let ConfigWatchEvent::Change {
+                    module_id,
+                    status,
+                    file_error,
+                    ..
+                } = serde_json::from_value(next).unwrap()
+                else {
+                    panic!("recovery must remain a module change");
+                };
+                assert_eq!(module_id, "sample-reader");
+                assert!(file_error.is_none());
+                if status == "adopted" {
+                    break;
+                }
+                assert_eq!(status, "write_back_behind");
+            }
+        })
+        .await
+        .unwrap();
+    }
+    assert!(handler.cancel_config_settings_subscription(ctx.connection_id, 91));
+    rig.write(b"{");
+    assert!(handler
+        .handle_control_frame(&ctx, request(json!({"op":"config.watch"})))
+        .await
+        .unwrap()
+        .is_empty());
+    let opened = event(&mut rx).await;
+    assert_eq!(opened["event"], "resync");
+    assert_eq!(opened["modules"][0]["file_error"]["code"], "value_invalid");
+    handler.cleanup_connection(ctx.connection_id).unwrap();
+}
+
+#[tokio::test]
 async fn config_settings_watch_reports_write_back_status_and_reason_changes() {
     let rig = SettingsRig::new();
     rig.stamp();
@@ -474,6 +701,21 @@ async fn config_settings_vectors_match_real_handler_bytes() {
     let change = event(&mut rx).await;
     assert_eq!(change["event"], "change");
     samples.push(("watch.change.json".into(), change));
+    rig.write(b"{");
+    let failed = event(&mut rx).await;
+    assert_eq!(failed["file_error"]["code"], "value_invalid");
+    samples.push(("watch.file-error.json".into(), failed));
+    let shown = handler
+        .handle_control_frame(
+            &ctx,
+            request(json!({"op":"config.show","module_id":"sample-reader"})),
+        )
+        .await
+        .unwrap();
+    assert_eq!(shown[0].header.ty, FrameType::Response);
+    let shown: Value = serde_json::from_slice(&shown[0].body).unwrap();
+    assert_eq!(shown["effective"]["limit"], 4);
+    samples.push(("show.file-error.reply.json".into(), shown));
     handler.cleanup_connection(ctx.connection_id).unwrap();
     let directory =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vectors/config-settings-v1");

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.41.3
+
+- Supersedes the unpublished 0.41.2 settings client before its first release.
+- Expose optional settings file diagnostics through typed module, show and watch replies; require subc-control 0.42.1.
+
 ## 0.41.2
 
 - Require subc-control 0.42.0 for typed configuration settings reads and edit plans,

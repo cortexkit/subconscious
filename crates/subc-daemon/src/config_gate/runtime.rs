@@ -43,6 +43,8 @@ pub struct RuntimeOwner {
     #[cfg(test)]
     pub(crate) settings_projection_hook: Mutex<Option<SettingsProjectionHook>>,
     #[cfg(test)]
+    pub(crate) settings_observation_hook: Mutex<Option<Box<dyn FnMut() + Send>>>,
+    #[cfg(test)]
     polled_capture_count: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     census_probe: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
@@ -916,6 +918,8 @@ impl RuntimeOwner {
             polled_capture_hook: Mutex::new(None),
             #[cfg(test)]
             settings_projection_hook: Mutex::new(None),
+            #[cfg(test)]
+            settings_observation_hook: Mutex::new(None),
             #[cfg(test)]
             config_park_hook: Mutex::new(None),
             #[cfg(test)]

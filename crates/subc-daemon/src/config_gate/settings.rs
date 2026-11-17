@@ -69,13 +69,14 @@ impl RuntimeOwner {
         }
         let snapshot = self.settings_snapshot(known)?;
         let approved = GateSnapshot::from_store(&snapshot.body.approved)?;
+        // Write-back status and capture read the file separately, so a concurrent
+        // edit can make their diagnostics disagree for one tick. Approved values
+        // stay store-backed, and the next poll reconciles the observations.
         let write_back = self.write_back_status()?;
+        let captured = self.capturer.capture_settings(&snapshot.declarations)?;
+        let file_errors = captured.file_errors;
         let observed = if snapshot.body.stamped {
-            Some(
-                self.capturer
-                    .capture_polled_configuration(&snapshot.declarations)?
-                    .proposal_snapshot(&approved),
-            )
+            Some(captured.configuration.proposal_snapshot(&approved))
         } else {
             None
         };
@@ -112,10 +113,11 @@ impl RuntimeOwner {
                 row.active_generation = Some(0);
             }
             row.pending_plan = snapshot.pending.get(module).cloned();
+            row.file_error = file_errors.get(module).cloned();
             let failed = entry.filter(|entry| entry.generation.never_redeliver.contains(module));
             let mut proposal = false;
             let mut formatting = false;
-            if let Some(observed) = &observed {
+            if let Some(observed) = observed.as_ref().filter(|_| row.file_error.is_none()) {
                 for key in approved
                     .changed_keys(observed)
                     .into_iter()
@@ -218,6 +220,11 @@ impl RuntimeOwner {
                 .ok_or_else(|| GateError::new("config_gated", "module view is unavailable"))?;
             (0, captured.view.clone(), declaration.clone())
         };
+        let file_error = if snapshot.body.stamped {
+            self.capturer.settings_file_error(&module, declaration)?
+        } else {
+            None
+        };
         let defaults = schema(&approved_declaration)?.defaults();
         let mut layers = vec![ConfigSettingsLayer::new(Layer::Default, defaults.clone())];
         for layer in &view.layers {
@@ -273,6 +280,7 @@ impl RuntimeOwner {
             effective,
             sources,
             layers,
+            file_error,
             pending_plan: snapshot.pending.get(&module).cloned(),
         })
     }

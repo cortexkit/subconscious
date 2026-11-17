@@ -14,16 +14,24 @@ invented. The credential reference is a reference, never a secret.
 | `schema.reply.json` | Normalized admitted schema and digest |
 | `show.request.json` | Read the complete approved settings |
 | `show.reply.json` | Effective settings, sources and default/user documents |
+| `show.file-error.reply.json` | Approved settings retained alongside an invalid user-file diagnostic |
 | `show-default.request.json` | Read through the default layer |
 | `show-default.reply.json` | Defaults and their sources |
 | `watch.request.json` | Watch only the sample module |
 | `watch.resync.json` | Initial complete replacement state |
 | `watch.change.json` | Activation changed the row's fields |
+| `watch.file-error.json` | A settled user-file failure without ending the watch |
 | `SHA256SUMS` | SHA-256 of every JSON sample in this directory |
 
 The watch emits StreamData bodies. A resync may arrive at any time, including
 when modules are added or removed or the stamp changes; it replaces all state.
 Reopening a watch always begins with another full resync.
+
+`file_error: {code, message}` is an optional fact separate from status. Watch
+events expose a matching failure only after the save-settling grace, and omit
+the member on recovery. A stamped show reply keeps its approved values and
+reports the file failure immediately. Unstamped show calls with no valid live
+view keep the file's refusal instead of inventing effective values or defaults.
 
 Regenerate with:
 

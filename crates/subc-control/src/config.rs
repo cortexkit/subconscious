@@ -162,6 +162,23 @@ pub enum ConfigThrough {
     Workspace,
 }
 
+/// A user-file observation failure, separate from the approved settings status.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ConfigFileError {
+    pub code: String,
+    pub message: String,
+}
+
+impl ConfigFileError {
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
 /// Status strings are open: clients display an unfamiliar status as raw text.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -175,6 +192,8 @@ pub struct ConfigModule {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_error: Option<ConfigFileError>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approved_generation: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -226,6 +245,8 @@ pub enum ConfigWatchEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status_reason: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        file_error: Option<ConfigFileError>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         schema_digest: Option<Digest>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pending_plan: Option<Digest>,
@@ -240,6 +261,7 @@ impl ConfigWatchEvent {
             active_generation: row.active_generation,
             status: row.status.clone(),
             status_reason: row.status_reason.clone(),
+            file_error: row.file_error.clone(),
             schema_digest: row.schema_digest.clone(),
             pending_plan: row.pending_plan.clone(),
         }
@@ -359,6 +381,8 @@ pub enum ConfigControlResponse {
         sources: std::collections::BTreeMap<String, subc_config::Layer>,
         layers: Vec<ConfigSettingsLayer>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        file_error: Option<ConfigFileError>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         pending_plan: Option<Digest>,
     },
     #[serde(rename = "config.plan")]
@@ -443,6 +467,38 @@ mod tests {
             serde_json::from_slice::<ConfigWatchResponse>(&serde_json::to_vec(&event).unwrap())
                 .unwrap(),
             event
+        );
+    }
+
+    #[test]
+    fn config_wire_file_errors_are_optional_and_tolerate_extensions() {
+        let legacy = json!({"module_id":"sample","gated":true,"status":"adopted"});
+        let mut row: ConfigModule = serde_json::from_value(legacy).unwrap();
+        assert!(row.file_error.is_none());
+        let error = ConfigFileError::new("value_invalid", "invalid settings");
+        row.file_error = Some(error.clone());
+        let change = ConfigWatchResponse::new(ConfigWatchEvent::change(&row));
+        let mut wire = serde_json::to_value(&change).unwrap();
+        assert_eq!(
+            wire["file_error"],
+            json!({"code":"value_invalid","message":"invalid settings"})
+        );
+        wire["file_error"]["future"] = json!(true);
+        assert_eq!(
+            serde_json::from_value::<ConfigWatchResponse>(wire).unwrap(),
+            change
+        );
+        let mut shown = json!({"op":"config.show","module_id":"sample","stamped":true,"base_generation":1,"effective":{},"sources":{},"layers":[]});
+        assert!(matches!(
+            serde_json::from_value::<ConfigControlResponse>(shown.clone()).unwrap(),
+            ConfigControlResponse::Show {
+                file_error: None,
+                ..
+            }
+        ));
+        shown["file_error"] = serde_json::to_value(&error).unwrap();
+        assert!(
+            matches!(serde_json::from_value::<ConfigControlResponse>(shown).unwrap(), ConfigControlResponse::Show {file_error:Some(found), ..} if found == error)
         );
     }
 

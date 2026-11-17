@@ -90,9 +90,10 @@ pub enum PrivilegedOperatorPrompt {
 }
 
 /// `scope_authority_owners` when the config does not set it: the session
-/// runtime, the same module that carries admission facts today.
+/// runtime under both names during its rename. The old `prefrontal-core`
+/// name will be dropped in a later release.
 pub fn default_scope_authority_owners() -> Vec<String> {
-    vec!["prefrontal-core".to_string()]
+    vec!["prefrontal-core".to_string(), "prefrontal".to_string()]
 }
 
 pub fn default_federated_scope_owner() -> String {
@@ -2040,7 +2041,10 @@ mod tests {
     #[test]
     fn scope_authority_owners_defaults_to_the_session_runtime() {
         let config = parse_doc(r#"{ "version": 1 }"#, Path::new("/tmp/subc.jsonc")).unwrap();
-        assert_eq!(config.scope_authority_owners, vec!["prefrontal-core"]);
+        assert_eq!(
+            config.scope_authority_owners,
+            vec!["prefrontal-core", "prefrontal"]
+        );
     }
 
     #[test]

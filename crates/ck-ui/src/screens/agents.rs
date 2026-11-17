@@ -2,7 +2,7 @@
 //!
 //! The list joins three sources on each agent's exact id, identity on the
 //! left: entorhinal's identity (name, project, role, workspace),
-//! prefrontal-core's state (working or idle, what the agent is doing, the
+//! prefrontal's state (working or idle, what the agent is doing, the
 //! questions it waits on) and entorhinal's places (the machine holding it).
 //! Each column ages and dims by its own source, so a fresh identity reply
 //! never makes an old state or place look current; the heading names any
@@ -301,7 +301,7 @@ pub fn draw(c: &mut Canvas, v: &View, state: &AgentsState, typing: bool) {
 /// or failing, by what it gives the list ("state 45s ago", "machines
 /// last good reading · 6m ago"), or that identity is still being read. A
 /// state source that never answered reads "state unknown" with its error,
-/// such as the code prefrontal-core refuses ck with.
+/// such as the code prefrontal refuses ck with.
 fn source_notes(v: &View, snap: &Snapshot) -> (String, St) {
     let sources = &snap.agents.data.sources;
     let mut parts = Vec::new();

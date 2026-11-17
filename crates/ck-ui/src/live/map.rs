@@ -918,7 +918,7 @@ pub struct AgentIdentity {
 /// Whether a reply to a fleet poll sent with a token says nothing changed
 /// since that token (`unchanged: true`, carrying no rows), and the token to
 /// send next time, if it gives one. Entorhinal wraps its reply in `result`;
-/// prefrontal-core doesn't.
+/// prefrontal doesn't.
 pub fn fleet_change(reply: &Value) -> (bool, Option<Value>) {
     let body = unwrap_result(reply);
     let unchanged = body.get("unchanged").and_then(Value::as_bool) == Some(true);
@@ -963,7 +963,7 @@ pub fn agent_identities(reply: &Value) -> Result<Vec<AgentIdentity>, Fault> {
         .collect())
 }
 
-/// An agent's state from prefrontal-core's `agent.fleet_residence`.
+/// An agent's state from prefrontal's `agent.fleet_residence`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentResidence {
     /// "busy", "idle" or "unknown".

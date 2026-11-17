@@ -56,7 +56,7 @@ pub enum Source {
     Devices,
     /// entorhinal `agent.fleet_identity`.
     Identity,
-    /// prefrontal-core `agent.fleet_residence`.
+    /// prefrontal `agent.fleet_residence`.
     Residence,
     /// entorhinal `agent.where_many`, for where each agent lives.
     Places,
@@ -329,7 +329,7 @@ where
 #[derive(Clone, Copy, Debug)]
 pub struct Polled {
     pub source: Source,
-    /// The module's id, as the daemon knows it.
+    /// The default module id; the request may select a renamed module.
     pub module: &'static str,
     pub method: &'static str,
     /// Seconds to wait after one reading completes before the next.
@@ -360,7 +360,7 @@ pub const POLLED: [Polled; 5] = [
     },
     Polled {
         source: Source::Residence,
-        module: modules::RESIDENCE,
+        module: "prefrontal",
         method: "agent.fleet_residence",
         every: every::AGENTS,
     },
@@ -373,38 +373,39 @@ pub const POLLED: [Polled; 5] = [
 ];
 
 /// Starts one [`gated_poll`] task per [`POLLED`] source. Each reading sends
-/// `call(module, method, params(source))` and hands the reply to `apply`;
-/// `params` is asked afresh for every reading, so a poll can carry the
-/// token the previous reply gave.
+/// `call(module, method, params)` and hands the reply and selected module
+/// to `apply`. `request` selects the target and params afresh for every
+/// reading, so a poll follows module renames and carries its last token.
 pub fn module_sources<C, CFut, P, A>(
     gate: &Gate,
     call: C,
-    params: P,
+    request: P,
     apply: A,
 ) -> Vec<JoinHandle<()>>
 where
     C: Fn(&'static str, &'static str, Value) -> CFut + Clone + Send + 'static,
     CFut: Future<Output = Result<Value, crate::model::Fault>> + Send,
-    P: Fn(Source) -> Value + Clone + Send + 'static,
-    A: Fn(Source, Result<Value, crate::model::Fault>) + Clone + Send + 'static,
+    P: Fn(Polled) -> (&'static str, Value) + Clone + Send + 'static,
+    A: Fn(Source, &'static str, Result<Value, crate::model::Fault>) + Clone + Send + 'static,
 {
     POLLED
         .iter()
         .map(|p| {
             let p = *p;
             let call = call.clone();
-            let params = params.clone();
+            let request = request.clone();
             let apply = apply.clone();
             gated_poll(
                 gate,
                 p.source,
                 Duration::from_secs_f64(p.every),
                 move || {
-                    let reply = call(p.module, p.method, params(p.source));
+                    let (module, params) = request(p);
+                    let reply = call(module, p.method, params);
                     let apply = apply.clone();
                     async move {
                         let reply = reply.await;
-                        apply(p.source, reply)
+                        apply(p.source, module, reply)
                     }
                 },
             )
@@ -443,6 +444,7 @@ mod tests {
         sent: Sent,
         /// The params each request carried, by method, in order.
         params: Arc<Mutex<Vec<(&'static str, Value)>>>,
+        residence_targets: Arc<Mutex<Vec<&'static str>>>,
         state: Arc<Mutex<State>>,
         began: tokio::time::Instant,
         tasks: Vec<JoinHandle<()>>,
@@ -481,12 +483,18 @@ mod tests {
             let gate = Gate::new(demand.subscribe());
             let sent: Sent = Arc::default();
             let params_sent: Arc<Mutex<Vec<(&'static str, Value)>>> = Arc::default();
+            let residence_targets = Arc::default();
             let state = Arc::new(Mutex::new(State::empty("This computer")));
             let began = tokio::time::Instant::now();
             let call = {
                 let sent = Arc::clone(&sent);
                 let params_sent = Arc::clone(&params_sent);
-                move |_module: &'static str, method: &'static str, params: Value| {
+                let residence_targets: Arc<Mutex<Vec<&'static str>>> =
+                    Arc::clone(&residence_targets);
+                move |module: &'static str, method: &'static str, params: Value| {
+                    if method == "agent.fleet_residence" {
+                        residence_targets.lock().unwrap().push(module);
+                    }
                     sent.lock()
                         .unwrap()
                         .push((method, began.elapsed().as_secs_f64()));
@@ -497,23 +505,27 @@ mod tests {
                     }
                 }
             };
-            let params = {
+            let request = {
                 let state = Arc::clone(&state);
-                move |source: Source| state.lock().unwrap().poll_params(source)
+                move |poll: Polled| state.lock().unwrap().poll_request(poll)
             };
             let apply = {
                 let state = Arc::clone(&state);
-                move |source: Source, reply: Result<Value, Fault>| {
+                move |source: Source, module: &'static str, reply: Result<Value, Fault>| {
                     let at = clock(began);
-                    state.lock().unwrap().record_module_reply(source, reply, at);
+                    state
+                        .lock()
+                        .unwrap()
+                        .record_poll_reply(source, module, reply, at);
                 }
             };
-            let tasks = module_sources(&gate, call, params, apply);
+            let tasks = module_sources(&gate, call, request, apply);
             Scripted {
                 demand,
                 gate,
                 sent,
                 params: params_sent,
+                residence_targets,
                 state,
                 began,
                 tasks,
@@ -580,6 +592,143 @@ mod tests {
 
     async fn run_for(secs: f64) {
         tokio::time::sleep(Duration::from_secs_f64(secs)).await;
+    }
+
+    fn residence_poll() -> Polled {
+        *POLLED
+            .iter()
+            .find(|poll| poll.source == Source::Residence)
+            .unwrap()
+    }
+
+    fn roster(state: &mut State, entries: &[(&str, &str)]) {
+        let entries = entries
+            .iter()
+            .map(|(id, status)| {
+                subc_control::SupervisorEntry::new(
+                    *id,
+                    *status,
+                    true,
+                    *status == "running",
+                    subc_control::SupervisorHealthStatus::Unknown,
+                )
+            })
+            .collect();
+        state.record_roster(entries, Timestamp::from_unix_millis(BASE_MS));
+    }
+
+    #[test]
+    fn residence_lookup_accepts_both_names_and_prefers_the_running_new_name() {
+        let mut state = State::empty("This computer");
+        let poll = residence_poll();
+        assert_eq!(state.poll_request(poll).0, "prefrontal");
+        for (entries, expected) in [
+            (vec![("prefrontal-core", "running")], "prefrontal-core"),
+            (vec![("prefrontal", "running")], "prefrontal"),
+            (
+                vec![("prefrontal-core", "running"), ("prefrontal", "running")],
+                "prefrontal",
+            ),
+            (
+                vec![("prefrontal", "running"), ("prefrontal-core", "running")],
+                "prefrontal",
+            ),
+            (
+                vec![("prefrontal-core", "running"), ("prefrontal", "stopped")],
+                "prefrontal-core",
+            ),
+            (
+                vec![("prefrontal-core", "disabled"), ("prefrontal", "running")],
+                "prefrontal",
+            ),
+        ] {
+            roster(&mut state, &entries);
+            assert_eq!(state.poll_request(poll).0, expected, "{entries:?}");
+        }
+    }
+
+    #[test]
+    fn residence_lookup_fallback_keeps_the_last_successful_id_not_a_failed_selection() {
+        let mut state = State::empty("This computer");
+        let poll = residence_poll();
+        let at = Timestamp::from_unix_millis(BASE_MS);
+        roster(&mut state, &[("prefrontal-core", "running")]);
+        let (old, _) = state.poll_request(poll);
+        assert!(state.record_poll_reply(
+            Source::Residence,
+            old,
+            fleet_unchanged(poll.method, &json!({})),
+            at
+        ));
+        roster(&mut state, &[]);
+        assert_eq!(
+            state.poll_request(poll),
+            ("prefrontal-core", json!({"token": "r1"}))
+        );
+
+        roster(&mut state, &[("prefrontal", "running")]);
+        let (new, params) = state.poll_request(poll);
+        assert_eq!(new, "prefrontal");
+        assert_eq!(
+            params,
+            json!({}),
+            "another module must not receive the old token"
+        );
+        for reply in [
+            Err(Fault::code("unreachable")),
+            Ok(json!({"error": {"code": "refused"}})),
+            Ok(json!({})),
+        ] {
+            assert!(!state.record_poll_reply(Source::Residence, new, reply, at));
+        }
+        roster(&mut state, &[("prefrontal", "stopped")]);
+        assert_eq!(state.poll_request(poll).0, "prefrontal-core");
+
+        assert!(state.record_poll_reply(
+            Source::Residence,
+            new,
+            fleet_unchanged(poll.method, &params),
+            at
+        ));
+        roster(&mut state, &[]);
+        assert_eq!(state.poll_request(poll).0, "prefrontal");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn residence_polls_keep_the_selected_id_when_the_roster_changes_in_flight() {
+        let run = Scripted::answering(
+            Showing::tab(Tab::Agents),
+            Duration::from_secs(1),
+            fleet_unchanged,
+        );
+        roster(
+            &mut run.state.lock().unwrap(),
+            &[("prefrontal-core", "running")],
+        );
+        run_for(0.5).await;
+        assert_eq!(*run.residence_targets.lock().unwrap(), ["prefrontal-core"]);
+        roster(&mut run.state.lock().unwrap(), &[("prefrontal", "running")]);
+        run_for(1.0).await;
+        roster(&mut run.state.lock().unwrap(), &[]);
+        run_for(15.0).await;
+        assert_eq!(
+            *run.residence_targets.lock().unwrap(),
+            ["prefrontal-core", "prefrontal-core"]
+        );
+
+        roster(&mut run.state.lock().unwrap(), &[("prefrontal", "running")]);
+        run_for(17.0).await;
+        roster(&mut run.state.lock().unwrap(), &[]);
+        run_for(16.0).await;
+        assert_eq!(
+            *run.residence_targets.lock().unwrap(),
+            [
+                "prefrontal-core",
+                "prefrontal-core",
+                "prefrontal",
+                "prefrontal"
+            ]
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -719,7 +868,7 @@ mod tests {
         assert_eq!(usage_reads(), [0.0, 30.0, 60.0, 565.0, 595.0]);
     }
 
-    /// Answers the fleet polls the way entorhinal and prefrontal-core do: a
+    /// Answers the fleet polls the way entorhinal and prefrontal do: a
     /// poll without a token gets every row and a token; a poll carrying the
     /// token gets `unchanged: true` and no rows. `enumerate` gets the
     /// fleet's counts.

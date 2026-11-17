@@ -11,7 +11,7 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use subc_control::config::{ConfigControlRequest, ConfigControlResponse, ConfigWatchResponse};
 pub use subc_control::config::{
-    ConfigEdit, ConfigEditAction, ConfigModule, ConfigPlanRefusal, ConfigPlanView,
+    ConfigEdit, ConfigEditAction, ConfigFileError, ConfigModule, ConfigPlanRefusal, ConfigPlanView,
     ConfigSettingsLayer, ConfigThrough, ConfigWatchEvent, Digest,
 };
 use tokio::{sync::Semaphore, time::Instant};
@@ -53,6 +53,7 @@ pub struct ConfigShowResponse {
     pub sources: BTreeMap<String, subc_config::Layer>,
     pub layers: Vec<ConfigSettingsLayer>,
     pub pending_plan: Option<Digest>,
+    pub file_error: Option<ConfigFileError>,
 }
 
 /// A completed apply; a stamped generation may still await activation.
@@ -194,6 +195,7 @@ impl SubcConsumer {
                 sources,
                 layers,
                 pending_plan,
+                file_error,
             } => Ok(ConfigShowResponse {
                 module_id,
                 project_id,
@@ -204,6 +206,7 @@ impl SubcConsumer {
                 sources,
                 layers,
                 pending_plan,
+                file_error,
             }),
             _ => Err(unexpected("config.show")),
         }
@@ -694,6 +697,53 @@ mod tests {
         );
         assert_eq!(watch.next().await.unwrap(), None);
         assert_eq!(watch.ended().await, SubscriptionEnd::Error(error));
+    }
+
+    #[tokio::test]
+    async fn config_file_errors_are_exposed_in_reads_and_watch_recovery() {
+        let (consumer, mut rx) = consumer();
+        let shared = consumer.shared.clone();
+        let call = tokio::spawn(async move {
+            let modules = consumer.config_modules().await.unwrap();
+            let show = consumer.config_show("demo", None, None).await.unwrap();
+            (consumer, modules, show)
+        });
+        let error = json!({"code":"input_unavailable","message":"configuration input could not be captured","future":true});
+        let req = request(&mut rx, json!({"op":"config.modules"})).await;
+        respond(&shared, &req, json!({"op":"config.modules","stamped":true,"modules":[{"module_id":"demo","gated":true,"status":"adopted","file_error":error}]})).await;
+        let req = request(&mut rx, json!({"op":"config.show","module_id":"demo"})).await;
+        respond(&shared, &req, json!({"op":"config.show","module_id":"demo","stamped":true,"base_generation":7,"effective":{"limit":8},"sources":{},"layers":[],"file_error":error})).await;
+        let (consumer, modules, shown) = call.await.unwrap();
+        let expected = ConfigFileError::new(
+            "input_unavailable",
+            "configuration input could not be captured",
+        );
+        assert_eq!(modules.modules[0].file_error.as_ref(), Some(&expected));
+        assert_eq!(shown.file_error.as_ref(), Some(&expected));
+        assert_eq!(shown.effective, json!({"limit":8}));
+        let mut watch = consumer.config_watch(None).await.unwrap();
+        let req = request(&mut rx, json!({"op":"config.watch"})).await;
+        dispatch_frame(&consumer.shared, 1, frame(FrameType::StreamData, req.header.corr, json!({"op":"config.watch","event":"change","module_id":"demo","status":"adopted","file_error":error}))).await;
+        assert!(
+            matches!(watch.next().await.unwrap(), Some(ConfigWatchEvent::Change {file_error:Some(found), ..}) if found == expected)
+        );
+        dispatch_frame(
+            &consumer.shared,
+            1,
+            frame(
+                FrameType::StreamData,
+                req.header.corr,
+                json!({"op":"config.watch","event":"change","module_id":"demo","status":"adopted"}),
+            ),
+        )
+        .await;
+        assert!(matches!(
+            watch.next().await.unwrap(),
+            Some(ConfigWatchEvent::Change {
+                file_error: None,
+                ..
+            })
+        ));
     }
 
     #[tokio::test]

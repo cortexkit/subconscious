@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.50.1
+
+- Keep settings watches alive through invalid user-file saves, settle matching file failures before reporting `file_error`, and expose the same diagnostic alongside approved show values; require subc-control 0.42.1.
+- `scope_authority_owners` defaults to both `prefrontal-core` and `prefrontal`
+  while the prefrontal module is renamed; the old name goes in a later release.
+
 ## 0.50.0
 
 - Retry capture-consistency races when opening or refreshing settings watches;

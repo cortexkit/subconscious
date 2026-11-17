@@ -11,6 +11,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use subc_config::{InputState, Layer, LayerValue, RecordedValue, Schema, ValidationContext};
+use subc_control::config::ConfigFileError;
 use subc_protocol::config::{
     ConfigDeclareRequest, ConfigLayer, ConfigLayerSnapshot, ConfigStatus, ConfigView,
 };
@@ -259,6 +260,11 @@ pub struct CapturedConfiguration {
     _program_handles: Vec<File>,
 }
 
+pub(crate) struct SettingsCapture {
+    pub configuration: CapturedConfiguration,
+    pub file_errors: BTreeMap<String, ConfigFileError>,
+}
+
 impl CapturedConfiguration {
     /// Edit candidates bind content before the replacement file has an identity.
     /// For drift reporting, equal written bytes satisfy that approved digest;
@@ -335,6 +341,16 @@ impl ConfigCapturer {
     ) -> Result<CapturedConfiguration> {
         let daemon = CapturedFile::open(&self.daemon_path)?;
         self.capture_layers(daemon, declarations, None, false, CapturedFile::open)
+    }
+
+    /// Settings observations report invalid user files per module. Planning and
+    /// delivery still use the rejecting capture path and cannot adopt them.
+    pub(crate) fn capture_settings(
+        &self,
+        declarations: &BTreeMap<String, ConfigDeclareRequest>,
+    ) -> Result<SettingsCapture> {
+        let daemon = CapturedFile::open(&self.daemon_path)?;
+        self.capture_layers_observed::<true>(daemon, declarations, None, false, CapturedFile::open)
     }
 
     pub fn capture(
@@ -461,8 +477,20 @@ impl ConfigCapturer {
         declarations: &BTreeMap<String, ConfigDeclareRequest>,
         selected: Option<&BTreeSet<String>>,
         programs: bool,
-        mut layer_file: impl FnMut(&Path) -> Result<CapturedFile>,
+        layer_file: impl FnMut(&Path) -> Result<CapturedFile>,
     ) -> Result<CapturedConfiguration> {
+        self.capture_layers_observed::<false>(daemon, declarations, selected, programs, layer_file)
+            .map(|captured| captured.configuration)
+    }
+
+    fn capture_layers_observed<const REPORT_FILE_ERRORS: bool>(
+        &self,
+        daemon: CapturedFile,
+        declarations: &BTreeMap<String, ConfigDeclareRequest>,
+        selected: Option<&BTreeSet<String>>,
+        programs: bool,
+        mut layer_file: impl FnMut(&Path) -> Result<CapturedFile>,
+    ) -> Result<SettingsCapture> {
         let invalid_daemon =
             || GateError::new("invalid_daemon_config", "captured subc.jsonc is invalid");
         let doc = daemon.parse().map_err(|_| invalid_daemon())?;
@@ -528,78 +556,29 @@ impl ConfigCapturer {
             }
         }
         let mut modules = BTreeMap::new();
+        let mut file_errors = BTreeMap::new();
         for (module, declaration) in declarations {
             if selected.is_some_and(|modules| !modules.contains(module)) {
                 continue;
             }
-            if !declaration.project_dirs.is_empty() {
-                // Module-authored directories never become registry roots.
-                return Err(GateError::new(
-                    "config_gated",
-                    format!("{module}: project-tuple planning and delivery are not supported yet"),
-                ));
-            }
-            if module.is_empty() || module.contains(['/', '\\']) || module == "." || module == ".."
+            let (captured, input) = match self.capture_module(module, declaration, &mut layer_file)
             {
-                return Err(GateError::new(
-                    "path_invalid",
-                    "module identity cannot form a layer path",
-                ));
-            }
-            let expected = self
-                .config_home
-                .join("cortexkit")
-                .join(format!("{module}.jsonc"));
-            if Path::new(&declaration.user_file) != expected || !expected.is_absolute() {
-                return Err(GateError::new(
-                    "path_invalid",
-                    format!("{module}: user layer must use its canonical config-home path"),
-                ));
-            }
-            let schema = Schema::new(declaration.schema.clone()).map_err(|refusal| {
-                GateError::new("schema_invalid", format!("{module}: {}", refusal.path))
-            })?;
-            let file = layer_file(&expected)?;
-            let value = file.parse()?;
-            refuse_expansions(&value, module, "")?;
-            // Record even invalid literals through the schema projection first;
-            // nothing raw is retained on the refusal path.
-            let recorded = schema.record(&value).map_err(GateError::invalid)?;
-            let layers = if file.bytes.is_some() {
-                vec![LayerValue::new(Layer::User, value)]
-            } else {
-                Vec::new()
+                Ok(captured) => captured,
+                Err(error) if REPORT_FILE_ERRORS && is_settings_file_error(&error) => {
+                    file_errors.insert(
+                        module.clone(),
+                        ConfigFileError::new(error.code, error.detail),
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error),
             };
-            let reviewed = schema
-                .review_tuple(&layers, &ValidationContext::new(module, None))
-                .map_err(|refusal| {
-                    GateError::new(
-                        refusal_code(refusal.code),
-                        format!("{module}: {}", refusal.path),
-                    )
-                })?;
-            let layer = ConfigLayerSnapshot::file(
-                module,
-                ConfigLayer::User,
-                expected.to_string_lossy(),
-                file.bytes.clone(),
-            );
-            let view = ConfigView::new(
-                0,
-                reviewed.effective,
-                reviewed.sources,
-                vec![layer],
-                ConfigStatus::Unstamped,
-            );
             diagnostic.inputs.insert(
                 InputKey::Layer {
                     module: module.clone(),
-                    path: expected.to_string_lossy().into_owned(),
+                    path: captured.file.path.to_string_lossy().into_owned(),
                 },
-                CapturedInput {
-                    state: file.state.clone(),
-                    value: RecordedValue::new(recorded),
-                },
+                input,
             );
             let decl = serde_json::to_value(declaration).map_err(GateError::invalid)?;
             diagnostic.inputs.insert(
@@ -612,23 +591,116 @@ impl ConfigCapturer {
                     value: RecordedValue::new(redact_launch_values(&decl)?),
                 },
             );
-            modules.insert(
-                module.clone(),
-                CapturedModule {
-                    declaration: declaration.clone(),
-                    schema,
-                    view,
-                    file,
-                },
-            );
+            modules.insert(module.clone(), captured);
         }
-        Ok(CapturedConfiguration {
-            diagnostic,
-            daemon,
-            modules,
-            _program_handles: program_handles,
+        Ok(SettingsCapture {
+            configuration: CapturedConfiguration {
+                diagnostic,
+                daemon,
+                modules,
+                _program_handles: program_handles,
+            },
+            file_errors,
         })
     }
+
+    fn capture_module(
+        &self,
+        module: &str,
+        declaration: &ConfigDeclareRequest,
+        layer_file: impl FnOnce(&Path) -> Result<CapturedFile>,
+    ) -> Result<(CapturedModule, CapturedInput)> {
+        if !declaration.project_dirs.is_empty() {
+            // Workspace/project roots must come from the project registry,
+            // not from directories supplied by the module.
+            return Err(GateError::new(
+                "config_gated",
+                format!("{module}: project-tuple planning and delivery are not supported yet"),
+            ));
+        }
+        if module.is_empty() || module.contains(['/', '\\']) || module == "." || module == ".." {
+            return Err(GateError::new(
+                "path_invalid",
+                "module identity cannot form a layer path",
+            ));
+        }
+        let expected = self
+            .config_home
+            .join("cortexkit")
+            .join(format!("{module}.jsonc"));
+        if Path::new(&declaration.user_file) != expected || !expected.is_absolute() {
+            return Err(GateError::new(
+                "path_invalid",
+                format!("{module}: user layer must use its canonical config-home path"),
+            ));
+        }
+        let schema = Schema::new(declaration.schema.clone()).map_err(|refusal| {
+            GateError::new("schema_invalid", format!("{module}: {}", refusal.path))
+        })?;
+        let file = layer_file(&expected)?;
+        let value = file.parse()?;
+        refuse_expansions(&value, module, "")?;
+        // Record even invalid literals through the schema projection first;
+        // nothing raw is retained on the refusal path.
+        let recorded = schema.record(&value).map_err(GateError::invalid)?;
+        let layers = if file.bytes.is_some() {
+            vec![LayerValue::new(Layer::User, value)]
+        } else {
+            Vec::new()
+        };
+        let reviewed = schema
+            .review_tuple(&layers, &ValidationContext::new(module, None))
+            .map_err(|refusal| {
+                GateError::new(
+                    refusal_code(refusal.code),
+                    format!("{module}: {}", refusal.path),
+                )
+            })?;
+        let layer = ConfigLayerSnapshot::file(
+            module,
+            ConfigLayer::User,
+            expected.to_string_lossy(),
+            file.bytes.clone(),
+        );
+        let view = ConfigView::new(
+            0,
+            reviewed.effective,
+            reviewed.sources,
+            vec![layer],
+            ConfigStatus::Unstamped,
+        );
+        let input = CapturedInput {
+            state: file.state.clone(),
+            value: RecordedValue::new(recorded),
+        };
+        Ok((
+            CapturedModule {
+                declaration: declaration.clone(),
+                schema,
+                view,
+                file,
+            },
+            input,
+        ))
+    }
+
+    pub(crate) fn settings_file_error(
+        &self,
+        module: &str,
+        declaration: &ConfigDeclareRequest,
+    ) -> Result<Option<ConfigFileError>> {
+        match self.capture_module(module, declaration, CapturedFile::open) {
+            Ok(_) => Ok(None),
+            Err(error) if is_settings_file_error(&error) => {
+                Ok(Some(ConfigFileError::new(error.code, error.detail)))
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn is_settings_file_error(error: &GateError) -> bool {
+    matches!(error.code.as_str(), "value_invalid" | "input_unavailable")
 }
 
 fn redact_launch_values(value: &Value) -> Result<Value> {

@@ -96,6 +96,46 @@ configured entry (for example, a daemon without a config file), and on older
 daemons. Absent values are omitted rather than serialized as `null`, preserving
 older list-entry bytes.
 
+### Module settings
+
+The additive `config.settings/v1` capability serves `config.modules`,
+`config.schema`, `config.show` and `config.watch` to authorized local settings
+readers without prompting. `config.show` returns approved effective values and
+layer documents on a stamped install; unstamped reads identify live, unreviewed
+file settings as generation zero. Edits currently serve the user layer only.
+
+`config.watch` opens with a `resync` containing module rows and `stamped`, then
+sends `change` events when a row's settings metadata changes. A later `resync`
+replaces the whole state when the module set or stamp changes. Reopening always
+starts with another complete resync.
+
+Module rows, watch changes and successful `config.show` replies may carry
+`file_error: {code, message}`. It describes a user-file observation failure with
+code `value_invalid` or `input_unavailable`, independently of `status` and its
+existing precedence. Approved effective values, sources and layer documents are
+not replaced by the broken file. One-shot `config.modules` and `config.show`
+reads report this diagnostic without a settling grace.
+
+A watch confirms the same failure on two observations separated by its
+two-second polling interval before exposing `file_error`. Repeated publication
+wakes do not shorten that grace. A single incomplete save keeps the last good
+row silently. A newly opened watch with a failing file waits for the same short
+grace before its initial resync. Persistent bad files do not close the watch:
+once the file parses again, the next event omits `file_error` and carries the
+current row. Other refusal classes retain their existing behavior.
+
+An unstamped `config.show` has no approved view to fall back to: if its live file
+cannot be parsed, the call keeps the file's own refusal code and message, the
+same pair a watch reports in `file_error`. Watch rows contain metadata, not
+effective settings values. An unstamped page keeps a previously loaded good
+view when available; a module that has never parsed has no values to display.
+The daemon does not fill that missing view with defaults.
+
+The Rust client exposes `ConfigFileError` and the optional fields on typed
+settings replies and events. Older readers may ignore the additive members.
+See the [settings wire samples](../vectors/config-settings-v1/README.md) for
+ordinary reads, file diagnostics and edit-plan requests.
+
 ### Configuration plans and approval
 
 The opt-in `config.gate` capability advertises standalone configuration bodies,

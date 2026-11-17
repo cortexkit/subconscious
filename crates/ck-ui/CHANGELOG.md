@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.5
+
+- The agents screen reads agent residence from the prefrontal module under
+  either name, `prefrontal` or `prefrontal-core`, preferring the one that is
+  running, so it keeps working across the module's rename.
+
 ## 0.9.4
 
 - Require subc-client-rs 0.41.2 and subc-control 0.42.0 for the settings release.

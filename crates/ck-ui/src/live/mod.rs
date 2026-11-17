@@ -51,7 +51,6 @@ pub mod modules {
     pub const USAGE: &str = crate::quota::USAGE_MODULE;
     pub const DEVICES: &str = "callosum";
     pub const IDENTITY: &str = "entorhinal";
-    pub const RESIDENCE: &str = "prefrontal-core";
     pub const BUILD_SERVER: &str = "motor";
     pub const BACKUPS: &str = "engram";
     pub const MODELS: &str = "fusiform";
@@ -378,6 +377,9 @@ pub struct State {
     pub identity_token: Option<serde_json::Value>,
     /// The same for `agent.fleet_residence`.
     pub residence_token: Option<serde_json::Value>,
+    /// The residence module that last gave a good reading, kept while
+    /// neither name is serving during a restart.
+    last_residence_module: Option<&'static str>,
     pub places: Part<HashMap<String, String>>,
     pub counts: Part<(Option<u32>, Option<u32>)>,
     /// When the activity ledger was last heard from (a page, an entry, or
@@ -466,6 +468,7 @@ impl State {
             residences: Part::default(),
             identity_token: None,
             residence_token: None,
+            last_residence_module: None,
             places: Part::default(),
             counts: Part::default(),
             activity: Part::default(),
@@ -597,6 +600,59 @@ impl State {
             })
             .map(|h| h.module_id.clone())
             .collect()
+    }
+
+    /// Selects the residence module from the roster already read for the
+    /// screens. A stopped configured entry must not win over a serving one.
+    fn residence_module(&self) -> &'static str {
+        for module in ["prefrontal", "prefrontal-core"] {
+            if self
+                .roster
+                .value
+                .iter()
+                .flatten()
+                .any(|entry| entry.module_id == module && (entry.live || entry.state == "running"))
+            {
+                return module;
+            }
+        }
+        self.last_residence_module.unwrap_or("prefrontal")
+    }
+
+    /// The target and params for one scheduled reading. Residence tokens
+    /// belong to the module that answered, not to another installed name.
+    pub fn poll_request(&self, poll: schedule::Polled) -> (&'static str, serde_json::Value) {
+        let module = if poll.source == Source::Residence {
+            self.residence_module()
+        } else {
+            poll.module
+        };
+        let params = if poll.source == Source::Residence
+            && self
+                .last_residence_module
+                .is_some_and(|last| last != module)
+        {
+            serde_json::json!({})
+        } else {
+            self.poll_params(poll.source)
+        };
+        (module, params)
+    }
+
+    /// Records a scheduled reading with the id selected before the request,
+    /// even if the roster changed while that request was in flight.
+    pub fn record_poll_reply(
+        &mut self,
+        source: Source,
+        module: &'static str,
+        reply: Result<serde_json::Value, Fault>,
+        at: Timestamp,
+    ) -> bool {
+        let good = self.record_module_reply(source, reply, at);
+        if good && source == Source::Residence {
+            self.last_residence_module = Some(module);
+        }
+        good
     }
 
     /// The params for the next poll of a module source in

@@ -1,6 +1,48 @@
 use super::*;
-use std::collections::BTreeSet;
-use subc_control::config::{ConfigModule, ConfigWatchEvent, ConfigWatchResponse};
+use std::collections::{BTreeMap, BTreeSet};
+use subc_control::config::{ConfigFileError, ConfigModule, ConfigWatchEvent, ConfigWatchResponse};
+
+#[derive(Default)]
+struct SettingsFileGrace {
+    pending: BTreeMap<String, (ConfigFileError, tokio::time::Instant)>,
+}
+
+impl SettingsFileGrace {
+    fn settle(
+        &mut self,
+        previous: &[ConfigModule],
+        rows: &mut [ConfigModule],
+        now: tokio::time::Instant,
+    ) {
+        self.pending.retain(|module, _| {
+            rows.iter()
+                .any(|row| &row.module_id == module && row.file_error.is_some())
+        });
+        for row in rows {
+            let Some(error) = row.file_error.clone() else {
+                continue;
+            };
+            let candidate = self
+                .pending
+                .entry(row.module_id.clone())
+                .or_insert((error.clone(), now));
+            if candidate.0 != error {
+                *candidate = (error, now);
+            }
+            // Repeated publication wakes are not distinct save-settling ticks.
+            // Confirm the same failure again at least one poll interval later.
+            if now.duration_since(candidate.1)
+                < crate::config_gate::runtime::unstamped::USER_FILE_POLL_INTERVAL
+            {
+                if let Some(old) = previous.iter().find(|old| old.module_id == row.module_id) {
+                    *row = old.clone();
+                } else {
+                    row.file_error = None;
+                }
+            }
+        }
+    }
+}
 
 impl ControlHandler {
     pub(super) fn config_settings_known_modules(
@@ -29,13 +71,28 @@ impl ControlHandler {
             .registry
             .subscribe_catalog_changes()
             .map_err(|error| RouterError::backend(0, frame.header.corr, error.to_string()))?;
-        let initial = match self
+        let mut initial = match self
             .config_settings_initial_rows(runtime.clone(), &modules)
             .await
         {
             Ok(initial) => initial,
             Err(error) => return Ok(vec![config_error_frame(&frame, error)?]),
         };
+        let mut file_grace = SettingsFileGrace::default();
+        let settling = initial.0.iter().any(|row| row.file_error.is_some());
+        file_grace.settle(&[], &mut initial.0, tokio::time::Instant::now());
+        if settling {
+            tokio::time::sleep(crate::config_gate::runtime::unstamped::USER_FILE_POLL_INTERVAL)
+                .await;
+            initial = match self
+                .config_settings_initial_rows(runtime.clone(), &modules)
+                .await
+            {
+                Ok(rows) => rows,
+                Err(error) => return Ok(vec![config_error_frame(&frame, error)?]),
+            };
+            file_grace.settle(&[], &mut initial.0, tokio::time::Instant::now());
+        }
         let key = (ctx.connection_id, frame.header.corr);
         let mut streams = self
             .config_settings_streams
@@ -97,12 +154,13 @@ impl ControlHandler {
                 let next = handler
                     .config_settings_rows(runtime.clone(), &modules)
                     .await;
-                let (rows, next_stamped) = match next {
+                let (mut rows, next_stamped) = match next {
                     Ok(next) => next,
                     Err(error) if error.is_capture_race() => {
                         // A read interrupted by a file edit is not a new state.
                         // Keep the last snapshot and retry on the next poll tick.
                         retry_capture = true;
+                        file_grace.pending.clear();
                         continue;
                     }
                     Err(error) => {
@@ -113,6 +171,7 @@ impl ControlHandler {
                     }
                 };
                 retry_capture = false;
+                file_grace.settle(&previous, &mut rows, tokio::time::Instant::now());
                 for event in settings_events(&previous, stamped, &rows, next_stamped) {
                     let Ok(next) = push(event) else {
                         return;
@@ -162,7 +221,15 @@ impl ControlHandler {
         filter: &Option<Vec<String>>,
     ) -> std::result::Result<(Vec<ConfigModule>, bool), GateError> {
         let known = self.config_settings_known_modules()?;
-        let response = config_work(runtime, move |owner| owner.settings_modules(known)).await?;
+        let response = config_work(runtime, move |owner| {
+            let response = owner.settings_modules(known);
+            #[cfg(test)]
+            if let Some(hook) = owner.settings_observation_hook.lock().unwrap().as_mut() {
+                hook();
+            }
+            response
+        })
+        .await?;
         let ConfigControlResponse::Modules {
             mut modules,
             stamped,

@@ -7,6 +7,48 @@ pub(crate) struct SettingsRig {
     pub(crate) owner: std::sync::Arc<RuntimeOwner>,
 }
 
+#[test]
+fn config_settings_file_error_is_per_module_and_does_not_relax_planning() {
+    let rig = SettingsRig::new();
+    rig.declare("sample-extra", 11, true);
+    std::fs::write(
+        rig.root.join("cortexkit/sample-extra.jsonc"),
+        br#"{"limit":6,"credential":{"vault_ref":"sample-reference"}}"#,
+    )
+    .unwrap();
+    rig.stamp();
+    rig.activate();
+    rig.write(b"{");
+    let ConfigControlResponse::Modules { modules, .. } =
+        rig.owner.settings_modules(BTreeSet::new()).unwrap()
+    else {
+        panic!("expected module rows")
+    };
+    let broken = modules
+        .iter()
+        .find(|row| row.module_id == "sample-reader")
+        .unwrap();
+    assert_eq!(broken.file_error.as_ref().unwrap().code, "value_invalid");
+    let healthy = modules
+        .iter()
+        .find(|row| row.module_id == "sample-extra")
+        .unwrap();
+    assert!(healthy.file_error.is_none());
+    let shown = serde_json::to_value(
+        rig.owner
+            .settings_show(BTreeSet::new(), "sample-extra".into(), None, None)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(shown["effective"]["limit"], 6);
+    let error = rig
+        .owner
+        .prepare(PlanKind::Change)
+        .err()
+        .expect("planning must still refuse invalid user files");
+    assert_eq!(error.code, "value_invalid");
+}
+
 impl SettingsRig {
     pub(crate) fn new() -> Self {
         let root = cortexkit_test_support::ScratchDir::new("settings-reads");

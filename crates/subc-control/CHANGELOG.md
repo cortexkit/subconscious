@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.42.1
+
+- Supersedes the unpublished 0.42.0 settings surface before its first release.
+- Add optional per-module `file_error` diagnostics to settings rows, watch changes and show replies without changing approved status fields.
+
 ## 0.42.0
 
 - Add typed settings reads: `config.modules`, `config.schema`, `config.show`

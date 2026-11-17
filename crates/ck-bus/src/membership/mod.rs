@@ -1,6 +1,7 @@
 //! Agent durables (spec ruling R15): prefrontal owns where each agent resides, and it
 //! creates, removes and reads each agent's durables through ops on ck-bus's management
-//! surface. ck-bus accepts them only from `reserved:prefrontal-core`; any other caller,
+//! surface. ck-bus accepts them only from `reserved:prefrontal-core` or
+//! `reserved:prefrontal`; any other caller,
 //! a `Direct` one included, is refused `ckbus_caller_not_permitted`.
 //!
 //! An agent has one durable, `consumer_name(agent_id)` (`c_{agent_id}`), on each of the
@@ -60,8 +61,8 @@ pub const OPERATIONS: [(&str, bool); 4] = [
     (EFFECTS_PENDING_OP, false),
 ];
 
-/// The only module whose attested routes may call these ops.
-pub const AUTHORIZED_MODULE: &str = "prefrontal-core";
+/// The legacy authority id; the readers-first rename also admits its new id.
+pub const AUTHORIZED_MODULE: &str = crate::grants::DELIVERY_AUTHORITY_MODULE;
 
 pub mod code {
     pub const CALLER_NOT_PERMITTED: &str = "ckbus_caller_not_permitted";
@@ -289,15 +290,19 @@ impl Membership {
     }
 }
 
-/// Only an attested `prefrontal-core` route passes. The principal is what the daemon
-/// stamped on the route at bind time; nothing in the request body is consulted.
+/// Only an attested prefrontal route passes, under either rename spelling. The
+/// principal is what the daemon stamped at bind time; request fields cannot attest it.
 pub fn authorize(principal: Option<&Principal>, method: &str) -> Result<(), Refusal> {
     match principal {
-        Some(Principal::Reserved { module_id }) if module_id == AUTHORIZED_MODULE => Ok(()),
+        Some(Principal::Reserved { module_id })
+            if crate::grants::is_delivery_authority_module(module_id) =>
+        {
+            Ok(())
+        }
         other => Err(Refusal::new(
             code::CALLER_NOT_PERMITTED,
             format!(
-                "{method} answers only reserved:{AUTHORIZED_MODULE}; this route arrived as {}",
+                "{method} answers only reserved:{AUTHORIZED_MODULE} or reserved:prefrontal; this route arrived as {}",
                 principal_label(other)
             ),
         )),

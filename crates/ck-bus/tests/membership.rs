@@ -4,8 +4,8 @@
 //! signs every issued credential), against a real nats-server and the acceptance daemon.
 //!
 //! Arms:
-//! - every agent-durable op refuses any caller but `reserved:prefrontal-core`, a `Direct`
-//!   one included, with `ckbus_caller_not_permitted`;
+//! - every agent-durable op accepts only the two reserved prefrontal ids; all other
+//!   callers, including `Direct`, receive `ckbus_caller_not_permitted`;
 //! - bind is idempotent, and a durable with a different configuration is refused by
 //!   name and left as it is; no consumer but an agent's `c_{agent_id}` sits on an agent
 //!   stream, and none that ck-bus owns is placed on one;
@@ -254,6 +254,127 @@ fn issuance_picks_the_grant_by_attested_module() {
             .contains(&format!("$JS.API.CONSUMER.MSG.NEXT.{stream}.*")));
     }
     assert!(!participant.publish_allow().contains(&names.wake_binding()));
+}
+
+#[tokio::test]
+async fn both_reserved_prefrontal_ids_pass_the_membership_gate() {
+    let membership = membership::Membership::new(Arc::new(NoPlane));
+    for module_id in ["prefrontal", "prefrontal-core"] {
+        let principal = Principal::Reserved {
+            module_id: module_id.to_string(),
+        };
+        for (op, _) in membership::OPERATIONS {
+            let refusal = membership
+                .answer(Some(&principal), op, &json!({"agent_id": "agent_rename"}))
+                .await
+                .unwrap()
+                .expect_err("authorization succeeds but the plane is not ready");
+            assert_eq!(refusal.code, issuance::code::NOT_READY, "{module_id}: {op}");
+        }
+    }
+}
+
+#[test]
+fn both_prefrontal_ids_receive_canonical_authority_grants() {
+    let names = grants::derive_account("box_renamegrants").unwrap();
+    let legacy = grants::issued_grant(&names, "prefrontal-core", "credential", &[]).unwrap();
+    assert_eq!(legacy.role(), grants::GrantRole::DeliveryAuthority);
+    assert!(legacy
+        .publish_allow()
+        .contains("$JS.API.CONSUMER.MSG.NEXT.CK_BOX_RENAMEGRANTS_ROOM.m_prefrontal-core"));
+    assert!(legacy
+        .publish_allow()
+        .contains("$JS.API.CONSUMER.MSG.NEXT.CK_BOX_RENAMEGRANTS_EVENT.m_prefrontal-core"));
+    assert!(legacy
+        .publish_allow()
+        .contains("$KV.CK_BOX_RENAMEGRANTS_PREFRONTAL_CORE_SESSION_LIVENESS.>"));
+    for module_id in ["prefrontal", "prefrontal-core"] {
+        let authority = grants::issued_grant(&names, module_id, "credential", &[]).unwrap();
+        assert_eq!(
+            authority.role(),
+            grants::GrantRole::DeliveryAuthority,
+            "{module_id}"
+        );
+        let mut expected = legacy.publish_allow().clone();
+        for plane in ["event", "live"] {
+            assert!(expected.remove(&format!("ck.box_renamegrants.{plane}.prefrontal-core.>")));
+            expected.insert(format!("ck.box_renamegrants.{plane}.{module_id}.>"));
+        }
+        assert_eq!(authority.publish_allow(), &expected, "{module_id}");
+        assert_eq!(
+            authority.subscribe_allow(),
+            legacy.subscribe_allow(),
+            "{module_id}"
+        );
+        for subject in authority
+            .publish_allow()
+            .iter()
+            .chain(authority.subscribe_allow())
+        {
+            assert!(
+                !subject.split('.').any(|token| token == "m_prefrontal"),
+                "{subject}"
+            );
+            assert!(
+                !subject.contains("PREFRONTAL_SESSION_LIVENESS"),
+                "{subject}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn prefrontal_lookalikes_receive_no_authority() {
+    let names = grants::derive_account("box_renamegrants").unwrap();
+    let membership = membership::Membership::new(Arc::new(NoPlane));
+    for module_id in [
+        "prefrontal-core2",
+        "prefrontalx",
+        "xprefrontal",
+        "prefrontal-cor",
+    ] {
+        let grant = grants::issued_grant(&names, module_id, "credential", &[]).unwrap();
+        assert_eq!(grant.role(), grants::GrantRole::Participant, "{module_id}");
+        assert_eq!(
+            grant,
+            grants::participant_grant(&names, "credential", module_id, &[]).unwrap()
+        );
+        let principal = Principal::Reserved {
+            module_id: module_id.to_string(),
+        };
+        for (op, _) in membership::OPERATIONS {
+            let refusal = membership
+                .answer(Some(&principal), op, &json!({"agent_id": "agent_rename"}))
+                .await
+                .unwrap()
+                .expect_err("look-alikes are not authorities");
+            assert_eq!(
+                refusal.code,
+                membership::code::CALLER_NOT_PERMITTED,
+                "{module_id}: {op}"
+            );
+        }
+    }
+    for module_id in ["prefrontal", "prefrontal-core"] {
+        for (op, _) in membership::OPERATIONS {
+            let refusal = membership
+                .answer(
+                    Some(&Principal::Direct),
+                    op,
+                    &json!({
+                        "module_id": module_id, "agent_id": "agent_rename"
+                    }),
+                )
+                .await
+                .unwrap()
+                .expect_err("a claimed id is not an attested principal");
+            assert_eq!(
+                refusal.code,
+                membership::code::CALLER_NOT_PERMITTED,
+                "{module_id}: {op}"
+            );
+        }
+    }
 }
 
 /// Every subject `pattern` covers, with NATS whole-token wildcards: `*` one token, a
@@ -1165,16 +1286,22 @@ async fn a_credential_issued_before_a_bind_pulls_from_the_durable_bound_after() 
     let connection_file = live.connection_file().to_path_buf();
 
     // A Direct principal still gets no credential.
-    let (code, message) = relay_as(
-        &connection_file,
-        PARTICIPANT,
-        false,
-        issuance::CREDENTIAL_OP,
-        json!({}),
-    )
-    .await
-    .expect_err("a Direct caller is never issued");
-    assert_eq!(code, issuance::code::PRINCIPAL_DIRECT, "{message}");
+    for claimed in [PARTICIPANT, "prefrontal", "prefrontal-core"] {
+        let (code, message) = relay_as(
+            &connection_file,
+            PARTICIPANT,
+            false,
+            issuance::CREDENTIAL_OP,
+            json!({"module_id": claimed}),
+        )
+        .await
+        .expect_err("a Direct caller is never issued, regardless of its claimed id");
+        assert_eq!(
+            code,
+            issuance::code::PRINCIPAL_DIRECT,
+            "{claimed}: {message}"
+        );
+    }
 
     // Both credentials are issued before any agent is bound.
     let participant = relay_as(

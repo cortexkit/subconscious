@@ -1052,6 +1052,7 @@ async fn bootstrap_removes_striatum_step_filters_preserving_delivered_position()
             "thalamus-harness.route_fact.v1",
             "colliculus.route_fact.v1",
             "prefrontal-core.route_fact.v1",
+            "prefrontal.route_fact.v1",
             "plexus.route_fact.v1",
             "fusiform.catalog_changed.v1",
         ]

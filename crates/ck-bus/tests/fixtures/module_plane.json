@@ -203,6 +203,7 @@
         "ck.box_upgradegolden.event.thalamus-harness.route_fact.v1",
         "ck.box_upgradegolden.event.colliculus.route_fact.v1",
         "ck.box_upgradegolden.event.prefrontal-core.route_fact.v1",
+        "ck.box_upgradegolden.event.prefrontal.route_fact.v1",
         "ck.box_upgradegolden.event.plexus.route_fact.v1",
         "ck.box_upgradegolden.event.fusiform.catalog_changed.v1"
       ],
@@ -261,6 +262,7 @@
         "ck.box_upgradegolden.event.aft.late_result_ready.v1.broca",
         "ck.box_upgradegolden.event.cerebellum.late_result_ready.v1.broca",
         "ck.box_upgradegolden.event.prefrontal-core.late_result_ready.v1.broca",
+        "ck.box_upgradegolden.event.prefrontal.late_result_ready.v1.broca",
         "ck.box_upgradegolden.event.basal.late_result_ready.v1.broca",
         "ck.box_upgradegolden.event.fusiform.catalog_changed.v1",
         "ck.box_upgradegolden.event.cingulate.card_settled.v1.broca"
@@ -301,7 +303,8 @@
         "ck.box_upgradegolden.event.aft.late_result_ready.v1.thalamus-harness",
         "ck.box_upgradegolden.event.cerebellum.late_result_ready.v1.thalamus-harness",
         "ck.box_upgradegolden.event.basal.late_result_ready.v1.thalamus-harness",
-        "ck.box_upgradegolden.event.prefrontal-core.late_result_ready.v1.thalamus-harness"
+        "ck.box_upgradegolden.event.prefrontal-core.late_result_ready.v1.thalamus-harness",
+        "ck.box_upgradegolden.event.prefrontal.late_result_ready.v1.thalamus-harness"
       ],
       "max_ack_pending": 1000,
       "max_deliver": -1,
@@ -332,6 +335,7 @@
       "durable": "m_astrocyte_attribution",
       "filter_subjects": [
         "ck.box_upgradegolden.event.prefrontal-core.attribution_fact.v1",
+        "ck.box_upgradegolden.event.prefrontal.attribution_fact.v1",
         "ck.box_upgradegolden.event.magic-context.attribution_fact.v1",
         "ck.box_upgradegolden.event.entorhinal.placement_fact.v1",
         "ck.box_upgradegolden.event.basal.attribution_fact.v1"
@@ -366,6 +370,7 @@
       "durable": "m_plexus",
       "filter_subjects": [
         "ck.box_upgradegolden.event.prefrontal-core.agent_changed.v1",
+        "ck.box_upgradegolden.event.prefrontal.agent_changed.v1",
         "ck.box_upgradegolden.event.cingulate.card_settled.v1.plexus"
       ],
       "max_ack_pending": 1000,
@@ -376,7 +381,8 @@
       "ack_wait_secs": 30,
       "durable": "m_wernicke_agents",
       "filter_subjects": [
-        "ck.box_upgradegolden.event.prefrontal-core.agent_changed.v1"
+        "ck.box_upgradegolden.event.prefrontal-core.agent_changed.v1",
+        "ck.box_upgradegolden.event.prefrontal.agent_changed.v1"
       ],
       "max_ack_pending": 1000,
       "max_deliver": -1,
@@ -388,6 +394,7 @@
       "filter_subjects": [
         "ck.box_upgradegolden.event.fusiform.catalog_changed.v1",
         "ck.box_upgradegolden.event.prefrontal-core.board_changed.v1",
+        "ck.box_upgradegolden.event.prefrontal.board_changed.v1",
         "ck.box_upgradegolden.event.magic-context.memory_changed.v1",
         "ck.box_upgradegolden.event.thalamus-harness.turn_ended.v1",
         "ck.box_upgradegolden.event.broca.run.ended.v1"

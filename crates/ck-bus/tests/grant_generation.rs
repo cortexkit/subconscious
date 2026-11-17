@@ -393,6 +393,7 @@ fn striatum_live_hints_grant_no_step_durable_rights() {
             "ck.box_livefixture.live.insula.>".to_owned(),
             "ck.box_livefixture.live.plexus.route_fact.v1".to_owned(),
             "ck.box_livefixture.live.prefrontal-core.route_fact.v1".to_owned(),
+            "ck.box_livefixture.live.prefrontal.route_fact.v1".to_owned(),
             "ck.box_livefixture.live.thalamus-harness.route_fact.v1".to_owned(),
             "ck.box_livefixture.live.thalamus-harness.step.finished.v1".to_owned(),
         ])
@@ -722,9 +723,9 @@ fn vendored_foundation_and_golden_match_their_source_record() {
     // so it moves with the pin in Cargo.toml.
     assert_eq!(
         field("golden_commit"),
-        "352462167a0f7f09e2431494e81381a6facd741c"
+        "f08a85f388140c0883ac21726651347f7a9e6d23"
     );
-    assert_eq!(field("golden_crate_version"), "cortexkit-bus-naming 0.4.7");
+    assert_eq!(field("golden_crate_version"), "cortexkit-bus-naming 0.4.8");
     for (file, digest_field) in [
         ("nats-message-plane-foundation.md", "source_sha256"),
         ("permission_golden.txt", "golden_sha256"),

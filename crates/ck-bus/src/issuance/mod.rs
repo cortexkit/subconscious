@@ -38,7 +38,7 @@
 //! The grant names no agent: agent access is account-scoped, so a credential may pull
 //! from any agent's durable in the box account and a change in where an agent resides
 //! needs no reissue. `grants::issued_grant` picks the grant from the attested module id:
-//! the delivery-authority grant for `prefrontal-core`, the flow-engine grant for
+//! the delivery-authority grant for either prefrontal id, the flow-engine grant for
 //! `basal`, and the participant grant for every other module. A grant can also name the
 //! rooms (the `ck.{acct}.room.{room_id}` subjects) a credential is bound to, but nothing
 //! yet tells ck-bus which rooms a module belongs to, so every module is issued with none.

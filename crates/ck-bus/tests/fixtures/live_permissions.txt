@@ -92,6 +92,7 @@ allow astrocyte subscribe ck.box_goldenfixture.live.fusiform.catalog_changed.v1
 allow astrocyte subscribe ck.box_goldenfixture.live.insula.>
 allow astrocyte subscribe ck.box_goldenfixture.live.magic-context.attribution_fact.v1
 allow astrocyte subscribe ck.box_goldenfixture.live.prefrontal-core.attribution_fact.v1
+allow astrocyte subscribe ck.box_goldenfixture.live.prefrontal.attribution_fact.v1
 allow astrocyte subscribe ck.box_goldenfixture.live.thalamus-harness.step.finished.v1
 allow astrocyte subscribe ck.box_goldenfixture.live.thalamus.step.finished.v1
 allow broca publish ck.box_goldenfixture.live.broca.>
@@ -102,6 +103,7 @@ allow broca subscribe ck.box_goldenfixture.live.cingulate.card_settled.v1.broca
 allow broca subscribe ck.box_goldenfixture.live.fusiform.catalog_changed.v1
 allow broca subscribe ck.box_goldenfixture.live.magic-context.compaction.>
 allow broca subscribe ck.box_goldenfixture.live.prefrontal-core.late_result_ready.v1.broca
+allow broca subscribe ck.box_goldenfixture.live.prefrontal.late_result_ready.v1.broca
 allow cerebellum publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CEREBELLUM_VIEWS
 allow cerebellum publish $JS.API.DIRECT.GET.KV_CK_BOX_GOLDENFIXTURE_CEREBELLUM_VIEWS.>
 allow cerebellum publish $JS.API.STREAM.INFO.KV_CK_BOX_GOLDENFIXTURE_CEREBELLUM_VIEWS
@@ -116,6 +118,7 @@ allow colliculus subscribe ck.box_goldenfixture.live.broca.run.ended.v1
 allow colliculus subscribe ck.box_goldenfixture.live.fusiform.catalog_changed.v1
 allow colliculus subscribe ck.box_goldenfixture.live.magic-context.memory_changed.v1
 allow colliculus subscribe ck.box_goldenfixture.live.prefrontal-core.board_changed.v1
+allow colliculus subscribe ck.box_goldenfixture.live.prefrontal.board_changed.v1
 allow colliculus subscribe ck.box_goldenfixture.live.thalamus-harness.turn_ended.v1
 allow entorhinal publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EFFECT.*.>
 allow entorhinal publish $JS.ACK.CK_BOX_GOLDENFIXTURE_PEER.*.>
@@ -188,6 +191,7 @@ allow plexus publish $JS.FC.KV_CK_BOX_GOLDENFIXTURE_ENTORHINAL_CHANGES.>
 allow plexus publish ck.box_goldenfixture.live.plexus.>
 allow plexus subscribe ck.box_goldenfixture.live.cingulate.card_settled.v1.plexus
 allow plexus subscribe ck.box_goldenfixture.live.prefrontal-core.agent_changed.v1
+allow plexus subscribe ck.box_goldenfixture.live.prefrontal.agent_changed.v1
 allow striatum publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_ASTROCYTE_MULTIPLIER
 allow striatum publish $JS.API.DIRECT.GET.KV_CK_BOX_GOLDENFIXTURE_ASTROCYTE_MULTIPLIER.>
 allow striatum publish $JS.API.STREAM.INFO.KV_CK_BOX_GOLDENFIXTURE_ASTROCYTE_MULTIPLIER
@@ -201,6 +205,7 @@ allow striatum subscribe ck.box_goldenfixture.live.fusiform.catalog_changed.v1
 allow striatum subscribe ck.box_goldenfixture.live.insula.>
 allow striatum subscribe ck.box_goldenfixture.live.plexus.route_fact.v1
 allow striatum subscribe ck.box_goldenfixture.live.prefrontal-core.route_fact.v1
+allow striatum subscribe ck.box_goldenfixture.live.prefrontal.route_fact.v1
 allow striatum subscribe ck.box_goldenfixture.live.thalamus-harness.route_fact.v1
 allow striatum subscribe ck.box_goldenfixture.live.thalamus-harness.step.finished.v1
 allow thalamus publish ck.box_goldenfixture.live.thalamus.>
@@ -216,8 +221,10 @@ allow thalamus-harness subscribe ck.box_goldenfixture.live.basal.late_result_rea
 allow thalamus-harness subscribe ck.box_goldenfixture.live.cerebellum.late_result_ready.v1.thalamus-harness
 allow thalamus-harness subscribe ck.box_goldenfixture.live.magic-context.compaction.>
 allow thalamus-harness subscribe ck.box_goldenfixture.live.prefrontal-core.late_result_ready.v1.thalamus-harness
+allow thalamus-harness subscribe ck.box_goldenfixture.live.prefrontal.late_result_ready.v1.thalamus-harness
 allow wernicke publish ck.box_goldenfixture.live.wernicke.>
 allow wernicke subscribe ck.box_goldenfixture.live.prefrontal-core.agent_changed.v1
+allow wernicke subscribe ck.box_goldenfixture.live.prefrontal.agent_changed.v1
 expect-refused participant publish ck.box_goldenfixture.live.other.pull_request_review.v1 foreign-module-live
 expect-refused delivery-authority publish ck.box_goldenfixture.live.broca.run.v1 foreign-module-live
 expect-refused delivery-authority publish ck.box_goldenfixture.live.insula.quota_sampled.v1 foreign-module-live

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.1
+
+- Require cortexkit-bus-naming 0.4.8 so event and live readers accept both
+  `prefrontal-core` and `prefrontal` publisher subjects before the module rename.
+- Accept either daemon-attested reserved id for delivery authority and agent-durable
+  operations. Keep all existing durables, streams, buckets and subjects; only the
+  authority's own event and live publish prefixes follow its attested id.
+
 ## 0.8.0
 
 - Require cortexkit-bus-naming 0.4.7; use the `aft`-specific send-state filter

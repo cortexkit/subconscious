@@ -236,30 +236,45 @@ pub fn participant_grant(
     Grant::from_entries(GrantRole::Participant, account, entries)
 }
 
-/// prefrontal-core's per-process grant: the participant set plus publish on each agent
+/// Prefrontal's per-process grant: the participant set plus publish on each agent
 /// stream's own binding and on the ROOM binding, since it is the only producer of wakes,
 /// peer deliveries, effect intents and room posts, and pull, ack and info on its one
-/// ROOM durable `m_{module_id}`, which bootstrap creates.
+/// ROOM durable `m_prefrontal-core`, which bootstrap creates.
 pub fn delivery_authority_grant(
     account: &AccountNames,
     credential_public: &str,
     module_id: &str,
     bound_rooms: &[&str],
 ) -> Result<Grant, GrantRefusal> {
+    // Resources retain their old names during the readers-first rename. Only the
+    // process's own event and live publications follow its attested module id.
+    let resource_module = if is_delivery_authority_module(module_id) {
+        DELIVERY_AUTHORITY_MODULE
+    } else {
+        module_id
+    };
     let mut entries =
-        delivery_authority_permissions(account, credential_public, module_id, bound_rooms)?;
+        delivery_authority_permissions(account, credential_public, resource_module, bound_rooms)?;
     add_live_permissions(
         account,
-        module_id,
+        resource_module,
         GrantRole::DeliveryAuthority,
         &mut entries,
     )?;
     add_module_bucket_permissions(
         account,
-        module_id,
+        resource_module,
         GrantRole::DeliveryAuthority,
         &mut entries,
     )?;
+    for plane in ["event", "live"] {
+        let canonical = format!("ck.{}.{plane}.{resource_module}.>", account.account());
+        for entry in &mut entries {
+            if entry.operation == Operation::Publish && entry.subject == canonical {
+                entry.subject = format!("ck.{}.{plane}.{module_id}.>", account.account());
+            }
+        }
+    }
     Grant::from_entries(GrantRole::DeliveryAuthority, account, entries)
 }
 
@@ -357,10 +372,15 @@ fn add_live_permissions(
     Ok(())
 }
 
-/// The module whose attested credential carries the delivery-authority grant (R15):
-/// prefrontal publishes to every agent and to every room, and reads room posts through
-/// its ROOM durable.
+/// The legacy delivery-authority id, retained for its existing resource names.
 pub const DELIVERY_AUTHORITY_MODULE: &str = "prefrontal-core";
+
+/// Accept both attested module ids because the rename is readers-first. The rename
+/// procedure stops the old process before starting the new one; they do not run
+/// concurrently. Callers must first require a daemon-attested reserved principal.
+pub fn is_delivery_authority_module(module_id: &str) -> bool {
+    matches!(module_id, DELIVERY_AUTHORITY_MODULE | "prefrontal")
+}
 
 /// The module whose attested credential carries the flow-engine grant: basal runs flows
 /// and reads every module event through its event-stream durable.
@@ -370,7 +390,7 @@ pub const FLOW_ENGINE_MODULE: &str = "basal";
 /// makes agent access account-scoped, so a module's residence can change without a
 /// reissue.
 ///
-/// `prefrontal-core` gets the delivery-authority grant, `basal` the flow-engine grant,
+/// Both prefrontal ids get the delivery-authority grant, `basal` the flow-engine grant,
 /// and every other module the participant grant. `module_id` is the daemon-attested
 /// route principal, never a request field: it also decides which event subjects the
 /// credential may publish on.
@@ -381,7 +401,7 @@ pub fn issued_grant(
     bound_rooms: &[&str],
 ) -> Result<Grant, GrantRefusal> {
     match module_id {
-        DELIVERY_AUTHORITY_MODULE => {
+        id if is_delivery_authority_module(id) => {
             delivery_authority_grant(account, credential_public, module_id, bound_rooms)
         }
         FLOW_ENGINE_MODULE => flow_engine_grant(account, credential_public, module_id),

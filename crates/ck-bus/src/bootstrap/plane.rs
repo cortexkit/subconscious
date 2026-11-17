@@ -216,6 +216,22 @@ pub trait SystemPlane: Send + Sync {
         &self,
         account_public: &str,
     ) -> Result<mpsc::UnboundedReceiver<ConnectionEvent>, PlaneError>;
+    /// The leaf connections bound to `account_public` on the connected server, from its
+    /// `LEAFZ` report. A plane that cannot read it (a test double) refuses by default.
+    async fn leafz(&self, _account_public: &str) -> Result<Vec<LeafLink>, PlaneError> {
+        Err(PlaneError::new("this plane cannot read leaf connections"))
+    }
+}
+
+/// One leaf connection as the server's `LEAFZ` report names it: enough to tell that the
+/// link is up and to kick it by id on the server that holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeafLink {
+    pub server_id: String,
+    /// The connection id `KICK` takes.
+    pub id: u64,
+    pub ip: String,
+    pub port: u16,
 }
 
 #[async_trait]
@@ -423,7 +439,7 @@ impl NatsBroker {
         Self { url, credentials }
     }
 
-    async fn connect(
+    pub(crate) async fn connect(
         &self,
         jwt: &str,
         user_public: &str,
@@ -520,6 +536,11 @@ pub struct NatsSystem {
 }
 
 impl NatsSystem {
+    /// A system plane over an already connected system-account client.
+    pub fn from_client(client: async_nats::Client) -> Self {
+        Self { client }
+    }
+
     async fn request(&self, subject: String, payload: Vec<u8>) -> Result<Vec<u8>, PlaneError> {
         let reply = tokio::time::timeout(
             REQUEST_TIMEOUT,
@@ -642,6 +663,57 @@ impl SystemPlane for NatsSystem {
         });
         Ok(receiver)
     }
+
+    async fn leafz(&self, account_public: &str) -> Result<Vec<LeafLink>, PlaneError> {
+        let server_id = self
+            .server_id()
+            .ok_or_else(|| PlaneError::new("LEAFZ: the system connection is not connected"))?;
+        let subject = format!("$SYS.REQ.SERVER.{server_id}.LEAFZ");
+        let body = self
+            .request(
+                subject.clone(),
+                serde_json::to_vec(&json!({ "account": account_public })).map_err(|error| {
+                    PlaneError::new(format!("LEAFZ request does not encode: {error}"))
+                })?,
+            )
+            .await?;
+        parse_leafz(&body, account_public)
+            .map_err(|reason| PlaneError::new(format!("{subject}: {reason}")))
+    }
+}
+
+/// Reads a `LEAFZ` reply (`{server, data: {server_id, leafs: [{id, account, ip, port}]}}`),
+/// keeping the leafs bound to `account_public`.
+pub fn parse_leafz(body: &[u8], account_public: &str) -> Result<Vec<LeafLink>, String> {
+    let value: Value =
+        serde_json::from_slice(body).map_err(|error| format!("reply is not JSON: {error}"))?;
+    if let Some(error) = value.get("error") {
+        return Err(format!("refused: {error}"));
+    }
+    let data = &value["data"];
+    let server_id = data["server_id"]
+        .as_str()
+        .or_else(|| value["server"]["id"].as_str())
+        .ok_or("reply names no server id")?;
+    // A server with no leaf connections omits the list.
+    let Some(leafs) = data["leafs"].as_array() else {
+        return Ok(Vec::new());
+    };
+    Ok(leafs
+        .iter()
+        .filter(|leaf| leaf["account"].as_str() == Some(account_public))
+        .filter_map(|leaf| {
+            Some(LeafLink {
+                server_id: server_id.to_string(),
+                id: leaf["id"].as_u64()?,
+                ip: leaf["ip"].as_str().unwrap_or_default().to_string(),
+                port: leaf["port"]
+                    .as_u64()
+                    .and_then(|port| u16::try_from(port).ok())
+                    .unwrap_or_default(),
+            })
+        })
+        .collect())
 }
 
 /// Reads one `$SYS` account connect or disconnect event. The server names the connection

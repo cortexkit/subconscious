@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"io"
@@ -12,7 +13,7 @@ import (
 	"github.com/nats-io/nats-server/v2/server"
 )
 
-const version = "0.1.1"
+const version = "0.1.2"
 const patchID = "reload-signaturecb-1"
 
 type terminal struct {
@@ -28,31 +29,30 @@ func main() {
 		}
 	}
 	flag.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: ck-nats-engine --version | -c <server.conf>")
+		fmt.Fprintln(os.Stderr, "usage: ck-nats-engine --version | -c <server.conf> [--hub]")
 		flag.PrintDefaults()
 	}
 	config := flag.String("c", "", "path to server.conf")
+	hub := flag.Bool("hub", false, "wait for hub listener state before starting")
 	flag.Parse()
 	if *config == "" || flag.NArg() != 0 {
 		flag.Usage()
 		os.Exit(1)
 	}
-	os.Exit(run(*config, os.Stdin, os.Stdout))
+	os.Exit(run(*config, *hub, os.Stdin, os.Stdout))
 }
 
-func run(config string, in io.Reader, out io.Writer) int {
-	opts, err := server.ProcessConfigFile(config)
-	if err != nil {
-		log.Print(err)
-		return 1
+func run(config string, hub bool, in io.Reader, out io.Writer) int {
+	var opts *server.Options
+	var srv *server.Server
+	var err error
+	if !hub {
+		opts, err = server.ProcessConfigFile(config)
+		if err != nil {
+			log.Print(err)
+			return 1
+		}
 	}
-	srv, err := server.NewServer(opts)
-	if err != nil {
-		log.Print(err)
-		return 1
-	}
-	// The protocol owns stdout; NATS' ordinary logger writes exclusively to stderr.
-	srv.SetLogger(logger.NewStdLogger(true, opts.Debug, opts.Trace, false, true), opts.Debug, opts.Trace)
 	writer := &output{w: out}
 	tracker := newRemoteTracker()
 	sign := newSigner(writer, tracker.failed)
@@ -100,6 +100,59 @@ func run(config string, in io.Reader, out io.Writer) int {
 			}
 		}
 	}()
+	var initial *message
+	var listenerTLS *tls.Config
+	if hub {
+		// NATS cannot add a leaf listener by reload. Do not open any server port
+		// until the watch supplies the certificate and port for this process.
+		// An idle computer has no hub configuration; ck-bus creates it at setup.
+		var generation uint64
+		var applied bool
+		for initial == nil {
+			select {
+			case end := <-stop:
+				close(sign.done)
+				return end.code
+			case m := <-states:
+				g := *m.Generation
+				if applied && g <= generation || m.HubListener == nil {
+					if !applied || g > generation {
+						generation, applied = g, true
+					}
+					err = writer.send("applied", map[string]any{"generation": g})
+				} else {
+					listenerTLS, err = hubTLS(m.HubListener, sign)
+					if err == nil {
+						opts, err = server.ProcessConfigFile(config)
+					}
+					if err == nil {
+						configureHub(opts, m.HubListener, listenerTLS)
+						srv, err = server.NewServer(opts)
+					}
+					if err != nil {
+						err = writer.send("apply_failed", map[string]any{"generation": g, "error": err.Error()})
+					} else {
+						initial = &m
+					}
+				}
+				if err != nil {
+					log.Print(err)
+					close(sign.done)
+					return 1
+				}
+			}
+		}
+	}
+	if !hub {
+		srv, err = server.NewServer(opts)
+		if err != nil {
+			log.Print(err)
+			close(sign.done)
+			return 1
+		}
+	}
+	// The protocol owns stdout; NATS' ordinary logger writes exclusively to stderr.
+	srv.SetLogger(logger.NewStdLogger(true, opts.Debug, opts.Trace, false, true), opts.Debug, opts.Trace)
 	go func() {
 		go srv.Start()
 		if !srv.ReadyForConnections(10*time.Second) || (opts.JetStream && !srv.JetStreamEnabled()) {
@@ -111,7 +164,7 @@ func run(config string, in io.Reader, out io.Writer) int {
 			finish(1, 5*time.Second)
 			return
 		}
-		if err := serve(config, srv, opts.JetStream, states, writer, sign, tracker, done); err != nil {
+		if err := serve(config, srv, opts.JetStream, initial, listenerTLS, states, writer, sign, tracker, done); err != nil {
 			log.Print(err)
 			finish(1, 5*time.Second)
 		}
@@ -132,16 +185,27 @@ func run(config string, in io.Reader, out io.Writer) int {
 	return end.code
 }
 
-func serve(config string, srv *server.Server, jetstream bool, states <-chan message, out *output, sign *signer, tracker *remoteTracker, done <-chan struct{}) error {
+func serve(config string, srv *server.Server, jetstream bool, initial *message, listenerTLS *tls.Config, states <-chan message, out *output, sign *signer, tracker *remoteTracker, done <-chan struct{}) error {
 	var remotes []remote
 	var generation uint64
 	var applied bool
+	var listener *hubListener
+	if initial != nil {
+		listener, generation, applied = initial.HubListener, *initial.Generation, true
+		if err := out.send("applied", map[string]any{"generation": generation}); err != nil {
+			return err
+		}
+	}
 	var lastStatus string
 	lastSent := time.Time{}
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	publish := func() error {
 		status := tracker.status(srv, jetstream, remotes)
+		if listener != nil {
+			// NATS readiness includes a successful bind of its configured leaf listener.
+			status["listener"] = map[string]any{"port": listener.Port, "bound": srv.ReadyForConnections(time.Millisecond)}
+		}
 		encoded := statusFingerprint(status)
 		if encoded != lastStatus || time.Since(lastSent) >= 5*time.Second {
 			if err := out.send("status", status); err != nil {
@@ -165,9 +229,15 @@ func serve(config string, srv *server.Server, jetstream bool, states <-chan mess
 				continue
 			}
 			opts, err := server.ProcessConfigFile(config)
-			if err == nil && m.HubListener != nil {
-				// Hub listener certificates and TLS signing over the protocol are not implemented yet.
-				err = fmt.Errorf("hub listener is not implemented")
+			if err == nil {
+				switch {
+				case listener == nil && m.HubListener != nil:
+					err = fmt.Errorf("hub listener requires --hub")
+				case listener != nil && (m.HubListener == nil || *m.HubListener != *listener):
+					err = fmt.Errorf("hub listener port or certificate changed; restart required")
+				case listener != nil:
+					configureHub(opts, listener, listenerTLS)
+				}
 			}
 			if err == nil {
 				opts.LeafNode.Remotes, err = buildRemotes(m.Remotes, remotes, func(name string, nonce []byte) (string, []byte, error) {

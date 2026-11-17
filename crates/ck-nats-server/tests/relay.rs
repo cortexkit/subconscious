@@ -37,6 +37,7 @@ enum BusCommand {
     Enable,
     State(u64),
     Remove,
+    HubState(u64, Option<Value>),
 }
 
 struct Fixture {
@@ -84,19 +85,53 @@ fn remotes() -> Value {
     json!([{"name":"hub","account":"ACCOUNT","urls":["tls://hub.invalid:7422"],"deny_imports":["private.>"],"deny_exports":[],"pin":{"kind":"spki","sha256_hex":"00".repeat(32)}}])
 }
 
-async fn push_state(stream: &mut TcpStream, corr: u64, generation: u64) {
+async fn push_state(stream: &mut TcpStream, corr: u64, generation: u64, hub: bool) {
+    let state = if hub {
+        json!({"generation":generation,"hub_listener":{"port":7422,"cert_der_b64":"public-certificate"}})
+    } else {
+        json!({"generation":generation,"remotes":remotes()})
+    };
     send(
         stream,
         FrameType::StreamData,
         41,
         corr,
-        json!({"result":{"generation":generation,"remotes":remotes()}}),
+        json!({"result":state}),
+    )
+    .await;
+}
+
+async fn push_hub_state(
+    stream: &mut TcpStream,
+    corr: u64,
+    generation: u64,
+    listener: Option<Value>,
+) {
+    let mut state = json!({"generation":generation});
+    if let Some(listener) = listener {
+        state["hub_listener"] = listener;
+    }
+    send(
+        stream,
+        FrameType::StreamData,
+        41,
+        corr,
+        json!({"result":state}),
     )
     .await;
 }
 
 impl Fixture {
     async fn start() -> Self {
+        Self::start_as(false).await
+    }
+
+    async fn start_as(hub: bool) -> Self {
+        Self::start_mode(hub, false).await
+    }
+
+    async fn start_mode(hub: bool, lifecycle: bool) -> Self {
+        let module_id = if hub { "nats-hub" } else { "nats-server" };
         let root = tempfile::tempdir().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let info = ConnectionInfo {
@@ -119,7 +154,7 @@ impl Fixture {
         let config = root.path().join("server.conf");
         fs::write(
             &config,
-            json!({"events":root.path().join("engine.jsonl")}).to_string(),
+            json!({"events":root.path().join("engine.jsonl"),"lifecycle":lifecycle}).to_string(),
         )
         .unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_ck-nats-server"))
@@ -131,7 +166,7 @@ impl Fixture {
             .arg(connection)
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-            .env("SUBC_MODULE_ID", "nats-server")
+            .env("SUBC_MODULE_ID", module_id)
             .env("XDG_DATA_HOME", root.path().join("data"))
             .env("XDG_RUNTIME_DIR", root.path().join("runtime"))
             .env("XDG_CONFIG_HOME", root.path().join("config"))
@@ -146,7 +181,7 @@ impl Fixture {
         let hello = read_frame(&mut primary).await.unwrap().unwrap();
         assert_eq!(hello.header.ty, FrameType::Hello);
         let body: ModuleHelloBody = serde_json::from_slice(&hello.body).unwrap();
-        assert_eq!(body.manifest.module_id, "nats-server");
+        assert_eq!(body.manifest.module_id, module_id);
         assert_eq!(body.manifest.registration_channel, Some(true));
         assert!(body.manifest.provides.is_empty());
         let ack = ModuleHelloAckBody {
@@ -171,7 +206,7 @@ impl Fixture {
         let bus = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             authenticate(&mut stream, &info).await;
-            fake_bus(stream, receive, call_tx, bus_opens).await;
+            fake_bus(stream, receive, call_tx, bus_opens, hub, lifecycle).await;
         });
         Self {
             root,
@@ -229,6 +264,71 @@ impl Fixture {
             .lines()
             .any(|line| serde_json::from_str::<Value>(line).unwrap()["type"] == "shutdown"));
     }
+
+    async fn lifecycle_events(&self, predicate: impl Fn(&[Value]) -> bool) -> Vec<Value> {
+        timeout(LIMIT, async {
+            loop {
+                let text =
+                    fs::read_to_string(self.root.path().join("engine.jsonl")).unwrap_or_default();
+                let events: Vec<Value> = text
+                    .lines()
+                    .filter_map(|line| serde_json::from_str(line).ok())
+                    .collect();
+                if predicate(&events) {
+                    return events;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("engine lifecycle event did not arrive")
+    }
+
+    async fn health(&mut self) -> Value {
+        send(
+            &mut self.primary,
+            FrameType::Request,
+            0,
+            501,
+            json!({"op":"health.check"}),
+        )
+        .await;
+        timeout(LIMIT, async {
+            loop {
+                let frame = read_frame(&mut self.primary).await.unwrap().unwrap();
+                if frame.header.ty == FrameType::Ping {
+                    send(
+                        &mut self.primary,
+                        FrameType::Pong,
+                        0,
+                        frame.header.corr,
+                        Value::Null,
+                    )
+                    .await;
+                } else if frame.header.corr == 501 {
+                    assert_eq!(frame.header.ty, FrameType::Response);
+                    return serde_json::from_slice(&frame.body).unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn wait_health(&mut self, detail: &str) -> Value {
+        timeout(LIMIT, async {
+            loop {
+                let report = self.health().await;
+                if report["detail"] == detail {
+                    assert_eq!(report["status"], "ok");
+                    return report;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("health did not reach the expected state")
+    }
 }
 
 async fn fake_bus(
@@ -236,7 +336,14 @@ async fn fake_bus(
     mut commands: mpsc::Receiver<BusCommand>,
     calls: mpsc::Sender<Value>,
     opens: Arc<AtomicUsize>,
+    hub: bool,
+    lifecycle: bool,
 ) {
+    let watch_method = if hub {
+        "ckbus.hub_server_watch"
+    } else {
+        "ckbus.leaf_watch"
+    };
     let mut available = false;
     let mut catalog_corr = None;
     let mut leaf_corr = None;
@@ -247,7 +354,8 @@ async fn fake_bus(
                     available = true;
                     if let Some(corr) = catalog_corr { send(&mut stream,FrameType::StreamData,0,corr,json!({"op":"catalog.watch","generation":2})).await; }
                 }
-                Some(BusCommand::State(generation)) => push_state(&mut stream,leaf_corr.unwrap(),generation).await,
+                Some(BusCommand::State(generation)) => push_state(&mut stream,leaf_corr.unwrap(),generation,hub).await,
+                Some(BusCommand::HubState(generation, listener)) => push_hub_state(&mut stream,leaf_corr.unwrap(),generation,listener).await,
                 Some(BusCommand::Remove) => {
                     available = false;
                     send(&mut stream,FrameType::StreamData,0,catalog_corr.unwrap(),json!({"op":"catalog.watch","generation":3})).await;
@@ -268,7 +376,7 @@ async fn fake_bus(
                         (FrameType::StreamData,json!({"op":"catalog.watch","generation":1}))
                     }
                     Some("catalog.list") => {
-                        let operations = if available {json!([{"name":"ckbus.leaf_watch","kind":"query"},{"name":"ckbus.leaf_sign","kind":"query"}])} else { json!([]) };
+                        let operations = if available {json!([{"name":watch_method,"kind":"query"},{"name":if hub { "ckbus.hub_tls_sign" } else { "ckbus.leaf_sign" },"kind":"query"}])} else { json!([]) };
                         (FrameType::Response,json!({"op":"catalog.list","generation":1,"modules":[{"module_id":"ckbus","ready":true,"roles":[{"role":"management_surface","operations":operations,"config_schema":{},"observability":[],"identity_scope":[],"concurrency":"module_managed"}],"control_ops":[]}],"subc_ops":[]}))
                     }
                     Some("server.describe") => (FrameType::Response,json!({"op":"server.describe","protocol_ver":1,"subc_ops":[],"capabilities":[],"connected_clients":2})),
@@ -280,19 +388,35 @@ async fn fake_bus(
                     other => {
                         assert!(other.is_none(),"unexpected control op: {body}");
                         match body["method"].as_str().unwrap() {
-                            "ckbus.leaf_watch" => {
+                            method if method == watch_method => {
                                 assert!(frame.header.flags.is_subscription());
                                 leaf_corr = Some(frame.header.corr);
-                                push_state(&mut stream,frame.header.corr,7).await;
+                                if lifecycle {
+                                    push_hub_state(&mut stream,frame.header.corr,7,None).await;
+                                } else {
+                                    push_state(&mut stream,frame.header.corr,7,hub).await;
+                                }
                                 continue;
                             }
                             "ckbus.leaf_sign" => {
+                                assert!(!hub);
                                 calls.send(body.clone()).await.unwrap();
                                 match body["params"]["remote"].as_str().unwrap() {
                                     "hub" => (FrameType::Response,json!({"result":{"jwt":"public.jwt","signature_b64":"A".repeat(86)}})),
                                     "denied" => (FrameType::Error,json!({"code":"vault_unavailable","message":"must not substitute this message for the code"})),
                                     "timeout" => continue,
                                     other => panic!("unexpected signer remote: {other}"),
+                                }
+                            }
+                            "ckbus.hub_tls_sign" => {
+                                assert!(hub);
+                                assert_eq!(body["params"]["scheme"], "ed25519");
+                                calls.send(body.clone()).await.unwrap();
+                                match body["params"]["message_b64"].as_str().unwrap() {
+                                    "aGVsbG8" => (FrameType::Response,json!({"result":{"signature_b64":"A".repeat(86)}})),
+                                    "ZGVuaWVk" => (FrameType::Error,json!({"code":"vault_unavailable","message":"not the reason"})),
+                                    "dGltZW91dA" => continue,
+                                    other => panic!("unexpected TLS message: {other}"),
                                 }
                             }
                             other => panic!("unexpected bus method: {other}"),
@@ -303,6 +427,219 @@ async fn fake_bus(
             }
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wrapper_hub_idle_health_before_listener() {
+    let mut fixture = Fixture::start_mode(true, true).await;
+    fixture
+        .lifecycle_events(|events| {
+            events
+                .iter()
+                .any(|e| e["type"] == "state" && e["generation"] == 0)
+        })
+        .await;
+    fixture.wait_health("Not this computer's hub; idle").await;
+    fixture.commands.send(BusCommand::Enable).await.unwrap();
+    let events = fixture
+        .lifecycle_events(|events| {
+            events
+                .iter()
+                .any(|e| e["type"] == "state" && e["generation"] == 7)
+        })
+        .await;
+    assert_eq!(events.iter().filter(|e| e["startup"] == true).count(), 1);
+    assert!(events
+        .iter()
+        .filter(|e| e["type"] == "state")
+        .all(|e| e.get("hub_listener").is_none()));
+    fixture.wait_health("Not this computer's hub; idle").await;
+    fixture.finish().await;
+}
+
+async fn active_hub_fixture() -> Fixture {
+    let mut fixture = Fixture::start_mode(true, true).await;
+    fixture.commands.send(BusCommand::Enable).await.unwrap();
+    fixture
+        .lifecycle_events(|events| {
+            events
+                .iter()
+                .any(|e| e["type"] == "state" && e["generation"] == 7)
+        })
+        .await;
+    fixture
+        .commands
+        .send(BusCommand::HubState(
+            8,
+            Some(json!({"port":7422,"cert_der_b64":"certificate-a"})),
+        ))
+        .await
+        .unwrap();
+    fixture.wait_health("Engine is ready.").await;
+    fixture
+}
+
+fn assert_clean_restart(events: &[Value], generation: u64) -> Value {
+    let new_state = events
+        .iter()
+        .position(|e| e["type"] == "state" && e["generation"] == generation)
+        .unwrap();
+    let new_pid = events[new_state]["process_id"].clone();
+    let startup = events
+        .iter()
+        .position(|e| e["startup"] == true && e["process_id"] == new_pid)
+        .unwrap();
+    assert!(events[startup]["hub"] == true);
+    assert!(
+        events[..startup]
+            .iter()
+            .any(|e| e["type"] == "shutdown" && e["process_id"] != new_pid),
+        "old engine must receive shutdown before replacement starts"
+    );
+    assert!(startup < new_state);
+    events[new_state].clone()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wrapper_hub_withdrawal_restarts_back_to_idle() {
+    let mut fixture = active_hub_fixture().await;
+    fixture
+        .commands
+        .send(BusCommand::HubState(9, None))
+        .await
+        .unwrap();
+    let events = fixture
+        .lifecycle_events(|events| {
+            events
+                .iter()
+                .any(|e| e["type"] == "state" && e["generation"] == 9)
+        })
+        .await;
+    let state = assert_clean_restart(&events, 9);
+    assert!(state.get("hub_listener").is_none());
+    assert_eq!(state["remotes"], json!([]));
+    assert_eq!(events.iter().filter(|e| e["startup"] == true).count(), 2);
+    assert!(
+        fixture.child.try_wait().unwrap().is_none(),
+        "wrapper must survive listener withdrawal"
+    );
+    fixture.wait_health("Not this computer's hub; idle").await;
+    assert_eq!(fixture.opens.load(Ordering::SeqCst), 1);
+    fixture.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wrapper_hub_changed_certificate_or_port_restarts_with_new_listener() {
+    let mut fixture = active_hub_fixture().await;
+    let listener = json!({"port":7422,"cert_der_b64":"certificate-b"});
+    fixture
+        .commands
+        .send(BusCommand::HubState(9, Some(listener.clone())))
+        .await
+        .unwrap();
+    let events = fixture
+        .lifecycle_events(|events| {
+            events
+                .iter()
+                .any(|e| e["type"] == "state" && e["generation"] == 9)
+        })
+        .await;
+    assert_eq!(assert_clean_restart(&events, 9)["hub_listener"], listener);
+    fixture.wait_health("Engine is ready.").await;
+    fixture
+        .commands
+        .send(BusCommand::HubState(10, Some(listener)))
+        .await
+        .unwrap();
+    let events = fixture
+        .lifecycle_events(|events| {
+            events
+                .iter()
+                .any(|e| e["type"] == "state" && e["generation"] == 10)
+        })
+        .await;
+    assert_eq!(
+        events.iter().filter(|e| e["startup"] == true).count(),
+        2,
+        "unchanged listener must not restart"
+    );
+    let moved = json!({"port":7423,"cert_der_b64":"certificate-b"});
+    fixture
+        .commands
+        .send(BusCommand::HubState(11, Some(moved.clone())))
+        .await
+        .unwrap();
+    let events = fixture
+        .lifecycle_events(|events| {
+            events
+                .iter()
+                .any(|e| e["type"] == "state" && e["generation"] == 11)
+        })
+        .await;
+    assert_eq!(assert_clean_restart(&events, 11)["hub_listener"], moved);
+    assert_eq!(events.iter().filter(|e| e["startup"] == true).count(), 3);
+    fixture.wait_health("Engine is ready.").await;
+    assert_eq!(fixture.opens.load(Ordering::SeqCst), 1);
+    fixture.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wrapper_hub_watch_and_tls_sign_relay() {
+    let mut fixture = Fixture::start_as(true).await;
+    for id in [1, 2] {
+        assert_eq!(
+            fixture.event("tls_sign_failed", id).await,
+            json!({"v":1,"type":"tls_sign_failed","id":id,"signer":"ck-bus","reason":"ck-bus unavailable"})
+        );
+    }
+    fixture.commands.send(BusCommand::Enable).await.unwrap();
+    assert_eq!(
+        timeout(LIMIT, fixture.calls.recv()).await.unwrap().unwrap(),
+        json!({"method":"ckbus.hub_tls_sign","params":{"message_b64":"aGVsbG8","scheme":"ed25519"}})
+    );
+    assert_eq!(
+        fixture.event("tls_sign_ok", 3).await,
+        json!({"v":1,"type":"tls_sign_ok","id":3,"signature_b64":"A".repeat(86)})
+    );
+    let events = fs::read_to_string(fixture.root.path().join("engine.jsonl")).unwrap();
+    let states: Vec<Value> = events
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|value| value["type"] == "state")
+        .collect();
+    assert_eq!(states, json!([
+        {"v":1,"type":"state","generation":0,"remotes":[]},
+        {"v":1,"type":"state","generation":7,"remotes":[],"hub_listener":{"port":7422,"cert_der_b64":"public-certificate"}}
+    ]).as_array().unwrap().clone());
+    assert!(events
+        .lines()
+        .any(|line| serde_json::from_str::<Value>(line).unwrap()["hub"] == true));
+    fixture.commands.send(BusCommand::State(8)).await.unwrap();
+    assert_eq!(
+        fixture.event("tls_sign_failed", 4).await["reason"],
+        "vault_unavailable"
+    );
+    assert_eq!(
+        fixture.calls.recv().await.unwrap()["params"]["message_b64"],
+        "ZGVuaWVk"
+    );
+    let started = Instant::now();
+    fixture.commands.send(BusCommand::State(9)).await.unwrap();
+    assert_eq!(
+        fixture.calls.recv().await.unwrap()["params"]["message_b64"],
+        "dGltZW91dA"
+    );
+    assert_eq!(
+        fixture.event("tls_sign_failed", 5).await["signer"],
+        "ck-bus"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "TLS relay must answer before the engine deadline"
+    );
+    assert_eq!(fixture.opens.load(Ordering::SeqCst), 1);
+    fixture.commands.send(BusCommand::Remove).await.unwrap();
+    fixture.finish().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

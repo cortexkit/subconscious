@@ -1284,6 +1284,11 @@ impl SetupFixture {
                     let path = fixture_binary_path(&bin, binary);
                     if cfg!(target_os = "macos") && *binary == "ck-subc" {
                         write_fixture_daemon(&bin, "0.17.9");
+                    } else if *binary == "ck-auth" {
+                        common::copy_executable(
+                            Path::new(env!("CARGO_BIN_EXE_vault-cli-fixture")),
+                            &path,
+                        );
                     } else {
                         fs::write(&path, binary).unwrap();
                     }
@@ -1312,6 +1317,7 @@ impl SetupFixture {
                         },
                         "aft": {"program": bin.join(platform_binary("ck-aft"))},
                         "claustrum": installed_claustrum_entry(&bin),
+                        "nats-hub": fixture_hub_entry(&bin, &cortexkit),
                         "insula": {"program": bin.join(platform_binary("ck-insula"))},
                     },
                 }))
@@ -1455,6 +1461,17 @@ impl SetupFixture {
         command
     }
 }
+
+fn fixture_hub_entry(bin: &Path, data: &Path) -> Value {
+    json!({
+        "program": bin.join(platform_binary("ck-nats-server")),
+        "args": ["-c", data.join("nats-hub").join("server.conf")],
+        "protocol": "subc", "registration_channel": true, "reserved": true, "enabled": true,
+    })
+}
+
+const SETUP_MAINTENANCE_NO_CHANGE: &str = "Install an idle message hub entry\n  Message hub entry: nothing changed (existing entry kept)\nLet the message module use this computer's message-plane keys\n  Message-plane grants: nothing changed (all nine already granted)\nNothing changed.\n";
+const UPGRADE_MAINTENANCE_NO_CHANGE: &str = "Message hub entry: nothing changed (existing entry kept)\nLet the message module use this computer's message-plane keys\nMessage-plane grants: nothing changed (all nine already granted)\nNothing changed.\n";
 
 /// Default setup leaves key-store selection to the vault on every platform.
 fn installed_claustrum_entry(bin: &Path) -> Value {
@@ -2235,7 +2252,11 @@ fn setup_live_daemon_uses_core_release_not_connection_library_version() {
         assert_exit(&output, 0);
         assert_eq!(
             text(&output.stdout),
-            "CortexKit is set up: daemon running, aft · claustrum · insula ok.\n"
+            if args.contains(&"--dry-run") {
+                "  1. would Install an idle message hub entry\n  2. would Let the message module use this computer's message-plane keys\n"
+            } else {
+                SETUP_MAINTENANCE_NO_CHANGE
+            }
         );
         assert_eq!(
             (fs::read(&config).unwrap(), fs::read(&inventory).unwrap()),
@@ -2377,10 +2398,7 @@ fn setup_nothing_to_do_never_renders_outcome_no_op() {
 
     assert_exit(&output, 0);
     assert!(output.stderr.is_empty(), "stderr: {}", text(&output.stderr));
-    assert_eq!(
-        text(&output.stdout),
-        "CortexKit is set up: daemon running, aft · claustrum · insula ok.\n"
-    );
+    assert_eq!(text(&output.stdout), SETUP_MAINTENANCE_NO_CHANGE);
 }
 
 /// Places the test CLI in the fixture's `cmd` folder, where the bootstrap
@@ -2496,10 +2514,7 @@ fn setup_puts_ckni_beside_the_managed_ck_and_then_has_nothing_to_do() {
 
     let again = run(&["setup"]);
     assert_exit(&again, 0);
-    assert_eq!(
-        text(&again.stdout),
-        "CortexKit is set up: daemon running, aft · claustrum · insula ok.\n"
-    );
+    assert_eq!(text(&again.stdout), SETUP_MAINTENANCE_NO_CHANGE);
 }
 
 /// Run from a byte copy named `ckni` (how Windows places it; on Unix a
@@ -2676,7 +2691,7 @@ fn setup_mc_apply_reports_each_completed_change_without_a_plan() {
     assert_eq!(
         text(&output.stdout),
         format!(
-            "Installing magic-context (ck-mc-alpha.22464bf2, {})\n  downloaded and verified ck-mc (12.1 MiB)\n  placed ~/.local/share/cortexkit/bin/{}\n  configured magic-context in ~/.config/cortexkit/subc.jsonc\n  registered with the daemon; magic-context ok\nDone.\n",
+            "Installing magic-context (ck-mc-alpha.22464bf2, {})\n  downloaded and verified ck-mc (12.1 MiB)\n  placed ~/.local/share/cortexkit/bin/{}\n  configured magic-context in ~/.config/cortexkit/subc.jsonc\nInstall an idle message hub entry\n  Message hub entry: nothing changed (existing entry kept)\nLet the message module use this computer's message-plane keys\n  Message-plane grants: nothing changed (all nine already granted)\n  registered with the daemon; magic-context ok\nDone.\n",
             host_target(),
             platform_binary("ck-mc")
         )
@@ -2764,8 +2779,12 @@ fn upgrade_without_mc_index_entry_leaves_installed_mc_unchanged() {
         assert_exit(&output, 0);
         assert!(output.stderr.is_empty(), "{}", text(&output.stderr));
         let stdout = text(&output.stdout);
-        assert!(stdout.starts_with("Everything is up to date"), "{stdout}");
-        assert!(stdout.contains("ck-mc ck-mc-alpha.22464bf2"), "{stdout}");
+        if args.contains(&"--check") {
+            assert!(stdout.starts_with("Everything is up to date"), "{stdout}");
+            assert!(stdout.contains("ck-mc ck-mc-alpha.22464bf2"), "{stdout}");
+        } else {
+            assert_eq!(stdout, UPGRADE_MAINTENANCE_NO_CHANGE);
+        }
         assert!(!stdout.contains("ck-mc →"), "{stdout}");
         assert_eq!(fs::read(&manifest).unwrap(), manifest_before);
         assert_eq!(fs::read(&mc_path).unwrap(), binary_before);
@@ -2889,7 +2908,9 @@ fn setup_mc_dry_run_has_future_steps_and_the_config_diff() {
             platform_binary("ck-mc")
         ),
         "  4. would configure magic-context in ~/.config/cortexkit/subc.jsonc".to_string(),
-        "  5. would register magic-context with the daemon and check its health".to_string(),
+        "  5. would Install an idle message hub entry".to_string(),
+        "  6. would register magic-context with the daemon and check its health".to_string(),
+        "  7. would Let the message module use this computer's message-plane keys".to_string(),
         "proposed configuration diff:".to_string(),
         "+    \"magic-context\": {".to_string(),
     ] {
@@ -3236,7 +3257,10 @@ fn setup_tightens_existing_owned_modes_on_a_noop_plan_without_chmodding_unowned_
     assert_exit(&output, 0);
     assert_eq!(
         text(&output.stdout),
-        "  tightened permissions on existing CortexKit paths\nDone.\n"
+        format!(
+            "  tightened permissions on existing CortexKit paths\n{}",
+            SETUP_MAINTENANCE_NO_CHANGE.replace("Nothing changed.", "Done.")
+        )
     );
     assert_mode(&cortexkit, 0o700);
     assert_mode(&bin, 0o755);
@@ -3275,7 +3299,7 @@ fn setup_keeps_bootstrapped_claustrum_key_owner_only_under_zero_umask() {
         0,
     );
     let auth_binary = platform_binary("ck-auth");
-    let auth_script = "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'ck-auth 0.17.10'; exit 0; fi\nif [ \"$1\" = \"bootstrap\" ]; then shift; while [ $# -gt 0 ]; do if [ \"$1\" = \"--key-path\" ]; then key=\"$2\"; shift 2; else shift; fi; done; if [ -n \"${key:-}\" ]; then printf secret >\"$key\"; fi; exit 0; fi\nexit 2\n".to_string();
+    let auth_script = "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'ck-auth 0.17.10'; exit 0; fi\nif [ \"$1\" = \"grant\" ]; then echo 'already granted (no change)'; exit 0; fi\nif [ \"$1\" = \"bootstrap\" ]; then shift; while [ $# -gt 0 ]; do if [ \"$1\" = \"--key-path\" ]; then key=\"$2\"; shift 2; else shift; fi; done; if [ -n \"${key:-}\" ]; then printf secret >\"$key\"; fi; exit 0; fi\nexit 2\n".to_string();
     let auth = stored_zip(&[(&auth_binary, auth_script.as_bytes())]);
     let index = serve_signed_index(|base| {
         let target = host_target();
@@ -3400,7 +3424,7 @@ impl UpgradeFixture {
         write_executable(&nats_engine, "#!/bin/sh\necho 'ck-nats-engine 0.1.1'\n");
         write_executable(&nats_server, "#!/bin/sh\necho 'ck-nats-server 0.1.1'\n");
         write_executable(&claustrum, "#!/bin/sh\necho 'ck-claustrum 0.8.0'\n");
-        write_executable(&auth, "#!/bin/sh\necho 'ck-auth 0.8.0'\n");
+        common::copy_executable(Path::new(env!("CARGO_BIN_EXE_vault-cli-fixture")), &auth);
         // The manifest names the `ck` this fixture's commands run: the test
         // CLI as published under its `ckdev-` name.
         let ck = fs::canonicalize(cortexkit_test_support::ckdev_binary(env!(
@@ -3435,6 +3459,17 @@ impl UpgradeFixture {
                 "platform": host_target(),
                 "mutations": mutations,
             }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let config = home.join(".config/cortexkit/subc.jsonc");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(
+            &config,
+            serde_json::to_vec_pretty(
+                &json!({"modules":{"nats-hub":fixture_hub_entry(&bin, &cortexkit)}}),
+            )
             .unwrap(),
         )
         .unwrap();
@@ -3488,6 +3523,7 @@ impl UpgradeFixture {
             .env("CK_TEST_AFT_VERSION", "0.55.1")
             .env("CK_TEST_CLAUSTRUM_VERSION", "0.8.0")
             .env("CK_TEST_AUTH_VERSION", "0.8.0")
+            .env("CK_TEST_SETUP_CONTROL_OK", "1")
             .env("CK_TEST_SETUP_MODULES", "aft,claustrum")
             .env(
                 "CK_UPDATE_CACHE_PATH",
@@ -3598,7 +3634,7 @@ fn upgrade_index(
 }
 
 #[test]
-fn upgrade_and_check_say_everything_is_current_in_one_line() {
+fn upgrade_runs_message_maintenance_while_check_only_reports_binary_currency() {
     let fixture = UpgradeFixture::new("ck-upgrade-current");
     let index = serve_signed_index(|base| {
         upgrade_index(
@@ -3618,8 +3654,62 @@ fn upgrade_and_check_say_everything_is_current_in_one_line() {
         let output = fixture.command(&index, args).output().unwrap();
         assert_exit(&output, 0);
         assert!(output.stderr.is_empty(), "stderr: {}", text(&output.stderr));
-        assert_eq!(text(&output.stdout), expected);
+        assert_eq!(
+            text(&output.stdout),
+            if args.contains(&"--check") {
+                expected
+            } else {
+                UPGRADE_MAINTENANCE_NO_CHANGE
+            }
+        );
     }
+}
+
+#[test]
+fn upgrade_adds_the_missing_hub_once_and_then_reports_no_changes() {
+    let fixture = UpgradeFixture::new("ck-upgrade-message-hub");
+    let config = fixture.home.join(".config/cortexkit/subc.jsonc");
+    fs::write(&config, "{\"modules\":{}}\n").unwrap();
+    let index = serve_signed_index(|base| {
+        upgrade_index(
+            base,
+            "0.55.1",
+            &"22".repeat(32),
+            "0.17.9",
+            &"44".repeat(32),
+            "0.8.0",
+            &"55".repeat(32),
+        )
+    });
+    let preview = fixture
+        .command(&index, &["upgrade", "--dry-run"])
+        .output()
+        .unwrap();
+    assert_exit(&preview, 0);
+    assert!(text(&preview.stdout).contains("Install an idle message hub entry"));
+    assert!(text(&preview.stdout)
+        .contains("Let the message module use this computer's message-plane keys"));
+    assert_eq!(fs::read_to_string(&config).unwrap(), "{\"modules\":{}}\n");
+    let first = fixture.command(&index, &["upgrade"]).output().unwrap();
+    assert_exit(&first, 0);
+    assert!(text(&first.stdout).contains("Installed idle nats-hub entry"));
+    assert!(text(&first.stdout).ends_with("Done.\n"));
+    let saved = fs::read(&config).unwrap();
+    let entry = subc_jsonc::read_document(&config).unwrap().1["modules"]["nats-hub"].clone();
+    assert_eq!(entry["enabled"], true);
+    assert_eq!(entry["protocol"], "subc");
+    // Compared as paths: Windows accepts both separators, and the data folder
+    // the fixture hands to ck is spelled with forward slashes.
+    assert_eq!(
+        std::path::Path::new(entry["args"][1].as_str().unwrap()),
+        fixture
+            .home
+            .join(".local/share/cortexkit/nats-hub/server.conf")
+    );
+    let second = fixture.command(&index, &["upgrade"]).output().unwrap();
+    assert_exit(&second, 0);
+    assert_eq!(text(&second.stdout), UPGRADE_MAINTENANCE_NO_CHANGE);
+    assert_eq!(fs::read(&config).unwrap(), saved);
 }
 
 // These byte pins protect redirected output as the terminal UI evolves. The
@@ -3963,11 +4053,13 @@ fn upgrade_noops_when_0_20_83_is_installed_and_cache_and_index_offer_0_20_41() {
         assert!(!stdout.contains("0.20.41"), "stdout:\n{stdout}");
         if args.is_empty() {
             assert!(stdout.contains("updates: none"), "stdout:\n{stdout}");
-        } else if !args.contains(&"--dry-run") {
+        } else if args.contains(&"--check") {
             assert!(
                 stdout.starts_with("Everything is up to date"),
                 "stdout:\n{stdout}"
             );
+        } else if !args.contains(&"--dry-run") {
+            assert_eq!(stdout, UPGRADE_MAINTENANCE_NO_CHANGE);
         }
         assert_eq!(
             fs::read(&manifest).unwrap(),

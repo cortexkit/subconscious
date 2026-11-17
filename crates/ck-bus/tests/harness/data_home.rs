@@ -29,12 +29,14 @@ pub fn operator_module_dir() -> Option<PathBuf> {
 /// state-file constant in ck-bus's source (named beside it);
 /// `every_ckbus_state_file_is_classified` fails if a new one is added there
 /// without being listed here or in [`CONTENT_COMPARED`].
-pub const LIVE_REWRITTEN: [&str; 5] = [
+pub const LIVE_REWRITTEN: [&str; 7] = [
     "activity_cursor.json",  // activity_mirror::cursor::CURSOR_FILE
     "spawn_cursor.json",     // spawn_consumer::cursor::CURSOR_FILE
     "sentinel_verdict.json", // sentinel::verdict::VERDICT_FILE
     "own_users.json",        // bootstrap::store::OWN_USERS_FILE
     "epoch_high_water.json", // issuance::high_water::HIGH_WATER_FILE
+    "fed_account.json",      // bootstrap::store::FED_ACCOUNT_FILE (written when a hub is named)
+    "hub.json",              // federation::hub::record::HUB_RECORD_FILE (issues, removals)
 ];
 
 /// Directories the live module or its supervised broker fills and empties while

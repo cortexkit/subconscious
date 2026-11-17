@@ -20,6 +20,9 @@ use subc_protocol::MachineId;
 
 pub const ACCOUNT_FILE: &str = "account.json";
 pub const OWN_USERS_FILE: &str = "own_users.json";
+/// The federation account's record, in the same shape as `account.json` with
+/// `acct` = `fed_<machine id>`.
+pub const FED_ACCOUNT_FILE: &str = "fed_account.json";
 
 /// What `account.json` names: the machine id and `{acct}` this store last served, and
 /// the box account's identity public key (`A...`), which is the account's id on the
@@ -85,7 +88,7 @@ impl Store {
     /// Removes a stale `*.tmp` left by a write that died before its rename. It was
     /// never the file of record, so removing it loses nothing.
     pub fn remove_stale_tmp(&self) {
-        for name in [ACCOUNT_FILE, OWN_USERS_FILE] {
+        for name in [ACCOUNT_FILE, OWN_USERS_FILE, FED_ACCOUNT_FILE] {
             let _ = fs::remove_file(self.root.join(format!("{name}.tmp")));
         }
     }
@@ -106,6 +109,36 @@ impl Store {
     pub fn write_account(&self, record: &AccountRecord) -> io::Result<()> {
         write_atomic(
             &self.account_path(),
+            &json!({
+                "machine_id": record.machine_id,
+                "acct": record.acct,
+                "account_public": record.account_public,
+            }),
+        )
+    }
+
+    pub fn federation_account_path(&self) -> PathBuf {
+        self.root.join(FED_ACCOUNT_FILE)
+    }
+
+    /// The federation account's record. Damage is handled as for `account.json`: named,
+    /// never repaired by a rewrite.
+    pub fn read_federation_account(&self) -> AccountFile {
+        let path = self.federation_account_path();
+        let value = match read_json(&path) {
+            Ok(None) => return AccountFile::Absent,
+            Ok(Some(value)) => value,
+            Err(reason) => return AccountFile::Damaged { path, reason },
+        };
+        match parse_record(&value, "fed_") {
+            Ok(record) => AccountFile::Present(record),
+            Err(reason) => AccountFile::Damaged { path, reason },
+        }
+    }
+
+    pub fn write_federation_account(&self, record: &AccountRecord) -> io::Result<()> {
+        write_atomic(
+            &self.federation_account_path(),
             &json!({
                 "machine_id": record.machine_id,
                 "acct": record.acct,
@@ -162,6 +195,11 @@ impl Store {
 }
 
 fn parse_account(value: &Value) -> Result<AccountRecord, String> {
+    parse_record(value, "box_")
+}
+
+/// An account record whose `acct` is `prefix` plus its machine id.
+fn parse_record(value: &Value, prefix: &str) -> Result<AccountRecord, String> {
     let field = |name: &str| {
         value
             .get(name)
@@ -176,9 +214,9 @@ fn parse_account(value: &Value) -> Result<AccountRecord, String> {
     };
     MachineId::parse(&record.machine_id)
         .map_err(|error| format!("machine_id does not parse: {error}"))?;
-    if record.acct != format!("box_{}", record.machine_id) {
+    if record.acct != format!("{prefix}{}", record.machine_id) {
         return Err(format!(
-            "acct {} is not box_ plus machine_id {}",
+            "acct {} is not {prefix} plus machine_id {}",
             record.acct, record.machine_id
         ));
     }
@@ -191,7 +229,7 @@ fn parse_account(value: &Value) -> Result<AccountRecord, String> {
 }
 
 /// `Ok(None)` for a missing file; `Err` names why a present file is damaged.
-fn read_json(path: &Path) -> Result<Option<Value>, String> {
+pub(crate) fn read_json(path: &Path) -> Result<Option<Value>, String> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -202,7 +240,7 @@ fn read_json(path: &Path) -> Result<Option<Value>, String> {
         .map_err(|error| format!("not JSON: {error}"))
 }
 
-fn write_atomic(path: &Path, value: &Value) -> io::Result<()> {
+pub(crate) fn write_atomic(path: &Path, value: &Value) -> io::Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| io::Error::other("store file has no parent directory"))?;

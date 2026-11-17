@@ -426,9 +426,9 @@ pub fn bus_module_grant(
 }
 
 /// ck-bus's system-account grant: the claims update, the claims list and per-account
-/// lookup, the kick, the connect and disconnect events, and the user's own inbox
-/// (`_INBOX.<credential_public>.>`) for the replies, as the naming crate enumerates
-/// them.
+/// lookup, the kick, the leaf report, the connect and disconnect events, and the user's
+/// own inbox (`_INBOX.<credential_public>.>`) for the replies, as the naming crate
+/// enumerates them.
 pub fn system_account_grant(
     account: &AccountNames,
     credential_public: &str,
@@ -721,5 +721,17 @@ mod tests {
         other = grant.clone();
         other.publish.remove("a");
         assert_ne!(grant.permission_digest(), other.permission_digest());
+    }
+
+    #[test]
+    fn system_grant_may_read_the_leaf_report() {
+        let account = derive_account("box_alpha").unwrap();
+        let user = nkeys::KeyPair::new_user().public_key();
+        let grant = system_account_grant(&account, &user).unwrap();
+        assert!(
+            grant.publish_allow().contains("$SYS.REQ.SERVER.*.LEAFZ"),
+            "{:?}",
+            grant.publish_allow()
+        );
     }
 }

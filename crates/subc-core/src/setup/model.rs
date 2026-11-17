@@ -586,6 +586,8 @@ pub enum SetupOperation {
     BootstrapClaustrum {
         key_path: Option<std::path::PathBuf>,
     },
+    GrantMessageKeys,
+    ConfigureMessageHub,
     AdoptRunningCk {
         path: std::path::PathBuf,
     },
@@ -633,6 +635,8 @@ impl SetupOperation {
             Self::InstallComponent { .. }
                 | Self::ConfigureComponent { .. }
                 | Self::BootstrapClaustrum { .. }
+                | Self::GrantMessageKeys
+                | Self::ConfigureMessageHub
                 | Self::AdoptRunningCk { .. }
                 | Self::LinkCkni { .. }
                 | Self::RescanComponent { .. }
@@ -656,12 +660,14 @@ impl SetupOperation {
             | Self::RescanComponent { component }
             | Self::EnableComponent { component } => Some(*component),
             Self::BootstrapClaustrum { .. } => Some(Component::Claustrum),
+            Self::ConfigureMessageHub => Some(Component::Core),
             Self::ObservePlatform
             | Self::OfferOptionalComponents { .. }
             | Self::OfferConversion { .. }
             | Self::ConfirmConversion { .. }
             | Self::AdoptRunningCk { .. }
             | Self::LinkCkni { .. }
+            | Self::GrantMessageKeys
             | Self::RestartRuntime { .. }
             | Self::RegisterRuntime
             | Self::UpdateRuntimeDefinition { .. }
@@ -709,6 +715,8 @@ impl fmt::Display for SetupOperation {
             Self::BootstrapClaustrum { key_path: None, .. } => {
                 formatter.write_str("bootstrap claustrum with ck auth bootstrap")
             }
+            Self::GrantMessageKeys => formatter.write_str(super::message_plane::GRANT_STEP),
+            Self::ConfigureMessageHub => formatter.write_str(super::message_plane::HUB_STEP),
             Self::AdoptRunningCk { path } => {
                 write!(formatter, "adopt running ck binary at {}", path.display())
             }
@@ -883,6 +891,8 @@ impl UpgradeObserved {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UpgradeOperation {
     ObservePlatform,
+    ConfigureMessageHub { target: UpgradeTarget },
+    GrantMessageKeys { target: UpgradeTarget },
     DownloadAndVerify { target: UpgradeTarget },
     CreateRollbackCopy { target: UpgradeTarget },
     ReplaceDestination { target: UpgradeTarget },
@@ -904,6 +914,8 @@ impl fmt::Display for UpgradeOperation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ObservePlatform => formatter.write_str("observe alpha platform support"),
+            Self::ConfigureMessageHub { .. } => formatter.write_str(super::message_plane::HUB_STEP),
+            Self::GrantMessageKeys { .. } => formatter.write_str(super::message_plane::GRANT_STEP),
             Self::DownloadAndVerify { target } => {
                 write!(
                     formatter,

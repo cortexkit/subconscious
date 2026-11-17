@@ -206,6 +206,8 @@ fn daemon_target(plan: &UpgradePlan) -> Option<UpgradeTarget> {
 /// failures name it; `None` for the platform check, which is no stage.
 pub fn operation_stage(operation: &UpgradeOperation) -> Option<(UpgradeTarget, &'static str)> {
     Some(match operation {
+        UpgradeOperation::ConfigureMessageHub { target } => (*target, "message-hub-entry"),
+        UpgradeOperation::GrantMessageKeys { target } => (*target, "message-plane-grants"),
         UpgradeOperation::ObservePlatform => return None,
         UpgradeOperation::DownloadAndVerify { target } => (*target, "download-and-verify"),
         UpgradeOperation::CreateRollbackCopy { target } => (*target, "rollback-copy"),
@@ -363,6 +365,25 @@ impl<B> Reporting<'_, B> {
 }
 
 impl<B: UpgradeExecutionBackend> UpgradeExecutionBackend for Reporting<'_, B> {
+    fn configure_message_hub(&mut self, target: UpgradeTarget) -> Result<(bool, String), String> {
+        let mut changed = false;
+        let detail = self.stage(Some(target), "message-hub-entry", |b| {
+            let result = b.configure_message_hub(target)?;
+            changed = result.0;
+            Ok(result.1)
+        })?;
+        Ok((changed, detail))
+    }
+
+    fn grant_message_keys(&mut self, target: UpgradeTarget) -> Result<(bool, String), String> {
+        let mut changed = false;
+        let detail = self.stage(Some(target), "message-plane-grants", |b| {
+            let result = b.grant_message_keys(target)?;
+            changed = result.0;
+            Ok(result.1)
+        })?;
+        Ok((changed, detail))
+    }
     fn download_and_verify(&mut self, target: UpgradeTarget) -> Result<String, String> {
         self.stage(Some(target), "download-and-verify", |b| {
             b.download_and_verify(target)
@@ -498,6 +519,14 @@ mod tests {
     }
 
     impl UpgradeExecutionBackend for Scripted {
+        fn configure_message_hub(&mut self, _: UpgradeTarget) -> Result<(bool, String), String> {
+            self.answer("message-hub-entry")
+                .map(|detail| (false, detail))
+        }
+        fn grant_message_keys(&mut self, _: UpgradeTarget) -> Result<(bool, String), String> {
+            self.answer("message-plane-grants")
+                .map(|detail| (false, detail))
+        }
         fn download_and_verify(&mut self, _: UpgradeTarget) -> Result<String, String> {
             self.answer("download-and-verify")
         }

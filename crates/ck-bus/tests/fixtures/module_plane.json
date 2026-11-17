@@ -309,16 +309,6 @@
     },
     {
       "ack_wait_secs": 30,
-      "durable": "m_astrocyte_payer",
-      "filter_subjects": [
-        "ck.box_upgradegolden.event.thalamus-harness.payer_row.v1"
-      ],
-      "max_ack_pending": 1000,
-      "max_deliver": -1,
-      "stream": "CK_BOX_UPGRADEGOLDEN_EVENT"
-    },
-    {
-      "ack_wait_secs": 30,
       "durable": "m_astrocyte_media_usage",
       "filter_subjects": [
         "ck.box_upgradegolden.event.colliculus.usage_recorded.v1"
@@ -354,7 +344,7 @@
       "ack_wait_secs": 30,
       "durable": "m_aft_sendstate",
       "filter_subjects": [
-        "ck.box_upgradegolden.event.thalamus-harness.send_state.v1",
+        "ck.box_upgradegolden.event.thalamus-harness.send_state.v1.aft",
         "ck.box_upgradegolden.event.broca.send_state.v1.aft"
       ],
       "max_ack_pending": 1000,

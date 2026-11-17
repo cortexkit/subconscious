@@ -130,12 +130,14 @@ fn nats_setup_verification_failure_restores_entry_and_stock_binary() {
             component: Component::Core,
         })
         .unwrap();
+    backend.apply(&SetupOperation::ConfigureMessageHub).unwrap();
     assert_eq!(nats_entry(&backend)["protocol"], "subc");
     assert!(backend
         .finish_daemon_migration(Err("pair health failed".into()))
         .unwrap_err()
         .contains("pair health failed"));
     assert_eq!(nats_entry(&backend), original);
+    assert!(subc_jsonc::read_document(&backend.paths.config_path).unwrap().1["modules"].get("nats-hub").is_none());
     assert_eq!(
         fs::read(root.join(format!(
             "bin/nats-server{}",
@@ -144,6 +146,65 @@ fn nats_setup_verification_failure_restores_entry_and_stock_binary() {
         .unwrap(),
         b"nats-server"
     );
+}
+
+#[test]
+fn message_plane_setup_hub_repeat_and_rollback_keep_existing_entries() {
+    for existing in [false, true] {
+        let root = ScratchDir::new("message-setup-hub");
+        let (mut backend, _) = nats_setup_fixture(&root, false);
+        let path = backend.paths.config_path.clone();
+        if existing {
+            let (mut text, _) = subc_jsonc::read_document(&path).unwrap();
+            subc_jsonc::set_member(&mut text, &["modules", "nats-hub"], &serde_json::json!({"enabled":false,"program":"operator-hub"})).unwrap();
+            fs::write(&path, text).unwrap();
+        }
+        let before = fs::read(&path).unwrap();
+        backend.apply(&SetupOperation::ConfigureMessageHub).unwrap();
+        let after = fs::read(&path).unwrap();
+        if !existing {
+            let doc = subc_jsonc::read_document(&path).unwrap().1;
+            assert_eq!(doc["modules"]["nats-hub"]["args"][1], root.join("data").join("nats-hub").join("server.conf").to_string_lossy().as_ref());
+        }
+        backend.apply(&SetupOperation::ConfigureMessageHub).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), after);
+        backend.rollback_component(Component::Core).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+}
+
+#[test]
+fn message_plane_setup_uses_the_installed_vault_cli_after_it_is_live() {
+    struct VaultRunner {
+        auth: PathBuf,
+        calls: std::sync::Arc<std::sync::Mutex<usize>>,
+    }
+    impl CommandRunner for VaultRunner {
+        fn run(&mut self, program: &str, args: &[String]) -> Result<runtime::CommandResult, String> {
+            let mut count = self.calls.lock().unwrap();
+            let stdout = if *count == 0 {
+                assert_eq!(args, ["--json", "module", "status", "claustrum"]);
+                serde_json::json!({"module":{"live":true}}).to_string()
+            } else {
+                assert_eq!(Path::new(program), self.auth);
+                assert!(Path::new(program).is_absolute());
+                assert_eq!(args[0], "grant");
+                "already granted (no change)".into()
+            };
+            *count += 1;
+            Ok(runtime::CommandResult { success: true, stdout, stderr: String::new() })
+        }
+    }
+    let root = ScratchDir::new("message-setup-vault-cli");
+    let mut backend = backend_without_user_manager(&root);
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(0));
+    backend.runner = Box::new(VaultRunner {
+        auth: root.join("bin").join(if cfg!(windows) {"ck-auth.exe"} else {"ck-auth"}),
+        calls: calls.clone(),
+    });
+    backend.apply(&SetupOperation::GrantMessageKeys).unwrap();
+    assert_eq!(*calls.lock().unwrap(), 10);
+    assert!(!backend.component_steps[&Component::Claustrum].message_grants_changed);
 }
 
 #[test]

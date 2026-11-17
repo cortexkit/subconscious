@@ -11,6 +11,7 @@ mod file_modes;
 mod inventory;
 mod managed_replace;
 mod mc_detection;
+mod message_plane;
 mod model;
 mod nats_migration;
 mod planner;

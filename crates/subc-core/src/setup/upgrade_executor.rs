@@ -34,7 +34,14 @@ impl std::fmt::Display for UpgradeEvidence {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct UpgradeExecutionReport {
+    changed: bool,
     pub evidence: Vec<UpgradeEvidence>,
+}
+
+impl UpgradeExecutionReport {
+    pub fn nothing_changed(&self) -> bool {
+        !self.changed
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -44,6 +51,12 @@ pub enum RollbackDecision {
 }
 
 pub trait UpgradeExecutionBackend {
+    fn configure_message_hub(&mut self, _target: UpgradeTarget) -> Result<(bool, String), String> {
+        Err("message hub configuration is not implemented by this backend".into())
+    }
+    fn grant_message_keys(&mut self, _target: UpgradeTarget) -> Result<(bool, String), String> {
+        Err("message-plane grants are not implemented by this backend".into())
+    }
     fn download_and_verify(&mut self, target: UpgradeTarget) -> Result<String, String>;
     fn create_rollback_copy(&mut self, target: UpgradeTarget) -> Result<String, String>;
     fn replace_destination(&mut self, target: UpgradeTarget) -> Result<String, String>;
@@ -118,6 +131,26 @@ pub fn execute_upgrade<B: UpgradeExecutionBackend>(
     for operation in &plan.operations {
         let (target, stage, result) = match operation {
             UpgradeOperation::ObservePlatform => continue,
+            UpgradeOperation::ConfigureMessageHub { target } => (
+                *target,
+                "message-hub-entry",
+                backend
+                    .configure_message_hub(*target)
+                    .map(|(changed, detail)| {
+                        report.changed |= changed;
+                        detail
+                    }),
+            ),
+            UpgradeOperation::GrantMessageKeys { target } => (
+                *target,
+                "message-plane-grants",
+                backend
+                    .grant_message_keys(*target)
+                    .map(|(changed, detail)| {
+                        report.changed |= changed;
+                        detail
+                    }),
+            ),
             UpgradeOperation::DownloadAndVerify { target } => (
                 *target,
                 "download-and-verify",
@@ -181,6 +214,7 @@ pub fn execute_upgrade<B: UpgradeExecutionBackend>(
         match result {
             Ok(detail) => {
                 if stage == "destination-replacement" {
+                    report.changed = true;
                     replaced.insert(target);
                 }
                 report.evidence.push(UpgradeEvidence {
@@ -262,6 +296,21 @@ mod tests {
         fail_activation: bool,
         fail_verify: bool,
         rollback: bool,
+        maintenance_changes: bool,
+    }
+
+    #[test]
+    fn message_plane_execution_summary_uses_actual_changes_not_planned_steps() {
+        let observed =
+            UpgradeObserved::for_roster(upgrade_roster([Component::Core, Component::Claustrum]));
+        let plan = plan_upgrade(&observed);
+        let mut backend = RecordingBackend::default();
+        let report = execute_upgrade(&plan, &mut backend).unwrap();
+        assert!(report.nothing_changed());
+        assert_eq!(report.evidence.len(), 2);
+        backend.maintenance_changes = true;
+        let report = execute_upgrade(&plan, &mut backend).unwrap();
+        assert!(!report.nothing_changed());
     }
 
     #[test]
@@ -281,6 +330,15 @@ mod tests {
     }
 
     impl UpgradeExecutionBackend for RecordingBackend {
+        fn configure_message_hub(
+            &mut self,
+            _target: UpgradeTarget,
+        ) -> Result<(bool, String), String> {
+            Ok((self.maintenance_changes, "message hub entry checked".into()))
+        }
+        fn grant_message_keys(&mut self, _target: UpgradeTarget) -> Result<(bool, String), String> {
+            Ok((self.maintenance_changes, "all nine grants checked".into()))
+        }
         fn download_and_verify(&mut self, _target: UpgradeTarget) -> Result<String, String> {
             self.calls.push("download");
             Ok("sha256 verified".to_string())

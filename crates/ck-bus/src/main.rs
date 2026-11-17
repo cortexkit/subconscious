@@ -28,6 +28,11 @@ mod membership;
 mod revocation;
 // The activity projection has its own checkpoint and cannot delay ledger appends.
 mod activity_mirror;
+// The leaf link to the user's hub: the federation account, `ckbus.leaf_watch` and
+// `ckbus.leaf_sign` for the local server's wrapper, and the leaf credential; and, on
+// the hub computer, the self-hosted hub's setup and its four ops.
+#[allow(dead_code)]
+mod federation;
 // The spawn-stream consumer: revokes the credential of every process that exits, and
 // reconciles the census against the supervisor's spawn snapshot.
 #[allow(dead_code)]
@@ -161,10 +166,34 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     )?;
     let wired = revocation::handler::wire(
         wired,
-        credentials,
+        credentials.clone(),
         &store_root,
         bootstrap.ready(),
         std::time::Duration::from_millis(sentinel_period_ms),
+    );
+    let callosum = Arc::new(federation::leaf::production::SubcFederation::new(
+        credentials::vault::subc_arg(env::args_os())
+            .ok_or("ck-bus needs --subc <connection file> to follow the hub")?,
+    ));
+    let hub = federation::hub::production::start(
+        callosum.clone(),
+        credentials.clone(),
+        &store_root,
+        bootstrap.ready(),
+    );
+    let leaf = federation::leaf::production::start(
+        callosum,
+        hub.clone(),
+        credentials,
+        &store_root,
+        bootstrap.ready(),
+    );
+    let revoker = wired.handler.area().revoker().clone();
+    let manifest =
+        federation::hub::handler::advertise(federation::leaf::handler::advertise(wired.manifest));
+    let handler = federation::leaf::handler::LeafHandler::new(
+        federation::hub::handler::HubHandler::new(wired.handler, hub),
+        leaf,
     );
     dead_letter::consumer::wire(
         bootstrap.ready(),
@@ -173,7 +202,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     spawn_consumer::wire(
         credentials::vault::subc_arg(env::args_os())
             .ok_or("ck-bus needs --subc <connection file> to follow the spawn stream")?,
-        wired.handler.area().revoker().clone(),
+        revoker,
         &store_root,
         bootstrap.ready(),
         module_id.clone(),
@@ -186,7 +215,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         bootstrap.ready(),
         std::time::Duration::from_millis(sentinel_period_ms),
     );
-    bootstrap.serve(wired.manifest, wired.handler).await?;
+    bootstrap.serve(manifest, handler).await?;
     Ok(())
 }
 

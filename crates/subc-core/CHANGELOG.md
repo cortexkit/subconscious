@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.21.24
+
+- Setup and upgrade grant the message module read/sign access to the bus leaf, hub operator, hub account and hub TLS signing keys and the hosted hub token audience through the installed vault CLI, including on already-current installs. Add an enabled `nats-hub` entry that idles until ck-bus says this computer is the hub, without changing an existing entry, and remove only the entry added by the failed run on Core rollback.
+
 ## 0.21.23
 
 - Keep CLI file-based planning compatible with edit-plan request members; require subc-control 0.42.0, subc-daemon 0.50.0, subc-client-rs 0.41.2, ck-ui 0.9.4 and subc-os 0.1.42.

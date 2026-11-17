@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.8.0
+
+- Require cortexkit-bus-naming 0.4.7; use the `aft`-specific send-state filter
+  and remove the `astrocyte` payer-row reader from the permission fixtures.
+- Require cortexkit-bus-naming 0.4.6, whose HUB_IDLOG refuses an append when
+  storage is full instead of dropping its oldest entry.
+
+- Add this machine's side of the leaf link to the user's hub. `ckbus.leaf_watch`
+  (a watch) sends the local server's wrapper `{generation, remotes}` on open and
+  after each change, and `ckbus.leaf_sign` signs the hub's 15-character connect
+  nonce with the vault's `signing:bus-leaf:1`, answering `{jwt, signature_b64}`.
+  Both are admitted only to `reserved:nats-server`.
+- Follow callosum's hub row (`callosum.hub_watch`, with `callosum.hub_read` every
+  60 s while the watch is down). Exactly one hub is allowed. A peer hub is dialled
+  at its candidate addresses with its SPKI pin, falling back to a relay bridge from
+  `callosum.leaf_bridge_open` after a failed round. A self hub waits for the local
+  hub, and the hosted hub is not dialled yet.
+- Get the leaf JWT from the hub computer (`ckbus.hub_leaf_issue` on
+  `fed:<fingerprint>:ckbus`), retrying from 1 s up to 5 min. Renew it at half its
+  life and bounce the leaf connection once at a quiet moment (within 1 h), and
+  request a new one when the leaf key changes.
+- Create the federation account `fed_<machine id>` (recorded in
+  `fed_account.json`, JetStream enabled, no streams or signing key yet) once a hub
+  is named. The leaf remote binds only that account and denies `fedlocal.>` and
+  `fedout.>` both ways.
+- The system user may read the server's `LEAFZ` report (from cortexkit-bus-naming
+  0.4.5's system grant, which ck-bus now pins), so the link's state and
+  connection id are known. Health gains `fed.hub_kind`, `fed.remote_state` and
+  `fed.jwt_expires_at_ms`; every existing health field is unchanged.
+- Add the hub computer's side. When callosum's hub row names this computer
+  (`source: "self"`), and again only after a hub key rotates, hub setup signs the
+  hub operator, its system account and the user's hub account with the vault's
+  `signing:bus-hub-operator:1`, issues the listener certificate for
+  `signing:bus-hub-tls:1` (kept in `hub.json`, so restarts serve the same bytes),
+  and writes `<cortexkit data dir>/nats-hub/server.conf` (full resolver, JetStream
+  domain `hub`, `leafnodes { no_advertise: true }`, one loopback admin listener on
+  17422). Once the hub instance answers, it pushes the hub account and creates
+  `HUB_IDLOG`, `KV_residence` and `OBJ_cuts`.
+- `ckbus.hub_server_watch` (a watch, `reserved:nats-hub`) sends `{generation}`, plus
+  `hub_listener: {port: 7422, cert_der_b64}` once setup has written the
+  configuration; the listener is withdrawn when this computer stops being the hub.
+  `ckbus.hub_tls_sign` (`reserved:nats-hub`) signs TLS 1.3 server
+  `CertificateVerify` content with the hub TLS key, at most 20 a second with a
+  burst of 40. `ckbus.hub_identity_read` (`reserved:callosum`) answers
+  `{spki_sha256, leaf_port}`, or `{hub: null}` on a computer that is not the hub.
+- `ckbus.hub_leaf_issue` answers only callosum's forward from a live paired
+  computer (harness `fed-computer:<fingerprint>`). It takes that computer's
+  machine id from `callosum.peer_keys_read`, signs a 24 h leaf JWT with
+  `signing:bus-hub-account:1` carrying that box's leaf grant, creates its
+  `HUB_INBOX_{box}`, and records the issue under the fingerprint. The hub
+  computer's own leaf gets its credential the same way, locally.
+- Follow `callosum.paired_devices_watch`. A computer named by a tombstone or gone
+  from the list has its leaf key revoked in the hub account, which the hub server
+  applies by closing that leaf connection; a later issue for it is refused.
+- Declare the `peer-sharing/v1` share `hub`, holding only `ckbus.hub_leaf_issue`,
+  for computers. Health gains `fed.hub_setup`, `fed.hub_setup_error`,
+  `fed.hub_leafs_connected` and `fed.hub_issued`.
+
 ## 0.7.4
 
 - Require subc-client-rs 0.41.2, subc-control 0.42.0, subc-daemon 0.50.0 and cortexkit-bus-testkit 0.9.4 for the settings release.

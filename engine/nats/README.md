@@ -1,6 +1,9 @@
 # ck-nats-engine
 
-Version 0.1.1 adds `ck-nats-engine --version`, which prints the build version
+Version 0.1.2 adds a hub listener with TLS 1.3 and channel-backed Ed25519 signing.
+The hub waits for its first listener state before opening the server, and a
+listener port or certificate change requires a restart. Version 0.1.1 added
+`ck-nats-engine --version`, which prints the build version
 without reading configuration or opening the store.
 
 The private child of `ck-nats-server`. It reads the existing NATS configuration
@@ -46,6 +49,11 @@ old remote and adds the new one. Peer pins authenticate the leaf SPKI directly;
 hosted pins trust only the presented pinned CA and require a valid chain and DNS
 name.
 
-Hub listener state and TLS signing replies are decoded, but the hub listener and
-its channel-backed signer are intentionally not implemented yet. A state asking
-for a hub listener is refused without replacing the previous state.
+With `--hub`, the engine waits for `state.hub_listener` before starting NATS.
+It does not read `server.conf` while idle: ck-bus writes that file during hub
+setup. A missing or invalid file after a listener arrives produces `apply_failed`
+and leaves the engine waiting for another state.
+The leaf listener uses only TLS 1.3 and the supplied public Ed25519 certificate;
+each handshake signs through `tls_sign` on the private channel, with a five-second
+budget. Later states can retain the listener but cannot replace its port or
+certificate. Without `--hub`, a listener state is refused.

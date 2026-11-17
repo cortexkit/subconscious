@@ -1,0 +1,74 @@
+//! The hub streams' JetStream configurations, from `cortexkit-bus-naming`'s descriptors.
+
+use async_nats::jetstream::stream;
+use cortexkit_bus_naming::federation::{
+    cuts_object_store, hub_idlog_stream, hub_inbox_stream, residence_bucket, BoxId, HubKind,
+    HubStreamSpec,
+};
+
+use super::seams::HubStream;
+use crate::bootstrap::plane::stream_config;
+
+/// The stream to create for `hub_stream`, or a refusal for a machine id in the wrong
+/// spelling.
+pub fn config_for(hub_stream: &HubStream) -> Result<stream::Config, String> {
+    let spec = match hub_stream {
+        HubStream::Inbox { box_id } => {
+            hub_inbox_stream(&BoxId::parse(box_id).map_err(|error| format!("{box_id:?}: {error}"))?)
+        }
+        HubStream::IdLog => hub_idlog_stream(),
+        // One server, so one replica.
+        HubStream::Residence => residence_bucket(HubKind::SelfHosted).backing_stream,
+        HubStream::Cuts => cuts_object_store(),
+    };
+    Ok(hub_config(&spec))
+}
+
+/// The local stream mapping plus the settings only hub streams carry.
+fn hub_config(spec: &HubStreamSpec) -> stream::Config {
+    let mut config = stream_config(&spec.stream);
+    if let Some(replicas) = spec.replicas {
+        config.num_replicas = replicas;
+    }
+    config.allow_rollup = spec.allow_rollup_hdrs;
+    config.allow_direct = spec.allow_direct;
+    config.deny_delete = spec.deny_delete;
+    config
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn the_four_hub_streams_follow_the_naming_crate() {
+        let inbox = config_for(&HubStream::Inbox {
+            box_id: "0123456789abcdef0123456789abcdef".to_string(),
+        })
+        .unwrap();
+        assert_eq!(inbox.name, "HUB_INBOX_0123456789abcdef0123456789abcdef");
+        assert_eq!(inbox.discard, stream::DiscardPolicy::New);
+        assert_eq!(inbox.max_age, Duration::from_secs(7 * 24 * 3600));
+        assert!(config_for(&HubStream::Inbox {
+            box_id: "0123456789ABCDEF0123456789ABCDEF".to_string()
+        })
+        .is_err());
+
+        let idlog = config_for(&HubStream::IdLog).unwrap();
+        assert_eq!(idlog.subjects, ["ck.fleet.idlog"]);
+        assert_eq!(idlog.max_age, Duration::ZERO);
+
+        let residence = config_for(&HubStream::Residence).unwrap();
+        assert_eq!(residence.name, "KV_residence");
+        assert_eq!(residence.num_replicas, 1);
+        assert_eq!(residence.max_messages_per_subject, 1);
+        assert!(residence.allow_rollup && residence.allow_direct && residence.deny_delete);
+
+        let cuts = config_for(&HubStream::Cuts).unwrap();
+        assert_eq!(cuts.name, "OBJ_cuts");
+        assert!(cuts.allow_rollup);
+        assert_eq!(cuts.discard, stream::DiscardPolicy::New);
+    }
+}

@@ -26,6 +26,32 @@
 //! (header `{"typ":"JWT","alg":"ed25519-nkey"}`, claims, ed25519 signature by the
 //! issuer's nkey). All servers run in operator (JWT) mode; the hub uses the `full`
 //! (directory) account resolver so account updates can be pushed over `$SYS`.
+//!
+//! Rig 7 is not a measurement of the stock server but ck-bus's own leaf area driving
+//! the engine pair (`ck-nats-server` and `ck-nats-engine`) as the leaf; it needs those
+//! two binaries as well (`CK_NATS_SERVER_BIN`, `CK_NATS_ENGINE_BIN`) and `openssl`.
+//!
+//! Rig 8 runs the same pair as the hub instance (`nats-hub`), configured from ck-bus's
+//! hub setup and signing its TLS handshakes through ck-bus, with a second pair as a box
+//! joining it. It needs only the two binaries, and the fixed hub ports 7422 (leaf) and
+//! 17422 (admin) free on loopback.
+
+// ck-bus's own modules, for rig 7.
+#[allow(dead_code)]
+#[path = "../src/bootstrap/mod.rs"]
+mod bootstrap;
+#[allow(dead_code)]
+#[path = "../src/credentials/mod.rs"]
+mod credentials;
+#[allow(dead_code)]
+#[path = "../src/federation/mod.rs"]
+mod federation;
+#[allow(dead_code)]
+#[path = "../src/grants/mod.rs"]
+mod grants;
+#[allow(dead_code)]
+#[path = "../src/runtime/seams.rs"]
+mod runtime;
 
 use std::{
     collections::BTreeMap,
@@ -1690,4 +1716,1270 @@ async fn rig6_revoking_one_user() {
         6,
         "RESULT: PASS - account-JWT revocation closes the revoked user's connection (client or leaf) and refuses its reconnect; other users in the account are unaffected",
     );
+}
+
+// ---------------------------------------------------------------------------------
+// 7. ck-bus's leaf area and the engine pair against a hub with its own operator
+// ---------------------------------------------------------------------------------
+
+mod leaf_link {
+    use std::{
+        path::{Path, PathBuf},
+        process::Stdio,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex as StdMutex,
+        },
+        time::Duration,
+    };
+
+    use async_trait::async_trait;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use nkeys::KeyPair;
+    use serde_json::{json, Value};
+    use sha2::{Digest, Sha256};
+    use subc_protocol::{
+        Flags, Frame, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority, PROTOCOL_VERSION,
+    };
+    use subc_transport::{
+        authenticate_server,
+        connection_file::{
+            generate_daemon_id, generate_key, write_atomic, ConnectionInfo, Endpoint,
+            SCHEMA_VERSION,
+        },
+        read_frame, write_frame,
+    };
+    use tokio::{
+        io::AsyncWriteExt,
+        net::{TcpListener, TcpStream},
+        process::{Child, Command},
+        sync::mpsc,
+        task::JoinHandle,
+        time::timeout,
+    };
+
+    use super::{
+        b64url, http_get, leafs_at, nats_server_bin, note, unix_now, url_port, wait_for, Account,
+        Operator, Resolver, Server, RIG_LOCK,
+    };
+    use crate::{
+        bootstrap::plane::{LeafLink, NatsSystem, SystemPlane},
+        credentials::{roots::RootCredential, Credentials},
+        federation::{
+            hub::{
+                area::{HubArea, HubDeps, HubFiles, HubTiming},
+                conf::admin_url,
+                issue_code,
+                production::NatsHubServer,
+                seams::{OwnMachine, PairedDevices},
+                tls_code,
+            },
+            leaf::{
+                area::{LeafArea, LeafDeps, Timing},
+                seams::{
+                    AlwaysQuiet, Callosum, FederationAccounts, LeafLinks, NoLocalHub, PeerIssuer,
+                },
+            },
+            test_support::KeyVault,
+        },
+    };
+
+    const HUB_FINGERPRINT: &str = "11111111111111111111111111111111";
+    const LIMIT: Duration = Duration::from_secs(30);
+    /// The hub's leaf JWTs live 20 s here, so the renewal at half life comes after 10 s.
+    const JWT_LIFETIME: i64 = 20;
+
+    fn binary(var: &str) -> PathBuf {
+        let path = PathBuf::from(std::env::var_os(var).unwrap_or_else(|| {
+            panic!("LEAF RIG NOT RUN: set {var}; this rig runs the real engine pair")
+        }));
+        assert!(
+            path.is_file(),
+            "LEAF RIG NOT RUN: {var}={} is not a file",
+            path.display()
+        );
+        path
+    }
+
+    /// Runs one helper command with the isolated XDG directories every child gets.
+    fn run(dir: &Path, program: &str, args: &[&str]) {
+        let status = std::process::Command::new(program)
+            .args(args)
+            .current_dir(dir)
+            .env("XDG_DATA_HOME", dir.join("data"))
+            .env("XDG_RUNTIME_DIR", dir.join("run"))
+            .env("XDG_CONFIG_HOME", dir.join("config"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap_or_else(|error| panic!("LEAF RIG NOT RUN: {program}: {error}"));
+        assert!(status.success(), "{program} {args:?} failed");
+    }
+
+    /// A self-signed hub certificate, its key, and the SHA-256 of its
+    /// SubjectPublicKeyInfo, which is the pin a peer hub row carries.
+    fn hub_certificate(dir: &Path) -> (PathBuf, PathBuf, String) {
+        std::fs::create_dir_all(dir).unwrap();
+        run(
+            dir,
+            "openssl",
+            &[
+                "req",
+                "-x509",
+                "-newkey",
+                "ec",
+                "-pkeyopt",
+                "ec_paramgen_curve:prime256v1",
+                "-nodes",
+                "-keyout",
+                "hub-key.pem",
+                "-out",
+                "hub-cert.pem",
+                "-days",
+                "1",
+                "-subj",
+                "/CN=ck-test-hub",
+            ],
+        );
+        run(
+            dir,
+            "openssl",
+            &[
+                "x509",
+                "-in",
+                "hub-cert.pem",
+                "-pubkey",
+                "-noout",
+                "-out",
+                "hub-pub.pem",
+            ],
+        );
+        run(
+            dir,
+            "openssl",
+            &[
+                "pkey",
+                "-pubin",
+                "-in",
+                "hub-pub.pem",
+                "-outform",
+                "DER",
+                "-out",
+                "hub-pub.der",
+            ],
+        );
+        let spki = std::fs::read(dir.join("hub-pub.der")).unwrap();
+        let pin = Sha256::digest(&spki)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        (dir.join("hub-cert.pem"), dir.join("hub-key.pem"), pin)
+    }
+
+    /// A leaf user JWT issued by the hub account, expiring after `JWT_LIFETIME`.
+    fn leaf_user_jwt(account: &KeyPair, leaf_nkey: &str, serial: usize) -> String {
+        let now = unix_now();
+        let mut claims = json!({
+            "jti": "",
+            "iat": now,
+            "exp": now + JWT_LIFETIME,
+            "iss": account.public_key(),
+            "name": format!("box-leaf-{serial}"),
+            "sub": leaf_nkey,
+            "nats": {
+                "type": "user", "version": 2,
+                "pub": {}, "sub": {}, "subs": -1, "data": -1, "payload": -1,
+            },
+        });
+        let digest = Sha256::digest(claims.to_string().as_bytes());
+        claims["jti"] = Value::String(digest.iter().map(|b| format!("{b:02X}")).collect());
+        let input = format!(
+            "{}.{}",
+            b64url(
+                json!({"typ": "JWT", "alg": "ed25519-nkey"})
+                    .to_string()
+                    .as_bytes()
+            ),
+            b64url(claims.to_string().as_bytes())
+        );
+        let signature = account.sign(input.as_bytes()).unwrap();
+        format!("{input}.{}", b64url(&signature))
+    }
+
+    /// Callosum with one peer hub row and no bridge.
+    struct OneHub {
+        body: Vec<u8>,
+    }
+
+    #[async_trait]
+    impl Callosum for OneHub {
+        async fn hub_watch(&self) -> Result<mpsc::Receiver<Vec<u8>>, String> {
+            let (notices, receiver) = mpsc::channel(1);
+            let body = self.body.clone();
+            tokio::spawn(async move {
+                notices.send(body).await.ok();
+                std::future::pending::<()>().await;
+                drop(notices);
+            });
+            Ok(receiver)
+        }
+
+        async fn hub_read(&self) -> Result<Vec<u8>, String> {
+            Ok(self.body.clone())
+        }
+
+        async fn leaf_bridge_open(&self, _fingerprint: &str) -> Result<u16, String> {
+            Err("this rig has no relay bridge".to_string())
+        }
+    }
+
+    /// The hub computer's ck-bus: issues leaf JWTs with the hub account's key.
+    struct HubIssuer {
+        account: KeyPair,
+        issued: Arc<StdMutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl PeerIssuer for HubIssuer {
+        async fn hub_leaf_issue(&self, hub: &str, leaf_nkey: &str) -> Result<String, String> {
+            assert_eq!(hub, HUB_FINGERPRINT);
+            let mut issued = self.issued.lock().unwrap();
+            let jwt = leaf_user_jwt(&self.account, leaf_nkey, issued.len());
+            issued.push(jwt.clone());
+            Ok(jwt)
+        }
+    }
+
+    /// The box server's leaf report and kick, through the production system plane. The
+    /// server only exists once the pair has started it, so the connection is made on
+    /// first use after `url` is set.
+    struct SystemLinks {
+        url: StdMutex<Option<String>>,
+        creds: String,
+        system: tokio::sync::Mutex<Option<Arc<NatsSystem>>>,
+    }
+
+    impl SystemLinks {
+        async fn system(&self) -> Result<Arc<NatsSystem>, String> {
+            let mut system = self.system.lock().await;
+            if system.is_none() {
+                let url = self
+                    .url
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .ok_or("the box server is not up yet")?;
+                let client = async_nats::ConnectOptions::with_credentials(&self.creds)
+                    .map_err(|error| error.to_string())?
+                    .connect(url)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                *system = Some(Arc::new(NatsSystem::from_client(client)));
+            }
+            Ok(system.as_ref().unwrap().clone())
+        }
+    }
+
+    #[async_trait]
+    impl LeafLinks for SystemLinks {
+        async fn leafs(&self, account: &str) -> Result<Vec<LeafLink>, String> {
+            self.system()
+                .await?
+                .leafz(account)
+                .await
+                .map_err(|error| error.message)
+        }
+
+        async fn kick(&self, link: &LeafLink) -> Result<(), String> {
+            self.system()
+                .await?
+                .kick(&link.server_id, link.id)
+                .await
+                .map_err(|error| error.message)
+        }
+    }
+
+    struct FixedAccount(String);
+
+    #[async_trait]
+    impl FederationAccounts for FixedAccount {
+        async fn ensure(&self) -> Result<String, String> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// One `ckbus.leaf_sign` the wrapper made, and the JWT it was answered with.
+    #[derive(Debug, Clone)]
+    struct SignSeen {
+        remote: String,
+        jwt: Option<String>,
+    }
+
+    /// The engine pair under a stand-in daemon that routes the wrapper's ck-bus calls to
+    /// a leaf area in this process.
+    struct EnginePair {
+        _child: Child,
+        _primary: TcpStream,
+        _bus: JoinHandle<()>,
+        signs: Arc<StdMutex<Vec<SignSeen>>>,
+        client_port: u16,
+    }
+
+    async fn send(stream: &mut TcpStream, ty: FrameType, channel: u16, corr: u64, body: Value) {
+        let frame = Frame::build(
+            ty,
+            Flags::new(false, Priority::Interactive, false),
+            channel,
+            if channel == 0 { 0 } else { 1 },
+            corr,
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap();
+        write_frame(stream, &frame).await.unwrap();
+        stream.flush().await.unwrap();
+    }
+
+    async fn authenticate(stream: &mut TcpStream, info: &ConnectionInfo) {
+        authenticate_server(
+            stream,
+            &info.key,
+            &info.daemon_id,
+            &info.daemon_ver,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// A wrapper (`ck-nats-server`) under a stand-in daemon: started with `conf` as the
+    /// module `module_id`, its hello answered. Returns the child, its primary connection,
+    /// and the listener and connection info its consumer connection arrives on.
+    async fn start_wrapper(
+        dir: &Path,
+        conf: &Path,
+        module_id: &str,
+    ) -> (Child, TcpStream, TcpListener, ConnectionInfo) {
+        std::fs::create_dir_all(dir).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let info = ConnectionInfo {
+            schema: SCHEMA_VERSION,
+            wire_version: None,
+            endpoints: vec![Endpoint {
+                host: "127.0.0.1".into(),
+                port: listener.local_addr().unwrap().port(),
+            }],
+            key: generate_key().unwrap(),
+            daemon_id: generate_daemon_id().unwrap(),
+            pid: std::process::id(),
+            daemon_ver: "0.41.0".into(),
+        };
+        let connection = dir.join("subc.json");
+        write_atomic(&connection, &info).unwrap();
+        let child = Command::new(binary("CK_NATS_SERVER_BIN"))
+            .arg("-c")
+            .arg(conf)
+            .arg("--engine")
+            .arg(binary("CK_NATS_ENGINE_BIN"))
+            .arg("--subc")
+            .arg(&connection)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("SUBC_MODULE_ID", module_id)
+            .env("XDG_DATA_HOME", dir.join("data"))
+            .env("XDG_RUNTIME_DIR", dir.join("run"))
+            .env("XDG_CONFIG_HOME", dir.join("config"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn ck-nats-server");
+        let (mut primary, _) = timeout(LIMIT, listener.accept()).await.unwrap().unwrap();
+        authenticate(&mut primary, &info).await;
+        let hello = read_frame(&mut primary).await.unwrap().unwrap();
+        assert_eq!(hello.header.ty, FrameType::Hello);
+        let body: ModuleHelloBody = serde_json::from_slice(&hello.body).unwrap();
+        assert_eq!(body.manifest.module_id, module_id);
+        let ack = ModuleHelloAckBody {
+            negotiated_ver: PROTOCOL_VERSION,
+            subc_ops: vec![],
+            subc_capabilities: vec![],
+            storage: None,
+            machine_id: None,
+        };
+        send(
+            &mut primary,
+            FrameType::HelloAck,
+            0,
+            hello.header.corr,
+            serde_json::to_value(ack).unwrap(),
+        )
+        .await;
+        (child, primary, listener, info)
+    }
+
+    impl EnginePair {
+        async fn start(dir: &Path, conf: &Path, area: Arc<LeafArea>) -> Self {
+            let ports_dir = conf.parent().unwrap().join("ports");
+            let _ = std::fs::remove_dir_all(&ports_dir);
+            std::fs::create_dir_all(&ports_dir).unwrap();
+            let (child, primary, listener, info) = start_wrapper(dir, conf, "nats-server").await;
+            let signs = Arc::new(StdMutex::new(Vec::new()));
+            let bus_signs = signs.clone();
+            let bus = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                authenticate(&mut stream, &info).await;
+                stand_in_daemon(stream, area, bus_signs).await;
+            });
+            let client_port = wait_for_client_port(&ports_dir).await;
+            Self {
+                _child: child,
+                _primary: primary,
+                _bus: bus,
+                signs,
+                client_port,
+            }
+        }
+
+        fn signs(&self) -> Vec<SignSeen> {
+            self.signs.lock().unwrap().clone()
+        }
+    }
+
+    /// The engine's server writes `<executable>_<pid>.ports` once it listens; the pid is
+    /// the engine's, not the wrapper's, so any ports file in the fresh directory is it.
+    async fn wait_for_client_port(ports_dir: &Path) -> u16 {
+        let found = Arc::new(StdMutex::new(None));
+        wait_for("the engine's ports file", LIMIT, || {
+            let found = found.clone();
+            let dir = ports_dir.to_path_buf();
+            async move {
+                let port = std::fs::read_dir(&dir)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Result::ok)
+                    .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+                    .filter_map(|text| serde_json::from_str::<Value>(&text).ok())
+                    .find_map(|value| url_port(&value["nats"]));
+                *found.lock().unwrap() = port;
+                port.is_some()
+            }
+        })
+        .await;
+        let port = found.lock().unwrap().expect("a port was read");
+        port
+    }
+
+    /// What the daemon would route: the wrapper's catalog reads and its two ck-bus ops,
+    /// answered by `area`.
+    async fn stand_in_daemon(
+        mut stream: TcpStream,
+        area: Arc<LeafArea>,
+        signs: Arc<StdMutex<Vec<SignSeen>>>,
+    ) {
+        let mut states = area.subscribe();
+        let mut leaf_corr: Option<u64> = None;
+        loop {
+            tokio::select! {
+                changed = states.changed(), if leaf_corr.is_some() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    let state = states.borrow_and_update().to_json();
+                    send(&mut stream, FrameType::StreamData, 41, leaf_corr.unwrap(), json!({"result": state})).await;
+                }
+                frame = read_frame(&mut stream) => {
+                    let Ok(Some(frame)) = frame else { return };
+                    if frame.header.ty == FrameType::Ping {
+                        send(&mut stream, FrameType::Pong, 0, frame.header.corr, Value::Null).await;
+                        continue;
+                    }
+                    if frame.header.ty != FrameType::Request {
+                        continue;
+                    }
+                    let body: Value = serde_json::from_slice(&frame.body).unwrap();
+                    let (ty, reply) = match body["op"].as_str() {
+                        Some("catalog.watch") => (
+                            FrameType::StreamData,
+                            json!({"op": "catalog.watch", "generation": 1}),
+                        ),
+                        Some("catalog.list") => (FrameType::Response, json!({
+                            "op": "catalog.list", "generation": 1,
+                            "modules": [{"module_id": "ckbus", "ready": true, "roles": [{
+                                "role": "management_surface",
+                                "operations": [
+                                    {"name": "ckbus.leaf_watch", "kind": "query"},
+                                    {"name": "ckbus.leaf_sign", "kind": "query"},
+                                ],
+                                "config_schema": {}, "observability": [], "identity_scope": [],
+                                "concurrency": "module_managed",
+                            }], "control_ops": []}],
+                            "subc_ops": [],
+                        })),
+                        Some("server.describe") => (FrameType::Response, json!({
+                            "op": "server.describe", "protocol_ver": 1, "subc_ops": [],
+                            "capabilities": [], "connected_clients": 2,
+                        })),
+                        Some("route.open") => (FrameType::Response, json!({
+                            "op": "route.open", "route_channel": 41, "route_epoch": 1,
+                        })),
+                        Some(other) => panic!("unexpected control op {other}"),
+                        None => match body["method"].as_str() {
+                            Some("ckbus.leaf_watch") => {
+                                leaf_corr = Some(frame.header.corr);
+                                let state = states.borrow_and_update().to_json();
+                                send(&mut stream, FrameType::StreamData, 41, frame.header.corr, json!({"result": state})).await;
+                                continue;
+                            }
+                            Some("ckbus.leaf_sign") => {
+                                let remote = body["params"]["remote"].as_str().unwrap_or_default().to_string();
+                                let nonce = body["params"]["nonce_b64"].as_str().unwrap_or_default();
+                                match area.sign(&remote, nonce).await {
+                                    Ok(result) => {
+                                        let jwt = result["jwt"].as_str().map(str::to_string);
+                                        signs.lock().unwrap().push(SignSeen { remote, jwt });
+                                        (FrameType::Response, json!({"result": result}))
+                                    }
+                                    Err(refusal) => {
+                                        signs.lock().unwrap().push(SignSeen { remote, jwt: None });
+                                        (FrameType::Error, json!({"code": refusal.code, "message": refusal.message}))
+                                    }
+                                }
+                            }
+                            other => panic!("unexpected ck-bus method {other:?}"),
+                        },
+                    };
+                    send(&mut stream, ty, frame.header.channel, frame.header.corr, reply).await;
+                }
+            }
+        }
+    }
+
+    struct Leaf {
+        area: Arc<LeafArea>,
+        issued: Arc<StdMutex<Vec<String>>>,
+        links: Arc<SystemLinks>,
+    }
+
+    impl Leaf {
+        fn issued(&self) -> Vec<String> {
+            self.issued.lock().unwrap().clone()
+        }
+    }
+
+    /// A leaf area for a peer hub at `hub_leaf_port` pinned to `pin`.
+    fn leaf(
+        hub_leaf_port: u16,
+        pin: &str,
+        hub_account: &Account,
+        sys_creds: &str,
+        fed: &str,
+    ) -> Leaf {
+        let vault = Arc::new(KeyVault::default());
+        vault.mint(
+            &RootCredential::BusLeaf.credential_id().unwrap(),
+            KeyPair::new_user(),
+        );
+        let issued = Arc::new(StdMutex::new(Vec::new()));
+        let links = Arc::new(SystemLinks {
+            url: StdMutex::new(None),
+            creds: sys_creds.to_string(),
+            system: tokio::sync::Mutex::new(None),
+        });
+        let body = json!({"hub": {
+            "source": "peer", "fingerprint": HUB_FINGERPRINT, "generation": "1",
+            "spki_sha256": pin,
+            "candidates": [{"host": "127.0.0.1", "port": hub_leaf_port, "kind": "lan"}],
+        }});
+        let area = LeafArea::new(
+            LeafDeps {
+                callosum: Arc::new(OneHub {
+                    body: serde_json::to_vec(&body).unwrap(),
+                }),
+                issuer: Arc::new(HubIssuer {
+                    account: KeyPair::from_seed(&hub_account.kp.seed().unwrap()).unwrap(),
+                    issued: issued.clone(),
+                }),
+                local_hub: Arc::new(NoLocalHub),
+                vault,
+                links: links.clone(),
+                quiet: Arc::new(AlwaysQuiet),
+                accounts: Arc::new(FixedAccount(fed.to_string())),
+            },
+            Timing {
+                link_poll: Duration::from_millis(500),
+                // Never a bridge here: the rig has none, and its one candidate answers.
+                round_per_url: Duration::from_secs(3600),
+                tick: Duration::from_millis(200),
+                ..Timing::default()
+            },
+        );
+        area.spawn();
+        Leaf {
+            area,
+            issued,
+            links,
+        }
+    }
+
+    async fn hub_leafs_bound_to(http_port: u16, account: &str) -> usize {
+        leafs_at(http_port)
+            .await
+            .iter()
+            .filter(|(_, bound)| bound == account)
+            .count()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs nats-server, the engine pair and openssl"]
+    async fn rig7_ck_bus_leaf_area_drives_the_engine_pair() {
+        let _serial = RIG_LOCK.lock().await;
+        let bin = nats_server_bin();
+        let root = tempfile::tempdir().unwrap();
+
+        // The hub: its own operator, the user's hub account, a TLS leaf listener.
+        let (cert, key, pin) = hub_certificate(&root.path().join("tls"));
+        let hub_operator = Operator::new("HUB");
+        let hub_account = Account::new("USER", true);
+        let mut hub = Server::configure(
+            &bin,
+            root.path(),
+            "hub",
+            "hub",
+            &hub_operator,
+            &[&hub_account],
+            Resolver::Memory,
+            &format!(
+                "leafnodes {{ listen: \"127.0.0.1:-1\", tls {{ cert_file: \"{}\", key_file: \"{}\" }} }}",
+                cert.display(),
+                key.display()
+            ),
+        );
+        hub.start().await;
+        let varz: Value =
+            serde_json::from_str(&http_get(hub.http_port, "/varz").await.unwrap()).unwrap();
+        let hub_leaf_port = u16::try_from(varz["leaf"]["port"].as_u64().unwrap()).unwrap();
+        let user = hub_account.public_key();
+
+        // This machine: its own operator and the federation account. Each arm gets its
+        // own server directory, so a stopping engine never shares a store with the next.
+        let box_operator = Operator::new("BOX");
+        let fed = Account::new("FED", true);
+        let box_conf = |name: &str| {
+            Server::configure(
+                &bin,
+                root.path(),
+                name,
+                name,
+                &box_operator,
+                &[&fed],
+                Resolver::Memory,
+                "",
+            )
+            .conf
+            .clone()
+        };
+        let sys_creds = box_operator.sys_user.creds.clone();
+
+        // A wrong pin: the engine refuses the hub's certificate before the connect, so it
+        // never asks for a signature and the hub sees no leaf.
+        {
+            let leaf = leaf(
+                hub_leaf_port,
+                &"00".repeat(32),
+                &hub_account,
+                &sys_creds,
+                &fed.public_key(),
+            );
+            let pair = EnginePair::start(
+                &root.path().join("pair-wrong-pin"),
+                &box_conf("boxa"),
+                leaf.area.clone(),
+            )
+            .await;
+            *leaf.links.url.lock().unwrap() =
+                Some(format!("nats://127.0.0.1:{}", pair.client_port));
+            let area = leaf.area.clone();
+            wait_for("the wrong-pin remote reaches the engine", LIMIT, || {
+                let area = area.clone();
+                async move { !area.current().remotes.is_empty() }
+            })
+            .await;
+            // The engine retries every second; several attempts fit in this window.
+            tokio::time::sleep(Duration::from_secs(8)).await;
+            assert_eq!(leaf.issued().len(), 1, "the credential was issued");
+            assert!(
+                pair.signs().is_empty(),
+                "a wrong pin must stop the handshake before any signature: {:?}",
+                pair.signs()
+            );
+            assert_eq!(hub_leafs_bound_to(hub.http_port, &user).await, 0);
+            assert_eq!(leaf.area.health_metrics()["fed.remote_state"], "connecting");
+            note(7, "wrong pin: no sign request, no leaf at the hub");
+        }
+
+        // The right pin: the link comes up on the area's remote with the hub's JWT.
+        let leaf = leaf(
+            hub_leaf_port,
+            &pin,
+            &hub_account,
+            &sys_creds,
+            &fed.public_key(),
+        );
+        let pair = EnginePair::start(
+            &root.path().join("pair"),
+            &box_conf("boxb"),
+            leaf.area.clone(),
+        )
+        .await;
+        *leaf.links.url.lock().unwrap() = Some(format!("nats://127.0.0.1:{}", pair.client_port));
+        let hub_port = hub.http_port;
+        let took = wait_for("the leaf at the hub", LIMIT, || {
+            let user = user.clone();
+            async move { hub_leafs_bound_to(hub_port, &user).await == 1 }
+        })
+        .await;
+        let remote = leaf.area.current().remotes[0].name.clone();
+        let signs = pair.signs();
+        assert!(!signs.is_empty());
+        assert_eq!(signs[0].remote, remote);
+        assert_eq!(signs[0].jwt.as_deref(), Some(leaf.issued()[0].as_str()));
+        let area = leaf.area.clone();
+        wait_for("the area sees the link up", LIMIT, || {
+            let area = area.clone();
+            async move { area.health_metrics()["fed.remote_state"] == "connected" }
+        })
+        .await;
+        let first_link = leaf.links.leafs(&fed.public_key()).await.unwrap();
+        assert_eq!(first_link.len(), 1, "{first_link:?}");
+        note(7, format!("right pin: leaf up at the hub after {took:?}"));
+
+        // Renewal at half life: a second JWT, one kick, and the reconnect signs with it.
+        let issued = leaf.issued.clone();
+        wait_for("the renewal", LIMIT, || {
+            let issued = issued.clone();
+            async move { issued.lock().unwrap().len() >= 2 }
+        })
+        .await;
+        let renewed = leaf.issued()[1].clone();
+        let signs = pair.signs.clone();
+        wait_for("a reconnect signed with the renewed JWT", LIMIT, || {
+            let signs = signs.clone();
+            let renewed = renewed.clone();
+            async move {
+                signs
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|sign| sign.jwt.as_deref() == Some(renewed.as_str()))
+            }
+        })
+        .await;
+        wait_for("the leaf back at the hub", LIMIT, || {
+            let user = user.clone();
+            async move { hub_leafs_bound_to(hub_port, &user).await == 1 }
+        })
+        .await;
+        let links = leaf.links.clone();
+        let fed_public = fed.public_key();
+        let first_id = first_link[0].id;
+        wait_for("a new leaf connection on the box server", LIMIT, || {
+            let links = links.clone();
+            let fed_public = fed_public.clone();
+            async move {
+                links
+                    .leafs(&fed_public)
+                    .await
+                    .is_ok_and(|now| now.len() == 1 && now[0].id != first_id)
+            }
+        })
+        .await;
+        assert_eq!(
+            leaf.issued().len(),
+            2,
+            "one renewal in the window, no re-issue loop"
+        );
+        note(7, "renewal: kicked once, reconnected with the renewed JWT");
+        hub.stop().await;
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Rig 8: ck-bus's hub side runs our engine pair as the hub instance (`nats-hub`),
+    // configured from its own setup and signing TLS through `ckbus.hub_tls_sign`, and a
+    // box's leaf area joins it with a JWT from `ckbus.hub_leaf_issue`.
+    // ---------------------------------------------------------------------------------
+
+    /// The joining computer, as callosum lists it, and its machine id.
+    const LEAF_FP: &str = "22222222222222222222222222222222";
+    const LEAF_BOX: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    /// A second paired computer whose inbox the first must not reach.
+    const OTHER_FP: &str = "33333333333333333333333333333333";
+    const OTHER_BOX: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn paired(fingerprints: &[&str]) -> Value {
+        json!({
+            "devices": fingerprints
+                .iter()
+                .map(|fp| json!({"class": "computer", "fingerprint": fp}))
+                .collect::<Vec<_>>(),
+            "self": {"static_public_key_hex": "00"},
+            "tombstones": [],
+        })
+    }
+
+    /// Callosum's paired devices, with a watch the test pushes each change into.
+    struct RigDevices {
+        body: StdMutex<Value>,
+        notices: StdMutex<Option<mpsc::Sender<Vec<u8>>>>,
+    }
+
+    impl RigDevices {
+        async fn set(&self, body: Value) {
+            *self.body.lock().unwrap() = body.clone();
+            let notices = self.notices.lock().unwrap().clone();
+            if let Some(notices) = notices {
+                notices
+                    .send(serde_json::to_vec(&body).unwrap())
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
+    #[async_trait]
+    impl PairedDevices for RigDevices {
+        async fn watch(&self) -> Result<mpsc::Receiver<Vec<u8>>, String> {
+            let (notices, receiver) = mpsc::channel(16);
+            let body = serde_json::to_vec(&*self.body.lock().unwrap()).unwrap();
+            notices.send(body).await.unwrap();
+            *self.notices.lock().unwrap() = Some(notices);
+            Ok(receiver)
+        }
+
+        async fn read(&self) -> Result<Vec<u8>, String> {
+            Ok(serde_json::to_vec(&*self.body.lock().unwrap()).unwrap())
+        }
+
+        async fn peer_keys(&self) -> Result<Vec<u8>, String> {
+            Ok(serde_json::to_vec(&json!({"peers": [
+                {"fingerprint": LEAF_FP, "machine_id": LEAF_BOX},
+                {"fingerprint": OTHER_FP, "machine_id": OTHER_BOX},
+            ]}))
+            .unwrap())
+        }
+    }
+
+    struct RigOwn;
+
+    #[async_trait]
+    impl OwnMachine for RigOwn {
+        async fn machine_id(&self) -> Result<String, String> {
+            Ok("c".repeat(32))
+        }
+    }
+
+    /// What callosum's re-export does for the joining computer: the hub area's
+    /// `hub_leaf_issue`, attributed to that computer's fingerprint.
+    struct ForwardedIssue {
+        hub: Arc<HubArea>,
+        issued: Arc<StdMutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl PeerIssuer for ForwardedIssue {
+        async fn hub_leaf_issue(&self, hub: &str, leaf_nkey: &str) -> Result<String, String> {
+            assert_eq!(hub, HUB_FINGERPRINT);
+            let jwt = self
+                .hub
+                .leaf_issue(LEAF_FP, leaf_nkey)
+                .await
+                .map_err(|refusal| format!("{}: {}", refusal.code, refusal.message))?;
+            self.issued.lock().unwrap().push(jwt.clone());
+            Ok(jwt)
+        }
+    }
+
+    /// What the daemon would route for the hub instance's wrapper: its catalog reads,
+    /// `ckbus.hub_server_watch` and `ckbus.hub_tls_sign`, answered by `area`.
+    async fn stand_in_hub_daemon(
+        mut stream: TcpStream,
+        area: Arc<HubArea>,
+        tls_signs: Arc<AtomicUsize>,
+    ) {
+        let mut states = area.subscribe();
+        let mut watch_corr: Option<u64> = None;
+        loop {
+            tokio::select! {
+                changed = states.changed(), if watch_corr.is_some() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    let state = states.borrow_and_update().to_json();
+                    send(&mut stream, FrameType::StreamData, 41, watch_corr.unwrap(), json!({"result": state})).await;
+                }
+                frame = read_frame(&mut stream) => {
+                    let Ok(Some(frame)) = frame else { return };
+                    if frame.header.ty == FrameType::Ping {
+                        send(&mut stream, FrameType::Pong, 0, frame.header.corr, Value::Null).await;
+                        continue;
+                    }
+                    if frame.header.ty != FrameType::Request {
+                        continue;
+                    }
+                    let body: Value = serde_json::from_slice(&frame.body).unwrap();
+                    let (ty, reply) = match body["op"].as_str() {
+                        Some("catalog.watch") => (
+                            FrameType::StreamData,
+                            json!({"op": "catalog.watch", "generation": 1}),
+                        ),
+                        Some("catalog.list") => (FrameType::Response, json!({
+                            "op": "catalog.list", "generation": 1,
+                            "modules": [{"module_id": "ckbus", "ready": true, "roles": [{
+                                "role": "management_surface",
+                                "operations": [
+                                    {"name": "ckbus.hub_server_watch", "kind": "query"},
+                                    {"name": "ckbus.hub_tls_sign", "kind": "query"},
+                                ],
+                                "config_schema": {}, "observability": [], "identity_scope": [],
+                                "concurrency": "module_managed",
+                            }], "control_ops": []}],
+                            "subc_ops": [],
+                        })),
+                        Some("server.describe") => (FrameType::Response, json!({
+                            "op": "server.describe", "protocol_ver": 1, "subc_ops": [],
+                            "capabilities": [], "connected_clients": 2,
+                        })),
+                        Some("route.open") => (FrameType::Response, json!({
+                            "op": "route.open", "route_channel": 41, "route_epoch": 1,
+                        })),
+                        Some(other) => panic!("unexpected control op {other}"),
+                        None => match body["method"].as_str() {
+                            Some("ckbus.hub_server_watch") => {
+                                watch_corr = Some(frame.header.corr);
+                                let state = states.borrow_and_update().to_json();
+                                send(&mut stream, FrameType::StreamData, 41, frame.header.corr, json!({"result": state})).await;
+                                continue;
+                            }
+                            Some("ckbus.hub_tls_sign") => {
+                                tls_signs.fetch_add(1, Ordering::SeqCst);
+                                let message = body["params"]["message_b64"].as_str().unwrap_or_default();
+                                let scheme = body["params"]["scheme"].as_str().unwrap_or_default();
+                                match area.tls_sign(message, scheme).await {
+                                    Ok(result) => (FrameType::Response, json!({"result": result})),
+                                    Err(refusal) => (FrameType::Error, json!({"code": refusal.code, "message": refusal.message})),
+                                }
+                            }
+                            other => panic!("unexpected ck-bus method {other:?}"),
+                        },
+                    };
+                    send(&mut stream, ty, frame.header.channel, frame.header.corr, reply).await;
+                }
+            }
+        }
+    }
+
+    /// The engine pair as the hub instance, under a stand-in daemon routing its ck-bus
+    /// calls to a hub area in this process.
+    struct HubPair {
+        _child: Child,
+        _primary: TcpStream,
+        _bus: JoinHandle<()>,
+        tls_signs: Arc<AtomicUsize>,
+    }
+
+    impl HubPair {
+        async fn start(dir: &Path, conf: &Path, area: Arc<HubArea>) -> Self {
+            let (child, primary, listener, info) = start_wrapper(dir, conf, "nats-hub").await;
+            let tls_signs = Arc::new(AtomicUsize::new(0));
+            let bus_signs = tls_signs.clone();
+            let bus = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                authenticate(&mut stream, &info).await;
+                stand_in_hub_daemon(stream, area, bus_signs).await;
+            });
+            Self {
+                _child: child,
+                _primary: primary,
+                _bus: bus,
+                tls_signs,
+            }
+        }
+    }
+
+    /// TLS 1.3 server `CertificateVerify` content with a SHA-256 transcript hash.
+    fn certificate_verify() -> Vec<u8> {
+        let mut message = vec![b' '; 64];
+        message.extend_from_slice(b"TLS 1.3, server CertificateVerify\0");
+        message.extend_from_slice(&[9; 32]);
+        message
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs the engine pair (CK_NATS_SERVER_BIN, CK_NATS_ENGINE_BIN) and free ports 7422 and 17422"]
+    async fn rig8_ck_bus_hub_side_runs_the_hub_instance() {
+        let _serial = RIG_LOCK.lock().await;
+        let root = tempfile::tempdir().unwrap();
+        let engine = binary("CK_NATS_ENGINE_BIN");
+
+        // The hub computer's ck-bus: the three hub keys in a test vault, the real admin
+        // connection to its instance, callosum naming this computer as the hub.
+        let vault = Arc::new(KeyVault::default());
+        for (root_credential, pair) in [
+            (RootCredential::BusHubOperator, KeyPair::new_operator()),
+            (RootCredential::BusHubAccount, KeyPair::new_account()),
+            (RootCredential::BusHubTls, KeyPair::new_user()),
+        ] {
+            vault.mint(&root_credential.credential_id().unwrap(), pair);
+        }
+        let devices = Arc::new(RigDevices {
+            body: StdMutex::new(paired(&[LEAF_FP, OTHER_FP])),
+            notices: StdMutex::new(None),
+        });
+        let files = HubFiles {
+            store_root: root.path().join("ckbus"),
+            hub_dir: root.path().join("nats-hub"),
+        };
+        let self_hub = json!({"hub": {
+            "source": "self", "fingerprint": HUB_FINGERPRINT, "generation": "1",
+            "spki_sha256": "ab".repeat(32), "candidates": [],
+        }});
+        let hub = HubArea::new(
+            HubDeps {
+                callosum: Arc::new(OneHub {
+                    body: serde_json::to_vec(&self_hub).unwrap(),
+                }),
+                devices: devices.clone(),
+                vault: vault.clone(),
+                server: Arc::new(NatsHubServer::new(
+                    admin_url(),
+                    Arc::new(Credentials::new(vault.clone())),
+                )),
+                own: Arc::new(RigOwn),
+                files: files.clone(),
+                local_server_url: None,
+            },
+            HubTiming {
+                leaf_poll: Duration::from_millis(500),
+                tick: Duration::from_millis(200),
+                ..HubTiming::default()
+            },
+        );
+        hub.spawn();
+        let area = hub.clone();
+        wait_for("hub setup writes its listener", LIMIT, || {
+            let area = area.clone();
+            async move { area.current().listener.is_some() }
+        })
+        .await;
+        assert!(files.server_conf().is_file());
+        let hub_pair = HubPair::start(
+            &root.path().join("hub-pair"),
+            &files.server_conf(),
+            hub.clone(),
+        )
+        .await;
+        let took = wait_for(
+            "the hub instance up with its accounts and streams",
+            Duration::from_secs(60),
+            || {
+                let area = area.clone();
+                async move { area.health_metrics()["fed.hub_setup"] == "ready" }
+            },
+        )
+        .await;
+        note(8, format!("hub setup ready after {took:?}"));
+        let pin = hub.identity_json()["spki_sha256"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // The joining computer: its own operator and federation account, its leaf area
+        // dialling the hub at 7422 through the pin, credentialed by `hub_leaf_issue`.
+        let box_operator = Operator::new("BOX");
+        let fed = Account::new("FED", true);
+        let box_conf = Server::configure(
+            &engine,
+            root.path(),
+            "boxa",
+            "boxa",
+            &box_operator,
+            &[&fed],
+            Resolver::Memory,
+            "",
+        )
+        .conf
+        .clone();
+        let issued = Arc::new(StdMutex::new(Vec::new()));
+        let leaf_vault = Arc::new(KeyVault::default());
+        let leaf_nkey = leaf_vault.mint(
+            &RootCredential::BusLeaf.credential_id().unwrap(),
+            KeyPair::new_user(),
+        );
+        let links = Arc::new(SystemLinks {
+            url: StdMutex::new(None),
+            creds: box_operator.sys_user.creds.clone(),
+            system: tokio::sync::Mutex::new(None),
+        });
+        let peer_row = json!({"hub": {
+            "source": "peer", "fingerprint": HUB_FINGERPRINT, "generation": "1",
+            "spki_sha256": pin,
+            "candidates": [{"host": "127.0.0.1", "port": 7422, "kind": "lan"}],
+        }});
+        let leaf = LeafArea::new(
+            LeafDeps {
+                callosum: Arc::new(OneHub {
+                    body: serde_json::to_vec(&peer_row).unwrap(),
+                }),
+                issuer: Arc::new(ForwardedIssue {
+                    hub: hub.clone(),
+                    issued: issued.clone(),
+                }),
+                local_hub: Arc::new(NoLocalHub),
+                vault: leaf_vault,
+                links: links.clone(),
+                quiet: Arc::new(AlwaysQuiet),
+                accounts: Arc::new(FixedAccount(fed.public_key())),
+            },
+            Timing {
+                link_poll: Duration::from_millis(500),
+                round_per_url: Duration::from_secs(3600),
+                tick: Duration::from_millis(200),
+                ..Timing::default()
+            },
+        );
+        leaf.spawn();
+        let pair = EnginePair::start(&root.path().join("pair"), &box_conf, leaf.clone()).await;
+        let box_url = format!("nats://127.0.0.1:{}", pair.client_port);
+        *links.url.lock().unwrap() = Some(box_url.clone());
+
+        // 1. The leaf connects with the JWT `hub_leaf_issue` gave it.
+        let took = wait_for("the leaf at the hub", LIMIT, || {
+            let area = area.clone();
+            async move { area.health_metrics()["fed.hub_leafs_connected"] == 1 }
+        })
+        .await;
+        let jwt = issued.lock().unwrap()[0].clone();
+        assert!(pair
+            .signs()
+            .iter()
+            .any(|sign| sign.jwt.as_deref() == Some(jwt.as_str())));
+        assert!(hub_pair.tls_signs.load(Ordering::SeqCst) >= 1);
+        assert_eq!(hub.health_metrics()["fed.hub_issued"], 1);
+        note(
+            8,
+            format!("leaf up at the hub after {took:?} with the issued JWT"),
+        );
+
+        // 2. Its own hub inbox answers across the leaf; another box's never does.
+        let other_nkey = KeyPair::new_user().public_key();
+        hub.leaf_issue(OTHER_FP, &other_nkey).await.unwrap();
+        let probe = super::connect(&box_url, &fed.user("probe")).await;
+        let ask = |subject: String| {
+            let probe = probe.clone();
+            async move {
+                tokio::time::timeout(Duration::from_secs(5), probe.request(subject, "".into()))
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .and_then(|reply| serde_json::from_slice::<Value>(&reply.payload).ok())
+            }
+        };
+        let own = format!("HUB_INBOX_{LEAF_BOX}");
+        let mut answered = None;
+        for _ in 0..20 {
+            answered = ask(format!("$JS.hub.API.STREAM.INFO.{own}")).await;
+            if answered.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        let answered = answered.expect("the own inbox's info crosses the leaf");
+        assert_eq!(answered["config"]["name"], json!(own), "{answered}");
+        let other = format!("HUB_INBOX_{OTHER_BOX}");
+        for verb in [
+            "STREAM.INFO",
+            "STREAM.PURGE",
+            "STREAM.DELETE",
+            "CONSUMER.CREATE",
+        ] {
+            let reply = ask(format!("$JS.hub.API.{verb}.{other}")).await;
+            assert!(
+                reply.is_none(),
+                "{verb} on another box's inbox answered: {reply:?}"
+            );
+        }
+        note(
+            8,
+            "own HUB_INBOX answers; another box's info, purge, delete and create do not",
+        );
+
+        // 3. The 41st immediate TLS signature is refused. The link is up, so no
+        // handshake competes for the bucket; two seconds refill it to its burst. The
+        // first 40 name a scheme the hub refuses after taking their token: they return
+        // at once, where 40 real signatures in a debug build take long enough to earn
+        // a token back at 20 a second and would hide the refusal.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let message = URL_SAFE_NO_PAD.encode(certificate_verify());
+        let mut outcomes = Vec::new();
+        for _ in 0..40 {
+            outcomes.push(
+                hub.tls_sign(&message, "rsa")
+                    .await
+                    .map(|_| ())
+                    .map_err(|r| r.code),
+            );
+        }
+        outcomes.push(
+            hub.tls_sign(&message, "ed25519")
+                .await
+                .map(|_| ())
+                .map_err(|r| r.code),
+        );
+        assert!(
+            outcomes[..40]
+                .iter()
+                .all(|o| *o == Err(tls_code::BAD_REQUEST)),
+            "{outcomes:?}"
+        );
+        assert_eq!(outcomes[40], Err(tls_code::RATE_LIMITED));
+        // A token returns within 50 ms, and a real signature passes again.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        hub.tls_sign(&message, "ed25519").await.unwrap();
+        note(
+            8,
+            "the 41st immediate TLS signature is refused, and one passes 100 ms later",
+        );
+
+        // 4. Removal: the computer leaves callosum's list. Its leaf key is revoked in the
+        // hub account, the claims update drops its connection, it stays out, and a
+        // re-issue is refused.
+        devices.set(paired(&[OTHER_FP])).await;
+        let took = wait_for("the removed leaf dropped at the hub", LIMIT, || {
+            let area = area.clone();
+            async move { area.health_metrics()["fed.hub_leafs_connected"] == 0 }
+        })
+        .await;
+        let fed_public = fed.public_key();
+        wait_for("the removed leaf dropped at the box", LIMIT, || {
+            let links = links.clone();
+            let fed_public = fed_public.clone();
+            async move {
+                links
+                    .leafs(&fed_public)
+                    .await
+                    .is_ok_and(|now| now.is_empty())
+            }
+        })
+        .await;
+        // The engine redials every second with its revoked JWT; none gets in.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert_eq!(hub.health_metrics()["fed.hub_leafs_connected"], 0);
+        assert!(links.leafs(&fed_public).await.unwrap().is_empty());
+        let refused = hub.leaf_issue(LEAF_FP, &leaf_nkey).await.unwrap_err();
+        assert_eq!(refused.code, issue_code::NOT_PAIRED);
+        note(
+            8,
+            format!("removal: revoked and dropped after {took:?}, stays out, re-issue refused"),
+        );
+    }
 }

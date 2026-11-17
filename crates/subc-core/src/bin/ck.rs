@@ -8232,7 +8232,14 @@ async fn upgrade_command(
     }
     match setup::execute_upgrade(&plan, &mut backend) {
         Ok(report) => {
-            println!("Done.");
+            println!(
+                "{}",
+                if report.nothing_changed() {
+                    "Nothing changed."
+                } else {
+                    "Done."
+                }
+            );
             print!(
                 "{}",
                 setup::text::print_verbose_outcomes(&plan.outcomes, verbose)

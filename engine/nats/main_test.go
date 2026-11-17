@@ -18,7 +18,7 @@ func TestEngineChild(t *testing.T) {
 	if os.Getenv("CK_NATS_ENGINE_TEST_CHILD") != "1" {
 		t.Skip("subprocess entry point")
 	}
-	os.Exit(run(os.Getenv("CK_NATS_ENGINE_TEST_CONFIG"), os.Stdin, os.Stdout))
+	os.Exit(run(os.Getenv("CK_NATS_ENGINE_TEST_CONFIG"), os.Getenv("CK_NATS_ENGINE_TEST_HUB") == "1", os.Stdin, os.Stdout))
 }
 
 func TestEngineVersionProcess(t *testing.T) {
@@ -36,12 +36,13 @@ func TestVersionExitsBeforeConfigOrStoreAccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	cmd := exec.Command(executable, "-test.run=^TestEngineVersionProcess$")
-	cmd.Env = append(os.Environ(), "CK_NATS_ENGINE_VERSION_CHILD=1")
+	dir := t.TempDir()
+	cmd.Env = append(os.Environ(), "CK_NATS_ENGINE_VERSION_CHILD=1", "XDG_DATA_HOME="+dir+"/data", "XDG_RUNTIME_DIR="+dir+"/runtime", "XDG_CONFIG_HOME="+dir+"/config")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("--version failed: %v: %s", err, output)
 	}
-	if string(output) != "ck-nats-engine 0.1.1\n" {
+	if string(output) != "ck-nats-engine 0.1.2\n" {
 		t.Fatalf("unexpected version output: %q", output)
 	}
 }
@@ -54,19 +55,29 @@ type engineChild struct {
 }
 
 func startEngine(t *testing.T) engineChild {
+	return startEngineWith(t, false, -1)
+}
+
+func startEngineWith(t *testing.T, hub bool, clientPort int) engineChild {
 	t.Helper()
 	dir := t.TempDir()
 	config := filepath.Join(dir, "server.conf")
-	text := fmt.Sprintf("host: 127.0.0.1\nport: -1\nhttp_port: -1\njetstream {store_dir: %q, max_memory_store: 16MB, max_file_store: 32MB}\n", filepath.ToSlash(filepath.Join(dir, "js")))
+	text := fmt.Sprintf("host: 127.0.0.1\nport: %d\nhttp_port: -1\njetstream {store_dir: %q, max_memory_store: 16MB, max_file_store: 32MB}\nleafnodes {host: 127.0.0.1, no_advertise: true}\n", clientPort, filepath.ToSlash(filepath.Join(dir, "js")))
 	if err := os.WriteFile(config, []byte(text), 0600); err != nil {
 		t.Fatal(err)
 	}
+	return launchEngine(t, hub, config)
+}
+
+func launchEngine(t *testing.T, hub bool, config string) engineChild {
+	t.Helper()
+	dir := filepath.Dir(config)
 	executable, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
 	cmd := exec.Command(executable, "-test.run=^TestEngineChild$")
-	cmd.Env = append(os.Environ(), "CK_NATS_ENGINE_TEST_CHILD=1", "CK_NATS_ENGINE_TEST_CONFIG="+config)
+	cmd.Env = append(os.Environ(), "CK_NATS_ENGINE_TEST_CHILD=1", "CK_NATS_ENGINE_TEST_CONFIG="+config, "CK_NATS_ENGINE_TEST_HUB="+map[bool]string{true: "1", false: "0"}[hub], "XDG_DATA_HOME="+dir+"/data", "XDG_RUNTIME_DIR="+dir+"/runtime", "XDG_CONFIG_HOME="+dir+"/config")
 	input, err := cmd.StdinPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -210,7 +221,7 @@ func TestEngineFailedStateRetainsGeneration(t *testing.T) {
 	c.next(t, "applied")
 	_, _ = io.WriteString(c.input, "{\"v\":1,\"type\":\"state\",\"generation\":1,\"remotes\":[],\"hub_listener\":{\"port\":7422,\"cert_der_b64\":\"AA\"}}\n")
 	failed := c.next(t, "apply_failed")
-	if failed["generation"] != float64(1) || failed["error"] != "hub listener is not implemented" {
+	if failed["generation"] != float64(1) || failed["error"] != "hub listener requires --hub" {
 		t.Fatalf("unexpected apply_failed: %+v", failed)
 	}
 	_, _ = io.WriteString(c.input, "{\"v\":1,\"type\":\"state\",\"generation\":1,\"remotes\":[]}\n")

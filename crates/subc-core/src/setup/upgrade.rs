@@ -457,6 +457,7 @@ pub struct SystemUpgradeBackend {
 
 #[derive(Default)]
 struct CoreCut {
+    message_hub_change: Option<super::config::ConfigChange>,
     captured: bool,
     nats: Option<super::nats_migration::Migration>,
     deferred: BTreeSet<String>,
@@ -1087,6 +1088,44 @@ impl SystemUpgradeBackend {
 }
 
 impl UpgradeExecutionBackend for SystemUpgradeBackend {
+    fn configure_message_hub(&mut self, target: UpgradeTarget) -> Result<(bool, String), String> {
+        let home = super::daemon_bundle::binary_home(&self.target(target)?.destination)?;
+        let data_dir = home
+            .parent()
+            .ok_or("installed binary folder has no data directory")?;
+        let connection = self
+            .subc
+            .clone()
+            .unwrap_or_else(subc_daemon::bootstrap::connection_file_path);
+        if let Some(change) =
+            super::message_plane::plan_hub(&self.config_path, &home, data_dir, &connection)?
+        {
+            super::config::apply(&change)?;
+            self.core_cut.message_hub_change = Some(change);
+            let detail = "Installed idle nats-hub entry".to_string();
+            self.lines.completed(detail.clone());
+            Ok((true, detail))
+        } else {
+            let detail = "Message hub entry: nothing changed (existing entry kept)".to_string();
+            self.lines.completed(detail.clone());
+            Ok((false, detail))
+        }
+    }
+
+    fn grant_message_keys(&mut self, target: UpgradeTarget) -> Result<(bool, String), String> {
+        let auth = self.target(target)?.destination.clone();
+        self.lines
+            .completed(super::message_plane::GRANT_STEP.into());
+        super::message_plane::wait_for_vault(
+            &self.executable,
+            self.subc.as_deref(),
+            &mut *self.runner,
+            super::upgrade_executor::RESTART_COMPLETION_TIMEOUT,
+        )?;
+        let (changed, detail) = super::message_plane::grant_keys(&auth, &mut *self.runner)?;
+        self.lines.completed(detail.clone());
+        Ok((changed, detail))
+    }
     fn failure_rollback_target(&self) -> Option<UpgradeTarget> {
         if !self.core_cut.captured || self.core_cut.rolling_back {
             return None;
@@ -1421,6 +1460,7 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
             return;
         }
         if target.is_daemon() {
+            self.core_cut.message_hub_change = None;
             if let Some(nats) = self.core_cut.nats.as_mut() {
                 if let Err(error) = nats.complete(&mut self.inventory) {
                     self.warn(format!(
@@ -1492,6 +1532,11 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
     }
 
     fn rollback(&mut self, target: UpgradeTarget) -> Result<String, String> {
+        if target.is_daemon() || nats_companion(target) {
+            if let Some(change) = self.core_cut.message_hub_change.take() {
+                super::message_plane::rollback_hub(&change)?;
+            }
+        }
         if !self.core_cut.rolling_back
             && self.core_cut.captured
             && (target.is_daemon() || nats_companion(target))

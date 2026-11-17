@@ -22,6 +22,7 @@ use wire::{JetStream, Leaf, LeafState, Listener};
 #[derive(Default)]
 struct Snapshot {
     ready: bool,
+    hub_listener_requested: bool,
     status: Option<(JetStream, Vec<Leaf>, Option<Listener>)>,
     apply_failure: Option<(u64, String)>,
 }
@@ -32,6 +33,13 @@ fn short(text: &str) -> String {
 
 impl Snapshot {
     fn health(&self, hub: bool) -> HealthReport {
+        if hub && !self.hub_listener_requested {
+            return HealthReport {
+                status: HealthStatus::Ok,
+                detail: Some("Not this computer's hub; idle".into()),
+                metrics: None,
+            };
+        }
         let mut report = HealthReport {
             status: HealthStatus::Failing,
             detail: Some("Waiting for engine ready and status.".into()),
@@ -104,7 +112,7 @@ impl ModuleHandler for Handler {
     }
 
     async fn health(&self) -> HealthReport {
-        if self.engine.get().is_none() {
+        if self.engine.get().is_none() && !self.hub {
             return HealthReport {
                 status: HealthStatus::Failing,
                 detail: Some("Starting the engine.".into()),
@@ -136,6 +144,7 @@ impl ModuleHandler for Handler {
 
 pub async fn run(config: PathBuf, executable: PathBuf, connection: PathBuf) -> Result<(), String> {
     let module_id = std::env::var("SUBC_MODULE_ID").map_err(|_| "SUBC_MODULE_ID is required")?;
+    let hub = module_id == "nats-hub";
     let manifest = ModuleManifest::builder(&module_id, env!("CARGO_PKG_VERSION"))
         .registration_channel(true)
         .build();
@@ -145,18 +154,19 @@ pub async fn run(config: PathBuf, executable: PathBuf, connection: PathBuf) -> R
     let handler = Handler {
         engine: engine_slot.clone(),
         snapshot: snapshot.clone(),
-        hub: module_id == "nats-hub",
+        hub,
     };
     // Adoption marks the daemon's registration descriptor close-on-exec before
     // any engine process can inherit the module's serving channel.
     let (_handle, serving) = subc_client_rs::serve_with_handle(&connection, manifest, handler)
         .await
         .map_err(|error| error.to_string())?;
-    let (engine, mut running) = Engine::spawn(&executable, &config, snapshot, bus.clone()).await?;
+    let (engine, mut running) =
+        Engine::spawn(&executable, &config, snapshot, bus.clone(), hub).await?;
     engine_slot
         .set(engine.clone())
         .map_err(|_| "engine already started")?;
-    let relay = tokio::spawn(bus::follow(connection, bus, engine.clone()));
+    let relay = tokio::spawn(bus::follow(connection, bus, engine.clone(), hub));
     tokio::pin!(serving);
     let result = tokio::select! {
         result = &mut serving => {
@@ -185,6 +195,7 @@ mod tests {
     fn status() -> Snapshot {
         Snapshot {
             ready: true,
+            hub_listener_requested: true,
             status: Some((
                 JetStream {
                     enabled: true,
@@ -212,6 +223,19 @@ mod tests {
             .on_draining(RouteCloseReason::Restart, SystemTime::now())
             .await;
         handler.on_connection_end(ConnectionEnd::Goodbye).await;
+    }
+
+    #[test]
+    fn wrapper_hub_idle_health_does_not_require_ready_or_status() {
+        let mut snapshot = Snapshot::default();
+        let report = snapshot.health(true);
+        assert_eq!(report.status, HealthStatus::Ok);
+        assert_eq!(
+            report.detail.as_deref(),
+            Some("Not this computer's hub; idle")
+        );
+        snapshot.hub_listener_requested = true;
+        assert_eq!(snapshot.health(true).status, HealthStatus::Failing);
     }
 
     #[test]

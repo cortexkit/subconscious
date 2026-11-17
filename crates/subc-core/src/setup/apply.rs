@@ -46,6 +46,8 @@ pub struct SetupBackend {
 
 #[derive(Default)]
 struct ComponentSteps {
+    message_hub_change: Option<config::ConfigChange>,
+    message_grants_changed: bool,
     daemon_migration: Option<super::daemon_bundle::Migration>,
     nats_migration: Option<super::nats_migration::Migration>,
     nats_definition: Option<runtime::DefinitionSnapshot>,
@@ -416,6 +418,10 @@ impl SetupBackend {
                 SetupOperation::BootstrapClaustrum { .. } => {
                     steps.push("would initialize claustrum credentials".to_string())
                 }
+                operation @ (SetupOperation::GrantMessageKeys
+                | SetupOperation::ConfigureMessageHub) => {
+                    steps.push(format!("would {operation}"));
+                }
                 SetupOperation::AdoptRunningCk { path } => steps.push(format!(
                     "would adopt {} as the managed ck binary",
                     components::display_home_path(path)
@@ -555,7 +561,25 @@ impl SetupBackend {
                 println!("  registered with the daemon; {module_id} ok");
             }
         }
-        println!("Done.");
+        let maintenance_only = !plan.permission_repair
+            && plan.operations.iter().filter(|op| op.mutates()).all(|op| {
+                matches!(
+                    op,
+                    SetupOperation::GrantMessageKeys | SetupOperation::ConfigureMessageHub
+                )
+            });
+        let maintenance_changed = self
+            .component_steps
+            .values()
+            .any(|steps| steps.message_hub_change.is_some() || steps.message_grants_changed);
+        println!(
+            "{}",
+            if maintenance_only && !maintenance_changed {
+                "Nothing changed."
+            } else {
+                "Done."
+            }
+        );
         if let Some(hint) = runtime::linger_hint(self.platform, &mut self.runner) {
             println!("{hint}");
         }
@@ -1041,7 +1065,13 @@ impl SetupExecutor for SetupBackend {
             return Ok(());
         }
         self.tighten_existing_permissions()?;
-        let has_mutating_operation = plan.operations.iter().any(SetupOperation::mutates);
+        let has_mutating_operation = plan.operations.iter().any(|op| {
+            op.mutates()
+                && !matches!(
+                    op,
+                    SetupOperation::GrantMessageKeys | SetupOperation::ConfigureMessageHub
+                )
+        });
         if plan.permission_repair && !has_mutating_operation {
             println!("  tightened permissions on existing CortexKit paths");
         }
@@ -1164,6 +1194,46 @@ impl SetupExecutor for SetupBackend {
             }
             SetupOperation::BootstrapClaustrum { key_path } => {
                 self.bootstrap_claustrum(key_path.as_deref())
+            }
+            SetupOperation::GrantMessageKeys => {
+                println!("{}", super::message_plane::GRANT_STEP);
+                let auth = self.paths.binary_home.join(if cfg!(windows) {
+                    "ck-auth.exe"
+                } else {
+                    "ck-auth"
+                });
+                super::message_plane::wait_for_vault(
+                    &self.executable,
+                    None,
+                    &mut *self.runner,
+                    super::upgrade_executor::RESTART_COMPLETION_TIMEOUT,
+                )?;
+                let (changed, detail) = super::message_plane::grant_keys(&auth, &mut *self.runner)?;
+                self.component_steps
+                    .entry(Component::Claustrum)
+                    .or_default()
+                    .message_grants_changed |= changed;
+                println!("  {detail}");
+                Ok(())
+            }
+            SetupOperation::ConfigureMessageHub => {
+                println!("{}", super::message_plane::HUB_STEP);
+                if let Some(change) = super::message_plane::plan_hub(
+                    &self.paths.config_path,
+                    &self.paths.binary_home,
+                    &self.paths.data_dir,
+                    &subc_daemon::bootstrap::connection_file_path(),
+                )? {
+                    config::apply(&change)?;
+                    self.component_steps
+                        .entry(Component::Core)
+                        .or_default()
+                        .message_hub_change = Some(change);
+                    println!("  added idle nats-hub entry");
+                } else {
+                    println!("  Message hub entry: nothing changed (existing entry kept)");
+                }
+                Ok(())
             }
             SetupOperation::AdoptRunningCk { path } => self.adopt_running_ck(path),
             SetupOperation::LinkCkni { ck, .. } => {
@@ -1301,6 +1371,9 @@ impl SetupExecutor for SetupBackend {
         let Some(mut steps) = self.component_steps.remove(&component) else {
             return Ok(());
         };
+        if let Some(change) = &steps.message_hub_change {
+            super::message_plane::rollback_hub(change)?;
+        }
         if let Some(migration) = &mut steps.nats_migration {
             migration.rollback(&mut self.inventory)?;
         }

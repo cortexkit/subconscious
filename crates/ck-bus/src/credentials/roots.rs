@@ -40,6 +40,19 @@ pub enum RootCredential {
     FederationAccount,
     /// Signs per-message sender signatures for cross-machine deliveries.
     MessageSigning,
+    /// This machine's leaf user on the hub: its public half is the leaf nkey the hub's
+    /// JWT names, and it signs the hub's connect nonce for the local server.
+    BusLeaf,
+    /// The self-hosted hub's operator: it signs the hub operator JWT, the hub system
+    /// account and the user's hub account, and as the system account's signing key it
+    /// signs ck-bus's own system user on the hub.
+    BusHubOperator,
+    /// The hub account's signing key: it signs every leaf user JWT and ck-bus's own
+    /// admin user in the hub account.
+    BusHubAccount,
+    /// The hub listener's TLS key. The vault signs with it only TLS 1.3 server
+    /// `CertificateVerify` content.
+    BusHubTls,
 }
 
 /// Why ck-bus has no credential id to call the vault with for a root.
@@ -75,6 +88,12 @@ impl RootCredential {
             Self::FederationAccount => ("ck-bus-fedaccount", Some(1)),
             // CKCRED's latest note names it without a generation.
             Self::MessageSigning => ("msgsig", None),
+            // The vault creates it at daemon start on every machine (ck-bus federation
+            // design, "Vault keys and grants").
+            Self::BusLeaf => ("bus-leaf", Some(1)),
+            Self::BusHubOperator => ("bus-hub-operator", Some(1)),
+            Self::BusHubAccount => ("bus-hub-account", Some(1)),
+            Self::BusHubTls => ("bus-hub-tls", Some(1)),
         }
     }
 

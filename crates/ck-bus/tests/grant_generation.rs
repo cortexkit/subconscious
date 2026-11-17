@@ -101,7 +101,6 @@ fn module_durables_are_granted_by_explicit_owner_for_every_table_row() {
     let astrocyte = grants::issued_grant(&names, "astrocyte", "credential", &[]).unwrap();
     for durable in [
         "m_astrocyte",
-        "m_astrocyte_payer",
         "m_astrocyte_media_usage",
         "m_astrocyte_catalog",
         "m_astrocyte_attribution",
@@ -111,6 +110,10 @@ fn module_durables_are_granted_by_explicit_owner_for_every_table_row() {
             names.streams().event
         )));
     }
+    assert!(!astrocyte.publish_allow().contains(&format!(
+        "$JS.API.CONSUMER.MSG.NEXT.{}.m_astrocyte_payer",
+        names.streams().event
+    )));
 }
 
 fn fixture_dir() -> PathBuf {
@@ -719,9 +722,9 @@ fn vendored_foundation_and_golden_match_their_source_record() {
     // so it moves with the pin in Cargo.toml.
     assert_eq!(
         field("golden_commit"),
-        "473f33c3d12ca2e62f72da75b444f918f1285ab7"
+        "352462167a0f7f09e2431494e81381a6facd741c"
     );
-    assert_eq!(field("golden_crate_version"), "cortexkit-bus-naming 0.4.3");
+    assert_eq!(field("golden_crate_version"), "cortexkit-bus-naming 0.4.7");
     for (file, digest_field) in [
         ("nats-message-plane-foundation.md", "source_sha256"),
         ("permission_golden.txt", "golden_sha256"),

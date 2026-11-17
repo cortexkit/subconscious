@@ -282,6 +282,20 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
         });
     }
 
+    if observed.component_state(Component::Core) != ComponentState::Missing
+        || observed.core_binary_present
+        || plan.operations.iter().any(|op| {
+            matches!(
+                op,
+                SetupOperation::InstallComponent {
+                    component: Component::Core
+                }
+            )
+        })
+    {
+        plan.operations.push(SetupOperation::ConfigureMessageHub);
+    }
+
     match &observed.runtime {
         RuntimeState::Missing => {
             plan.operations.push(SetupOperation::RegisterRuntime);
@@ -319,6 +333,19 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
             plan.operations
                 .push(SetupOperation::EnableComponent { component });
         }
+    }
+
+    if observed.component_state(Component::Claustrum) != ComponentState::Missing
+        || plan.operations.iter().any(|op| {
+            matches!(
+                op,
+                SetupOperation::InstallComponent {
+                    component: Component::Claustrum
+                }
+            )
+        })
+    {
+        plan.operations.push(SetupOperation::GrantMessageKeys);
     }
 
     // After every rescan this run makes: a rescan applies a new health check
@@ -526,7 +553,9 @@ pub fn execute_setup<E: SetupExecutor>(
     {
         if matches!(
             operation,
-            SetupOperation::RescanComponent { .. } | SetupOperation::EnableComponent { .. }
+            SetupOperation::RescanComponent { .. }
+                | SetupOperation::EnableComponent { .. }
+                | SetupOperation::GrantMessageKeys
         ) && !restart_applied
         {
             if let Some(sections) = pending_restart.take() {
@@ -630,7 +659,18 @@ pub fn plan_upgrade(observed: &UpgradeObserved) -> UpgradePlan {
         return plan;
     };
 
+    if let Some(&target) = observed
+        .roster
+        .iter()
+        .find(|t| t.is_daemon() && observed.target_state(**t) != UpgradeState::NotInstalled)
+    {
+        plan.operations
+            .push(UpgradeOperation::ConfigureMessageHub { target });
+    }
     for &target in &observed.roster {
+        if target.is_self_replacing() {
+            append_message_grants(observed, &mut plan);
+        }
         match observed.target_state(target) {
             UpgradeState::NotInstalled => plan.outcomes.push(PlanOutcome::Noop {
                 scope: format!("{target} is not installed"),
@@ -709,6 +749,9 @@ pub fn plan_upgrade(observed: &UpgradeObserved) -> UpgradePlan {
             }
         }
     }
+    if !observed.roster.iter().any(|t| t.is_self_replacing()) {
+        append_message_grants(observed, &mut plan);
+    }
     if super::upgrade_executor::unpaired_nats_upgrade(&plan).is_some() {
         plan.outcomes.push(PlanOutcome::Refusal {
             reason:
@@ -717,6 +760,17 @@ pub fn plan_upgrade(observed: &UpgradeObserved) -> UpgradePlan {
         });
     }
     plan
+}
+
+fn append_message_grants(observed: &UpgradeObserved, plan: &mut UpgradePlan) {
+    if let Some(&target) = observed.roster.iter().find(|t| {
+        t.component == Component::Claustrum
+            && t.binary == "ck-auth"
+            && observed.target_state(**t) != UpgradeState::NotInstalled
+    }) {
+        plan.operations
+            .push(UpgradeOperation::GrantMessageKeys { target });
+    }
 }
 
 fn upgrade_core_floor_refusal(observed: &UpgradeObserved, target: UpgradeTarget) -> Option<String> {
@@ -788,6 +842,119 @@ fn plan_upgrade_target(plan: &mut UpgradePlan, target: UpgradeTarget, observed: 
     }
     plan.operations
         .push(UpgradeOperation::PostVerify { target });
+}
+
+#[cfg(test)]
+mod message_plane_tests {
+    use super::super::components::upgrade_roster;
+    use super::*;
+
+    #[test]
+    fn message_plane_steps_are_planned_for_current_setup_and_upgrade() {
+        let mut observed = SetupObserved::unconfigured_current_host();
+        observed
+            .components
+            .insert(Component::Core, ComponentState::Correct);
+        observed
+            .components
+            .insert(Component::Claustrum, ComponentState::Correct);
+        observed.runtime = RuntimeState::Correct;
+        let plan = plan_setup(&observed, &SetupRequest::install(Vec::new()));
+        assert!(plan
+            .operations
+            .contains(&SetupOperation::ConfigureMessageHub));
+        assert!(plan.operations.contains(&SetupOperation::GrantMessageKeys));
+        assert!(plan
+            .render()
+            .contains(super::super::message_plane::GRANT_STEP));
+        assert!(plan
+            .render()
+            .contains(super::super::message_plane::HUB_STEP));
+
+        let observed =
+            UpgradeObserved::for_roster(upgrade_roster([Component::Core, Component::Claustrum]));
+        let plan = plan_upgrade(&observed);
+        assert_eq!(plan.operations.iter().filter(|op| op.mutates()).count(), 2);
+        assert!(plan
+            .render()
+            .contains(super::super::message_plane::GRANT_STEP));
+        assert!(plan
+            .render()
+            .contains(super::super::message_plane::HUB_STEP));
+    }
+
+    #[test]
+    fn message_plane_grants_follow_vault_enable_and_precede_cli_replacement() {
+        let observed = SetupObserved::unconfigured_current_host();
+        let plan = plan_setup(
+            &observed,
+            &SetupRequest::install(vec![Component::Claustrum]),
+        );
+        let grant = plan
+            .operations
+            .iter()
+            .position(|op| matches!(op, SetupOperation::GrantMessageKeys))
+            .unwrap();
+        let enable = plan
+            .operations
+            .iter()
+            .position(|op| {
+                matches!(
+                    op,
+                    SetupOperation::EnableComponent {
+                        component: Component::Claustrum
+                    }
+                )
+            })
+            .unwrap();
+        assert!(grant > enable);
+
+        let mut observed =
+            UpgradeObserved::for_roster(upgrade_roster([Component::Core, Component::Claustrum]));
+        for target in &observed.roster {
+            observed.targets.insert(
+                target.label().into(),
+                UpgradeState::UpdateAvailable {
+                    from: "0.1.0".into(),
+                    to: "0.2.0".into(),
+                    reason: None,
+                },
+            );
+        }
+        let plan = plan_upgrade(&observed);
+        let grant = plan
+            .operations
+            .iter()
+            .position(|op| matches!(op, UpgradeOperation::GrantMessageKeys { .. }))
+            .unwrap();
+        let cli = plan.operations.iter().position(|op| matches!(op, UpgradeOperation::ReplaceDestination { target } if target.is_self_replacing())).unwrap();
+        let vault = plan.operations.iter().rposition(|op| matches!(op, UpgradeOperation::PostVerify { target } if target.component == Component::Claustrum)).unwrap();
+        assert!(vault < grant && grant < cli, "{}", plan.render());
+    }
+
+    #[test]
+    fn message_plane_grants_are_not_planned_without_an_installed_vault_or_for_uninstall() {
+        let mut observed = SetupObserved::unconfigured_current_host();
+        observed
+            .components
+            .insert(Component::Core, ComponentState::Correct);
+        let plan = plan_setup(&observed, &SetupRequest::install(Vec::new()));
+        assert!(!plan.operations.contains(&SetupOperation::GrantMessageKeys));
+        let plan = plan_upgrade(&UpgradeObserved::for_roster(upgrade_roster([
+            Component::Core,
+        ])));
+        assert!(!plan
+            .operations
+            .iter()
+            .any(|op| matches!(op, UpgradeOperation::GrantMessageKeys { .. })));
+        let mut request = SetupRequest::install(Vec::new());
+        request.uninstall = true;
+        let plan = plan_setup(&observed, &request);
+        assert!(!plan.operations.contains(&SetupOperation::GrantMessageKeys));
+        assert!(!plan
+            .operations
+            .contains(&SetupOperation::ConfigureMessageHub));
+    }
 }
 
 #[cfg(test)]
@@ -1536,8 +1703,8 @@ mod tests {
         )));
         let mut executor = RecordingExecutor::default();
         let report = execute_setup(&plan, ExecutionMode::Apply, &mut executor).unwrap();
-        assert!(report.applied.is_empty());
-        assert!(executor.applied.is_empty());
+        assert_eq!(report.applied, [SetupOperation::ConfigureMessageHub]);
+        assert_eq!(executor.applied, [SetupOperation::ConfigureMessageHub]);
     }
 
     #[test]
@@ -1759,7 +1926,7 @@ mod tests {
         let component_operations = plan
             .operations
             .iter()
-            .filter(|operation| operation.component().is_some())
+            .filter(|operation| operation.component() == Some(Component::Aft))
             .cloned()
             .collect::<Vec<_>>();
 
@@ -1806,12 +1973,14 @@ mod tests {
             executor.applied,
             vec![
                 SetupOperation::BootstrapClaustrum { key_path: None },
+                SetupOperation::ConfigureMessageHub,
                 SetupOperation::RescanComponent {
                     component: Component::Claustrum,
                 },
                 SetupOperation::EnableComponent {
                     component: Component::Claustrum,
                 },
+                SetupOperation::GrantMessageKeys,
             ]
         );
         assert!(plan.outcomes.iter().any(|outcome| {
@@ -2331,8 +2500,8 @@ mod tests {
     }
 
     /// On an otherwise complete install, a nats-server without monitoring is the
-    /// only change, it comes after every rescan this run makes, and a run that
-    /// finds both pieces present plans no mutation at all.
+    /// only bus-listener change, it comes after every rescan this run makes,
+    /// and a run that finds both pieces present plans no monitoring mutation.
     #[test]
     fn nats_server_monitoring_is_planned_after_rescans_and_only_when_missing() {
         use super::super::bus_monitoring::{HealthState, ListenerState};
@@ -2377,7 +2546,7 @@ mod tests {
         assert_eq!(
             plan.operations
                 .iter()
-                .filter(|operation| operation.mutates())
+                .filter(|operation| matches!(operation, SetupOperation::MonitorNatsServer { .. }))
                 .count(),
             1
         );
@@ -2390,7 +2559,10 @@ mod tests {
             assert_eq!(
                 plan.operations
                     .iter()
-                    .filter(|operation| operation.mutates())
+                    .filter(|operation| matches!(
+                        operation,
+                        SetupOperation::MonitorNatsServer { .. }
+                    ))
                     .count(),
                 0,
                 "{}",
@@ -2404,7 +2576,7 @@ mod tests {
         assert_eq!(
             plan.operations
                 .iter()
-                .filter(|operation| operation.mutates())
+                .filter(|operation| matches!(operation, SetupOperation::MonitorNatsServer { .. }))
                 .count(),
             0
         );

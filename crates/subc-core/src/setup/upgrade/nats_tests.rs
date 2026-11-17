@@ -121,6 +121,7 @@ fn nats_upgrade_migrates_entry_and_retains_stock_until_verified() {
 fn nats_upgrade_rollback_restores_entry_stock_and_daemon() {
     let root = cortexkit_test_support::ScratchDir::new("nats-upgrade-rollback");
     let (mut backend, daemon, original) = nats_upgrade_fixture(&root, true);
+    assert!(backend.configure_message_hub(daemon).unwrap().0);
     backend.create_rollback_copy(daemon).unwrap();
     backend.replace_destination(daemon).unwrap();
     assert_eq!(
@@ -130,6 +131,7 @@ fn nats_upgrade_rollback_restores_entry_stock_and_daemon() {
         "subc"
     );
     backend.rollback(daemon).unwrap();
+    assert!(subc_jsonc::read_document(&root.join("subc.jsonc")).unwrap().1["modules"].get("nats-hub").is_none());
     assert_eq!(
         subc_jsonc::read_document(&root.join("subc.jsonc"))
             .unwrap()
@@ -152,6 +154,29 @@ fn nats_upgrade_rollback_restores_entry_stock_and_daemon() {
         .unwrap(),
         b"nats-server"
     );
+}
+
+#[test]
+fn message_plane_upgrade_hub_repeat_and_rollback_keep_existing_entries() {
+    for existing in [false, true] {
+        let root = cortexkit_test_support::ScratchDir::new("message-upgrade-hub");
+        let (mut backend, daemon, _) = nats_upgrade_fixture(&root, false);
+        let path = root.join("subc.jsonc");
+        if existing {
+            let (mut text, _) = subc_jsonc::read_document(&path).unwrap();
+            subc_jsonc::set_member(&mut text, &["modules", "nats-hub"], &serde_json::json!({"enabled":false,"program":"operator-hub"})).unwrap();
+            fs::write(&path, text).unwrap();
+        }
+        let original = subc_jsonc::read_document(&path).unwrap().1["modules"]["nats-hub"].clone();
+        assert_eq!(backend.configure_message_hub(daemon).unwrap().0, !existing);
+        let after = fs::read(&path).unwrap();
+        assert!(!backend.configure_message_hub(daemon).unwrap().0);
+        assert_eq!(fs::read(&path).unwrap(), after);
+        backend.create_rollback_copy(daemon).unwrap();
+        backend.replace_destination(daemon).unwrap();
+        backend.rollback(daemon).unwrap();
+        assert_eq!(subc_jsonc::read_document(&path).unwrap().1["modules"]["nats-hub"], original);
+    }
 }
 
 #[test]

@@ -85,6 +85,8 @@ pub use subc_config::{ApplyKind, LayerValue, RecordedValue, Schema, ValidationCo
 pub use subc_protocol::config::*;
 
 /// The bytes available after a refusal. Absence is not permission to read files.
+// The view is held inline: boxing it would change this published variant's type.
+#[allow(clippy::large_enum_variant)]
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConfigAvailability {
@@ -395,7 +397,7 @@ impl Delivery {
                 return;
             }
         };
-        let Some(view) = reply.pending.as_ref().or(reply.active.as_ref()) else {
+        let Some(mut view) = reply.pending.clone().or(reply.active.clone()) else {
             self.error(
                 handler,
                 ConfigError::Protocol("config.get returned no view".into()),
@@ -403,6 +405,7 @@ impl Delivery {
             .await;
             return;
         };
+        view.declaration_pending = reply.declaration_pending.clone();
         if view.project_id != project
             || reply
                 .active
@@ -468,7 +471,9 @@ impl Delivery {
             .await;
             return;
         }
-        let attempt = if reply.pending.is_some() {
+        let attempt = if reply.pending.is_some()
+            || (reply.declaration_pending.is_some() && view.attempt.is_some())
+        {
             match view.attempt {
                 Some(attempt) => Some(attempt),
                 None => {

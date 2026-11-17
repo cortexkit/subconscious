@@ -19,6 +19,15 @@ keeps its last view and surfaces that refusal rather than exiting or reading
 unapproved files. Before stamping, a file view uses generation zero and status
 `unstamped`.
 
+`config_get_reply_declaration_pending.json` serves the unchanged approved active
+view when a connection declares a schema that matches neither approved active
+nor pending declarations. The optional `declaration_pending` object is delivery
+state, not approved content: `{}` means no plan yet, and `plan_digest`, when
+present, identifies a pending plan carrying that declaration. Readers ignore
+unknown members. The daemon assigns an attempt on the active view for a
+connection-local catch-up ACK; it does not activate or change the stored view.
+Without an approved active view the existing `config_gated` refusal remains.
+
 ## `config.changed` envelope
 
 The `config_changed.json` body is an unsolicited `PUSH` on channel 0, epoch 0,

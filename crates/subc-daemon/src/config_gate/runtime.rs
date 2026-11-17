@@ -1344,10 +1344,10 @@ impl RuntimeOwner {
                     .and_then(|snapshot| snapshot.declarations.get(module))
                     == Some(&declaration)
             });
-        if !approved_declaration {
+        if !approved_declaration && versions.active.is_none() {
             return Err(GateError::new(
                 "config_gated",
-                "connection declaration differs from approved declaration",
+                "module has no approved active configuration",
             ));
         }
         let view = |generation: Option<u64>, status: ConfigStatus| -> Result<Option<ConfigView>> {
@@ -1370,6 +1370,15 @@ impl RuntimeOwner {
             Ok(Some(view))
         };
         let active = view(versions.active, ConfigStatus::Active)?;
+        if !approved_declaration {
+            let mut reply = subc_protocol::config::ConfigGetReply::new(active, None);
+            reply.declaration_pending = Self::declaration_pending(state, module, &declaration);
+            return if check_store {
+                delivery::bind_declaration_fallback(state, connection, module, &request, reply)
+            } else {
+                Ok(reply)
+            };
+        }
         let pending = view(versions.pending, ConfigStatus::Pending)?;
         let transition = versions
             .pending
@@ -1399,6 +1408,53 @@ impl RuntimeOwner {
             subc_protocol::config::ConfigGetReply::new(active, pending),
             transition,
         )
+    }
+
+    fn declaration_pending(
+        state: &OwnerState,
+        module: &str,
+        declaration: &ConfigDeclareRequest,
+    ) -> Option<subc_protocol::config::ConfigDeclarationPending> {
+        let body = state.store.loaded_admission_state().1;
+        if !body.stamped {
+            return None;
+        }
+        let versions = body
+            .versions
+            .iter()
+            .find(|(tuple, _)| tuple.module == module && tuple.project.is_none())?
+            .1
+            .clone();
+        if versions.active.is_none()
+            || [versions.active, versions.pending]
+                .into_iter()
+                .flatten()
+                .any(|id| {
+                    body.generations
+                        .get(&id)
+                        .and_then(|entry| entry.delivery.as_ref())
+                        .and_then(|delivery| delivery.declarations.get(module))
+                        == Some(declaration)
+                })
+        {
+            return None;
+        }
+        let mut marker = subc_protocol::config::ConfigDeclarationPending::default();
+        marker.plan_digest = state
+            .gate
+            .plans
+            .values()
+            .filter(|plan| {
+                plan.modules.contains(module)
+                    && plan
+                        .delivery
+                        .as_ref()
+                        .and_then(|delivery| delivery.declarations.get(module))
+                        == Some(declaration)
+            })
+            .max_by_key(|plan| plan.creation_sequence)
+            .map(|plan| plan.view.digest.clone());
+        Some(marker)
     }
 
     fn declarations(state: &mut OwnerState) -> Result<BTreeMap<String, ConfigDeclareRequest>> {
@@ -2405,16 +2461,23 @@ impl RuntimeOwner {
             for (connection, module) in declarations {
                 // Use get's approved-declaration/view checks without opening the
                 // store or binding a delivery attempt merely to display status.
-                if self
-                    .module_get_locked(
-                        &mut state,
+                let reply = self.module_get_locked(
+                    &mut state,
+                    connection,
+                    &module,
+                    subc_protocol::config::ConfigGetRequest::new(),
+                    false,
+                );
+                if let Ok(reply) = &reply {
+                    Self::report_declaration_pending(
+                        &state,
                         connection,
                         &module,
-                        subc_protocol::config::ConfigGetRequest::new(),
-                        false,
-                    )
-                    .is_err_and(|error| error.code == "config_gated")
-                {
+                        reply,
+                        &mut status,
+                    );
+                }
+                if reply.is_err_and(|error| error.code == "config_gated") {
                     status.gated_modules.push(module);
                 }
             }
@@ -2422,6 +2485,32 @@ impl RuntimeOwner {
             status.gated_modules.dedup();
         }
         Ok(status)
+    }
+
+    fn report_declaration_pending(
+        state: &OwnerState,
+        connection: ConnectionId,
+        module: &str,
+        reply: &subc_protocol::config::ConfigGetReply,
+        status: &mut subc_control::config::ConfigStatus,
+    ) {
+        if state.active_declarations.get(module) != Some(&connection) {
+            return;
+        }
+        if let Some(marker) = &reply.declaration_pending {
+            status
+                .declaration_pending
+                .insert(module.into(), marker.clone());
+            if let Some(generation) = state.delivery.fallback_applied.get(&connection) {
+                if reply
+                    .active
+                    .as_ref()
+                    .is_some_and(|view| view.generation == *generation)
+                {
+                    status.warnings.push(format!("module {module}: running last approved settings (generation {generation}); declaration awaits approval"));
+                }
+            }
+        }
     }
 
     pub fn history(&self) -> Result<(Vec<subc_config::Generation>, Vec<serde_json::Value>)> {

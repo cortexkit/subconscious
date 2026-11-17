@@ -10,6 +10,8 @@ use subc_control::config::{
 };
 
 struct SettingsSnapshot {
+    declaration_pending: BTreeMap<String, subc_protocol::config::ConfigDeclarationPending>,
+    fallback_applied: BTreeSet<String>,
     body: StoreBody,
     declarations: BTreeMap<String, ConfigDeclareRequest>,
     pending: BTreeMap<String, Digest>,
@@ -51,7 +53,31 @@ impl RuntimeOwner {
                     .map(|digest| (module.clone(), digest))
             })
             .collect();
+        let declaration_pending = declarations
+            .iter()
+            .filter_map(|(module, declaration)| {
+                Self::declaration_pending(&state, module, declaration)
+                    .map(|marker| (module.clone(), marker))
+            })
+            .collect();
+        let fallback_applied = state
+            .active_declarations
+            .iter()
+            .filter_map(|(module, connection)| {
+                let generation = state.delivery.fallback_applied.get(connection)?;
+                body.versions
+                    .iter()
+                    .any(|(tuple, versions)| {
+                        tuple.module == *module
+                            && tuple.project.is_none()
+                            && versions.active == Some(*generation)
+                    })
+                    .then(|| module.clone())
+            })
+            .collect();
         Ok(SettingsSnapshot {
+            declaration_pending,
+            fallback_applied,
             body,
             declarations,
             pending,
@@ -113,6 +139,7 @@ impl RuntimeOwner {
                 row.active_generation = Some(0);
             }
             row.pending_plan = snapshot.pending.get(module).cloned();
+            row.declaration_pending = snapshot.declaration_pending.get(module).cloned();
             row.file_error = file_errors.get(module).cloned();
             let failed = entry.filter(|entry| entry.generation.never_redeliver.contains(module));
             let mut proposal = false;
@@ -152,6 +179,11 @@ impl RuntimeOwner {
                 "write_back_behind" => behind,
                 _ => None,
             };
+            if row.declaration_pending.is_some() && snapshot.fallback_applied.contains(module) {
+                row.status = "active".into();
+                row.status_reason =
+                    Some("Running last approved settings; declaration awaits approval.".into());
+            }
             modules.push(row);
         }
         Ok(ConfigControlResponse::Modules {
@@ -282,6 +314,7 @@ impl RuntimeOwner {
             layers,
             file_error,
             pending_plan: snapshot.pending.get(&module).cloned(),
+            declaration_pending: snapshot.declaration_pending.get(&module).cloned(),
         })
     }
 }

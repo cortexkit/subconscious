@@ -285,16 +285,23 @@ impl RuntimeOwner {
                 .map(|(connection, (module, _))| (*connection, module.clone()))
                 .collect();
             for (connection, module) in declared {
-                if self
-                    .module_get_locked(
+                let reply = self.module_get_locked(
+                    state,
+                    connection,
+                    &module,
+                    subc_protocol::config::ConfigGetRequest::new(),
+                    false,
+                );
+                if let Ok(reply) = &reply {
+                    Self::report_declaration_pending(
                         state,
                         connection,
                         &module,
-                        subc_protocol::config::ConfigGetRequest::new(),
-                        false,
-                    )
-                    .is_err_and(|error| error.code == "config_gated")
-                {
+                        reply,
+                        &mut status,
+                    );
+                }
+                if reply.is_err_and(|error| error.code == "config_gated") {
                     status.gated_modules.push(module);
                 }
             }

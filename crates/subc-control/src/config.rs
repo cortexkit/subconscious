@@ -4,6 +4,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 pub use subc_config::{ApprovalChannel, Digest, Generation, Plan};
+pub use subc_protocol::config::ConfigDeclarationPending;
 
 pub const CONFIG_GATE_CAPABILITY: &str = "config.gate";
 pub const CONFIG_SETTINGS_CAPABILITY: &str = "config.settings/v1";
@@ -183,6 +184,8 @@ impl ConfigFileError {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ConfigModule {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declaration_pending: Option<ConfigDeclarationPending>,
     pub module_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
@@ -238,6 +241,8 @@ pub enum ConfigWatchEvent {
     Change {
         module_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        declaration_pending: Option<ConfigDeclarationPending>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         approved_generation: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         active_generation: Option<u64>,
@@ -257,6 +262,7 @@ impl ConfigWatchEvent {
     pub fn change(row: &ConfigModule) -> Self {
         Self::Change {
             module_id: row.module_id.clone(),
+            declaration_pending: row.declaration_pending.clone(),
             approved_generation: row.approved_generation,
             active_generation: row.active_generation,
             status: row.status.clone(),
@@ -334,6 +340,8 @@ impl ConfigApprovalRecord {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ConfigStatus {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub declaration_pending: BTreeMap<String, ConfigDeclarationPending>,
     pub approval_channels: Vec<ConfigApprovalRecord>,
     pub state: String,
     pub integrity: String,
@@ -384,6 +392,8 @@ pub enum ConfigControlResponse {
         file_error: Option<ConfigFileError>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pending_plan: Option<Digest>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        declaration_pending: Option<ConfigDeclarationPending>,
     },
     #[serde(rename = "config.plan")]
     Plan { view: ConfigPlanView },
@@ -417,6 +427,23 @@ pub enum ConfigControlResponse {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn config_wire_declaration_pending_reaches_settings_watch() {
+        use super::*;
+        let row = ConfigModule {
+            module_id: "sample".into(),
+            declaration_pending: Some(ConfigDeclarationPending::default()),
+            ..ConfigModule::default()
+        };
+        let event = ConfigWatchResponse::new(ConfigWatchEvent::change(&row));
+        let mut wire = serde_json::to_value(&event).unwrap();
+        assert_eq!(wire["declaration_pending"], serde_json::json!({}));
+        wire["declaration_pending"]["future_member"] = serde_json::json!(true);
+        assert_eq!(
+            serde_json::from_value::<ConfigWatchResponse>(wire).unwrap(),
+            event
+        );
+    }
     #[test]
     fn config_wire_existing_bodies_remain_byte_identical() {
         use super::*;

@@ -14,7 +14,7 @@ const refusal = (code: string) => Object.assign(new Error(`daemon refused: ${cod
 function rig(options: Partial<ModuleConfigOptions> = {}) {
   let epoch = 1;
   let capabilities = ["config.gate"];
-  let response: { active: ConfigView | null; pending?: ConfigView } = { active: null, pending: sampleView(1) };
+  let response: { active: ConfigView | null; pending?: ConfigView; declaration_pending?: { plan_digest?: string } } = { active: null, pending: sampleView(1) };
   let fail: { op: string; code: string } | undefined;
   const calls: Array<Record<string, unknown>> = [], applied: ConfigView[] = [], errors: unknown[] = [], states: ModuleConfigState[] = [];
   let filesRead = 0;
@@ -36,7 +36,7 @@ function rig(options: Partial<ModuleConfigOptions> = {}) {
   });
   sessions.push(config);
   return { config, calls, applied, errors, states, filesRead: () => filesRead,
-    reply: (active: ConfigView | null, pending?: ConfigView) => { response = { active, pending }; },
+    reply: (active: ConfigView | null, pending?: ConfigView, declaration_pending?: { plan_digest?: string }) => { response = { active, pending, declaration_pending }; },
     fail: (op: string, code: string) => { fail = { op, code }; }, recover: () => { fail = undefined; },
     reconnect: () => { epoch++; }, legacy: () => { capabilities = []; } };
 }
@@ -51,6 +51,24 @@ test("config declares once, applies pending N+1 rather than active N, and ACKs i
   expect(r.calls.at(-1)).toEqual({ op: "config.applied", generation: 2, attempt: 12, result: "ack", reasons: [], project_id: undefined });
   expect(r.config.state?.state).toBe("active");
   expect(r.filesRead()).toBe(0);
+});
+
+test("declaration pending applies approved active bytes and leaves ACK and layer digests unchanged", async () => {
+  for (const marker of [{}, { plan_digest: "sha256:new-plan", future_member: true }]) {
+    const r = rig();
+    const golden = JSON.parse(readFileSync(join(import.meta.dir, "../../../crates/subc-protocol/tests/golden/config_gate/config_get_reply_active.json"), "utf8"));
+    const approved: ConfigView = { ...golden.active, attempt: 13 };
+    r.reply(approved, undefined, marker);
+    await r.config.refresh();
+    expect(r.errors).toEqual([]);
+    expect(r.applied[0]?.declaration_pending).toEqual("plan_digest" in marker ? { plan_digest: marker.plan_digest } : {});
+    expect(r.applied[0]?.effective).toEqual(approved.effective);
+    expect(r.applied[0]?.layers).toEqual(approved.layers);
+    expect(configLayerBytes(r.applied[0]!.layers[0]!)).toEqual(configLayerBytes(approved.layers[0]!));
+    expect(r.calls.at(-1)).toEqual({ op: "config.applied", generation: 3, attempt: 13, result: "ack", reasons: [], project_id: undefined });
+    expect(r.config.state?.state).toBe("active");
+    expect(r.filesRead()).toBe(0);
+  }
 });
 
 for (const op of ["config.declare", "config.get", "config.applied"]) {

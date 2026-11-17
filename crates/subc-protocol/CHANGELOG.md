@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.37.3
+
+- Add the optional declaration_pending config.get marker and client-only view
+  metadata without changing approved view serialization.
+
 ## 0.37.2
 
 - Add the opt-in `peer-build/v1` capability and `RouteBindPeer::peer_build`

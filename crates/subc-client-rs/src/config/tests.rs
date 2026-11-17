@@ -219,6 +219,45 @@ async fn declared(rig: &mut Rig) {
     let request = rig.request(CONFIG_DECLARE_OP).await;
     rig.ok(request, json!({"op":"config.declare"})).await;
 }
+
+#[tokio::test]
+async fn config_sdk_declaration_pending_keeps_approved_digest_and_ack() {
+    let (handler, mut rx) = sample();
+    let (mut rig, _) = Rig::new(handler, true).await;
+    declared(&mut rig).await;
+    let approved = view(3, ConfigStatus::Active, 2);
+    let mut reply = ConfigGetReply::new(Some(approved.clone()), None);
+    reply.declaration_pending = Some(ConfigDeclarationPending::default());
+    let request = rig.request(CONFIG_GET_OP).await;
+    rig.ok(request, serde_json::to_value(reply).unwrap()).await;
+    let marked = match seen(&mut rx).await {
+        Seen::Applied(view) => view,
+        other => panic!("expected apply, got {other:?}"),
+    };
+    assert!(marked.declaration_pending.is_some());
+    let digest = |view: &ConfigView| {
+        subc_config::raw_digest(
+            &subc_config::canonical_json(&serde_json::to_value(view).unwrap()).unwrap(),
+        )
+    };
+    assert_eq!(digest(&marked), digest(&approved));
+    let ack = rig.request(CONFIG_APPLIED_OP).await;
+    assert_eq!(
+        body(&ack),
+        serde_json::to_value(ConfigAppliedRequest::new(
+            approved.generation,
+            approved.attempt.unwrap(),
+            ConfigApplyResult::Ack,
+            vec![]
+        ))
+        .unwrap()
+    );
+    rig.ok(ack, json!({"op":"config.applied"})).await;
+    assert!(
+        matches!(seen(&mut rx).await, Seen::State(ConfigState::Active(view)) if view.declaration_pending.is_some())
+    );
+    rig.finish().await;
+}
 async fn get(rig: &mut Rig, active: Option<ConfigView>, pending: Option<ConfigView>) {
     let request = rig.request(CONFIG_GET_OP).await;
     rig.ok(

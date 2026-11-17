@@ -99,7 +99,7 @@ export {
   ModuleConfig, configLayerBytes,
   type ConfigLayerSnapshot, type ConfigView, type ConfigDeclaration,
   type ConfigReviewRequest, type ConfigReviewReply, type ConfigFieldChange, type ConfigRecordedValue,
-  type ConfigGetReply, type ConfigAppliedRequest, type ConfigRefusal,
+  type ConfigGetReply, type ConfigDeclarationPending, type ConfigAppliedRequest, type ConfigRefusal,
   type ConfigAvailability, type ModuleConfigState, type ModuleConfigOptions,
 } from "./config.js";
 export type {

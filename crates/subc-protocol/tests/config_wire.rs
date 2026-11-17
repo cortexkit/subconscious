@@ -214,6 +214,32 @@ fn config_wire_no_approved_view_is_an_error_not_empty_config() {
 }
 
 #[test]
+fn config_wire_declaration_pending_is_optional_and_extensible() {
+    let mut reply = ConfigGetReply::new(Some(active()), None);
+    let mut marker = ConfigDeclarationPending::default();
+    marker.plan_digest =
+        Some(subc_config::Digest::new(format!("sha256:{}", "a".repeat(64))).unwrap());
+    reply.declaration_pending = Some(marker);
+    golden("config_get_reply_declaration_pending", &reply);
+    let mut extended = serde_json::to_value(&reply).unwrap();
+    extended["declaration_pending"]["future_member"] = json!(true);
+    assert_eq!(
+        serde_json::from_value::<ConfigGetReply>(extended).unwrap(),
+        reply
+    );
+    reply.declaration_pending = Some(ConfigDeclarationPending::default());
+    assert_eq!(
+        serde_json::to_value(&reply).unwrap()["declaration_pending"],
+        json!({})
+    );
+    reply.declaration_pending = None;
+    assert!(serde_json::to_value(reply)
+        .unwrap()
+        .get("declaration_pending")
+        .is_none());
+}
+
+#[test]
 fn config_wire_applied_and_changed_golden() {
     let ack = ConfigAppliedRequest::new(4, 8, ConfigApplyResult::Ack, vec![]);
     assert!(ack.result.is_ack());

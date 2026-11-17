@@ -12,7 +12,13 @@ export interface ConfigLayerSnapshot {
   digest?: string;
 }
 
+export interface ConfigDeclarationPending {
+  plan_digest?: string;
+}
+
 export interface ConfigView {
+  /** Set only by clients from config.get; delivery state, not approved content. */
+  declaration_pending?: ConfigDeclarationPending;
   generation: number;
   attempt?: number;
   project_id?: string;
@@ -57,6 +63,7 @@ export interface ConfigReviewReply {
 }
 
 export interface ConfigGetReply {
+  declaration_pending?: ConfigDeclarationPending;
   op: "config.get";
   active: ConfigView | null;
   pending?: ConfigView;
@@ -243,7 +250,13 @@ export class ModuleConfig {
       const reply = record(await this.transport.request({ op: "config.get" }));
       if (!this.live(epoch)) return;
       if (reply.op !== "config.get") throw new Error("invalid config.get reply");
-      const active = reply.active === null ? undefined : immutable(view(reply.active));
+      let marker: ConfigDeclarationPending | undefined;
+      if (reply.declaration_pending !== undefined) {
+        const raw = record(reply.declaration_pending);
+        if (raw.plan_digest !== undefined && typeof raw.plan_digest !== "string") throw new Error("invalid declaration plan digest");
+        marker = raw.plan_digest === undefined ? {} : { plan_digest: raw.plan_digest };
+      }
+      const active = reply.active === null ? undefined : immutable({ ...view(reply.active), declaration_pending: marker });
       const pending = reply.pending === undefined ? undefined : immutable(view(reply.pending));
       // A fresh process needs a recovery view before trying a delivery that can
       // be rejected. Never ACK that already-active view as the pending attempt.
@@ -290,7 +303,7 @@ export class ModuleConfig {
       if (target.attempt === undefined) throw new Error("config delivery has no attempt");
       this.report = { op: "config.applied", generation: target.generation, attempt: target.attempt,
         project_id: target.project_id, result: result.result, reasons: result.reasons ?? [] };
-      this.publish(result.result === "ack" ? { state: "pending", view: target }
+      this.publish(result.result === "ack" ? { state: target.status === "active" ? "active" : "pending", view: target }
         : { state: "failed", view: this.lastView, reasons: result.reasons ?? [] });
       await this.sendReport(epoch);
     } catch (error) {

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.50.3
+
+- Serve the last approved active configuration while a newer module declaration
+  awaits approval. Track catch-up acknowledgements separately from activation
+  and expose the pending declaration in status and settings.
+
 ## 0.50.2
 
 - Require subc-config 0.1.1 to admit setup feature annotations at declaration and

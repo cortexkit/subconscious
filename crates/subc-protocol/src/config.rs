@@ -232,6 +232,10 @@ impl TryFrom<SnapshotWire> for ConfigLayerSnapshot {
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConfigView {
+    /// Set only by clients from the config.get reply; never sent by the daemon
+    /// in a view. Delivery state, not part of the approved configuration.
+    #[serde(skip)]
+    pub declaration_pending: Option<ConfigDeclarationPending>,
     pub generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempt: Option<u64>,
@@ -253,6 +257,7 @@ impl ConfigView {
     ) -> Self {
         Self {
             generation,
+            declaration_pending: None,
             attempt: None,
             project_id: None,
             effective,
@@ -389,9 +394,13 @@ impl Default for ConfigGetRequest {
 /// `active` for recovery. A module with no approved configuration is refused
 /// with [`crate::error_codes::CONFIG_GATED`], never given empty file bytes.
 /// `active: null` is permitted when a first delivery has no prior active view.
+/// A changed declaration can receive only the approved active view, with
+/// `declaration_pending` on this reply and a catch-up attempt on that view.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConfigGetReply {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declaration_pending: Option<ConfigDeclarationPending>,
     op: GetOp,
     pub active: Option<ConfigView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -400,11 +409,21 @@ pub struct ConfigGetReply {
 impl ConfigGetReply {
     pub fn new(active: Option<ConfigView>, pending: Option<ConfigView>) -> Self {
         Self {
+            declaration_pending: None,
             op: GetOp::Op,
             active,
             pending,
         }
     }
+}
+
+/// A newer declaration awaits approval. An absent digest means no plan carries it yet.
+/// Unknown members are ignored for forward compatibility.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigDeclarationPending {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_digest: Option<subc_config::Digest>,
 }
 
 /// A complete-generation outcome bound to the caller's child, project and

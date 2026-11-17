@@ -73,6 +73,7 @@ struct Attempt {
     /// generation for its first-party mark. Its refusal or timeout leaves the
     /// spawn unmarked and starts no recovery.
     mark_only: bool,
+    declaration_fallback: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -126,6 +127,7 @@ impl DeliverySpawn {
 
 #[derive(Default)]
 pub(super) struct DeliveryState {
+    pub(super) fallback_applied: HashMap<ConnectionId, u64>,
     #[cfg(test)]
     failed_spawn_module: Option<String>,
     next_spawn: u64,
@@ -334,6 +336,7 @@ impl DeliveryState {
     /// Forget `connection`'s delivery state. Returns whether it had any.
     pub(super) fn disconnected(&mut self, connection: ConnectionId) -> bool {
         let mut held = self.attempts.remove(&connection).is_some();
+        held |= self.fallback_applied.remove(&connection).is_some();
         held |= self.served.remove(&connection).is_some();
         held |= self.unstamped_views.remove(&connection).is_some();
         held |= self.stamp_running.remove(&connection);
@@ -392,6 +395,7 @@ impl DeliveryState {
             policy_probe_requested: false,
             spawn: None,
             mark_only: false,
+            declaration_fallback: false,
         })
     }
 }
@@ -533,6 +537,68 @@ pub(super) fn bind_get(
             "selected delivery has been superseded",
         ));
     }
+    Ok(reply)
+}
+
+pub(super) fn bind_declaration_fallback(
+    state: &mut OwnerState,
+    connection: ConnectionId,
+    module: &str,
+    request: &ConfigGetRequest,
+    mut reply: ConfigGetReply,
+) -> Result<ConfigGetReply> {
+    let active = reply.active.as_mut().ok_or_else(|| {
+        GateError::new(
+            "config_gated",
+            "module has no approved active configuration",
+        )
+    })?;
+    if request.generation.is_some() || request.attempt.is_some() {
+        let assigned = state
+            .delivery
+            .attempts
+            .get(&connection)
+            .is_some_and(|attempt| {
+                attempt.declaration_fallback
+                    && attempt.module == module
+                    && Some(attempt.generation) == request.generation
+                    && Some(attempt.id) == request.attempt
+                    && attempt.generation == active.generation
+            });
+        if !assigned {
+            return Err(GateError::new(
+                "config_gated",
+                "requested fallback attempt is not assigned to this connection",
+            ));
+        }
+    }
+    if state.delivery.fallback_applied.get(&connection) == Some(&active.generation) {
+        return Ok(reply);
+    }
+    if !state
+        .delivery
+        .attempts
+        .get(&connection)
+        .is_some_and(|attempt| {
+            attempt.declaration_fallback && attempt.generation == active.generation
+        })
+    {
+        // Serve only the daemon's approved bytes: a module-owned copy could be
+        // edited without approval. Re-applying them is connection-local catch-up,
+        // never an activation of a generation under the unapproved declaration.
+        let mut attempt = state
+            .delivery
+            .allocate(module, active.generation, Transition::Live)?;
+        attempt.catchup = true;
+        attempt.declaration_fallback = true;
+        attempt.spawn = state.delivery.children.get(&connection).cloned();
+        state.delivery.attempts.insert(connection, attempt);
+    }
+    active.attempt = state
+        .delivery
+        .attempts
+        .get(&connection)
+        .map(|attempt| attempt.id);
     Ok(reply)
 }
 
@@ -1301,6 +1367,13 @@ impl RuntimeOwner {
             }
         }
         if active {
+            if reply.declaration_pending.is_some() {
+                if let Some(view) = &reply.active {
+                    if let Some(attempt) = view.attempt {
+                        self.delivery_written(connection, view.generation, attempt, written_at)?;
+                    }
+                }
+            }
             if let Some(view) = &reply.pending {
                 if let Some(attempt) = view.attempt {
                     self.delivery_written(connection, view.generation, attempt, written_at)?;
@@ -1650,6 +1723,24 @@ impl RuntimeOwner {
             && !bound
                 .deadline
                 .is_some_and(|deadline| tokio::time::Instant::now() >= deadline);
+        if bound.declaration_fallback {
+            let declaration = &state.declarations[&connection].1;
+            if versions.active != Some(bound.generation)
+                || Self::declaration_pending(&state, module, declaration).is_none()
+            {
+                return Ok(AppliedDisposition::Ignored);
+            }
+            state.delivery.attempts.remove(&connection);
+            if ack {
+                state
+                    .delivery
+                    .fallback_applied
+                    .insert(connection, bound.generation);
+                super::mark::acknowledged(self, &state, bound.spawn.as_ref(), bound.generation);
+                return Ok(AppliedDisposition::CatchupComplete);
+            }
+            return Ok(AppliedDisposition::Ignored);
+        }
         if bound.catchup {
             // A later approval waiting for a new daemon cannot replace the
             // active configuration this child is catching up to now.

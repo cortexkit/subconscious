@@ -104,6 +104,27 @@ readers without prompting. `config.show` returns approved effective values and
 layer documents on a stamped install; unstamped reads identify live, unreviewed
 file settings as generation zero. Edits currently serve the user layer only.
 
+On a stamped install (after a person approves a configuration stamp),
+`config.get` normally serves the approved active and
+deliverable pending views. If the connection's declaration matches neither
+approved declaration, the daemon serves only its last approved active view,
+with the same generation, effective values, layers and sources. It adds the
+optional reply field `declaration_pending: { plan_digest?: string }`: `{}` means
+no plan yet, while `plan_digest` names a pending plan carrying the connection's
+declaration. Unknown members are ignored. Missing keys use the module's schema
+defaults. The source remains the daemon's approved store, not a module-owned
+copy that could be edited without approval.
+
+The active view may carry a connection-local attempt for `config.applied` to
+ACK catch-up. This does not activate a generation or change approved bytes.
+`config.status` exposes a module-keyed `declaration_pending` map; settings module
+rows and `config.show` expose the same optional marker. After an ACK, status
+reports the module running its last approved settings, not failed activation.
+Approval of the new declaration resumes normal pending-generation delivery.
+Without an approved active view, the existing `config_gated` error remains
+(`no_approved_config` availability in SDKs); it never authorizes file reads.
+While the approved store is in recovery or has failed its integrity check, the module is refused as before; the fallback never serves a view the daemon cannot vouch for.
+
 **Settings schema annotations.**
 
 The [config vocabulary](../crates/subc-config/vocabulary.schema.json) defines the

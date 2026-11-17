@@ -271,6 +271,10 @@ impl ControlHandler {
                     let selected = view
                         .pending
                         .as_ref()
+                        .or(view
+                            .active
+                            .as_ref()
+                            .filter(|_| view.declaration_pending.is_some()))
                         .and_then(|view| view.attempt.map(|attempt| (view.generation, attempt)));
                     let window = runtime
                         .on_blocking(move |owner| {

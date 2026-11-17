@@ -140,6 +140,22 @@ After stamping, edits are proposals, not authority. The whole `subc.jsonc`
 document is covered, including ungated modules' entries and top-level policy.
 An ungated module still reads its own files unchecked; status lists that gap.
 
+A new module build can declare settings that have not yet been approved. If its
+declaration matches neither the approved active nor pending declaration,
+`config.get` still supplies the daemon's last approved active view, unchanged;
+new keys absent from that view use the module's schema defaults. Its optional
+`declaration_pending` reply object is `{}` before a plan exists, or contains
+`plan_digest` for a pending plan carrying the new declaration. The module must
+not keep an editable file copy as its authority: only the daemon holds the
+approved store. With no approved active view, it still receives `config_gated`
+(`no_approved_config` availability), never permission to read unapproved files.
+
+The module can ACK the active view's catch-up attempt without activating a new
+generation. `ck config status` and settings report the declaration awaiting
+approval and, after that ACK, the module running its last approved settings.
+Approve a plan carrying the new declaration to deliver and activate the next
+generation normally. While the approved store is in recovery or the daemon has detected tampering (see Integrity and platform limits below), modules are refused as before; the fallback never serves a view the daemon cannot vouch for.
+
 While the config gate is on, script modules are refused with `program_refused`.
 This includes executable `#!` scripts and modules launched through a known
 interpreter such as Node, Bun, Deno, Python or sh, even when the script is listed

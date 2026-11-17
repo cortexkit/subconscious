@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.26.5
+
+- Expose pending declaration metadata while applying and acknowledging the
+  daemon-provided last approved settings.
+
 ## 0.26.4
 
 - Exit successfully after a daemon GOODBYE on an inherited registration

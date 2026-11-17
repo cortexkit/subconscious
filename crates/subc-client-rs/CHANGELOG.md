@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.41.4
+
+- Expose pending declaration metadata and acknowledge connection-local catch-up
+  of last approved active settings.
+
 ## 0.41.3
 
 - Supersedes the unpublished 0.41.2 settings client before its first release.

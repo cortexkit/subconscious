@@ -44,6 +44,7 @@ pub struct ConfigSchemaResponse {
 /// Effective settings and the layer documents that supplied them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConfigShowResponse {
+    pub declaration_pending: Option<subc_control::config::ConfigDeclarationPending>,
     pub module_id: String,
     pub project_id: Option<String>,
     pub through: Option<ConfigThrough>,
@@ -196,6 +197,7 @@ impl SubcConsumer {
                 layers,
                 pending_plan,
                 file_error,
+                declaration_pending,
             } => Ok(ConfigShowResponse {
                 module_id,
                 project_id,
@@ -207,6 +209,7 @@ impl SubcConsumer {
                 layers,
                 pending_plan,
                 file_error,
+                declaration_pending,
             }),
             _ => Err(unexpected("config.show")),
         }

@@ -539,14 +539,19 @@ async fn module_worker(
                 .await
             };
             if let Ok(view) = view {
-                if let Some(pending) = view.pending {
+                let declaration_fallback = view.declaration_pending.is_some();
+                if let Some(pending) = view
+                    .pending
+                    .or(view.active.filter(|_| declaration_fallback))
+                {
                     if let Some(attempt) = pending.attempt {
                         let generation = pending.generation;
-                        if module_work(owner, module, move |owner, module| {
-                            owner.route_policy_needed(&module, generation)
-                        })
-                        .await
-                        .unwrap_or(true)
+                        if !declaration_fallback
+                            && module_work(owner, module, move |owner, module| {
+                                owner.route_policy_needed(&module, generation)
+                            })
+                            .await
+                            .unwrap_or(true)
                         {
                             if let Err(error) = owner
                                 .install_approved_route_policy(module, pending.generation)

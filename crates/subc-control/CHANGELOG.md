@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.42.2
+
+- Expose pending module declarations in configuration status and settings.
+
 ## 0.42.1
 
 - Supersedes the unpublished 0.42.0 settings surface before its first release.

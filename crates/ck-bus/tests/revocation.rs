@@ -378,6 +378,7 @@ async fn plane_with(
         account_public,
         system,
         box_plane,
+        federation_account: None,
     }
 }
 
@@ -2333,6 +2334,7 @@ async fn a_claim_ck_bus_did_not_write_refuses_the_push_and_is_named() {
                 account_public,
                 system: stored,
                 box_plane: Arc::new(EmptyCensus),
+                federation_account: None,
             };
             Revoker::new(credentials, store.path(), Arc::new(Connections::default()))
                 .revoke(&plane, target(module))

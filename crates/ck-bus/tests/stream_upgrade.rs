@@ -1,18 +1,18 @@
-//! Upgrading a plane that ck-bus 0.1.29 built with five streams to the current nine
+//! Upgrading a plane that ck-bus 0.1.29 built with five streams to the current eleven
 //! streams and module durables, in place. This is the upgrade arm of the "Install
 //! bootstrap and own users" acceptance row in `docs/ck-bus.md`. The vault
 //! is the harness signer answered in process, the broker a real `nats-server`; no subc
 //! daemon is started.
 //!
-//! - Older wire configurations remain pinned in `EARLIER_STREAM_CONFIGS`. Only
-//!   EFFECT's age and message cap change; unset optional properties are omitted.
+//! - Older wire configurations remain pinned in `EARLIER_STREAM_CONFIGS`. EFFECT's age
+//!   and message cap and the hand-off destination policies change.
 //! - Live: boot once as the five-stream ck-bus did (newer streams and module durables
 //!   withheld), store one message on each stream, then boot the current ck-bus.
 //!   The five streams retain their creation times and messages, EFFECT updates in
 //!   place, the new streams exist with their limits, and
 //!   `m_basal` and `m_prefrontal` exist with the shipped durable configuration. The
 //!   room post published before `m_prefrontal` existed is pending on it. A further
-//!   boot leaves all nine streams and all module durables unchanged. Further cases cover
+//!   boot leaves all eleven streams and all module durables unchanged. Further cases cover
 //!   an existing event stream's cap and readers whose acknowledgement floors must survive.
 
 #[allow(dead_code)]
@@ -188,12 +188,29 @@ fn older_stream_wire_configs_change_only_the_reviewed_delivery_policies() {
             expected["max_age"] = json!(0);
             expected["max_msg_size"] = json!(16 * 1024);
         }
+        apply_expected_handoff_policy(&mut expected, GOLDEN_ACCOUNT, spec.kind);
         assert_eq!(
             emitted, expected,
             "{} changes only reviewed limits and optional-property omission",
             spec.name
         );
     }
+}
+
+fn apply_expected_handoff_policy(config: &mut Value, acct: &str, kind: StreamKind) {
+    let extra: &[&str] = match kind {
+        StreamKind::Room => &["room.fed.*.*.post"],
+        StreamKind::Wake => &["wake.fed.*.*.handoff"],
+        StreamKind::Peer => &["peer.fed.*.*.handoff", "peer.fed.*.custody"],
+        _ => return,
+    };
+    config["discard"] = json!("new");
+    config["max_age"] = json!(604_800_000_000_000_u64);
+    config["subjects"].as_array_mut().unwrap().extend(
+        extra
+            .iter()
+            .map(|suffix| json!(format!("ck.{acct}.{suffix}"))),
+    );
 }
 
 #[test]
@@ -373,6 +390,14 @@ impl BoxPlane for FiveStreamBox {
             earlier.max_age = Duration::from_secs(24 * 3600);
             earlier.max_message_size = None;
         }
+        if matches!(
+            earlier.kind,
+            StreamKind::Room | StreamKind::Wake | StreamKind::Peer
+        ) {
+            earlier.subjects.truncate(1);
+            earlier.discard = cortexkit_bus_naming::DiscardPolicy::Old;
+            earlier.max_age = Duration::from_secs(24 * 3600);
+        }
         self.0.ensure_stream(&earlier).await
     }
     async fn publish(&self, subject: &str, payload: Vec<u8>) -> Result<(), PlaneError> {
@@ -485,7 +510,7 @@ async fn consumer_state(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_five_stream_plane_upgrades_in_place_to_nine_streams_and_the_module_durables() {
+async fn stream_upgrade_keeps_old_room_wake_and_peer_messages_and_is_idempotent() {
     let _gate = harness::acceptance_gate().await;
     harness::install_tracing();
     let bin = match nats_server_bin() {
@@ -577,9 +602,24 @@ async fn a_five_stream_plane_upgrades_in_place_to_nine_streams_and_the_module_du
 
     // The current ck-bus boots on that plane.
     let broker = NatsBroker::new(server.url.clone(), credentials.clone());
-    drop(boot_with(&machine_id, &config, &broker, &deps).await);
+    let ready = boot_with(&machine_id, &config, &broker, &deps).await;
+    bootstrap::prefrontal_rename::reconcile(&ready, ["prefrontal"])
+        .await
+        .unwrap();
     for ((stream, _), earlier) in older.iter().zip(&before) {
         let mut expected = earlier.clone();
+        let kind = match stream {
+            name if name == &streams.room => StreamKind::Room,
+            name if name == &streams.wake => StreamKind::Wake,
+            name if name == &streams.peer => StreamKind::Peer,
+            _ => StreamKind::Effect,
+        };
+        if kind != StreamKind::Effect {
+            assert_eq!(expected.0["discard"], "old");
+            assert_eq!(expected.0["max_age"], 86_400_000_000_000_u64);
+            assert_eq!(expected.0["subjects"].as_array().unwrap().len(), 1);
+            apply_expected_handoff_policy(&mut expected.0, names.account(), kind);
+        }
         if stream == &streams.effect {
             assert_eq!(expected.0["max_age"], 86_400_000_000_000_u64);
             assert_eq!(expected.0["max_msg_size"], -1);
@@ -676,7 +716,7 @@ async fn a_five_stream_plane_upgrades_in_place_to_nine_streams_and_the_module_du
         .into_iter()
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    assert_eq!(all.len(), 9);
+    assert_eq!(all.len(), 11);
     let mut streams_before = Vec::new();
     for stream in &all {
         streams_before.push(stream_state(&js, stream).await);
@@ -686,7 +726,10 @@ async fn a_five_stream_plane_upgrades_in_place_to_nine_streams_and_the_module_du
         durables_before.push(consumer_state(&js, stream, durable).await);
     }
     assert_eq!(durables_before[0].2, 1, "m_basal holds the event for basal");
-    drop(boot_with(&machine_id, &config, &broker, &deps).await);
+    let ready = boot_with(&machine_id, &config, &broker, &deps).await;
+    bootstrap::prefrontal_rename::reconcile(&ready, ["prefrontal"])
+        .await
+        .unwrap();
     for (stream, earlier) in all.iter().zip(&streams_before) {
         assert_eq!(
             &stream_state(&js, stream).await,
@@ -816,6 +859,14 @@ impl UpgradePlane {
 
     async fn bootstrap(&self) -> Ready {
         boot_with(&self.machine_id, &self.config, &self.broker, &self.deps).await
+    }
+
+    async fn bootstrap_with_owner(&self, owner: &str) -> Ready {
+        let ready = self.bootstrap().await;
+        bootstrap::prefrontal_rename::reconcile(&ready, [owner])
+            .await
+            .unwrap();
+        ready
     }
 
     async fn store_event(&self, module: &str, event: &str) -> u64 {
@@ -1275,12 +1326,77 @@ async fn prefrontal_event_grant_pulls_and_acks_seven_token_events_but_refuses_ot
 }
 
 #[tokio::test]
-async fn module_buckets_owner_put_delete_and_declared_reader_get_watch() {
+async fn only_the_named_authority_can_info_pull_and_ack_each_federation_reader() {
     let _gate = harness::acceptance_gate().await;
     let Some(plane) = UpgradePlane::start().await else {
         return;
     };
     drop(plane.bootstrap().await);
+    let unrelated = plane.module_client("broca").await;
+    let current = plane.module_client("prefrontal").await;
+    let legacy = plane.module_client("prefrontal-core").await;
+    for (module, owner, other) in [
+        ("prefrontal", &current, &legacy),
+        ("prefrontal-core", &legacy, &current),
+    ] {
+        let durable = AccountNames::module_consumer_name(module).unwrap();
+        for stream in [&plane.names.streams().peer, &plane.names.streams().wake] {
+            for verb in ["INFO", "MSG.NEXT"] {
+                let subject = format!("$JS.API.CONSUMER.{verb}.{stream}.{durable}");
+                for refused in [&unrelated, other] {
+                    refused.publish(&subject, b"{}").await;
+                    refused.expect_denied(&subject).await;
+                }
+            }
+            let js = jetstream::new(owner.client.clone());
+            let reader: jetstream::consumer::Consumer<pull::Config> =
+                js.get_consumer_from_stream(&durable, stream).await.unwrap();
+            let info = reader.get_info().await.unwrap();
+            let filter = info
+                .config
+                .filter_subjects
+                .first()
+                .unwrap_or(&info.config.filter_subject);
+            let subject = filter.replace(['*', '>'], "probe");
+            plane
+                .js
+                .publish(subject, "handoff".into())
+                .await
+                .unwrap()
+                .await
+                .unwrap();
+            let delivered = reader
+                .fetch()
+                .max_messages(1)
+                .expires(Duration::from_secs(2))
+                .messages()
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(delivered.payload.as_ref(), b"handoff");
+            let ack = delivered.reply.as_ref().unwrap().as_str();
+            for refused in [&unrelated, other] {
+                refused.publish(ack, b"+ACK").await;
+                refused.expect_denied(ack).await;
+            }
+            delivered.double_ack().await.unwrap();
+            owner.expect_allowed(ack).await;
+            assert_eq!(reader.get_info().await.unwrap().num_ack_pending, 0);
+        }
+    }
+    plane.server.stop().await;
+}
+
+#[tokio::test]
+async fn module_buckets_owner_put_delete_and_declared_reader_get_watch() {
+    let _gate = harness::acceptance_gate().await;
+    let Some(plane) = UpgradePlane::start().await else {
+        return;
+    };
+    drop(plane.bootstrap_with_owner("prefrontal").await);
     // Exercise every declaration, including both participant and authority readers.
     for row in cortexkit_bus_naming::MODULE_BUCKETS {
         let bucket = plane.names.module_bucket_name(row.owner, row.name).unwrap();
@@ -1440,7 +1556,7 @@ async fn module_buckets_reconcile_limits_in_place_and_refuse_immutable_storage()
     let Some(plane) = UpgradePlane::start().await else {
         return;
     };
-    let ready = plane.bootstrap().await;
+    let ready = plane.bootstrap_with_owner("prefrontal").await;
     for row in cortexkit_bus_naming::MODULE_BUCKETS {
         let bucket = plane.names.module_bucket_name(row.owner, row.name).unwrap();
         let stream = format!("KV_{bucket}");

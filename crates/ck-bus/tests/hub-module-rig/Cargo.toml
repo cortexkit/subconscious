@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+
+[package]
+name = "ck-bus-hub-module-rig"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[test]]
+name = "hub_module_imports"
+path = "hub_module_imports.rs"
+
+[dev-dependencies]
+async-nats = "=0.50.0"
+base64 = "0.22"
+cortexkit-bus-naming = "=0.5.4"
+futures-util = "0.3"
+nkeys = "=0.4.5"
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+
+[lints.rust]
+unsafe_code = "forbid"

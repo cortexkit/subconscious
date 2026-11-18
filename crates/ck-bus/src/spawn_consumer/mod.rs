@@ -363,23 +363,33 @@ impl SpawnConsumer {
             );
             return true;
         }
-        match self
-            .census
-            .revoke(&event.module_id, Fence::Exited(event.spawn_generation))
-            .await
-        {
-            Ok(outcome) => {
-                log_event("ckbus.spawn.event", fields(revoked_json(&outcome)));
-                true
+        let hub_key =
+            cortexkit_bus_naming::federation::is_hub_module(&event.module_id).then(|| {
+                format!(
+                    "{}{}",
+                    crate::bootstrap::census::HUB_PREFIX,
+                    event.module_id
+                )
+            });
+        let mut complete = true;
+        for key in std::iter::once(event.module_id.as_str()).chain(hub_key.as_deref()) {
+            let mut outcome = match self
+                .census
+                .revoke(key, Fence::Exited(event.spawn_generation))
+                .await
+            {
+                Ok(outcome) => revoked_json(&outcome),
+                Err(error) => {
+                    complete = false;
+                    json!({ "deferred": error, "retry": "reconciliation" })
+                }
+            };
+            if key != event.module_id {
+                outcome["census_key"] = json!(key);
             }
-            Err(error) => {
-                log_event(
-                    "ckbus.spawn.event",
-                    fields(json!({ "deferred": error, "retry": "reconciliation" })),
-                );
-                false
-            }
+            log_event("ckbus.spawn.event", fields(outcome));
         }
+        complete
     }
 
     /// Lists the census, then snapshots, then revokes every entry the snapshot does not
@@ -400,9 +410,12 @@ impl SpawnConsumer {
         let mut complete = true;
         let mut judged = Vec::new();
         for entry in &entries {
-            if entry.module_id == self.own_module_id
+            let Some(module) = crate::bootstrap::census::module_for_key(&entry.module_id) else {
+                continue;
+            };
+            if module == self.own_module_id
                 || live
-                    .get(entry.module_id.as_str())
+                    .get(module)
                     .is_some_and(|generations| generations.contains(&entry.spawn_generation))
             {
                 continue;

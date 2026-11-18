@@ -1,8 +1,37 @@
 use super::*;
-use runtime::SentinelHealth;
 
 const OLD_DURABLE: &str = "m_prefrontal-core";
 const NEW_DURABLE: &str = "m_prefrontal";
+
+#[tokio::test]
+async fn fresh_boot_without_a_registered_owner_leaves_delivery_resources_absent() {
+    let _gate = harness::acceptance_gate().await;
+    let Some(plane) = UpgradePlane::start().await else {
+        return;
+    };
+    let ready = plane.bootstrap().await;
+    for stream in delivery_streams(&plane) {
+        for durable in [OLD_DURABLE, NEW_DURABLE] {
+            assert!(
+                ready
+                    .box_plane
+                    .consumer_state(stream, durable)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "boot created {durable} on {stream} without a registered owner"
+            );
+        }
+    }
+    for owner in ["prefrontal-core", "prefrontal"] {
+        let bucket = plane
+            .names
+            .module_bucket_name(owner, "session-liveness")
+            .unwrap();
+        assert!(plane.js.get_key_value(bucket).await.is_err());
+    }
+    plane.server.stop().await;
+}
 
 fn delivery_streams(plane: &UpgradePlane) -> [&str; 3] {
     let streams = plane.names.streams();
@@ -17,55 +46,26 @@ fn old_bucket(plane: &UpgradePlane) -> String {
 }
 
 async fn seed_old_readers(plane: &UpgradePlane) {
-    drop(plane.bootstrap().await);
-    for spec in bootstrap::module_durables::planned(&plane.names)
-        .unwrap()
-        .into_iter()
-        .filter(|spec| spec.durable == NEW_DURABLE)
-    {
-        plane
-            .js
-            .delete_consumer_from_stream(NEW_DURABLE, &spec.stream)
-            .await
-            .unwrap();
-        plane
-            .js
-            .create_consumer_on_stream(
-                pull::Config {
-                    durable_name: Some(OLD_DURABLE.into()),
-                    ack_policy: jetstream::consumer::AckPolicy::Explicit,
-                    ack_wait: spec.ack_wait,
-                    max_deliver: spec.max_deliver,
-                    max_ack_pending: spec.max_ack_pending,
-                    filter_subjects: spec
-                        .filter_subjects
-                        .iter()
-                        .map(|filter| filter.replace(".v1.prefrontal", ".v1.prefrontal-core"))
-                        .collect(),
-                    ..Default::default()
-                },
-                &spec.stream,
-            )
-            .await
-            .unwrap();
-    }
-    let bucket = old_bucket(plane);
-    let current = cortexkit_bus_naming::MODULE_BUCKETS
-        .iter()
-        .find(|bucket| bucket.owner == "prefrontal" && bucket.name == "session-liveness")
+    drop(plane.bootstrap_with_owner("prefrontal-core").await);
+    let store = plane.js.get_key_value(old_bucket(plane)).await.unwrap();
+    store
+        .put("agent_keep", "stale liveness".into())
+        .await
         .unwrap();
-    let mut config = bootstrap::plane::module_bucket_config(&plane.names, current).unwrap();
-    config.name = format!("KV_{bucket}");
-    config.subjects = vec![format!("$KV.{bucket}.>")];
-    plane.js.create_stream(config).await.unwrap();
+    // EVENT is not one of the transferred delivery readers.
     plane
         .js
-        .publish(format!("$KV.{bucket}.agent_keep"), "stale liveness".into())
-        .await
-        .unwrap()
+        .create_consumer_on_stream(
+            pull::Config {
+                durable_name: Some(OLD_DURABLE.into()),
+                ack_policy: jetstream::consumer::AckPolicy::Explicit,
+                filter_subject: format!("ck.{}.event.broca.>", plane.names.account()),
+                ..Default::default()
+            },
+            &plane.names.streams().event,
+        )
         .await
         .unwrap();
-    // An acknowledged EVENT cursor must survive even though delivery readers move.
     let sequence = plane.store_event("broca", "run").await;
     assert_eq!(plane.ack_one(OLD_DURABLE).await, sequence);
 }
@@ -101,7 +101,7 @@ async fn empty_delivery_readers_move_and_stale_bucket_is_deleted_but_event_curso
         let info = old_reader(&plane, stream).await.get_info().await.unwrap();
         assert_eq!((info.num_pending, info.num_ack_pending), (0, 0));
     }
-    let ready = plane.bootstrap().await;
+    let ready = plane.bootstrap_with_owner("prefrontal").await;
     assert_eq!(ready.orphaned_module_durables, 1);
     for stream in delivery_streams(&plane) {
         assert!(ready
@@ -132,126 +132,192 @@ async fn empty_delivery_readers_move_and_stale_bucket_is_deleted_but_event_curso
     plane.server.stop().await;
 }
 
-async fn refuses_busy_reader(ack_pending: bool) {
+#[tokio::test]
+async fn neither_or_both_registered_preserve_the_existing_delivery_resources() {
     let _gate = harness::acceptance_gate().await;
     let Some(plane) = UpgradePlane::start().await else {
         return;
     };
     seed_old_readers(&plane).await;
-    let event_before = plane.cursor(OLD_DURABLE).await;
-    for stream in delivery_streams(&plane) {
-        let reader = old_reader(&plane, stream).await;
-        let before = reader.get_info().await.unwrap();
-        let filter = before.config.filter_subjects.first().unwrap();
-        plane
-            .js
-            .publish(filter.replace('*', "rename"), "queued work".into())
-            .await
-            .unwrap()
+    let ready = plane.bootstrap().await;
+    let before = old_reader(&plane, &plane.names.streams().inbox)
+        .await
+        .get_info()
+        .await
+        .unwrap();
+    for modules in [vec![], vec!["prefrontal-core", "prefrontal"]] {
+        bootstrap::prefrontal_rename::reconcile(&ready, modules)
             .await
             .unwrap();
-        let message = if ack_pending {
-            Some(
-                reader
-                    .fetch()
-                    .max_messages(1)
-                    .messages()
-                    .await
-                    .unwrap()
-                    .next()
-                    .await
-                    .unwrap()
-                    .unwrap(),
-            )
-        } else {
-            None
-        };
-        let counts = if ack_pending { (0, 1) } else { (1, 0) };
-        let info = reader.get_info().await.unwrap();
-        assert_eq!((info.num_pending, info.num_ack_pending), counts);
-        let failure = match boot(
-            Some(&plane.machine_id),
-            BrokerInputs {
-                config: &plane.config,
-                broker: &plane.broker,
-            },
-            &plane.deps,
-        )
-        .await
-        {
-            Err(failure) => failure,
-            Ok(_) => panic!("busy old reader on {stream} must refuse the move"),
-        };
-        assert_eq!(
-            failure.cause,
-            bootstrap::cause::DELIVERY_DURABLE_MOVE_REFUSED
-        );
-        assert!(
-            !failure.retry,
-            "rollback requires an operator, not a background retry"
-        );
-        let health = bootstrap::BootstrapHealth::default();
-        health.record_failure(failure);
-        let report = health.report_health().await.unwrap();
-        assert_eq!(report.status, subc_protocol::session::HealthStatus::Failing);
-        for text in [
-            stream.to_string(),
-            format!("pending={}", counts.0),
-            format!("ack_pending={}", counts.1),
-        ] {
-            assert!(
-                report.detail.as_ref().unwrap().contains(&text),
-                "{report:?}"
-            );
-            assert!(report.metrics.as_ref().unwrap()["message"]
-                .as_str()
+        for stream in delivery_streams(&plane) {
+            assert!(ready
+                .box_plane
+                .consumer_state(stream, NEW_DURABLE)
+                .await
                 .unwrap()
-                .contains(&text));
+                .is_none());
+            assert!(ready
+                .box_plane
+                .consumer_state(stream, OLD_DURABLE)
+                .await
+                .unwrap()
+                .is_some());
         }
-        let after = reader.get_info().await.unwrap();
+        let after = old_reader(&plane, &plane.names.streams().inbox)
+            .await
+            .get_info()
+            .await
+            .unwrap();
         assert_eq!(after.created, before.created);
-        assert_eq!((after.num_pending, after.num_ack_pending), counts);
-        for untouched in delivery_streams(&plane) {
-            assert!(plane
-                .js
-                .get_consumer_from_stream::<pull::Config, _, _>(NEW_DURABLE, untouched)
-                .await
-                .is_err());
-            assert!(plane
-                .js
-                .get_consumer_from_stream::<pull::Config, _, _>(OLD_DURABLE, untouched)
-                .await
-                .is_ok());
-        }
         assert_old_bucket_retained(&plane).await;
-        assert_eq!(plane.cursor(OLD_DURABLE).await, event_before);
-        // Drain only after checking refusal, so the next stream is tested independently.
-        let message = match message {
-            Some(message) => message,
-            None => reader
-                .fetch()
-                .max_messages(1)
-                .messages()
-                .await
-                .unwrap()
-                .next()
-                .await
-                .unwrap()
-                .unwrap(),
-        };
-        message.double_ack().await.unwrap();
     }
     plane.server.stop().await;
 }
 
 #[tokio::test]
-async fn pending_delivery_refuses_move_reports_health_and_retains_old_bucket() {
-    refuses_busy_reader(false).await;
+async fn rollback_moves_busy_workqueues_without_losing_pending_or_unacked_messages() {
+    let _gate = harness::acceptance_gate().await;
+    let Some(plane) = UpgradePlane::start().await else {
+        return;
+    };
+    let before = plane.bootstrap_with_owner("prefrontal").await;
+    let streams = plane.names.streams();
+    for stream in [&streams.inbox, &streams.core_work] {
+        let reader: jetstream::consumer::Consumer<pull::Config> = plane
+            .js
+            .get_consumer_from_stream(NEW_DURABLE, stream)
+            .await
+            .unwrap();
+        let state = before
+            .box_plane
+            .consumer_state(stream, NEW_DURABLE)
+            .await
+            .unwrap()
+            .unwrap();
+        let subject = state.config.filter_subjects[0].replace('*', "move");
+        for body in ["unacked", "pending"] {
+            plane
+                .js
+                .publish(subject.clone(), body.into())
+                .await
+                .unwrap()
+                .await
+                .unwrap();
+        }
+        let first = pull_one(&reader).await;
+        assert_eq!(first.payload.as_ref(), b"unacked");
+        let info = reader.get_info().await.unwrap();
+        assert_eq!((info.num_pending, info.num_ack_pending), (1, 1));
+    }
+    let ready = plane.bootstrap_with_owner("prefrontal-core").await;
+    for stream in delivery_streams(&plane) {
+        assert!(ready
+            .box_plane
+            .consumer_state(stream, NEW_DURABLE)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(ready
+            .box_plane
+            .consumer_state(stream, OLD_DURABLE)
+            .await
+            .unwrap()
+            .is_some());
+    }
+    for stream in [&streams.inbox, &streams.core_work] {
+        let reader = old_reader(&plane, stream).await;
+        for expected in [b"unacked".as_slice(), b"pending".as_slice()] {
+            let message = pull_one(&reader).await;
+            assert_eq!(message.payload.as_ref(), expected);
+            message.double_ack().await.unwrap();
+        }
+    }
+    let owner = plane.module_client("prefrontal-core").await;
+    let own_store = jetstream::new(owner.client.clone())
+        .get_key_value(old_bucket(&plane))
+        .await
+        .unwrap();
+    assert!(own_store.get("agent_new").await.unwrap().is_none());
+    own_store.put("agent_old", "liveness".into()).await.unwrap();
+    let current_bucket = plane
+        .names
+        .module_bucket_name("prefrontal", "session-liveness")
+        .unwrap();
+    assert!(plane.js.get_key_value(current_bucket).await.is_err());
+    plane.server.stop().await;
+}
+
+async fn pull_one(reader: &jetstream::consumer::Consumer<pull::Config>) -> jetstream::Message {
+    reader
+        .fetch()
+        .max_messages(1)
+        .expires(Duration::from_secs(2))
+        .messages()
+        .await
+        .unwrap()
+        .next()
+        .await
+        .expect("one delivery")
+        .unwrap()
 }
 
 #[tokio::test]
-async fn ack_pending_delivery_refuses_move_reports_health_and_retains_old_bucket() {
-    refuses_busy_reader(true).await;
+async fn room_replacement_starts_after_the_ack_floor_not_at_the_first_retained_post() {
+    let _gate = harness::acceptance_gate().await;
+    let Some(plane) = UpgradePlane::start().await else {
+        return;
+    };
+    let ready = plane.bootstrap_with_owner("prefrontal-core").await;
+    let room = &plane.names.streams().room;
+    for body in ["old", "next"] {
+        plane
+            .js
+            .publish(plane.names.room_post("room_move").unwrap(), body.into())
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+    }
+    let previous = old_reader(&plane, room).await;
+    let old = pull_one(&previous).await;
+    old.double_ack().await.unwrap();
+    let floor = previous.get_info().await.unwrap().ack_floor.stream_sequence;
+    assert!(floor > 0);
+    assert_eq!(
+        plane
+            .js
+            .get_stream(room)
+            .await
+            .unwrap()
+            .cached_info()
+            .state
+            .messages,
+        2
+    );
+    bootstrap::prefrontal_rename::reconcile(&ready, ["prefrontal"])
+        .await
+        .unwrap();
+    let replacement: jetstream::consumer::Consumer<pull::Config> = plane
+        .js
+        .get_consumer_from_stream(NEW_DURABLE, room)
+        .await
+        .unwrap();
+    assert_eq!(
+        replacement.get_info().await.unwrap().config.deliver_policy,
+        jetstream::consumer::DeliverPolicy::ByStartSequence {
+            start_sequence: floor + 1
+        }
+    );
+    let next = pull_one(&replacement).await;
+    assert_eq!(next.info().unwrap().stream_sequence, floor + 1);
+    assert_eq!(next.payload.as_ref(), b"next");
+    assert!(ready
+        .box_plane
+        .consumer_state(room, OLD_DURABLE)
+        .await
+        .unwrap()
+        .is_none());
+    plane.server.stop().await;
 }
 
 #[tokio::test]
@@ -261,7 +327,7 @@ async fn second_start_keeps_new_delivery_cursors_and_bucket_while_old_bucket_sta
         return;
     };
     seed_old_readers(&plane).await;
-    drop(plane.bootstrap().await);
+    drop(plane.bootstrap_with_owner("prefrontal").await);
     let mut before = Vec::new();
     for stream in delivery_streams(&plane) {
         let reader: jetstream::consumer::Consumer<pull::Config> = plane
@@ -309,7 +375,7 @@ async fn second_start_keeps_new_delivery_cursors_and_bucket_while_old_bucket_sta
         .unwrap()
         .cached_info()
         .created;
-    drop(plane.bootstrap().await);
+    drop(plane.bootstrap_with_owner("prefrontal").await);
     for (stream, before) in before {
         let reader: jetstream::consumer::Consumer<pull::Config> = plane
             .js

@@ -78,6 +78,8 @@ allow delivery-authority publish ck.box_goldenfixture.delivery.dead
 allow delivery-authority publish ck.box_goldenfixture.effect.*.*.intent
 allow delivery-authority publish ck.box_goldenfixture.effect.dead
 allow delivery-authority publish ck.box_goldenfixture.event.prefrontal.>
+allow delivery-authority publish ck.box_goldenfixture.fedsend.*.peer.>
+allow delivery-authority publish ck.box_goldenfixture.fedsend.*.wake.>
 allow delivery-authority publish ck.box_goldenfixture.inbox.head.*.ready
 allow delivery-authority publish ck.box_goldenfixture.inbox.worker.*.ready
 allow delivery-authority publish ck.box_goldenfixture.peer.*.*.deliver
@@ -94,6 +96,8 @@ allow bus publish $JS.API.CONSUMER.CREATE.CK_BOX_GOLDENFIXTURE_DELIVERY_DEAD.>
 allow bus publish $JS.API.CONSUMER.CREATE.CK_BOX_GOLDENFIXTURE_EFFECT.>
 allow bus publish $JS.API.CONSUMER.CREATE.CK_BOX_GOLDENFIXTURE_EFFECT_DEAD.>
 allow bus publish $JS.API.CONSUMER.CREATE.CK_BOX_GOLDENFIXTURE_EVENT.>
+allow bus publish $JS.API.CONSUMER.CREATE.CK_BOX_GOLDENFIXTURE_FEDSEND.>
+allow bus publish $JS.API.CONSUMER.CREATE.CK_BOX_GOLDENFIXTURE_FEDSEND_DEAD.>
 allow bus publish $JS.API.CONSUMER.CREATE.CK_BOX_GOLDENFIXTURE_INBOX.>
 allow bus publish $JS.API.CONSUMER.CREATE.CK_BOX_GOLDENFIXTURE_PEER.>
 allow bus publish $JS.API.CONSUMER.CREATE.CK_BOX_GOLDENFIXTURE_ROOM.>
@@ -105,6 +109,8 @@ allow bus publish $JS.API.CONSUMER.DELETE.CK_BOX_GOLDENFIXTURE_DELIVERY_DEAD.>
 allow bus publish $JS.API.CONSUMER.DELETE.CK_BOX_GOLDENFIXTURE_EFFECT.>
 allow bus publish $JS.API.CONSUMER.DELETE.CK_BOX_GOLDENFIXTURE_EFFECT_DEAD.>
 allow bus publish $JS.API.CONSUMER.DELETE.CK_BOX_GOLDENFIXTURE_EVENT.>
+allow bus publish $JS.API.CONSUMER.DELETE.CK_BOX_GOLDENFIXTURE_FEDSEND.>
+allow bus publish $JS.API.CONSUMER.DELETE.CK_BOX_GOLDENFIXTURE_FEDSEND_DEAD.>
 allow bus publish $JS.API.CONSUMER.DELETE.CK_BOX_GOLDENFIXTURE_INBOX.>
 allow bus publish $JS.API.CONSUMER.DELETE.CK_BOX_GOLDENFIXTURE_PEER.>
 allow bus publish $JS.API.CONSUMER.DELETE.CK_BOX_GOLDENFIXTURE_ROOM.>
@@ -115,6 +121,8 @@ allow bus publish $JS.API.CONSUMER.DURABLE.CREATE.CK_BOX_GOLDENFIXTURE_DELIVERY_
 allow bus publish $JS.API.CONSUMER.DURABLE.CREATE.CK_BOX_GOLDENFIXTURE_EFFECT.>
 allow bus publish $JS.API.CONSUMER.DURABLE.CREATE.CK_BOX_GOLDENFIXTURE_EFFECT_DEAD.>
 allow bus publish $JS.API.CONSUMER.DURABLE.CREATE.CK_BOX_GOLDENFIXTURE_EVENT.>
+allow bus publish $JS.API.CONSUMER.DURABLE.CREATE.CK_BOX_GOLDENFIXTURE_FEDSEND.>
+allow bus publish $JS.API.CONSUMER.DURABLE.CREATE.CK_BOX_GOLDENFIXTURE_FEDSEND_DEAD.>
 allow bus publish $JS.API.CONSUMER.DURABLE.CREATE.CK_BOX_GOLDENFIXTURE_INBOX.>
 allow bus publish $JS.API.CONSUMER.DURABLE.CREATE.CK_BOX_GOLDENFIXTURE_PEER.>
 allow bus publish $JS.API.CONSUMER.DURABLE.CREATE.CK_BOX_GOLDENFIXTURE_ROOM.>
@@ -127,6 +135,8 @@ allow bus publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EFFECT.>
 allow bus publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EFFECT_DEAD.>
 allow bus publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EFFECT_DEAD.c_ckbus_dead
 allow bus publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EVENT.>
+allow bus publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_FEDSEND.>
+allow bus publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_FEDSEND_DEAD.>
 allow bus publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_INBOX.>
 allow bus publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_PEER.>
 allow bus publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_ROOM.>
@@ -142,6 +152,8 @@ allow bus publish $JS.API.STREAM.CREATE.CK_BOX_GOLDENFIXTURE_DELIVERY_DEAD
 allow bus publish $JS.API.STREAM.CREATE.CK_BOX_GOLDENFIXTURE_EFFECT
 allow bus publish $JS.API.STREAM.CREATE.CK_BOX_GOLDENFIXTURE_EFFECT_DEAD
 allow bus publish $JS.API.STREAM.CREATE.CK_BOX_GOLDENFIXTURE_EVENT
+allow bus publish $JS.API.STREAM.CREATE.CK_BOX_GOLDENFIXTURE_FEDSEND
+allow bus publish $JS.API.STREAM.CREATE.CK_BOX_GOLDENFIXTURE_FEDSEND_DEAD
 allow bus publish $JS.API.STREAM.CREATE.CK_BOX_GOLDENFIXTURE_INBOX
 allow bus publish $JS.API.STREAM.CREATE.CK_BOX_GOLDENFIXTURE_PEER
 allow bus publish $JS.API.STREAM.CREATE.CK_BOX_GOLDENFIXTURE_ROOM
@@ -152,6 +164,8 @@ allow bus publish $JS.API.STREAM.DELETE.CK_BOX_GOLDENFIXTURE_DELIVERY_DEAD
 allow bus publish $JS.API.STREAM.DELETE.CK_BOX_GOLDENFIXTURE_EFFECT
 allow bus publish $JS.API.STREAM.DELETE.CK_BOX_GOLDENFIXTURE_EFFECT_DEAD
 allow bus publish $JS.API.STREAM.DELETE.CK_BOX_GOLDENFIXTURE_EVENT
+allow bus publish $JS.API.STREAM.DELETE.CK_BOX_GOLDENFIXTURE_FEDSEND
+allow bus publish $JS.API.STREAM.DELETE.CK_BOX_GOLDENFIXTURE_FEDSEND_DEAD
 allow bus publish $JS.API.STREAM.DELETE.CK_BOX_GOLDENFIXTURE_INBOX
 allow bus publish $JS.API.STREAM.DELETE.CK_BOX_GOLDENFIXTURE_PEER
 allow bus publish $JS.API.STREAM.DELETE.CK_BOX_GOLDENFIXTURE_ROOM
@@ -161,6 +175,8 @@ allow bus publish $JS.API.STREAM.INFO.CK_BOX_GOLDENFIXTURE_DELIVERY_DEAD
 allow bus publish $JS.API.STREAM.INFO.CK_BOX_GOLDENFIXTURE_EFFECT
 allow bus publish $JS.API.STREAM.INFO.CK_BOX_GOLDENFIXTURE_EFFECT_DEAD
 allow bus publish $JS.API.STREAM.INFO.CK_BOX_GOLDENFIXTURE_EVENT
+allow bus publish $JS.API.STREAM.INFO.CK_BOX_GOLDENFIXTURE_FEDSEND
+allow bus publish $JS.API.STREAM.INFO.CK_BOX_GOLDENFIXTURE_FEDSEND_DEAD
 allow bus publish $JS.API.STREAM.INFO.CK_BOX_GOLDENFIXTURE_INBOX
 allow bus publish $JS.API.STREAM.INFO.CK_BOX_GOLDENFIXTURE_PEER
 allow bus publish $JS.API.STREAM.INFO.CK_BOX_GOLDENFIXTURE_ROOM
@@ -175,6 +191,8 @@ allow bus publish $JS.API.STREAM.UPDATE.CK_BOX_GOLDENFIXTURE_DELIVERY_DEAD
 allow bus publish $JS.API.STREAM.UPDATE.CK_BOX_GOLDENFIXTURE_EFFECT
 allow bus publish $JS.API.STREAM.UPDATE.CK_BOX_GOLDENFIXTURE_EFFECT_DEAD
 allow bus publish $JS.API.STREAM.UPDATE.CK_BOX_GOLDENFIXTURE_EVENT
+allow bus publish $JS.API.STREAM.UPDATE.CK_BOX_GOLDENFIXTURE_FEDSEND
+allow bus publish $JS.API.STREAM.UPDATE.CK_BOX_GOLDENFIXTURE_FEDSEND_DEAD
 allow bus publish $JS.API.STREAM.UPDATE.CK_BOX_GOLDENFIXTURE_INBOX
 allow bus publish $JS.API.STREAM.UPDATE.CK_BOX_GOLDENFIXTURE_PEER
 allow bus publish $JS.API.STREAM.UPDATE.CK_BOX_GOLDENFIXTURE_ROOM
@@ -183,6 +201,7 @@ allow bus publish $JS.API.STREAM.UPDATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS
 allow bus publish $KV.CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow bus publish _INBOX.ckbus.>
 allow bus publish ck.box_goldenfixture.event.subc.activity.v1
+allow bus publish ck.box_goldenfixture.fedsend_dead.>
 allow bus publish ck.box_goldenfixture.sentinel.ping
 allow bus subscribe $KV.CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow bus subscribe _INBOX.ckbus.>
@@ -329,6 +348,9 @@ allow cerebellum publish ck.box_goldenfixture.effect.dead
 allow cerebellum publish ck.box_goldenfixture.event.cerebellum.>
 allow cerebellum subscribe $KV.CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow cerebellum subscribe _INBOX.cerebellum.>
+allow cerebellum subscribe ck.box_goldenfixture.event.broca.run.ended.v1
+allow cerebellum subscribe ck.box_goldenfixture.event.broca.run.paused.v1
+allow cerebellum subscribe ck.box_goldenfixture.event.broca.run.started.v1
 allow colliculus publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EFFECT.*.>
 allow colliculus publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EVENT.m_colliculus_events.>
 allow colliculus publish $JS.ACK.CK_BOX_GOLDENFIXTURE_PEER.*.>

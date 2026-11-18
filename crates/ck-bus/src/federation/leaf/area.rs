@@ -263,6 +263,12 @@ impl LeafArea {
         self.published.borrow().clone()
     }
 
+    pub fn has_hub_link(&self) -> bool {
+        let inner = self.inner();
+        inner.link.connected == Some(true)
+            && matches!(inner.remote_state, "connected" | "connected_via_bridge")
+    }
+
     /// The `fed.` entries health carries. They never change the module's status: the
     /// local bus works without a hub.
     pub fn health_metrics(&self) -> Map<String, Value> {

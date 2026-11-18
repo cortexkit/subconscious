@@ -23,13 +23,17 @@ pub trait PairedDevices: Send + Sync {
 pub enum HubStream {
     /// `HUB_INBOX_{box}`, one per machine, created when that machine's first leaf JWT
     /// is issued.
-    Inbox { box_id: String },
+    Inbox {
+        box_id: String,
+    },
     /// The account-wide shared identity log, `HUB_IDLOG`.
     IdLog,
     /// The account-wide residence records, the KV bucket `residence` (`KV_residence`).
     Residence,
     /// The account-wide move cuts, the object store `cuts` (`OBJ_cuts`).
     Cuts,
+    Rooms,
+    Memory,
 }
 
 /// The hub instance, through ck-bus's own users on its loopback admin listener.

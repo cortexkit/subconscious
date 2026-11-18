@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.10.0
+
+- Require cortexkit-bus-naming 0.5.4. Reconcile ROOM, WAKE and PEER in place with seven-day retention, discard-new, and exact inbound federation bindings. Provision the hand-off and shared hub streams and the federation-only readers.
+- Apply box-account publish denies to every user. Revoke changed logins at boot so clients fetch the new permissions, including cerebellum's raw run-event subscriptions.
+- Issue and renew scoped hub credentials for eligible modules over the existing local server, with separate census entries and access limited to each module's hub streams.
+- Move the delivery readers and session-liveness bucket to the sole registered prefrontal authority, in either direction, without blocking bus startup. Preserve work-queue messages and resume ROOM after the old acknowledgement floor.
+- Restrict each federation-only WAKE and PEER reader to its named authority. Keep those readers out of the agent-durable list.
+
 ## 0.9.1
 
 - `fed.remote_state` reports `connected_via_bridge` only when the live leaf link's peer is

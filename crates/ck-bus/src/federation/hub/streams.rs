@@ -2,8 +2,8 @@
 
 use async_nats::jetstream::stream;
 use cortexkit_bus_naming::federation::{
-    cuts_object_store, hub_idlog_stream, hub_inbox_stream, residence_bucket, BoxId, HubKind,
-    HubStreamSpec,
+    cuts_object_store, hub_idlog_stream, hub_inbox_stream, hub_memory_stream, hub_rooms_stream,
+    residence_bucket, BoxId, HubKind, HubStreamSpec,
 };
 
 use super::seams::HubStream;
@@ -20,6 +20,8 @@ pub fn config_for(hub_stream: &HubStream) -> Result<stream::Config, String> {
         // One server, so one replica.
         HubStream::Residence => residence_bucket(HubKind::SelfHosted).backing_stream,
         HubStream::Cuts => cuts_object_store(),
+        HubStream::Rooms => hub_rooms_stream(),
+        HubStream::Memory => hub_memory_stream(),
     };
     Ok(hub_config(&spec))
 }
@@ -43,7 +45,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_four_hub_streams_follow_the_naming_crate() {
+    fn hub_streams_follow_the_naming_crate() {
         let inbox = config_for(&HubStream::Inbox {
             box_id: "0123456789abcdef0123456789abcdef".to_string(),
         })
@@ -70,5 +72,17 @@ mod tests {
         assert_eq!(cuts.name, "OBJ_cuts");
         assert!(cuts.allow_rollup);
         assert_eq!(cuts.discard, stream::DiscardPolicy::New);
+
+        let rooms = config_for(&HubStream::Rooms).unwrap();
+        assert_eq!(rooms.name, "HUB_ROOMS");
+        assert_eq!(rooms.max_messages_per_subject, 100_000);
+        assert_eq!(rooms.max_message_size, 256 * 1024);
+        assert_eq!(rooms.max_age, Duration::ZERO);
+
+        let memory = config_for(&HubStream::Memory).unwrap();
+        assert_eq!(memory.name, "HUB_MEMORY");
+        assert_eq!(memory.subjects, ["ck.fleet.memory.*.*"]);
+        assert_eq!(memory.max_message_size, 64 * 1024);
+        assert_eq!(memory.discard, stream::DiscardPolicy::New);
     }
 }

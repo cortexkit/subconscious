@@ -20,6 +20,10 @@ path; a missing broker input answers health down with cause `broker-config-absen
 `SUBC_MODULE_ID`, `SUBC_LAUNCH_NONCE` and `--subc <connection file>` come from the
 daemon.
 
+Hub-capable modules use `ckbus.hub_credential` and `ckbus.hub_credential_renew` for
+a separate, scoped connection to the same local server. See [the credential ops](../../docs/ck-bus.md#credential-ops)
+for the reply and refusals.
+
 ## Server requirements
 
 The local server runs in operator mode with the full (directory) resolver, the system

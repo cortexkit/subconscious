@@ -14,9 +14,9 @@
 //! is pushed and the seed is dropped. Each process then re-signs the account JWT with
 //! the operator signer, pushes it through the system account and reads it back.
 //!
-//! JetStream is enabled (every limit explicit, as for the box account), but no stream is
-//! created here: the message path creates its outbox and inbox when it lands.
+//! FEDOUT is reconciled at boot when the federation signing key is available.
 
+use cortexkit_bus_naming::federation::fedout_stream;
 use nkeys::KeyPair;
 use serde_json::Value;
 
@@ -24,11 +24,83 @@ use crate::{
     bootstrap::{
         account_jwt::AccountClaims,
         account_jwt::{decode_claims, prune_revocations, revocations, sign_account_jwt},
-        plane::{apply_account_jwt, SystemPlane},
+        plane::{apply_account_jwt, Broker, SystemPlane},
         store::{AccountFile, AccountRecord, Store},
     },
-    credentials::{roots::RootCredential, Credentials},
+    credentials::{
+        issue::{sign_user_jwt, UserJwtRequest},
+        nkey::{encode_public, NkeyRole},
+        roots::RootCredential,
+        vault::VaultError,
+        Credentials,
+    },
+    grants::{Grant, GrantRole},
 };
+
+pub async fn provision_fedout(
+    system: &dyn SystemPlane,
+    broker: &dyn Broker,
+    credentials: &Credentials,
+    store: &Store,
+    machine_id: &str,
+) -> Result<Option<String>, String> {
+    let root = RootCredential::FederationAccount
+        .credential_id()
+        .map_err(|e| e.to_string())?;
+    let signing_key = match credentials.vault.public_key(&root).await {
+        Ok(key) => encode_public(NkeyRole::Account, &key.public),
+        Err(VaultError::RootKeyUnreachable { .. }) => return Ok(None),
+        Err(error) => {
+            super::log_event(
+                "ckbus.federation.signer_unavailable",
+                serde_json::json!({"reason": error.to_string()}),
+            );
+            return Ok(None);
+        }
+    };
+    let account = ensure_account(system, credentials, store, machine_id, Some(signing_key)).await?;
+    let spec = fedout_stream();
+    let user = credentials.custody.generate_user();
+    let result = async {
+        let grant = Grant::with_denies(
+            GrantRole::BusModule,
+            &federation_account_name(machine_id),
+            ["INFO", "CREATE", "UPDATE"]
+                .into_iter()
+                .map(|verb| format!("$JS.API.STREAM.{verb}.{}", spec.name))
+                .collect(),
+            [format!("_INBOX.{user}.>")].into(),
+            Vec::new(),
+        );
+        let issued_at = unix_now();
+        let signed = sign_user_jwt(
+            credentials.vault.as_ref(),
+            &credentials.key_ids,
+            &UserJwtRequest {
+                root_credential_id: &root,
+                user_public: &user,
+                issuer_account: Some(&account),
+                name: "ckbus-fedout",
+                issued_at,
+                expires_at: credentials.lifetime.expires_at(issued_at),
+                grant: &grant,
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let plane = broker
+            .connect_box(&signed.jwt, &user)
+            .await
+            .map_err(|error| error.message)?;
+        plane
+            .ensure_stream(&spec)
+            .await
+            .map_err(|error| error.message)
+    }
+    .await;
+    credentials.custody.forget(&user);
+    result.map(|()| Some(account))
+}
 
 /// The federation account's name for a machine id.
 pub fn federation_account_name(machine_id: &str) -> String {
@@ -43,6 +115,30 @@ pub async fn ensure_federation_account(
     store: &Store,
     machine_id: &str,
 ) -> Result<String, String> {
+    ensure_account(system, credentials, store, machine_id, None).await
+}
+
+pub(crate) async fn ensure_account(
+    system: &dyn SystemPlane,
+    credentials: &Credentials,
+    store: &Store,
+    machine_id: &str,
+    signing_key: Option<String>,
+) -> Result<String, String> {
+    let _update = credentials.federation_account_update.lock().await;
+    if let Some(expected) = &signing_key {
+        let root = RootCredential::FederationAccount
+            .credential_id()
+            .map_err(|e| e.to_string())?;
+        let current = credentials
+            .vault
+            .public_key(&root)
+            .await
+            .map_err(|e| e.to_string())?;
+        if encode_public(NkeyRole::Account, &current.public) != *expected {
+            return Err("the federation signing key changed during issuance".to_owned());
+        }
+    }
     let acct = federation_account_name(machine_id);
     let (record, existing) = match store.read_federation_account() {
         AccountFile::Damaged { path, reason } => {
@@ -79,6 +175,14 @@ pub async fn ensure_federation_account(
             ));
         }
     }
+    if let Some(key) = &signing_key {
+        if existing
+            .as_ref()
+            .is_some_and(|claims| claims["nats"]["signing_keys"] == serde_json::json!([key]))
+        {
+            return Ok(record.account_public);
+        }
+    }
 
     let signer_id = RootCredential::OperatorSigner
         .credential_id()
@@ -94,11 +198,17 @@ pub async fn ensure_federation_account(
     let claims = AccountClaims {
         account_public: record.account_public.clone(),
         name: record.acct.clone(),
-        // No signing key yet, unlike the box account: the leaf remote binds this account
-        // without any user in it, so nothing needs to sign one. The message path adds the
-        // federation root (`RootCredential::FederationAccount`) here, and re-issues this
-        // JWT, when it first needs a federation-account user.
-        signing_keys: Vec::new(),
+        // Without a new signer, retain the keys already listed in the account JWT.
+        signing_keys: signing_key.map(|key| vec![key]).unwrap_or_else(|| {
+            existing
+                .as_ref()
+                .and_then(|claims| claims["nats"]["signing_keys"].as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        }),
         revocations: revoked,
         issued_at: now.max(previous_iat + 1),
     };
@@ -173,6 +283,3 @@ fn unix_now() -> i64 {
         .map(|elapsed| elapsed.as_secs() as i64)
         .unwrap_or_default()
 }
-
-#[cfg(test)]
-mod tests;

@@ -17,10 +17,11 @@
 use std::{collections::BTreeSet, error::Error, fmt};
 
 use cortexkit_bus_naming::{
-    bus_permissions, delivery_authority_permissions, flow_engine_consumer_spec,
+    box_account_denies, bus_permissions, delivery_authority_permissions, flow_engine_consumer_spec,
     flow_engine_permissions, generate_permission_golden, live_hint_subscriptions,
     participant_permissions, system_permissions, validate_permission_file, AccountNames,
-    AllowEntry, GoldenFixture, GrantError, NamingError, Operation, Principal,
+    AllowEntry, DenyEntry, GoldenFixture, GrantError, ModuleBucket, NamingError, Operation,
+    Principal, MODULE_BUCKETS,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -112,14 +113,15 @@ impl From<NamingError> for GrantRefusal {
     }
 }
 
-/// One role's checked, allow-only permission set. There is no deny list: absence from
-/// the allow lists is the denial, and the type has nowhere to put a deny entry.
+/// One role's permission set, including explicit denies that take precedence over allows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Grant {
     role: GrantRole,
     account: String,
     publish: BTreeSet<String>,
     subscribe: BTreeSet<String>,
+    publish_deny: BTreeSet<String>,
+    subscribe_deny: BTreeSet<String>,
 }
 
 impl Grant {
@@ -150,12 +152,60 @@ impl Grant {
             };
         }
         validate_role_entries(&entries, account)?;
-        Ok(Self {
+        Ok(Self::with_denies(
             role,
-            account: account.account().to_owned(),
+            account.account(),
             publish,
             subscribe,
-        })
+            box_account_denies(account),
+        ))
+    }
+
+    pub(crate) fn with_denies(
+        role: GrantRole,
+        account: &str,
+        publish: BTreeSet<String>,
+        subscribe: BTreeSet<String>,
+        denies: Vec<DenyEntry>,
+    ) -> Self {
+        let mut grant = Self {
+            role,
+            account: account.to_owned(),
+            publish,
+            subscribe,
+            publish_deny: BTreeSet::new(),
+            subscribe_deny: BTreeSet::new(),
+        };
+        for deny in denies {
+            match deny.operation {
+                Operation::Publish => grant.publish_deny.insert(deny.subject),
+                Operation::Subscribe => grant.subscribe_deny.insert(deny.subject),
+            };
+        }
+        grant
+    }
+
+    fn deny_foreign_federation_readers(
+        &mut self,
+        account: &AccountNames,
+        owner: Option<&str>,
+    ) -> Result<(), GrantRefusal> {
+        // Agent consumers share these streams. Their whole-token wildcard also matches
+        // the federation readers, so the JWT must exclude the exact foreign names.
+        for module in DELIVERY_AUTHORITY_MODULES
+            .into_iter()
+            .filter(|id| Some(*id) != owner)
+        {
+            let durable = AccountNames::module_consumer_name(module)?;
+            for stream in [&account.streams().peer, &account.streams().wake] {
+                self.publish_deny.extend([
+                    format!("$JS.API.CONSUMER.MSG.NEXT.{stream}.{durable}"),
+                    format!("$JS.API.CONSUMER.INFO.{stream}.{durable}"),
+                    format!("$JS.ACK.{stream}.{durable}.>"),
+                ]);
+            }
+        }
+        Ok(())
     }
 
     pub fn role(&self) -> GrantRole {
@@ -192,22 +242,30 @@ impl Grant {
         publish.chain(subscribe).collect()
     }
 
-    /// The `pub` and `sub` members of a NATS user JWT's `nats` claim. Only `allow` lists
-    /// are emitted; a `deny` list would carve exceptions out of a broader allow, which the
-    /// foundation forbids.
+    /// The `pub` and `sub` members of a NATS user JWT's `nats` claim.
     pub fn jwt_permissions(&self) -> Value {
+        let permissions = |allow: &BTreeSet<String>, deny: &BTreeSet<String>| {
+            let mut value = json!({ "allow": allow });
+            if !deny.is_empty() {
+                value["deny"] = json!(deny);
+            }
+            value
+        };
         json!({
-            "pub": { "allow": self.publish.iter().collect::<Vec<_>>() },
-            "sub": { "allow": self.subscribe.iter().collect::<Vec<_>>() },
+            "pub": permissions(&self.publish, &self.publish_deny),
+            "sub": permissions(&self.subscribe, &self.subscribe_deny),
         })
     }
 
-    /// SHA-256 of `[publish_allow, subscribe_allow]` encoded as compact JSON. Each
-    /// list is sorted and deduplicated, so only JWT permissions affect the digest,
-    /// not construction order, role metadata, or JSON object-key ordering.
+    /// SHA-256 of the sorted, deduplicated JWT permissions, including explicit denies.
     pub fn permission_digest(&self) -> String {
-        let canonical = serde_json::to_vec(&(&self.publish, &self.subscribe))
-            .expect("permission sets always encode as JSON");
+        let canonical = serde_json::to_vec(&(
+            &self.publish,
+            &self.subscribe,
+            &self.publish_deny,
+            &self.subscribe_deny,
+        ))
+        .expect("permission sets always encode as JSON");
         data_encoding::HEXLOWER.encode(&Sha256::digest(canonical))
     }
 }
@@ -233,49 +291,69 @@ pub fn participant_grant(
     let mut entries = participant_permissions(account, credential_public, module_id, bound_rooms)?;
     add_live_permissions(account, module_id, GrantRole::Participant, &mut entries)?;
     add_module_bucket_permissions(account, module_id, GrantRole::Participant, &mut entries)?;
-    Grant::from_entries(GrantRole::Participant, account, entries)
+    let mut grant = Grant::from_entries(GrantRole::Participant, account, entries)?;
+    grant.deny_foreign_federation_readers(account, None)?;
+    Ok(grant)
 }
 
 /// Prefrontal's per-process grant: the participant set plus publish on each agent
 /// stream's own binding and on the ROOM binding, since it is the only producer of wakes,
 /// peer deliveries, effect intents and room posts, and pull, ack and info on its one
-/// ROOM durable `m_prefrontal`, which bootstrap creates.
+/// ROOM durable for its own module id, which ck-bus creates when the catalog selects it.
 pub fn delivery_authority_grant(
     account: &AccountNames,
     credential_public: &str,
     module_id: &str,
     bound_rooms: &[&str],
 ) -> Result<Grant, GrantRefusal> {
-    // Both authority ids use the current readers and bucket. Only the process's
-    // own event and live publications follow its attested module id.
-    let resource_module = if is_delivery_authority_module(module_id) {
+    let shared_module = if is_delivery_authority_module(module_id) {
         DELIVERY_AUTHORITY_MODULE
     } else {
         module_id
     };
     let mut entries =
-        delivery_authority_permissions(account, credential_public, resource_module, bound_rooms)?;
+        delivery_authority_permissions(account, credential_public, shared_module, bound_rooms)?;
     add_live_permissions(
         account,
-        resource_module,
+        shared_module,
         GrantRole::DeliveryAuthority,
         &mut entries,
     )?;
-    add_module_bucket_permissions(
-        account,
-        resource_module,
-        GrantRole::DeliveryAuthority,
-        &mut entries,
-    )?;
-    for plane in ["event", "live"] {
-        let canonical = format!("ck.{}.{plane}.{resource_module}.>", account.account());
+    if module_id != shared_module {
+        let old = AccountNames::module_consumer_name(shared_module)?;
+        let own = AccountNames::module_consumer_name(module_id)?;
         for entry in &mut entries {
-            if entry.operation == Operation::Publish && entry.subject == canonical {
-                entry.subject = format!("ck.{}.{plane}.{module_id}.>", account.account());
+            for plane in ["event", "live"] {
+                if entry.subject == format!("ck.{}.{plane}.{shared_module}.>", account.account()) {
+                    entry.subject = format!("ck.{}.{plane}.{module_id}.>", account.account());
+                }
+            }
+            // EVENT remains a shared cursor. Only the three legacy delivery readers move.
+            for stream in [
+                &account.streams().room,
+                &account.streams().inbox,
+                &account.streams().core_work,
+            ] {
+                for api in ["MSG.NEXT", "INFO"] {
+                    if entry.subject == format!("$JS.API.CONSUMER.{api}.{stream}.{old}") {
+                        entry.subject = format!("$JS.API.CONSUMER.{api}.{stream}.{own}");
+                    }
+                }
+                if entry.subject == format!("$JS.ACK.{stream}.{old}.>") {
+                    entry.subject = format!("$JS.ACK.{stream}.{own}.>");
+                }
             }
         }
     }
-    Grant::from_entries(GrantRole::DeliveryAuthority, account, entries)
+    add_module_bucket_permissions(
+        account,
+        module_id,
+        GrantRole::DeliveryAuthority,
+        &mut entries,
+    )?;
+    let mut grant = Grant::from_entries(GrantRole::DeliveryAuthority, account, entries)?;
+    grant.deny_foreign_federation_readers(account, Some(module_id))?;
+    Ok(grant)
 }
 
 /// The flow engine's per-process grant: pull, ack and info on its own durable
@@ -290,7 +368,9 @@ pub fn flow_engine_grant(
     let mut entries = flow_engine_permissions(account, credential_public, module_id)?;
     add_live_permissions(account, module_id, GrantRole::FlowEngine, &mut entries)?;
     add_module_bucket_permissions(account, module_id, GrantRole::FlowEngine, &mut entries)?;
-    Grant::from_entries(GrantRole::FlowEngine, account, entries)
+    let mut grant = Grant::from_entries(GrantRole::FlowEngine, account, entries)?;
+    grant.deny_foreign_federation_readers(account, None)?;
+    Ok(grant)
 }
 
 /// Only the owner writes values. Owners and declared readers may read and create
@@ -302,9 +382,13 @@ fn add_module_bucket_permissions(
     role: GrantRole,
     entries: &mut Vec<AllowEntry>,
 ) -> Result<(), GrantRefusal> {
-    for bucket in cortexkit_bus_naming::MODULE_BUCKETS {
+    let legacy = liveness_bucket(LEGACY_DELIVERY_AUTHORITY_MODULE);
+    for bucket in MODULE_BUCKETS.iter().chain(legacy.iter()) {
         let owner = bucket.owner == module_id;
-        if !owner && !bucket.readers.contains(&module_id) {
+        let reader = bucket.readers.contains(&module_id)
+            || (module_id == LEGACY_DELIVERY_AUTHORITY_MODULE
+                && bucket.readers.contains(&DELIVERY_AUTHORITY_MODULE));
+        if !owner && !reader {
             continue;
         }
         let name = account.module_bucket_name(bucket.owner, bucket.name)?;
@@ -374,12 +458,32 @@ fn add_live_permissions(
 
 /// The delivery-authority module whose readers bootstrap provisions.
 pub const DELIVERY_AUTHORITY_MODULE: &str = "prefrontal";
+pub const LEGACY_DELIVERY_AUTHORITY_MODULE: &str = "prefrontal-core";
+pub const DELIVERY_AUTHORITY_MODULES: [&str; 2] =
+    [DELIVERY_AUTHORITY_MODULE, LEGACY_DELIVERY_AUTHORITY_MODULE];
+pub const LIVENESS_BUCKET: &str = "session-liveness";
+
+pub fn is_delivery_durable(name: &str) -> bool {
+    matches!(name, "m_prefrontal" | "m_prefrontal-core")
+}
+
+pub fn is_liveness_bucket(bucket: &ModuleBucket) -> bool {
+    bucket.owner == DELIVERY_AUTHORITY_MODULE && bucket.name == LIVENESS_BUCKET
+}
+
+pub fn liveness_bucket(owner: &'static str) -> Option<ModuleBucket> {
+    let mut bucket = *MODULE_BUCKETS
+        .iter()
+        .find(|bucket| is_liveness_bucket(bucket))?;
+    bucket.owner = owner;
+    Some(bucket)
+}
 
 /// Accept both attested module ids so the old process can resume after a rollback. The rename
 /// procedure stops the old process before starting the new one; they do not run
 /// concurrently. Callers must first require a daemon-attested reserved principal.
 pub fn is_delivery_authority_module(module_id: &str) -> bool {
-    matches!(module_id, DELIVERY_AUTHORITY_MODULE | "prefrontal-core")
+    DELIVERY_AUTHORITY_MODULES.contains(&module_id)
 }
 
 /// The module whose attested credential carries the flow-engine grant: basal runs flows
@@ -430,7 +534,8 @@ pub fn bus_module_grant(
             subject: format!("$JS.API.CONSUMER.NAMES.{stream}"),
         });
     }
-    for bucket in cortexkit_bus_naming::MODULE_BUCKETS {
+    let legacy = liveness_bucket(LEGACY_DELIVERY_AUTHORITY_MODULE);
+    for bucket in MODULE_BUCKETS.iter().chain(legacy.iter()) {
         let stream = format!(
             "KV_{}",
             account.module_bucket_name(bucket.owner, bucket.name)?
@@ -443,16 +548,17 @@ pub fn bus_module_grant(
             });
         }
     }
-    // Retiring the old liveness store needs one exact stream delete, not
-    // permission to delete current module buckets or arbitrary streams.
-    entries.push(AllowEntry {
-        principal: Principal::Bus,
-        operation: Operation::Publish,
-        subject: format!(
-            "$JS.API.STREAM.DELETE.KV_{}",
-            account.module_bucket_name("prefrontal-core", "session-liveness")?
-        ),
-    });
+    // Switching owners may retire either liveness bucket, never an unrelated store.
+    for owner in DELIVERY_AUTHORITY_MODULES {
+        entries.push(AllowEntry {
+            principal: Principal::Bus,
+            operation: Operation::Publish,
+            subject: format!(
+                "$JS.API.STREAM.DELETE.KV_{}",
+                account.module_bucket_name(owner, LIVENESS_BUCKET)?
+            ),
+        });
+    }
     Grant::from_entries(GrantRole::BusModule, account, entries)
 }
 
@@ -738,10 +844,12 @@ mod tests {
             account: "metadata".to_string(),
             publish: ["b", "a", "a"].into_iter().map(str::to_string).collect(),
             subscribe: ["c"].into_iter().map(str::to_string).collect(),
+            publish_deny: ["blocked".to_owned()].into(),
+            subscribe_deny: BTreeSet::new(),
         };
         assert_eq!(
             grant.permission_digest(),
-            data_encoding::HEXLOWER.encode(&Sha256::digest(br#"[["a","b"],["c"]]"#))
+            data_encoding::HEXLOWER.encode(&Sha256::digest(br#"[["a","b"],["c"],["blocked"],[]]"#))
         );
         let mut other = grant.clone();
         other.role = GrantRole::FlowEngine;
@@ -751,6 +859,9 @@ mod tests {
         assert_ne!(grant.permission_digest(), other.permission_digest());
         other = grant.clone();
         other.publish.remove("a");
+        assert_ne!(grant.permission_digest(), other.permission_digest());
+        other = grant.clone();
+        other.publish_deny.clear();
         assert_ne!(grant.permission_digest(), other.permission_digest());
     }
 

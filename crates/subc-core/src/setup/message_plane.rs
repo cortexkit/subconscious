@@ -21,6 +21,7 @@ pub(super) fn grant_keys(
         "signing:bus-leaf:1",
         "signing:bus-hub-operator:1",
         "signing:bus-hub-account:1",
+        "signing:bus-federation-account:1",
         "signing:bus-hub-tls:1",
     ] {
         for operation in ["read", "sign"] {
@@ -233,6 +234,8 @@ mod tests {
             "grant --principal reserved:ckbus --selector-kind exact --selector signing:bus-hub-operator:1 --operation sign",
             "grant --principal reserved:ckbus --selector-kind exact --selector signing:bus-hub-account:1 --operation read",
             "grant --principal reserved:ckbus --selector-kind exact --selector signing:bus-hub-account:1 --operation sign",
+            "grant --principal reserved:ckbus --selector-kind exact --selector signing:bus-federation-account:1 --operation read",
+            "grant --principal reserved:ckbus --selector-kind exact --selector signing:bus-federation-account:1 --operation sign",
             "grant --principal reserved:ckbus --selector-kind exact --selector signing:bus-hub-tls:1 --operation read",
             "grant --principal reserved:ckbus --selector-kind exact --selector signing:bus-hub-tls:1 --operation sign",
             "grant --principal reserved:ckbus --selector-kind audience --selector cortexkit-hub --operation account_token",

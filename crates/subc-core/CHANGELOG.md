@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.21.26
+
+- Grant ck-bus read and sign access to the federation-account signing key during setup and upgrade.
+
 ## 0.21.25
 
 - The macOS daemon app is now named Subconscious.

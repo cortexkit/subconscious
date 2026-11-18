@@ -203,7 +203,9 @@ fn message_plane_setup_uses_the_installed_vault_cli_after_it_is_live() {
         calls: calls.clone(),
     });
     backend.apply(&SetupOperation::GrantMessageKeys).unwrap();
-    assert_eq!(*calls.lock().unwrap(), 10);
+    // One vault status read, then one grant per line: five signing keys, each
+    // for read and sign, and the hub token audience.
+    assert_eq!(*calls.lock().unwrap(), 12);
     assert!(!backend.component_steps[&Component::Claustrum].message_grants_changed);
 }
 

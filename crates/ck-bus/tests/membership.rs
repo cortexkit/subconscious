@@ -57,7 +57,7 @@ use std::{
 
 use async_nats::jetstream::{self, consumer::pull, AckKind};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use cortexkit_bus_naming::{shipped_streams, AccountNames};
+use cortexkit_bus_naming::{shipped_streams, AccountNames, StreamKind};
 use futures_util::StreamExt;
 use harness::{
     bus::{self, BusServer, TrustChain, LOOPBACK},
@@ -147,11 +147,10 @@ fn ckbus_owned_durables_stay_off_the_agent_streams() {
             bootstrap.contains(&stream),
             "{durable} sits on a bootstrap stream"
         );
-        assert!(
-            !agent_streams.contains(&stream),
-            "ck-bus-owned durable {durable} is on agent stream {stream}, which every \
-             participant may pull"
-        );
+        if agent_streams.contains(&stream) {
+            assert!(matches!(kind, StreamKind::Peer | StreamKind::Wake));
+            assert!(matches!(durable, "m_prefrontal" | "m_prefrontal-core"));
+        }
     }
 
     // The module durables bootstrap creates are listed as ck-bus-owned, by their own
@@ -275,51 +274,35 @@ async fn both_reserved_prefrontal_ids_pass_the_membership_gate() {
 }
 
 #[test]
-fn both_prefrontal_ids_receive_canonical_authority_grants() {
+fn both_prefrontal_ids_receive_shared_authority_and_own_delivery_resources() {
     let names = grants::derive_account("box_renamegrants").unwrap();
     let legacy = grants::issued_grant(&names, "prefrontal-core", "credential", &[]).unwrap();
-    assert_eq!(legacy.role(), grants::GrantRole::DeliveryAuthority);
-    assert!(legacy
-        .publish_allow()
-        .contains("$JS.API.CONSUMER.MSG.NEXT.CK_BOX_RENAMEGRANTS_ROOM.m_prefrontal"));
-    assert!(legacy
-        .publish_allow()
-        .contains("$JS.API.CONSUMER.MSG.NEXT.CK_BOX_RENAMEGRANTS_EVENT.m_prefrontal"));
-    assert!(legacy
-        .publish_allow()
-        .contains("$KV.CK_BOX_RENAMEGRANTS_PREFRONTAL_SESSION_LIVENESS.>"));
-    for module_id in ["prefrontal", "prefrontal-core"] {
-        let authority = grants::issued_grant(&names, module_id, "credential", &[]).unwrap();
-        assert_eq!(
-            authority.role(),
-            grants::GrantRole::DeliveryAuthority,
-            "{module_id}"
-        );
-        let mut expected = legacy.publish_allow().clone();
+    let current = grants::issued_grant(&names, "prefrontal", "credential", &[]).unwrap();
+    assert_eq!(current.subscribe_allow(), legacy.subscribe_allow());
+    for (module, own, other, authority) in [
+        ("prefrontal", "PREFRONTAL", "PREFRONTAL_CORE", &current),
+        ("prefrontal-core", "PREFRONTAL_CORE", "PREFRONTAL", &legacy),
+    ] {
+        assert_eq!(authority.role(), grants::GrantRole::DeliveryAuthority);
+        let allows = authority.publish_allow();
+        assert!(allows.contains("$JS.API.CONSUMER.MSG.NEXT.CK_BOX_RENAMEGRANTS_EVENT.m_prefrontal"));
         for plane in ["event", "live"] {
-            assert!(expected.remove(&format!("ck.box_renamegrants.{plane}.prefrontal-core.>")));
-            expected.insert(format!("ck.box_renamegrants.{plane}.{module_id}.>"));
+            assert!(allows.contains(&format!("ck.box_renamegrants.{plane}.{module}.>")));
         }
-        assert_eq!(authority.publish_allow(), &expected, "{module_id}");
-        assert_eq!(
-            authority.subscribe_allow(),
-            legacy.subscribe_allow(),
-            "{module_id}"
-        );
-        for subject in authority
-            .publish_allow()
+        for stream in ["INBOX", "CORE_WORK", "ROOM"] {
+            let stem = format!("$JS.API.CONSUMER.MSG.NEXT.CK_BOX_RENAMEGRANTS_{stream}");
+            assert!(allows.contains(&format!("{stem}.m_{module}")));
+            let foreign = if module == "prefrontal" {
+                "prefrontal-core"
+            } else {
+                "prefrontal"
+            };
+            assert!(!allows.contains(&format!("{stem}.m_{foreign}")));
+        }
+        assert!(allows.contains(&format!("$KV.CK_BOX_RENAMEGRANTS_{own}_SESSION_LIVENESS.>")));
+        assert!(!allows
             .iter()
-            .chain(authority.subscribe_allow())
-        {
-            assert!(
-                !subject.split('.').any(|token| token == "m_prefrontal-core"),
-                "{subject}"
-            );
-            assert!(
-                !subject.contains("PREFRONTAL_CORE_SESSION_LIVENESS"),
-                "{subject}"
-            );
-        }
+            .any(|subject| subject.contains(&format!("_{other}_SESSION_LIVENESS"))));
     }
 }
 
@@ -488,14 +471,15 @@ fn a_participant_publishes_only_its_own_module_events() {
 fn prefrontal_core_grant_carries_the_room_binding_and_its_room_durable() {
     let names = grants::derive_account("box_membershiproom").unwrap();
     let user = nkeys::KeyPair::new_user().public_key();
-    let authority = grants::issued_grant(&names, PREFRONTAL, &user, &[]).unwrap();
+    let legacy = "prefrontal-core";
+    let authority = grants::issued_grant(&names, legacy, &user, &[]).unwrap();
     let room = &names.streams().room;
     for subject in [
         names.room_binding(),
-        format!("$JS.API.CONSUMER.MSG.NEXT.{room}.m_prefrontal"),
-        format!("$JS.API.CONSUMER.INFO.{room}.m_prefrontal"),
-        format!("$JS.ACK.{room}.m_prefrontal.>"),
-        names.event_publish_grant(PREFRONTAL).unwrap(),
+        format!("$JS.API.CONSUMER.MSG.NEXT.{room}.m_prefrontal-core"),
+        format!("$JS.API.CONSUMER.INFO.{room}.m_prefrontal-core"),
+        format!("$JS.ACK.{room}.m_prefrontal-core.>"),
+        names.event_publish_grant(legacy).unwrap(),
     ] {
         assert!(
             authority.publish_allow().contains(&subject),
@@ -504,19 +488,18 @@ fn prefrontal_core_grant_carries_the_room_binding_and_its_room_durable() {
     }
     assert!(!publishes(
         &authority,
-        &format!("$JS.API.CONSUMER.MSG.NEXT.{room}.m_other")
+        &format!("$JS.API.CONSUMER.MSG.NEXT.{room}.m_prefrontal")
     ));
     assert!(!publishes(
         &authority,
-        &format!("$JS.API.CONSUMER.DURABLE.CREATE.{room}.m_prefrontal")
+        &format!("$JS.API.CONSUMER.DURABLE.CREATE.{room}.m_prefrontal-core")
     ));
-    // The durable bootstrap creates is the one the grant names.
+    // Both owners use the same ROOM filter; the live catalog selects the durable name.
     let planned = bootstrap::module_durables::planned(&names).unwrap();
     let on_room = planned
         .iter()
         .find(|durable| &durable.stream == room)
         .expect("bootstrap plans a ROOM durable");
-    assert_eq!(on_room.durable, "m_prefrontal");
     assert_eq!(on_room.filter_subjects, vec![names.room_binding()]);
 }
 
@@ -651,6 +634,107 @@ async fn register_module(run: &SignerRun, module_id: &str) {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_catalog_moves_delivery_readers_back_to_prefrontal_core() {
+    let _gate = harness::acceptance_gate().await;
+    harness::install_tracing();
+    let Some(live) = start(&["prefrontal"]).await else {
+        return;
+    };
+    let observer = live.observer().await;
+    let streams = live.names.streams();
+    let observer_ref = &observer;
+    let wait_owner = |module: &'static str| async move {
+        let durable = AccountNames::module_consumer_name(module).unwrap();
+        tokio::time::timeout(BOOT_LIMIT, async {
+            loop {
+                let mut exists = true;
+                for stream in [&streams.inbox, &streams.core_work, &streams.room] {
+                    exists &= observer_ref
+                        .get_consumer_from_stream::<pull::Config, _, _>(&durable, stream)
+                        .await
+                        .is_ok();
+                }
+                if exists {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("catalog never provisioned {durable}"));
+    };
+    wait_owner("prefrontal").await;
+    register_module(&live.run, "prefrontal-core").await;
+    assert!(!consumers_on(&observer, &streams.inbox)
+        .await
+        .contains("m_prefrontal-core"));
+    let info = consumer_info(&observer, &streams.inbox, "m_prefrontal").await;
+    let subject = info.config.filter_subjects[0].replace('*', "rollback");
+    stored_publish(&observer, subject, b"queued through rollback").await;
+    let mut config: Value =
+        serde_json::from_slice(&fs::read(&live.run.config_file).unwrap()).unwrap();
+    config["modules"]["prefrontal"]["enabled"] = json!(false);
+    fs::write(
+        &live.run.config_file,
+        serde_json::to_vec_pretty(&config).unwrap(),
+    )
+    .unwrap();
+    let reload = control::rpc(
+        live.connection_file(),
+        ClientControlRequest::SupervisorRescan { preview: false },
+    )
+    .await;
+    assert!(
+        !matches!(reload, control::ControlReply::Error(_)),
+        "{reload:?}"
+    );
+    wait_owner("prefrontal-core").await;
+    let moves = bus::events(
+        live.run.root.path(),
+        "ckbus.bootstrap.delivery_durable_moved",
+    );
+    assert!(
+        moves.iter().any(|row| row["stream"] == streams.inbox
+            && row["from"] == "m_prefrontal"
+            && row["to"] == "m_prefrontal-core"
+            && row["pending"] == 1),
+        "{moves:?}"
+    );
+    let reader: jetstream::consumer::Consumer<pull::Config> = observer
+        .get_consumer_from_stream("m_prefrontal-core", &streams.inbox)
+        .await
+        .unwrap();
+    let delivery = reader
+        .fetch()
+        .max_messages(1)
+        .expires(Duration::from_secs(3))
+        .messages()
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(delivery.payload.as_ref(), b"queued through rollback");
+    delivery.double_ack().await.unwrap();
+    for stream in [&streams.inbox, &streams.core_work, &streams.room] {
+        assert!(!consumers_on(&observer, stream)
+            .await
+            .contains("m_prefrontal"));
+    }
+    relay_as(
+        live.connection_file(),
+        "prefrontal-core",
+        true,
+        membership::LIST_OP,
+        json!({}),
+    )
+    .await
+    .unwrap();
+    live.stop().await;
 }
 
 type CkbusReply = Result<Value, (String, String)>;
@@ -802,7 +886,10 @@ async fn callers_other_than_prefrontal_core_are_refused_through_the_daemon() {
     let observer = live.observer().await;
     for stream in membership::agent_streams(&live.names) {
         assert!(
-            consumers_on(&observer, &stream).await.is_empty(),
+            consumers_on(&observer, &stream)
+                .await
+                .iter()
+                .all(|durable| membership::is_federation_reader(&live.names, &stream, durable)),
             "{stream}"
         );
     }
@@ -902,12 +989,13 @@ async fn bind_is_idempotent_and_a_different_configuration_is_refused_and_kept() 
         "the differing durable was not replaced"
     );
 
-    // Only agent durables sit on the agent streams.
+    // Binding cannot add anything other than the requested agent durables.
     for stream in membership::agent_streams(&live.names) {
         for durable in consumers_on(&observer, &stream).await {
             assert!(
                 durable == AccountNames::consumer_name(agent).unwrap()
-                    || durable == AccountNames::consumer_name(conflicted).unwrap(),
+                    || durable == AccountNames::consumer_name(conflicted).unwrap()
+                    || membership::is_federation_reader(&live.names, &stream, &durable),
                 "{durable} on agent stream {stream} is not an agent durable"
             );
         }
@@ -1072,6 +1160,25 @@ async fn the_list_reports_each_durables_undelivered_count() {
         |rows| pending(rows, a, &wake) == Some(2),
     )
     .await;
+    observer
+        .create_consumer_on_stream(
+            pull::Config {
+                durable_name: Some("m_unexpected".into()),
+                filter_subject: live.names.peer_filter(b).unwrap(),
+                ..Default::default()
+            },
+            &streams.peer,
+        )
+        .await
+        .unwrap();
+    let rows = live.prefrontal(membership::LIST_OP, json!({})).await;
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 7);
+    let unexpected = rows
+        .iter()
+        .find(|row| row["durable"] == "m_unexpected")
+        .unwrap();
+    assert!(unexpected["agent_id"].is_null(), "{unexpected}");
     passed();
     live.stop().await;
 }

@@ -457,7 +457,7 @@ dependencies = [
 
 [[package]]
 name = "ck-bus"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -669,9 +669,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-bus-naming"
-version = "0.5.0"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a853393c74b013e737d9b8a0a56ed05e70ffc911c174ed09232f4edcd61427ec"
+checksum = "0fa062a586449c8841f851bf042483b9a3347d8222c38c06f807f5eb243e9ce0"
 
 [[package]]
 name = "cortexkit-bus-nats"
@@ -3009,7 +3009,7 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.21.25"
+version = "0.21.26"
 dependencies = [
  "async-trait",
  "base64",
@@ -3268,7 +3268,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

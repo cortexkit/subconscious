@@ -16,18 +16,16 @@
 //!    incarnation's box users added), has the operator signer sign it, pushes it, and
 //!    reads it back through the claims lookup before treating it as applied;
 //! 4. signs its box-account user with the box account root, connects, creates the
-//!    census and module buckets and nine message streams if absent, reconciles module
-//!    durables without deleting their cursors (except empty, retired prefrontal
-//!    delivery readers), writes its own census key
+//!    census and shared module resources if absent, reconciles their durables without
+//!    deleting cursors, writes its own census key
 //!    (the single census entry ck-bus writes for itself), and publishes on its sentinel
 //!    subject.
 //!
 //! A plane an earlier ck-bus built with five streams is upgraded in place: existing
 //! messages are kept, reviewed limits update without recreation, and missing streams,
 //! buckets and module durables are added.
-//! The prefrontal rename first removes empty old delivery readers because those
-//! streams allow one reader per subject. Busy readers refuse startup and keep the
-//! old liveness bucket for rollback; after successful provisioning it is deleted.
+//! A separate catalog watcher moves the three prefrontal delivery readers and the
+//! liveness bucket to the sole registered authority. That work cannot fail bootstrap.
 //!
 //! Both users' JWTs expire 15 minutes after issue; a renewal task per user
 //! (`credentials::renewal`) re-signs the same key before then, and each connection
@@ -48,10 +46,12 @@
 pub mod account_jwt;
 pub mod census;
 pub mod config;
+#[path = "../federation/account.rs"]
+pub mod federation_account;
 pub(crate) mod grant_changes;
 pub mod module_durables;
 pub mod plane;
-mod prefrontal_rename;
+pub(crate) mod prefrontal_rename;
 pub mod store;
 
 use std::{
@@ -110,8 +110,6 @@ pub mod cause {
     /// A module durable could not be planned or reconciled, or its stream could not be
     /// inspected for orphans. Immutable mismatches leave the cursor in place.
     pub const MODULE_DURABLES_UNAVAILABLE: &str = "module-durables-unavailable";
-    /// An old delivery reader still has work and cannot safely be replaced.
-    pub const DELIVERY_DURABLE_MOVE_REFUSED: &str = "delivery-durable-move-refused";
     /// ck-bus's own census key could not be written: its spawn generation could not be
     /// read, or the census write failed.
     pub const OWN_CENSUS_UNWRITTEN: &str = "own-census-unwritten";
@@ -156,6 +154,8 @@ pub struct Ready {
     pub box_user: String,
     pub system: Arc<dyn SystemPlane>,
     pub box_plane: Arc<dyn BoxPlane>,
+    pub federation_account: Option<String>,
+    pub fedout_account: tokio::sync::OnceCell<String>,
     /// The tasks renewing the system-account and box-account users' JWTs (R16); dropping
     /// this aborts them.
     pub renewals: Vec<RenewalTask>,
@@ -510,9 +510,30 @@ pub async fn boot(
             .await
             .map_err(|error| Failure::retry(cause::STREAMS_UNAVAILABLE, error.message))?;
     }
+    let fedout = federation_account::provision_fedout(
+        system.as_ref(),
+        inputs.broker,
+        &deps.credentials,
+        &deps.store,
+        &account.machine_id,
+    )
+    .await
+    .map_err(|error| Failure::retry(cause::STREAMS_UNAVAILABLE, error))?;
+    let federation_account =
+        fedout
+            .clone()
+            .or_else(|| match deps.store.read_federation_account() {
+                AccountFile::Present(record) if record.machine_id == account.machine_id => {
+                    Some(record.account_public)
+                }
+                _ => None,
+            });
     validate_module_buckets(&names, MODULE_BUCKETS)
         .map_err(|error| Failure::stop(cause::STREAMS_UNAVAILABLE, error.to_string()))?;
-    for bucket in MODULE_BUCKETS {
+    for bucket in MODULE_BUCKETS
+        .iter()
+        .filter(|bucket| !crate::grants::is_liveness_bucket(bucket))
+    {
         box_plane
             .ensure_module_bucket(&names, bucket)
             .await
@@ -521,16 +542,15 @@ pub async fn boot(
     // Create or reconcile module readers before issuing credentials. Updates retain
     // their acknowledgement floors; an immutable configuration mismatch stops boot
     // rather than deleting a module's cursor.
-    let durables = module_durables::planned(&names)
+    let mut durables = module_durables::planned(&names)
         .map_err(|error| Failure::stop(cause::MODULE_DURABLES_UNAVAILABLE, error))?;
-    prefrontal_rename::remove_empty_delivery_readers(&names, box_plane.as_ref()).await?;
+    durables.retain(|row| !prefrontal_rename::delivery_stream(&names, &row.stream));
     for durable in &durables {
         box_plane
             .ensure_module_durable(durable)
             .await
             .map_err(|error| Failure::retry(cause::MODULE_DURABLES_UNAVAILABLE, error.message))?;
     }
-    prefrontal_rename::remove_stale_liveness(&names, box_plane.as_ref()).await?;
     let plan = module_durables::plan_output(&names, box_plane.as_ref(), &durables)
         .await
         .map_err(|error| Failure::retry(cause::MODULE_DURABLES_UNAVAILABLE, error.message))?;
@@ -600,6 +620,8 @@ pub async fn boot(
         box_user,
         system,
         box_plane,
+        federation_account,
+        fedout_account: tokio::sync::OnceCell::new_with(fedout),
         renewals,
     })
 }
@@ -804,12 +826,7 @@ impl SentinelHealth for BootstrapHealth {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        let detail = match &state {
-            BootState::Down(failure) if failure.cause == cause::DELIVERY_DURABLE_MOVE_REFUSED => {
-                format!("Message bus is down. {}", failure.message)
-            }
-            _ => "Message bus is down.".to_string(),
-        };
+        let detail = "Message bus is down.".to_string();
         let metrics = match state {
             BootState::Starting => json!({
                 "class": "Unavailable",
@@ -882,13 +899,13 @@ impl Bootstrap {
         let (handle, serving) =
             subc_client_rs::serve_with_handle(&connection_file, manifest, handler).await?;
         let machine_id = handle.machine_id().cloned();
-        let running = tokio::spawn(self.run(machine_id));
+        let running = tokio::spawn(self.run(machine_id, connection_file));
         let served = serving.await;
         running.abort();
         served
     }
 
-    async fn run(self, machine_id: Option<MachineId>) {
+    async fn run(self, machine_id: Option<MachineId>, connection_file: std::path::PathBuf) {
         let config = BrokerConfig::from_env();
         let broker_url = config.as_ref().map(|config| config.url.clone()).ok();
         let broker = NatsBroker::new(
@@ -909,6 +926,21 @@ impl Bootstrap {
             .await;
             match outcome {
                 Ok(ready) => {
+                    let ready = Arc::new(ready);
+                    let (initial_tx, initial_rx) = tokio::sync::oneshot::channel();
+                    let follow = prefrontal_rename::follow(
+                        &connection_file,
+                        &ready,
+                        initial_tx,
+                        self.period,
+                    );
+                    tokio::pin!(follow);
+                    // Don't hold up other modules if the catalog or one delivery resource is
+                    // unavailable. Keep the same reconciliation future alive after the deadline.
+                    tokio::select! {
+                        _ = tokio::time::timeout(Duration::from_secs(2), initial_rx) => {},
+                        _ = &mut follow => unreachable!("catalog watcher reconnects until shutdown"),
+                    }
                     log_event(
                         "ckbus.bootstrap.ready",
                         json!({
@@ -926,10 +958,9 @@ impl Bootstrap {
                         account_public: ready.account.account_public.clone(),
                     });
                     // The connections stay open for as long as the process serves.
-                    let ready = Arc::new(ready);
                     self.ready.send_replace(Some(ready.clone()));
-                    let _held = ready;
-                    std::future::pending::<()>().await;
+                    follow.await;
+                    return;
                 }
                 Err(failure) => {
                     log_event(

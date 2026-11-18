@@ -389,15 +389,27 @@ Credentials (design D; foundation amendment `48c83a68e`, `0eb12229f`, `b9e827c69
   and ck-bus signs in memory. A copied
   child-held seed works anywhere until expiry, while a bus-held seed works only for a
   caller that reaches ck-bus as that module.
-- Delivery and attestation. ck-bus serves two ops to supervised children over the subc
-  wire: `ckbus.credential`, `ckbus.credential_renew` and
-  `ckbus.nonce_sign`. These spellings discharge `ckbus-client-ops-unagreed`.
+- <a id="credential-ops"></a>Delivery and attestation. ck-bus serves these credential ops
+  to supervised children over the subconscious daemon's module wire:
   - `ckbus.credential` returns the caller's user JWT, its `{acct}`, its inbox prefix
     `_INBOX.{credential_public}`, and the server URL.
   - `ckbus.nonce_sign` signs the given nonce with the caller's current seed.
   - `ckbus.credential_renew` (R16) re-signs the caller's current key with a fresh `exp`;
     it follows the same principal rules.
-  - Both authorize by the stamped principal alone. `Principal::Reserved { module_id }`
+  - `ckbus.hub_credential` accepts the same request as `ckbus.credential` and returns a
+    separate credential on the same local server. The answer also includes `domain: "hub"`
+    and `box_id` (the local machine's 32-character lowercase hex id), with `acct: "fed_{box_id}"`
+    and `inbox_prefix: "ckdel.{box_id}.{module}"`. This user can access only its assigned
+    hub streams: `magic-context` uses HUB_MEMORY, `prefrontal` uses HUB_ROOMS,
+    `entorhinal` uses HUB_IDLOG and KV_residence, and `engram` uses OBJ_cuts. The legacy
+    `prefrontal-core` id can still use the room grant, with its own inbox prefix. These
+    users cannot publish or subscribe on per-machine federation subjects.
+  - `ckbus.hub_credential_renew` takes `credential_public`, like `ckbus.credential_renew`.
+    Hub credentials have a separate `hub.{module}` census entry and follow the same
+    supersede and revocation rules. To connect, name the hub key in `ckbus.nonce_sign`.
+    Both hub ops refuse an ineligible module with terminal `hub_not_granted`, and refuse
+    with retryable `hub_unavailable` while there is no live hub link or federation signing key.
+  - These ops authorize by the stamped principal alone. `Principal::Reserved { module_id }`
     binds the answer to that `module_id` and to the live generation the spawn stream
     shows for it. A body field claiming another id is ignored. A `Direct` caller gets
     the named refusal `ckbus_principal_direct` and nothing else. A caller whose module id
@@ -532,7 +544,7 @@ Ownership of acts.
   incarnation's box users, pushes it, and reads it back through the claims lookup
   before treating it as applied (a claims update is saved without a trust or `iat`
   check). It then issues its box-account user, connects, and creates the census bucket
-  and all nine streams with their literal bindings if absent, then the module
+  and all shipped box streams with their literal bindings if absent, then the module
   durables (Module streams, durables and KV buckets, below). It does NOT revoke the
   previous incarnation's system-account users (trust-chain design 6.7): their seeds
   died with that process, so they cannot answer a nonce, and revoking them would
@@ -565,10 +577,16 @@ Ownership of acts.
   spawning.
 - Dead-letter consumer: `c_ckbus_dead` on `CK_{ACCT}_EFFECT_DEAD`, deduplicating on
   message id, because the claimant publishes the record before `term()`.
-- Module streams, durables and KV buckets. Bootstrap creates the nine streams of
+- Module streams, durables and KV buckets. Bootstrap creates the eleven box streams of
   `shipped_streams`: ROOM, WAKE, PEER, EFFECT, EFFECT_DEAD, EVENT, INBOX, CORE_WORK
-  and DELIVERY_DEAD. The census and seven module KV backing streams are additional
-  streams, separate from that nine-stream message plane. EVENT
+  and DELIVERY_DEAD, plus FEDSEND for outbound hand-offs and FEDSEND_DEAD for their
+  bus-only dead letters. ROOM, WAKE and PEER retain seven days, discard new when full,
+  and bind exact inbound federation subjects; local users may not publish on
+  `ck.{acct}.*.fed.>`. In the separate federation account, ck-bus creates FEDOUT for
+  sealed outbound frames once the federation signing key is available. These three
+  hand-off streams cap messages at 1 MiB and retain seven days, discarding new when
+  full. The hub provisions HUB_ROOMS and HUB_MEMORY for shared room posts and memory
+  changes. The census and module KV backing streams are separate. EVENT
   (`CK_{ACCT}_EVENT`, binding `ck.{acct}.event.>`, subjects
   `ck.{acct}.event.{module_id}.{event}.v{version}[.{reader}]`) holds module events:
   7 days, 1 GiB, discard old, limits retention (not a work queue), and at most 100,000
@@ -576,12 +594,12 @@ Ownership of acts.
   version; publishers use `event_subject_with_reader`, and readers can use
   `parse_event_subject` rather than assuming the last token is the version.
   Existing streams and module readers reconcile in place, preserving stored messages
-  and acknowledgement floors. Bootstrap creates these readers before issuing module
-  credentials, so events and posts made before the module first connects are kept:
+  and acknowledgement floors. Bootstrap creates shared readers before issuing module
+  credentials, so events made before the module first connects are kept:
   - `m_basal` on `CK_{ACCT}_EVENT`, filtered on `ck.{acct}.event.>`: the flow engine
     reads every module event through it;
-  - `m_prefrontal-core` on `CK_{ACCT}_ROOM`, filtered on the ROOM binding
-    `ck.{acct}.room.*.post`: prefrontal-core is the only consumer of room posts.
+  - `m_<authority>` on `CK_{ACCT}_ROOM`, filtered on the local ROOM binding
+    `ck.{acct}.room.*.post`.
   - Every `EVENT_CONSUMERS` row on EVENT, using its explicit durable and filters.
     A module may own several rows: astrocyte owns `m_astrocyte`,
     `m_astrocyte_payer`, `m_astrocyte_media_usage`, `m_astrocyte_catalog` and
@@ -591,9 +609,19 @@ Ownership of acts.
     `m_{module}` or `m_{module}_{suffix}`. Each module receives pull, ack and info
     for every one of its rows, never another owner's rows. Naming 0.4 still
     includes `m_prefrontal-routing`, so bootstrap continues to provision it.
-  - INBOX and CORE_WORK each have prefrontal-core's command reader, and each
+  - INBOX and CORE_WORK each have the authority's command reader, and each
     dead-letter stream has the bus's `c_ckbus_dead` diagnostic reader, as declared
     by `delivery_consumer_specs`.
+
+  The daemon catalog selects the owner of the ROOM, INBOX and CORE_WORK readers
+  and the session-liveness bucket. ck-bus follows catalog changes and moves these
+  resources only when exactly one of `prefrontal` and `prefrontal-core` is registered.
+  A work-queue move preserves outstanding messages and logs the old reader's pending
+  counts; the new ROOM reader starts after the old acknowledgement floor, so deliveries
+  beyond that floor can repeat. The new liveness bucket starts empty. With both or
+  neither registered, the existing resources are left alone. A catalog or migration
+  failure does not take the message bus down. EVENT and the federation-only PEER and
+  WAKE readers are not moved.
 
   The command streams' limits come from naming's `shipped_streams`:
   - INBOX binds `ck.{acct}.inbox.{kind}.*.ready` for `head` and `worker`.
@@ -605,7 +633,7 @@ Ownership of acts.
     64 MiB total, discard old, no stream-specific message-size or per-subject cap,
     and the 120-second dead-letter duplicate window.
 
-  Event and ROOM readers carry pull, explicit ack, deliver all, ack wait 30 s,
+  Event and newly provisioned ROOM readers carry pull, explicit ack, deliver all, ack wait 30 s,
   unlimited deliveries and max ack pending 1000. Command readers have max ack
   pending 1. Filters are validated against their stream bindings. Mutable settings,
   including filters, update in place; immutable mismatches refuse boot with
@@ -619,7 +647,7 @@ Ownership of acts.
   but there is no module-orphan deletion command; agent membership operations do
   not manage module cursors. Only the bus bootstrap user can list those consumers.
 
-  Bootstrap also provisions every `MODULE_BUCKETS` row. The bucket name comes from
+  Bootstrap also provisions the shared `MODULE_BUCKETS` rows. The bucket name comes from
   `AccountNames::module_bucket_name`: `CK_{ACCT}_{OWNER}_{NAME}`, uppercased with
   hyphens and dots replaced by underscores. Its backing stream is `KV_<bucket>`.
   All current rows have history 1; a dash below means no TTL:
@@ -630,7 +658,7 @@ Ownership of acts.
   | astrocyte | multiplier | striatum | 8,192 B | 1 MiB | - |
   | astrocyte | read-marks | thalamus-harness | 256 B | 16 MiB | - |
   | entorhinal | changes | prefrontal-core, plexus, magic-context | 512 B | 32 MiB | - |
-  | prefrontal-core | session-liveness | entorhinal | 1,024 B | 16 MiB | - |
+  | Catalog-selected authority | session-liveness | entorhinal | 1,024 B | 16 MiB | - |
   | aft | views | occipital | 256 KiB | 32 MiB | - |
   | cerebellum | views | occipital | 256 KiB | 32 MiB | - |
 
@@ -1371,23 +1399,22 @@ The index summarizes normative requirements; where an index line and a section d
   agent streams. NATS wildcards are whole-token only, so the grant cannot say `c_*`: it is a
   whole-token `*` in the consumer position on each agent stream
   (`$JS.API.CONSUMER.MSG.NEXT.<S>.*`, `$JS.API.CONSUMER.INFO.<S>.*`, `$JS.ACK.<S>.*.>`,
-  plus `$JS.API.STREAM.INFO.<S>`). That grant also reaches any other consumer on those
-  streams, so ck-bus never creates a non-agent durable on WAKE, PEER or EFFECT (its own
-  `c_ckbus_dead` is on EFFECT_DEAD, and the module durables `m_basal` and
-  `m_prefrontal-core` are on EVENT and ROOM). The membership row asserts this against
-  bootstrap's stream set and against the live server's consumers.
+  plus `$JS.API.STREAM.INFO.<S>`). WAKE and PEER also carry the named federation
+  readers for the two authority IDs. JWT denies on the exact pull, info and ack
+  subjects keep each reader private to its owner. `ckbus.agent_durable_list` omits
+  only these known service readers; an unexpected non-agent durable is still reported.
   Three grants, chosen by the attested principal at issuance, none naming an agent. The
   module id each is generated for is the daemon-stamped route principal, never a
   request field:
-  - participant (every module except prefrontal-core and basal): its own `_INBOX`,
+  - participant (every module except the delivery authority IDs and basal): its own `_INBOX`,
     pull, ack and info on any agent durable as above, the `effect_dead` publish, census
     read, and publish on its own module events, `ck.{acct}.event.{module_id}.>`, and on
     no other module's. No workload publish at all.
-  - delivery authority (only `reserved:prefrontal-core`): the participant set plus
+  - delivery authority (`reserved:prefrontal` or `reserved:prefrontal-core`): the participant set plus
     publish on `ck.{acct}.wake.*.fire`, `ck.{acct}.peer.*.*.deliver`,
     `ck.{acct}.effect.*.*.intent` for every agent, and the ROOM binding
-    `ck.{acct}.room.*.post` for every room, and pull, ack and info on its one ROOM
-    durable `m_prefrontal-core` by name (no consumer create or delete on ROOM).
+    `ck.{acct}.room.*.post` for every room, and pull, ack and info on the ROOM
+    durable matching the caller's own ID (no consumer create or delete on ROOM).
   - flow engine (only `reserved:basal`, `FLOW_ENGINE_MODULE`): its own `_INBOX`, census
     read, the `effect_dead` publish, pull, ack and info on its own durable `m_basal` on
     EVENT, and for dry-run replay unnamed consumer create, consumer info and flow control

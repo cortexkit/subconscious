@@ -640,6 +640,10 @@ fn stream_configs_omit_unset_duplicate_windows_and_message_caps() {
             | cortexkit_bus_naming::StreamKind::CoreWork => {
                 assert_eq!(wire["max_msg_size"], 16 * 1024);
             }
+            cortexkit_bus_naming::StreamKind::Fedsend
+            | cortexkit_bus_naming::StreamKind::FedsendDead => {
+                assert_eq!(wire["max_msg_size"], 1024 * 1024);
+            }
             _ => assert!(wire.get("max_msg_size").is_none(), "{}", spec.name),
         }
     }

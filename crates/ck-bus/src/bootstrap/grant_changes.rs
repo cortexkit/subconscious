@@ -29,7 +29,7 @@ pub(crate) async fn revoke_changed(
         .map_err(|e| census_failure(e.message))?
     {
         // ck-bus has its own grant and rotates its user on every boot already.
-        if module_id == own_module {
+        if module_id == own_module || module_id.starts_with(super::census::HUB_PREFIX) {
             continue;
         }
         let Some(record) = box_plane

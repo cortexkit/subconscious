@@ -6,7 +6,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use cortexkit_bus_naming::AccountNames;
 use serde_json::json;
 use tokio::sync::watch;
 
@@ -49,9 +48,7 @@ impl Census for RevokerCensus {
             .map_err(|error| error.message)?;
         let mut entries = Vec::new();
         for key in keys {
-            // The census key is the module id itself; a key that is not a module id was
-            // not written by issuance and names no process.
-            if AccountNames::census_key(&key).ok().as_deref() != Some(key.as_str()) {
+            if crate::bootstrap::census::module_for_key(&key).is_none() {
                 continue;
             }
             let Some(record) = plane
@@ -80,10 +77,12 @@ impl Census for RevokerCensus {
 
     async fn revoke(&self, module_id: &str, fence: Fence) -> Result<RevokeOutcome, String> {
         let plane = self.plane()?;
-        let key = AccountNames::census_key(module_id).map_err(|error| error.to_string())?;
+        let key = module_id;
+        crate::bootstrap::census::module_for_key(key)
+            .ok_or_else(|| format!("invalid census key {key}"))?;
         let Some(record) = plane
             .box_plane
-            .census_get(&plane.names, &key)
+            .census_get(&plane.names, key)
             .await
             .map_err(|error| error.message)?
         else {

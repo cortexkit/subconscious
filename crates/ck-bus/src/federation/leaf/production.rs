@@ -13,9 +13,9 @@ use tokio::sync::{mpsc, watch, OnceCell};
 
 use super::seams::{Callosum, FederationAccounts, LeafLinks, LocalHub, PeerIssuer};
 use crate::{
+    bootstrap::federation_account::ensure_federation_account,
     bootstrap::{plane::LeafLink, store::Store, Ready},
     credentials::Credentials,
-    federation::account::ensure_federation_account,
 };
 
 pub const CALLOSUM_MODULE_ID: &str = "callosum";
@@ -222,6 +222,9 @@ pub struct ReadyFederationAccounts {
 impl FederationAccounts for ReadyFederationAccounts {
     async fn ensure(&self) -> Result<String, String> {
         let ready = ready(&self.ready)?;
+        if let Some(account) = ready.fedout_account.get() {
+            return Ok(account.clone());
+        }
         ensure_federation_account(
             ready.system.as_ref(),
             &self.credentials,

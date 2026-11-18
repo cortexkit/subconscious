@@ -1,9 +1,9 @@
 //! Issuance: a supervised participant asks ck-bus for its bus credential.
 //!
-//! ck-bus serves three ops over the subc wire, `ckbus.credential`, `ckbus.nonce_sign` and
-//! `ckbus.credential_renew`. Every user JWT expires 15 minutes after it is signed;
+//! ck-bus issues and renews box and hub credentials and signs their connect nonces.
+//! Every user JWT expires 15 minutes after it is signed;
 //! renewal re-signs the same key with a fresh `exp`, and the holder renews before the old
-//! one lapses. All three
+//! one lapses. All credential ops
 //! authorize by the principal the daemon stamped on the caller's route at bind time
 //! and by nothing the caller writes in its request: `Principal::Reserved { module_id }`
 //! (the caller presented its launch nonce) binds the answer to that module id and to the
@@ -55,18 +55,26 @@ use std::{
 };
 
 use async_trait::async_trait;
-use cortexkit_bus_naming::AccountNames;
+use cortexkit_bus_naming::{
+    federation::{hub_module_grant, is_hub_module, module_deliver_prefix, BoxId},
+    AccountNames,
+};
 use serde_json::{json, Value};
 
 use crate::{
-    bootstrap::plane::BoxPlane,
+    bootstrap::{
+        federation_account,
+        plane::{BoxPlane, SystemPlane},
+        store::Store,
+    },
     credentials::{
         custody::CREDENTIAL_SUPERSEDED,
-        issue::{sign_user_jwt, SignedUserJwt, UserJwtRequest},
+        issue::{sign_user_jwt, IssueError, SignedUserJwt, UserJwtRequest},
         roots::RootCredential,
+        vault::VaultError,
         Credentials,
     },
-    grants::{self, Grant},
+    grants::{self, Grant, GrantRole},
 };
 use census::CensusValue;
 use high_water::{HighWater, HighWaterRefusal};
@@ -78,6 +86,8 @@ pub const NONCE_SIGN_OP: &str = "ckbus.nonce_sign";
 /// The op a participant calls to renew its JWT before `exp` (every JWT expires 15
 /// minutes after signing): the same key and epoch, re-signed with a fresh `iat` and `exp`.
 pub const CREDENTIAL_RENEW_OP: &str = "ckbus.credential_renew";
+pub const HUB_CREDENTIAL_OP: &str = "ckbus.hub_credential";
+pub const HUB_CREDENTIAL_RENEW_OP: &str = "ckbus.hub_credential_renew";
 
 /// Refusal codes, each an Error frame code on the caller's request.
 pub mod code {
@@ -99,6 +109,8 @@ pub mod code {
     pub const REVOCATION_UNWRITABLE: &str = "ckbus_revocation_unwritable";
     pub const NAME_REFUSED: &str = "naming-constructor-absent";
     pub const BAD_REQUEST: &str = "ckbus_bad_request";
+    pub const HUB_NOT_GRANTED: &str = "hub_not_granted";
+    pub const HUB_UNAVAILABLE: &str = "hub_unavailable";
 }
 
 /// A refused request: the Error frame code and a message naming the cause.
@@ -147,6 +159,23 @@ pub trait PlaneSource: Send + Sync {
     fn current(&self) -> Option<Plane>;
 }
 
+pub struct HubPlane {
+    pub account_public: String,
+    pub box_id: BoxId,
+    pub system: Arc<dyn SystemPlane>,
+    pub store: Store,
+}
+
+#[async_trait]
+pub trait HubSource: Send + Sync {
+    /// Requires a live hub link and a reachable federation-account signer.
+    async fn current(&self) -> Result<HubPlane, Refusal>;
+
+    fn fedout_waiting(&self) -> bool {
+        false
+    }
+}
+
 /// The replacement guard. Before issuance overwrites a module's census entry, `prepare`
 /// durably records a revocation of the credential that entry names (`previous`, the
 /// module's previous credential), so the old key can still be revoked after the entry
@@ -176,11 +205,12 @@ pub struct CredentialAnswer {
     pub inbox_prefix: String,
     pub server_url: String,
     pub issued: Issued,
+    pub box_id: Option<BoxId>,
 }
 
 impl CredentialAnswer {
     pub fn to_json(&self) -> Value {
-        json!({
+        let mut result = json!({
             "jwt": self.jwt,
             "exp": self.exp,
             "acct": self.acct,
@@ -191,7 +221,12 @@ impl CredentialAnswer {
             "user_jwt_id": self.issued.user_jwt_id,
             "spawn_generation": self.issued.spawn_generation,
             "credential_epoch": self.issued.credential_epoch,
-        })
+        });
+        if let Some(box_id) = &self.box_id {
+            result["box_id"] = json!(box_id.as_str());
+            result["domain"] = json!("hub");
+        }
+        result
     }
 }
 
@@ -234,6 +269,7 @@ pub struct Issuance {
     high_water: HighWater,
     spawn: Arc<dyn LiveGenerations>,
     plane: Arc<dyn PlaneSource>,
+    hub: Mutex<Option<Arc<dyn HubSource>>>,
     current: Mutex<HashMap<String, Issued>>,
     /// Per-module serialization, so two concurrent requests for one module never pick
     /// the same epoch or race their census writes.
@@ -260,6 +296,7 @@ impl Issuance {
             high_water,
             spawn,
             plane,
+            hub: Mutex::new(None),
             current: Mutex::new(HashMap::new()),
             module_locks: Mutex::new(HashMap::new()),
             damage: Mutex::new(None),
@@ -280,6 +317,29 @@ impl Issuance {
     /// would stay usable until its JWT expired.
     pub fn set_replacement_guard(&self, guard: Arc<dyn CensusReplacement>) {
         *lock(&self.replacement) = Some(guard);
+    }
+
+    pub fn set_hub_source(&self, hub: Arc<dyn HubSource>) {
+        *lock(&self.hub) = Some(hub);
+    }
+
+    fn fedout_waiting(&self) -> bool {
+        lock(&self.hub)
+            .as_ref()
+            .is_some_and(|hub| hub.fedout_waiting())
+    }
+
+    async fn hub(&self, module_id: &str) -> Result<HubPlane, Refusal> {
+        if !is_hub_module(module_id) {
+            return Err(Refusal::new(
+                code::HUB_NOT_GRANTED,
+                format!("{module_id} has no hub grant"),
+            ));
+        }
+        let source = lock(&self.hub)
+            .clone()
+            .ok_or_else(|| Refusal::new(code::HUB_UNAVAILABLE, "the hub link is not available"))?;
+        source.current().await
     }
 
     /// The credential currently held for a module, if any.
@@ -327,9 +387,27 @@ impl Issuance {
 
     /// `ckbus.credential` for the attested `module_id`: the six-step act.
     pub async fn issue(&self, module_id: &str) -> Result<CredentialAnswer, Refusal> {
-        let names_check = AccountNames::census_key(module_id)
+        self.issue_in(module_id, None).await
+    }
+
+    pub async fn issue_hub(&self, module_id: &str) -> Result<CredentialAnswer, Refusal> {
+        let hub = self.hub(module_id).await?;
+        self.issue_in(module_id, Some(hub)).await
+    }
+
+    async fn issue_in(
+        &self,
+        module_id: &str,
+        hub: Option<HubPlane>,
+    ) -> Result<CredentialAnswer, Refusal> {
+        let module_key = AccountNames::census_key(module_id)
             .map_err(|error| Refusal::new(code::NAME_REFUSED, error.to_string()))?;
-        let _serialized = self.module_lock(module_id).lock_owned().await;
+        let names_check = if hub.is_some() {
+            format!("{}{module_key}", census::HUB_PREFIX)
+        } else {
+            module_key
+        };
+        let _serialized = self.module_lock(&names_check).lock_owned().await;
 
         // 1. Fence: the generation comes from the supervisor, never from the caller.
         let generation = self.live_generation(module_id).await?;
@@ -340,13 +418,10 @@ impl Issuance {
                 "bootstrap has not finished; no box account connection yet",
             )
         })?;
-        let census_subject = plane
-            .names
-            .census_subject(&names_check)
-            .map_err(|error| Refusal::new(code::NAME_REFUSED, error.to_string()))?;
+        let census_subject = format!("$KV.{}.{names_check}", plane.names.buckets().census);
 
         // 2. The high-water entry is durable before anything is signed at its epoch.
-        let epoch = match self.high_water.advance(module_id, generation) {
+        let epoch = match self.high_water.advance(&names_check, generation) {
             Ok(epoch) => epoch,
             Err(refusal) => {
                 let code = if refusal.is_damage() {
@@ -381,7 +456,9 @@ impl Issuance {
         let user_public = custody.generate_user();
         let identities: Vec<String> = Vec::new();
         let rooms: Vec<String> = Vec::new();
-        let (signed, grant_digest) = match self.sign(&plane, module_id, &user_public, &rooms).await
+        let (signed, grant_digest) = match self
+            .sign(&plane, hub.as_ref(), module_id, &user_public)
+            .await
         {
             Ok(signed) => signed,
             Err(refusal) => {
@@ -418,7 +495,7 @@ impl Issuance {
                 if let Some(previous) = previous {
                     let previous = CensusValue::parse(&previous.value)
                         .map_err(|reason| Refusal::new(code::CENSUS_UNAVAILABLE, reason))?;
-                    guard.prepare(module_id, &previous)?;
+                    guard.prepare(&names_check, &previous)?;
                 }
                 Ok::<_, Refusal>(())
             }
@@ -449,7 +526,7 @@ impl Issuance {
             spawn_generation: generation,
             credential_epoch: epoch,
         };
-        let previous = lock(&self.current).insert(module_id.to_string(), issued.clone());
+        let previous = lock(&self.current).insert(names_check, issued.clone());
         if let Some(previous) = previous {
             self.supersede(previous);
         }
@@ -471,38 +548,76 @@ impl Issuance {
         );
 
         // 6. The answer.
+        let (acct, account_public, inbox_prefix, box_id) = match hub {
+            Some(hub) => (
+                federation_account::federation_account_name(hub.box_id.as_str()),
+                hub.account_public,
+                module_deliver_prefix(&hub.box_id, module_id).expect("validated module id"),
+                Some(hub.box_id),
+            ),
+            None => (
+                plane.names.account().to_string(),
+                plane.account_public,
+                format!("_INBOX.{user_public}"),
+                None,
+            ),
+        };
         Ok(CredentialAnswer {
             jwt: signed.jwt,
             exp: signed.exp,
-            acct: plane.names.account().to_string(),
-            account_public: plane.account_public.clone(),
-            inbox_prefix: format!("_INBOX.{user_public}"),
+            acct,
+            account_public,
+            inbox_prefix,
             server_url: plane.server_url.clone(),
             issued,
+            box_id,
         })
     }
 
     async fn sign(
         &self,
         plane: &Plane,
+        hub: Option<&HubPlane>,
         module_id: &str,
         user_public: &str,
-        rooms: &[String],
     ) -> Result<(SignedUserJwt, String), Refusal> {
-        let bound_rooms: Vec<&str> = rooms.iter().map(String::as_str).collect();
-        let grant: Grant = grants::issued_grant(&plane.names, module_id, user_public, &bound_rooms)
-            .map_err(|refusal| Refusal::new(code::GRANT_REFUSED, refusal.to_string()))?;
-        let root_id = RootCredential::BoxAccount
+        let (grant, account, root) = if let Some(hub) = hub {
+            let grant = hub_module_grant(&hub.box_id, module_id).ok_or_else(|| {
+                Refusal::new(
+                    code::HUB_NOT_GRANTED,
+                    format!("{module_id} has no hub grant"),
+                )
+            })?;
+            (
+                Grant::with_denies(
+                    GrantRole::Participant,
+                    &federation_account::federation_account_name(hub.box_id.as_str()),
+                    grant.publish.into_iter().collect(),
+                    grant.subscribe.into_iter().collect(),
+                    grant.denies,
+                ),
+                &hub.account_public,
+                RootCredential::FederationAccount,
+            )
+        } else {
+            (
+                grants::issued_grant(&plane.names, module_id, user_public, &[])
+                    .map_err(|refusal| Refusal::new(code::GRANT_REFUSED, refusal.to_string()))?,
+                &plane.account_public,
+                RootCredential::BoxAccount,
+            )
+        };
+        let root_id = root
             .credential_id()
             .map_err(|error| Refusal::new(code::NAME_REFUSED, error.to_string()))?;
         let issued_at = unix_now();
-        sign_user_jwt(
+        let signed = sign_user_jwt(
             self.credentials.vault.as_ref(),
             &self.credentials.key_ids,
             &UserJwtRequest {
                 root_credential_id: &root_id,
                 user_public,
-                issuer_account: Some(&plane.account_public),
+                issuer_account: Some(account),
                 name: module_id,
                 issued_at,
                 expires_at: self.credentials.lifetime.expires_at(issued_at),
@@ -510,8 +625,36 @@ impl Issuance {
             },
         )
         .await
-        .map(|signed| (signed, grant.permission_digest()))
-        .map_err(|error| Refusal::new(code::SIGNING_FAILED, error.to_string()))
+        .map_err(|error| {
+            let code = if hub.is_some()
+                && matches!(
+                    error,
+                    IssueError::Vault(VaultError::RootKeyUnreachable { .. })
+                ) {
+                code::HUB_UNAVAILABLE
+            } else {
+                code::SIGNING_FAILED
+            };
+            Refusal::new(code, error.to_string())
+        })?;
+        if let Some(hub) = hub {
+            let actual = federation_account::ensure_account(
+                hub.system.as_ref(),
+                &self.credentials,
+                &hub.store,
+                hub.box_id.as_str(),
+                Some(signed.issuer.clone()),
+            )
+            .await
+            .map_err(|error| Refusal::new(code::HUB_UNAVAILABLE, error))?;
+            if actual != *account {
+                return Err(Refusal::new(
+                    code::HUB_UNAVAILABLE,
+                    "the federation account changed while signing",
+                ));
+            }
+        }
+        Ok((signed, grant.permission_digest()))
     }
 
     /// `ckbus.credential_renew` for the attested `module_id` (R16): re-signs the key the
@@ -530,14 +673,40 @@ impl Issuance {
         module_id: &str,
         credential_public: &str,
     ) -> Result<RenewAnswer, Refusal> {
-        let _serialized = self.module_lock(module_id).lock_owned().await;
+        self.renew_in(module_id, credential_public, None).await
+    }
+
+    pub async fn renew_hub(
+        &self,
+        module_id: &str,
+        credential_public: &str,
+    ) -> Result<RenewAnswer, Refusal> {
+        let hub = self.hub(module_id).await?;
+        self.renew_in(module_id, credential_public, Some(hub)).await
+    }
+
+    async fn renew_in(
+        &self,
+        module_id: &str,
+        credential_public: &str,
+        hub: Option<HubPlane>,
+    ) -> Result<RenewAnswer, Refusal> {
+        let (key, op) = if hub.is_some() {
+            (
+                format!("{}{module_id}", census::HUB_PREFIX),
+                HUB_CREDENTIAL_OP,
+            )
+        } else {
+            (module_id.to_owned(), CREDENTIAL_OP)
+        };
+        let _serialized = self.module_lock(&key).lock_owned().await;
         let generation = self.live_generation(module_id).await?;
         let revoked = || {
             Refusal::new(
                 code::CREDENTIAL_REVOKED,
                 format!(
                     "{}: {credential_public} is revoked; fetch a fresh credential with \
-                     {CREDENTIAL_OP}",
+                     {op}",
                     code::CREDENTIAL_REVOKED
                 ),
             )
@@ -546,7 +715,7 @@ impl Issuance {
             return Err(revoked());
         }
         let current = self
-            .current(module_id)
+            .current(&key)
             .filter(|current| current.credential_public == credential_public)
             .filter(|current| self.credentials.custody.holds(&current.credential_public))
             .ok_or_else(|| {
@@ -554,7 +723,7 @@ impl Issuance {
                     code::CREDENTIAL_SUPERSEDED,
                     format!(
                         "{CREDENTIAL_SUPERSEDED}: {credential_public} is not {module_id}'s \
-                         current credential; fetch a fresh one with {CREDENTIAL_OP}"
+                         current credential; fetch a fresh one with {op}"
                     ),
                 )
             })?;
@@ -574,9 +743,8 @@ impl Issuance {
                 "bootstrap has not finished; no box account connection yet",
             )
         })?;
-        let rooms: Vec<String> = Vec::new();
         let (signed, _) = self
-            .sign(&plane, module_id, credential_public, &rooms)
+            .sign(&plane, hub.as_ref(), module_id, credential_public)
             .await?;
         // Checked again after signing: a revocation recorded while the vault signed has
         // a timestamp no earlier than this JWT's `iat`, so the server would refuse the
@@ -633,7 +801,19 @@ impl Issuance {
         nonce: &[u8],
     ) -> Result<Vec<u8>, Refusal> {
         let generation = self.live_generation(module_id).await?;
-        let Some(current) = self.current(module_id) else {
+        let current = match credential_public {
+            Some(public) => self
+                .current(module_id)
+                .filter(|current| current.credential_public == public)
+                .or_else(|| {
+                    is_hub_module(module_id)
+                        .then(|| self.current(&format!("{}{module_id}", census::HUB_PREFIX)))
+                        .flatten()
+                        .filter(|current| current.credential_public == public)
+                }),
+            None => self.current(module_id),
+        };
+        let Some(current) = current else {
             return Err(Refusal::new(
                 code::CREDENTIAL_SUPERSEDED,
                 format!(
@@ -650,17 +830,6 @@ impl Issuance {
                     current.spawn_generation
                 ),
             ));
-        }
-        if let Some(named) = credential_public {
-            if named != current.credential_public {
-                return Err(Refusal::new(
-                    code::CREDENTIAL_SUPERSEDED,
-                    format!(
-                        "{CREDENTIAL_SUPERSEDED}: ck-bus holds no key for {named}; fetch a fresh \
-                         credential with {CREDENTIAL_OP}"
-                    ),
-                ));
-            }
         }
         self.credentials
             .custody

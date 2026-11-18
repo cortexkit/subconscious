@@ -104,6 +104,7 @@ impl Area {
             }
         };
         let mut watching = false;
+        let mut watching_federation = false;
         loop {
             if !watching {
                 match plane.system.watch_connections(&plane.account_public).await {
@@ -126,7 +127,17 @@ impl Area {
                     ),
                 }
             }
-            self.revoker.resume_all(&plane).await;
+            let current = self.plane().unwrap_or_else(|| plane.clone());
+            if !watching_federation {
+                if let Some(account) = &current.federation_account {
+                    if let Ok(events) = current.system.watch_connections(account).await {
+                        watching_federation = true;
+                        let connections = self.revoker.connections().clone();
+                        tokio::spawn(async move { connections.follow(events).await });
+                    }
+                }
+            }
+            self.revoker.resume_all(&current).await;
             tokio::select! {
                 _ = self.wake.notified() => {}
                 _ = tokio::time::sleep(period) => {}
@@ -175,13 +186,21 @@ impl<H> RevocationHandler<H> {
     }
 }
 
-/// Whether `body` asks for a credential. Every other request passes straight through.
-fn is_credential_request(body: &[u8]) -> bool {
-    serde_json::from_slice::<Value>(body)
-        .ok()
-        .and_then(|request| request["method"].as_str().map(str::to_string))
-        .as_deref()
-        == Some(issuance::CREDENTIAL_OP)
+/// The addressed census key for an eligible issuance request.
+fn credential_key(body: &[u8], module_id: &str) -> Option<String> {
+    let request = serde_json::from_slice::<Value>(body).ok()?;
+    match request["method"].as_str()? {
+        issuance::CREDENTIAL_OP => AccountNames::census_key(module_id).ok(),
+        issuance::HUB_CREDENTIAL_OP
+            if cortexkit_bus_naming::federation::is_hub_module(module_id) =>
+        {
+            Some(format!(
+                "{}{module_id}",
+                crate::bootstrap::census::HUB_PREFIX
+            ))
+        }
+        _ => None,
+    }
 }
 
 #[async_trait]
@@ -195,18 +214,19 @@ impl<H: ModuleHandler> ModuleHandler for RevocationHandler<H> {
         // Only an attested credential request can issue, and issuance answers every
         // other case (a Direct caller, bootstrap not finished) with its own refusal.
         let module_id = match principal {
-            Some(Principal::Reserved { module_id }) if is_credential_request(&body) => module_id,
+            Some(Principal::Reserved { module_id }) => module_id,
             _ => return self.inner.handle(ctx, body).await,
         };
-        let (Some(plane), Ok(key)) = (self.area.plane(), AccountNames::census_key(&module_id))
+        let (Some(plane), Some(key)) = (self.area.plane(), credential_key(&body, &module_id))
         else {
             return self.inner.handle(ctx, body).await;
         };
-        let lock = self.area.module_lock(&module_id);
+        let lock = self.area.module_lock(&key);
         let _serialized = lock.lock().await;
-        match plane.box_plane.census_get(&plane.names, &key).await {
-            Ok(_) => {}
-            Err(error) => {
+        // Hub issuance checks the leaf link and signing key before reading the old credential.
+        // Its replacement guard still requires a successful census read before writing.
+        if !key.starts_with(crate::bootstrap::census::HUB_PREFIX) {
+            if let Err(error) = plane.box_plane.census_get(&plane.names, &key).await {
                 log_event(
                     "ckbus.revocation.census_unavailable",
                     json!({ "module_id": module_id, "reason": error.message }),

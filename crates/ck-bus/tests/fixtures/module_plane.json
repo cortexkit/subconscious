@@ -458,6 +458,48 @@
       "max_ack_pending": 1000,
       "max_deliver": -1,
       "stream": "CK_BOX_UPGRADEGOLDEN_DELIVERY_DEAD"
+    },
+    {
+      "ack_wait_secs": 30,
+      "durable": "m_prefrontal",
+      "filter_subjects": [
+        "ck.box_upgradegolden.peer.fed.*.*.handoff",
+        "ck.box_upgradegolden.peer.fed.*.custody"
+      ],
+      "max_ack_pending": 1000,
+      "max_deliver": -1,
+      "stream": "CK_BOX_UPGRADEGOLDEN_PEER"
+    },
+    {
+      "ack_wait_secs": 30,
+      "durable": "m_prefrontal",
+      "filter_subjects": [
+        "ck.box_upgradegolden.wake.fed.*.*.handoff"
+      ],
+      "max_ack_pending": 1000,
+      "max_deliver": -1,
+      "stream": "CK_BOX_UPGRADEGOLDEN_WAKE"
+    },
+    {
+      "ack_wait_secs": 30,
+      "durable": "m_prefrontal-core",
+      "filter_subjects": [
+        "ck.box_upgradegolden.peer.fed.*.*.handoff",
+        "ck.box_upgradegolden.peer.fed.*.custody"
+      ],
+      "max_ack_pending": 1000,
+      "max_deliver": -1,
+      "stream": "CK_BOX_UPGRADEGOLDEN_PEER"
+    },
+    {
+      "ack_wait_secs": 30,
+      "durable": "m_prefrontal-core",
+      "filter_subjects": [
+        "ck.box_upgradegolden.wake.fed.*.*.handoff"
+      ],
+      "max_ack_pending": 1000,
+      "max_deliver": -1,
+      "stream": "CK_BOX_UPGRADEGOLDEN_WAKE"
     }
   ]
 }

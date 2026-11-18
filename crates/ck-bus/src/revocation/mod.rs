@@ -96,6 +96,7 @@ pub struct RevocationPlane {
     pub account_public: String,
     pub system: Arc<dyn SystemPlane>,
     pub box_plane: Arc<dyn BoxPlane>,
+    pub federation_account: Option<String>,
 }
 
 impl RevocationPlane {
@@ -105,8 +106,17 @@ impl RevocationPlane {
             account_public: ready.account.account_public.clone(),
             system: ready.system.clone(),
             box_plane: ready.box_plane.clone(),
+            federation_account: ready
+                .fedout_account
+                .get()
+                .cloned()
+                .or_else(|| ready.federation_account.clone()),
         })
     }
+}
+
+fn census_key(key: &str) -> Option<&str> {
+    crate::bootstrap::census::module_for_key(key).map(|_| key)
 }
 
 /// The credential to revoke, as the census value named it.
@@ -256,11 +266,12 @@ impl Revoker {
         plane: &RevocationPlane,
         module_id: &str,
     ) -> Result<Option<Completed>, RevocationError> {
-        let key = AccountNames::census_key(module_id)
-            .map_err(|error| RevocationError::CensusUnreadable(error.to_string()))?;
+        let key = census_key(module_id).ok_or_else(|| {
+            RevocationError::CensusUnreadable(format!("invalid census key {module_id}"))
+        })?;
         let record = plane
             .box_plane
-            .census_get(&plane.names, &key)
+            .census_get(&plane.names, key)
             .await
             .map_err(|error| RevocationError::CensusUnreadable(error.message))?;
         let Some(record) = record else {
@@ -380,12 +391,17 @@ impl Revoker {
         path: &Path,
         reason: &str,
     ) -> Result<Completed, RevocationError> {
-        let key = AccountNames::census_key(&identity.module_id)
-            .map_err(|error| deferred(0, cause::CENSUS_READ_FAILED, error.to_string()))?;
+        let key = census_key(&identity.module_id).ok_or_else(|| {
+            deferred(
+                0,
+                cause::CENSUS_READ_FAILED,
+                format!("invalid census key {}", identity.module_id),
+            )
+        })?;
         // Absence concludes something only from a read that succeeded.
         let entry = plane
             .box_plane
-            .census_get(&plane.names, &key)
+            .census_get(&plane.names, key)
             .await
             .map_err(|error| deferred(0, cause::CENSUS_READ_FAILED, error.message))?;
         let current = entry
@@ -497,16 +513,36 @@ impl Revoker {
         plane: &RevocationPlane,
         record: &Record,
     ) -> Result<bool, RevocationError> {
+        let hub = record
+            .identity
+            .module_id
+            .starts_with(crate::bootstrap::census::HUB_PREFIX);
+        let _account_update = if hub {
+            Some(self.credentials.federation_account_update.lock().await)
+        } else {
+            None
+        };
+        let account_public = if hub {
+            plane.federation_account.as_ref().ok_or_else(|| {
+                deferred(
+                    0,
+                    cause::CLAIMS_LOOKUP_FAILED,
+                    "the federation account is not available".to_owned(),
+                )
+            })?
+        } else {
+            &plane.account_public
+        };
         let current = plane
             .system
-            .lookup(&plane.account_public)
+            .lookup(account_public)
             .await
             .map_err(|error| deferred(0, cause::CLAIMS_LOOKUP_FAILED, error.message))?
             .ok_or_else(|| {
                 deferred(
                     0,
                     cause::CLAIMS_LOOKUP_FAILED,
-                    format!("the resolver holds no JWT for {}", plane.account_public),
+                    format!("the resolver holds no JWT for {account_public}"),
                 )
             })?;
         let claims = decode_claims(&current).ok_or_else(|| {
@@ -516,13 +552,13 @@ impl Revoker {
                 "the looked-up account JWT does not decode",
             )
         })?;
-        if claims["sub"].as_str() != Some(plane.account_public.as_str()) {
+        if claims["sub"].as_str() != Some(account_public.as_str()) {
             return Err(deferred(
                 0,
                 cause::ACCOUNT_JWT_UNUSABLE,
                 format!(
                     "the lookup for {} answered a JWT for {:?}",
-                    plane.account_public, claims["sub"]
+                    account_public, claims["sub"]
                 ),
             ));
         }
@@ -555,7 +591,7 @@ impl Revoker {
         // another writer, and the push is refused naming that claim rather than dropping
         // it silently.
         let as_written = AccountClaims {
-            account_public: plane.account_public.clone(),
+            account_public: account_public.clone(),
             name: name.clone(),
             signing_keys: signing_keys.clone(),
             revocations: revoked.clone(),
@@ -567,7 +603,7 @@ impl Revoker {
                 0,
                 cause::ACCOUNT_JWT_FOREIGN_CLAIM,
                 format!(
-                    "the box account JWT carries `{claim}`, which ck-bus does not write; \
+                    "the account JWT carries `{claim}`, which ck-bus does not write; \
                      rebuilding it for the revocation would drop it, so nothing is pushed"
                 ),
             ));
@@ -582,7 +618,7 @@ impl Revoker {
         // The server keeps the newer of two account JWTs by `iat`, so an update in the
         // same second as the one it replaces is dated one second later.
         let updated = AccountClaims {
-            account_public: plane.account_public.clone(),
+            account_public: account_public.clone(),
             name,
             signing_keys,
             revocations: revoked,
@@ -599,7 +635,7 @@ impl Revoker {
         )
         .await
         .map_err(|error| deferred(0, cause::OPERATOR_SIGNATURE_REFUSED, error.to_string()))?;
-        apply_account_jwt(plane.system.as_ref(), &plane.account_public, &jwt)
+        apply_account_jwt(plane.system.as_ref(), account_public, &jwt)
             .await
             .map_err(|error| match error {
                 ApplyError::ReadBackMismatch { .. } => {
@@ -616,24 +652,29 @@ impl Revoker {
         plane: &RevocationPlane,
         record: &Record,
     ) -> Result<bool, RevocationError> {
-        let key = AccountNames::census_key(&record.identity.module_id)
-            .map_err(|error| deferred(1, cause::CENSUS_READ_FAILED, error.to_string()))?;
+        let key = census_key(&record.identity.module_id).ok_or_else(|| {
+            deferred(
+                1,
+                cause::CENSUS_READ_FAILED,
+                format!("invalid census key {}", record.identity.module_id),
+            )
+        })?;
         let names_this = |entry: &Option<progress_census::Stored>| {
             entry.as_ref().is_some_and(|stored| stored.names(record))
         };
-        let entry = progress_census::read(plane, &key).await?;
+        let entry = progress_census::read(plane, key).await?;
         if !names_this(&entry) {
             return Ok(false);
         }
         let revision = entry.map(|stored| stored.revision).unwrap_or_default();
         if let Err(error) = plane
             .box_plane
-            .census_delete(&plane.names, &key, revision)
+            .census_delete(&plane.names, key, revision)
             .await
         {
             // A write between the read and the delete moved the revision; the key then
             // names another credential and is not this revocation's to delete.
-            if names_this(&progress_census::read(plane, &key).await?) {
+            if names_this(&progress_census::read(plane, key).await?) {
                 return Err(deferred(1, cause::CENSUS_DELETE_FAILED, error.message));
             }
             return Ok(false);

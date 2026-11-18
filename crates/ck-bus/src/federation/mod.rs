@@ -9,7 +9,9 @@
 //! The ck-bus federation design ("The leaf link", "Leaf credentials, per hub kind" and
 //! "Channel wire, v1") is the contract this follows.
 
-pub mod account;
+#[cfg(test)]
+#[path = "account/tests.rs"]
+mod account_tests;
 pub mod hub;
 pub mod leaf;
 #[cfg(test)]

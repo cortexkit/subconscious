@@ -5,12 +5,14 @@ use nkeys::KeyPair;
 use serde_json::json;
 use tokio::sync::mpsc;
 
-use super::*;
+use crate::bootstrap::federation_account::*;
 use crate::{
     bootstrap::{
-        account_jwt::verify_self_named_issuer,
-        plane::{ConnectionEvent, PlaneError},
+        account_jwt::{decode_claims, verify_self_named_issuer},
+        plane::{ConnectionEvent, PlaneError, SystemPlane},
+        store::{AccountFile, AccountRecord, Store},
     },
+    credentials::{roots::RootCredential, Credentials},
     federation::test_support::KeyVault,
 };
 

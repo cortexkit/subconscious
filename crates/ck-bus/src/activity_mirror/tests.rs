@@ -713,6 +713,8 @@ fn ready_plane(plane: Arc<dyn crate::bootstrap::plane::BoxPlane>) -> Arc<Ready> 
         box_user: "unused".into(),
         system: Arc::new(UnusedSystem),
         box_plane: plane,
+        federation_account: None,
+        fedout_account: tokio::sync::OnceCell::new(),
         renewals: vec![],
     })
 }

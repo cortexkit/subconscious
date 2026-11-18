@@ -7,6 +7,20 @@
 
 use serde_json::{json, Value};
 
+/// Distinguish federation users from box users in the same census. Naming's
+/// `census_key` validates module IDs as single tokens, so none can contain a dot.
+pub(crate) const HUB_PREFIX: &str = "hub.";
+
+pub(crate) fn module_for_key(key: &str) -> Option<&str> {
+    let module = match key.strip_prefix(HUB_PREFIX) {
+        Some(module) if cortexkit_bus_naming::federation::is_hub_module(module) => module,
+        Some(_) => return None,
+        None => key,
+    };
+    cortexkit_bus_naming::AccountNames::census_key(module).ok()?;
+    Some(module)
+}
+
 /// The version of this value's layout, carried in `schema_versions.census` so a reader
 /// can refuse a layout it does not know.
 pub const CENSUS_SCHEMA_VERSION: u64 = 1;

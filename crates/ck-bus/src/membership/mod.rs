@@ -31,9 +31,9 @@
 //! `ckbus.agent_durable_delete` for the source agent. Nothing in ck-bus assumes a copy.
 //!
 //! The pull grant on any agent durable is a whole-token `*` in the consumer position on
-//! the three agent streams, so no consumer other than an agent's `c_{agent_id}` may ever
-//! exist on them. `ckbus_owned_durables` lists the consumers ck-bus itself owns, and its
-//! test holds them off the agent streams.
+//! the three agent streams. The only non-agent consumers ck-bus creates there are the
+//! federation readers on WAKE and PEER. Explicit JWT denies reserve each of those
+//! readers for its named authority regardless of the wildcard.
 
 use std::{sync::Arc, time::Duration};
 
@@ -91,16 +91,23 @@ pub const AGENT_STREAM_KINDS: [StreamKind; 3] =
     [StreamKind::Wake, StreamKind::Peer, StreamKind::Effect];
 
 /// Consumers ck-bus creates, other than agent durables, by stream kind and name: its own
-/// dead-letter consumer and the module durables bootstrap creates. None may sit on an
-/// agent stream: the participant grant pulls any consumer there.
+/// dead-letter consumer and the module durables bootstrap creates. Only the declared
+/// federation readers may share agent streams; JWT denies isolate those readers.
 pub fn ckbus_owned_durables() -> impl Iterator<Item = (StreamKind, &'static str)> {
     [
         (StreamKind::EffectDead, "c_ckbus_dead"),
         (StreamKind::DeliveryDead, "c_ckbus_dead"),
         (StreamKind::Inbox, "m_prefrontal"),
+        (StreamKind::Inbox, "m_prefrontal-core"),
         (StreamKind::CoreWork, "m_prefrontal"),
+        (StreamKind::CoreWork, "m_prefrontal-core"),
         (StreamKind::Event, "m_basal"),
         (StreamKind::Room, "m_prefrontal"),
+        (StreamKind::Room, "m_prefrontal-core"),
+        (StreamKind::Wake, "m_prefrontal"),
+        (StreamKind::Wake, "m_prefrontal-core"),
+        (StreamKind::Peer, "m_prefrontal"),
+        (StreamKind::Peer, "m_prefrontal-core"),
     ]
     .into_iter()
     .chain(
@@ -108,6 +115,11 @@ pub fn ckbus_owned_durables() -> impl Iterator<Item = (StreamKind, &'static str)
             .iter()
             .map(|reader| (StreamKind::Event, reader.durable)),
     )
+}
+
+pub fn is_federation_reader(names: &AccountNames, stream: &str, durable: &str) -> bool {
+    (stream == names.streams().wake || stream == names.streams().peer)
+        && crate::grants::is_delivery_durable(durable)
 }
 
 /// The literal names of the agent streams, as the naming crate lists them (the list its
@@ -383,15 +395,17 @@ pub async fn delete(
     Ok(json!({ "agent_id": agent_id, "deleted": deleted, "purged": purged }))
 }
 
-/// One row per consumer on an agent stream. A consumer whose name is not an agent
-/// durable (which the grant's invariant forbids) is still listed, with `agent_id` null,
-/// so it is seen rather than hidden.
+/// One row per agent-stream consumer other than the declared federation readers.
+/// Unexpected non-agent consumers are still listed with `agent_id` null.
 pub async fn list(names: &AccountNames, plane: &dyn BoxPlane) -> Result<Value, Refusal> {
     let mut rows = Vec::new();
     for stream in agent_streams(names) {
         let mut consumers = plane.consumer_names(&stream).await.map_err(plane_failed)?;
         consumers.sort();
         for durable in consumers {
+            if is_federation_reader(names, &stream, &durable) {
+                continue;
+            }
             // Deleted between the listing and the read: not a durable any more.
             let Some(state) = plane
                 .consumer_state(&stream, &durable)

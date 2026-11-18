@@ -41,6 +41,7 @@ pub struct Credentials {
     /// The JWT each of ck-bus's own users presents on its next connect, kept current by
     /// the renewal tasks.
     pub own_jwts: renewal::OwnJwts,
+    pub federation_account_update: tokio::sync::Mutex<()>,
 }
 
 impl Credentials {
@@ -56,6 +57,7 @@ impl Credentials {
             key_ids: KeyIdLedger::new(),
             lifetime,
             own_jwts: renewal::OwnJwts::default(),
+            federation_account_update: tokio::sync::Mutex::new(()),
         }
     }
 

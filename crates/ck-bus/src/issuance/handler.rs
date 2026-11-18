@@ -1,4 +1,5 @@
-//! The subc side of issuance: the three issuance ops and the membership area's agent-durable
+//! The daemon-route side of issuance (requests arriving over the subconscious daemon's
+//! module wire): the credential ops and the membership area's agent-durable
 //! ops advertised on ck-bus's management surface, the principal each route was bound
 //! with, and the wiring `main.rs` calls.
 //!
@@ -32,7 +33,9 @@ use subc_protocol::{
 };
 use tokio::sync::{watch, OnceCell};
 
-use super::{code, log_event, Issuance, LiveGenerations, Plane, PlaneSource, Refusal};
+use super::{
+    code, log_event, HubPlane, HubSource, Issuance, LiveGenerations, Plane, PlaneSource, Refusal,
+};
 use crate::{
     bootstrap::{config::BrokerConfig, Ready},
     credentials::Credentials,
@@ -61,6 +64,11 @@ pub fn advertise(builder: ModuleManifestBuilder) -> ModuleManifest {
         (super::CREDENTIAL_OP, ManagementOperationKind::Mutate),
         (super::NONCE_SIGN_OP, ManagementOperationKind::Query),
         (super::CREDENTIAL_RENEW_OP, ManagementOperationKind::Mutate),
+        (super::HUB_CREDENTIAL_OP, ManagementOperationKind::Mutate),
+        (
+            super::HUB_CREDENTIAL_RENEW_OP,
+            ManagementOperationKind::Mutate,
+        ),
     ]
     .into_iter()
     .map(|(name, kind)| (name, kind, "ck-bus participant credential issuance"));
@@ -144,6 +152,8 @@ impl<H> IssuanceHandler<H> {
             super::CREDENTIAL_OP,
             super::NONCE_SIGN_OP,
             super::CREDENTIAL_RENEW_OP,
+            super::HUB_CREDENTIAL_OP,
+            super::HUB_CREDENTIAL_RENEW_OP,
         ]
         .contains(&method)
         {
@@ -169,17 +179,29 @@ impl<H> IssuanceHandler<H> {
                 .issue(&module_id)
                 .await
                 .map(|answer| answer.to_json()),
-            Ok(module_id) if method == super::CREDENTIAL_RENEW_OP => {
+            Ok(module_id) if method == super::HUB_CREDENTIAL_OP => self
+                .issuance
+                .issue_hub(&module_id)
+                .await
+                .map(|answer| answer.to_json()),
+            Ok(module_id)
+                if matches!(
+                    method,
+                    super::CREDENTIAL_RENEW_OP | super::HUB_CREDENTIAL_RENEW_OP
+                ) =>
+            {
                 match params.get("credential_public").and_then(Value::as_str) {
-                    Some(credential_public) => self
-                        .issuance
-                        .renew(&module_id, credential_public)
-                        .await
-                        .map(|answer| answer.to_json()),
+                    Some(credential_public) => if method == super::HUB_CREDENTIAL_RENEW_OP {
+                        self.issuance.renew_hub(&module_id, credential_public).await
+                    } else {
+                        self.issuance.renew(&module_id, credential_public).await
+                    }
+                    .map(|answer| answer.to_json()),
                     None => Err(Refusal::new(
                         code::BAD_REQUEST,
-                        "ckbus.credential_renew requires params.credential_public, the key \
-                         being renewed",
+                        format!(
+                            "{method} requires params.credential_public, the key being renewed"
+                        ),
                     )),
                 }
             }
@@ -272,19 +294,31 @@ impl<H: ModuleHandler> ModuleHandler for IssuanceHandler<H> {
     }
 
     async fn health(&self) -> HealthReport {
-        let Some(damage) = self.issuance.damage() else {
-            return self.inner.health().await;
+        let mut report = if let Some(damage) = self.issuance.damage() {
+            HealthReport {
+                status: HealthStatus::Failing,
+                detail: Some("Message bus is down.".to_string()),
+                metrics: Some(json!({
+                    "class": "Unavailable",
+                    "cause": HIGH_WATER_DAMAGED_CAUSE,
+                    "path": damage.path().display().to_string(),
+                    "message": damage.to_string(),
+                })),
+            }
+        } else {
+            self.inner.health().await
         };
-        HealthReport {
-            status: HealthStatus::Failing,
-            detail: Some("Message bus is down.".to_string()),
-            metrics: Some(json!({
-                "class": "Unavailable",
-                "cause": HIGH_WATER_DAMAGED_CAUSE,
-                "path": damage.path().display().to_string(),
-                "message": damage.to_string(),
-            })),
+        if self.issuance.fedout_waiting() {
+            let mut metrics = report.metrics.take().unwrap_or_else(|| json!({}));
+            if let Some(fields) = metrics.as_object_mut() {
+                fields.insert(
+                    "fed.fedout".into(),
+                    json!("FEDOUT is waiting for the federation signing key"),
+                );
+            }
+            report.metrics = Some(metrics);
         }
+        report
     }
 
     async fn on_route_gone(&self, handle: &RouteHandle) {
@@ -358,6 +392,64 @@ impl PlaneSource for ReadyPlane {
             account_public: ready.account.account_public.clone(),
             server_url: self.server_url.clone()?,
             box_plane: ready.box_plane.clone(),
+        })
+    }
+}
+
+pub struct ReadyHub {
+    pub ready: watch::Receiver<Option<Arc<Ready>>>,
+    pub server_url: String,
+    pub credentials: Arc<Credentials>,
+    pub store: crate::bootstrap::store::Store,
+    pub linked: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+#[async_trait]
+impl HubSource for ReadyHub {
+    fn fedout_waiting(&self) -> bool {
+        self.ready
+            .borrow()
+            .as_ref()
+            .is_some_and(|ready| ready.fedout_account.get().is_none())
+    }
+
+    async fn current(&self) -> Result<HubPlane, Refusal> {
+        let unavailable = |message| Refusal::new(code::HUB_UNAVAILABLE, message);
+        if !(self.linked)() {
+            return Err(unavailable("the hub link is not available".to_owned()));
+        }
+        let ready = self
+            .ready
+            .borrow()
+            .clone()
+            .ok_or_else(|| unavailable("the local bus is not ready".to_owned()))?;
+        let box_id = cortexkit_bus_naming::federation::BoxId::parse(&ready.account.machine_id)
+            .map_err(|error| unavailable(error.to_string()))?;
+        let account_public = ready
+            .fedout_account
+            .get_or_try_init(|| async {
+                let broker = crate::bootstrap::plane::NatsBroker::new(
+                    self.server_url.clone(),
+                    self.credentials.clone(),
+                );
+                crate::bootstrap::federation_account::provision_fedout(
+                    ready.system.as_ref(),
+                    &broker,
+                    &self.credentials,
+                    &self.store,
+                    box_id.as_str(),
+                )
+                .await?
+                .ok_or_else(|| "FEDOUT is waiting for the federation signing key".to_owned())
+            })
+            .await
+            .map_err(unavailable)?
+            .clone();
+        Ok(HubPlane {
+            account_public,
+            box_id,
+            system: ready.system.clone(),
+            store: self.store.clone(),
         })
     }
 }

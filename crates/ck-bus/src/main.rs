@@ -164,6 +164,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         &store_root,
         bootstrap.ready(),
     )?;
+    let issuance = wired.handler.issuance().clone();
     let wired = revocation::handler::wire(
         wired,
         credentials.clone(),
@@ -184,10 +185,20 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let leaf = federation::leaf::production::start(
         callosum,
         hub.clone(),
-        credentials,
+        credentials.clone(),
         &store_root,
         bootstrap.ready(),
     );
+    let linked = leaf.clone();
+    issuance.set_hub_source(Arc::new(issuance::handler::ReadyHub {
+        ready: bootstrap.ready(),
+        server_url: bootstrap::config::BrokerConfig::from_env()
+            .map(|config| config.url)
+            .unwrap_or_default(),
+        credentials,
+        store: bootstrap::store::Store::new(store_root.clone()),
+        linked: Arc::new(move || linked.has_hub_link()),
+    }));
     let revoker = wired.handler.area().revoker().clone();
     let manifest =
         federation::hub::handler::advertise(federation::leaf::handler::advertise(wired.manifest));

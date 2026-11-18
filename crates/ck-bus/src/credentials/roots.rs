@@ -36,7 +36,7 @@ pub enum RootCredential {
     /// The operator signing key: signs the box account JWT, including every revocation
     /// claims update.
     OperatorSigner,
-    /// Signs ck-bus's federation-account user JWT.
+    /// Signs federation-account users for scoped access to the hub and FEDOUT.
     FederationAccount,
     /// Signs per-message sender signatures for cross-machine deliveries.
     MessageSigning,
@@ -85,7 +85,7 @@ impl RootCredential {
             Self::SystemAccount => ("ck-bus-sysaccount", Some(1)),
             Self::OperatorRoot => ("ck-bus-operator-root", Some(1)),
             Self::OperatorSigner => ("ck-bus-operator-signer", Some(1)),
-            Self::FederationAccount => ("ck-bus-fedaccount", Some(1)),
+            Self::FederationAccount => ("bus-federation-account", Some(1)),
             // CKCRED's latest note names it without a generation.
             Self::MessageSigning => ("msgsig", None),
             // The vault creates it at daemon start on every machine (ck-bus federation

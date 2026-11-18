@@ -301,6 +301,16 @@ pub trait BoxPlane: Send + Sync {
     async fn ensure_module_durable(&self, durable: &DurableConsumer) -> Result<(), PlaneError> {
         self.create_durable(durable).await
     }
+    /// Creates a replacement ROOM reader at the first sequence after its predecessor's ack floor.
+    async fn create_durable_from_sequence(
+        &self,
+        _durable: &DurableConsumer,
+        _start: u64,
+    ) -> Result<(), PlaneError> {
+        Err(PlaneError::new(
+            "sequence-based durable creation is unavailable",
+        ))
+    }
     /// One consumer's configuration and counters. `Ok(None)` is the server's own answer
     /// that the stream holds no consumer of that name; a read that fails is an `Err`.
     async fn consumer_state(
@@ -356,6 +366,7 @@ pub struct ConsumerState {
     /// The server's names for the ack and deliver policies (`explicit`, `all`, ...).
     pub ack_policy: String,
     pub deliver_policy: String,
+    pub ack_floor_stream_sequence: Option<u64>,
     /// Messages matching the filter that the consumer has not delivered yet.
     pub num_pending: u64,
     /// Messages delivered and not yet acknowledged, which the server will redeliver
@@ -833,10 +844,15 @@ impl BoxPlane for NatsBox {
     }
 
     async fn ensure_stream(&self, spec: &StreamSpec) -> Result<(), PlaneError> {
+        let handoff_destination = matches!(
+            spec.kind,
+            StreamKind::Room | StreamKind::Wake | StreamKind::Peer
+        );
         if spec.max_msgs_per_subject.is_some()
             || spec.max_message_size.is_some()
             || spec.duplicate_window.is_some()
             || spec.kind == StreamKind::Effect
+            || handoff_destination
         {
             let what = format!("stream info {}", spec.name);
             let reply = self
@@ -857,19 +873,24 @@ impl BoxPlane for NatsBox {
                 if let Some(window) = spec.duplicate_window {
                     config.duplicate_window = window;
                 }
-                if spec.kind == StreamKind::Effect {
+                if spec.kind == StreamKind::Effect || handoff_destination {
                     config.max_age = spec.max_age;
+                }
+                if handoff_destination {
+                    let desired = stream_config(spec);
+                    config.discard = desired.discard;
+                    config.subjects = desired.subjects;
                 }
                 let new = serde_json::to_value(&config)
                     .map_err(|error| PlaneError::new(format!("{what}: {error}")))?;
                 if old != new {
-                    // Change only the limit being upgraded, preserving the stream's
+                    // Change only the settings being upgraded, preserving the stream's
                     // messages and all other stored settings.
                     // Zero is the client's omission sentinel, not a wire value.
-                    if spec.max_message_size.is_none() {
+                    if !handoff_destination && spec.max_message_size.is_none() {
                         config.max_message_size = 0;
                     }
-                    if spec.duplicate_window.is_none() {
+                    if !handoff_destination && spec.duplicate_window.is_none() {
                         config.duplicate_window = Duration::ZERO;
                     }
                     self.jetstream
@@ -1041,6 +1062,27 @@ impl BoxPlane for NatsBox {
             })
     }
 
+    async fn create_durable_from_sequence(
+        &self,
+        durable: &DurableConsumer,
+        start: u64,
+    ) -> Result<(), PlaneError> {
+        let mut config = durable_config(durable);
+        config.deliver_policy = jetstream::consumer::DeliverPolicy::ByStartSequence {
+            start_sequence: start,
+        };
+        self.jetstream
+            .create_consumer_strict_on_stream(config, durable.stream.as_str())
+            .await
+            .map(|_| ())
+            .map_err(|error| {
+                PlaneError::new(format!(
+                    "create {} on {} at sequence {start}: {error}",
+                    durable.durable, durable.stream
+                ))
+            })
+    }
+
     async fn consumer_state(
         &self,
         stream: &str,
@@ -1199,6 +1241,7 @@ pub fn parse_consumer_state(reply: &Value) -> Option<ConsumerState> {
         },
         ack_policy: config["ack_policy"].as_str()?.to_string(),
         deliver_policy: config["deliver_policy"].as_str()?.to_string(),
+        ack_floor_stream_sequence: reply["ack_floor"]["stream_seq"].as_u64(),
         num_pending: reply["num_pending"].as_u64()?,
         num_ack_pending: reply["num_ack_pending"].as_u64()?,
     })

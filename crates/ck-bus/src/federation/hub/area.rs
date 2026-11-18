@@ -721,7 +721,13 @@ impl HubArea {
 
     async fn bring_online(&self, record: &HubRecord) -> Result<i64, String> {
         let iat = self.push_hub_account(record).await?;
-        let mut streams = vec![HubStream::IdLog, HubStream::Residence, HubStream::Cuts];
+        let mut streams = vec![
+            HubStream::IdLog,
+            HubStream::Residence,
+            HubStream::Cuts,
+            HubStream::Rooms,
+            HubStream::Memory,
+        ];
         let mut boxes: Vec<&str> = record.issued.values().map(|i| i.box_id.as_str()).collect();
         boxes.sort_unstable();
         boxes.dedup();

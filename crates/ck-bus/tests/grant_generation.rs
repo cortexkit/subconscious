@@ -34,6 +34,54 @@ const SERVED_BY: &str = "none";
 /// digest. These pin the principal and operation as well as the subject of every line.
 const LIVE_GOLDEN: &str = include_str!("fixtures/live_permissions.txt");
 
+#[test]
+fn box_jwt_denies_inbound_federation_publishes_for_every_role() {
+    let account = grants::derive_account("box_example").unwrap();
+    let user = "credential";
+    for grant in [
+        grants::issued_grant(&account, "other", user, &[]).unwrap(),
+        grants::issued_grant(&account, "prefrontal", user, &[]).unwrap(),
+        grants::issued_grant(&account, "prefrontal-core", user, &[]).unwrap(),
+        grants::issued_grant(&account, "basal", user, &[]).unwrap(),
+        grants::bus_module_grant(&account, user).unwrap(),
+        grants::system_account_grant(&account, user).unwrap(),
+    ] {
+        let jwt = grant.jwt_permissions();
+        assert!(
+            jwt["pub"]["deny"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("ck.box_example.*.fed.>")),
+            "{:?}",
+            grant.role()
+        );
+        assert!(jwt["sub"].get("deny").is_none());
+    }
+}
+
+#[test]
+fn cerebellum_can_read_raw_run_events_outside_its_existing_durables() {
+    let account = grants::derive_account("box_example").unwrap();
+    let cerebellum = grants::issued_grant(&account, "cerebellum", "credential", &[]).unwrap();
+    let other = grants::issued_grant(&account, "other", "credential", &[]).unwrap();
+    let consumers = cortexkit_bus_naming::event_consumer_specs(&account).unwrap();
+    for state in ["started", "paused", "ended"] {
+        let subject = format!("ck.box_example.event.broca.run.{state}.v1");
+        assert!(cerebellum.subscribe_allow().contains(&subject));
+        assert!(!other.subscribe_allow().contains(&subject));
+        for consumer in consumers
+            .iter()
+            .filter(|spec| spec.consumer.durable.starts_with("m_cerebellum"))
+        {
+            assert!(!consumer
+                .consumer
+                .filter_subjects
+                .iter()
+                .any(|filter| subject_matches(filter, &subject)));
+        }
+    }
+}
+
 /// Run explicitly after a reviewed naming-table update; ordinary suites never write fixtures.
 #[test]
 #[ignore = "explicit fixture regeneration only"]
@@ -48,25 +96,25 @@ fn regenerate_local_permission_fixture() {
 }
 
 #[test]
-fn retired_liveness_delete_is_scoped_to_ckbus_and_the_old_bucket() {
+fn liveness_retirement_is_scoped_to_ckbus_and_the_two_owner_buckets() {
     let account = grants::derive_account("box_retiregrant").unwrap();
     let bus = grants::bus_module_grant(&account, "credential").unwrap();
     let old = "$JS.API.STREAM.DELETE.KV_CK_BOX_RETIREGRANT_PREFRONTAL_CORE_SESSION_LIVENESS";
-    assert!(bus.publish_allow().contains(old));
+    let new = "$JS.API.STREAM.DELETE.KV_CK_BOX_RETIREGRANT_PREFRONTAL_SESSION_LIVENESS";
     assert_eq!(
         bus.publish_allow()
             .iter()
             .filter(|subject| subject.starts_with("$JS.API.STREAM.DELETE.KV_"))
-            .count(),
-        1
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        [old, new].into()
     );
     for module in ["prefrontal", "prefrontal-core", "entorhinal", "other"] {
         let grant = grants::issued_grant(&account, module, "credential", &[]).unwrap();
         assert!(
-            !grant
-                .publish_allow()
+            !grant.publish_allow().iter().any(|pattern| [old, new]
                 .iter()
-                .any(|pattern| subject_matches(pattern, old)),
+                .any(|subject| subject_matches(pattern, subject))),
             "{module}"
         );
     }
@@ -270,15 +318,15 @@ fn reliable_delivery_grants_are_authority_only_and_scoped_to_its_durables() {
     }
     for stream in ["INBOX", "CORE_WORK"] {
         for subject in [
-            format!("$JS.ACK.CK_BOX_DELIVERYGRANTS_{stream}.m_prefrontal.1"),
-            format!("$JS.API.CONSUMER.MSG.NEXT.CK_BOX_DELIVERYGRANTS_{stream}.m_prefrontal"),
-            format!("$JS.API.CONSUMER.INFO.CK_BOX_DELIVERYGRANTS_{stream}.m_prefrontal"),
+            format!("$JS.ACK.CK_BOX_DELIVERYGRANTS_{stream}.m_prefrontal-core.1"),
+            format!("$JS.API.CONSUMER.MSG.NEXT.CK_BOX_DELIVERYGRANTS_{stream}.m_prefrontal-core"),
+            format!("$JS.API.CONSUMER.INFO.CK_BOX_DELIVERYGRANTS_{stream}.m_prefrontal-core"),
         ] {
             assert!(permits(&authority, &subject), "{subject}");
             assert!(!permits(&participant, &subject), "{subject}");
             assert!(!permits(
                 &authority,
-                &subject.replace("m_prefrontal", "m_other")
+                &subject.replace("m_prefrontal-core", "m_other")
             ));
         }
         assert!(!permits(
@@ -618,12 +666,29 @@ fn grant_generation_emits_each_role_set_from_the_pinned_literals() {
             let lists = claim[direction]
                 .as_object()
                 .expect("direction is an object");
-            assert_eq!(
-                lists.keys().collect::<Vec<_>>(),
-                ["allow"],
-                "{:?} {direction} must carry an allow list and no deny list",
-                grant.role()
-            );
+            if direction == "pub" {
+                assert_eq!(lists.keys().collect::<Vec<_>>(), ["allow", "deny"]);
+                let mut denies = BTreeSet::from(["ck.box_goldenfixture.*.fed.>".to_owned()]);
+                let foreign: &[_] = match grant.role() {
+                    grants::GrantRole::Participant | grants::GrantRole::FlowEngine => {
+                        &["m_prefrontal", "m_prefrontal-core"]
+                    }
+                    grants::GrantRole::DeliveryAuthority => &["m_prefrontal-core"],
+                    _ => &[],
+                };
+                for reader in foreign {
+                    for stream in ["CK_BOX_GOLDENFIXTURE_PEER", "CK_BOX_GOLDENFIXTURE_WAKE"] {
+                        denies.extend([
+                            format!("$JS.API.CONSUMER.INFO.{stream}.{reader}"),
+                            format!("$JS.API.CONSUMER.MSG.NEXT.{stream}.{reader}"),
+                            format!("$JS.ACK.{stream}.{reader}.>"),
+                        ]);
+                    }
+                }
+                assert_eq!(lists["deny"], serde_json::json!(denies));
+            } else {
+                assert_eq!(lists.keys().collect::<Vec<_>>(), ["allow"]);
+            }
             let allow = lists["allow"]
                 .as_array()
                 .expect("allow is a list")
@@ -748,9 +813,9 @@ fn vendored_foundation_and_golden_match_their_source_record() {
     // so it moves with the pin in Cargo.toml.
     assert_eq!(
         field("golden_commit"),
-        "25e0d5d01323ee5af94dec8dec5d41d25bb3c1f5"
+        "314fb862162d663137d57ea0496c6f3c3bd71603"
     );
-    assert_eq!(field("golden_crate_version"), "cortexkit-bus-naming 0.5.0");
+    assert_eq!(field("golden_crate_version"), "cortexkit-bus-naming 0.5.4");
     for (file, digest_field) in [
         ("nats-message-plane-foundation.md", "source_sha256"),
         ("permission_golden.txt", "golden_sha256"),

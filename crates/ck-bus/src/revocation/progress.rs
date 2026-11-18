@@ -17,7 +17,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use cortexkit_bus_naming::AccountNames;
 use cortexkit_lease::durable_replace;
 use serde_json::{json, Value};
 
@@ -58,7 +57,7 @@ impl Identity {
             spawn_generation: parse(generation)?,
             credential_epoch: parse(epoch)?,
         };
-        AccountNames::census_key(&identity.module_id).ok()?;
+        super::census_key(&identity.module_id)?;
         Some(identity)
     }
 }

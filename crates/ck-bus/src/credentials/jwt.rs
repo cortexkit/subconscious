@@ -35,7 +35,7 @@ pub struct UserClaims<'a> {
     pub issued_at: i64,
     /// The `exp` claim, seconds since the Unix epoch.
     pub expires_at: i64,
-    /// The generated permission set; only its allow lists are written.
+    /// The generated allow and deny lists written to the user JWT.
     pub grant: &'a Grant,
 }
 

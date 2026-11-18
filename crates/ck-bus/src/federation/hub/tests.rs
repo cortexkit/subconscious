@@ -338,7 +338,13 @@ async fn setup_writes_the_conf_and_record_then_listens_and_brings_the_instance_u
     );
     assert_eq!(
         *fixture.server.streams.lock().unwrap(),
-        [HubStream::IdLog, HubStream::Residence, HubStream::Cuts]
+        [
+            HubStream::IdLog,
+            HubStream::Residence,
+            HubStream::Cuts,
+            HubStream::Rooms,
+            HubStream::Memory
+        ]
     );
     assert_eq!(fixture.metric("fed.hub_setup"), json!("ready"));
     assert_eq!(fixture.metric("fed.hub_setup_error"), Value::Null);

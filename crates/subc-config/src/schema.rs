@@ -336,13 +336,15 @@ fn normalize(
     if !["object", "array", "string", "number", "integer", "boolean"].contains(&kind.as_str()) {
         return Err(schema_error(path));
     }
-    let structural = kind == "object" && !credential(&policy);
+    let is_credential = credential(&policy);
+    let structural = kind == "object" && !is_credential;
     if !structural
         && (node
             .get("description")
             .and_then(Value::as_str)
             .is_none_or(str::is_empty)
-            || (!node.contains_key("default")
+            || (!is_credential
+                && !node.contains_key("default")
                 && node.get("x-ck-required") != Some(&Value::Bool(true)))
             || !node.contains_key("x-ck-apply")
             || !node.contains_key("x-ck-layers"))
@@ -473,6 +475,9 @@ fn child_schema<'a>(s: &'a Value, key: &str) -> Option<&'a Value> {
     })
 }
 fn defaults(s: &Value) -> Option<Value> {
+    if credential(s) {
+        return None;
+    }
     if let Some(v) = s.get("default") {
         return Some(v.clone());
     }
@@ -492,7 +497,7 @@ fn validate_defaults(s: &Value, path: &str) -> Result<(), Refusal> {
             &declaration_schema,
             value,
             path,
-            None,
+            Some(Layer::Default),
             false,
             &ValidationContext::default(),
         )
@@ -658,7 +663,7 @@ fn validate(
     if value.is_null() || canonical_json(value).is_err() || contains_expansion(value) {
         return Err(invalid());
     }
-    if let Some(layer) = layer {
+    if let Some(layer) = layer.filter(|&layer| layer != Layer::Default) {
         if let Some(layers) = s.get("x-ck-layers").and_then(Value::as_array) {
             if !layers.contains(&serde_json::to_value(layer).expect("layer enum")) {
                 return Err(refusal(RefusalCode::LayerForbidden, path, c));
@@ -666,7 +671,8 @@ fn validate(
         }
     }
     if credential(s) {
-        return if is_vault_reference(value) {
+        // A schema default cannot supply a vault reference, even inside an object or array.
+        return if layer != Some(Layer::Default) && is_vault_reference(value) {
             Ok(())
         } else {
             Err(invalid())
@@ -894,7 +900,23 @@ fn merge(
             && higher.get(&key).is_some()
             && lower.get(&key) != higher.get(&key)
         {
-            return Err(refusal(RefusalCode::ValueInvalid, &pointer(path, &key), c));
+            // Editing any field in a variant fixes it for higher layers, even
+            // when that edit inherits the discriminator from the default.
+            let prefix = format!("{path}/");
+            if sources
+                .get(path)
+                .is_some_and(|&source| source != Layer::Default)
+                || sources
+                    .range(prefix.clone()..)
+                    .take_while(|(p, _)| p.starts_with(&prefix))
+                    .any(|(_, &source)| source != Layer::Default)
+            {
+                return Err(refusal(RefusalCode::ValueInvalid, &pointer(path, &key), c));
+            }
+            *lower = higher.clone();
+            sources.retain(|p, _| p != path && !p.starts_with(&prefix));
+            mark_sources(higher, path, layer, sources);
+            return Ok(());
         }
         variant(s, higher)
             .or_else(|| variant(s, lower))
@@ -1187,6 +1209,15 @@ mod tests {
     fn field(kind: &str, default: Value) -> Value {
         json!({"type":kind,"description":"A configurable value", "default":default,"x-ck-apply":"live","x-ck-layers":["user","workspace","project"]})
     }
+    fn credential_field() -> Value {
+        json!({
+            "type":"object",
+            "description":"A credential reference",
+            "x-ck-kind":"credential_ref",
+            "x-ck-apply":"live",
+            "x-ck-layers":["user","workspace","project"]
+        })
+    }
     fn object(properties: Value) -> Value {
         json!({"type":"object","properties":properties,"unevaluatedProperties":false})
     }
@@ -1276,9 +1307,7 @@ mod tests {
     fn policy_contract_picker_and_secret_redaction() {
         let mut choice = field("string", json!("small"));
         choice["enum"] = json!(["small", "large"]);
-        let mut secret = field("object", json!({"vault_ref":"user-key"}));
-        secret["x-ck-kind"] = json!("credential_ref");
-        let s = schema(json!({"choice":choice,"key":secret}));
+        let s = schema(json!({"choice":choice,"key":credential_field()}));
         assert_eq!(
             s.validate_layer(Layer::User, &json!({"choice":"huge"}), &context())
                 .unwrap_err()
@@ -1331,9 +1360,8 @@ mod tests {
     }
     #[test]
     fn policy_contract_credential_shared_is_not_entitlement() {
-        let mut key = field("object", json!({"vault_ref":"user-key"}));
-        key["x-ck-kind"] = json!("credential_ref");
-        let s = schema(json!({"key":key,"endpoint":field("string",json!("approved"))}));
+        let s =
+            schema(json!({"key":credential_field(),"endpoint":field("string",json!("approved"))}));
         let mut c = context();
         c.credential_destinations
             .insert("/key".into(), vec!["/endpoint".into()]);
@@ -1368,6 +1396,57 @@ mod tests {
         assert!(s.review_tuple(&owned, &c).is_ok());
     }
     #[test]
+    fn policy_contract_optional_credential_has_no_default() {
+        let mut key = credential_field();
+        key["properties"] = json!({"vault_ref":{"type":"string"}});
+        let s = schema(json!({"key":key}));
+
+        let empty = s
+            .review_tuple(&[LayerValue::new(Layer::User, json!({}))], &context())
+            .unwrap();
+        assert_eq!(empty.effective, json!({}));
+        assert!(empty.sources.is_empty());
+
+        let user = json!({"key":{"vault_ref":"user-key"}});
+        let supplied = s
+            .review_tuple(&[LayerValue::new(Layer::User, user.clone())], &context())
+            .unwrap();
+        assert_eq!(supplied.effective, user);
+        assert_eq!(
+            supplied.sources,
+            BTreeMap::from([("/key".into(), Layer::User)])
+        );
+    }
+
+    #[test]
+    fn policy_contract_credential_defaults_are_refused() {
+        let mut declaration = object(json!({"key":credential_field()}));
+        declaration["$schema"] = json!("https://json-schema.org/draft/2020-12/schema");
+        let mut direct = declaration.clone();
+        direct["properties"]["key"]["default"] = json!({"vault_ref":"example"});
+        let error = Schema::new(direct).unwrap_err();
+        assert_eq!(error.code, RefusalCode::SchemaInvalid);
+        assert_eq!(error.path, "/key");
+
+        declaration["default"] = json!({"key":{"vault_ref":"example"}});
+        assert_eq!(
+            Schema::new(declaration).unwrap_err().code,
+            RefusalCode::SchemaInvalid
+        );
+    }
+
+    #[test]
+    fn policy_contract_other_fields_still_need_a_default_or_required() {
+        let mut name = field("string", Value::Null);
+        name.as_object_mut().unwrap().remove("default");
+        let mut declaration = object(json!({"name":name}));
+        declaration["$schema"] = json!("https://json-schema.org/draft/2020-12/schema");
+        let error = Schema::new(declaration).unwrap_err();
+        assert_eq!(error.code, RefusalCode::SchemaInvalid);
+        assert_eq!(error.path, "/name");
+    }
+
+    #[test]
     fn policy_contract_merge_absent_empty_arrays_maps_null_and_unknown() {
         let mut array = field("array", json!([1, 2]));
         array["items"] = field("number", json!(0));
@@ -1401,6 +1480,60 @@ mod tests {
                 .is_err());
         }
     }
+
+    #[test]
+    fn policy_contract_first_layer_can_replace_a_union_default() {
+        let mut auto_kind = field("string", json!("auto"));
+        auto_kind["const"] = json!("auto");
+        let mut tokens_kind = field("string", json!("tokens"));
+        tokens_kind["const"] = json!("tokens");
+        let mut auto = object(json!({
+            "kind": auto_kind,
+            "floor": field("integer", json!(1000)),
+            "ceiling": field("integer", json!(6000))
+        }));
+        auto["required"] = json!(["kind"]);
+        let mut tokens = object(json!({"kind":tokens_kind,"tokens":field("integer",json!(4000))}));
+        tokens["required"] = json!(["kind", "tokens"]);
+        let s = schema(json!({"protected_tokens":{
+            "oneOf":[auto,tokens],
+            "default":{"kind":"auto","floor":1000,"ceiling":6000}
+        }}));
+
+        let user = json!({"protected_tokens":{"kind":"tokens","tokens":8000}});
+        let accepted = s
+            .review_tuple(&[LayerValue::new(Layer::User, user.clone())], &context())
+            .unwrap();
+        assert_eq!(accepted.effective, user);
+        assert_eq!(
+            accepted.sources,
+            BTreeMap::from([
+                ("/protected_tokens/kind".into(), Layer::User),
+                ("/protected_tokens/tokens".into(), Layer::User),
+            ])
+        );
+
+        let refusal = s
+            .review_tuple(
+                &layers(user, json!({"protected_tokens":{"kind":"auto"}})),
+                &context(),
+            )
+            .unwrap_err();
+        assert_eq!(refusal.code, RefusalCode::ValueInvalid);
+        assert_eq!(refusal.path, "/protected_tokens/kind");
+
+        let partial = json!({"protected_tokens":{"kind":"auto","floor":1200}});
+        let merged = s
+            .review_tuple(&[LayerValue::new(Layer::User, partial)], &context())
+            .unwrap();
+        assert_eq!(
+            merged.effective,
+            json!({"protected_tokens":{"kind":"auto","floor":1200,"ceiling":6000}})
+        );
+        assert_eq!(merged.sources["/protected_tokens/floor"], Layer::User);
+        assert_eq!(merged.sources["/protected_tokens/ceiling"], Layer::Default);
+    }
+
     #[test]
     fn policy_contract_union_inheritance_and_complete_array_items() {
         let mut disk_kind = field("string", json!("disk"));
@@ -1423,12 +1556,17 @@ mod tests {
             result.effective,
             json!({"storage":{"kind":"disk","path":"b"}})
         );
-        assert!(s
+        let refusal = s
             .review_tuple(
-                &layers(json!({}), json!({"storage":{"kind":"memory","capacity":2}})),
-                &context()
+                &layers(
+                    json!({"storage":{"path":"b"}}),
+                    json!({"storage":{"kind":"memory","capacity":2}}),
+                ),
+                &context(),
             )
-            .is_err());
+            .unwrap_err();
+        assert_eq!(refusal.code, RefusalCode::ValueInvalid);
+        assert_eq!(refusal.path, "/storage/kind");
         let mut item =
             object(json!({"id":field("string",json!("a")),"n":field("number",json!(1))}));
         item["required"] = json!(["id", "n"]);

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.41.7
+
+- Adopt subc-config 0.1.2 for tagged-union defaults and optional credential references.
+
 ## 0.41.6
 
 - Restarted processes apply the delivered settings first, and the recovery view

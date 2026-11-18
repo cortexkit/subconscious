@@ -200,7 +200,8 @@ fn setup_refuses_value_rejected_by_field_schema() {
 }
 
 fn credential() -> Value {
-    let mut schema = field("object", json!({"vault_ref":"example"}));
+    let mut schema = field("object", Value::Null);
+    schema.as_object_mut().unwrap().remove("default");
     schema["x-ck-kind"] = json!("credential_ref");
     schema
 }

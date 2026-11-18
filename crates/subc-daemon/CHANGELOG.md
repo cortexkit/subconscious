@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.50.12
+
+- Adopt subc-config 0.1.2 for tagged-union defaults and optional credential references.
+
 ## 0.50.11
 
 - Do not report registration channel changes as pending on installs without a

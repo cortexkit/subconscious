@@ -35,9 +35,10 @@ file bytes: comments, BOMs, line endings and absent files remain distinct snapsh
 recursive, unresolved references, conditional/ambiguous policy compositions and nullable types are
 refused. Structural objects require `unevaluatedProperties: false`. Dynamic maps use a constrained
 `patternProperties` value schema, not arbitrary additional JSON. Every primitive, replacement
-array, item and map value needs a description, a default or `x-ck-required: true`, and effective
-`x-ck-apply` and `x-ck-layers`. Structural policies propagate; children may narrow layers, not widen
-them. Apply transitions must agree or increase disruption (live to a deferred transition, or a
+array, item and map value needs a description and effective `x-ck-apply` and `x-ck-layers`.
+Except for credential references, these fields need a default or `x-ck-required: true`.
+Structural policies propagate; children may narrow layers, not widen them.
+Apply transitions must agree or increase disruption (live to a deferred transition, or a
 transition to daemon restart). Process-wide restart fields are user-only.
 
 The apply kinds are `live`, `module_restart`, `daemon_restart`, `next_supervision`, `route_rebind`.
@@ -49,8 +50,11 @@ layer changes, even when the changeset does not edit that project's file.
 
 Layer overlays inherit absent keys and source attribution. Objects/maps deep-merge; `{}` does not
 clear them. Arrays replace in order, including `[]`, with complete items and no id-based merge.
-Declared item ids must be unique. Null, unknown keys, type changes and inherited union-discriminator
-changes are refused. Discriminated `oneOf` branches must have a unique required const discriminator.
+Declared item ids must be unique. Null, unknown keys, and type changes are refused. Discriminated
+`oneOf` branches must have a unique required const discriminator. The first layer to set a union
+may select a different variant and replace the schema default wholesale, or deep-merge into the
+default's variant. A lower layer's edits to any field in a variant fix it for higher layers, even
+if the lower layer does not set the discriminator explicitly.
 Full effective schema and cross-field checks remain mandatory in the module's review reply; the
 shared helper's type/enum/range/required checks do not replace a full draft 2020-12 validator.
 
@@ -76,6 +80,8 @@ resolves the reference through the vault using the daemon's attestation of the c
 identity and approved layer/project context. The vault must check that context against the
 credential's entitlement rather than trusting a caller-supplied project string. The reference never contains a
 secret. Environment/file expansion tokens are refused, never expanded.
+Credential fields cannot have defaults. For an optional credential field, an omitted reference
+means no credential and the field is left out of effective settings.
 
 Project/workspace references require an entitlement supplied by the validator for the particular
 module and project (`ValidationContext::project_credentials`, canonical reference digests). Copying

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.2
+
+- Let the first settings layer choose a tagged-union variant even when the
+  schema supplies a default, while keeping the variant fixed for higher layers.
+- Allow optional credential references with no default; omit absent references
+  from effective settings and refuse schemas that declare a credential default.
+
 ## 0.1.1
 
 - Admit `x-ck-setup` on top-level settings sections, validating unique feature ids,

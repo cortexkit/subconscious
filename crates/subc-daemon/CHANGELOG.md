@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.50.6
+
+- macOS: capture only the kernel peer credentials when accepting a local
+  connection. Verify and revalidate operator-app identity on demand in a
+  dedicated, bounded lane, so delayed code-signing queries cannot stall the
+  listener or routing runtime. Require subc-os 0.1.43.
+
 ## 0.50.5
 
 - Accept the new federated stamp members (origin principal, peer box id, project, run id on run

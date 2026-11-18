@@ -282,7 +282,13 @@ mod unix {
                 .unwrap(),
         );
         let connection = accept_from(path, listener, child);
-        let observed = observation(observe_unix_peer(&connection.stream));
+        let capture = super::super::capture_unix_peer_credentials(&connection.stream);
+        assert!(capture.has_audit_token());
+        let credentials = observation(capture.observation().clone());
+        assert_eq!(credentials.pid, connection.child.0.id());
+        assert_eq!(credentials.user, PeerUser::Uid(effective_uid()));
+        assert_eq!((credentials.exe, credentials.signing_id), (None, None));
+        let observed = observation(capture.observe_code());
         assert_eq!(observed.pid, connection.child.0.id());
         let exe = observed.exe.as_deref().expect("peer executable");
         assert!(same_file(exe, nc), "{exe:?}");

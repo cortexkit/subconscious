@@ -96,6 +96,7 @@ fn executable(pid: u32) -> Option<PathBuf> {
     if pid == 0 {
         return None;
     }
+    // This procfs kernel lookup does not open the executable's file.
     std::fs::read_link(format!("/proc/{pid}/exe")).ok()
 }
 

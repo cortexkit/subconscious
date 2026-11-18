@@ -138,6 +138,7 @@ fn user_sid(process: &OwnedHandle) -> Option<String> {
 fn executable(process: &OwnedHandle) -> Option<PathBuf> {
     let mut path = vec![0u16; 32768];
     let mut length = path.len() as u32;
+    // Query the kernel's image name on the existing handle; no executable is opened.
     // SAFETY: the handle is live; path and length are writable for the stated
     // UTF-16 capacity. The returned length excludes the NUL.
     let ok = unsafe {

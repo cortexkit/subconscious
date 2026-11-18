@@ -1167,13 +1167,14 @@ impl Router {
                 .handle_control_frame_ingress(ctx, frame, dispatch_started_at, first)
                 .await?;
             for response in responses {
-                if let Some(view) = review_request
-                    .then(|| {
-                        self.control
-                            .config_desktop_review_response(ctx.connection_id, &response)
-                    })
-                    .flatten()
-                {
+                let view = if review_request {
+                    self.control
+                        .config_desktop_review_response(ctx.connection_id, &response)
+                        .await
+                } else {
+                    None
+                };
+                if let Some(view) = view {
                     self.observe_connection_wait(
                         ctx,
                         "reply_egress",

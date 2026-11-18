@@ -2,13 +2,16 @@
 //! cannot enable shortcuts or establish an app's identity.
 
 use semver::Version;
-use subc_os::local_peer::{CapturedPeer, CodeRequirementOutcome, ObservedPeer};
+#[cfg(target_os = "macos")]
+use subc_os::local_peer::CodeRequirementOutcome;
+use subc_os::local_peer::{CapturedPeer, ObservedPeer};
 use subc_protocol::peer::OperatorApp;
 
 pub const MACOS_OPERATOR_APP_ENABLED: bool = true;
 pub const WINDOWS_OPERATOR_APP_ENABLED: bool = false;
 pub const LINUX_OPERATOR_APP_ENABLED: bool = false;
 pub const PHONE_OPERATOR_ENABLED: bool = false;
+pub(crate) const EVIDENCE_BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// No release is admitted until an enabling release replaces this sentinel.
 pub const RELEASE_FLOOR: Version = Version::new(u64::MAX, u64::MAX, u64::MAX);
@@ -111,9 +114,13 @@ impl AppOpenPlatform {
 #[derive(Clone, Debug)]
 pub(crate) struct OperatorAppStamp {
     pub app: OperatorApp,
+    #[cfg(target_os = "macos")]
     peer: CapturedPeer,
+    #[cfg(target_os = "macos")]
     requirement: &'static str,
+    #[cfg(target_os = "macos")]
     floor: Version,
+    generation: std::sync::Arc<()>,
     /// The launch entry incarnation this stamp matched, present only for
     /// stamps derived from a live Windows launch entry. macOS stamps carry
     /// `None` and check the captured audit token instead.
@@ -125,9 +132,13 @@ impl OperatorAppStamp {
     pub(crate) fn fixture(app: &str, pid: u32) -> Self {
         Self {
             app: OperatorApp::new(app, pid),
+            #[cfg(target_os = "macos")]
             peer: ObservedPeer::Unobserved.into(),
+            #[cfg(target_os = "macos")]
             requirement: MACOS_REQUIREMENT,
+            #[cfg(target_os = "macos")]
             floor: RELEASE_FLOOR,
+            generation: Default::default(),
             launch_incarnation: None,
         }
     }
@@ -136,12 +147,10 @@ impl OperatorAppStamp {
     /// entry. Linux never stamps, so every `Some` incarnation on the wire is
     /// a Windows launch.
     #[cfg(windows)]
-    pub(crate) fn launch_stamp(app: OperatorApp, peer: CapturedPeer, incarnation: u64) -> Self {
+    pub(crate) fn launch_stamp(app: OperatorApp, _peer: CapturedPeer, incarnation: u64) -> Self {
         Self {
             app,
-            peer,
-            requirement: MACOS_REQUIREMENT,
-            floor: RELEASE_FLOOR,
+            generation: Default::default(),
             launch_incarnation: Some(incarnation),
         }
     }
@@ -159,14 +168,39 @@ impl OperatorAppStamp {
 
     /// A bind-time stamp is not authority: Windows must still name its own live
     /// launch entry, while macOS checks the captured process token again.
-    pub(crate) fn revalidate_with_launches(&self, launches: &crate::app_open::LaunchTable) -> bool {
+    pub(crate) async fn revalidate_with_launches(
+        &self,
+        launches: &crate::app_open::LaunchTable,
+    ) -> bool {
         if let Some(incarnation) = self.launch_incarnation {
             return launches.is_live_incarnation(&self.app.app, incarnation);
         }
-        self.revalidate()
+        self.revalidate_native().await
     }
 
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn revalidate(&self) -> bool {
+        self.check_requirement()
+    }
+
+    pub(crate) fn same_generation(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.generation, &other.generation)
+    }
+
+    async fn revalidate_native(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        if self.peer.has_audit_token() {
+            let stamp = self.clone();
+            return crate::peer_identity_lane::PeerIdentityLane::native()
+                .run(move || stamp.check_requirement())
+                .await
+                .unwrap_or(false);
+        }
+        false
+    }
+
+    #[cfg(target_os = "macos")]
+    fn check_requirement(&self) -> bool {
         matches!(self.peer.check_code_requirement(self.requirement),
             CodeRequirementOutcome::Satisfied(code)
                 if meets_release_floor(code.short_version.as_deref(), &self.floor))
@@ -180,10 +214,13 @@ pub(crate) struct OperatorAppPolicy {
     pub linux_enabled: bool,
     pub phone_enabled: bool,
     app: CompiledApp,
+    #[cfg(target_os = "macos")]
     requirement: &'static str,
     floor: Version,
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     requirement_checks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    pub(crate) test_lane: Option<std::sync::Arc<crate::peer_identity_lane::PeerIdentityLane>>,
     /// Where the installed app lives. The production table leaves both unset;
     /// a known app with no location answers `app_not_installed` once its
     /// platform switch is on.
@@ -212,10 +249,13 @@ impl Default for OperatorAppPolicy {
             linux_enabled: LINUX_OPERATOR_APP_ENABLED,
             phone_enabled: PHONE_OPERATOR_ENABLED,
             app: COMPILED_APP,
+            #[cfg(target_os = "macos")]
             requirement: MACOS_REQUIREMENT,
             floor: effective_release_floor(),
-            #[cfg(test)]
+            #[cfg(all(test, target_os = "macos"))]
             requirement_checks: Default::default(),
+            #[cfg(test)]
+            test_lane: None,
             windows_path: COMPILED_APP.windows_path.map(std::path::PathBuf::from),
             linux_path: COMPILED_APP.linux_path.map(std::path::PathBuf::from),
             windows_breakaway: true,
@@ -265,19 +305,24 @@ impl OperatorAppPolicy {
         self.app.windows_publisher
     }
 
+    #[cfg(test)]
     pub(crate) fn stamp(&self, peer: CapturedPeer) -> Option<OperatorAppStamp> {
+        #[cfg(target_os = "macos")]
         if !self.macos_enabled {
             return None;
         }
-        self.config_identity(peer)
+        #[cfg(target_os = "macos")]
+        return self.config_identity(peer);
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = peer;
+            None
+        }
     }
 
-    /// A trusted full-diff surface needs the same process identity and release
-    /// floor, but never gains the operator-app prompt exemption from this check.
+    #[cfg(target_os = "macos")]
     pub(crate) fn config_identity(&self, peer: CapturedPeer) -> Option<OperatorAppStamp> {
-        // The reserved floor admits nothing, so avoid native signature work
-        // on every local connection until a release or development floor exists.
-        if self.floor == RELEASE_FLOOR || !cfg!(target_os = "macos") {
+        if self.floor == RELEASE_FLOOR {
             return None;
         }
         let app = self.app.id?;
@@ -300,8 +345,44 @@ impl OperatorAppPolicy {
             peer,
             requirement: self.requirement,
             floor: self.floor.clone(),
+            generation: Default::default(),
             launch_incarnation: None,
         })
+    }
+
+    pub(crate) fn may_recognize(&self, peer: &CapturedPeer) -> bool {
+        #[cfg(test)]
+        if self.test_lane.is_some() {
+            return true;
+        }
+        self.floor != RELEASE_FLOOR && self.app.id.is_some() && peer.has_audit_token()
+    }
+
+    pub(crate) async fn recognize(
+        &self,
+        peer: CapturedPeer,
+        deadline: std::time::Instant,
+    ) -> Option<(OperatorAppStamp, ObservedPeer)> {
+        #[cfg(test)]
+        if let Some(lane) = &self.test_lane {
+            lane.run_until(deadline, || ()).await;
+            return None;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let policy = self.clone();
+            crate::peer_identity_lane::PeerIdentityLane::native()
+                .run_until(deadline, move || {
+                    let stamp = policy.config_identity(peer.clone())?;
+                    Some((stamp, peer.observe_code()))
+                })
+                .await?
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (peer, deadline);
+            None
+        }
     }
 }
 
@@ -337,10 +418,13 @@ impl From<TestOperatorAppPolicy> for OperatorAppPolicy {
                 windows_publisher: test.windows_publisher,
                 ..COMPILED_APP
             },
+            #[cfg(target_os = "macos")]
             requirement: test.requirement,
             floor: test.floor,
-            #[cfg(test)]
+            #[cfg(all(test, target_os = "macos"))]
             requirement_checks: Default::default(),
+            #[cfg(test)]
+            test_lane: None,
             windows_path: test.windows_path,
             linux_path: test.linux_path,
             windows_breakaway: test.windows_breakaway,

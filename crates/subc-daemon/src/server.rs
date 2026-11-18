@@ -442,13 +442,9 @@ fn accept_resource_exhausted(error: &io::Error) -> bool {
 /// Serve this daemon's local endpoint (a Unix-domain socket, or a Windows named
 /// pipe) until its accept loop fails.
 ///
-/// Every connection gets the same key handshake, frame format and router as a
-/// TCP client, so a client's bytes are identical either way. What differs is
-/// that this endpoint serves clients only: a HELLO that would register a module
-/// is refused with [`crate::local_listener::LOCAL_ENDPOINT_CLIENTS_ONLY`]. A
-/// peer read failure costs that one connection; a failure to accept at all ends
-/// the loop, because a local listener that cannot accept is no longer an
-/// endpoint.
+/// Uses the TCP key handshake and router, but refuses module registration
+/// with [`crate::local_listener::LOCAL_ENDPOINT_CLIENTS_ONLY`]. A peer read
+/// failure costs that connection; a terminal accept error ends the listener.
 pub async fn serve_local_listener(
     bound: crate::local_listener::BoundLocalListener,
     router: Arc<Router>,
@@ -497,8 +493,7 @@ async fn serve_unix_local(
             }
             Err(source) => return Err(local_accept_error(&path, source)),
         };
-        debug!(?path, "accepted a local-socket connection");
-        let peer = subc_os::local_peer::capture_unix_peer(&stream);
+        let peer = subc_os::local_peer::capture_unix_peer_credentials(&stream);
         let router = Arc::clone(&router);
         let auth = auth.clone();
         tokio::spawn(async move {
@@ -1640,6 +1635,10 @@ impl Error for ConnectionError {
         }
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "server/peer_liveness_test.rs"]
+mod peer_liveness_test;
 
 #[cfg(test)]
 mod tests {

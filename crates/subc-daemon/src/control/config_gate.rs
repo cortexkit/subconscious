@@ -431,7 +431,7 @@ impl ControlHandler {
         handler
     }
 
-    fn config_desktop_identity(
+    async fn config_desktop_identity(
         &self,
         connection: ConnectionId,
     ) -> std::result::Result<bool, GateError> {
@@ -450,12 +450,7 @@ impl ControlHandler {
         }
         #[cfg(not(feature = "dev-desktop-approval"))]
         {
-            Ok(self
-                .config_desktop_stamps
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .get(&connection)
-                .is_some_and(|stamp| stamp.revalidate_with_launches(&self.launch_table)))
+            Ok(self.has_current_config_desktop_stamp(connection).await)
         }
     }
 
@@ -470,7 +465,7 @@ impl ControlHandler {
             })
     }
 
-    pub(crate) fn config_desktop_review_response(
+    pub(crate) async fn config_desktop_review_response(
         &self,
         connection: ConnectionId,
         response: &Frame,
@@ -486,7 +481,7 @@ impl ControlHandler {
                 | "config.stamp"
                 | "config.unstamp"
                 | "config.rollback"
-        ) || !matches!(self.config_desktop_identity(connection), Ok(true))
+        ) || !matches!(self.config_desktop_identity(connection).await, Ok(true))
         {
             return None;
         }
@@ -505,7 +500,7 @@ impl ControlHandler {
         connection: ConnectionId,
         view: subc_control::config::ConfigPlanView,
     ) {
-        if !matches!(self.config_desktop_identity(connection), Ok(true)) {
+        if !matches!(self.config_desktop_identity(connection).await, Ok(true)) {
             return;
         }
         let Some(runtime) = self.config_runtime.clone() else {
@@ -696,9 +691,6 @@ impl ControlHandler {
                         &facts,
                         matches!(status.state.as_str(), "store_missing" | "store_unverified"),
                     ));
-                if let Err(error) = self.config_desktop_identity(ctx.connection_id) {
-                    status.missing_approval_surfaces.push(error.code);
-                }
                 self.report_daemon_configuration(&snapshot.approved_daemon, &mut status)
                     .await?;
                 Ok(ConfigControlResponse::Status { status })
@@ -749,16 +741,7 @@ impl ControlHandler {
                     )?;
                     Ok((challenge, guard))
                 })
-                .await
-                .map_err(|error| {
-                    if error.code == "approval_surface_unavailable" {
-                        self.config_desktop_identity(ctx.connection_id)
-                            .err()
-                            .unwrap_or(error)
-                    } else {
-                        error
-                    }
-                })?;
+                .await?;
                 request_guard.request.ensure_live()?;
                 let reply = match &challenge {
                     ApprovalChallenge::Desktop { .. } | ApprovalChallenge::OsPrompt { .. } => {
@@ -1065,6 +1048,7 @@ impl ControlHandler {
                 .is_some_and(|owner| owner.os_prompt_policy_for_tests());
         let desktop = self
             .config_desktop_identity(ctx.connection_id)
+            .await
             .unwrap_or(false);
         ApprovalFacts {
             connection: ctx.connection_id.get(),

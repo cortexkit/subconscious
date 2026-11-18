@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.43
+
+- macOS: offer credentials-only Unix peer capture that retains the audit token
+  for a later, separately scheduled code-signing check.
+
 ## 0.1.42
 
 - Windows: atomically replace files held by delete-sharing readers using POSIX

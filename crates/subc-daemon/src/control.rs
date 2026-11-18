@@ -165,6 +165,8 @@ pub(crate) mod claims;
 #[path = "control/config_advertisement_tests.rs"]
 mod config_advertisement_tests;
 mod config_gate;
+#[path = "operator_apps/connection.rs"]
+mod peer_identity;
 use caller_attestation::{caller_for_target, scope_acts_for_another};
 #[cfg(all(test, unix, feature = "test-support"))]
 #[path = "control/caller_attestation_tests.rs"]
@@ -538,7 +540,7 @@ pub struct ControlHandler {
     caller_endpoints: Arc<Mutex<HashMap<ConnectionId, (SocketAddr, SocketAddr)>>>,
     build_class_warned: Arc<Mutex<HashSet<ConnectionId>>>,
     observed_peers: Arc<Mutex<HashMap<ConnectionId, ObservedPeer>>>,
-    captured_peers: Arc<Mutex<HashMap<ConnectionId, subc_os::local_peer::CapturedPeer>>>,
+    captured_peers: Arc<Mutex<HashMap<ConnectionId, Arc<peer_identity::PeerCapture>>>>,
     config_desktop_stamps:
         Arc<Mutex<HashMap<ConnectionId, crate::operator_apps::OperatorAppStamp>>>,
     local_connections: Arc<Mutex<HashSet<ConnectionId>>>,
@@ -2155,42 +2157,6 @@ impl ControlHandler {
         self
     }
 
-    pub(crate) fn record_captured_peer(
-        &self,
-        connection: ConnectionId,
-        peer: subc_os::local_peer::CapturedPeer,
-    ) {
-        self.record_observed_peer(connection, peer.observation().clone());
-        let identity = self.operator_app_policy.config_identity(peer.clone());
-        #[cfg(windows)]
-        let identity = identity.or_else(|| self.config_windows_launch_identity(&peer));
-        if let Some(identity) = identity {
-            // Keep the connect-time launch incarnation. Looking it up afresh
-            // from a numeric pipe-client PID could match a later reused PID.
-            self.config_desktop_stamps
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .insert(connection, identity);
-        }
-        self.captured_peers
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(connection, peer.clone());
-        #[cfg(windows)]
-        if let Some(stamp) = self.stamp_windows_launch(&peer) {
-            self.operator_apps
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .insert(connection, stamp);
-        }
-        if let Some(stamp) = self.operator_app_policy.stamp(peer) {
-            self.operator_apps
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .insert(connection, stamp);
-        }
-    }
-
     pub(crate) fn record_local_connection(&self, connection: ConnectionId) {
         self.local_connections
             .lock()
@@ -2207,32 +2173,6 @@ impl ControlHandler {
         stamp
             .filter(|stamp| stamp.delivery_enabled(&self.operator_app_policy))
             .map(|stamp| stamp.app.clone())
-    }
-
-    fn handle_connection_describe(
-        &self,
-        ctx: &RouteCtx,
-        frame: Frame,
-    ) -> Result<Vec<Frame>, RouterError> {
-        if serde_json::from_slice::<subc_control::ConnectionDescribeRequest>(&frame.body).is_err() {
-            return Ok(vec![control_error_frame(
-                &frame,
-                "invalid_control_body",
-                "malformed connection.describe body",
-            )?]);
-        }
-        let local = self
-            .local_connections
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .contains(&ctx.connection_id);
-        let stamps = self.operator_apps.lock().unwrap_or_else(|p| p.into_inner());
-        let operator_app = self.connection_operator_app(stamps.get(&ctx.connection_id));
-        Ok(vec![control_response_body_frame(
-            &frame,
-            &subc_control::ConnectionDescribeReply::new(local, operator_app),
-            ops::CONNECTION_DESCRIBE,
-        )?])
     }
 
     pub(crate) fn record_observed_peer(
@@ -2643,7 +2583,7 @@ impl ControlHandler {
                     .as_ref()
                     .is_some_and(|probe| probe.op == "operator.confirm")
                 {
-                    return self.handle_operator_confirm(ctx, frame);
+                    return self.handle_operator_confirm(ctx, frame).await;
                 }
                 if op.as_ref().is_some_and(|probe| probe.op == ops::APP_OPEN) {
                     return self
@@ -2659,7 +2599,7 @@ impl ControlHandler {
                     .as_ref()
                     .is_some_and(|probe| probe.op == ops::CONNECTION_DESCRIBE)
                 {
-                    return self.handle_connection_describe(ctx, frame);
+                    return self.handle_connection_describe(ctx, frame).await;
                 }
                 if op
                     .as_ref()
@@ -2911,11 +2851,13 @@ impl ControlHandler {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(&connection_id);
-        self.observed_peers
+        // Retire the capture before its published facts so an in-flight
+        // verification cannot recreate them after cleanup.
+        self.captured_peers
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(&connection_id);
-        self.captured_peers
+        self.observed_peers
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(&connection_id);
@@ -4463,18 +4405,12 @@ impl ControlHandler {
                 PrivilegedOperatorPrompt::Enforce => {
                     let key =
                         crate::operator_confirm::DeclineKey::for_caller(&caller, ctx.connection_id);
-                    let stamp = self
-                        .operator_apps
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .get(&ctx.connection_id)
-                        .cloned();
-                    let shortcut = crate::operator_confirm::ShortcutContext::eligible_stamp(
-                        &self.operator_app_policy,
-                        &self.launch_table,
-                        stamp.as_ref(),
-                    )
-                    .then(|| self.shortcut_context(stamp, None, None));
+                    let shortcut =
+                        self.operator_shortcut_stamp(ctx.connection_id)
+                            .await
+                            .map(|stamp| {
+                                self.shortcut_context(Some(stamp), None, None, ctx.connection_id)
+                            });
                     let outcome = self
                         .forwarding
                         .operator_confirms()
@@ -4913,126 +4849,6 @@ impl ControlHandler {
             &reply,
             "ScopeServedByReply",
         )?])
-    }
-
-    fn handle_operator_confirm(
-        &self,
-        ctx: &RouteCtx,
-        frame: Frame,
-    ) -> Result<Vec<Frame>, RouterError> {
-        use crate::operator_confirm::{audit, Outcome};
-        let registration = self
-            .registry
-            .get_module_by_connection(ctx.connection_id)
-            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?;
-        let Some(registration) = registration else {
-            let outcome = Outcome::refusal("not_registered");
-            audit("", "", "", &outcome, Duration::ZERO, Duration::ZERO, false);
-            return Ok(vec![outcome.frame(&frame)]);
-        };
-        let request = match serde_json::from_slice::<OperatorConfirmRequest>(&frame.body) {
-            Ok(request) => request,
-            Err(_) => {
-                let outcome = Outcome::refusal("invalid_control_body");
-                audit("", "", "", &outcome, Duration::ZERO, Duration::ZERO, false);
-                return Ok(vec![outcome.frame(&frame)]);
-            }
-        };
-        let declared = matches!(
-            request.kind,
-            Some(subc_protocol::session::OperatorConfirmKind::Operation)
-        ) && request.operation.as_ref().is_some_and(|operation| {
-            registration
-                .manifest
-                .confirm_operations
-                .as_ref()
-                .is_some_and(|operations| operations.contains(operation))
-        });
-        let module_id = registration.manifest.module_id;
-        // Read the launch nonce (under its own lock) before taking the forwarding
-        // table's lock below: holding forwarding while waiting on another daemon
-        // lock risks a lock-order deadlock with paths that take them the other way.
-        let nonce = self
-            .hello_launch_nonces
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .nonce(ctx.connection_id)
-            .map(str::to_owned);
-        // A registration channel proves its own spawn; only a connection that
-        // registered over the launch nonce falls back to the nonce.
-        let nonce_proven = self
-            .confirm_channel_proven(ctx.connection_id, &module_id)
-            .unwrap_or_else(|| {
-                nonce.as_deref().is_some_and(|nonce| {
-                    self.supervisor
-                        .spawned_consumer_authorized(&module_id, nonce)
-                })
-            });
-        let confirms = self.forwarding.operator_confirms();
-        self.forwarding
-            .with_operator_route(
-                ctx.connection_id,
-                request.route_channel,
-                request.route_epoch,
-                |binding| {
-                    let shortcut = binding
-                        .filter(|binding| {
-                            nonce_proven
-                                && crate::operator_confirm::valid_summary(&request.summary)
-                                && declared
-                                && crate::operator_confirm::ShortcutContext::route_eligible(
-                                    &self.operator_app_policy,
-                                    &self.launch_table,
-                                    binding,
-                                )
-                        })
-                        .map(|binding| {
-                            let phone = crate::operator_confirm::ShortcutContext::phone_fingerprint(
-                                &self.operator_app_policy,
-                                binding,
-                            );
-                            let stamp = if phone.is_some() {
-                                None
-                            } else {
-                                binding.operator_app.clone()
-                            };
-                            self.shortcut_context(
-                                stamp,
-                                phone,
-                                Some((request.route_channel, request.route_epoch)),
-                            )
-                        });
-                    confirms.admit_with_shortcut(
-                        ctx,
-                        frame,
-                        module_id,
-                        nonce_proven,
-                        request,
-                        binding,
-                        shortcut,
-                    )
-                },
-            )
-            .map_err(RouterError::Forwarding)
-    }
-
-    fn shortcut_context(
-        &self,
-        stamp: Option<crate::operator_apps::OperatorAppStamp>,
-        phone_fingerprint: Option<String>,
-        route: Option<(u16, u32)>,
-    ) -> crate::operator_confirm::ShortcutContext {
-        crate::operator_confirm::ShortcutContext {
-            ledger: self.activity.clone(),
-            forwarding: self.forwarding.clone(),
-            launches: self.launch_table.clone(),
-            stamp,
-            phone_fingerprint,
-            route,
-            connections: self.operator_apps.clone(),
-            #[cfg(test)]
-            hooks: Default::default(),
-        }
     }
 
     /// Explicit test-only phone policy; daemon configuration cannot select it.
@@ -7219,18 +7035,15 @@ impl ControlHandler {
             }
         };
 
+        let operator_app = self
+            .route_operator_app(ctx.connection_id, registration.capabilities.as_ref())
+            .await;
         // Resolve the per-module budget here so the wait matches the operator's
         // intent for this specific target. A per-module override in
         // `subc.jsonc` (or `with_route_bind_relay_timeouts` for embedded
         // daemons) wins over the daemon-wide default.
         let route_bind_relay_timeout = self.route_bind_relay_timeout_for(&target_module_id);
         let relay_deadline = Instant::now() + route_bind_relay_timeout;
-        let operator_app = self
-            .operator_apps
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(&ctx.connection_id)
-            .cloned();
         let production_peer_build =
             build_class.as_deref() == Some(subc_protocol::BUILD_CLASS_PRODUCTION);
         timings.enter(RouteOpenPhase::EgressReservation);

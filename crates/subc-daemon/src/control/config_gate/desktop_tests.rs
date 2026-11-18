@@ -73,7 +73,10 @@ fn owner_peer(handler: &ControlHandler, connection: ConnectionId) {
         .insert(connection, observed);
     handler.captured_peers.lock().unwrap().insert(
         connection,
-        subc_os::local_peer::ObservedPeer::Unobserved.into(),
+        Arc::new(
+            subc_os::local_peer::CapturedPeer::from(subc_os::local_peer::ObservedPeer::Unobserved)
+                .into(),
+        ),
     );
 }
 
@@ -86,29 +89,45 @@ fn config_desktop_os_presence_requires_both_provider_and_policy() {
 }
 
 #[cfg(feature = "dev-desktop-approval")]
-#[test]
-fn config_desktop_development_accepts_owner_local_review_without_app_verification() {
+#[tokio::test]
+async fn config_desktop_development_accepts_owner_local_review_without_app_verification() {
     let handler = ControlHandler::new(Arc::new(Registry::default()));
     let connection = ConnectionId::new(700);
     owner_peer(&handler, connection);
     assert!(handler.config_owner_connection(connection));
-    assert!(handler.config_desktop_identity(connection).unwrap());
+    assert!(handler.config_desktop_identity(connection).await.unwrap());
     assert!(handler.config_desktop_stamps.lock().unwrap().is_empty());
 }
 
 #[cfg(not(feature = "dev-desktop-approval"))]
-#[test]
-fn config_desktop_production_owner_uid_and_path_observations_are_not_attestation() {
-    let handler = ControlHandler::new(Arc::new(Registry::default()));
+#[tokio::test]
+async fn config_desktop_production_owner_uid_and_path_observations_are_not_attestation() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mut handler = ControlHandler::new(Arc::new(Registry::default()));
+    let checks = Arc::new(AtomicUsize::new(0));
+    handler.operator_app_policy.test_lane = Some(Arc::new(
+        crate::peer_identity_lane::PeerIdentityLane::start().with_probe({
+            let checks = checks.clone();
+            move || {
+                checks.fetch_add(1, Ordering::SeqCst);
+            }
+        }),
+    ));
     let connection = ConnectionId::new(700);
     owner_peer(&handler, connection);
     assert!(handler.config_owner_connection(connection));
-    assert!(!handler.config_desktop_identity(connection).unwrap());
+    assert_eq!(
+        checks.load(Ordering::SeqCst),
+        0,
+        "owner checks need only kernel credentials"
+    );
+    assert!(!handler.config_desktop_identity(connection).await.unwrap());
+    assert_eq!(checks.load(Ordering::SeqCst), 1);
 }
 
 #[cfg(all(windows, not(feature = "dev-desktop-approval")))]
-#[test]
-fn config_desktop_windows_connection_keeps_its_launch_incarnation_without_prompt_exemption() {
+#[tokio::test]
+async fn config_desktop_windows_connection_keeps_its_launch_incarnation_without_prompt_exemption() {
     use subc_os::local_peer::{ObservedPeer as OsPeer, PeerObservation, PeerUser};
     let handler = ControlHandler::new(Arc::new(Registry::default())).with_test_operator_app_policy(
         crate::operator_apps::TestOperatorAppPolicy {
@@ -139,7 +158,7 @@ fn config_desktop_windows_connection_keeps_its_launch_incarnation_without_prompt
     let connection = ConnectionId::new(710);
     handler.record_captured_peer(connection, peer.clone());
     assert!(handler.operator_apps.lock().unwrap().is_empty());
-    assert!(handler.config_desktop_identity(connection).unwrap());
+    assert!(handler.config_desktop_identity(connection).await.unwrap());
     // Reusing the numeric PID for a different launch must not rebind the old
     // connection, even when the current launch independently verifies.
     handler.launch_table.retire("desktop-fixture");
@@ -153,10 +172,10 @@ fn config_desktop_windows_connection_keeps_its_launch_incarnation_without_prompt
             .match_live_pid("desktop-fixture", own_pid),
         Some(second)
     );
-    assert!(!handler.config_desktop_identity(connection).unwrap());
+    assert!(!handler.config_desktop_identity(connection).await.unwrap());
     let reconnected = ConnectionId::new(711);
     handler.record_captured_peer(reconnected, peer);
-    assert!(handler.config_desktop_identity(reconnected).unwrap());
+    assert!(handler.config_desktop_identity(reconnected).await.unwrap());
     assert!(handler.operator_apps.lock().unwrap().is_empty());
     handler.cleanup_connection(connection).unwrap();
     assert!(!handler
@@ -176,7 +195,7 @@ async fn config_desktop_development_requires_a_same_user_local_peer_and_rechecks
         connection_id: connection,
         egress: crate::FrameSink::new(tx),
     };
-    assert!(!handler.config_desktop_identity(connection).unwrap());
+    assert!(!handler.config_desktop_identity(connection).await.unwrap());
     owner_peer(&handler, connection);
     let facts = handler.config_approval_facts(&ctx).await;
     assert!(facts.owner_uid && facts.desktop_app);
@@ -202,7 +221,7 @@ async fn config_desktop_development_requires_a_same_user_local_peer_and_rechecks
     );
     owner_peer(&handler, connection);
     handler.cleanup_connection(connection).unwrap();
-    assert!(!handler.config_desktop_identity(connection).unwrap());
+    assert!(!handler.config_desktop_identity(connection).await.unwrap());
     assert!(!handler
         .captured_peers
         .lock()
@@ -423,6 +442,7 @@ async fn config_desktop_complete_response_binds_only_after_successful_writer_flu
     let response = stamp_response(view.clone());
     let delivered = handler
         .config_desktop_review_response(connection, &response)
+        .await
         .unwrap();
     assert_eq!(delivered, view);
     let mut facts = handler.config_approval_facts(&ctx).await;
@@ -503,6 +523,7 @@ async fn config_desktop_failed_flush_revocation_and_disconnect_never_create_a_vi
         let response = stamp_response(view.clone());
         let delivered = handler
             .config_desktop_review_response(connection, &response)
+            .await
             .unwrap();
         let task = {
             let handler = handler.clone();

@@ -31,11 +31,12 @@ async fn config_gate_prompt_with_legacy_authority(attested: bool) {
             .operator_app_policy
             .windows_enabled = true;
         let stamp = launch_stamp(incarnation);
-        assert!(ShortcutContext::eligible_stamp(
-            &f.handler.operator_app_policy,
-            &f.handler.launch_table,
-            Some(&stamp)
-        ));
+        assert!(stamp.delivery_enabled(&f.handler.operator_app_policy));
+        assert!(
+            stamp
+                .revalidate_with_launches(&f.handler.launch_table)
+                .await
+        );
         f.handler
             .operator_apps
             .lock()
@@ -104,6 +105,7 @@ impl ShortcutFixture {
             phone_fingerprint: Some("0123456789abcdef0123456789abcdef".into()),
             route: None,
             connections: Arc::default(),
+            stamp_owner: None,
             hooks: Hooks {
                 settled: Some(settled.clone()),
                 ..hooks
@@ -556,7 +558,11 @@ async fn retired_or_replaced_launch_after_revalidation_hands_off_instead_of_gran
                 if replace {
                     let replacement = publish_self(&f.context.launches);
                     assert_ne!(replacement, incarnation);
-                    assert!(launch_stamp(replacement).revalidate_with_launches(&f.context.launches));
+                    assert!(
+                        launch_stamp(replacement)
+                            .revalidate_with_launches(&f.context.launches)
+                            .await
+                    );
                 }
                 hold.release.notify_one();
                 let answer = running.answer().await;
@@ -971,7 +977,12 @@ async fn desktop_control_shortcuts_and_privileged_enforce_dispatch_are_audit_gat
             } else {
                 f.forwarding
                     .alter_operator_binding_for_test(module.key, |binding| {
-                        binding.operator_app = Some(stamp)
+                        f.handler
+                            .operator_apps
+                            .lock()
+                            .unwrap()
+                            .insert(binding.client_connection_id, stamp.clone());
+                        binding.operator_app = Some(stamp);
                     });
                 let request = serde_json::json!({"op":"operator.confirm", "summary":"private summary",
                     "kind":"operation", "operation":"reset", "route_channel":module.key.channel, "route_epoch":module.epoch});
@@ -1207,7 +1218,11 @@ async fn windows_app_open_replacement_while_paused_after_revalidation_never_gran
         let _replacement_process =
             LaunchedWindowsApp(subc_os::Process::open(new.pid).unwrap().unwrap());
         assert_ne!(old.incarnation, new.incarnation);
-        assert!(launch_stamp(new.incarnation).revalidate_with_launches(&f.context.launches));
+        assert!(
+            launch_stamp(new.incarnation)
+                .revalidate_with_launches(&f.context.launches)
+                .await
+        );
         hold.release.notify_one();
         assert_eq!(running.answer().await["detail"]["reason"], "person");
         f.settled().await;

@@ -209,6 +209,12 @@ pub(super) fn observe(socket: BorrowedFd<'_>, forced: ForcedFailures) -> Observe
 }
 
 pub(super) fn capture(socket: BorrowedFd<'_>, forced: ForcedFailures) -> CapturedPeer {
+    let mut peer = capture_credentials(socket, forced);
+    peer.observation = observe_code(&peer, forced);
+    peer
+}
+
+pub(super) fn capture_credentials(socket: BorrowedFd<'_>, forced: ForcedFailures) -> CapturedPeer {
     let Some(token) = audit_token(socket).filter(|_| !forced.user) else {
         return ObservedPeer::Unobserved.into();
     };
@@ -217,21 +223,30 @@ pub(super) fn capture(socket: BorrowedFd<'_>, forced: ForcedFailures) -> Capture
     let Ok(pid) = u32::try_from(pid) else {
         return ObservedPeer::Unobserved.into();
     };
-    let guest = guest_code(token);
-    let exe = guest.as_ref().filter(|_| !forced.exe).and_then(code_path);
-    let signing_id = guest
-        .as_ref()
-        .filter(|code| !forced.signing_id && valid(code))
-        .and_then(signing_identifier);
     CapturedPeer {
         observation: ObservedPeer::Observed(PeerObservation {
             user: PeerUser::Uid(uid),
             pid,
-            exe,
-            signing_id,
+            exe: None,
+            signing_id: None,
         }),
         token: Some(token),
     }
+}
+
+pub(super) fn observe_code(peer: &CapturedPeer, forced: ForcedFailures) -> ObservedPeer {
+    let (Some(token), ObservedPeer::Observed(mut observation)) =
+        (peer.token, peer.observation.clone())
+    else {
+        return peer.observation.clone();
+    };
+    let guest = guest_code(token);
+    observation.exe = guest.as_ref().filter(|_| !forced.exe).and_then(code_path);
+    observation.signing_id = guest
+        .as_ref()
+        .filter(|code| !forced.signing_id && valid(code))
+        .and_then(signing_identifier);
+    ObservedPeer::Observed(observation)
 }
 
 /// The audit token the kernel recorded for the peer when it connected.

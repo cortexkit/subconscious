@@ -431,7 +431,14 @@ async fn operator_app_native_connection_is_stamped_again_by_a_restarted_daemon()
         let identity = BindIdentity::new("unit", "s");
         let (bind, binding) = bind_route(&handler, &target, &mut rx, &client, identity, None).await;
         assert_eq!(binding.principal, Principal::Direct);
-        assert!(binding.operator_app.as_ref().unwrap().revalidate());
+        assert!(
+            binding
+                .operator_app
+                .as_ref()
+                .unwrap()
+                .revalidate_with_launches(&handler.launch_table)
+                .await
+        );
         let raw: Value = serde_json::from_slice(&bind.body).unwrap();
         assert_eq!(
             raw["operator_app"],

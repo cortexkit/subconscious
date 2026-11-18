@@ -37,6 +37,8 @@ pub mod machine_id;
 pub mod observability;
 pub mod operator_apps;
 pub mod operator_confirm;
+#[cfg(any(target_os = "macos", test))]
+mod peer_identity_lane;
 pub mod privileged_prompt;
 pub(crate) mod program_origin;
 #[allow(dead_code)]

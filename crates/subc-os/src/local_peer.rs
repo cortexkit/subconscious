@@ -2,8 +2,9 @@
 //! Unix-domain socket on macOS and Linux, a named-pipe client on Windows.
 //!
 //! Unlike [`crate::socket_peer`], which searches process tables for the holder
-//! of a loopback TCP socket, every value here comes from a kernel primitive
-//! tied to the connection itself and read when it is accepted:
+//! of a loopback TCP socket, peer identity comes from kernel primitives tied
+//! to the accepted connection. Optional code metadata is derived from that
+//! captured identity:
 //!
 //! - macOS: the `LOCAL_PEERTOKEN` audit token. `uid` is the token's effective
 //!   uid. The guest code for the token (`SecCodeCopyGuestWithAttributes`)
@@ -141,6 +142,22 @@ impl CapturedPeer {
         &self.observation
     }
 
+    /// Whether this capture can be submitted for macOS code verification.
+    pub fn has_audit_token(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        return self.token.is_some();
+        #[cfg(not(target_os = "macos"))]
+        false
+    }
+
+    /// Resolve the advisory path and signing identifier from the captured
+    /// audit token. This may access disk or block in Security.framework; do
+    /// not call it inline in a listener or on an async runtime worker.
+    #[cfg(target_os = "macos")]
+    pub fn observe_code(&self) -> ObservedPeer {
+        macos::observe_code(self, ForcedFailures::default())
+    }
+
     /// Evaluate a code-signing requirement against the captured peer token.
     /// Hardened runtime is also required. Repeating this check revalidates the
     /// same process incarnation; neither a pid nor a path is accepted as proof.
@@ -163,6 +180,16 @@ pub fn capture_unix_peer(socket: &impl std::os::fd::AsFd) -> CapturedPeer {
     return macos::capture(socket.as_fd(), ForcedFailures::default());
     #[cfg(not(target_os = "macos"))]
     observe_unix_peer(socket).into()
+}
+
+/// Capture kernel peer facts without consulting macOS Security.framework.
+/// On macOS only the audit-token uid and pid are observed at this point.
+#[cfg(unix)]
+pub fn capture_unix_peer_credentials(socket: &impl std::os::fd::AsFd) -> CapturedPeer {
+    #[cfg(target_os = "macos")]
+    return macos::capture_credentials(socket.as_fd(), ForcedFailures::default());
+    #[cfg(not(target_os = "macos"))]
+    capture_unix_peer(socket)
 }
 
 /// Read failures a test can force, to show how each one shapes the result

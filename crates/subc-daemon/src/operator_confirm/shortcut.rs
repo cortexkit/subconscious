@@ -19,30 +19,12 @@ pub(crate) struct ShortcutContext {
     pub phone_fingerprint: Option<String>,
     pub route: Option<(u16, u32)>,
     pub connections: Arc<Mutex<HashMap<ConnectionId, OperatorAppStamp>>>,
+    pub stamp_owner: Option<ConnectionId>,
     #[cfg(test)]
     pub hooks: Hooks,
 }
 
 impl ShortcutContext {
-    pub(crate) fn route_eligible(
-        policy: &OperatorAppPolicy,
-        launches: &LaunchTable,
-        binding: &RouteBinding,
-    ) -> bool {
-        Self::eligible_stamp(policy, launches, binding.operator_app.as_ref())
-            || Self::phone_fingerprint(policy, binding).is_some()
-    }
-
-    pub(crate) fn eligible_stamp(
-        policy: &OperatorAppPolicy,
-        launches: &LaunchTable,
-        stamp: Option<&OperatorAppStamp>,
-    ) -> bool {
-        stamp.is_some_and(|stamp| {
-            stamp.delivery_enabled(policy) && stamp.revalidate_with_launches(launches)
-        })
-    }
-
     pub(crate) fn phone_fingerprint(
         policy: &OperatorAppPolicy,
         binding: &RouteBinding,
@@ -61,10 +43,20 @@ impl ShortcutContext {
         .then(|| fingerprint.to_owned())
     }
 
-    fn revalidate(&self) -> bool {
-        self.stamp
-            .as_ref()
-            .is_none_or(|stamp| stamp.revalidate_with_launches(&self.launches))
+    async fn revalidate(&self) -> bool {
+        match &self.stamp {
+            Some(stamp) => stamp.revalidate_with_launches(&self.launches).await,
+            None => true,
+        }
+    }
+
+    fn stamp_current(&self, connections: &HashMap<ConnectionId, OperatorAppStamp>) -> bool {
+        match (self.stamp_owner, &self.stamp) {
+            (Some(owner), Some(stamp)) => connections
+                .get(&owner)
+                .is_some_and(|current| stamp.same_generation(current)),
+            _ => true,
+        }
     }
 
     fn with_incarnation<T>(&self, commit: impl FnOnce() -> T) -> Option<T> {
@@ -311,6 +303,16 @@ impl OperatorConfirms {
                         Some(binding) if binding.module_epoch != epoch => Some("stale"),
                         Some(_) => None,
                     };
+                    if error.is_none() && !handoff && context.stamp.is_some() {
+                        let connections = context
+                            .connections
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner());
+                        if !context.stamp_current(&connections) {
+                            return Decision::Handoff;
+                        }
+                        return self.decide_shortcut(request, context, error, false);
+                    }
                     self.decide_shortcut(request, context, error, handoff)
                 })
                 .unwrap_or_else(|_| self.decide_shortcut(request, context, Some("closed"), handoff))
@@ -331,6 +333,8 @@ impl OperatorConfirms {
                     "withdrawn",
                 );
                 Decision::Ended("withdrawn")
+            } else if !handoff && !context.stamp_current(&connections) {
+                Decision::Handoff
             } else {
                 self.decide_shortcut(request, context, None, handoff)
             }
@@ -402,7 +406,7 @@ impl OperatorConfirms {
             #[cfg(test)]
             context.hooks.wait_before_handoff().await;
             self.check_shortcut(&request, &context, true)
-        } else if !context.revalidate() {
+        } else if !context.revalidate().await {
             #[cfg(test)]
             context.hooks.wait_before_handoff().await;
             self.check_shortcut(&request, &context, true)

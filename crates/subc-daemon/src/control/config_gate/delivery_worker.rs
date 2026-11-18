@@ -4,10 +4,13 @@ use super::*;
 use crate::config_gate::runtime::{
     delivery::CONFIG_LIVE_ACK_TIMEOUT, AppliedDisposition, DeliveryObserver,
 };
+use crate::registry::ConfigReviewRegistration;
 use std::collections::{HashMap, HashSet};
 use tokio::sync::Notify;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{sleep_until, timeout_at, Instant};
+
+const OVERDUE_RETRY_SPACING: Duration = Duration::from_millis(250);
 
 #[derive(Default)]
 struct AuthorityExitRetry {
@@ -233,7 +236,7 @@ impl ControlHandler {
                     }
                     let registrations = control
                         .registry
-                        .list_registered_modules()
+                        .config_review_registrations()
                         .unwrap_or_default();
                     wakes.retain(|connection, wake| {
                         let current = registrations
@@ -245,12 +248,7 @@ impl ControlHandler {
                         }
                         current
                     });
-                    for registration in registrations.into_iter().filter(|registration| {
-                        registration
-                            .control_ops
-                            .iter()
-                            .any(|op| op == "config.review")
-                    }) {
+                    for registration in registrations {
                         let connection = registration.connection_id;
                         if let Some(wake) = wakes.get(&connection) {
                             wake.notify_one();
@@ -317,6 +315,17 @@ impl ControlHandler {
                         let _ = released.await;
                     }
                 }
+                // If I/O outlasted the retry schedule, don't run another pass
+                // immediately on the same stale deadline. Notifications still
+                // interrupt the wait for real delivery changes.
+                let next_anchor = next_anchor.map(|at| {
+                    let now = Instant::now();
+                    if at <= now {
+                        now + OVERDUE_RETRY_SPACING
+                    } else {
+                        at
+                    }
+                });
                 tokio::select! {
                     _ = changed.notified(), if listen_for_changes => {
                         #[cfg(test)]
@@ -414,7 +423,7 @@ async fn config_recovery_exit_retry_backoff_caps_and_does_not_postpone_on_owner_
 
 async fn module_worker(
     handler: std::sync::Weak<ControlHandler>,
-    registration: crate::registry::ModuleRegistration,
+    registration: ConfigReviewRegistration,
     wake: Arc<Notify>,
 ) {
     use crate::config_gate::runtime::unstamped::{UserFilePoll, UserFileWatch};
@@ -431,7 +440,7 @@ async fn module_worker(
             let Some(owner) = &control.config_runtime else {
                 break;
             };
-            let module = &registration.manifest.module_id;
+            let module = &registration.module_id;
             let connection = registration.connection_id;
             let watched_module = module.clone();
             let (watch, poll) = owner
@@ -714,7 +723,7 @@ async fn module_worker(
 /// Returns whether the deadline, rather than a notification, ended the wait.
 async fn wait_for_next_pass(
     handler: &std::sync::Weak<ControlHandler>,
-    registration: &crate::registry::ModuleRegistration,
+    registration: &ConfigReviewRegistration,
     wake: &Notify,
     next: Option<Instant>,
 ) -> bool {

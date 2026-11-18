@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     error::Error,
     fmt,
     sync::{Arc, Mutex, MutexGuard},
@@ -72,6 +72,12 @@ pub struct ModuleRegistration {
     pub state: ChannelState,
     pub connection_id: ConnectionId,
     pub control_ops: Vec<String>,
+}
+
+pub(crate) struct ConfigReviewRegistration {
+    pub(crate) module_id: String,
+    pub(crate) connection_id: ConnectionId,
+    pub(crate) negotiated_ver: u8,
 }
 
 /// Only the role identities used by route target selection, not their schemas.
@@ -713,6 +719,35 @@ impl Registry {
         let mut modules = inner.modules.values().cloned().collect::<Vec<_>>();
         modules.sort_by(|left, right| left.manifest.module_id.cmp(&right.manifest.module_id));
         Ok(modules)
+    }
+
+    /// IDs from the active registration slots, including unpublished ones.
+    pub(crate) fn registered_module_ids(&self) -> Result<BTreeSet<String>, RegistryError> {
+        Ok(self.lock_inner()?.modules.keys().cloned().collect())
+    }
+
+    /// Active config reviewers, even if their catalog entries are not published yet.
+    pub(crate) fn config_review_registrations(
+        &self,
+    ) -> Result<Vec<ConfigReviewRegistration>, RegistryError> {
+        let inner = self.lock_inner()?;
+        let mut registrations: Vec<_> = inner
+            .modules
+            .iter()
+            .filter(|(_, registration)| {
+                registration
+                    .control_ops
+                    .iter()
+                    .any(|op| op == "config.review")
+            })
+            .map(|(module_id, registration)| ConfigReviewRegistration {
+                module_id: module_id.clone(),
+                connection_id: registration.connection_id,
+                negotiated_ver: registration.negotiated_ver,
+            })
+            .collect();
+        registrations.sort_unstable_by(|left, right| left.module_id.cmp(&right.module_id));
+        Ok(registrations)
     }
 
     /// Like [`Self::registration`], but a registration that is not published

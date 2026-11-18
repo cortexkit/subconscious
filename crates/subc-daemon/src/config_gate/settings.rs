@@ -9,6 +9,41 @@ use subc_control::config::{
     ConfigControlResponse, ConfigModule, ConfigSettingsLayer, ConfigThrough,
 };
 
+/// Owner inputs that can change a settings row without a file or catalog edit.
+/// The publication separately compares the ungated module IDs from `config.status`.
+#[derive(PartialEq, Eq)]
+pub(super) struct SettingsVersion {
+    store: (StoreState, u64),
+    active: Vec<(ConnectionId, Option<u64>)>,
+    plans: (u64, usize),
+}
+
+impl SettingsVersion {
+    pub(super) fn from_state(state: &OwnerState) -> Self {
+        Self {
+            store: (
+                state.store.loaded_admission_state().0,
+                state.store.publication_sequence(),
+            ),
+            // Declarations are immutable per connection. Track their identity
+            // and fallback acknowledgement without comparing the schemas.
+            active: state
+                .active_declarations
+                .values()
+                .map(|connection| {
+                    (
+                        *connection,
+                        state.delivery.fallback_applied.get(connection).copied(),
+                    )
+                })
+                .collect(),
+            // Insertion (including replacement) advances the sequence; removal
+            // alone changes the count. Neither requires inspecting plan bodies.
+            plans: (state.gate.next_plan_sequence, state.gate.plans.len()),
+        }
+    }
+}
+
 struct SettingsSnapshot {
     declaration_pending: BTreeMap<String, subc_protocol::config::ConfigDeclarationPending>,
     fallback_applied: BTreeSet<String>,

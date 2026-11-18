@@ -297,6 +297,40 @@ fn config_settings_missing_review_record_requires_rereview() {
 }
 
 #[test]
+fn config_cpu_settings_revision_tracks_declarations_plans_and_ungated_ids() {
+    let rig = SettingsRig::new();
+    let mut changes = rig.owner.subscribe_settings();
+    rig.declare("sample-reader", 11, false);
+    assert!(changes.has_changed().unwrap(), "active declaration changed");
+    changes.borrow_and_update();
+
+    // A small stand-in program: a debug test binary can exceed the 512 MiB hash
+    // limit that capture enforces on covered programs.
+    let program = rig.root.join("sample-legacy-program");
+    std::fs::write(&program, b"sample program").unwrap();
+    std::fs::write(
+        rig.root.join("subc.jsonc"),
+        json!({"version":1,"modules":{"sample-legacy":{
+            "program":program,"enabled":false,"protocol":"none"
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    // Preparing the review updates the ungated list shown by `config.status`
+    // before a pending plan exists, so this checks the ungated IDs separately.
+    let prepared = rig.owner.prepare(PlanKind::Stamp).unwrap();
+    assert!(changes.has_changed().unwrap(), "ungated IDs changed");
+    changes.borrow_and_update();
+    assert_eq!(rig.modules()["modules"][0]["module_id"], "sample-legacy");
+
+    let plan = rig.owner.finish_plan(prepared, daemon_review).unwrap();
+    assert!(changes.has_changed().unwrap(), "pending plan was published");
+    changes.borrow_and_update();
+    rig.owner.plan_discard(&plan.digest).unwrap();
+    assert!(changes.has_changed().unwrap(), "pending plan was removed");
+}
+
+#[test]
 fn config_settings_unstamped_files_and_stamped_approved_values_are_distinct() {
     let rig = SettingsRig::new();
     let direct = rig.show(None);

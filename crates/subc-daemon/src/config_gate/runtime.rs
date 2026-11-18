@@ -590,6 +590,20 @@ impl<'a> OwnerGuard<'a> {
         Ok(self.state.store.loaded_admission_state().1)
     }
 
+    fn check_authority_for_read(&mut self) -> Result<()> {
+        let before = store_witness(&self.state.store);
+        let retry = self.state.anchor_retry.next();
+        let result = RuntimeOwner::check_authority(&mut self.state, false);
+        let after = store_witness(&self.state.store);
+        self.changed |= after != before;
+        // Verification can finish writing the committed store's integrity
+        // anchor or schedule its first retry. Delivery waits for that write.
+        if before.2 != after.2 || retry != self.state.anchor_retry.next() {
+            self.owner.notify_delivery_changed();
+        }
+        result
+    }
+
     fn publish(&mut self) {
         #[cfg(test)]
         self.owner
@@ -630,21 +644,27 @@ impl<'a> OwnerGuard<'a> {
         let projection = self
             .owner
             .status_projection(&mut self.state, observed, &next);
+        let settings = settings::SettingsVersion::from_state(&self.state);
         if let Ok(mut cache) = self.owner.published.write() {
             let (holds, releases) = next.transitions_from(&cache);
             let changed = next.is_recovering() != cache.is_recovering()
                 || !holds.is_empty()
                 || !releases.is_empty();
+            let settings_changed = cache.settings.as_ref() != Some(&settings)
+                || projection.status.ungated_modules != cache.projection.status.ungated_modules;
             self.state.admission_holds.extend(holds);
             self.state.admission_releases.extend(releases);
             *cache = std::sync::Arc::new(Published {
                 admission: next,
                 approved_daemon,
                 projection,
+                settings: Some(settings),
             });
-            self.owner
-                .settings_changed
-                .send_modify(|revision| *revision = revision.wrapping_add(1));
+            if settings_changed {
+                self.owner
+                    .settings_changed
+                    .send_modify(|revision| *revision = revision.wrapping_add(1));
+            }
             if changed {
                 self.owner.delivery_changed.notify_one();
             }
@@ -911,6 +931,7 @@ impl RuntimeOwner {
             admission,
             approved_daemon,
             projection: polled::Projection::default(),
+            settings: None,
         }));
         let delivery_changed = std::sync::Arc::new(tokio::sync::Notify::new());
         let owner = Self {
@@ -1188,11 +1209,11 @@ impl RuntimeOwner {
         Ok(())
     }
 
-    /// Clear everything `connection` held in the configuration owner. The
-    /// delivery coordinator wakes only when the connection held configuration
-    /// state (a declaration, a delivery, an approval or its request, a desktop
-    /// view, an anchor wait) or ran a `config.review` worker. Unrelated client
-    /// disconnects do not wake it.
+    /// Clear everything `connection` held in the configuration owner. If another
+    /// task holds the owner lock, the close is queued and the coordinator is
+    /// always woken to drain it, because the connection can't be checked. When
+    /// the lock is free, wake only if the connection had configuration state or
+    /// ran a `config.review` worker.
     pub fn disconnected(&self, connection: ConnectionId) {
         let mut held = false;
         if let Ok(mut index) = self.approval_request_index.lock() {
@@ -1220,9 +1241,8 @@ impl RuntimeOwner {
                 if let Ok(mut pending) = self.disconnected_pending.lock() {
                     pending.push(connection);
                 }
-                // The busy owner cannot say whether this connection held
-                // state. Wake the coordinator so its next owner acquisition
-                // applies the queued disconnect promptly.
+                // Without the owner lock we cannot rule out config state.
+                // The coordinator's next acquisition applies the queued close.
                 held = true;
             }
         }

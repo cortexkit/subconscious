@@ -253,6 +253,133 @@ async fn config_settings_watch_filters_reopens_cancels_and_cleans_up() {
 }
 
 #[tokio::test]
+async fn config_cpu_watch_ignores_unchanged_owner_releases() {
+    let rig = SettingsRig::new();
+    let handler = handler(&rig);
+    let (ctx, mut rx) = context();
+    let (captured, mut captures) = tokio::sync::mpsc::unbounded_channel();
+    *rig.owner.settings_observation_hook.lock().unwrap() = Some(Box::new(move || {
+        let _ = captured.send(());
+    }));
+    handler
+        .handle_control_frame(&ctx, request(json!({"op":"config.watch"})))
+        .await
+        .unwrap();
+    assert_eq!(event(&mut rx).await["event"], "resync");
+    assert_eq!(captures.try_recv(), Ok(()));
+
+    for _ in 0..32 {
+        assert!(rig.owner.poll_anchor_retry().unwrap().is_none());
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), captures.recv())
+            .await
+            .is_err(),
+        "an unchanged owner release triggered an extra settings capture"
+    );
+    handler.cleanup_connection(ctx.connection_id).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn config_cpu_coordinator_coalesces_busy_disconnect_bursts() {
+    let rig = SettingsRig::new();
+    let (woke, mut wakes) = tokio::sync::mpsc::unbounded_channel();
+    let (idle, mut passes) = tokio::sync::mpsc::unbounded_channel();
+    let handler = Arc::new(
+        handler(&rig)
+            .with_delivery_wakes_for_test(woke)
+            .with_delivery_idle_for_test(idle),
+    );
+    let worker = handler.spawn_config_delivery_worker().unwrap();
+    // Pause after consuming the notification from the fixture's declaration.
+    let resume = tokio::time::timeout(Duration::from_secs(2), async {
+        passes.recv().await.unwrap().send(()).unwrap();
+        assert_eq!(wakes.recv().await.unwrap().0, "notification");
+        passes.recv().await.unwrap()
+    })
+    .await
+    .unwrap();
+    let (ctx, mut rx) = context();
+    handler
+        .handle_control_frame(&ctx, request(json!({"op":"config.watch"})))
+        .await
+        .unwrap();
+    assert_eq!(event(&mut rx).await["event"], "resync");
+
+    rig.owner.with_owner_lock_for_test(|| {
+        for id in 100..132 {
+            let connection = ConnectionId::new(id);
+            handler.record_local_connection(connection);
+            handler.cleanup_connection(connection).unwrap();
+        }
+    });
+    resume.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        assert_eq!(wakes.recv().await.unwrap().0, "notification");
+        passes.recv().await.unwrap().send(()).unwrap();
+    })
+    .await
+    .expect("busy closes must wake the coordinator for a delivery pass");
+    let unexpected = tokio::time::timeout(Duration::from_millis(250), wakes.recv()).await;
+    worker.abort();
+    let _ = worker.await;
+    handler.cleanup_connection(ctx.connection_id).unwrap();
+    assert!(
+        unexpected.is_err(),
+        "busy disconnects queued together must cause only one delivery pass: {unexpected:?}"
+    );
+    assert!(passes.try_recv().is_err());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn config_cpu_coordinator_drains_busy_disconnect_with_config_state() {
+    let rig = SettingsRig::new();
+    let (woke, mut wakes) = tokio::sync::mpsc::unbounded_channel();
+    let (idle, mut passes) = tokio::sync::mpsc::unbounded_channel();
+    let handler = Arc::new(
+        handler(&rig)
+            .with_delivery_wakes_for_test(woke)
+            .with_delivery_idle_for_test(idle),
+    );
+    let worker = handler.spawn_config_delivery_worker().unwrap();
+    let mut changes = rig.owner.subscribe_settings();
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        passes.recv().await.unwrap().send(()).unwrap();
+        assert_eq!(wakes.recv().await.unwrap().0, "notification");
+        let resume = passes.recv().await.unwrap();
+        // The declaration is owned by a connection with no running delivery
+        // worker. The queued cleanup is the only way to discover it is gone.
+        rig.owner.with_owner_lock_for_test(|| {
+            handler.cleanup_connection(ConnectionId::new(10)).unwrap();
+            assert!(!changes.has_changed().unwrap());
+        });
+        resume.send(()).unwrap();
+        assert_eq!(wakes.recv().await.unwrap().0, "notification");
+        changes.changed().await.unwrap();
+        // Wait for the real delivery pass, without any other owner calls
+        // that could inadvertently drain the queued disconnect.
+        let _resume = passes.recv().await.unwrap();
+        let ConfigControlResponse::Modules { modules, .. } =
+            rig.owner.settings_modules(BTreeSet::new()).unwrap()
+        else {
+            panic!("expected settings rows");
+        };
+        assert!(
+            modules.is_empty(),
+            "the disconnected declaration was retained"
+        );
+    })
+    .await
+    .expect("the coordinator must promptly drain a queued config disconnect");
+    worker.abort();
+    let _ = worker.await;
+}
+
+#[tokio::test]
 async fn config_settings_watch_retries_initial_capture_race() {
     let rig = SettingsRig::new();
     rig.stamp();

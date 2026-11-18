@@ -185,11 +185,11 @@ fn schema_path<'a>(
 impl RuntimeOwner {
     pub fn write_back_status(&self) -> Result<BTreeMap<String, String>> {
         let mut state = self.lock()?;
-        Self::check_authority(&mut state, false)?;
-        if state.store.status().state != StoreState::Stamped {
+        state.check_authority_for_read()?;
+        if state.store_read(ConfigStore::status).state != StoreState::Stamped {
             return Ok(BTreeMap::new());
         }
-        let body = state.store.body()?;
+        let body = state.checked_body()?;
         let entry = body
             .generations
             .get(&super::placement::last_approved_generation(body));

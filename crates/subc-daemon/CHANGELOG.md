@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.50.10
+
+- Stop settings watches from waking themselves and coalesce bursts of changes.
+- Read only the registry fields needed by settings watches and configuration
+  delivery instead of cloning full module registrations.
+
 ## 0.50.9
 
 - Validate registry roots on a dedicated bounded I/O pool and report outstanding

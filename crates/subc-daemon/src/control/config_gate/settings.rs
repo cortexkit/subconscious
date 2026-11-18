@@ -2,6 +2,8 @@ use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 use subc_control::config::{ConfigFileError, ConfigModule, ConfigWatchEvent, ConfigWatchResponse};
 
+const SETTINGS_CAPTURE_SPACING: Duration = Duration::from_millis(250);
+
 #[derive(Default)]
 struct SettingsFileGrace {
     pending: BTreeMap<String, (ConfigFileError, tokio::time::Instant)>,
@@ -49,13 +51,7 @@ impl ControlHandler {
         &self,
     ) -> std::result::Result<BTreeSet<String>, GateError> {
         self.registry
-            .list_registered_modules()
-            .map(|modules| {
-                modules
-                    .into_iter()
-                    .map(|module| module.manifest.module_id)
-                    .collect()
-            })
+            .registered_module_ids()
             .map_err(|_| GateError::new("config_unavailable", "module registry is unavailable"))
     }
 
@@ -142,15 +138,25 @@ impl ControlHandler {
             );
             poll.tick().await;
             let mut retry_capture = false;
+            let mut next_capture = None;
             loop {
                 tokio::select! {
                     result = changes.changed(), if !retry_capture => if result.is_err() { return; },
                     result = catalog.changed(), if !retry_capture => if result.is_err() { return; },
                     _ = poll.tick() => {},
                 }
+                if let Some(at) = next_capture {
+                    tokio::time::sleep_until(at).await;
+                }
                 if sink.is_closed() {
                     return;
                 }
+                // Coalesce both change sources before reading. Changes during
+                // the capture remain unread for the next pass.
+                changes.borrow_and_update();
+                catalog.borrow_and_update();
+                next_capture = Some(tokio::time::Instant::now() + SETTINGS_CAPTURE_SPACING);
+                poll.reset();
                 let next = handler
                     .config_settings_rows(runtime.clone(), &modules)
                     .await;
@@ -232,15 +238,16 @@ impl ControlHandler {
         filter: &Option<Vec<String>>,
     ) -> std::result::Result<Option<(Vec<ConfigModule>, bool)>, GateError> {
         let known = self.config_settings_known_modules()?;
-        let response = config_work(runtime, move |owner| {
-            let response = owner.observe_settings_modules(known);
-            #[cfg(test)]
-            if let Some(hook) = owner.settings_observation_hook.lock().unwrap().as_mut() {
-                hook();
-            }
-            response
-        })
-        .await?;
+        let response = runtime
+            .on_blocking(move |owner| {
+                let response = owner.observe_settings_modules(known);
+                #[cfg(test)]
+                if let Some(hook) = owner.settings_observation_hook.lock().unwrap().as_mut() {
+                    hook();
+                }
+                response
+            })
+            .await?;
         let Some(response) = response else {
             return Ok(None);
         };

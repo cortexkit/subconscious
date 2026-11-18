@@ -5,6 +5,7 @@ pub(crate) struct Published {
     pub(super) admission: admission::AdmissionCache,
     pub(crate) approved_daemon: ApprovedDaemonView,
     pub(super) projection: polled::Projection,
+    pub(super) settings: Option<settings::SettingsVersion>,
 }
 
 impl Published {

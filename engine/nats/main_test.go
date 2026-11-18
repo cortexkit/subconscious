@@ -42,7 +42,7 @@ func TestVersionExitsBeforeConfigOrStoreAccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("--version failed: %v: %s", err, output)
 	}
-	if string(output) != "ck-nats-engine 0.1.2\n" {
+	if string(output) != "ck-nats-engine 0.1.3\n" {
 		t.Fatalf("unexpected version output: %q", output)
 	}
 }

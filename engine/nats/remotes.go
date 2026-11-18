@@ -122,7 +122,8 @@ func buildRemotes(remotes []remote, previous []remote, sign func(string, []byte)
 			// NATS includes Nkey in reload identity, but SignatureCB bypasses seed handling.
 			Nkey:        "ck-bus:" + r.Name,
 			SignatureCB: func(nonce []byte) (string, []byte, error) { return sign(r.Name, nonce) },
-			TLS:         true, TLSConfig: tlsConfig,
+			// Send TLS first so relays can forward the leaf's first bytes without plaintext INFO.
+			TLS: true, TLSConfig: tlsConfig, TLSHandshakeFirst: true,
 			DenyImports: append([]string(nil), r.DenyImports...), DenyExports: append([]string(nil), r.DenyExports...),
 		})
 	}

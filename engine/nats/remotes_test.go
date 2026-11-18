@@ -7,7 +7,9 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
+	"io"
 	"math/big"
+	"net"
 	"strconv"
 	"sync/atomic"
 	"testing"
@@ -163,12 +165,69 @@ func eventually(t *testing.T, why string, fn func() bool) {
 	t.Fatal(why)
 }
 
+func TestRemoteConnectsToHubThroughLeafFirstRelay(t *testing.T) {
+	cert, leafCert, key := certificate(t, nil, nil, false)
+	port := freeHubPort(t)
+	hubOpts := &server.Options{Host: "127.0.0.1", Port: -1, LeafNode: server.LeafNodeOpts{Host: "127.0.0.1", NoAdvertise: true}}
+	configureHub(hubOpts, &hubListener{Port: uint16(port)}, &tls.Config{
+		Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS13,
+	})
+	hub := startServer(t, hubOpts)
+
+	relay, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relay.Close()
+	r := sampleRemote(certPin(leafCert))
+	r.URLs = []string{"tls://" + relay.Addr().String()}
+	var signs atomic.Int32
+	remotes, err := buildRemotes([]remote{r}, nil, func(_ string, nonce []byte) (string, []byte, error) {
+		signs.Add(1)
+		return "", ed25519.Sign(key, nonce), nil
+	}, func(_ string, err error) { t.Log(err) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf := startServer(t, &server.Options{Host: "127.0.0.1", Port: -1, LeafNode: server.LeafNodeOpts{Remotes: remotes}})
+
+	if err := relay.SetDeadline(time.Now().Add(4 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	fromLeaf, err := relay.AcceptTCP()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fromLeaf.Close()
+	if err := fromLeaf.SetReadDeadline(time.Now().Add(4 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	// The relay opens the hub connection only once the leaf has sent data.
+	var first [1]byte
+	if _, err := io.ReadFull(fromLeaf, first[:]); err != nil {
+		t.Fatalf("leaf did not speak first: %v", err)
+	}
+	toHub, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer toHub.Close()
+	if _, err := toHub.Write(first[:]); err != nil {
+		t.Fatal(err)
+	}
+	go io.Copy(toHub, fromLeaf)
+	go io.Copy(fromLeaf, toHub)
+	eventually(t, "TLS-first leaf link did not authenticate through the relay", func() bool {
+		return hub.NumLeafNodes() == 1 && leaf.NumLeafNodes() == 1 && signs.Load() > 0
+	})
+}
+
 func TestRemoteReloadSyntheticNkeyAndPinRename(t *testing.T) {
 	cert1, x509Cert1, key := certificate(t, nil, nil, false)
 	cert2, x509Cert2, _ := certificate(t, nil, nil, false)
 	hubOptions := func(port int, cert tls.Certificate) *server.Options {
 		return &server.Options{Host: "127.0.0.1", Port: -1, LeafNode: server.LeafNodeOpts{
-			Host: "127.0.0.1", Port: port, NoAdvertise: true,
+			Host: "127.0.0.1", Port: port, NoAdvertise: true, TLSHandshakeFirst: true,
 			TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12},
 		}}
 	}

@@ -13,7 +13,7 @@ import (
 	"github.com/nats-io/nats-server/v2/server"
 )
 
-const version = "0.1.2"
+const version = "0.1.3"
 const patchID = "reload-signaturecb-1"
 
 type terminal struct {

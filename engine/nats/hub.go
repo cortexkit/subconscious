@@ -62,4 +62,7 @@ func hubTLS(listener *hubListener, sign *signer) (*tls.Config, error) {
 func configureHub(opts *server.Options, listener *hubListener, config *tls.Config) {
 	opts.LeafNode.Port = int(listener.Port)
 	opts.LeafNode.TLSConfig = config
+	// Relays wait for the leaf's first bytes; never send plaintext INFO first.
+	opts.LeafNode.TLSHandshakeFirst = true
+	opts.LeafNode.TLSHandshakeFirstFallback = 0
 }

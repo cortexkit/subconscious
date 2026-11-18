@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.3
+
+- Start leaf connections with TLS, before sending any NATS metadata. The hub
+  rejects plaintext connections, and relays can wait for the leaf to speak first.
+- Hub and leaf engines must both support TLS-first; older engines cannot connect.
+
 ## 0.1.2
 
 - Start hub instances only after the listener state arrives, with TLS 1.3 and an

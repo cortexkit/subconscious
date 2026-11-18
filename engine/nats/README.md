@@ -1,6 +1,8 @@
 # ck-nats-engine
 
-Version 0.1.2 adds a hub listener with TLS 1.3 and channel-backed Ed25519 signing.
+Version 0.1.3 starts every leaf link with TLS, before any NATS `INFO` is sent.
+Both ends must support TLS-first. The hub's TLS 1.3 listener asks `ck-nats-server`
+to sign handshakes with Ed25519 over the engine's stdin/stdout channel.
 The hub waits for its first listener state before opening the server, and a
 listener port or certificate change requires a restart. Version 0.1.1 added
 `ck-nats-engine --version`, which prints the build version

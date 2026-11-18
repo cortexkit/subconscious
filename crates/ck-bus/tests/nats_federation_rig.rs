@@ -2337,7 +2337,7 @@ mod leaf_link {
         let bin = nats_server_bin();
         let root = tempfile::tempdir().unwrap();
 
-        // The hub: its own operator, the user's hub account, a TLS leaf listener.
+        // A stock hub with its own operator and a TLS-first leaf listener to match the engine.
         let (cert, key, pin) = hub_certificate(&root.path().join("tls"));
         let hub_operator = Operator::new("HUB");
         let hub_account = Account::new("USER", true);
@@ -2350,7 +2350,7 @@ mod leaf_link {
             &[&hub_account],
             Resolver::Memory,
             &format!(
-                "leafnodes {{ listen: \"127.0.0.1:-1\", tls {{ cert_file: \"{}\", key_file: \"{}\" }} }}",
+                "leafnodes {{ listen: \"127.0.0.1:-1\", tls {{ cert_file: \"{}\", key_file: \"{}\", handshake_first: true }} }}",
                 cert.display(),
                 key.display()
             ),

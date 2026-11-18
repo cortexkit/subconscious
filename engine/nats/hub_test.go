@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"crypto"
 	"crypto/ed25519"
@@ -9,12 +8,14 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -38,7 +39,7 @@ func hubState(t *testing.T, c engineChild, generation int, port int, der []byte)
 	}
 }
 
-func dialHubTLS(t *testing.T, port int, maxVersion uint16) *tls.Conn {
+func dialHub(t *testing.T, port int) net.Conn {
 	t.Helper()
 	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), time.Second)
 	if err != nil {
@@ -47,12 +48,12 @@ func dialHubTLS(t *testing.T, port int, maxVersion uint16) *tls.Conn {
 	if err := conn.SetDeadline(time.Now().Add(7 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	// A NATS leaf listener sends its plaintext INFO before switching to TLS.
-	line, err := bufio.NewReader(conn).ReadString('\n')
-	if err != nil || !strings.HasPrefix(line, "INFO ") {
-		t.Fatalf("leaf INFO: %q %v", line, err)
-	}
-	return tls.Client(conn, &tls.Config{InsecureSkipVerify: true, MinVersion: maxVersion, MaxVersion: maxVersion})
+	return conn
+}
+
+func dialHubTLS(t *testing.T, port int, maxVersion uint16) *tls.Conn {
+	t.Helper()
+	return tls.Client(dialHub(t, port), &tls.Config{InsecureSkipVerify: true, MinVersion: maxVersion, MaxVersion: maxVersion})
 }
 
 func handshakeHub(t *testing.T, c engineChild, port int, der []byte, key ed25519.PrivateKey) {
@@ -120,6 +121,35 @@ func TestHubStartsAfterListenerAndRefusesChanges(t *testing.T) {
 	hubState(t, c, 2, leafPort, cert.Raw)
 	c.next(t, "applied")
 	handshakeHub(t, c, leafPort, cert.Raw, key)
+	_ = c.input.Close()
+	c.wait(t, 0)
+}
+
+func TestEngineHubClosesPlaintextLeafConnections(t *testing.T) {
+	port := freeHubPort(t)
+	c := startEngineWith(t, true, -1)
+	_, cert, _ := certificate(t, nil, nil, false)
+	hubState(t, c, 1, port, cert.Raw)
+	c.next(t, "ready")
+	for _, tc := range []struct{ name, send string }{
+		{"plaintext CONNECT", "CONNECT {}\r\n"},
+		{"waiting for INFO", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conn := dialHub(t, port)
+			defer conn.Close()
+			if tc.send != "" {
+				if _, err := io.WriteString(conn, tc.send); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var buf [128]byte
+			n, err := conn.Read(buf[:])
+			if n != 0 || (!errors.Is(err, io.EOF) && !errors.Is(err, syscall.ECONNRESET)) {
+				t.Fatalf("expected close without INFO, got %q and %v", buf[:n], err)
+			}
+		})
+	}
 	_ = c.input.Close()
 	c.wait(t, 0)
 }

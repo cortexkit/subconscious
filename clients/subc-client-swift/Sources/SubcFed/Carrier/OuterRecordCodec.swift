@@ -207,6 +207,10 @@ public actor FedTCPRecordCarrier {
         self.stream = stream
     }
 
+    func takeBufferedNoiseMessage() -> Data? {
+        pendingRecords.isEmpty ? nil : pendingRecords.removeFirst()
+    }
+
     public func sendNoiseMessage(_ message: Data) async throws {
         guard readyToUse else { throw FedCarrierError.carrierClosed }
         do {
@@ -220,7 +224,7 @@ public actor FedTCPRecordCarrier {
 
     public func receiveNoiseMessage() async throws -> Data {
         guard readyToUse else { throw FedCarrierError.carrierClosed }
-        if !pendingRecords.isEmpty { return pendingRecords.removeFirst() }
+        if let buffered = takeBufferedNoiseMessage() { return buffered }
         do {
             while true {
                 guard let bytes = try await stream.read() else {

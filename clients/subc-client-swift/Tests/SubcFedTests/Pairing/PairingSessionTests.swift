@@ -270,6 +270,16 @@ final class PairingSessionTests: XCTestCase {
     }
 
     func testPairingResultRefusedOnNormalSessionBeforeAndAfterHello() async throws {
+        try await assertPairingFrameRefusedOnNormalSession(#"{"type":"pairing_result","outcome":"granted"}"#)
+    }
+
+    func testRemotePairingResultRefusedOnNormalSessionBeforeAndAfterHello() async throws {
+        let targetKey = String(repeating: "ab", count: 32)
+        try await assertPairingFrameRefusedOnNormalSession(
+            #"{"type":"remote_pair_result","outcome":"granted","target_key":"\#(targetKey)"}"#)
+    }
+
+    private func assertPairingFrameRefusedOnNormalSession(_ header: String) async throws {
         for afterHello in [false, true] {
             let transport = FedLoopbackByteTransport()
             let engine = FedSessionEngine(deps: .init(
@@ -277,7 +287,7 @@ final class PairingSessionTests: XCTestCase {
                 localPublicKey: Data(repeating: 1, count: 32), responderStaticPublicKey: Data(repeating: 2, count: 32),
                 helloPolicy: try FedHelloPolicy(), connectionAttemptID: String(repeating: "a", count: 32)
             ))
-            let bytes = Self.rawFrame(#"{"type":"pairing_result","outcome":"granted"}"#)
+            let bytes = Self.rawFrame(header)
             if afterHello {
                 let hello = FedHelloCodec.buildLocalHello(policy: try FedHelloPolicy(features: ["mgmt-v1", "effects-v1", "effects-v2"]),
                     incarnation: "00000000-0000-4000-8000-0000000000aa",

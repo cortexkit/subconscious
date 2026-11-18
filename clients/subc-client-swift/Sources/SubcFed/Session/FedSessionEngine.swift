@@ -1227,7 +1227,7 @@ public actor FedSessionEngine {
             activeKeepalive.noteAssemblyProgress(at: deps.clock.nowNanoseconds())
             keepalive = activeKeepalive
         }
-        let frames = try streamDecoder.append(bytes)
+        let frames = try await appendOrdinaryFrames(bytes)
         for frame in frames {
             if var activeKeepalive = keepalive {
                 activeKeepalive.noteInboundFrame(at: deps.clock.nowNanoseconds())
@@ -1236,6 +1236,15 @@ public actor FedSessionEngine {
             try await handleInboundFrame(frame)
         }
         return frames
+    }
+
+    private func appendOrdinaryFrames(_ bytes: Data) async throws -> [FedFrame] {
+        do { return try streamDecoder.append(bytes) }
+        catch FedFrameError.invalidHeaderField(let type, _) where FedRemotePairCodec.standaloneTypes.contains(type) {
+            let failure = FedFailure.protocolViolation(byeCode: "fed_bad_frame")
+            await disconnect(reason: failure)
+            throw failure
+        }
     }
 
     // MARK: - Internals
@@ -1451,11 +1460,11 @@ public actor FedSessionEngine {
     private func receiveOneFrame() async throws -> FedFrame {
         while true {
             if cancelledActivities { throw FedFailure.cancelled }
-            if let buffered = try streamDecoder.append(Data()).first {
+            if let buffered = try await appendOrdinaryFrames(Data()).first {
                 return buffered
             }
             let chunk = try await deps.transport.receive()
-            let frames = try streamDecoder.append(chunk)
+            let frames = try await appendOrdinaryFrames(chunk)
             if frames.contains(where: { $0.knownType == .pairingResult }) {
                 await disconnect(reason: .protocolViolation(byeCode: "fed_bad_frame"))
                 throw FedFailure.protocolViolation(byeCode: "fed_bad_frame")

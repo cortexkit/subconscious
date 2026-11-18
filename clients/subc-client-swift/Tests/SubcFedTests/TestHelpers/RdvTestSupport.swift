@@ -306,7 +306,7 @@ struct RelayOpsHarness {
     let client: FedRendezvousClient
     let server: LoopbackWebSocketStream
 
-    static func connect(localX25519Priv: Data) async throws -> RelayOpsHarness {
+    static func connect(localX25519Priv: Data, devices: [RdvJSONObject] = []) async throws -> RelayOpsHarness {
         let registry = RdvServerPeerRegistry()
         let x25519Key = try FedNoiseKeyPair(privateKey: localX25519Priv)
         let identity = try FedRendezvousIdentity(
@@ -346,7 +346,7 @@ struct RelayOpsHarness {
         let serverEphPubHex = Curve25519.KeyAgreement.PrivateKey().publicKey.rawRepresentation.lowercaseHex
         try await server.send(.text(try RdvTestSigning.helloChallengeText(serverEphX25519PubkeyHex: serverEphPubHex)))
         _ = try await server.receive() // the client's hello
-        let barrier = RdvTestSigning.registrySnapshotPayload(serverSeq: "1", devices: [])
+        let barrier = RdvTestSigning.registrySnapshotPayload(serverSeq: "1", devices: devices)
         try await server.send(.text(try RdvTestSigning.signedEnvelopeText(signPayload: barrier)))
         try await connectTask.value
         return RelayOpsHarness(client: client, server: server)

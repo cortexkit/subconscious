@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Add SubcFed remote pairing from the signed account device list. The SDK runs
+  both Noise roles, derives the code independently, and offers a pin only after
+  a local match and a grant for the authenticated computer key. A lost result
+  can be looked up separately using the device's saved receipt; starting over
+  discards the old receipt and never retries the previous ceremony.
+
 - Bound every `SubcFed` session transport write to ten seconds by default
   (configurable through `FedSessionEngine.Dependencies.transportWriteTimeout`).
   A timed-out write closes the session, fails queued writers, and cannot update

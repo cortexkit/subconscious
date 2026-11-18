@@ -38,3 +38,28 @@ public extension FedNoiseIKInitiator {
         }
     }
 }
+
+extension FedNoiseIKResponder {
+    func establish(
+        on carrier: any FedNoiseMessageCarrier, clock: any FedMonotonicClock,
+        timeout: Duration, entropy: any FedNoiseEntropy,
+        admit: @escaping @Sendable () async throws -> Void
+    ) async throws -> FedNoiseRecordSession {
+        do {
+            return try await FedStageDeadlineRunner(clock: clock).run(stage: .noiseHandshake, duration: timeout) {
+                let response = try self.readMessage1(await carrier.receiveNoiseMessage(), using: entropy)
+                // Message 1's tag authenticates the initiator static key, but
+                // message 1 can be replayed. Admission permits a reply, not
+                // ownership: under fed-wire §3.10, the responder selects the
+                // winning leg only after a `pair_commit` inside Noise transport.
+                try await admit()
+                try Task.checkCancellation()
+                try await carrier.sendNoiseMessage(response)
+                return try self.makeHandshakeResult().makeRecordSession(carrier: carrier)
+            }
+        } catch {
+            await carrier.close()
+            throw error
+        }
+    }
+}

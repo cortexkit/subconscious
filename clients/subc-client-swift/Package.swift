@@ -9,7 +9,7 @@ import PackageDescription
 //
 // SubcFed implements the client/origin side of the fed-wire protocol and starts
 // Noise handshakes for iOS 16+ and macOS 13+. It stays free of AppKit/UIKit and
-// only makes outbound connections; it never listens for incoming connections.
+// never listens on a socket; a remote-pair relay can carry the responder role.
 let package = Package(
     name: "SubcClient",
     platforms: [
@@ -35,7 +35,7 @@ let package = Package(
         .testTarget(
             name: "SubcFedTests",
             dependencies: ["SubcFed"],
-            resources: [.copy("Fixtures/fed-pairing-v1")]
+            resources: [.copy("Fixtures/fed-pairing-v1"), .copy("Fixtures/remote-pairing-v1")]
         ),
         .testTarget(name: "SubcFedTestSupportTests", dependencies: ["SubcFedTestSupport", "SubcFed"]),
         .testTarget(

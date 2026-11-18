@@ -85,20 +85,18 @@ final class FedRendezvousRelayOpsTests: XCTestCase {
         try await waitFor { await harness.client.relayGrantCount == 1 }
     }
 
-    func testTargetSideBUnsolicitedGrantIsActedOn() async throws {
+    func testTargetSideBUnsolicitedGrantIsNotBufferedForOrdinaryDial() async throws {
         let harness = try await RelayOpsHarness.connect(localX25519Priv: Data(repeating: 0x11, count: 32))
         defer { Task { await harness.client.disconnect() } }
 
-        // The target never opened; the server pushes an unsolicited side-b grant
-        // (no of_seq) and the client must surface it for dialing, not drop it.
-        let grantTask = Task { [peerPubkey] in try await harness.client.awaitRelayGrant(fromPeer: peerPubkey) }
         try await harness.sendRelayGrant(serverSeq: "2", ofSeq: nil, side: .b, peer: peerPubkey)
-        let grant = try await fedTestWithTimeout { try await grantTask.value }
-
-        XCTAssertEqual(grant.side, .b)
-        XCTAssertNil(grant.ofSeq, "the target's grant is unsolicited (no of_seq)")
-        XCTAssertFalse(grant.isOpenerGrant)
         try await waitFor { await harness.client.relayGrantCount == 1 }
+        let published = await harness.client.lastRelayGrant
+        XCTAssertNil(published)
+        try await harness.sendRelayGrant(serverSeq: "3", ofSeq: "2", side: .a, peer: peerPubkey)
+        let grant = try await fedTestWithTimeout { [peerPubkey] in try await harness.client.awaitRelayGrant(fromPeer: peerPubkey) }
+        XCTAssertEqual(grant.side, .a)
+        XCTAssertEqual(grant.serverSeq, "3")
     }
 
     func testBufferedGrantIsReturnedToALateAwaiter() async throws {
@@ -107,10 +105,10 @@ final class FedRendezvousRelayOpsTests: XCTestCase {
 
         // The grant arrives BEFORE anyone awaits it; it is buffered per peer and
         // handed to the next awaiter for that peer.
-        try await harness.sendRelayGrant(serverSeq: "2", ofSeq: nil, side: .b, peer: peerPubkey)
+        try await harness.sendRelayGrant(serverSeq: "2", ofSeq: "2", side: .a, peer: peerPubkey)
         try await waitFor { await harness.client.relayGrantCount == 1 }
         let grant = try await fedTestWithTimeout { [peerPubkey] in try await harness.client.awaitRelayGrant(fromPeer: peerPubkey) }
-        XCTAssertEqual(grant.side, .b)
+        XCTAssertEqual(grant.side, .a)
     }
 
     // MARK: - relay_grant participates in the server_seq cursor
@@ -155,7 +153,7 @@ final class FedRendezvousRelayOpsTests: XCTestCase {
         let harness = try await RelayOpsHarness.connect(localX25519Priv: Data(repeating: 0x11, count: 32))
         defer { Task { await harness.client.disconnect() } }
 
-        try await harness.sendRelayGrant(serverSeq: "2", ofSeq: nil, side: .b, peer: peerPubkey)
+        try await harness.sendRelayGrant(serverSeq: "2", ofSeq: "2", side: .a, peer: peerPubkey)
         let grant = try await fedTestWithTimeout { [peerPubkey] in try await harness.client.awaitRelayGrant(fromPeer: peerPubkey) }
 
         // The grant's redemption TTL ends at expires_at_ms (1700000060000 in the
@@ -174,7 +172,7 @@ final class FedRendezvousRelayOpsTests: XCTestCase {
         let harness = try await RelayOpsHarness.connect(localX25519Priv: Data(repeating: 0x11, count: 32))
         defer { Task { await harness.client.disconnect() } }
 
-        try await harness.sendRelayGrant(serverSeq: "2", ofSeq: nil, side: .b, peer: peerPubkey)
+        try await harness.sendRelayGrant(serverSeq: "2", ofSeq: "2", side: .a, peer: peerPubkey)
         let grant = try await fedTestWithTimeout { [peerPubkey] in try await harness.client.awaitRelayGrant(fromPeer: peerPubkey) }
 
         // First redemption inside the TTL succeeds…

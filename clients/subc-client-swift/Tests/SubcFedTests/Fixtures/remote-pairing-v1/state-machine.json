@@ -1,0 +1,193 @@
+{
+  "prefixes": {
+    "open": [["open", "C", "D", "phone", "ios"]],
+    "bound": [["use", "open"], ["m1", "a"], ["binding", "window_phone"]],
+    "owned": [["use", "bound"], ["commit", "a", true]],
+    "nonce_sent": [["use", "owned"], ["consume", "T", "a"], ["nonce", "a"]],
+    "ready": [["use", "nonce_sent"], ["consume", "D", "a"], ["reveal", "a"]],
+    "confirmed": [["use", "ready"], ["confirm", "confirm", "current"], ["match", "match"]]
+  },
+  "ceremonies": [
+    {
+      "name": "both screens match and the committed grant reaches D",
+      "steps": [["use", "confirmed"], ["grant"], ["result", "granted"]],
+      "expect": {"message_2": 1, "claims": 1, "releases": 2, "writes": ["roster", "audit", "receipt"], "pin": true}
+    },
+    {
+      "name": "replayed message 1 holds but does not claim",
+      "steps": [["use", "open"], ["m1", "replay"], ["binding", "window_phone"], ["commit", "replay", false], ["lapse"], ["m1", "a"], ["binding", "window_phone"], ["commit", "a", true]],
+      "expect": {"message_2": 2, "claims": 1}
+    },
+    {
+      "name": "crash after durable consume and before the nonce",
+      "steps": [["use", "owned"], ["consume", "T", "a"], ["restart", "T"], ["nonce", "a"], ["m1", "b"], ["commit", "b", true]],
+      "expect": {"message_2": 1, "claims": 1, "end": "restart"}
+    },
+    {
+      "name": "D restarts after both disclosures and does not retry",
+      "steps": [["use", "ready"], ["restart", "D"], ["m1", "b"], ["commit", "b", true], ["result", "granted"]],
+      "expect": {"message_2": 1, "claims": 1, "releases": 2, "end": "restart"}
+    },
+    {
+      "name": "restart of an owned window does not reopen it",
+      "steps": [["use", "owned"], ["restart", "T"], ["m1", "b"], ["commit", "b", true]],
+      "expect": {"message_2": 1, "claims": 1, "end": "restart"}
+    },
+    {
+      "name": "duplicate D connection cannot disclose a second nonce",
+      "steps": [["use", "bound"], ["m1", "b"], ["commit", "a", true], ["commit", "b", true], ["consume", "T", "b"], ["nonce", "b"], ["consume", "T", "a"], ["nonce", "a"], ["nonce", "a"]],
+      "expect": {"message_2": 1, "claims": 1, "releases": 1}
+    },
+    {
+      "name": "the same D is opened from two computers",
+      "steps": [["use", "open"], ["open", "Other C", "D", "phone", "ios"], ["m1", "a"]],
+      "expect": {"message_2": 1, "refusals": ["fed_pairing_busy"]}
+    },
+    {
+      "name": "stale confirm, stale generation and wrong session cannot grant",
+      "steps": [["use", "ready"], ["confirm", "confirm", "wrong_hash"], ["confirm", "confirm", "old_generation"], ["confirm", "confirm", "wrong_session"], ["match", "match"], ["grant"]],
+      "expect": {"message_2": 1, "claims": 1, "releases": 2}
+    },
+    {
+      "name": "D was removed before grant",
+      "steps": [["use", "confirmed"], ["device_record", "removed"], ["grant"]],
+      "expect": {"message_2": 1, "claims": 1, "releases": 2, "refusals": ["fed_not_account_device"]}
+    },
+    {
+      "name": "D was superseded before grant",
+      "steps": [["use", "confirmed"], ["device_record", "superseded"], ["grant"]],
+      "expect": {"message_2": 1, "claims": 1, "releases": 2, "refusals": ["fed_not_account_device"]}
+    },
+    {
+      "name": "C was unpaired before grant",
+      "steps": [["use", "confirmed"], ["confirmer_record", "unpaired"], ["grant"]],
+      "expect": {"message_2": 1, "claims": 1, "releases": 2, "refusals": ["fed_not_paired"]}
+    },
+    {
+      "name": "C was reclassified before grant",
+      "steps": [["use", "confirmed"], ["confirmer_record", "app"], ["grant"]],
+      "expect": {"message_2": 1, "claims": 1, "releases": 2, "refusals": ["fed_not_paired"]}
+    },
+    {
+      "name": "C lost permission before grant",
+      "steps": [["use", "confirmed"], ["confirmer_record", "no_permission"], ["grant"]],
+      "expect": {"message_2": 1, "claims": 1, "releases": 2, "refusals": ["fed_not_allowed"]}
+    },
+    {
+      "name": "desktop record cannot open as phone",
+      "steps": [["open", "C", "D", "phone", "macos"], ["m1", "a"]],
+      "expect": {"hourly_charge": 0, "refusals": ["fed_class_not_allowed"]}
+    },
+    {
+      "name": "D refuses a binding claiming the wrong class",
+      "steps": [["use", "open"], ["m1", "a"], ["binding", "window_app"], ["commit", "a", true]],
+      "expect": {"message_2": 1, "end": "consumed_on_D", "bye": "bye_fed_class_not_allowed"}
+    },
+    {
+      "name": "T must send the binding before any other frame",
+      "steps": [["use", "open"], ["m1", "a"], ["first_t_frame", "granted"], ["binding", "window_phone"], ["commit", "a", true]],
+      "expect": {"message_2": 1, "end": "violation"}
+    },
+    {
+      "name": "D may not commit before receiving the binding",
+      "steps": [["use", "open"], ["m1", "a"], ["commit", "a", true], ["binding", "window_phone"]],
+      "expect": {"message_2": 1, "end": "violation"}
+    },
+    {
+      "name": "wrong T key in granted cannot pin even after D matched",
+      "steps": [["use", "ready"], ["match", "match"], ["result", "granted_wrong_key"]],
+      "expect": {"message_2": 1, "claims": 1, "releases": 2}
+    },
+    {
+      "name": "fake T sends granted but D has seen no C code and has not matched",
+      "steps": [["use", "ready"], ["result", "granted"]],
+      "expect": {"message_2": 1, "claims": 1, "releases": 2}
+    },
+    {
+      "name": "opening session rotation cancels an otherwise ready attempt",
+      "steps": [["use", "ready"], ["rotate"], ["confirm", "confirm", "current"], ["match", "match"], ["grant"]],
+      "expect": {"message_2": 1, "claims": 1, "releases": 2, "end": "rotation"}
+    },
+    {
+      "name": "mode 02 starts after 3 seconds; T commits and reveals, D sends the nonce",
+      "steps": [["use", "open"], ["m1", "early", 2, 2], ["m1", "r", 2, 3], ["binding", "window_phone"], ["commit", "r", true], ["consume", "D", "r"], ["nonce", "r"], ["consume", "T", "r"], ["reveal", "r"], ["confirm", "confirm", "current"], ["match", "match"], ["grant"], ["result", "granted"]],
+      "expect": {"message_2": 1, "claims": 1, "releases": 2, "owners": {"D": "r", "T": "r"}, "writes": ["roster", "audit", "receipt"], "pin": true}
+    },
+    {
+      "name": "direct message 1 authenticated in time suppresses mode 02",
+      "steps": [["use", "open"], ["m1", "a", 0, 2], ["m1", "r", 2, 3], ["binding", "window_phone", "a"], ["commit", "a", true]],
+      "expect": {"message_2": 1, "claims": 1, "owners": {"D": "a", "T": "a"}}
+    },
+    {
+      "name": "an authenticated direct leg drops the relay before claiming",
+      "steps": [["use", "open"], ["m1", "r", 2, 3], ["binding", "window_phone"], ["m1", "a", 0, 4], ["binding", "window_phone"], ["claim", "T", "r"], ["commit", "a", true]],
+      "expect": {"message_2": 2, "claims": 1, "owners": {"D": "a", "T": "a"}, "dropped": ["r"]}
+    },
+    {
+      "name": "crossed authenticated legs end without grant or hourly charge",
+      "steps": [["use", "open"], ["m1", "r", 2, 3], ["binding", "window_phone"], ["m1", "a", 0, 4], ["binding", "window_phone"], ["drop_view", "T", "a"], ["claim", "T", "r"], ["claim", "D", "a"], ["consume", "T", "r"], ["reveal", "r"], ["consume", "D", "a"], ["reveal", "a"], ["grant"]],
+      "expect": {"message_2": 2, "owners": {"D": "a", "T": "r"}, "dropped": ["r"], "end": "crossed_legs", "hourly_charge": 0}
+    },
+    {
+      "name": "a terminal decline is not revived by a late affirmative",
+      "steps": [["use", "ready"], ["confirm", "decline", "current"], ["confirm", "confirm", "current"], ["match", "match"], ["grant"]],
+      "expect": {"message_2": 1, "claims": 1, "releases": 2, "refusals": ["fed_pairing_declined"], "end": "decline"}
+    },
+    {
+      "name": "cancel before the code and ignore a late confirm",
+      "steps": [["use", "open"], ["cancel", "current"], ["confirm", "confirm", "current"], ["m1", "a"], ["grant"]],
+      "expect": {"refusals": ["fed_pairing_expired"], "end": "cancel"}
+    }
+  ],
+  "status_sessions": [
+    {"name": "saved grant and recorded local match", "receipt": "granted", "local_match": true, "requests": ["status"], "expect": ["granted", true]},
+    {"name": "saved non-grant", "receipt": "not_granted", "local_match": true, "requests": ["status"], "expect": ["not_granted", false]},
+    {"name": "mismatched transcript hash", "receipt": "granted", "local_match": true, "requests": ["status_wrong_hash"], "expect": ["not_granted", false]},
+    {"name": "unknown D", "receipt": null, "local_match": true, "requests": ["status"], "expect": ["zero_bytes", false]},
+    {"name": "extra frame in a status exchange", "receipt": "granted", "local_match": true, "requests": ["status", "match"], "expect": ["violation", false]},
+    {"name": "no recorded match cannot pin", "receipt": "granted", "local_match": false, "requests": ["status"], "expect": ["granted", false]},
+    {"name": "wrong target key cannot pin", "receipt": "granted_wrong_key", "local_match": true, "requests": ["status"], "expect": ["granted_wrong_key", false]}
+  ],
+  "receipt_lifecycle": [
+    {
+      "name": "different devices and generations do not overwrite another grant",
+      "steps": [["receipt", "A", "status", "granted", "p1", 0], ["roster", "A", "p1"], ["receipt", "A", "status_new_generation", "not_granted", null, 1], ["receipt", "B", "status", "not_granted", null, 2], ["m1", "B", 4], ["request", "B", 4, true, "status", "fixture_target"], ["m1", "A", 4], ["request", "A", 4, true, "status", "fixture_target"]],
+      "expect": ["message_2", "not_granted", "message_2", "granted"]
+    },
+    {
+      "name": "status authentication must use the saved T key, not a new registry key",
+      "steps": [["receipt", "A", "status", "granted", "p1", 0], ["roster", "A", "p1"], ["remember"], ["m1", "A", 4], ["request", "A", 4, true, "status", "replacement_target"], ["check_local"], ["m1", "A", 5], ["request", "A", 5, true, "status", "fixture_target"]],
+      "expect": ["message_2", "wrong_target", "retained", "message_2", "pinned"]
+    },
+    {
+      "name": "expired receipt cannot admit a status handshake",
+      "steps": [["receipt", "A", "status", "granted", "p1", 0], ["roster", "A", "p1"], ["m1", "A", 86400]],
+      "expect": ["zero_bytes"]
+    },
+    {
+      "name": "receipt can expire after message 2",
+      "steps": [["receipt", "A", "status", "granted", "p1", 0], ["roster", "A", "p1"], ["m1", "A", 86399], ["request", "A", 86400, true, "status", "fixture_target"]],
+      "expect": ["message_2", "not_granted"]
+    },
+    {
+      "name": "message 1 replay can hold a slot but cannot charge the authenticated rate limit",
+      "steps": [["receipt", "A", "status", "granted", "p1", 0], ["roster", "A", "p1"], ["m1", "A", 0], ["m1", "A", 1], ["request", "A", 2, false, "status", "fixture_target"], ["request", "A", 5, true, "status", "fixture_target"], ["m1", "A", 6], ["request", "A", 7, true, "status_wrong_hash", "fixture_target"], ["m1", "A", 8], ["request", "A", 9, true, "status", "fixture_target"], ["m1", "A", 66], ["request", "A", 67, true, "status", "fixture_target"]],
+      "expect": ["message_2", "zero_bytes", "unauthenticated", "request_timeout", "message_2", "not_granted", "message_2", "rate_limited", "message_2", "granted"]
+    },
+    {
+      "name": "a saved grant requires the same current roster pairing id",
+      "steps": [["receipt", "A", "status", "granted", "p1", 0], ["roster", "A", "other_pairing"], ["m1", "A", 4], ["request", "A", 4, true, "status", "fixture_target"]],
+      "expect": ["message_2", "not_granted"]
+    },
+    {
+      "name": "unpair, tombstone and re-pair each delete D's prior receipts",
+      "steps": [["receipt", "A", "status", "granted", "p1", 0], ["receipt", "A", "status_new_generation", "not_granted", null, 1], ["roster", "A", "p1"], ["unpair", "A"], ["m1", "A", 2], ["receipt", "B", "status", "granted", "p2", 0], ["roster", "B", "p2"], ["tombstone", "B"], ["m1", "B", 2], ["receipt", "C", "status", "granted", "p3", 0], ["roster", "C", "p3"], ["re_pair", "C", "p4"], ["receipt", "C", "status_new_generation", "granted", "p4", 3], ["m1", "C", 4], ["request", "C", 4, true, "status", "fixture_target"], ["m1", "C", 63], ["request", "C", 64, true, "status_new_generation", "fixture_target"]],
+      "expect": ["zero_bytes", "zero_bytes", "message_2", "not_granted", "message_2", "granted"]
+    },
+    {
+      "name": "D drops receipts at a terminal non-grant or on a new start",
+      "steps": [["remember"], ["ceremony_not_granted"], ["check_local"], ["remember"], ["ceremony_bye"], ["check_local"], ["remember"], ["start"], ["check_local"], ["remember"], ["receipt", "A", "status", "not_granted", null, 0], ["m1", "A", 1], ["request", "A", 2, true, "status", "fixture_target"], ["check_local"]],
+      "expect": ["deleted", "deleted", "deleted", "message_2", "not_granted", "deleted"]
+    }
+  ]
+}

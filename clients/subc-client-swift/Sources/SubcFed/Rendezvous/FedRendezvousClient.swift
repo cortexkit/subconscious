@@ -164,7 +164,22 @@ public actor FedRendezvousClient {
     private var grantLedger = FedRelayGrantLedger()
     private var bufferedGrants: [String: [RdvRelayGrant]] = [:]
     private var grantWaiters: [String: [CheckedContinuation<RdvRelayGrant, Error>]] = [:]
-    /// The most recent relay_grant delivered (surfaced for tests and the app).
+    private struct PairRelayWaiter {
+        let id: UUID
+        let peer: String
+        let sequence: String?
+        let continuation: CheckedContinuation<RdvRelayGrant, Error>
+    }
+    private var pairRelayWaiters: [UUID: PairRelayWaiter] = [:]
+    var pendingPairRelayWaiterCount: Int { pairRelayWaiters.count }
+    private var pairRelayOpenSequences: Set<String> = []
+    private struct PairHandshakeBudget {
+        let lastUpdate: UInt64
+        let credit: UInt64
+    }
+    private var pairHandshakeBudgets: [Data: PairHandshakeBudget] = [:]
+    private var pairHandshakesInProgress = 0
+    /// The most recent grant delivered to or buffered for an ordinary dial.
     private(set) public var lastRelayGrant: RdvRelayGrant?
     /// Count of relay_grant frames accepted off the control WS (both sides).
     private(set) public var relayGrantCount = 0
@@ -275,6 +290,12 @@ public actor FedRendezvousClient {
         let waiters = grantWaiters
         grantWaiters = [:]
         bufferedGrants = [:]
+        let pairingWaiters = pairRelayWaiters
+        pairRelayWaiters = [:]
+        pairRelayOpenSequences = []
+        for waiter in pairingWaiters.values {
+            waiter.continuation.resume(throwing: FedRendezvousError.relayGrantSessionEnded)
+        }
         for peerWaiters in waiters.values {
             for waiter in peerWaiters {
                 waiter.resume(throwing: FedRendezvousError.relayGrantSessionEnded)
@@ -440,10 +461,8 @@ public actor FedRendezvousClient {
     /// Handle a plain (unsigned) `relay_grant` control frame (§6.6). The grant
     /// carries a per-recipient `server_seq` and participates in the contiguous
     /// cursor exactly like a signed frame; because it is unsigned, a gap
-    /// quarantines by sequence alone (§4 plain-frame rule). On an in-sequence
-    /// grant the cursor advances and the grant is delivered to the dial ladder —
-    /// BOTH the opener's `of_seq`-bound copy (side a) and the target's
-    /// UNSOLICITED copy (side b), which the target must act on, never drop.
+    /// quarantines by sequence alone (§4 plain-frame rule). Every in-sequence
+    /// grant advances the cursor, even when it is refused or has no waiter.
     private func processRelayGrant(_ object: RdvJSONObject) -> ReadLoopOutcome? {
         guard let grant = try? RdvRelayGrant.decode(object) else { return nil }
         if quarantined { return nil }
@@ -482,6 +501,9 @@ public actor FedRendezvousClient {
             return .needsResync
         case .apply:
             lastRefusal = refusal
+            if let waiter = pairRelayWaiters.values.first(where: { $0.sequence == refusal.ofSeq && $0.sequence != nil }) {
+                endPairRelayWait(waiter.id, .failure(FedRemotePairingError.unavailable))
+            }
             advanceCursor()
             return nil
         }
@@ -515,12 +537,22 @@ public actor FedRendezvousClient {
         }
     }
 
-    /// Deliver an in-sequence grant: resume a waiter parked for the grant's peer,
-    /// or buffer it until the dial ladder claims it. Keyed by `peer` (the remote
-    /// pubkey the grant connects to), which is the same lookup both the opener
-    /// (side a) and the target (side b) use.
+    /// Route an in-sequence grant to a matching pairing waiter first: opener
+    /// replies must match its `of_seq`, and unsolicited side-b grants must name
+    /// its selected peer. No other side-b grant is redeemable by this dial-only
+    /// SDK. An ordinary side-a grant resumes a waiter or is buffered by peer.
     private func deliverRelayGrant(_ grant: RdvRelayGrant) {
         relayGrantCount += 1
+        if let waiter = pairRelayWaiters.values.first(where: {
+            $0.peer == grant.peer && $0.sequence == grant.ofSeq && grant.side == ($0.sequence == nil ? .b : .a)
+        }) {
+            endPairRelayWait(waiter.id, .success(grant))
+            return
+        }
+        // The SDK is dial-only. A target-opened grant has no ordinary consumer.
+        guard grant.side == .a else { return }
+        // Drop late opener replies within the retained pairing sequence window.
+        if let sequence = grant.ofSeq, pairRelayOpenSequences.contains(sequence) { return }
         lastRelayGrant = grant
         if var waiters = grantWaiters[grant.peer], !waiters.isEmpty {
             let waiter = waiters.removeFirst()
@@ -786,8 +818,8 @@ public actor FedRendezvousClient {
 
     /// Send `relay_open` toward `peerPubkey` (docs/rdv-wire.md §6.6). ONLY the
     /// lower-key initiator of the pair calls this — the dial ladder makes that
-    /// ownership decision; the higher-key peer never opens and instead redeems
-    /// the unsolicited grant via `awaitRelayGrant(fromPeer:)`. Consumes the next
+    /// ownership decision. The higher-key peer never opens. An unsolicited
+    /// side-b grant is usable only by a matching remote pairing start. Consumes the next
     /// per-session `seq`. `nonce` is 16 bytes of hex minted by the caller; a
     /// replayed open (same nonce) is refused `duplicate_rejected` server-side.
     public func relayOpen(to peerPubkey: String, nonce: String) async throws {
@@ -797,12 +829,99 @@ public actor FedRendezvousClient {
         try await stream.send(.text(try open.encode()))
     }
 
-    /// Await the next relay_grant whose `peer` is `peerPubkey` (the remote pubkey
-    /// this device connects to). Returns a buffered grant immediately if one has
-    /// already arrived; otherwise parks until the control WS delivers one. Both
-    /// the opener (side a, `of_seq`-bound) and the target (side b, unsolicited)
-    /// claim their grant through this one path. Throws
-    /// `relayGrantSessionEnded` if the session tears down before a grant lands.
+    func remotePairIdentity() -> FedRendezvousIdentity { configuration.identity }
+
+    func admitRemotePairHandshake(target: Data, now: UInt64) throws {
+        // fed-wire §3.10 “Admission, ownership and consume” imports §3.4:
+        // 6 message-1 trials/minute (burst 12), before DH, and 32 half-opens.
+        // A relay hides the source IP; use the lower-key opener named by the
+        // grant. Keep the budget here so a new pairing start cannot reset it.
+        let cost: UInt64 = 10_000_000_000
+        let burst = 12 * cost
+        guard pairHandshakesInProgress < 32 else { throw FedRemotePairingError.unavailable }
+        pairHandshakeBudgets = pairHandshakeBudgets.filter { _, budget in
+            now < budget.lastUpdate || now - budget.lastUpdate < burst
+        }
+        let previous = pairHandshakeBudgets[target]
+        let elapsed = previous.map { now >= $0.lastUpdate ? now - $0.lastUpdate : 0 } ?? 0
+        let credit = min(burst, (previous?.credit ?? burst) + min(burst, elapsed))
+        guard credit >= cost else { throw FedRemotePairingError.unavailable }
+        pairHandshakeBudgets[target] = PairHandshakeBudget(lastUpdate: now, credit: credit - cost)
+        pairHandshakesInProgress += 1
+    }
+
+    func finishRemotePairHandshake() { pairHandshakesInProgress -= 1 }
+
+    func remotePairTarget(_ key: Data) throws -> RdvRegistryRow {
+        guard state == .ready, !quarantined else { throw FedRemotePairingError.unavailable }
+        guard let row = deviceRow(forPubkey: key.lowercaseHex), row.servesFed,
+              ["macos", "windows", "linux"].contains(row.platform) else { throw FedRemotePairingError.invalidTarget }
+        return row
+    }
+
+    func remotePairRelay(
+        peer: String, openNonce: String?, clock: any FedMonotonicClock, timeout: Duration
+    ) async throws -> (FedRelayCandidate, Data) {
+        let id = UUID()
+        guard let peerKey = FedRemotePairCodec.hex(peer, count: 32),
+              let mode = try? FedRemotePairMode.relay(device: configuration.identity.x25519Key.publicKey, target: peerKey),
+              (openNonce != nil) == (mode == .deviceRelay) else { throw FedRemotePairingError.invalidTarget }
+        guard state == .ready, !quarantined, let stream,
+              !pairRelayWaiters.values.contains(where: { $0.peer == peer }) else { throw FedRemotePairingError.unavailable }
+        let open: RdvRelayOpen?
+        if let openNonce {
+            sessionSeq += 1
+            open = RdvRelayOpen(seq: String(sessionSeq), to: peer, nonce: openNonce)
+            // On each new pairing open, forget recorded sequences more than
+            // 128 client sequence numbers behind it. Reconnect clears the set.
+            pairRelayOpenSequences = pairRelayOpenSequences.filter { (UInt64($0) ?? 0) + 128 >= sessionSeq }
+            pairRelayOpenSequences.insert(String(sessionSeq))
+        } else {
+            open = nil
+        }
+        let deadline = clock.nowNanoseconds().addingReportingOverflow(fedDurationNanoseconds(timeout))
+        let timer = Task {
+            do {
+                try await clock.sleep(untilNanoseconds: deadline.overflow ? UInt64.max : deadline.partialValue)
+                endPairRelayWait(id, .failure(FedRemotePairingError.unavailable))
+            } catch { }
+        }
+        defer { timer.cancel() }
+        let grant: RdvRelayGrant = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<RdvRelayGrant, Error>) in
+                guard !Task.isCancelled else { continuation.resume(throwing: CancellationError()); return }
+                pairRelayWaiters[id] = PairRelayWaiter(id: id, peer: peer, sequence: open?.seq, continuation: continuation)
+                if let open {
+                    Task {
+                        do { try await stream.send(.text(try open.encode())) }
+                        catch { endPairRelayWait(id, .failure(error)) }
+                    }
+                }
+            }
+        } onCancel: {
+            Task { await self.endPairRelayWait(id, .failure(CancellationError())) }
+        }
+        try Task.checkCancellation()
+        let now = UInt64(Date().timeIntervalSince1970 * 1_000)
+        try redeemRelayGrant(grant, nowMs: now)
+        let identity = configuration.identity
+        let pin = configuration.signingKeyPin
+        guard let url = URL(string: grant.relayURL), let version = UInt64(identity.tokenVersion),
+              let expiry = UInt64(grant.expiresAtMs), expiry > now else { throw FedRemotePairingError.unavailable }
+        let candidate = try FedRelayCandidate(candidateID: grant.pipeID, relayURL: url,
+            pipeToken: Data(grant.pipeToken.utf8), accountID: identity.accountId, pipeID: grant.pipeID, side: grant.side,
+            tokenVersion: version, accountSigningPublicKey: pin.ed25519PublicKey.rawRepresentation, accountKeyID: pin.keyId,
+            peerBarrierTimeout: .milliseconds(Int64(min(expiry - now, 60_000))), peerBarrierDeadlineEpochMs: expiry)
+        return (candidate, identity.ed25519PrivateKey.rawRepresentation)
+    }
+
+    private func endPairRelayWait(_ id: UUID, _ result: Result<RdvRelayGrant, Error>) {
+        pairRelayWaiters.removeValue(forKey: id)?.continuation.resume(with: result)
+    }
+
+    /// Await an ordinary side-a grant for `peerPubkey`. An already buffered
+    /// grant returns immediately. Throws `relayGrantSessionEnded` if the
+    /// control session tears down before a grant arrives.
     public func awaitRelayGrant(fromPeer peerPubkey: String) async throws -> RdvRelayGrant {
         if var buffered = bufferedGrants[peerPubkey], !buffered.isEmpty {
             let grant = buffered.removeFirst()

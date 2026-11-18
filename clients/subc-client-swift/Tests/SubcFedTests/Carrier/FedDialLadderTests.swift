@@ -209,35 +209,30 @@ final class FedDialLadderTests: XCTestCase {
         XCTAssertTrue(redeemed, "establishment redeems the grant single-use")
     }
 
-    func testHigherKeyNeverOpensButRedeemsTheUnsolicitedGrant() async throws {
+    func testHigherKeyDoesNotOpenOrdinaryRelayOrRedeemSideB() async throws {
         let keys = try orderedKeypairs()
         let harness = try await RelayOpsHarness.connect(localX25519Priv: keys.higherPriv)
         defer { Task { await harness.client.disconnect() } }
 
         let ladder = FedDialLadder(rungTimeout: .seconds(5), clock: SystemFedMonotonicClock())
-        let grantTask = Task {
-            try await ladder.establishRelayGrant(
+        do {
+            _ = try await ladder.establishRelayGrant(
                 client: harness.client,
                 responderPublicKey: keys.lowerPub,
                 localPublicKey: keys.higherPub,
                 nonce: String(repeating: "cd", count: 16),
                 nowMs: 1_700_000_000_000
             )
-        }
-
-        // The higher key NEVER sends relay_open. The server pushes the unsolicited
-        // side-b grant (no of_seq) and the target MUST act on it.
+            XCTFail("a dial-only device does not redeem an unsolicited ordinary relay")
+        } catch { XCTAssertEqual(error as? FedFailure, .notDialOwner) }
         try await harness.sendRelayGrant(serverSeq: "2", ofSeq: nil, side: .b, peer: keys.lowerPub.lowercaseHex)
-        let grant = try await fedTestWithTimeout { try await grantTask.value }
-        XCTAssertEqual(grant.side, .b)
-        XCTAssertFalse(grant.isOpenerGrant, "the target's grant is unsolicited (no of_seq)")
 
         // Prove no relay_open crossed the wire: the only client frame after hello
         // is absent — the server inbox has nothing further queued.
         let sawOpen = await harness.hasPendingRelayOpen()
         XCTAssertFalse(sawOpen, "the higher key must not send relay_open")
-        let redeemed = await harness.client.isGrantRedeemed(pipeID: grant.pipeID)
-        XCTAssertTrue(redeemed)
+        let redeemed = await harness.client.isGrantRedeemed(pipeID: "01HZPIPEPIPEPIPEPIPEPIPEPI")
+        XCTAssertFalse(redeemed)
     }
 }
 

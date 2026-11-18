@@ -6,6 +6,11 @@ public protocol FedNoiseMessageCarrier: Sendable {
     func close() async
 }
 
+protocol FedBufferedNoiseMessageCarrier: FedNoiseMessageCarrier {
+    /// Only records already decoded by the carrier; never performs a read.
+    func takeBufferedNoiseMessage() async -> Data?
+}
+
 struct FedNoiseTransportMaterial: Sendable {
     let sendKey: Data
     let receiveKey: Data
@@ -78,6 +83,10 @@ public actor FedNoiseRecordSession {
     /// method closes the carrier and throws: the partial frame cannot continue on a
     /// replacement session because the peer's frame assembler would reject it.
     public func sendTransportPayload(_ plaintext: Data) async throws {
+        try await sendTransportPayload(plaintext, didWrite: {})
+    }
+
+    func sendTransportPayload(_ plaintext: Data, didWrite: @Sendable () -> Void) async throws {
         guard !closed else { throw FedNoiseError.transportClosed }
         if sending {
             try await withCheckedThrowingContinuation { sendWaiters.append($0) }
@@ -123,12 +132,36 @@ public actor FedNoiseRecordSession {
                 }
             }
         }
+        didWrite()
     }
 
     /// Authentication is deliberately completed before invoking the parser. A
     /// failed tag, stale nonce, or replay therefore contributes zero bytes to
     /// fed framing or application parsing.
     public func receiveTransportPayload() async throws -> Data {
+        try await receiveTransportPayload(observing: { _ in () }).0
+    }
+
+    func takeBufferedTransportPayload() async throws -> Data? {
+        guard !closed, !receiving, let buffered = carrier as? any FedBufferedNoiseMessageCarrier else { return nil }
+        receiving = true
+        defer {
+            if !receiveWaiters.isEmpty { receiveWaiters.removeFirst().resume() }
+            else { receiving = false }
+        }
+        do {
+            guard let ciphertext = await buffered.takeBufferedNoiseMessage() else { return nil }
+            guard !closed else { throw FedNoiseError.transportClosed }
+            let plaintext = try transport.decrypt(ciphertext)
+            if transport.isClosed { await close() }
+            return plaintext
+        } catch {
+            await close()
+            throw error
+        }
+    }
+
+    func receiveTransportPayload<State: Sendable>(observing read: @Sendable (Data) -> State) async throws -> (Data, State) {
         guard !closed else { throw FedNoiseError.transportClosed }
         if receiving {
             try await withCheckedThrowingContinuation { receiveWaiters.append($0) }
@@ -146,10 +179,11 @@ public actor FedNoiseRecordSession {
             try Task.checkCancellation()
             guard !closed else { throw FedNoiseError.transportClosed }
             let plaintext = try transport.decrypt(ciphertext)
+            let state = read(plaintext)
             if transport.isClosed {
                 await close()
             }
-            return plaintext
+            return (plaintext, state)
         } catch {
             await close()
             throw error
@@ -242,6 +276,6 @@ private final class FedNoiseTransport {
     }
 }
 
-extension FedTCPRecordCarrier: FedNoiseMessageCarrier {}
+extension FedTCPRecordCarrier: FedBufferedNoiseMessageCarrier {}
 extension FedWebSocketRecordCarrier: FedNoiseMessageCarrier {}
 extension FedRelayRecordCarrier: FedNoiseMessageCarrier {}

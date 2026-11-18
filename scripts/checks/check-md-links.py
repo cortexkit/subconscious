@@ -22,6 +22,15 @@ import re
 import subprocess
 import sys
 
+# Byte-identical copies of another repository's test data, pinned by their own
+# SHA256SUMS. Their relative links point into the source repository, and editing
+# them would break the checksum, so they are not scanned. Each entry names the
+# source; add one only for a vendored copy, never to silence a broken link.
+VENDORED = {
+    "clients/subc-client-swift/Tests/SubcFedTests/Fixtures/remote-pairing-v1/README.md":
+        "callosum test-vectors/remote-pairing-v1 (tag remote-pairing-vectors-v1.0)",
+}
+
 INLINE = re.compile(r"!?\[(?:[^\[\]]|\[[^\]]*\])*\]\(\s*<?([^)\s>]+)>?(?:\s+\"[^\"]*\")?\s*\)")
 REFDEF = re.compile(r"^\s{0,3}\[[^\]]+\]:\s*<?(\S+?)>?(?:\s+.*)?$")
 HTML = re.compile(r"""(?:href|src)\s*=\s*["']([^"']+)["']""")
@@ -65,7 +74,7 @@ def main(argv):
     root = subprocess.run(
         ["git", "rev-parse", "--show-toplevel"], check=True, capture_output=True, text=True
     ).stdout.strip()
-    files = argv[1:] or tracked_markdown(root)
+    files = argv[1:] or [f for f in tracked_markdown(root) if f not in VENDORED]
     broken = []
     checked = 0
     for rel in files:

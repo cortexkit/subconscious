@@ -284,6 +284,15 @@ public enum FedFrameCodec {
         negotiationComplete: Bool = true,
         negotiatedFeatures: Set<String> = []
     ) throws -> Data {
+        try encode(headerData: headerData, body: body, negotiatedMaximumBodyLength: negotiatedMaximumBodyLength,
+                   negotiationComplete: negotiationComplete, negotiatedFeatures: negotiatedFeatures, headerPolicy: nil)
+    }
+
+    static func encode(
+        headerData: Data, body: Data = Data(), negotiatedMaximumBodyLength: UInt32,
+        negotiationComplete: Bool = false, negotiatedFeatures: Set<String> = [],
+        headerPolicy: FedFrameHeaderPolicy?
+    ) throws -> Data {
         let header: FedJSONObject
         do {
             header = try FedJSONObject(jsonData: headerData)
@@ -291,12 +300,12 @@ public enum FedFrameCodec {
             throw FedFrameError.invalidHeader(error)
         }
         guard let type = header.typeName else { throw FedFrameError.missingType }
-        try validateHeader(
-            header,
-            type: type,
-            negotiationComplete: negotiationComplete,
-            negotiatedFeatures: negotiatedFeatures
-        )
+        if let headerPolicy {
+            try headerPolicy.validate(header, type, headerData.count, true)
+        } else {
+            try validateHeader(header, type: type, negotiationComplete: negotiationComplete,
+                               negotiatedFeatures: negotiatedFeatures)
+        }
         guard headerData.count <= Int(maximumHeaderLength) else {
             throw FedFrameError.headerTooLarge(
                 declared: UInt32(min(headerData.count, Int(UInt32.max))),
@@ -407,6 +416,9 @@ public enum FedFrameCodec {
         negotiationComplete: Bool,
         negotiatedFeatures: Set<String>
     ) throws {
+        guard !FedRemotePairCodec.standaloneTypes.contains(type) else {
+            throw FedFrameError.invalidHeaderField(type: type, field: "type")
+        }
         if FedShareCodec.frameTypes.contains(type) {
             try FedShareCodec.validateHeader(header, type: type, complete: negotiationComplete, features: negotiatedFeatures)
             return
@@ -733,6 +745,13 @@ public enum FedFrameCodec {
     }
 }
 
+/// Policy for a standalone session that does not negotiate ordinary frame types.
+struct FedFrameHeaderPolicy: Sendable {
+    let maximumLength: UInt32
+    let firstFrameMaximumLength: UInt32?
+    let validate: @Sendable (FedJSONObject, String, Int, Bool) throws -> Void
+}
+
 /// Incremental parser for the logical decrypted fed byte stream. It only
 /// allocates a header after the bounded header length is known, and only
 /// allocates a body after both the negotiated and catalog-specific caps pass.
@@ -760,6 +779,8 @@ public struct FedFrameStreamDecoder: Sendable {
     private var discardBody = false
     // Specialized sessions can reject foreign frames before buffering a body.
     var allowedFrameTypes: Set<String>?
+    var headerPolicy: FedFrameHeaderPolicy?
+    private var isFirstFrame = true
 
     public init(
         negotiatedMaximumBodyLength: UInt32 = FedFrameCodec.defaultMaximumBodyLength,
@@ -808,10 +829,12 @@ public struct FedFrameStreamDecoder: Sendable {
                 if fourBytePrefix.count == 4 {
                     let declared = readUInt32(fourBytePrefix)
                     fourBytePrefix.removeAll(keepingCapacity: true)
-                    guard declared <= FedFrameCodec.maximumHeaderLength else {
+                    let maximum = (isFirstFrame ? headerPolicy?.firstFrameMaximumLength : nil)
+                        ?? headerPolicy?.maximumLength ?? FedFrameCodec.maximumHeaderLength
+                    guard declared <= maximum else {
                         throw FedFrameError.headerTooLarge(
                             declared: declared,
-                            maximum: FedFrameCodec.maximumHeaderLength
+                            maximum: maximum
                         )
                     }
                     guard declared > 0 else { throw FedFrameError.invalidHeader(.invalidSyntax) }
@@ -834,12 +857,12 @@ public struct FedFrameStreamDecoder: Sendable {
                     if let allowedFrameTypes, !allowedFrameTypes.contains(type) {
                         throw FedFrameError.invalidHeaderField(type: type, field: "type")
                     }
-                    try FedFrameCodec.validateHeader(
-                        header,
-                        type: type,
-                        negotiationComplete: negotiationComplete,
-                        negotiatedFeatures: negotiatedFeatures
-                    )
+                    if let headerPolicy {
+                        try headerPolicy.validate(header, type, headerLength, isFirstFrame)
+                    } else {
+                        try FedFrameCodec.validateHeader(header, type: type, negotiationComplete: negotiationComplete,
+                                                         negotiatedFeatures: negotiatedFeatures)
+                    }
                     currentHeader = header
                     currentType = type
                     bodyLimit = FedFrameCodec.effectiveBodyLimit(
@@ -884,7 +907,7 @@ public struct FedFrameStreamDecoder: Sendable {
                     }
                     try validateDeclaredBody(declared, type: type, header: header)
                     bodyLength = Int(declared)
-                    discardBody = FedFrameType(rawValue: type) == nil
+                    discardBody = headerPolicy == nil && FedFrameType(rawValue: type) == nil
                         && !FedEffectsV2Codec.frameTypes.contains(type)
                         && !FedSubscriptionCodec.frameTypes.contains(type)
                         && !FedShareCodec.frameTypes.contains(type)
@@ -925,6 +948,7 @@ public struct FedFrameStreamDecoder: Sendable {
     }
 
     private mutating func completeBody(_ frames: inout [FedFrame]) throws {
+        isFirstFrame = false
         guard let header = currentHeader, let type = currentType else {
             throw FedFrameError.invalidSyntaxInvariant
         }

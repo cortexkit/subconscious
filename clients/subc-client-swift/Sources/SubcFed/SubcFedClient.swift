@@ -76,8 +76,14 @@ public actor SubcFedClient {
     private let dialFactory: any FedCandidateDialFactory
     private let pairingDialFactory: FedNetworkDialFactory
     private let appAttestProvider: (any FedAppAttestProvider)?
+    private let remotePairingStore: any FedRemotePairingStore
     private var pairingGeneration: UInt64 = 0
     private var pendingPairing: FedPendingPairing?
+    private var remotePairingAttempt: FedRemotePairAttempt?
+    private var remotePairingPending: FedPendingRemotePairing?
+    private var remotePairingStatusID: UUID?
+    private var remotePairingStatusWire: FedRemotePairWire?
+    private var pairingRetirement: Task<Void, Never>?
     private var defaultManagementTarget: FedManagementTarget?
     /// The single authority for whether this client observed its state document
     /// minted fresh. Do not re-derive this from a later snapshot or revision:
@@ -205,6 +211,26 @@ public actor SubcFedClient {
         pairingDialFactory: FedNetworkDialFactory = FedNetworkDialFactory(),
         appAttestProvider: (any FedAppAttestProvider)? = nil
     ) {
+        self.init(profile: profile, dialPolicy: dialPolicy, keyStore: keyStore, stateStore: stateStore,
+                  observedNetwork: observedNetwork, managementTarget: managementTarget, clock: clock,
+                  entropy: entropy, dialFactory: dialFactory, pairingDialFactory: pairingDialFactory,
+                  appAttestProvider: appAttestProvider, remotePairingStore: FedKeychainRemotePairingStore())
+    }
+
+    init(
+        profile: FedPeerProfile,
+        dialPolicy: FedDialPolicy = FedDialPolicy(),
+        keyStore: any FedPrivateKeyStore,
+        stateStore: any FedStateStore,
+        observedNetwork: @escaping ObservedNetworkProvider,
+        managementTarget: FedManagementTarget? = nil,
+        clock: any FedMonotonicClock = SystemFedMonotonicClock(),
+        entropy: any FedNoiseEntropy = SystemFedNoiseEntropy(),
+        dialFactory: any FedCandidateDialFactory = FedUnimplementedDialFactory(),
+        pairingDialFactory: FedNetworkDialFactory = FedNetworkDialFactory(),
+        appAttestProvider: (any FedAppAttestProvider)? = nil,
+        remotePairingStore: any FedRemotePairingStore
+    ) {
         self.activeProfile = profile
         self.dialPolicy = dialPolicy
         self.keyStore = keyStore
@@ -216,6 +242,7 @@ public actor SubcFedClient {
         self.dialFactory = dialFactory
         self.pairingDialFactory = pairingDialFactory
         self.appAttestProvider = appAttestProvider
+        self.remotePairingStore = remotePairingStore
     }
 
     deinit {
@@ -277,11 +304,7 @@ public actor SubcFedClient {
     public func pair(qr: FedPairingQR, resultTimeout: Duration = .seconds(130)) async throws -> FedPendingPairing {
         try await checkStateStoreLifetime()
         let resultTimeout = max(resultTimeout, .seconds(130))
-        pairingGeneration &+= 1
-        let generation = pairingGeneration
-        let previous = pendingPairing
-        pendingPairing = nil
-        await previous?.cancel()
+        let generation = await supersedePairing()
         guard pairingGeneration == generation else { throw FedFailure.cancelled }
         guard Double(qr.expiryUnix) > Date().timeIntervalSince1970 else { throw FedPairingQR.Refusal.pastExpiry }
         let key = try await keyStore.staticPrivateKey()
@@ -333,10 +356,163 @@ public actor SubcFedClient {
     }
 
     public func cancelPairing() async {
+        _ = await supersedePairing()
+    }
+
+    private func supersedePairing() async -> UInt64 {
         pairingGeneration &+= 1
+        let generation = pairingGeneration
         let pending = pendingPairing
+        let remoteAttempt = remotePairingAttempt
+        let remotePending = remotePairingPending
+        let statusWire = remotePairingStatusWire
         pendingPairing = nil
-        await pending?.cancel()
+        remotePairingAttempt = nil
+        remotePairingPending = nil
+        remotePairingStatusID = nil
+        remotePairingStatusWire = nil
+        let previous = pairingRetirement
+        let retirement = Task {
+            await previous?.value
+            await remotePending?.cancel()
+            await remoteAttempt?.cancel()
+            await statusWire?.close()
+            await pending?.cancel()
+        }
+        pairingRetirement = retirement
+        await retirement.value
+        if pairingGeneration == generation { pairingRetirement = nil }
+        return generation
+    }
+
+    /// Starts a new ceremony with the selected key from the signed account
+    /// device list. The carrier resolves fresh candidates from the same mirror.
+    /// Starting over deletes any old lookup receipt, without querying its status.
+    public func pair(remote target: RdvRegistryRow, rendezvous: FedRendezvousClient,
+                     deviceClass: FedRemotePairingClass = .phone) async throws -> FedPendingRemotePairing {
+        let generation = await supersedePairing()
+        let (key, scope) = try await remotePairIdentity(rendezvous)
+        try checkRemotePairGeneration(generation)
+        try remotePairingStore.replace(scope: scope, record: nil)
+        guard let targetKey = FedRemotePairCodec.hex(target.x25519PubkeyHex, count: 32), targetKey != key.publicKey else {
+            throw FedRemotePairingError.invalidTarget
+        }
+        let dial = try await remotePairDial(key: key, target: targetKey, rendezvous: rendezvous)
+        try checkRemotePairGeneration(generation)
+        let attempt = FedRemotePairAttempt(targetKey: targetKey, store: remotePairingStore, scope: scope)
+        remotePairingAttempt = attempt
+        let provider = appAttestProvider
+        do {
+            let pending = try await withTaskCancellationHandler {
+                try await FedStageDeadlineRunner(clock: clock).run(stage: .fedNegotiation, duration: .seconds(120)) {
+                    try await attempt.run(dial: dial, deviceClass: deviceClass, provider: provider, resultTimeout: .seconds(120))
+                }
+            } onCancel: {
+                Task { await attempt.cancel() }
+            }
+            do { try checkRemotePairGeneration(generation) }
+            catch { await pending.cancel(); throw error }
+            remotePairingPending = pending
+            return pending
+        } catch {
+            await attempt.cancel()
+            if pairingGeneration == generation { remotePairingAttempt = nil }
+            if error is FedDeadlineError { throw FedRemotePairingError.unavailable }
+            throw error
+        }
+    }
+
+    /// Whether there is a saved positive match whose result can be checked.
+    public func hasRemotePairingReceipt(rendezvous: FedRendezvousClient) async throws -> Bool {
+        if let remotePairingPending, !(await remotePairingPending.canCheckStatus) { return false }
+        let (_, scope) = try await remotePairIdentity(rendezvous)
+        return try FedRemotePairReceipt.load(remotePairingStore.load(scope: scope)) != nil
+    }
+
+    /// Looks up only the saved receipt, using its authenticated T key. Never
+    /// starts a new pairing or changes the active profile.
+    public func remotePairingStatus(rendezvous: FedRendezvousClient) async throws -> FedRemotePairingOutcome {
+        guard remotePairingStatusID == nil else { throw FedRemotePairingError.statusUnavailable }
+        let operation = UUID()
+        let generation = pairingGeneration
+        remotePairingStatusID = operation
+        defer {
+            if remotePairingStatusID == operation {
+                remotePairingStatusID = nil
+                remotePairingStatusWire = nil
+            }
+        }
+        if let remotePairingPending, !(await remotePairingPending.canCheckStatus) {
+            throw FedRemotePairingError.noReceipt
+        }
+        let (key, scope) = try await remotePairIdentity(rendezvous)
+        try checkRemotePairGeneration(generation)
+        guard let receipt = try FedRemotePairReceipt.load(remotePairingStore.load(scope: scope)) else {
+            throw FedRemotePairingError.noReceipt
+        }
+        let dial: FedRemotePairDial
+        let link: FedRemotePairLink
+        do {
+            dial = try await remotePairDial(key: key, target: receipt.targetKey, rendezvous: rendezvous)
+            try checkRemotePairGeneration(generation)
+            if let direct = try await dial.direct(status: true) { link = direct }
+            else { link = try await dial.relay(status: true) }
+        } catch {
+            try checkRemotePairGeneration(generation)
+            throw FedRemotePairingError.statusUnavailable
+        }
+        do {
+            try checkRemotePairGeneration(generation)
+            remotePairingStatusWire = link.wire
+            let frame = try await FedStageDeadlineRunner(clock: clock).run(stage: .fedNegotiation, duration: .seconds(5)) {
+                try await link.wire.send(receipt.request)
+                let frame = try await link.wire.receive()
+                try await link.wire.requireNoBufferedInput()
+                return frame
+            }
+            let grantedKey = try FedPendingRemotePairing.grantedKey(frame)
+            await link.wire.close()
+            try checkRemotePairGeneration(generation)
+            // A later start or terminal ceremony may have replaced this record
+            // while the separate status link was in flight.
+            guard try FedRemotePairReceipt.load(remotePairingStore.load(scope: scope)) == receipt else {
+                throw FedRemotePairingError.noReceipt
+            }
+            if let grantedKey {
+                guard receipt.matched, grantedKey == receipt.targetKey, grantedKey == link.authenticatedTarget else {
+                    throw FedRemotePairingError.wrongTargetKey
+                }
+                try remotePairingStore.replace(scope: scope, record: nil)
+                return .granted(dial.target.remotePairGrant(grantedKey))
+            }
+            try remotePairingStore.replace(scope: scope, record: nil)
+            return .notGranted
+        } catch {
+            await link.wire.close()
+            if let error = error as? FedRemotePairingError { throw error }
+            try checkRemotePairGeneration(generation)
+            throw FedRemotePairingError.statusUnavailable
+        }
+    }
+
+    private func checkRemotePairGeneration(_ generation: UInt64) throws {
+        guard pairingGeneration == generation, !Task.isCancelled else { throw FedRemotePairingError.cancelled }
+    }
+
+    private func remotePairIdentity(_ rendezvous: FedRendezvousClient) async throws -> (FedNoiseKeyPair, String) {
+        let identity = await rendezvous.remotePairIdentity()
+        let key = try FedNoiseKeyPair(privateKey: await keyStore.staticPrivateKey())
+        guard !identity.accountId.isEmpty, key.publicKey == identity.x25519Key.publicKey else {
+            throw FedRemotePairingError.invalidTarget
+        }
+        return (key, "\(identity.accountId):\(key.publicKey.lowercaseHex)")
+    }
+
+    private func remotePairDial(key: FedNoiseKeyPair, target: Data, rendezvous: FedRendezvousClient) async throws -> FedRemotePairDial {
+        let row = try await rendezvous.remotePairTarget(target)
+        return FedRemotePairDial(factory: pairingDialFactory, rendezvous: rendezvous, staticKey: key, targetKey: target,
+                               target: row, clock: clock, policy: dialPolicy, entropy: entropy,
+                               observedNetwork: await observedNetworkProvider())
     }
 
     /// Sends one pairing attestation frame when a provider is configured.

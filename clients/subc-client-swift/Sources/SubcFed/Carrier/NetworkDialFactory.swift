@@ -126,14 +126,19 @@ public struct FedNetworkDialFactory: FedCandidateDialFactory {
             staticKey: staticKey, responderStatic: qr.computerStaticPublicKey,
             psk: FedPairingCrypto.derivePSK(secret: qr.secret, computerStaticPublicKey: qr.computerStaticPublicKey)
         )
-        let connect = self.connect
-        let carrier = try await FedTCPRecordCarrier.establish(clock: clock, timeout: policy.carrierConnect) {
-            try await connect(hint.ipv4, hint.port)
-        }
+        let carrier = try await openPairingTCP(host: hint.ipv4, port: hint.port, clock: clock, policy: policy)
         let session = try await initiator.establish(
             on: carrier, clock: clock, timeout: policy.noiseHandshake, entropy: entropy
         )
         return (session, initiator.handshakeHash)
+    }
+
+    func openPairingTCP(host: String, port: UInt16, clock: any FedMonotonicClock,
+                        policy: FedDialPolicy) async throws -> FedTCPRecordCarrier {
+        let connect = self.connect
+        return try await FedTCPRecordCarrier.establish(clock: clock, timeout: policy.carrierConnect) {
+            try await connect(host, port)
+        }
     }
 
     private func dialDirect(host: String, port: UInt16, context: FedDialAttemptContext) async throws -> FedDialedSession {
@@ -163,6 +168,18 @@ public struct FedNetworkDialFactory: FedCandidateDialFactory {
         guard let companionKey = context.companionSigningPrivateKey else {
             throw FedFailure.invalidProfile(field: "companionSigningPrivateKey")
         }
+        let carrier = try await openPairingRelay(relay, staticKey: staticKey, companionKey: companionKey,
+                                                clock: context.clock, progress: context.progress)
+
+        let initiator = try FedNoiseIKInitiator(
+            staticKey: staticKey,
+            pinnedResponderStatic: context.responderStaticPublicKey
+        )
+        return try await finishHandshake(initiator: initiator, carrier: carrier, context: context)
+    }
+
+    func openPairingRelay(_ relay: FedRelayCandidate, staticKey: FedNoiseKeyPair, companionKey: Data,
+                          clock: any FedMonotonicClock, progress: FedDialProgress? = nil) async throws -> FedRelayRecordCarrier {
         let material = try FedRelayMaterial(
             relayURL: relay.relayURL,
             pipeToken: relay.pipeToken,
@@ -178,20 +195,14 @@ public struct FedNetworkDialFactory: FedCandidateDialFactory {
         // establish() upgrades the pipe (webSocketUpgrade deadline) then runs the
         // relay_challenge → relay_hello → relay_ready PoP barrier (relayAuthentication
         // deadline); on any failure it closes the carrier and rethrows classified.
-        let carrier = try await FedRelayRecordCarrier.establish(
+        return try await FedRelayRecordCarrier.establish(
             material: material,
-            clock: context.clock,
+            clock: clock,
             barrierTimeout: relay.peerBarrierTimeout,
             barrierDeadlineEpochMs: relay.peerBarrierDeadlineEpochMs,
-            progress: context.progress,
+            progress: progress,
             upgrade: { try await upgrade(relay) }
         )
-
-        let initiator = try FedNoiseIKInitiator(
-            staticKey: staticKey,
-            pinnedResponderStatic: context.responderStaticPublicKey
-        )
-        return try await finishHandshake(initiator: initiator, carrier: carrier, context: context)
     }
 
     // MARK: - Shared Noise + session wiring

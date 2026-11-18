@@ -48,7 +48,7 @@ public final class FedFixedNoiseEntropy: FedNoiseEntropy, @unchecked Sendable {
     }
 }
 
-public struct FedNoiseKeyPair: Equatable {
+public struct FedNoiseKeyPair: Equatable, Sendable {
     let privateKey: Curve25519.KeyAgreement.PrivateKey
 
     public static func == (lhs: FedNoiseKeyPair, rhs: FedNoiseKeyPair) -> Bool {
@@ -272,8 +272,8 @@ public final class FedNoiseIKInitiator {
     }
 }
 
-/// A minimal responder exists for deterministic conformance tests. Production
-/// SubcFed only constructs the initiator role; no listener is exposed by it.
+/// IK responder, also used when the selected computer opens a remote-pair relay.
+/// SubcFed does not expose an inbound socket listener.
 public final class FedNoiseIKResponder {
     private let staticKey: FedNoiseKeyPair
     private let expectedInitiatorStatic: Data?
@@ -310,41 +310,10 @@ public final class FedNoiseIKResponder {
     public var isComplete: Bool { handshakeComplete }
 
     public func readMessage1(_ message: Data) throws -> Data {
-        guard !handshakeComplete, message.count == 96 else { throw FedNoiseError.invalidMessage }
-        let start = message.startIndex
-        let initiatorEphemeral = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: Data(message.prefix(32)))
-        let initiatorEphemeralBytes = initiatorEphemeral.rawRepresentation
-        self.initiatorEphemeral = initiatorEphemeralBytes
-        symmetric.mixHash(initiatorEphemeralBytes)
-        symmetric.mixKey(try dh(staticKey.privateKey, initiatorEphemeralBytes))
-
-        let encryptedStatic = Data(message[(start + 32)..<(start + 80)])
-        let initiatorStatic = try symmetric.decryptAndHash(encryptedStatic)
-        guard initiatorStatic.count == 32 else { throw FedNoiseError.invalidMessage }
-        if let expectedInitiatorStatic, expectedInitiatorStatic != initiatorStatic {
-            throw FedNoiseError.pinnedResponderKeyMismatch
-        }
-        self.initiatorStatic = initiatorStatic
-
-        symmetric.mixKey(try dh(staticKey.privateKey, initiatorStatic))
-        let payload = try symmetric.decryptAndHash(Data(message[(start + 80)..<(start + 96)]))
-        guard payload.isEmpty else { throw FedNoiseError.invalidHandshakePayload }
-
-        let ephemeral = try FedNoiseKeyPair.generate(using: SystemFedNoiseEntropy())
-        ephemeralKey = ephemeral
-        var response = Data()
-        response.append(ephemeral.publicKey)
-        symmetric.mixHash(ephemeral.publicKey)
-        symmetric.mixKey(try dh(ephemeral.privateKey, initiatorEphemeralBytes))
-        symmetric.mixKey(try dh(ephemeral.privateKey, initiatorStatic))
-        response.append(try symmetric.encryptAndHash(Data()))
-
-        handshakeComplete = true
-        return response
+        try readMessage1(message, using: SystemFedNoiseEntropy())
     }
 
     public func readMessage1(_ message: Data, using entropy: any FedNoiseEntropy) throws -> Data {
-        // This overload gives test responders deterministic ephemeral output.
         guard !handshakeComplete, message.count == 96 else { throw FedNoiseError.invalidMessage }
         let start = message.startIndex
         let initiatorEphemeral = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: Data(message.prefix(32)))
@@ -354,15 +323,14 @@ public final class FedNoiseIKResponder {
         symmetric.mixKey(try dh(staticKey.privateKey, initiatorEphemeralBytes))
         let initiatorStatic = try symmetric.decryptAndHash(Data(message[(start + 32)..<(start + 80)]))
         guard initiatorStatic.count == 32 else { throw FedNoiseError.invalidMessage }
-        if let expectedInitiatorStatic, expectedInitiatorStatic != initiatorStatic {
-            throw FedNoiseError.pinnedResponderKeyMismatch
-        }
-        self.initiatorStatic = initiatorStatic
         symmetric.mixKey(try dh(staticKey.privateKey, initiatorStatic))
         guard try symmetric.decryptAndHash(Data(message[(start + 80)..<(start + 96)])).isEmpty else {
             throw FedNoiseError.invalidHandshakePayload
         }
-
+        if let expectedInitiatorStatic, expectedInitiatorStatic != initiatorStatic {
+            throw FedNoiseError.pinnedResponderKeyMismatch
+        }
+        self.initiatorStatic = initiatorStatic
         let ephemeral = try FedNoiseKeyPair.generate(using: entropy)
         ephemeralKey = ephemeral
         var response = Data()
@@ -373,6 +341,16 @@ public final class FedNoiseIKResponder {
         response.append(try symmetric.encryptAndHash(Data()))
         handshakeComplete = true
         return response
+    }
+
+    func makeHandshakeResult() throws -> FedNoiseHandshakeResult {
+        guard handshakeComplete else { throw FedNoiseError.handshakeState }
+        // A second handoff would reuse both transport nonces from zero.
+        guard ephemeralKey != nil else { throw FedNoiseError.transportClosed }
+        ephemeralKey = nil
+        let split = symmetric.split()
+        return FedNoiseHandshakeResult(sendKey: split.responderToInitiator, receiveKey: split.initiatorToResponder,
+                                       handshakeHash: handshakeHash)
     }
 
     private func dh(_ privateKey: Curve25519.KeyAgreement.PrivateKey, _ publicKeyBytes: Data) throws -> Data {

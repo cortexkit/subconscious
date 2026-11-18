@@ -43,8 +43,8 @@ public enum FedDialLadderError: Error, Sendable, Equatable {
 /// logic is testable deterministically without live sockets. Dial ownership is
 /// the canon from §6.5: direct rungs keep the conservative lower-key single-
 /// dialer rule (no glare arbitration exists), and relay-pipe establishment is
-/// reserved to the lower-key initiator — the higher-key peer never sends
-/// `relay_open` but MUST redeem the unsolicited grant the server pushes to it.
+/// reserved to the lower-key initiator. SubcFed is dial-only: an unsolicited
+/// side-b grant is reserved for a pending remote pairing, not an ordinary dial.
 public struct FedDialLadder: Sendable {
     /// Per-rung deadline. A rung that does not connect within it is abandoned and
     /// the ladder falls through to the next rung.
@@ -128,11 +128,9 @@ public struct FedDialLadder: Sendable {
     // MARK: - Relay grant establishment (dial-ownership branch over the control WS)
 
     /// Establish the relay grant for `responderPublicKey` over the control WS,
-    /// honoring dial ownership. The LOWER key opens — it sends `relay_open` and
-    /// then claims its `of_seq`-bound side-a grant. The HIGHER key NEVER sends
-    /// `relay_open`; it claims the UNSOLICITED side-b grant the server pushes and
-    /// acts on it (dials the pipe). Both paths redeem the grant single-use and
-    /// return it ready to build relay material from.
+    /// honoring dial ownership. The lower key opens, then claims and redeems
+    /// its side-a grant. A dial-only client cannot wait for an ordinary side-b
+    /// grant; the rendezvous client reserves this for remote pairing.
     public func establishRelayGrant(
         client: FedRendezvousClient,
         responderPublicKey: Data,
@@ -141,9 +139,10 @@ public struct FedDialLadder: Sendable {
         nowMs: UInt64
     ) async throws -> RdvRelayGrant {
         let peerPubkey = responderPublicKey.lowercaseHex
-        if Self.relayInitiatesOpen(localPublicKey: localPublicKey, responderPublicKey: responderPublicKey) {
-            try await client.relayOpen(to: peerPubkey, nonce: nonce)
+        guard Self.relayInitiatesOpen(localPublicKey: localPublicKey, responderPublicKey: responderPublicKey) else {
+            throw FedFailure.notDialOwner
         }
+        try await client.relayOpen(to: peerPubkey, nonce: nonce)
         let grant = try await client.awaitRelayGrant(fromPeer: peerPubkey)
         try await client.redeemRelayGrant(grant, nowMs: nowMs)
         return grant

@@ -372,6 +372,7 @@ struct SupervisorRescanContext {
     /// names the state a `supervisor.rescan_checked` preview was computed
     /// against.
     generation: Arc<std::sync::atomic::AtomicU64>,
+    rescan_lock: Arc<tokio::sync::Mutex<()>>,
     module_entries: Arc<Mutex<rescan_checked::ModuleEntries>>,
 }
 
@@ -1593,6 +1594,7 @@ impl ControlHandler {
             federated_scope_owner: self.federated_scope_owner.clone(),
             privileged_operator_prompt: self.privileged_operator_prompt,
             generation: Arc::default(),
+            rescan_lock: Arc::default(),
             module_entries: Arc::default(),
         });
         self
@@ -8361,21 +8363,6 @@ impl ControlHandler {
         requester: Principal,
     ) -> Result<Vec<Frame>, RouterError> {
         let preview = mode.previews();
-        let mut approved_preview = None;
-        if matches!(mode, RescanMode::Preview) {
-            if let Some(owner) = &self.config_runtime {
-                match owner
-                    .on_blocking(|owner| {
-                        owner.observe_file_proposal()?;
-                        owner.approved_daemon_configuration()
-                    })
-                    .await
-                {
-                    Ok(config) => approved_preview = config,
-                    Err(error) => return Ok(vec![config_gate::config_error_frame(&frame, error)?]),
-                }
-            }
-        }
         let Some(context) = self.rescan.clone() else {
             return Ok(vec![control_error_frame(
                 &frame,
@@ -8384,14 +8371,14 @@ impl ControlHandler {
             )?]);
         };
 
-        let operation_lock = self.supervisor.operation_lock();
-        let _operation_guard = operation_lock.lock().await;
-        // Loaded under the operation lock, so no other rescan can change the
-        // staged configuration between a checked apply's comparison and the
-        // apply itself.
-        let loaded = match self.load_rescan_config(&mode, &context) {
-            Ok(config) => config,
-            Err((code, message)) => return Ok(vec![control_error_frame(&frame, code, message)?]),
+        let _rescan_guard = context.rescan_lock.lock().await;
+        let rescan_checked::RescanInput {
+            config: loaded,
+            approved_preview,
+            guard: _operation_guard,
+        } = match self.rescan_input(&mode, &context).await {
+            Ok(input) => input,
+            Err(error) => return Ok(vec![error.into_frame(&frame)?]),
         };
         // `load` reports a missing file as Ok(None), which is correct at boot
         // (no config, nothing to supervise) and catastrophic here: rescan treats

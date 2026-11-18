@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.50.7
+
+- Drain module output independently of the daemon runtime and slow log sinks, report runtime stalls from a separate thread, and bound config reads for supervisor rescans. Concurrent rescans queue behind each other instead of failing, and none holds the supervisor operation lock while it reads the config file.
+
 ## 0.50.6
 
 - macOS: capture only the kernel peer credentials when accepting a local

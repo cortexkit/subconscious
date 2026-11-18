@@ -1145,6 +1145,7 @@ async fn serve_bound_daemon(
     #[cfg(feature = "test-support")] shutdown_intent_window: Duration,
     #[cfg(target_os = "linux")] cgroup_placement: Option<subc_cgroup::Placement>,
 ) -> Result<(), BootstrapError> {
+    let _stall_witness = crate::stall_witness::Witness::start_if_daemon_logging();
     #[cfg(unix)]
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(BootstrapError::Signal)?;

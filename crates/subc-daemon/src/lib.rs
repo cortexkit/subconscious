@@ -17,6 +17,7 @@ pub mod caller_identity;
 pub(crate) mod capability_requirements;
 #[cfg(target_os = "linux")]
 mod cgroup_recovery;
+mod child_output;
 mod child_resources;
 mod child_roster;
 mod clock;
@@ -52,6 +53,7 @@ mod run_dir_lock;
 mod scopes;
 pub mod server;
 pub(crate) mod spawn_authority;
+mod stall_witness;
 pub mod stderr_tail;
 mod subtree_resources;
 pub mod supervise;

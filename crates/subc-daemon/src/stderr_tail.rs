@@ -648,6 +648,7 @@ impl OutputSink for ChildOutputSink {
 /// Read one process generation's stderr to EOF. `generation` is the value
 /// [`StderrRing::begin_process`] returned for that process; it decides which
 /// section of the ring a line lands in if the reader outlives the process.
+#[cfg(test)]
 pub(crate) async fn pump_stderr_to<R, S>(
     source: R,
     ring: Arc<Mutex<StderrRing>>,
@@ -660,6 +661,7 @@ pub(crate) async fn pump_stderr_to<R, S>(
     pump_lines_into(source, Some((&ring, generation)), &mut sink, "stderr").await;
 }
 
+#[cfg(test)]
 pub(crate) async fn pump_stdout_to<R>(source: R, mut sink: ChildOutputSink)
 where
     R: AsyncReadExt + Unpin,
@@ -691,14 +693,7 @@ async fn pump_lines_into<R, S>(
         lock_ring(ring).mark_captured();
     }
 
-    let mut pending: Vec<u8> = Vec::new();
-    // Bytes before `scanned_upto` are already known to hold no newline; searching
-    // them again would rescan the whole buffer on every chunk -- for a line with
-    // no newline that is about 64 MiB examined per MiB of module output.
-    let mut scanned_upto = 0usize;
-    // Bytes before `cursor` were emitted as complete lines. They are removed in
-    // one compaction per chunk rather than shifting the buffer once per line.
-    let mut cursor = 0usize;
+    let mut framer = LineFramer::default();
     let mut chunk = [0u8; 8192];
     loop {
         let read = match source.read(&mut chunk).await {
@@ -718,34 +713,45 @@ async fn pump_lines_into<R, S>(
                 return;
             }
         };
-        pending.extend_from_slice(&chunk[..read]);
+        framer.push(&chunk[..read], |raw, terminated| {
+            emit_line(ring, sink, raw, terminated)
+        });
+    }
 
+    framer.finish(|raw, terminated| emit_line(ring, sink, raw, terminated));
+    if let Some((ring, generation)) = ring {
+        lock_ring(ring).finish_pump(generation);
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct LineFramer {
+    // Everything retained from the previous chunk has already been scanned.
+    pending: Vec<u8>,
+}
+
+impl LineFramer {
+    pub(crate) fn push(&mut self, chunk: &[u8], mut emit: impl FnMut(&[u8], bool)) {
+        let pending = &mut self.pending;
+        let mut scanned_upto = pending.len();
+        pending.extend_from_slice(chunk);
+        let mut cursor = 0;
         while let Some(relative) = find_newline(&pending[scanned_upto..]) {
             let newline = scanned_upto + relative;
-            emit_line(ring, sink, &pending[cursor..newline], true);
+            emit(&pending[cursor..newline], true);
             cursor = newline + 1;
             scanned_upto = cursor;
         }
-        scanned_upto = pending.len();
-
-        if cursor > 0 {
-            pending.drain(..cursor);
-            scanned_upto -= cursor;
-            cursor = 0;
-        }
-
+        pending.drain(..cursor);
         if pending.len() >= MAX_PENDING_LINE_BYTES {
-            let line = std::mem::take(&mut pending);
-            emit_line(ring, sink, &line, false);
-            scanned_upto = 0;
+            emit(&std::mem::take(pending), false);
         }
     }
 
-    if !pending.is_empty() {
-        emit_line(ring, sink, &pending, false);
-    }
-    if let Some((ring, generation)) = ring {
-        lock_ring(ring).finish_pump(generation);
+    pub(crate) fn finish(self, mut emit: impl FnMut(&[u8], bool)) {
+        if !self.pending.is_empty() {
+            emit(&self.pending, false);
+        }
     }
 }
 
@@ -788,7 +794,16 @@ fn emit_line<S: OutputSink>(
     // so the time is stored beside it: as `at_ms` in the ring and as the stamp
     // in the file. A time assigned later, when either is read, would look
     // recorded while being off by however long the line sat there.
-    let at_ms = unix_ms(SystemTime::now());
+    write_captured_line(ring, sink, raw, terminated, unix_ms(SystemTime::now()));
+}
+
+pub(crate) fn write_captured_line<S: OutputSink>(
+    ring: Option<(&Arc<Mutex<StderrRing>>, u64)>,
+    sink: &mut S,
+    raw: &[u8],
+    terminated: bool,
+    at_ms: u64,
+) {
     if let Some((ring, generation)) = ring {
         lock_ring(ring).push_line_from_at(generation, &String::from_utf8_lossy(raw), at_ms);
     }
@@ -812,7 +827,7 @@ fn emit_line<S: OutputSink>(
     sink.write_line(&framed);
 }
 
-fn unix_ms(at: SystemTime) -> u64 {
+pub(crate) fn unix_ms(at: SystemTime) -> u64 {
     // A clock set before 1970 is already wrong about every time it reports;
     // saturating keeps the stamp well-formed rather than failing the write.
     at.duration_since(UNIX_EPOCH)

@@ -22,7 +22,10 @@ use subc_control::{
     RESCAN_CANDIDATE_MAX_BYTES, RESCAN_CANDIDATE_PREVIEW_CAPABILITY, RESCAN_CANDIDATE_TOO_LARGE,
 };
 
-use super::{control_error_frame, launch_spec_agreement, ControlHandler, SupervisorRescanContext};
+use super::{
+    config_gate, control_error_frame, launch_spec_agreement, ControlHandler,
+    SupervisorRescanContext,
+};
 use crate::{
     daemon_config::{ActivityConfig, ConfiguredModule, DaemonConfig},
     router::{RouteCtx, RouterError},
@@ -34,6 +37,7 @@ use crate::{
 mod tests;
 
 /// Where a rescan's configuration comes from, and whether it is applied.
+#[derive(Clone)]
 pub(super) enum RescanMode {
     /// `supervisor.rescan`: read the config file and apply it.
     Execute,
@@ -46,6 +50,31 @@ pub(super) enum RescanMode {
     /// A `supervisor.rescan_checked` apply: read the config file and apply it,
     /// but only if the file and the staged configuration still match.
     Checked(RescanExpect),
+}
+
+const CONFIG_READ_DEADLINE: Duration = Duration::from_secs(5);
+// A timed-out filesystem read cannot be cancelled. Its slot stays charged
+// until it finishes, so repeated rescans cannot create unbounded threads.
+static CONFIG_READ_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
+pub(super) struct RescanInput {
+    pub(super) config: Option<(DaemonConfig, ActivityConfig)>,
+    pub(super) approved_preview: Option<DaemonConfig>,
+    pub(super) guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+pub(super) enum RescanInputError {
+    Config(&'static str, String),
+    Gate(crate::config_gate::GateError),
+}
+
+impl RescanInputError {
+    pub(super) fn into_frame(self, request: &Frame) -> Result<Frame, RouterError> {
+        match self {
+            Self::Config(code, message) => control_error_frame(request, code, message),
+            Self::Gate(error) => config_gate::config_error_frame(request, error),
+        }
+    }
 }
 
 impl RescanMode {
@@ -384,90 +413,185 @@ impl ControlHandler {
         self.handle_supervisor_rescan(frame, mode, requester).await
     }
 
-    /// The configuration a rescan in `mode` works from. Called with the
-    /// supervisor operation lock held. Errors are a refusal code and message.
-    pub(super) fn load_rescan_config(
+    // The caller holds the rescan lock through both read and apply. Take the
+    // supervisor operation lock only after the read so other operations can
+    // proceed during file I/O. Check the staged generation for changes made
+    // outside the rescan lock, then build the plan from current module state.
+    pub(super) async fn rescan_input(
         &self,
         mode: &RescanMode,
         context: &SupervisorRescanContext,
-    ) -> Result<Option<(DaemonConfig, ActivityConfig)>, (&'static str, String)> {
+    ) -> Result<RescanInput, RescanInputError> {
+        use tokio::time::{timeout_at, Instant};
+        use RescanInputError::Config;
+
+        let staged = self.staged_generation(context);
+        let (config, approved_preview) = if matches!(mode, RescanMode::Candidate(_)) {
+            (Self::read_rescan_config(mode, &context.config_path)?, None)
+        } else {
+            let deadline = Instant::now() + CONFIG_READ_DEADLINE;
+            let timed_out = || {
+                Config(
+                    "rescan_config_read_timeout",
+                    format!(
+                        "supervisor rescan timed out reading daemon config at {}; nothing was applied",
+                        context.config_path.display()
+                    ),
+                )
+            };
+            let permit = timeout_at(deadline, CONFIG_READ_SLOTS.acquire())
+                .await
+                .map_err(|_| timed_out())?
+                .expect("rescan read slots never close");
+            if Instant::now() >= deadline {
+                return Err(timed_out());
+            }
+            let path = context.config_path.clone();
+            let owner = if matches!(mode, RescanMode::Preview) {
+                self.config_runtime.clone()
+            } else {
+                None
+            };
+            let mode = mode.clone();
+            let (send, recv) = tokio::sync::oneshot::channel();
+            std::thread::Builder::new()
+                .name("rescan-config-read".into())
+                .spawn(move || {
+                    let _permit = permit;
+                    let result = (|| {
+                        let config = Self::read_rescan_config(&mode, &path)?;
+                        // Preview can record a file proposal, but only the caller
+                        // (after the deadline and generation checks) can apply a
+                        // rescan. The worker has no supervisor handle.
+                        let approved = if let Some(owner) = owner.filter(|_| !send.is_closed()) {
+                            owner
+                                .observe_file_proposal()
+                                .map_err(RescanInputError::Gate)?;
+                            owner
+                                .approved_daemon_configuration()
+                                .map_err(RescanInputError::Gate)?
+                        } else {
+                            None
+                        };
+                        Ok((config, approved))
+                    })();
+                    let _ = send.send(result);
+                })
+                .map_err(|error| {
+                    Config(
+                        "rescan_failed",
+                        format!("could not start supervisor rescan config read: {error}"),
+                    )
+                })?;
+            let result = timeout_at(deadline, recv).await.map_err(|_| timed_out())?;
+            // Tokio polls the result before the timer when both are ready.
+            // Never apply a read after its deadline, even in that race.
+            if Instant::now() >= deadline {
+                return Err(timed_out());
+            }
+            result.map_err(|error| {
+                Config(
+                    "rescan_failed",
+                    format!("supervisor rescan config reader stopped: {error}"),
+                )
+            })??
+        };
+
+        let guard = self.supervisor.operation_lock().lock_owned().await;
+        let current = self.staged_generation(context);
+        let changed = match mode {
+            RescanMode::Candidate(_) => None,
+            RescanMode::Checked(expect) if current != expect.staged_generation => Some((
+                CONFIG_CHANGED_SINCE_PREVIEW,
+                &expect.staged_generation,
+                "after the preview",
+            )),
+            _ if current != staged => {
+                Some(("rescan_failed", &staged, "while reading daemon config"))
+            }
+            _ => None,
+        };
+        if let Some((code, before, reason)) = changed {
+            return Err(Config(code, format!(
+                "the daemon's staged configuration changed {reason} (was {}:{}, now {}:{}); nothing was applied",
+                before.incarnation, before.counter, current.incarnation, current.counter,
+            )));
+        }
+        Ok(RescanInput {
+            config,
+            approved_preview,
+            guard,
+        })
+    }
+
+    fn read_rescan_config(
+        mode: &RescanMode,
+        path: &Path,
+    ) -> Result<Option<(DaemonConfig, ActivityConfig)>, RescanInputError> {
         let rejected = |err: crate::daemon_config::DaemonConfigError| {
-            (
+            RescanInputError::Config(
                 "invalid_daemon_config",
                 format!("supervisor rescan rejected daemon config: {err}"),
             )
         };
         match mode {
             RescanMode::Execute | RescanMode::Preview => {
-                crate::daemon_config::load_with_activity(&context.config_path).map_err(rejected)
+                crate::daemon_config::load_with_activity(path).map_err(rejected)
             }
             RescanMode::Candidate(candidate) => {
-                crate::daemon_config::parse_with_activity(candidate, &context.config_path)
+                crate::daemon_config::parse_with_activity(candidate, path)
                     .map(Some)
                     .map_err(rejected)
             }
             RescanMode::Checked(expect) => {
-                let doc = self.checked_config_doc(context, expect)?;
-                crate::daemon_config::parse_with_activity(&doc, &context.config_path)
+                let doc = Self::checked_config_doc(path, expect)?;
+                crate::daemon_config::parse_with_activity(&doc, path)
                     .map(Some)
                     .map_err(rejected)
             }
         }
     }
 
-    /// The config file's text, provided it is the text the preview hashed and
-    /// the staged configuration is the one the preview compared it with. The
-    /// file is read once and those same bytes are parsed, so a write landing
-    /// after the hash check cannot be what gets applied.
-    fn checked_config_doc(
-        &self,
-        context: &SupervisorRescanContext,
-        expect: &RescanExpect,
-    ) -> Result<String, (&'static str, String)> {
-        let path = context.config_path.display();
-        let bytes = match std::fs::read(&context.config_path) {
+    /// Read and hash the bytes that will be parsed, so a write landing after
+    /// the hash check cannot be what gets applied.
+    fn checked_config_doc(path: &Path, expect: &RescanExpect) -> Result<String, RescanInputError> {
+        use RescanInputError::Config;
+        let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Err((
+                return Err(Config(
                     CONFIG_CHANGED_SINCE_PREVIEW,
-                    format!("daemon config not found at {path}; nothing was applied"),
+                    format!(
+                        "daemon config not found at {}; nothing was applied",
+                        path.display()
+                    ),
                 ));
             }
             Err(err) => {
-                return Err((
+                return Err(Config(
                     "invalid_daemon_config",
-                    format!("supervisor rescan could not read daemon config at {path}: {err}"),
+                    format!(
+                        "supervisor rescan could not read daemon config at {}: {err}",
+                        path.display()
+                    ),
                 ));
             }
         };
         if !sha256_hex(&bytes).eq_ignore_ascii_case(&expect.config_sha256) {
-            return Err((
+            return Err(Config(
                 CONFIG_CHANGED_SINCE_PREVIEW,
                 format!(
-                    "daemon config at {path} is not the text that was previewed; nothing was applied"
-                ),
-            ));
-        }
-        let current = self.staged_generation(context);
-        if current != expect.staged_generation {
-            return Err((
-                CONFIG_CHANGED_SINCE_PREVIEW,
-                format!(
-                    "the daemon's staged configuration changed after the preview \
-                     (previewed {}:{}, now {}:{}); nothing was applied",
-                    expect.staged_generation.incarnation,
-                    expect.staged_generation.counter,
-                    current.incarnation,
-                    current.counter
+                    "daemon config at {} is not the text that was previewed; nothing was applied",
+                    path.display(),
                 ),
             ));
         }
         // The hash matched text that arrived as a JSON string, so this only
         // fails on a hash collision; refuse rather than assume.
         String::from_utf8(bytes).map_err(|err| {
-            (
+            Config(
                 "invalid_daemon_config",
-                format!("daemon config at {path} is not UTF-8: {err}"),
+                format!("daemon config at {} is not UTF-8: {err}", path.display()),
             )
         })
     }
@@ -591,4 +715,106 @@ impl ControlHandler {
         });
         Ok(result)
     }
+}
+
+#[cfg(all(test, unix))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stalled_config_read_times_out_without_holding_operation_lock() {
+    use crate::{Registry, RestartPolicy, Supervisor, SupervisorHandle};
+    use cortexkit_test_support::ScratchDir;
+    use std::io::Write;
+    use std::sync::{mpsc, Arc};
+    use subc_protocol::{FrameType, Principal};
+
+    let dir = ScratchDir::new("rescan-stalled-file");
+    let path = dir.join("subc.jsonc");
+    assert!(std::process::Command::new("mkfifo")
+        .arg(&path)
+        .status()
+        .unwrap()
+        .success());
+    let registry = Arc::new(Registry::default());
+    let handle = SupervisorHandle::new();
+    let supervisor =
+        Supervisor::new(registry.clone(), RestartPolicy::default()).with_handle(handle.clone());
+    let handler = Arc::new(
+        ControlHandler::new(registry)
+            .with_supervisor(handle.clone())
+            .with_supervisor_rescan(supervisor, &path, None),
+    );
+    let (opened, is_open) = tokio::sync::oneshot::channel();
+    let (release, released) = mpsc::channel();
+    let feeder = std::thread::spawn(move || {
+        let mut fifo = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        opened.send(()).unwrap();
+        released.recv_timeout(Duration::from_secs(10)).unwrap();
+        let _ = fifo.write_all(br#"{"version":1,"modules":{"never-applied":{"program":"/bin/true","protocol":"none","enabled":false}}}"#);
+    });
+    let request = tokio::spawn({
+        let handler = Arc::clone(&handler);
+        async move {
+            let frame = Frame::build(
+                FrameType::Request,
+                super::control_flags(),
+                0,
+                0,
+                1,
+                Vec::new(),
+            )
+            .unwrap();
+            handler
+                .handle_supervisor_rescan(frame, RescanMode::Execute, Principal::Direct)
+                .await
+                .unwrap()
+                .remove(0)
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), is_open)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Restart takes the operation lock even for an unknown module. Receive
+    // that ordinary refusal while the reader is still waiting for file data.
+    let frame = Frame::build(
+        FrameType::Request,
+        super::control_flags(),
+        0,
+        0,
+        2,
+        Vec::new(),
+    )
+    .unwrap();
+    let restart = tokio::time::timeout(
+        Duration::from_secs(1),
+        handler.handle_supervisor_restart(frame, "missing".into(), None, Principal::Direct),
+    )
+    .await;
+    let mut request = request;
+    let reply = tokio::time::timeout(Duration::from_secs(6), &mut request).await;
+    release.send(()).unwrap();
+    feeder.join().unwrap();
+    let restart = restart
+        .expect("the rescan held the supervisor operation lock during its config read")
+        .unwrap()
+        .remove(0);
+    let body: serde_json::Value = serde_json::from_slice(&restart.body).unwrap();
+    assert_eq!(body["code"], "unknown_module");
+    let reply = reply
+        .expect("rescan did not answer before the config reader was released")
+        .unwrap();
+    assert_eq!(reply.header.ty, FrameType::Error);
+    let body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(body["code"], "rescan_config_read_timeout");
+    assert!(body["message"].as_str().unwrap().contains("subc.jsonc"));
+    assert!(handle.list().is_empty());
+    assert_eq!(
+        handler
+            .rescan
+            .as_ref()
+            .unwrap()
+            .generation
+            .load(Ordering::SeqCst),
+        0
+    );
 }

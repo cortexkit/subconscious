@@ -42,6 +42,7 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 
 use crate::{
+    child_output::StderrPump,
     child_roster::ChildRoster,
     daemon_config::{
         CAPTURE_KEEP_ENV, CAPTURE_MAX_AGE_DAYS_ENV, CAPTURE_MAX_FILE_MB_ENV, CK_LOG_ENV,
@@ -52,10 +53,7 @@ use crate::{
     },
     provenance::{ExecutableIdentityProbe, SpawnedFileIdentity},
     registry::{ConnectionId, RegistrationEndReason, RegistryError},
-    stderr_tail::{
-        pump_stderr_to, pump_stdout_to, ChildOutputSink, StderrRing, StderrTailConfig,
-        StderrTailSnapshot,
-    },
+    stderr_tail::{ChildOutputSink, StderrRing, StderrTailConfig, StderrTailSnapshot},
     terminal_ring::{TerminalHistorySnapshot, TerminalRecord, TerminalRing, TerminalRingConfig},
     Frame, FrameSink, Registry,
 };
@@ -166,28 +164,13 @@ const REGISTRY_RELEASE_POLL: Duration = Duration::from_millis(10);
 /// so a slow module is never asked more often than it can answer. Periodic
 /// health checks outside a drain keep using the configured cadence.
 const DRAIN_BUSY_REPROBE_INTERVAL: Duration = Duration::from_millis(250);
-/// How long a restart waits for the exited process's output readers.
+/// How long a restart waits per pipe for queued capture to finish.
 ///
-/// The restart does not depend on either output reader finishing. A stderr
-/// reader still running at this bound is left running, and its later output goes
-/// into the exited process's own section of the stderr ring (see
-/// `StderrRing::push_line_from`), ending naturally at EOF on its pipe. So the
-/// bound no longer decides whether a crash's last lines are kept: under load
-/// the reader may simply not have been scheduled yet, and cutting it there
-/// discarded exactly the lines that explained the crash.
-///
-/// What the bound still decides is when the tail starts reporting
-/// `Incomplete`: a pipe open past it usually means a descendant of the exited
-/// process still holds it, and the tail cannot claim to be whole until that
-/// pipe closes. That is also the only case in which the wait costs the restart
-/// anything, because a pipe with no other holder reaches EOF when the process
-/// exits. Under load a slow reader can show `Incomplete` briefly; it returns to
-/// `Captured` at EOF with nothing lost.
-///
-/// The stdout reader carries no ring, only the capture file. It also continues
-/// to EOF after this bound: child exit closes the writer but does not mean the
-/// reader has consumed all buffered bytes. Late output from either pipe can
-/// therefore reach the shared capture file after the successor starts.
+/// A reader and writer still running at the bound are left running. Stderr
+/// stays in the exited process's section of the ring. Its tail reports
+/// `Incomplete` until EOF has reached the writer, and stays incomplete if
+/// backpressure forced capture to drop lines. Late output from either pipe
+/// can reach the capture file after the successor starts.
 const STDERR_PUMP_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 /// Maximum number of supervised process spawn/exit facts retained per daemon incarnation.
 pub const SPAWN_EVENT_RING_CAPACITY: usize = 4096;
@@ -457,7 +440,7 @@ struct SupervisedChild {
     /// reaches only what the drain left behind, which is what it should reach.
     #[cfg(windows)]
     job: Option<Arc<Mutex<subc_jobobject::JobObject>>>,
-    stdout_pump: Option<JoinHandle<()>>,
+    stdout_pump: Option<tokio::sync::oneshot::Receiver<()>>,
     stderr_pump: Option<StderrPump>,
     stderr_ring: Arc<Mutex<StderrRing>>,
     /// Conservative monotonic bound sampled before `command.spawn()`, not when
@@ -1014,51 +997,41 @@ impl SupervisedChild {
     }
 }
 
-/// Bound the restart's wait, not the lifetime of the exited child's stdout
-/// reader. Slow pipe reads or capture writes must not turn the bound into lost
-/// output; dropping the handle lets the reader finish at EOF, like stderr.
-async fn settle_stdout_pump(module_id: &str, mut pump: JoinHandle<()>, bound: Duration) {
-    match timeout(bound, &mut pump).await {
+/// Bound the restart's wait. Dropping the completion future does not stop
+/// the reader or the capture writer.
+async fn settle_stdout_pump<E: std::fmt::Display>(
+    module_id: &str,
+    pump: impl std::future::Future<Output = Result<(), E>>,
+    bound: Duration,
+) {
+    match timeout(bound, pump).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
             warn!(module_id, error = %error, "stdout pump ended unexpectedly");
         }
         Err(_) => {
-            drop(pump);
             warn!(
                 module_id,
                 waited = ?bound,
-                "stdout pipe of the exited process has not drained; its reader keeps running without delaying the restart"
+                "stdout of the exited process has not finished capture; the reader and writer continue without delaying restart"
             );
         }
     }
 }
 
-/// The reader task for one process's stderr, with the ring generation its
-/// lines are attributed to.
-struct StderrPump {
-    task: JoinHandle<()>,
-    generation: u64,
-}
-
-/// Retire an exited process's stderr reader and wait up to `bound` for it to
-/// reach EOF. A reader still running at the bound is detached, not stopped: it
-/// keeps filling the exited process's section of the ring until its pipe
-/// closes, and the tail reads `Incomplete` until then. See
-/// [`STDERR_PUMP_DRAIN_TIMEOUT`] for why.
-async fn settle_stderr_pump(
+/// Retire an exited process's stderr reader and allow up to `bound` for its
+/// output to reach the ring and sink. A late reader or writer keeps going,
+/// and the tail reads `Incomplete` until it finishes.
+async fn settle_stderr_pump<E: std::fmt::Display>(
     module_id: &str,
     ring: &Arc<Mutex<StderrRing>>,
-    pump: StderrPump,
+    pump: StderrPump<impl std::future::Future<Output = Result<(), E>>>,
     bound: Duration,
 ) {
     let lock = || ring.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let StderrPump {
-        mut task,
-        generation,
-    } = pump;
+    let StderrPump { task, generation } = pump;
     lock().retire_pump(generation);
-    match timeout(bound, &mut task).await {
+    match timeout(bound, task).await {
         Ok(Ok(())) => {}
         Ok(Err(err)) => {
             let mut ring = lock();
@@ -1067,20 +1040,17 @@ async fn settle_stderr_pump(
             warn!(module_id, error = %err, "stderr pump ended before clean EOF");
         }
         Err(_) => {
-            // Dropping the handle detaches the task; it ends at EOF on its pipe.
-            drop(task);
             lock().mark_pump_late(
                 generation,
                 format!(
-                    "stderr of the exited process had not reached EOF {bound:?} after it was \
-                     retired (a descendant may still hold the pipe open); lines it still \
-                     writes are kept in that process's section"
+                    "stderr of the exited process had not reached EOF or finished queued capture \
+                     {bound:?} after it was retired; retained lines go in that process's section"
                 ),
             );
             warn!(
                 module_id,
                 waited = ?bound,
-                "stderr pipe of the exited process is still open; its reader keeps running without delaying the restart"
+                "stderr of the exited process has not finished capture; the reader and writer continue without delaying restart"
             );
         }
     }
@@ -12905,46 +12875,8 @@ fn launch_child_in_slot(
         });
     }
 
-    let stdout_pump = match child.stdout.take() {
-        Some(stdout) => Some(tokio::spawn(pump_stdout_to(stdout, output_sink.clone()))),
-        None => {
-            warn!(
-                module_id = %spec.module_id,
-                "spawned child exposed no stdout pipe; file capture will be incomplete"
-            );
-            None
-        }
-    };
-    let stderr_pump = match child.stderr.take() {
-        Some(stderr) => {
-            let generation = ring
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .begin_process();
-            Some(StderrPump {
-                task: tokio::spawn(pump_stderr_to(
-                    stderr,
-                    Arc::clone(ring),
-                    generation,
-                    output_sink,
-                )),
-                generation,
-            })
-        }
-        None => {
-            // Spawning succeeded but the pipe did not materialise. Recording it as
-            // uncaptured keeps the tail honest: the alternative is an empty tail
-            // that reads as a module which printed nothing.
-            ring.lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .mark_not_captured("stderr pipe was not available on spawn");
-            warn!(
-                module_id = %spec.module_id,
-                "spawned child exposed no stderr pipe; tail will be unavailable"
-            );
-            None
-        }
-    };
+    let (stdout_pump, stderr_pump) =
+        crate::child_output::start(&mut child, output_sink, ring, &spec.module_id);
 
     let exec = Arc::new(crate::activity::ExecOutcome::new());
     #[cfg(target_os = "macos")]
@@ -21053,7 +20985,7 @@ mod stderr_settle_tests {
         ring: &Arc<Mutex<StderrRing>>,
         before: &str,
         after: &str,
-    ) -> (StderrPump, oneshot::Sender<()>) {
+    ) -> (StderrPump<tokio::task::JoinHandle<()>>, oneshot::Sender<()>) {
         let generation = lock(ring).begin_process();
         let (release, gate) = oneshot::channel();
         let reader = HeldReader {

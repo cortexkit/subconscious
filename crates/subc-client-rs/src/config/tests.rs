@@ -42,10 +42,10 @@ impl ModuleHandler for Sample {
         if let Some(blocked) = &self.blocked {
             blocked.notified().await;
         }
-        if view.effective["value"] == json!(-1) {
-            Err(vec!["negative value".into()])
-        } else {
-            Ok(())
+        match view.effective["value"].as_i64() {
+            Some(-1) => Err(vec!["negative value".into()]),
+            Some(-2) => Err(vec!["recovery refused".into()]),
+            _ => Ok(()),
         }
     }
     async fn config_review(&self, _: ConfigReviewRequest) -> ConfigReviewReply {
@@ -571,7 +571,8 @@ async fn config_sdk_committed_wire_goldens_drive_pending_ack_and_gated_refusal()
         .unwrap(),
     )
     .await;
-    active(&mut rx, 3).await;
+    // The accepted pending generation replaces the need to apply recovery generation 3.
+    assert!(matches!(seen(&mut rx).await, Seen::Applied(view) if view.generation == 4));
     active(&mut rx, 4).await;
     let review: Value = serde_json::from_str(include_str!(
         "../../../subc-protocol/tests/golden/config_gate/config_review_request.json"
@@ -605,25 +606,92 @@ async fn config_sdk_committed_wire_goldens_drive_pending_ack_and_gated_refusal()
 }
 
 #[tokio::test]
+async fn config_sdk_first_pending_ack_skips_the_supplied_active_recovery_view() {
+    let (handler, mut rx) = sample();
+    let (mut rig, _) = Rig::new(handler, true).await;
+    declared(&mut rig).await;
+    let mut pending = view(2, ConfigStatus::Pending, 2);
+    get(
+        &mut rig,
+        Some(view(1, ConfigStatus::Active, 1)),
+        Some(pending.clone()),
+    )
+    .await;
+    assert!(matches!(seen(&mut rx).await, Seen::Applied(view) if view == pending));
+    assert!(
+        matches!(seen(&mut rx).await, Seen::State(ConfigState::Pending(view)) if view == pending)
+    );
+    let ack = rig.request(CONFIG_APPLIED_OP).await;
+    assert_eq!(
+        body(&ack),
+        json!({"op":"config.applied","generation":2,"attempt":102,"result":"ack","reasons":[]})
+    );
+    rig.ok(ack, json!({"op":"config.applied"})).await;
+    pending.status = ConfigStatus::Active;
+    assert!(
+        matches!(seen(&mut rx).await, Seen::State(ConfigState::Active(view)) if view == pending)
+    );
+    rig.finish().await;
+    assert!(matches!(
+        rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Disconnected)
+    ));
+}
+
+#[tokio::test]
 async fn config_sdk_first_pending_nack_keeps_the_supplied_active_recovery_view() {
     let (handler, mut rx) = sample();
     let (mut rig, _) = Rig::new(handler, true).await;
     declared(&mut rig).await;
-    get(
-        &mut rig,
-        Some(view(1, ConfigStatus::Active, 1)),
-        Some(view(2, ConfigStatus::Pending, -1)),
-    )
-    .await;
-    let nack = rig.request(CONFIG_APPLIED_OP).await;
-    assert_eq!(body(&nack)["result"], "nack");
-    rig.ok(nack, json!({"op":"config.applied"})).await;
-    active(&mut rx, 1).await;
-    assert!(matches!(seen(&mut rx).await, Seen::Applied(view) if view.generation == 2));
+    let recovery = view(1, ConfigStatus::Active, 1);
+    let pending = view(2, ConfigStatus::Pending, -1);
+    get(&mut rig, Some(recovery.clone()), Some(pending.clone())).await;
+    // A restarted module tries the delivery before booting on the recovery view.
+    assert!(matches!(seen(&mut rx).await, Seen::Applied(view) if view == pending));
+    assert!(matches!(seen(&mut rx).await, Seen::Applied(view) if view == recovery));
     assert!(
-        matches!(seen(&mut rx).await, Seen::State(ConfigState::Failed { view: ConfigAvailability::LastView(view), .. }) if view.generation == 1)
+        matches!(seen(&mut rx).await, Seen::State(ConfigState::Active(view)) if view == recovery)
     );
+    assert!(
+        matches!(seen(&mut rx).await, Seen::State(ConfigState::Failed { view: ConfigAvailability::LastView(view), reasons }) if view == recovery && reasons == ["negative value"])
+    );
+    let nack = rig.request(CONFIG_APPLIED_OP).await;
+    assert_eq!(
+        body(&nack),
+        json!({"op":"config.applied","generation":2,"attempt":102,"result":"nack","reasons":["negative value"]})
+    );
+    rig.ok(nack, json!({"op":"config.applied"})).await;
     rig.finish().await;
+    assert!(matches!(
+        rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Disconnected)
+    ));
+}
+
+#[tokio::test]
+async fn config_sdk_first_pending_nack_reports_even_when_recovery_is_refused() {
+    let (handler, mut rx) = sample();
+    let (mut rig, _) = Rig::new(handler, true).await;
+    declared(&mut rig).await;
+    let recovery = view(1, ConfigStatus::Active, -2);
+    let pending = view(2, ConfigStatus::Pending, -1);
+    get(&mut rig, Some(recovery.clone()), Some(pending.clone())).await;
+    assert!(matches!(seen(&mut rx).await, Seen::Applied(view) if view == pending));
+    assert!(matches!(seen(&mut rx).await, Seen::Applied(view) if view == recovery));
+    assert!(
+        matches!(seen(&mut rx).await, Seen::State(ConfigState::Failed { view: ConfigAvailability::NoApprovedConfig, reasons }) if reasons == ["recovery refused"])
+    );
+    let nack = rig.request(CONFIG_APPLIED_OP).await;
+    assert_eq!(
+        body(&nack),
+        json!({"op":"config.applied","generation":2,"attempt":102,"result":"nack","reasons":["negative value"]})
+    );
+    rig.ok(nack, json!({"op":"config.applied"})).await;
+    rig.finish().await;
+    assert!(matches!(
+        rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Disconnected)
+    ));
 }
 
 #[tokio::test]

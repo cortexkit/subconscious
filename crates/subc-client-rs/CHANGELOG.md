@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.41.6
+
+- Restarted processes apply the delivered settings first, and the recovery view
+  only if that is refused.
+
 ## 0.41.5
 
 - Build with subc-control 0.42.3 and subc-protocol 0.37.5. Existing watch calls

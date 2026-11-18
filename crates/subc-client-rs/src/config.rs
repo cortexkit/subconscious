@@ -419,42 +419,25 @@ impl Delivery {
             .await;
             return;
         }
-        // A reconnect may see both an approved recovery view and a delivery.
-        // Establish that recovery view before attempting the new configuration,
-        // so a rejected first delivery does not leave a fresh process empty.
-        if self.view.is_none() && reply.pending.is_some() {
-            if let Some(active) = &reply.active {
-                if active.status != ConfigStatus::Active
-                    || active
-                        .layers
-                        .iter()
-                        .any(|layer| layer.layer.known_layer().is_none())
-                {
-                    self.error(
-                        handler,
-                        ConfigError::Protocol("invalid recovery view".into()),
-                    )
-                    .await;
-                    return;
-                }
-                match handler.config_apply(active.clone()).await {
-                    Ok(()) => {
-                        self.view = Some(active.clone());
-                        handler
-                            .on_config_state(ConfigState::Active(active.clone()))
-                            .await;
-                    }
-                    Err(reasons) => {
-                        handler
-                            .on_config_state(ConfigState::Failed {
-                                view: self.available(),
-                                reasons,
-                            })
-                            .await;
-                        return;
-                    }
-                }
-            }
+        // A module that boots on its first apply must boot once, on the view it
+        // will keep. Try pending first, but keep active for recovery so a refused
+        // delivery does not leave a fresh process without settings.
+        let recovery = reply
+            .active
+            .filter(|_| self.view.is_none() && reply.pending.is_some());
+        if recovery.as_ref().is_some_and(|active| {
+            active.status != ConfigStatus::Active
+                || active
+                    .layers
+                    .iter()
+                    .any(|layer| layer.layer.known_layer().is_none())
+        }) {
+            self.error(
+                handler,
+                ConfigError::Protocol("invalid recovery view".into()),
+            )
+            .await;
+            return;
         }
         if !matches!(
             view.status,
@@ -510,10 +493,20 @@ impl Delivery {
                 }
             }
             Err(reasons) => {
+                let mut failure_reasons = reasons.clone();
+                if let Some(active) = recovery {
+                    match handler.config_apply(active.clone()).await {
+                        Ok(()) => {
+                            self.view = Some(active.clone());
+                            handler.on_config_state(ConfigState::Active(active)).await;
+                        }
+                        Err(recovery_reasons) => failure_reasons = recovery_reasons,
+                    }
+                }
                 handler
                     .on_config_state(ConfigState::Failed {
                         view: self.available(),
-                        reasons: reasons.clone(),
+                        reasons: failure_reasons,
                     })
                     .await;
                 if let Some(attempt) = attempt {

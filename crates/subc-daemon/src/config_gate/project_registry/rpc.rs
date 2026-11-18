@@ -11,6 +11,7 @@ use tokio::time::{timeout_at, Duration, Instant};
 pub struct EntorhinalProjectRegistry {
     registry: Arc<Registry>,
     forwarding: Arc<ForwardingTable>,
+    root_io: std::io::Result<RootIoPool>,
 }
 
 impl EntorhinalProjectRegistry {
@@ -18,6 +19,7 @@ impl EntorhinalProjectRegistry {
         Self {
             registry,
             forwarding,
+            root_io: RootIoPool::new(),
         }
     }
 
@@ -119,14 +121,16 @@ impl ProjectRegistry for EntorhinalProjectRegistry {
     ) -> RegistryFuture<'a> {
         Box::pin(async move {
             let reply = self.enumerate().await?;
-            let module = module.to_owned();
-            let affected = affected.clone();
-            tokio::task::spawn_blocking(move || {
-                RegistryRevision::from_enumerate(&reply, &module, &affected)
-            })
-            .await
-            .map_err(|_| unavailable("registry capture worker stopped"))?
+            let pool = self
+                .root_io
+                .as_ref()
+                .map_err(|_| unavailable("registry capture worker stopped"))?;
+            RegistryRevision::from_enumerate(pool, &reply, module, affected).await
         })
+    }
+
+    fn root_io_health(&self) -> Option<subc_control::config::ConfigRootIo> {
+        self.root_io.as_ref().ok().and_then(RootIoPool::health)
     }
 }
 

@@ -13,6 +13,7 @@ pub(crate) mod program;
 pub mod project_registry;
 pub(crate) mod review;
 mod reviewed_build;
+mod root_io;
 pub mod runtime;
 mod snapshot;
 mod strict_json;

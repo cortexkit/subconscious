@@ -2357,6 +2357,7 @@ impl RuntimeOwner {
         status.revision = store_status.revision;
         status.base_revision = store_status.base_revision;
         status.anchor_pending = store_status.anchor_pending;
+        status.root_io = self.capturer.projects.root_io_health();
         status.ungated_inputs = self.startup_overrides.clone();
         #[cfg(feature = "test-support")]
         if state.store.uses_config_gate_test_seam() {

@@ -51,6 +51,7 @@ impl RuntimeOwner {
                 status_inputs::report_snapshot(&candidate, &mut status);
             }
         }
+        status.root_io = self.capturer.projects.root_io_health();
         Ok(status)
     }
 

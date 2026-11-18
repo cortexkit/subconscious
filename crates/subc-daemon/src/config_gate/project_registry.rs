@@ -2,7 +2,7 @@
 //! consults this reader; approved tuples must remain usable while it is offline.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::File,
     future::Future,
     path::{Path, PathBuf},
@@ -10,7 +10,8 @@ use std::{
     sync::Arc,
 };
 
-use super::{GateError, Result};
+pub use super::root_io::RootIoPool;
+use super::{root_io::RootIoError, GateError, Result};
 use cortexkit_project_identity::{
     Approval, ApprovalState, EnumerateReply, Project, RootIdentity, RootIncarnation, RootRecord,
 };
@@ -68,26 +69,22 @@ impl RegistryFileId {
         }
     }
 
-    fn matches(&self, file: &File) -> Result<bool> {
+    fn read(file: &File) -> std::io::Result<Self> {
         #[cfg(unix)]
         {
-            let id = subc_os::retained_file_identity(file)
-                .map_err(|_| unavailable("root identity is unreadable"))?;
-            Ok(*self
-                == Self::Unix {
-                    device: id.device,
-                    inode: id.inode,
-                })
+            let id = subc_os::retained_file_identity(file)?;
+            Ok(Self::Unix {
+                device: id.device,
+                inode: id.inode,
+            })
         }
         #[cfg(windows)]
         {
-            let id = subc_os::retained_file_index(file)
-                .map_err(|_| unavailable("root identity is unreadable"))?;
-            Ok(*self
-                == Self::Windows {
-                    volume_serial: id.volume_serial,
-                    file_index: id.file_index,
-                })
+            let id = subc_os::retained_file_index(file)?;
+            Ok(Self::Windows {
+                volume_serial: id.volume_serial,
+                file_index: id.file_index,
+            })
         }
     }
 }
@@ -101,27 +98,35 @@ pub struct RegistryRoot {
     pub identity: Option<RootIdentity>,
 }
 
-impl RegistryRoot {
-    fn open(&self, project: &str) -> Result<File> {
-        let invalid = || {
-            unavailable(format!(
-                "{project}: root {} is unavailable or its fileId changed",
-                self.path.display()
-            ))
-        };
-        let file = subc_os::open_directory_nofollow_all(&self.path).map_err(|_| invalid())?;
-        if self
-            .file_id
-            .as_ref()
-            .map(|id| id.matches(&file))
-            .transpose()
-            .map_err(|_| invalid())?
-            .is_some_and(|matches| !matches)
-        {
-            return Err(invalid());
+#[derive(Clone, Debug)]
+enum RootCheckFailure {
+    Pool(RootIoError),
+    OpenRefused(Arc<subc_os::OpenRegularError>),
+    IdentityUnreadable(Arc<std::io::Error>),
+    IdentityMismatch,
+}
+
+impl std::fmt::Display for RootCheckFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pool(error) => std::fmt::Display::fmt(&GateError::from(*error), f),
+            Self::OpenRefused(error) => write!(f, "root open refused: {error}"),
+            Self::IdentityUnreadable(error) => write!(f, "root identity is unreadable: {error}"),
+            Self::IdentityMismatch => f.write_str("root fileId changed"),
         }
-        Ok(file)
     }
+}
+
+fn probe_root(
+    path: &Path,
+    need_id: bool,
+) -> std::result::Result<Option<RegistryFileId>, RootCheckFailure> {
+    let file = subc_os::open_directory_nofollow_all(path)
+        .map_err(|error| RootCheckFailure::OpenRefused(Arc::new(error)))?;
+    need_id
+        .then(|| RegistryFileId::read(&file))
+        .transpose()
+        .map_err(|error| RootCheckFailure::IdentityUnreadable(Arc::new(error)))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,8 +145,33 @@ pub struct RegistryRevision {
     pub projects: Vec<RegistryProject>,
 }
 
+struct RootOutcome<'a> {
+    project: &'a str,
+    path: &'a Path,
+    outcome: std::result::Result<(), RootCheckFailure>,
+}
+
 impl RegistryRevision {
-    pub fn from_enumerate(
+    pub async fn from_enumerate(
+        pool: &RootIoPool,
+        reply: &EnumerateReply,
+        module: &str,
+        affected: &BTreeSet<String>,
+    ) -> Result<Self> {
+        let revision = Self::parse_enumeration(reply, module, affected)?;
+        for root in revision.check_roots(pool).await {
+            root.outcome.map_err(|_| {
+                unavailable(format!(
+                    "{}: root {} is unavailable or its fileId changed",
+                    root.project,
+                    root.path.display()
+                ))
+            })?;
+        }
+        Ok(revision)
+    }
+
+    fn parse_enumeration(
         reply: &EnumerateReply,
         module: &str,
         affected: &BTreeSet<String>,
@@ -214,25 +244,90 @@ impl RegistryRevision {
             } else {
                 None
             };
-            let entry = RegistryProject {
+            projects.push(RegistryProject {
                 project_id: id.clone(),
                 workspace_id: project.workspace_id.clone(),
                 project_roots,
                 workspace_root,
-            };
-            for root in entry
-                .project_roots
-                .iter()
-                .chain(entry.workspace_root.iter())
-            {
-                root.open(id)?;
-            }
-            projects.push(entry);
+            });
         }
         Ok(Self {
             module: module.into(),
             projects,
         })
+    }
+
+    async fn check_roots(&self, pool: &RootIoPool) -> Vec<RootOutcome<'_>> {
+        let roots = || {
+            self.projects.iter().flat_map(|project| {
+                project
+                    .project_roots
+                    .iter()
+                    .chain(project.workspace_root.iter())
+                    .map(|root| (project.project_id.as_str(), root))
+            })
+        };
+        // One physical open per path, even when multiple projects or roles
+        // expect different identities for that path.
+        let mut probes = BTreeMap::new();
+        for (_, root) in roots() {
+            let need_id = probes.entry(root.path.as_path()).or_insert(false);
+            *need_id |= root.file_id.is_some();
+        }
+        let mut probes = probes.into_iter();
+        let mut observed = BTreeMap::new();
+        loop {
+            let jobs: Vec<_> = probes
+                .by_ref()
+                .take(pool.batch_slots())
+                .map(|(root, need_id)| {
+                    let path = root.to_owned();
+                    (
+                        root,
+                        pool.submit(path.clone(), move || probe_root(&path, need_id)),
+                    )
+                })
+                .collect();
+            if jobs.is_empty() {
+                break;
+            }
+            for (root, job) in jobs {
+                let result = match job {
+                    Ok(job) => job.wait().await,
+                    Err(error) => Err(error),
+                };
+                observed.insert(
+                    root,
+                    result
+                        .map_err(RootCheckFailure::Pool)
+                        .and_then(|probe| probe),
+                );
+            }
+        }
+        roots()
+            .map(|(project, root)| {
+                let path = root.path.as_path();
+                let outcome = observed[path]
+                    .as_ref()
+                    .map_err(Clone::clone)
+                    .and_then(|id| {
+                        if root
+                            .file_id
+                            .as_ref()
+                            .is_some_and(|expected| Some(expected) != id.as_ref())
+                        {
+                            Err(RootCheckFailure::IdentityMismatch)
+                        } else {
+                            Ok(())
+                        }
+                    });
+                RootOutcome {
+                    project,
+                    path,
+                    outcome,
+                }
+            })
+            .collect()
     }
 
     pub fn digest(&self) -> Result<Digest> {
@@ -325,6 +420,11 @@ pub trait ProjectRegistry: Send + Sync {
         module: &'a str,
         affected: &'a BTreeSet<String>,
     ) -> RegistryFuture<'a>;
+
+    #[doc(hidden)]
+    fn root_io_health(&self) -> Option<subc_control::config::ConfigRootIo> {
+        None
+    }
 
     fn recheck<'a>(
         &'a self,

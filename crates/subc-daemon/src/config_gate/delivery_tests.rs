@@ -150,6 +150,123 @@ async fn registry_offline_refuses_snapshot_but_active_user_tuple_delivery_contin
     assert!(delivered.pending.is_none());
 }
 
+#[tokio::test]
+async fn root_io_status_and_user_work_remain_responsive_during_a_stuck_job() {
+    use crate::config_gate::project_registry::{ProjectRegistry, RegistryFuture, RootIoPool};
+    use std::sync::{mpsc, Arc};
+    use subc_os::local_peer::{ObservedPeer, PeerObservation, PeerUser};
+    use subc_protocol::{Frame, FrameType};
+
+    struct RootReader(RootIoPool);
+    impl ProjectRegistry for RootReader {
+        fn snapshot<'a>(&'a self, _: &'a str, _: &'a BTreeSet<String>) -> RegistryFuture<'a> {
+            panic!("status, user delivery and a user plan must not enumerate project roots")
+        }
+
+        fn root_io_health(&self) -> Option<subc_control::config::ConfigRootIo> {
+            self.0.health()
+        }
+    }
+
+    let (rig, mut owner) = rig();
+    let view = pending(&owner, INCUMBENT);
+    applied(&owner, INCUMBENT, &view, true).unwrap();
+    let reader = Arc::new(RootReader(
+        RootIoPool::with_timeout(Duration::from_millis(300)).unwrap(),
+    ));
+    owner.capturer.projects = reader.clone();
+    let owner = Arc::new(owner);
+    let handler = crate::ControlHandler::new(Arc::new(crate::registry::Registry::default()))
+        .with_config_runtime(owner.clone());
+    let connection = ConnectionId::new(500);
+    handler.record_local_connection(connection);
+    #[cfg(unix)]
+    let user = PeerUser::Uid(subc_os::effective_uid());
+    #[cfg(windows)]
+    let user = PeerUser::Sid(subc_os::named_pipe::current_user_sid_string().unwrap());
+    handler.record_observed_peer(
+        connection,
+        ObservedPeer::Observed(PeerObservation {
+            user,
+            pid: std::process::id(),
+            exe: None,
+            signing_id: None,
+        }),
+    );
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let ctx = crate::router::RouteCtx {
+        connection_id: connection,
+        egress: crate::FrameSink::new(tx),
+    };
+    let status = || async {
+        let request = Frame::build(
+            FrameType::Request,
+            crate::control::control_flags(),
+            0,
+            0,
+            91,
+            br#"{"op":"config.status"}"#.to_vec(),
+        )
+        .unwrap();
+        let mut response = handler.handle_control_frame(&ctx, request).await.unwrap();
+        assert_eq!(response.len(), 1);
+        let frame = response.pop().unwrap();
+        assert_eq!(frame.header.ty, FrameType::Response, "{:?}", frame.body);
+        frame.body
+    };
+    let idle = status().await;
+    assert!(
+        serde_json::from_slice::<serde_json::Value>(&idle).unwrap()["status"]
+            .get("root_io")
+            .is_none()
+    );
+
+    let root = rig.path.join("unavailable-root");
+    let (release, wait) = mpsc::channel();
+    let (entered, signal) = tokio::sync::oneshot::channel();
+    let job = reader
+        .0
+        .submit(root.clone(), move || {
+            entered.send(()).unwrap();
+            let _ = wait.recv();
+        })
+        .unwrap();
+    let limit = Duration::from_secs(5);
+    tokio::time::timeout(limit, signal).await.unwrap().unwrap();
+    assert!(job.wait().await.is_err());
+    let busy = tokio::time::timeout(limit, status()).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&busy).unwrap()["status"]["root_io"],
+        json!({"stuck_roots":[root],"charged_workers":1})
+    );
+    let delivered = tokio::time::timeout(
+        limit,
+        owner.on_blocking(|owner| owner.module_get(INCUMBENT, "a", ConfigGetRequest::new())),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(delivered.active.unwrap().generation, view.generation);
+    let prepared = tokio::time::timeout(
+        limit,
+        owner.on_blocking(|owner| owner.prepare(PlanKind::Change)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(matches!(prepared.kind, PlanKind::Change));
+
+    release.send(()).unwrap();
+    tokio::time::timeout(limit, async {
+        while reader.0.health().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(status().await, idle);
+}
+
 #[test]
 fn config_delivery_get_binds_exact_generation_and_attempt_to_one_child() {
     let (rig, owner) = rig();

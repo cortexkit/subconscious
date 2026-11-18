@@ -31,8 +31,10 @@ fn enumeration(projects: Vec<Value>, workspace: &Path) -> EnumerateReply {
         "generation":7,"incarnation":"registry-process"})).unwrap()
 }
 
-fn snapshot(reply: &EnumerateReply) -> Result<RegistryRevision> {
-    RegistryRevision::from_enumerate(reply, "module", &BTreeSet::from(["project".into()]))
+async fn snapshot(reply: &EnumerateReply) -> Result<RegistryRevision> {
+    let pool = RootIoPool::new().unwrap();
+    RegistryRevision::from_enumerate(&pool, reply, "module", &BTreeSet::from(["project".into()]))
+        .await
 }
 
 #[test]
@@ -68,22 +70,22 @@ fn registry_file_id_parses_both_forms_and_refuses_malformed_text() {
     }
 }
 
-#[test]
-fn registry_snapshot_workspace_then_project_from_fake_enumerate() {
+#[tokio::test]
+async fn registry_snapshot_workspace_then_project_from_fake_enumerate() {
     let dir = ScratchDir::new("registry-snapshot");
     let workspace = dir.join("workspace");
     let local = dir.join("project");
     std::fs::create_dir_all(&workspace).unwrap();
     std::fs::create_dir_all(&local).unwrap();
     let mut reply = enumeration(vec![project("project", vec![])], &workspace);
-    let saved = snapshot(&reply).unwrap();
+    let saved = snapshot(&reply).await.unwrap();
     assert!(saved.projects[0].project_roots.is_empty());
     assert_eq!(
         saved.projects[0].workspace_root.as_ref().unwrap().path,
         workspace
     );
     reply.projects[0] = serde_json::from_value(project("project", vec![root(&local)])).unwrap();
-    let saved = snapshot(&reply).unwrap();
+    let saved = snapshot(&reply).await.unwrap();
     assert_eq!(saved.projects[0].project_roots[0].path, local);
     assert_eq!(
         saved.projects[0].workspace_root.as_ref().unwrap().path,
@@ -151,34 +153,34 @@ fn registry_root_selection_zero_ineligible_one_and_multiple_candidates() {
     assert!(error.detail.contains(second.to_str().unwrap()));
 }
 
-#[test]
-fn registry_identity_absent_malformed_mismatched_and_incarnation_only() {
+#[tokio::test]
+async fn registry_identity_absent_malformed_mismatched_and_incarnation_only() {
     let dir = ScratchDir::new("registry-identities");
     let mut reply = enumeration(vec![project("project", vec![root(&dir)])], &dir);
     reply.workspaces[0].file_id = None;
-    let error = snapshot(&reply).unwrap_err();
+    let error = snapshot(&reply).await.unwrap_err();
     assert_eq!(error.code, "project_registry_unavailable");
     assert!(error.detail.contains("project"));
     reply.workspaces[0].file_id = Some(file_id(&dir));
     for bad in ["broken", "unix:0:0"] {
         reply.projects[0].root_records.as_mut().unwrap()[0].file_id = Some(bad.into());
-        let error = snapshot(&reply).unwrap_err();
+        let error = snapshot(&reply).await.unwrap_err();
         assert_eq!(error.code, "project_registry_unavailable");
         assert!(error.detail.contains("project"));
     }
     let record = &mut reply.projects[0].root_records.as_mut().unwrap()[0];
     record.file_id = None;
-    assert!(!snapshot(&reply).unwrap().projects[0]
+    assert!(!snapshot(&reply).await.unwrap().projects[0]
         .project_roots
         .is_empty());
     reply.projects[0].root_records.as_mut().unwrap()[0].incarnation = None;
-    assert!(snapshot(&reply).unwrap().projects[0]
+    assert!(snapshot(&reply).await.unwrap().projects[0]
         .project_roots
         .is_empty());
 }
 
-#[test]
-fn registry_commit_recheck_ignores_unrelated_edits_but_refuses_affected_changes() {
+#[tokio::test]
+async fn registry_commit_recheck_ignores_unrelated_edits_but_refuses_affected_changes() {
     let dir = ScratchDir::new("registry-recheck");
     let reply = enumeration(
         vec![
@@ -187,12 +189,12 @@ fn registry_commit_recheck_ignores_unrelated_edits_but_refuses_affected_changes(
         ],
         &dir,
     );
-    let saved = snapshot(&reply).unwrap();
+    let saved = snapshot(&reply).await.unwrap();
     let mut unrelated = reply.clone();
     unrelated.generation += 1;
     unrelated.incarnation = "another-registry-process".into();
     unrelated.projects[1].workspace_id = None;
-    let current = snapshot(&unrelated).unwrap();
+    let current = snapshot(&unrelated).await.unwrap();
     saved.recheck(&current).unwrap();
     assert_eq!(saved.digest().unwrap(), current.digest().unwrap());
     for change in [
@@ -238,7 +240,7 @@ fn registry_commit_recheck_ignores_unrelated_edits_but_refuses_affected_changes(
 
 #[tokio::test]
 async fn registry_recheck_rereads_only_the_saved_projects() {
-    struct FakeRegistry(std::sync::Mutex<EnumerateReply>);
+    struct FakeRegistry(std::sync::Mutex<EnumerateReply>, RootIoPool);
     impl ProjectRegistry for FakeRegistry {
         fn snapshot<'a>(
             &'a self,
@@ -246,7 +248,8 @@ async fn registry_recheck_rereads_only_the_saved_projects() {
             affected: &'a BTreeSet<String>,
         ) -> RegistryFuture<'a> {
             Box::pin(async move {
-                RegistryRevision::from_enumerate(&self.0.lock().unwrap(), module, affected)
+                let reply = self.0.lock().unwrap().clone();
+                RegistryRevision::from_enumerate(&self.1, &reply, module, affected).await
             })
         }
     }
@@ -258,7 +261,7 @@ async fn registry_recheck_rereads_only_the_saved_projects() {
         ],
         &dir,
     );
-    let reader = FakeRegistry(std::sync::Mutex::new(reply));
+    let reader = FakeRegistry(std::sync::Mutex::new(reply), RootIoPool::new().unwrap());
     let saved = reader
         .snapshot("module", &BTreeSet::from(["project".into()]))
         .await
@@ -287,7 +290,7 @@ fn registry_windows_real_directory_file_index_matches_and_mismatch_refuses() {
     let dir = ScratchDir::new("registry-windows-index");
     let file = subc_os::open_directory_nofollow_all(&dir).unwrap();
     let identity = RegistryFileId::parse(&file_id(&dir)).unwrap();
-    assert!(identity.matches(&file).unwrap());
+    assert_eq!(identity, RegistryFileId::read(&file).unwrap());
     let RegistryFileId::Windows {
         volume_serial,
         file_index,
@@ -295,10 +298,100 @@ fn registry_windows_real_directory_file_index_matches_and_mismatch_refuses() {
     else {
         panic!("not Windows")
     };
-    assert!(!RegistryFileId::Windows {
-        volume_serial,
-        file_index: file_index ^ 1
+    assert_ne!(
+        RegistryFileId::Windows {
+            volume_serial,
+            file_index: file_index ^ 1
+        },
+        RegistryFileId::read(&file).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn registry_snapshot_validates_25_roots_with_bounded_submissions() {
+    let dir = ScratchDir::new("registry-many-roots");
+    let mut projects = Vec::new();
+    let mut affected = BTreeSet::new();
+    for index in 0..25 {
+        let id = format!("project-{index:02}");
+        let path = dir.join(&id);
+        std::fs::create_dir(&path).unwrap();
+        projects.push(project(&id, vec![root(&path)]));
+        affected.insert(id);
     }
-    .matches(&file)
-    .unwrap());
+    let reply = enumeration(projects, &dir);
+    let pool = RootIoPool::new().unwrap();
+    let revision = RegistryRevision::from_enumerate(&pool, &reply, "module", &affected)
+        .await
+        .unwrap();
+    assert_eq!(revision.projects.len(), 25);
+    assert!(pool.health().is_none());
+}
+
+#[tokio::test]
+async fn registry_root_outcomes_keep_healthy_and_refused_roots_distinct() {
+    use std::{sync::mpsc, time::Duration};
+
+    let dir = ScratchDir::new("registry-root-outcomes");
+    let [blocked, gone, mismatched, healthy] =
+        ["blocked", "gone", "mismatch", "healthy"].map(|name| {
+            let path = dir.join(name);
+            std::fs::create_dir(&path).unwrap();
+            path
+        });
+    let mut mismatch = root(&mismatched);
+    mismatch["fileId"] = json!(file_id(&healthy));
+    let reply = enumeration(
+        vec![project(
+            "project",
+            vec![root(&blocked), root(&gone), mismatch, root(&healthy)],
+        )],
+        &dir,
+    );
+    std::fs::remove_dir(&gone).unwrap();
+    let pool = RootIoPool::with_timeout(Duration::from_millis(300)).unwrap();
+    let (release, wait) = mpsc::channel();
+    let (entered, signal) = tokio::sync::oneshot::channel();
+    let job = pool
+        .submit(blocked.clone(), move || {
+            entered.send(()).unwrap();
+            let _ = wait.recv();
+        })
+        .unwrap();
+    signal.await.unwrap();
+    assert_eq!(job.wait().await, Err(RootIoError::DeadlineElapsed));
+
+    let affected = BTreeSet::from(["project".into()]);
+    let revision = RegistryRevision::parse_enumeration(&reply, "module", &affected).unwrap();
+    let outcomes: BTreeMap<_, _> = revision
+        .check_roots(&pool)
+        .await
+        .into_iter()
+        .map(|root| (root.path, root.outcome))
+        .collect();
+    assert!(matches!(
+        outcomes[blocked.as_path()],
+        Err(RootCheckFailure::Pool(RootIoError::RootBusy))
+    ));
+    assert!(matches!(
+        outcomes[gone.as_path()],
+        Err(RootCheckFailure::OpenRefused(_))
+    ));
+    assert!(matches!(
+        outcomes[mismatched.as_path()],
+        Err(RootCheckFailure::IdentityMismatch)
+    ));
+    assert!(outcomes[healthy.as_path()].is_ok());
+    assert!(outcomes[dir.as_ref() as &Path].is_ok());
+    let legacy = RegistryRevision::from_enumerate(&pool, &reply, "module", &affected)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        legacy,
+        unavailable(format!(
+            "project: root {} is unavailable or its fileId changed",
+            blocked.display()
+        ))
+    );
+    release.send(()).unwrap();
 }

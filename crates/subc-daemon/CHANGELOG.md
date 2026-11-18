@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.50.9
+
+- Validate registry roots on a dedicated bounded I/O pool and report outstanding
+  past-deadline jobs in `config.status`.
+- `RegistryRevision::from_enumerate` is now async and takes a `&RootIoPool`.
+
 ## 0.50.8
 
 - Build with subc-control 0.42.3 and subc-protocol 0.37.5 while keeping settings

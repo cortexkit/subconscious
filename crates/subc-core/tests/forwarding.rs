@@ -3137,8 +3137,9 @@ async fn ordinary_long_running_request_is_not_excluded_and_holds_drain() {
     )
     .await;
     let held_corr = 422;
+    // Outlast the reload; the stub drops delayed replies when its connection closes.
     let held_payload =
-        br#"{"delay_ms":500,"uncancellable":true,"jsonrpc":"2.0","id":"reload-timeout"}"#;
+        br#"{"delay_ms":60000,"uncancellable":true,"jsonrpc":"2.0","id":"reload-timeout"}"#;
     write_frame(
         &mut route_client,
         &data_request(ack.route_channel, ack.route_epoch, held_corr, held_payload),
@@ -3229,8 +3230,9 @@ async fn bit_set_subscription_is_excluded_and_reported_by_route_closed() {
     )
     .await;
     let held_corr = 462;
+    // Outlast the reload; the stub drops delayed replies when its connection closes.
     let held_payload =
-        br#"{"delay_ms":500,"uncancellable":true,"jsonrpc":"2.0","id":"subscription"}"#;
+        br#"{"delay_ms":60000,"uncancellable":true,"jsonrpc":"2.0","id":"subscription"}"#;
     write_frame(
         &mut route_client,
         &subscription_request(ack.route_channel, ack.route_epoch, held_corr, held_payload),

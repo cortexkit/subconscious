@@ -144,6 +144,8 @@ impl LocalHub for FakeLocalHub {
 #[derive(Default)]
 struct FakeLinks {
     up: AtomicBool,
+    /// The peer address an up link reports; `None` means a direct link to 10.0.0.1:7422.
+    peer: Mutex<Option<(String, u16)>>,
     kicks: Mutex<Vec<u64>>,
 }
 
@@ -152,11 +154,17 @@ impl LeafLinks for FakeLinks {
     async fn leafs(&self, account: &str) -> Result<Vec<LeafLink>, String> {
         assert_eq!(account, ACCOUNT);
         Ok(if self.up.load(Ordering::SeqCst) {
+            let (ip, port) = self
+                .peer
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| ("10.0.0.1".to_string(), 7422));
             vec![LeafLink {
                 server_id: "NSERVER".to_string(),
                 id: 7,
-                ip: "10.0.0.1".to_string(),
-                port: 7422,
+                ip,
+                port,
             }]
         } else {
             Vec::new()
@@ -490,9 +498,25 @@ async fn the_bridge_opens_after_one_failed_round_and_comes_last() {
         ])
     );
     assert_eq!(remotes[0]["name"], name_before, "a new URL keeps the name");
+    *fixture.links.peer.lock().unwrap() = Some(("127.0.0.1".to_string(), 49152));
     fixture.links.up.store(true, Ordering::SeqCst);
     fixture.at(22).await;
     assert_eq!(fixture.metric("fed.remote_state"), "connected_via_bridge");
+}
+
+#[tokio::test]
+async fn a_direct_link_reports_connected_while_a_bridge_is_open() {
+    let fixture = Fixture::new();
+    fixture
+        .area
+        .apply_hub(peer(&[("10.0.0.1", 7422), ("10.0.0.2", 7422)]));
+    fixture.at(0).await;
+    fixture.at(20).await;
+    assert_eq!(*fixture.callosum.bridges.lock().unwrap(), vec![HUB]);
+    // The engine reached a direct candidate after the bridge opened.
+    fixture.links.up.store(true, Ordering::SeqCst);
+    fixture.at(22).await;
+    assert_eq!(fixture.metric("fed.remote_state"), "connected");
 }
 
 #[tokio::test]

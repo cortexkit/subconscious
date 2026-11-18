@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.9.1
+
+- `fed.remote_state` reports `connected_via_bridge` only when the live leaf link's peer is
+  the relay bridge's port. An open bridge alone no longer marks a direct link as bridged.
+
 ## 0.9.0
 
 - Require cortexkit-bus-naming 0.5.0: prefrontal owns the delivery and EVENT

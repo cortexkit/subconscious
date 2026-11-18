@@ -383,9 +383,18 @@ impl LeafArea {
         };
         self.publish(remote.iter().cloned().collect());
         let mut inner = self.inner();
+        // The bridge is only the last URL the engine tries, so an open bridge says nothing
+        // about the live link. Report it only when a link's peer is the bridge's own port.
+        let via_bridge = inner.bridge.is_some_and(|port| {
+            inner
+                .link
+                .links
+                .iter()
+                .any(|link| link.ip == "127.0.0.1" && link.port == port)
+        });
         inner.remote_state = match (remote.is_some(), inner.link.connected) {
             (false, _) => "no_address",
-            (true, Some(true)) if inner.bridge.is_some() => "connected_via_bridge",
+            (true, Some(true)) if via_bridge => "connected_via_bridge",
             (true, Some(true)) => "connected",
             (true, _) => "connecting",
         };

@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, expect, test } from "bun:test";
+import { afterAll, beforeAll, expect, setDefaultTimeout, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { resolve, join } from "node:path";
@@ -6,6 +6,9 @@ import { removeScratch } from "./remove-scratch";
 
 let dir: string;
 let executable: string;
+// Every test here spawns the compiled runner, and several also run `bun build` first. The
+// Intel macOS CI runner takes longer than bun's 5 s default for those; a hung child still fails.
+setDefaultTimeout(30_000);
 const env = { ...process.env };
 for (const name of Object.keys(env)) {
   const key = process.platform === "win32" ? name.toUpperCase() : name;

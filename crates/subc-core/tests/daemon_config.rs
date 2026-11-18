@@ -1539,11 +1539,8 @@ async fn ck_module_rescan_pending_policy_edits_are_visible_in_status_and_json() 
             assert_eq!(result["unchanged"], 0);
             assert_eq!(result["changed_pending"][0]["module_id"], module_id);
             assert_eq!(
-                result["changed_pending"][0]["fields"]
-                    .as_array()
-                    .unwrap()
-                    .len(),
-                2
+                result["changed_pending"][0]["fields"],
+                json!([{"field":"register_timeout_s","applies":"next_supervision"}])
             );
         } else {
             assert!(stdout.contains("changed, pending"), "{stdout}");
@@ -1578,7 +1575,7 @@ async fn ck_module_rescan_pending_policy_edits_are_visible_in_status_and_json() 
                 ),
                 "{stdout}"
             );
-            assert!(stdout.contains("registration channel true pending: applies through an approved config-gate plan"), "{stdout}");
+            assert!(!stdout.contains("registration channel"), "{stdout}");
         }
     }
 }

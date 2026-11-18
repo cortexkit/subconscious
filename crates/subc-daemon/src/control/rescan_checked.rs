@@ -212,6 +212,7 @@ impl ControlHandler {
         proposed: Option<&ConfiguredModule>,
         applies_configuration: bool,
         approved_registration_channel: Option<bool>,
+        publication: Option<&crate::config_gate::runtime::Published>,
     ) -> Result<Vec<subc_control::SupervisorPendingField>, String> {
         let id = module.module_id();
         let (recorded, registration_channel) = self
@@ -251,7 +252,24 @@ impl ControlHandler {
             Some(self.route_bind_relay_timeout_for(id).as_millis() as u64);
         current.registration_channel =
             approved_registration_channel.unwrap_or(registration_channel);
-        Ok(entry_pending_fields(&current, &next, applies_configuration))
+        let mut fields = entry_pending_fields(&current, &next, applies_configuration);
+        // The caller passes the publication it already read for the whole
+        // list, so a status of many modules reads it once. With no settings
+        // owner, or one reporting an unstamped install, nothing is pending.
+        // An unreadable publication keeps the field, as the safer report.
+        let unstamped = match &self.config_runtime {
+            None => true,
+            Some(_) => publication.is_some_and(|view| {
+                matches!(
+                    view.approved_daemon,
+                    crate::config_gate::runtime::ApprovedDaemonView::NotStamped
+                )
+            }),
+        };
+        if unstamped {
+            fields.retain(|field| field.field != "registration_channel");
+        }
+        Ok(fields)
     }
 }
 

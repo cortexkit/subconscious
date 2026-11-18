@@ -57,6 +57,25 @@ pub(crate) struct RequirementStatus {
     pub detail: String,
 }
 
+impl RequirementStatus {
+    /// The `supervisor.health` row for this requirement.
+    pub(crate) fn into_wire(self) -> subc_control::CapabilityRequirementStatus {
+        subc_control::CapabilityRequirementStatus {
+            consumer: self.consumer,
+            capability: self.capability,
+            need: match self.need {
+                CapabilityNeed::Required => "required".to_string(),
+                CapabilityNeed::Optional => "optional".to_string(),
+            },
+            verdict: self.verdict.as_str().to_string(),
+            episode_seq: self.episode_seq,
+            config_satisfiable: self.config_satisfiable,
+            runtime_available: self.runtime_available,
+            detail: self.detail,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RequirementEvent {
     pub severity: RequirementSeverity,

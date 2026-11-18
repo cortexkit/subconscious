@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.50.11
+
+- Do not report registration channel changes as pending on installs without a
+  protected settings store.
+
 ## 0.50.10
 
 - Stop settings watches from waking themselves and coalesce bursts of changes.

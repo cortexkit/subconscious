@@ -294,6 +294,28 @@ async fn rescan_status_shows_pending_register_timeout_until_new_supervision() {
 }
 
 #[tokio::test]
+async fn rescan_unstamped_registration_channel_is_not_pending() {
+    let dir = ScratchDir::new("rescan-unstamped-registration");
+    let rig = Rig::new(&dir.path().join("subc.jsonc"), "unstamped-registration");
+    rig.write(&doc(json!({"worker": entry(false)})));
+    rig.apply_file().await;
+    let mut next = entry(false);
+    next["registration_channel"] = json!(true);
+    rig.write(&doc(json!({"worker": next})));
+    for preview in [true, false] {
+        let result = rig
+            .rescan(ClientControlRequest::SupervisorRescan { preview })
+            .await
+            .unwrap();
+        assert!(result.changed_pending.is_empty(), "{result:?}");
+        assert_eq!(result.unchanged, 1);
+    }
+    let status = rig.send(ClientControlRequest::SupervisorList {}).await;
+    let status: Value = serde_json::from_slice(&status.body).unwrap();
+    assert!(status["modules"][0].get("pending").is_none(), "{status}");
+}
+
+#[tokio::test]
 async fn rescan_pending_covers_every_non_launch_policy_without_applying_it() {
     for (field, value, applies) in [
         ("restart", json!({"max_restarts": 9}), "next_supervision"),
@@ -307,7 +329,6 @@ async fn rescan_pending_covers_every_non_launch_policy_without_applying_it() {
             json!(60000),
             "daemon_restart",
         ),
-        ("registration_channel", json!(true), "config_gate"),
     ] {
         let dir = ScratchDir::new("rescan-policy-pending");
         let rig = Rig::new(&dir.path().join("subc.jsonc"), "pending-policy");

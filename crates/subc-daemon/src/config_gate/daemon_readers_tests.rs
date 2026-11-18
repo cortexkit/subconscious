@@ -107,6 +107,37 @@ async fn handler(
 }
 
 #[tokio::test]
+async fn config_readers_registration_channel_pending_depends_on_stamp() {
+    for stamped in [false, true] {
+        let rig = Rig::new();
+        let owner = Arc::new(rig.owner("reader-registration-pending"));
+        if stamped {
+            rig.stamp(&owner);
+        }
+        let (handler, module, _) = handler(&rig, owner).await;
+        let path = rig.path.join("subc.jsonc");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        config["modules"]["a"]["registration_channel"] = json!(false);
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let reply = request(&handler, json!({"op":"supervisor.rescan","preview":true})).await;
+        if stamped {
+            assert_eq!(
+                reply["changed_pending"],
+                json!([{
+                    "module_id":"a",
+                    "fields":[{"field":"registration_channel","applies":"config_gate"}]
+                }]),
+                "{reply}"
+            );
+        } else {
+            assert!(reply.get("changed_pending").is_none(), "{reply}");
+        }
+        module.stop().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn config_readers_preview_records_files_candidate_records_nothing() {
     let rig = Rig::new();
     let owner = Arc::new(rig.owner("reader-preview"));

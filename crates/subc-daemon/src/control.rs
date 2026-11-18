@@ -1952,7 +1952,7 @@ impl ControlHandler {
         self.capability_evaluator
             .statuses()
             .into_iter()
-            .map(capability_requirement_status)
+            .map(RequirementStatus::into_wire)
             .collect()
     }
 
@@ -7658,6 +7658,7 @@ impl ControlHandler {
                             .as_deref(),
                         pending_entry.map(|entry| entry.registration_channel),
                     ),
+                    publication.as_deref(),
                 )
                 .map_err(|err| RouterError::backend(0, frame.header.corr, err))?;
             let script = configured.script.as_ref().map(|entry| {
@@ -8741,6 +8742,7 @@ impl ControlHandler {
                             _ => None,
                         }),
                 ),
+                publication.as_deref(),
             )?;
             let has_pending = !pending.is_empty();
             if has_pending {
@@ -9705,22 +9707,6 @@ impl Default for ControlHandler {
 impl crate::supervise::SwapPromotionObserver for ControlHandler {
     fn swap_promoted(&self, registration: &crate::registry::ModuleRegistration) {
         self.apply_registration_capabilities(registration);
-    }
-}
-
-fn capability_requirement_status(status: RequirementStatus) -> CapabilityRequirementStatus {
-    CapabilityRequirementStatus {
-        consumer: status.consumer,
-        capability: status.capability,
-        need: match status.need {
-            subc_protocol::manifest::CapabilityNeed::Required => "required".to_string(),
-            subc_protocol::manifest::CapabilityNeed::Optional => "optional".to_string(),
-        },
-        verdict: status.verdict.as_str().to_string(),
-        episode_seq: status.episode_seq,
-        config_satisfiable: status.config_satisfiable,
-        runtime_available: status.runtime_available,
-        detail: status.detail,
     }
 }
 

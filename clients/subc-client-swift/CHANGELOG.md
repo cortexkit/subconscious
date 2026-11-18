@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Bound every `SubcFed` session transport write to ten seconds by default
+  (configurable through `FedSessionEngine.Dependencies.transportWriteTimeout`).
+  A timed-out write closes the session, fails queued writers, and cannot update
+  session state if the carrier completes later. Mutations keep the existing
+  possibly-sent versus provably-not-sent distinction for recovery. Management
+  calls, plain and tracked, also stop waiting at their wire `deadline_ms` plus
+  five seconds without closing an otherwise healthy session: mutations report
+  `indeterminateMutation` and remain recoverable through `settledOutcome`.
+  **Breaking:** pure queries can now throw the new public
+  `FedFailure.callTimedOut` case; exhaustive switches must handle it. The new
+  case round-trips through `Codable`.
+
 - Add `SubcFedClient.catalogUpdates()` with client-local generations for applied
   session catalog snapshots, including unchanged contents. Late subscribers
   receive the latest generation immediately; the stream and counter survive

@@ -203,6 +203,9 @@ public enum FedFailure: Error, Codable, Sendable, Equatable {
     case cancelled
     case suspended
     case disconnected
+    /// No reply arrived within the management call's wire deadline plus five
+    /// seconds of local grace. The session remains usable; mutations report uncertainty.
+    case callTimedOut
     /// The remote module answered this call with an error envelope.
     ///
     /// Distinct from `disconnected`, which means the session went away without a
@@ -239,7 +242,7 @@ public enum FedFailure: Error, Codable, Sendable, Equatable {
              accountKeyMismatch, noiseAuthenticationFailed, framingViolation,
              protocolViolation, catalogTargetUnavailable, fedBodyTooLarge,
              fedEffectsUnsupported, storeCorrupt, storeUnavailable, storeMigrationFailed,
-             storeLocked, reservationFailed, persistenceFailed, cancelled, suspended, disconnected,
+             storeLocked, reservationFailed, persistenceFailed, cancelled, suspended, disconnected, callTimedOut,
              moduleError, mutationNotSent, indeterminateMutation, admissionQueueFull, admissionQueueTimedOut,
              noEligibleCandidates, allCandidatesFailed, pairingNotAccepted
     }
@@ -272,6 +275,7 @@ public enum FedFailure: Error, Codable, Sendable, Equatable {
         case .cancelled: self = .cancelled
         case .suspended: self = .suspended
         case .disconnected: self = .disconnected
+        case .callTimedOut: self = .callTimedOut
         case .moduleError:
             self = .moduleError(
                 code: try c.decode(String.self, forKey: .code),
@@ -328,6 +332,7 @@ public enum FedFailure: Error, Codable, Sendable, Equatable {
         case .cancelled: try c.encode(Kind.cancelled, forKey: .kind)
         case .suspended: try c.encode(Kind.suspended, forKey: .kind)
         case .disconnected: try c.encode(Kind.disconnected, forKey: .kind)
+        case .callTimedOut: try c.encode(Kind.callTimedOut, forKey: .kind)
         case .moduleError(let code, let message, let hostRefusal, let detail):
             try c.encode(Kind.moduleError, forKey: .kind)
             try c.encode(code, forKey: .code)
@@ -505,6 +510,8 @@ extension FedFailure: CustomStringConvertible {
             return "The connection is suspended."
         case .disconnected:
             return "Disconnected before a reply arrived."
+        case .callTimedOut:
+            return "Timed out waiting for the remote service to reply."
         case let .moduleError(code, message, _, _):
             // The module's own prose says what to do about it, so prefer it and
             // fall back to the code only when no message was sent.

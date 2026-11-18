@@ -187,6 +187,7 @@ public actor SubcFedClient {
         let startedAtNs: UInt64
         let admittedAtNs: UInt64
         let dispatchStartedAtNs: UInt64
+        let deadlineTask: Task<Void, Never>
     }
 
     var pendingCallCount: Int { pendingCalls.count }
@@ -456,6 +457,10 @@ public actor SubcFedClient {
     /// not-sent outcome fails, the call throws the store's error instead and
     /// the mutation stays undecided. A read-only call throws
     /// `FedFailure.disconnected` as before.
+    /// After admission, the local reply wait is bounded by the wire deadline
+    /// plus five seconds. On a healthy session a read-only call then throws
+    /// `FedFailure.callTimedOut`; a mutation reports `indeterminateMutation`
+    /// and remains available for reconciliation, without closing the session.
     public func callManagement(
         method: String,
         params: FedJSONObject,
@@ -743,6 +748,22 @@ public actor SubcFedClient {
         return try await withTaskCancellationHandler(
             operation: {
                 try await withCheckedThrowingContinuation { continuation in
+                    // The wire budget cannot bound a lost reply on a live
+                    // session. Grace allows a terminal frame already in flight
+                    // to arrive without turning a local timeout into a redial.
+                    let sum = admittedAtNs.addingReportingOverflow((prepared.permit.deadlineMs + 5_000) * 1_000_000)
+                    let deadline = sum.overflow ? UInt64.max : sum.partialValue
+                    let deadlineTask = Task { [weak self, clock] in
+                        do {
+                            try await clock.sleep(untilNanoseconds: deadline)
+                            try Task.checkCancellation()
+                            await self?.resolvePendingCall(seq: seq) { pending in
+                                .failure(await pending.engine.expireManagementCall(pending.prepared))
+                            }
+                        } catch {
+                            // Reply, cancellation, or teardown removed the call.
+                        }
+                    }
                     pendingCalls[seq] = PendingCall(
                         effect: prepared.effect,
                         isMutation: prepared.isMutation,
@@ -753,7 +774,8 @@ public actor SubcFedClient {
                         method: method,
                         startedAtNs: startedAtNs,
                         admittedAtNs: admittedAtNs,
-                        dispatchStartedAtNs: clock.nowNanoseconds()
+                        dispatchStartedAtNs: clock.nowNanoseconds(),
+                        deadlineTask: deadlineTask
                     )
                     Task { [weak self] in
                         do {
@@ -1609,6 +1631,7 @@ public actor SubcFedClient {
             pendingCalls.removeAll()
         }
         for call in pending {
+            call.deadlineTask.cancel()
             let result = await result(call)
             call.continuation.resume(with: result)
         }
@@ -1780,6 +1803,7 @@ public actor SubcFedClient {
         // calls keeps its own typed error, as before.
         var lostMutations: [PendingCall] = []
         for call in pending {
+            call.deadlineTask.cancel()
             if call.isMutation, pendingError == nil {
                 lostMutations.append(call)
             } else {

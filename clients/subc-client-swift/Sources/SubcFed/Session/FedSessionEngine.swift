@@ -20,6 +20,17 @@ public actor FedLoopbackByteTransport: FedSessionByteTransport {
     /// When true, send records bytes then throws (simulates failure after the
     /// first network write).
     public var failAfterSend = false
+    private var holdNextSend = false
+    private var heldSend: CheckedContinuation<Void, Never>?
+    private(set) var releasedSendCount = 0
+
+    var isSendHeld: Bool { heldSend != nil }
+    func setHoldNextSend() { holdNextSend = true }
+    func releaseHeldSend() {
+        let pending = heldSend
+        heldSend = nil
+        pending?.resume()
+    }
 
     public init() {}
 
@@ -37,6 +48,12 @@ public actor FedLoopbackByteTransport: FedSessionByteTransport {
 
     public func send(_ bytes: Data) async throws {
         if closed { throw FedFailure.disconnected }
+        if holdNextSend {
+            holdNextSend = false
+            // Deliberately ignores cancellation and close, like a stuck carrier.
+            await withCheckedContinuation { heldSend = $0 }
+            releasedSendCount += 1
+        }
         if failNextSend {
             failNextSend = false
             throw FedFailure.disconnected
@@ -204,6 +221,8 @@ public actor FedSessionEngine {
         public var transport: any FedSessionByteTransport
         public var store: any FedStateStore
         public var clock: any FedMonotonicClock
+        /// Bounds a carrier write even when its send ignores task cancellation.
+        public var transportWriteTimeout: Duration
         public var localPublicKey: Data
         public var responderStaticPublicKey: Data
         public var helloPolicy: FedHelloPolicy
@@ -233,11 +252,13 @@ public actor FedSessionEngine {
             sharedAdmission: FedAdmissionController? = nil,
             sharedEffectLog: FedOriginEffectLog? = nil,
             handshakeHash: Data? = nil,
-            appAttestProvider: (any FedAppAttestProvider)? = nil
+            appAttestProvider: (any FedAppAttestProvider)? = nil,
+            transportWriteTimeout: Duration = .seconds(10)
         ) {
             self.transport = transport
             self.store = store
             self.clock = clock
+            self.transportWriteTimeout = transportWriteTimeout
             self.localPublicKey = localPublicKey
             self.responderStaticPublicKey = responderStaticPublicKey
             self.helloPolicy = helloPolicy
@@ -268,6 +289,10 @@ public actor FedSessionEngine {
     private var streamDecoder = FedFrameStreamDecoder(negotiationComplete: false)
     private var writingFrame = false
     private var writeWaiters: [CheckedContinuation<Void, Error>] = []
+    private var frameWriteID: UUID?
+    private var frameWriteContinuation: CheckedContinuation<Void, Error>?
+    private var frameWriteTasks: [Task<Void, Never>] = []
+    var frameWriterWaiterCount: Int { writeWaiters.count }
     private var role: FedSessionRole = .primary
     private var drain: FedRekeyDrainPolicy?
     private var admission: FedAdmissionController?
@@ -278,7 +303,7 @@ public actor FedSessionEngine {
     private var cancelledActivities = false
     private var admittedEffectSequences: Set<UInt64> = []
     private var openPureQuerySequences: Set<UInt64> = []
-    /// Set once a `transport.send` has thrown. The send may have written part
+    /// Set once a `transport.send` has thrown or timed out. It may have written part
     /// of a frame, so anything written after it would be misframed; no
     /// further write is attempted on this session. It also means a request
     /// still waiting to write will never leave the device on this session.
@@ -698,6 +723,15 @@ public actor FedSessionEngine {
         await admission?.release(permit)
     }
 
+    /// A lost reply does not make a mutation safe to repeat, even while the
+    /// session is healthy. Keep its intent for the usual reconnect reconciliation.
+    func expireManagementCall(_ prepared: FedPreparedManagementCall) async -> any Error {
+        if prepared.isMutation { return await resolveMutationLostWithSession(prepared) }
+        openPureQuerySequences.remove(prepared.effect.seq)
+        await releasePermit(prepared.permit)
+        return FedFailure.callTimedOut
+    }
+
     /// The `mutationNotSent` code for a mutation whose session ended before
     /// its request reached the transport. It is local to this library and
     /// never appears on the wire.
@@ -1073,6 +1107,7 @@ public actor FedSessionEngine {
         timerDeadlineChanged = nil
         lastFailure = reason
         phase = .closed
+        if let id = frameWriteID { finishFrameWrite(id: id, result: .failure(reason)) }
         for waiter in writeWaiters { waiter.resume(throwing: reason) }
         writeWaiters.removeAll()
         if var activeKeepalive = keepalive {
@@ -1289,25 +1324,68 @@ public actor FedSessionEngine {
         defer { releaseFrameWriter() }
         guard !cancelledActivities else { throw FedFailure.cancelled }
         guard !transportWriteFailed else { throw FedFailure.disconnected }
-        // No suspension is allowed between the caller's check and transport handoff.
-        try preSendGate?.checkAndNoteWriteAttempt()
-        // Marked before the transport is entered, not after it returns: a
-        // send that throws may still have delivered some bytes. With no
-        // suspension between the checks above and this mark, a session that
-        // is disconnected or whose transport failed never gains a new mark.
-        writeRecord?.noteReachedTransport()
-        do {
-            try await deps.transport.send(bytes)
-        } catch {
-            transportWriteFailed = true
-            throw error
+        let now = deps.clock.nowNanoseconds()
+        let sum = now.addingReportingOverflow(fedDurationNanoseconds(deps.transportWriteTimeout))
+        let deadline = sum.overflow ? UInt64.max : sum.partialValue
+        try await withCheckedThrowingContinuation { continuation in
+            let id = UUID()
+            frameWriteID = id
+            frameWriteContinuation = continuation
+            // A task group would wait for a cancellation-insensitive send even
+            // after its timer won. Only the winner can resume this write; a late
+            // carrier completion cannot update frame history or keepalive state.
+            frameWriteTasks = [Task {
+                guard !cancelledActivities, frameWriteID == id else { return }
+                do {
+                    // No suspension between the caller's check and handoff.
+                    try preSendGate?.checkAndNoteWriteAttempt()
+                    writeRecord?.noteReachedTransport()
+                    do {
+                        try await deps.transport.send(bytes)
+                    } catch {
+                        if frameWriteID == id { transportWriteFailed = true }
+                        throw error
+                    }
+                    finishFrameWrite(id: id, result: .success(()))
+                } catch {
+                    finishFrameWrite(id: id, result: .failure(error))
+                }
+            }, Task {
+                do {
+                    try await deps.clock.sleep(untilNanoseconds: deadline)
+                    try Task.checkCancellation()
+                    guard frameWriteID == id else { return }
+                    transportWriteFailed = true
+                    timerFailureCause = "write timeout"
+                    await disconnect(reason: .disconnected)
+                } catch is CancellationError {
+                    // A completed write or teardown cancels its timer.
+                } catch {
+                    guard frameWriteID == id else { return }
+                    transportWriteFailed = true
+                    timerFailureCause = "write timer failure"
+                    await disconnect(reason: .disconnected)
+                }
+            }]
         }
+        guard !cancelledActivities else { throw lastFailure ?? FedFailure.disconnected }
         // Watch requests must not accumulate payload history for the life of a session.
         if !FedSubscriptionCodec.frameTypes.contains(frame.typeName ?? "") { emittedFrames.append(frame) }
         if var activeKeepalive = keepalive {
             activeKeepalive.noteOutboundFrame(at: deps.clock.nowNanoseconds())
             keepalive = activeKeepalive
         }
+    }
+
+    private func finishFrameWrite(id: UUID, result: Result<Void, Error>) {
+        guard frameWriteID == id else { return }
+        frameWriteID = nil
+        let continuation = frameWriteContinuation
+        frameWriteContinuation = nil
+        let tasks = frameWriteTasks
+        frameWriteTasks.removeAll()
+        tasks.forEach { $0.cancel() }
+        continuation?.resume(with: result)
     }
 
     private func acquireFrameWriter() async throws {

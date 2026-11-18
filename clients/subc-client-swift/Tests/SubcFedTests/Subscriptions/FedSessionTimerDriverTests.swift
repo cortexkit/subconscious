@@ -534,8 +534,11 @@ final class FedSessionTimerDriverTests: XCTestCase {
         let client = try TimerHarness.makeClient(clock: clock, factory: RecordingDialFactory { _, _ in try await queue.next() })
         try await client.connect()
         try await eventually { clock.deadlines == [16_000_000_000] }
+        // Completed writes cancel their own deadlines too; isolate the one
+        // cancellation caused by stopping the old session's timer driver.
+        let beforeSuspend = clock.cancellationCount
         await client.suspend()
-        try await eventually { clock.cancellationCount == 1 && clock.deadlines.isEmpty }
+        try await eventually { clock.cancellationCount == beforeSuspend + 1 && clock.deadlines.isEmpty }
         clock.advance(seconds: 44)
         try await client.resume()
         let h = TimerHarness(client: client, transport: secondTransport, engine: secondEngine, clock: clock)
@@ -550,8 +553,9 @@ final class FedSessionTimerDriverTests: XCTestCase {
         XCTAssertTrue(isReady)
         let oldCount = await firstTransport.count("keepalive")
         XCTAssertEqual(oldCount, 0)
+        let beforeDisconnect = clock.cancellationCount
         await client.disconnect()
-        try await eventually { clock.cancellationCount >= 2 && clock.deadlines.isEmpty }
+        try await eventually { clock.cancellationCount >= beforeDisconnect + 1 && clock.deadlines.isEmpty }
         clock.advance(seconds: 60)
         let newCount = await secondTransport.count("keepalive")
         XCTAssertEqual(newCount, 0)

@@ -9,7 +9,7 @@ usage() {
 Usage: macos-daemon-bundle.sh <ck-subc> <profile> <signing identity> <out dir>
        macos-daemon-bundle.sh --unentitled <ck-subc> <out dir>
 
-Build CortexKit Daemon.app, sign with hardened runtime and a timestamp, and
+Build Subconscious.app, sign with hardened runtime and a timestamp, and
 verify its signature and exact entitlements. The profile must authorize
 5R5846NBPW.io.cortexkit.daemon. The output bundle must not already exist.
 
@@ -39,7 +39,7 @@ else
   out_dir=$4
 fi
 [[ -x "$binary" && -f "$binary" ]] || fail "daemon binary is not executable: $binary"
-bundle="$out_dir/CortexKit Daemon.app"
+bundle="$out_dir/Subconscious.app"
 [[ ! -e "$bundle" ]] || fail "refusing to overwrite existing bundle: $bundle"
 created_out=0
 if [[ ! -d "$out_dir" ]]; then created_out=1; fi
@@ -119,7 +119,8 @@ minimum = max(minimums, key=lambda value: tuple(map(int, value.split("."))))
 info = {
     "CFBundleIdentifier": "io.cortexkit.daemon",
     "CFBundleExecutable": "ck-subc",
-    "CFBundleName": "CortexKit Daemon",
+    "CFBundleName": "Subconscious",
+    "CFBundleDisplayName": "Subconscious",
     "CFBundlePackageType": "APPL",
     "CFBundleVersion": match[1],
     "CFBundleShortVersionString": match[1],

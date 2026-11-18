@@ -103,13 +103,14 @@ import sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
-contents = root / "good/CortexKit Daemon.app/Contents"
+contents = root / "good/Subconscious.app/Contents"
 assert (contents / "MacOS/ck-subc").read_bytes() == (root / "ck-subc").read_bytes()
 assert (contents / "embedded.provisionprofile").read_bytes() == (root / "profile").read_bytes()
 assert plistlib.loads((contents / "Info.plist").read_bytes()) == {
     "CFBundleIdentifier": "io.cortexkit.daemon",
     "CFBundleExecutable": "ck-subc",
-    "CFBundleName": "CortexKit Daemon",
+    "CFBundleName": "Subconscious",
+    "CFBundleDisplayName": "Subconscious",
     "CFBundlePackageType": "APPL",
     "CFBundleVersion": "1.2.3",
     "CFBundleShortVersionString": "1.2.3",
@@ -125,23 +126,23 @@ if "$SCRIPT_DIR/macos-daemon-bundle.sh" "$FIXTURE_DIR/ck-subc" "$FIXTURE_DIR/wro
   echo 'wrong application-identifier profile was accepted' >&2; exit 1
 fi
 grep -Fq 'refusing daemon profile: application-identifier' "$FIXTURE_DIR/error"
-[[ ! -e "$CK_TEST_BUNDLE_LOG" && ! -e "$FIXTURE_DIR/wrong/CortexKit Daemon.app" ]]
+[[ ! -e "$CK_TEST_BUNDLE_LOG" && ! -e "$FIXTURE_DIR/wrong/Subconscious.app" ]]
 
 if CK_TEST_WRONG_ENTITLEMENTS=1 "$SCRIPT_DIR/macos-daemon-bundle.sh" "$FIXTURE_DIR/ck-subc" "$FIXTURE_DIR/profile" 'Developer ID fixture' "$FIXTURE_DIR/mismatch" > "$FIXTURE_DIR/error" 2>&1; then
   echo 'mismatched signed entitlements were accepted' >&2; exit 1
 fi
 grep -Fq 'signed entitlements differ' "$FIXTURE_DIR/error"
-[[ ! -e "$FIXTURE_DIR/mismatch/CortexKit Daemon.app" ]]
+[[ ! -e "$FIXTURE_DIR/mismatch/Subconscious.app" ]]
 
 if CK_TEST_NO_BUILD_VERSION=1 "$SCRIPT_DIR/macos-daemon-bundle.sh" --unentitled "$FIXTURE_DIR/ck-subc" "$FIXTURE_DIR/no-build" > "$FIXTURE_DIR/error" 2>&1; then
   echo 'missing Mach-O build version was accepted' >&2; exit 1
 fi
 grep -Fq 'vtool found no LC_BUILD_VERSION' "$FIXTURE_DIR/error"
-[[ ! -e "$FIXTURE_DIR/no-build/CortexKit Daemon.app" ]]
+[[ ! -e "$FIXTURE_DIR/no-build/Subconscious.app" ]]
 
 CK_TEST_UNENTITLED=1 "$SCRIPT_DIR/macos-daemon-bundle.sh" --unentitled "$FIXTURE_DIR/ck-subc" "$FIXTURE_DIR/alpha"
-[[ ! -e "$FIXTURE_DIR/alpha/CortexKit Daemon.app/Contents/embedded.provisionprofile" ]]
-[[ -f "$FIXTURE_DIR/alpha/CortexKit Daemon.app/Contents/MacOS/ck-subc" ]]
+[[ ! -e "$FIXTURE_DIR/alpha/Subconscious.app/Contents/embedded.provisionprofile" ]]
+[[ -f "$FIXTURE_DIR/alpha/Subconscious.app/Contents/MacOS/ck-subc" ]]
 if "$SCRIPT_DIR/macos-daemon-bundle.sh" "$FIXTURE_DIR/ck-subc" "$FIXTURE_DIR/alternate-key" 'Developer ID fixture' "$FIXTURE_DIR/alternate-output" > "$FIXTURE_DIR/error" 2>&1; then
   echo 'wrong application-identifier alias profile was accepted' >&2; exit 1
 fi

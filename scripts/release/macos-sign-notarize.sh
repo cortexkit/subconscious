@@ -51,7 +51,7 @@ for binary in "${BINARIES[@]}"; do # nonempty-array: literal release binaries
 
   if [[ "$binary" == ck-subc ]]; then
     "$SCRIPT_DIR/macos-daemon-bundle.sh" "$binary_path" "$MACOS_DAEMON_PROFILE_PATH" "$identity" "$SOURCE_DIR"
-    binary_path="$SOURCE_DIR/CortexKit Daemon.app"
+    binary_path="$SOURCE_DIR/Subconscious.app"
   elif [[ "$binary" == ck-script-runner-bun ]]; then
     codesign --force --options runtime --timestamp --entitlements "$SCRIPT_DIR/../../clients/script-runner/entitlements.plist" --sign "$identity" "$binary_path"
     codesign -d --entitlements :- "$binary_path" 2>/dev/null | python3 "$SCRIPT_DIR/check-runner-entitlements.py"
@@ -132,10 +132,10 @@ for binary in "${BINARIES[@]}"; do # nonempty-array: literal release binaries
 
   if [[ "$binary" == ck-subc ]]; then
     # Staple the app, not its transport zip, then publish the stapled bytes.
-    xcrun stapler staple "$SOURCE_DIR/CortexKit Daemon.app"
-    xcrun stapler validate "$SOURCE_DIR/CortexKit Daemon.app"
+    xcrun stapler staple "$SOURCE_DIR/Subconscious.app"
+    xcrun stapler validate "$SOURCE_DIR/Subconscious.app"
     rm -f "$archive"
-    ditto -c -k --keepParent "$SOURCE_DIR/CortexKit Daemon.app" "$archive"
+    ditto -c -k --keepParent "$SOURCE_DIR/Subconscious.app" "$archive"
   # Other binaries keep their existing notarized-but-unstapled fallback:
   # transport zips cannot always receive a ticket immediately.
   elif ! xcrun stapler staple "$archive"; then

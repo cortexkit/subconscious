@@ -11,7 +11,7 @@ use super::{
     runtime::{self, CommandRunner, RuntimePaths, RuntimePlatform},
 };
 
-pub(super) const NAME: &str = "CortexKit Daemon.app";
+pub(super) const NAME: &str = "Subconscious.app";
 const APP_ID: &str = "5R5846NBPW.io.cortexkit.daemon";
 const EXECUTABLE: &str = "Contents/MacOS/ck-subc";
 

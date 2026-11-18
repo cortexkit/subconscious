@@ -54,7 +54,7 @@ for binary in ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-pytho
 done
 printf 'Unix package fixtures passed (7 archives and sidecars, test-support refusal)\n'
 if command -v ditto >/dev/null; then
-  bundle="$FIXTURE_DIR/source/CortexKit Daemon.app"
+  bundle="$FIXTURE_DIR/source/Subconscious.app"
   mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/_CodeSignature"
   cp "$FIXTURE_DIR/source/ck-subc" "$bundle/Contents/MacOS/ck-subc"
   printf 'info fixture\n' > "$bundle/Contents/Info.plist"
@@ -66,9 +66,9 @@ if command -v ditto >/dev/null; then
     archive_path="$FIXTURE_DIR/dist/$archive_name"
     if [[ "$binary" == ck-subc ]]; then
       unzip -Z1 "$archive_path" > "$FIXTURE_DIR/entries"
-      grep -Fxq 'CortexKit Daemon.app/Contents/MacOS/ck-subc' "$FIXTURE_DIR/entries"
-      grep -Fxq 'CortexKit Daemon.app/Contents/embedded.provisionprofile' "$FIXTURE_DIR/entries"
-      grep -Fxq 'CortexKit Daemon.app/Contents/_CodeSignature/CodeResources' "$FIXTURE_DIR/entries"
+      grep -Fxq 'Subconscious.app/Contents/MacOS/ck-subc' "$FIXTURE_DIR/entries"
+      grep -Fxq 'Subconscious.app/Contents/embedded.provisionprofile' "$FIXTURE_DIR/entries"
+      grep -Fxq 'Subconscious.app/Contents/_CodeSignature/CodeResources' "$FIXTURE_DIR/entries"
       if grep -Fxq ck-subc "$FIXTURE_DIR/entries"; then
         echo 'darwin daemon archive included the bare binary' >&2; exit 1
       fi

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.21.25
+
+- The macOS daemon app is now named Subconscious.
+
 ## 0.21.24
 
 - Setup and upgrade grant the message module read/sign access to the bus leaf, hub operator, hub account and hub TLS signing keys and the hosted hub token audience through the installed vault CLI, including on already-current installs. Add an enabled `nats-hub` entry that idles until ck-bus says this computer is the hub, without changing an existing entry, and remove only the entry added by the failed run on Core rollback.

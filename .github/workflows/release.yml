@@ -301,7 +301,7 @@ jobs:
               codesign --force --options runtime --sign - --identifier "$bin" "target/release/$bin"
             fi
             if [ "$bin" = ck-subc ]; then
-              ditto -c -k --keepParent "target/release/CortexKit Daemon.app" "dist/$bin-darwin-arm64.zip"
+              ditto -c -k --keepParent "target/release/Subconscious.app" "dist/$bin-darwin-arm64.zip"
             else
               (cd target/release && zip -q -X "../../dist/$bin-darwin-arm64.zip" "$bin")
             fi

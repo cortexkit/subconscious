@@ -1565,7 +1565,7 @@ mod tests {
         let root = cortexkit_test_support::ScratchDir::new("bundle-setup-rollback");
         let mut backend = backend_without_user_manager(&root);
         backend.platform = RuntimePlatform::Macos;
-        let app = root.join("apps/CortexKit Daemon.app");
+        let app = root.join("apps/Subconscious.app");
         let daemon = app.join("Contents/MacOS/ck-subc");
         fs::create_dir_all(daemon.parent().unwrap()).unwrap();
         fs::write(&daemon, "new daemon").unwrap();

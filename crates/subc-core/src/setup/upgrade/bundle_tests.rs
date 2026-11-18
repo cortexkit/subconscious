@@ -1,6 +1,6 @@
 use crate::setup::runtime::{CommandResult, CommandRunner, RuntimePlatform};
 
-const TEST_APP: &str = "CortexKit Daemon.app";
+const TEST_APP: &str = "Subconscious.app";
 const TEST_APP_ID: &str = "5R5846NBPW.io.cortexkit.daemon";
 
 pub(in crate::setup) struct BundleRunner {
@@ -378,7 +378,7 @@ fn macos_bundle_fresh_release_install_lands_bundle_and_definition() {
         .unwrap();
     migration.attach(source.daemon_replacement.take().unwrap());
     assert!(root
-        .join("apps/CortexKit Daemon.app/Contents/embedded.provisionprofile")
+        .join("apps/Subconscious.app/Contents/embedded.provisionprofile")
         .is_file());
     crate::setup::runtime::ensure(
         RuntimePlatform::Macos,
@@ -390,11 +390,11 @@ fn macos_bundle_fresh_release_install_lands_bundle_and_definition() {
     .unwrap();
     assert!(fs::read_to_string(&paths.definition)
         .unwrap()
-        .contains("apps/CortexKit Daemon.app/Contents/MacOS/ck-subc"));
+        .contains("apps/Subconscious.app/Contents/MacOS/ck-subc"));
     assert!(!root.join("bin/ck-subc").exists());
     migration
         .rollback(&mut BundleRunner::default(), &mut inventory, None)
         .unwrap();
-    assert!(!root.join("apps/CortexKit Daemon.app").exists());
+    assert!(!root.join("apps/Subconscious.app").exists());
     assert!(!paths.definition.exists());
 }

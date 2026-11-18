@@ -1655,13 +1655,10 @@ fn fixture_archive(_root: &Path, binary: &str, version_line: &str, filler_bytes:
     #[cfg(target_os = "macos")]
     if binary == "ck-subc" {
         return stored_zip(&[
-            ("CortexKit Daemon.app/Contents/MacOS/ck-subc", &script),
+            ("Subconscious.app/Contents/MacOS/ck-subc", &script),
+            ("Subconscious.app/Contents/Info.plist", b"fixture metadata"),
             (
-                "CortexKit Daemon.app/Contents/Info.plist",
-                b"fixture metadata",
-            ),
-            (
-                "CortexKit Daemon.app/Contents/embedded.provisionprofile",
+                "Subconscious.app/Contents/embedded.provisionprofile",
                 b"signed profile fixture",
             ),
             ("fixture-padding", &filler),
@@ -1839,7 +1836,7 @@ fn fixture_binary_path(binary_home: &Path, binary: &str) -> PathBuf {
         return binary_home
             .parent()
             .unwrap()
-            .join("apps/CortexKit Daemon.app/Contents/MacOS/ck-subc");
+            .join("apps/Subconscious.app/Contents/MacOS/ck-subc");
     }
     binary_home.join(platform_binary(binary))
 }
@@ -1902,7 +1899,7 @@ fn setup_macos_daemon_fixtures_include_bundle_metadata() {
         .unwrap();
     assert_exit(&output, 0);
     for root in [data.join("apps"), extracted] {
-        let app = root.join("CortexKit Daemon.app");
+        let app = root.join("Subconscious.app");
         for file in [
             "Contents/MacOS/ck-subc",
             "Contents/Info.plist",

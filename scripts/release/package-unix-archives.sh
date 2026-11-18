@@ -56,7 +56,7 @@ for binary in "${BINARIES[@]}"; do # nonempty-array: literal release binaries
   archive_path="${DIST_DIR}/${archive_name}"
 
   if [[ "$OS" == darwin && "$binary" == ck-subc ]]; then
-    source_path="${SOURCE_DIR}/CortexKit Daemon.app"
+    source_path="${SOURCE_DIR}/Subconscious.app"
     [[ -f "$source_path/Contents/MacOS/ck-subc" && -f "$source_path/Contents/Info.plist" ]] || {
       echo "missing daemon bundle: ${source_path}" >&2
       exit 1

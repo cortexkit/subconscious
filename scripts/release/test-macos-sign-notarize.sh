@@ -53,13 +53,13 @@ cat > "$FIXTURE_DIR/bin/codesign" <<'EOF'
 printf '%s\n' "$*" >> "$CK_TEST_CODESIGN_LOG"
 if [[ "$1" == "-dv" ]]; then
   binary="${@: -1}"
-  if [[ "$binary" == *"/${CK_TEST_MIXED_BINARY:-CortexKit Daemon.app}" ]]; then
+  if [[ "$binary" == *"/${CK_TEST_MIXED_BINARY:-Subconscious.app}" ]]; then
     printf 'Authority=Developer ID Application: Other Team (OTHER12345)\n' >&2
   else
     printf 'Authority=Developer ID Application: CortexKit (ABCDE12345)\n' >&2
   fi
 fi
-if [[ "$1" == -d && "${@: -1}" == *'/CortexKit Daemon.app' ]]; then
+if [[ "$1" == -d && "${@: -1}" == *'/Subconscious.app' ]]; then
   cat "$CK_TEST_ENTITLEMENTS"
 fi
 if [[ "$1" == -d && "${@: -1}" == */ck-script-runner-python && "${CK_TEST_PYTHON_ENTITLEMENTS:-}" == 1 ]]; then
@@ -127,7 +127,7 @@ if [[ -e "$FIXTURE_DIR/notarytool-invoked" ]]; then
   exit 1
 fi
 
-rm -rf "$FIXTURE_DIR/source/CortexKit Daemon.app"
+rm -rf "$FIXTURE_DIR/source/Subconscious.app"
 if PATH="$FIXTURE_DIR/bin:$PATH" CK_TEST_MIXED_BINARY=none CK_TEST_PYTHON_ENTITLEMENTS=1 \
   "$SCRIPT_DIR/macos-sign-notarize.sh" "$FIXTURE_DIR/source" "$FIXTURE_DIR/dist" \
   > "$FIXTURE_DIR/python-output" 2>&1; then
@@ -136,7 +136,7 @@ if PATH="$FIXTURE_DIR/bin:$PATH" CK_TEST_MIXED_BINARY=none CK_TEST_PYTHON_ENTITL
 fi
 grep -Fq 'refusing Python runner: it carries entitlements:' "$FIXTURE_DIR/python-output"
 [[ ! -e "$FIXTURE_DIR/notarytool-invoked" ]]
-rm -rf "$FIXTURE_DIR/source/CortexKit Daemon.app"
+rm -rf "$FIXTURE_DIR/source/Subconscious.app"
 # The daemon smoke run must still be inside a complete renamed bundle.
 cat > "$FIXTURE_DIR/source/ck-subc" <<'EOF'
 #!/bin/sh
@@ -145,7 +145,7 @@ case "$0" in
   */ckdev-subc.app/Contents/MacOS/ck-subc)
     [ -f "$(dirname "$0")/../embedded.provisionprofile" ] || exit 65
     ;;
-  */source/ck-subc|*'/CortexKit Daemon.app/Contents/MacOS/ck-subc') ;;
+  */source/ck-subc|*'/Subconscious.app/Contents/MacOS/ck-subc') ;;
   *) exit 66 ;;
 esac
 echo 'ck-subc 1.2.3'
@@ -156,12 +156,12 @@ PATH="$FIXTURE_DIR/bin:$PATH" CK_TEST_MIXED_BINARY=none \
   APP_STORE_CONNECT_API_KEY_ID=fixture APP_STORE_CONNECT_API_ISSUER_ID=fixture \
   "$SCRIPT_DIR/macos-sign-notarize.sh" "$FIXTURE_DIR/source" "$FIXTURE_DIR/dist" \
   > "$FIXTURE_DIR/success-output" 2>&1
-grep -Fq "stapler staple $FIXTURE_DIR/source/CortexKit Daemon.app" "$FIXTURE_DIR/notary.log"
-grep -Fq "stapler validate $FIXTURE_DIR/source/CortexKit Daemon.app" "$FIXTURE_DIR/notary.log"
+grep -Fq "stapler staple $FIXTURE_DIR/source/Subconscious.app" "$FIXTURE_DIR/notary.log"
+grep -Fq "stapler validate $FIXTURE_DIR/source/Subconscious.app" "$FIXTURE_DIR/notary.log"
 if grep -Fq 'stapler staple '"$FIXTURE_DIR/dist/ck-subc-darwin-arm64.zip" "$FIXTURE_DIR/notary.log"; then
   echo 'daemon transport zip was stapled instead of the bundle' >&2; exit 1
 fi
-unzip -Z1 "$FIXTURE_DIR/dist/ck-subc-darwin-arm64.zip" | grep -Fxq 'CortexKit Daemon.app/Contents/embedded.provisionprofile'
+unzip -Z1 "$FIXTURE_DIR/dist/ck-subc-darwin-arm64.zip" | grep -Fxq 'Subconscious.app/Contents/embedded.provisionprofile'
 (cd "$FIXTURE_DIR/dist" && shasum -a 256 -c ck-subc-darwin-arm64.zip.sha256)
 for binary in ck-nats-server ck-nats-engine; do
   grep -Fq -- "--force --options runtime --timestamp --sign Developer ID Application: CortexKit (ABCDE12345) $FIXTURE_DIR/source/$binary" "$FIXTURE_DIR/codesign.log"

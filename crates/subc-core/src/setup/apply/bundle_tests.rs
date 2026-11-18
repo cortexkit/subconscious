@@ -87,7 +87,7 @@ fn macos_bundle_setup_migrates_pre_bundle_core_after_health_verification() {
     assert!(!root.join("bin/ck-subc").exists());
     assert!(fs::read_to_string(&backend.paths.runtime_paths.definition)
         .unwrap()
-        .contains("apps/CortexKit Daemon.app/Contents/MacOS/ck-subc"));
+        .contains("apps/Subconscious.app/Contents/MacOS/ck-subc"));
 }
 
 #[test]
@@ -102,7 +102,7 @@ fn macos_bundle_setup_failed_health_restores_bare_and_definition() {
         fs::read_to_string(&backend.paths.runtime_paths.definition).unwrap(),
         old_definition
     );
-    assert!(!root.join("apps/CortexKit Daemon.app").exists());
+    assert!(!root.join("apps/Subconscious.app").exists());
     assert!(backend
         .inventory
         .owns_path("managed-binary", &root.join("bin/ck-subc")));

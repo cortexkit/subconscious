@@ -1579,7 +1579,7 @@ mod tests {
     fn macos_bundle_runtime_paths_and_launch_agent_use_the_bundle() {
         let root = fixture_dir("bundle-runtime-paths");
         let paths = runtime_paths(RuntimePlatform::Macos, &root.join("bin"), root.path());
-        let executable = root.join("apps/CortexKit Daemon.app/Contents/MacOS/ck-subc");
+        let executable = root.join("apps/Subconscious.app/Contents/MacOS/ck-subc");
         assert_eq!(paths.daemon, executable);
         let definition = desired_definition_for_user(RuntimePlatform::Macos, &paths, "user");
         assert!(definition.contains(&format!(

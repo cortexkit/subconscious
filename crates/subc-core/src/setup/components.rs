@@ -1184,7 +1184,7 @@ mod tests {
             let bin = root.join("bin");
             fs::create_dir_all(&bin).unwrap();
             let daemon = if bundled {
-                root.join("apps/CortexKit Daemon.app/Contents/MacOS/ck-subc")
+                root.join("apps/Subconscious.app/Contents/MacOS/ck-subc")
             } else {
                 bin.join("ck-subc")
             };

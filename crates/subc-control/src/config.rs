@@ -8,6 +8,7 @@ pub use subc_protocol::config::ConfigDeclarationPending;
 
 pub const CONFIG_GATE_CAPABILITY: &str = "config.gate";
 pub const CONFIG_SETTINGS_CAPABILITY: &str = "config.settings/v1";
+pub const CONFIG_SETTINGS_PROJECTS_CAPABILITY: &str = "config.settings.projects/v1";
 
 /// One approved-layer patch. Workspace and project edits currently produce
 /// `layer_not_served`; daemon settings cannot be edited through this operation.
@@ -67,13 +68,17 @@ impl<'de> Deserialize<'de> for ConfigEdit {
     }
 }
 
-/// A field refusal is displayed verbatim and prevents applying the whole plan.
+/// A diagnostic displayed verbatim for a blocking refusal or a skipped input.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ConfigPlanRefusal {
     pub module_id: String,
     pub path: String,
     pub code: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
 }
 
 /// Standalone bodies keep additions out of the legacy exhaustive control enum.
@@ -100,6 +105,9 @@ pub enum ConfigControlRequest {
     Watch {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         modules: Option<Vec<String>>,
+        /// Only `true` opts in to project rows.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        projects: Option<bool>,
     },
     #[serde(rename = "config.plan")]
     Plan {
@@ -188,6 +196,10 @@ pub struct ConfigModule {
     pub declaration_pending: Option<ConfigDeclarationPending>,
     pub module_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     pub gated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -233,6 +245,9 @@ impl ConfigSettingsLayer {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 #[non_exhaustive]
+// Resync holds a vector, while Change exposes its fields directly so Rust
+// callers can keep matching the existing optional fields without indirection.
+#[allow(clippy::large_enum_variant)]
 pub enum ConfigWatchEvent {
     Resync {
         modules: Vec<ConfigModule>,
@@ -240,6 +255,10 @@ pub enum ConfigWatchEvent {
     },
     Change {
         module_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         declaration_pending: Option<ConfigDeclarationPending>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -262,6 +281,8 @@ impl ConfigWatchEvent {
     pub fn change(row: &ConfigModule) -> Self {
         Self::Change {
             module_id: row.module_id.clone(),
+            project_id: row.project_id.clone(),
+            workspace_id: row.workspace_id.clone(),
             declaration_pending: row.declaration_pending.clone(),
             approved_generation: row.approved_generation,
             active_generation: row.active_generation,
@@ -304,8 +325,12 @@ pub struct ConfigPlanView {
     pub digest: Digest,
     pub base_revision: u64,
     pub plan: Plan,
+    /// Every entry prevents applying the plan.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub refusals: Vec<ConfigPlanRefusal>,
+    /// Inputs skipped while reading layer files do not block the plan or enter its digest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<ConfigPlanRefusal>,
 }
 
 impl ConfigPlanView {
@@ -315,6 +340,7 @@ impl ConfigPlanView {
             base_revision: plan.base_revision,
             plan,
             refusals: Vec::new(),
+            skipped: Vec::new(),
         })
     }
 }
@@ -357,6 +383,26 @@ pub struct ConfigStatus {
     pub development_switches: Vec<String>,
     pub missing_approval_surfaces: Vec<String>,
     pub warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "ConfigRootIo::absent_or_idle")]
+    pub root_io: Option<ConfigRootIo>,
+}
+
+/// Root I/O still outstanding after its deadline.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ConfigRootIo {
+    /// Canonical paths in sorted order.
+    pub stuck_roots: Vec<String>,
+    /// Workers still occupied by past-deadline jobs.
+    pub charged_workers: u64,
+}
+
+impl ConfigRootIo {
+    fn absent_or_idle(root_io: &Option<Self>) -> bool {
+        root_io
+            .as_ref()
+            .is_none_or(|io| io.stuck_roots.is_empty() && io.charged_workers == 0)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -446,32 +492,177 @@ mod tests {
     }
     #[test]
     fn config_wire_existing_bodies_remain_byte_identical() {
-        use super::*;
+        const DIGEST: &str =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        for wire in [
+            r#"{"op":"config.status"}"#,
+            r#"{"op":"config.modules"}"#,
+            r#"{"op":"config.schema","module_id":"demo"}"#,
+            r#"{"op":"config.show","module_id":"demo"}"#,
+            r#"{"op":"config.show","module_id":"demo","through":"workspace"}"#,
+            r#"{"op":"config.watch"}"#,
+            r#"{"op":"config.watch","modules":["demo"]}"#,
+            r#"{"op":"config.plan"}"#,
+            r#"{"op":"config.plan","base_generations":{"demo":3},"edits":[{"module_id":"demo","layer":"user","path":"/limit","set":3}]}"#,
+            r#"{"op":"config.stamp"}"#,
+            r#"{"op":"config.unstamp"}"#,
+            r#"{"op":"config.history"}"#,
+            r#"{"op":"config.rollback","generation":3}"#,
+        ] {
+            assert_wire_bytes::<ConfigControlRequest>(wire);
+        }
+        for op in ["config.plan_get", "config.plan_discard", "config.apply"] {
+            assert_wire_bytes::<ConfigControlRequest>(&format!(
+                r#"{{"op":"{op}","digest":"{DIGEST}"}}"#
+            ));
+        }
+        assert_wire_bytes::<ConfigControlRequest>(&format!(
+            r#"{{"op":"config.place_program","module_id":"demo","path":"/bin/demo","sha256":"{DIGEST}"}}"#
+        ));
+
+        let row = r#"{"module_id":"demo","gated":true,"status":"adopted"}"#;
+        for wire in [
+            r#"{"op":"config.status","status":{"approval_channels":[],"state":"","integrity":"","revision":0,"base_revision":0,"pending_proposals":0,"anchor_pending":false,"ungated_modules":[],"ungated_inputs":[],"gated_modules":[],"interpreter_only_covered":[],"approved_but_inactive":[],"development_switches":[],"missing_approval_surfaces":[],"warnings":[]}}"#.to_owned(),
+            format!(r#"{{"op":"config.modules","modules":[{row}],"stamped":true}}"#),
+            format!(r#"{{"op":"config.schema","module_id":"demo","schema_digest":"{DIGEST}","schema":{{"type":"object"}}}}"#),
+            r#"{"op":"config.show","module_id":"demo","through":"workspace","stamped":true,"base_generation":3,"effective":{"limit":3},"sources":{"/limit":"user"},"layers":[{"layer":"user","document":{"limit":3}}]}"#.to_owned(),
+            r#"{"op":"config.plan_discard"}"#.to_owned(),
+            r#"{"op":"config.apply","generation":3,"restart_required":false}"#.to_owned(),
+            r#"{"op":"config.history","generations":[],"pruned":[]}"#.to_owned(),
+            r#"{"op":"config.place_program","generation":3}"#.to_owned(),
+        ] {
+            assert_wire_bytes::<ConfigControlResponse>(&wire);
+        }
+        let plan = r#"{"base_revision":7,"base_generation":3,"active_generations":{},"daemon_incarnation":"daemon","input_vector":{"inputs":{}},"changeset":{"fields":[],"affected_projects":[],"policy_changes":[],"launch_manifests":{},"apply_plan":null}}"#;
+        for op in [
+            "config.plan",
+            "config.plan_get",
+            "config.stamp",
+            "config.unstamp",
+            "config.rollback",
+        ] {
+            assert_wire_bytes::<ConfigControlResponse>(&format!(
+                r#"{{"op":"{op}","view":{{"digest":"{DIGEST}","base_revision":7,"plan":{plan}}}}}"#
+            ));
+        }
+        let refusal = r#"{"module_id":"demo","path":"/limit","code":"value_invalid","message":"invalid limit"}"#;
+        assert_wire_bytes::<ConfigControlResponse>(&format!(
+            r#"{{"op":"config.plan","view":{{"digest":"{DIGEST}","base_revision":7,"plan":{plan},"refusals":[{refusal}]}}}}"#
+        ));
+        assert_wire_bytes::<ConfigWatchResponse>(&format!(
+            r#"{{"op":"config.watch","event":"resync","modules":[{row}],"stamped":true}}"#
+        ));
+        assert_wire_bytes::<ConfigWatchResponse>(
+            r#"{"op":"config.watch","event":"change","module_id":"demo","status":"adopted"}"#,
+        );
+    }
+
+    fn assert_wire_bytes<T: serde::de::DeserializeOwned + Serialize>(wire: &str) {
+        let decoded: T =
+            serde_json::from_str(wire).unwrap_or_else(|error| panic!("{wire}: {error}"));
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), wire);
+    }
+
+    #[test]
+    fn config_wire_project_watch_round_trips_ids_and_opt_in() {
         assert_eq!(
-            serde_json::to_vec(&ConfigControlRequest::Plan {
-                base_generations: None,
-                edits: None,
+            CONFIG_SETTINGS_PROJECTS_CAPABILITY,
+            "config.settings.projects/v1"
+        );
+        assert_wire_bytes::<ConfigControlRequest>(
+            r#"{"op":"config.watch","modules":["demo"],"projects":true}"#,
+        );
+        assert_wire_bytes::<ConfigControlRequest>(r#"{"op":"config.watch","projects":false}"#);
+        assert!(serde_json::from_str::<ConfigControlRequest>(
+            r#"{"op":"config.watch","projects":"true"}"#
+        )
+        .is_err());
+
+        let row = ConfigModule {
+            module_id: "demo".into(),
+            project_id: Some("p".into()),
+            workspace_id: Some("w".into()),
+            gated: true,
+            status: "adopted".into(),
+            ..ConfigModule::default()
+        };
+        let change = ConfigWatchResponse::new(ConfigWatchEvent::change(&row));
+        let wire = r#"{"op":"config.watch","event":"change","module_id":"demo","project_id":"p","workspace_id":"w","status":"adopted"}"#;
+        assert_eq!(serde_json::to_string(&change).unwrap(), wire);
+        assert_eq!(
+            serde_json::from_str::<ConfigWatchResponse>(wire).unwrap(),
+            change
+        );
+        assert_wire_bytes::<ConfigWatchResponse>(
+            r#"{"op":"config.watch","event":"resync","modules":[{"module_id":"demo","project_id":"p","workspace_id":"w","gated":true,"status":"adopted"}],"stamped":true}"#,
+        );
+    }
+
+    #[test]
+    fn config_wire_project_plan_keeps_skips_separate_from_refusals() {
+        let plan = Plan::new(7, 3, "daemon", Default::default(), Default::default());
+        let mut view = ConfigPlanView::new(plan).unwrap();
+        view.refusals.push(ConfigPlanRefusal {
+            module_id: "demo".into(),
+            path: "/limit".into(),
+            code: "credential_layer_unsupported".into(),
+            message: "section is user-only".into(),
+            project_id: Some("p".into()),
+            workspace_id: None,
+        });
+        view.skipped.push(ConfigPlanRefusal {
+            module_id: "demo".into(),
+            path: ".cortexkit/demo.jsonc".into(),
+            code: "layer_symlink".into(),
+            message: "layer is a symlink".into(),
+            project_id: Some("q".into()),
+            workspace_id: Some("w".into()),
+        });
+        let response = ConfigControlResponse::Plan { view };
+        let wire = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            wire["view"]["refusals"],
+            json!([{
+                "module_id":"demo","path":"/limit","code":"credential_layer_unsupported",
+                "message":"section is user-only","project_id":"p"
+            }])
+        );
+        assert_eq!(
+            wire["view"]["skipped"],
+            json!([{
+                "module_id":"demo","path":".cortexkit/demo.jsonc","code":"layer_symlink",
+                "message":"layer is a symlink","project_id":"q","workspace_id":"w"
+            }])
+        );
+        assert_eq!(
+            serde_json::from_value::<ConfigControlResponse>(wire).unwrap(),
+            response
+        );
+    }
+
+    #[test]
+    fn config_wire_status_emits_only_non_idle_root_io_health() {
+        let mut status = ConfigStatus::default();
+        let legacy = serde_json::to_vec(&status).unwrap();
+        status.root_io = Some(ConfigRootIo::default());
+        assert_eq!(serde_json::to_vec(&status).unwrap(), legacy);
+
+        status.root_io = Some(ConfigRootIo {
+            stuck_roots: vec!["/roots/a".into(), "/roots/b".into()],
+            charged_workers: 2,
+        });
+        let response = ConfigControlResponse::Status { status };
+        let wire = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            wire["status"]["root_io"],
+            json!({
+                "stuck_roots":["/roots/a","/roots/b"],"charged_workers":2
             })
-            .unwrap(),
-            br#"{"op":"config.plan"}"#
         );
         assert_eq!(
-            serde_json::to_vec(&ConfigControlRequest::Status {}).unwrap(),
-            br#"{"op":"config.status"}"#
+            serde_json::from_value::<ConfigControlResponse>(wire).unwrap(),
+            response
         );
-        assert_eq!(
-            serde_json::to_vec(&ConfigControlRequest::History {}).unwrap(),
-            br#"{"op":"config.history"}"#
-        );
-        assert_eq!(
-            serde_json::to_vec(&ConfigControlResponse::History {
-                generations: vec![],
-                pruned: vec![]
-            })
-            .unwrap(),
-            br#"{"op":"config.history","generations":[],"pruned":[]}"#
-        );
-        assert_eq!(serde_json::to_vec(&ConfigControlResponse::Status { status: ConfigStatus::default() }).unwrap(), br#"{"op":"config.status","status":{"approval_channels":[],"state":"","integrity":"","revision":0,"base_revision":0,"pending_proposals":0,"anchor_pending":false,"ungated_modules":[],"ungated_inputs":[],"gated_modules":[],"interpreter_only_covered":[],"approved_but_inactive":[],"development_switches":[],"missing_approval_surfaces":[],"warnings":[]}}"#);
     }
 
     #[test]

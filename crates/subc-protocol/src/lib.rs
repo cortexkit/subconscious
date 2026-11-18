@@ -74,6 +74,18 @@ pub mod error_codes {
     pub const BOUND_VIOLATED: &str = "bound_violated";
     pub const VALUE_INVALID: &str = "value_invalid";
     pub const CREDENTIAL_SHARED: &str = "credential_shared";
+    pub const LAYER_SYMLINK: &str = "layer_symlink";
+    pub const LAYER_NOT_REGULAR: &str = "layer_not_regular";
+    pub const LAYER_HARDLINKED: &str = "layer_hardlinked";
+    pub const LAYER_TOO_LARGE: &str = "layer_too_large";
+    pub const LAYER_ROOT_INVALID: &str = "layer_root_invalid";
+    pub const LAYER_ROOT_AMBIGUOUS: &str = "layer_root_ambiguous";
+    pub const EDIT_SPANS_FILES: &str = "edit_spans_files";
+    pub const PROJECT_APPLY_KIND_UNSUPPORTED: &str = "project_apply_kind_unsupported";
+    pub const CREDENTIAL_LAYER_UNSUPPORTED: &str = "credential_layer_unsupported";
+    pub const UNKNOWN_WORKSPACE: &str = "unknown_workspace";
+    pub const WORKSPACE_MISMATCH: &str = "workspace_mismatch";
+    pub const UNKNOWN_PROJECT: &str = "unknown_project";
     /// Declare exactly once per connection, before config.get or config.applied.
     pub const DECLARATION_ORDER: &str = "declaration_order";
     pub const PROGRAM_REFUSED: &str = "program_refused";

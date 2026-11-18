@@ -26,6 +26,13 @@ pub use authorize::{
 /// A reader declares this only after implementing the federated provider rules.
 pub const SCOPE_FEDERATED_CAPABILITY: &str = "scope-federated/v1";
 
+/// Advertised by a daemon that accepts the federated scope members added in
+/// 0.37.4 (`origin_principal`, `peer_box_id`, `project`, a run's `run_id`, a
+/// flow's `agent_id`, the `app` peer class) in `scope.sync` and `scope.apply`,
+/// and stamps them on routes. A daemon without it refuses those members, so a
+/// scope owner sends them only when the connected daemon lists this.
+pub const SCOPE_FEDERATED_V2_CAPABILITY: &str = "scope-federated/v2";
+
 // Scope principals are authority-bearing input: an unrecognized constraint must
 // not silently widen a grant. Principal elsewhere is a forward-compatible caller
 // fact, so keep its general decoder lenient and enforce this only on scope input.

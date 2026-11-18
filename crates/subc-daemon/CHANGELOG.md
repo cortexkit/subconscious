@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.50.8
+
+- Build with subc-control 0.42.3 and subc-protocol 0.37.5 while keeping settings
+  watches and plan refusals user-only.
+- Advertise `scope-federated/v2` in HELLO_ACK and `server.describe`: this daemon
+  accepts and stamps the federated scope members subc-protocol 0.37.4 added.
+
 ## 0.50.7
 
 - Drain module output independently of the daemon runtime and slow log sinks, report runtime stalls from a separate thread, and bound config reads for supervisor rescans. Concurrent rescans queue behind each other instead of failing, and none holds the supervisor operation lock while it reads the config file.

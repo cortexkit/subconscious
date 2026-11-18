@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.42.3
+
+- Define the `config.settings.projects/v1` wire capability, opt-in project watches,
+  project and workspace identifiers on watch and plan diagnostics, non-blocking
+  capture skips, and optional root I/O health. User-only encodings are unchanged.
+- Rust callers constructing a watch request or a plan refusal must supply the
+  new optional fields. Require subc-protocol 0.37.5.
+
 ## 0.42.2
 
 - Expose pending module declarations in configuration status and settings.

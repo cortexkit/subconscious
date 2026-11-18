@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.37.5
+
+- Define the shared workspace and project configuration refusal codes.
+- Add `scope::SCOPE_FEDERATED_V2_CAPABILITY` (`scope-federated/v2`): a daemon
+  that accepts and stamps the 0.37.4 federated members lists it, so a scope
+  owner can wait for it before sending them.
+
 ## 0.37.4
 
 - Accept optional federated origin principals, stable peer machine ids, portable

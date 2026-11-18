@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.44
+
+- Add retained-directory staging, metadata-preserving durable replacement, and
+  exclusive publication of new files and directories on Linux, macOS and Windows.
+
 ## 0.1.43
 
 - macOS: offer credentials-only Unix peer capture that retains the audit token

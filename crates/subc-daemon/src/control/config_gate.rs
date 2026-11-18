@@ -579,7 +579,7 @@ impl ControlHandler {
                 "configuration control requires a kernel-observed owner-user connection",
             )?]);
         }
-        if let ConfigControlRequest::Watch { modules } = request {
+        if let ConfigControlRequest::Watch { modules, .. } = request {
             return self
                 .handle_config_settings_watch(ctx, frame, runtime, modules)
                 .await;
@@ -975,6 +975,8 @@ impl ControlHandler {
                                     path: path.clone(),
                                     code: "module_review_refused".into(),
                                     message: "the module refused this field".into(),
+                                    project_id: None,
+                                    workspace_id: None,
                                 });
                             }
                         }
@@ -984,6 +986,8 @@ impl ControlHandler {
                                 path: String::new(),
                                 code: "module_review_refused".into(),
                                 message: "the module refused the edits".into(),
+                                project_id: None,
+                                workspace_id: None,
                             });
                         }
                         fields.extend(prepared.refused_fields(module)?);

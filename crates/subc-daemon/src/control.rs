@@ -1196,6 +1196,7 @@ impl ControlHandler {
                 CAP_ADMISSION_FACTS_RELAY.to_string(),
                 CAP_SCOPES_V1.to_string(),
                 subc_protocol::scope::SCOPE_FEDERATED_CAPABILITY.to_string(),
+                subc_protocol::scope::SCOPE_FEDERATED_V2_CAPABILITY.to_string(),
                 subc_protocol::peer::CALLER_ATTESTATION_CAPABILITY.to_string(),
                 PEER_BUILD_CAPABILITY.to_string(),
                 CAP_ROUTE_ROLE_VERSIONS_V1.to_string(),
@@ -15905,6 +15906,10 @@ mod tests {
             .subc_capabilities
             .iter()
             .any(|cap| cap == subc_protocol::scope::SCOPE_SERVED_BY_CAPABILITY));
+        assert!(parse_ack(&ack)
+            .subc_capabilities
+            .iter()
+            .any(|cap| cap == subc_protocol::scope::SCOPE_FEDERATED_V2_CAPABILITY));
         let (client, _rx) = route_ctx(ConnectionId::new(157));
         let body = serde_json::to_vec(&ClientControlRequest::ServerDescribe {}).unwrap();
         let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 5, body).unwrap();
@@ -15925,6 +15930,9 @@ mod tests {
         assert!(capabilities
             .iter()
             .any(|cap| cap == subc_protocol::scope::SCOPE_SERVED_BY_CAPABILITY));
+        assert!(capabilities
+            .iter()
+            .any(|cap| cap == subc_protocol::scope::SCOPE_FEDERATED_V2_CAPABILITY));
     }
 
     #[tokio::test]

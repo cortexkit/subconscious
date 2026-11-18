@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.41.5
+
+- Build with subc-control 0.42.3 and subc-protocol 0.37.5. Existing watch calls
+  still request only user rows.
+
 ## 0.41.4
 
 - Expose pending declaration metadata and acknowledge connection-local catch-up

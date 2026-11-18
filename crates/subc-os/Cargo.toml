@@ -1,6 +1,6 @@
 [package]
 name = "subc-os"
-version = "0.1.43"
+version = "0.1.44"
 edition = "2021"
 license = "MIT"
 publish = true
@@ -50,6 +50,7 @@ rustix = { version = "1", default-features = false, features = ["fs", "process",
 [target.'cfg(windows)'.dependencies]
 tokio = { version = "1", optional = true, features = ["net"] }
 windows-sys = { version = "0.61", features = [
+    "Wdk_Storage_FileSystem",
     "Wdk_System_SystemInformation",
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",

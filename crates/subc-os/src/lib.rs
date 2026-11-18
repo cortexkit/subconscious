@@ -89,6 +89,8 @@ pub mod config_keychain;
 mod durable_replace;
 #[cfg(any(unix, windows))]
 mod retained_file;
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+mod retained_replace;
 #[cfg(feature = "test-support")]
 pub use durable_replace::durable_replace_with_rename_hook;
 pub use durable_replace::{durable_replace, DurableReplaceError};
@@ -99,6 +101,8 @@ pub use retained_file::{
 };
 #[cfg(windows)]
 pub use retained_file::{retained_file_index, WindowsFileIndexIdentity};
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+pub use retained_replace::{create_directory_nofollow_at, RetainedTempFile};
 #[cfg(all(unix, feature = "test-support"))]
 pub mod fork_exec_test;
 pub mod host;

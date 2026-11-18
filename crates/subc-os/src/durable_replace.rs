@@ -16,7 +16,7 @@ impl DurableReplaceError {
         self.renamed
     }
 
-    fn new(source: io::Error, renamed: bool) -> Self {
+    pub(crate) fn new(source: io::Error, renamed: bool) -> Self {
         Self { renamed, source }
     }
 }

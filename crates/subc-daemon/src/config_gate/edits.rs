@@ -61,6 +61,8 @@ fn refused(edit: &ConfigEdit, code: &str, message: &str) -> ConfigPlanRefusal {
         path: edit.path.clone(),
         code: code.into(),
         message: message.into(),
+        project_id: None,
+        workspace_id: None,
     }
 }
 

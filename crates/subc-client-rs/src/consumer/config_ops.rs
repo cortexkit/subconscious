@@ -301,8 +301,11 @@ impl SubcConsumer {
         modules: Option<Vec<String>>,
     ) -> Result<ConfigSubscription, CallError> {
         let deadline = Instant::now() + self.shared.opts.call_timeout;
-        let body = serde_json::to_vec(&ConfigControlRequest::Watch { modules })
-            .map_err(|err| CallError::not_sent(format!("failed to encode config.watch: {err}")))?;
+        let body = serde_json::to_vec(&ConfigControlRequest::Watch {
+            modules,
+            projects: None,
+        })
+        .map_err(|err| CallError::not_sent(format!("failed to encode config.watch: {err}")))?;
         loop {
             self.shared.ensure_connected_for_call(deadline).await?;
             // Keep a permit alive until this watch ends, as route subscriptions do.
@@ -500,6 +503,8 @@ mod tests {
             path: "/limit".into(),
             code: "value_invalid".into(),
             message: "invalid limit".into(),
+            project_id: None,
+            workspace_id: None,
         });
         let expected = view.clone();
         let call = tokio::spawn(async move {

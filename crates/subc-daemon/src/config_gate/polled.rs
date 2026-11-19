@@ -42,7 +42,7 @@ impl RuntimeOwner {
                 let changed = candidate
                     .changed_keys(&view.approved)
                     .iter()
-                    .any(|key| !key.is_program());
+                    .any(|key| !key.is_program() && !key.is_project());
                 // A config-only read cannot disprove a recorded program change.
                 status.pending_proposals = status.pending_proposals.max(u64::from(changed));
             } else {

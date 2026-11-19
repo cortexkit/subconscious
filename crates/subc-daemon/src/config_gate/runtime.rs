@@ -14,6 +14,7 @@ use subc_protocol::config::{
 
 use super::{
     capture::{CapturedConfiguration, ConfigCapturer},
+    capture_plan::{self, CapturePlan, ModuleRoots, ProjectCapture},
     ApprovalChallenge, ApprovalFacts, ApprovalReply, ConfigGate, GateError, PlanKind, Result,
 };
 use crate::{
@@ -77,6 +78,9 @@ pub struct RuntimeOwner {
     configured_modules: std::sync::RwLock<Option<admission::ConfiguredModuleSnapshot>>,
     inner: Mutex<OwnerState>,
     capturer: ConfigCapturer,
+    // Enable with the public project-settings capability. Until then an
+    // unscoped config.plan must not return project targets or diagnostics.
+    project_capture_enabled: bool,
     startup_overrides: Vec<String>,
     module_gates: Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
     delivery_changed: std::sync::Arc<tokio::sync::Notify>,
@@ -322,6 +326,7 @@ fn layer_file_rows(
         // expose the exact raw input without disclosing its contents.
         if changeset.fields.iter().any(|field| {
             field.module_id == *module
+                && field.project_id.is_none()
                 && (field.old_source == subc_config::Layer::User
                     || field.new_source == subc_config::Layer::User)
         }) {
@@ -733,6 +738,7 @@ pub struct PreparedPlan {
     /// Filled by project capture only after checking the module's reply. A
     /// user-only plan leaves this absent to preserve its digest and view.
     pub(crate) projects: Option<super::targets::ProjectReviews>,
+    project_capture: Option<CapturePlan>,
     pub candidate: CapturedConfiguration,
     pub bases: BTreeMap<String, ConfigView>,
     pub base_schemas: BTreeMap<String, subc_config::Schema>,
@@ -837,7 +843,11 @@ pub(crate) use published::Published;
 pub(crate) mod settings;
 #[path = "status_inputs.rs"]
 mod status_inputs;
+
+#[path = "runtime_capture.rs"]
+mod runtime_capture;
 pub(crate) use approval_request::{ApprovalRequest, ApprovalRequestGuard, CancelApprovalRequest};
+pub(crate) use runtime_capture::CaptureApply;
 
 impl RuntimeOwner {
     /// Keep store I/O and waits for its synchronous owner lock off runtime threads.
@@ -1015,6 +1025,7 @@ impl RuntimeOwner {
                 after_approval_drain_hook: None,
             }),
             capturer,
+            project_capture_enabled: false,
             startup_overrides: status_inputs::present_overrides(|name| {
                 std::env::var_os(name).is_some()
             }),
@@ -1308,7 +1319,17 @@ impl RuntimeOwner {
                     "config.declare must precede get or applied on this connection",
                 )
             })?;
-        if request.project_id.is_some() {
+        if let Some(project) = &request.project_id {
+            if state.store.loaded_admission_state().0 == StoreState::Stamped {
+                return self.stamped_project_get(
+                    state,
+                    module,
+                    project,
+                    &declaration,
+                    &request,
+                    check_store,
+                );
+            }
             return Err(GateError::new(
                 "config_gated",
                 format!("{module}: project-tuple delivery is not supported yet"),
@@ -1559,30 +1580,109 @@ impl RuntimeOwner {
     /// launch selection happen before any plan, approval or generation is
     /// written. A proposal neither approves nor records the refused plan.
     pub fn prepare(&self, kind: PlanKind) -> Result<PreparedPlan> {
+        self.prepare_inner(kind, None)
+    }
+
+    fn prepare_inner(
+        &self,
+        kind: PlanKind,
+        registry: Option<(u64, Result<super::project_registry::RegistryBatch>)>,
+    ) -> Result<PreparedPlan> {
         let mut state = self.lock()?;
         Self::check_authority(
             &mut state,
             matches!(kind, PlanKind::Stamp | PlanKind::Unstamp),
         )?;
+        let registry = if let Some((base, reply)) = registry {
+            if state.store.status().state != StoreState::Stamped
+                || state.store.status().base_revision != base
+            {
+                return Err(capture_plan::changed());
+            }
+            let body = state.store.body()?;
+            match reply {
+                Ok(batch) => Some(batch),
+                Err(error)
+                    if error.code == "project_registry_unavailable"
+                        && !capture_plan::known_projects(body) =>
+                {
+                    None
+                }
+                Err(error) => return Err(capture_plan::registry_retry(error)),
+            }
+        } else {
+            None
+        };
         #[cfg(test)]
         if let Some(hook) = self.prepare_capture_hook.lock().unwrap().take() {
             hook();
         }
-        let observed = self.capture(&mut state)?;
+        let (mut project_capture, observed) = if let Some((enumeration, revisions)) = registry {
+            let declarations = Self::declarations(&mut state)?;
+            if !declarations.keys().eq(revisions.keys()) {
+                return Err(capture_plan::changed());
+            }
+            if let Some(enumeration) = &enumeration {
+                state.store.replace_registry_membership(Ok(enumeration))?;
+            }
+            let mut project_plan = CapturePlan::default();
+            let body = state.store.body()?;
+            let approved = super::GateSnapshot::from_store(&body.approved)?;
+            let roots = revisions
+                .into_iter()
+                .map(|(module, revision)| {
+                    ModuleRoots::new(revision, &approved, &mut project_plan.skipped)
+                        .map(|roots| (module, roots))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?;
+            project_plan.context.held_user.extend(
+                roots
+                    .iter()
+                    .filter(|(_, roots)| roots.holds_user())
+                    .map(|(module, _)| module.clone()),
+            );
+            let held = capture_plan::retained_user_files(
+                body,
+                &approved,
+                &declarations,
+                &project_plan.context.held_user,
+            );
+            let captured = self
+                .capturer
+                .capture_with_retained_user(&declarations, None, held)?;
+            let (project_plan, observed) = capture_plan::capture_projects(
+                &self.capturer,
+                body,
+                &approved,
+                &captured,
+                &roots,
+                project_plan,
+            )?;
+            state.store.observe(observed.to_store()?)?;
+            state.observed_snapshot = Some(observed);
+            (Some(project_plan), captured)
+        } else {
+            (None, self.capture(&mut state)?)
+        };
         if observed.daemon.bytes.is_none() {
             return Err(GateError::new(
                 "invalid_daemon_config",
                 "subc.jsonc is absent; refusing to rescan",
             ));
         }
-        if !state.recovery_exit_hold && state.store.status().state == StoreState::Stamped {
+        if project_capture.is_none()
+            && !state.recovery_exit_hold
+            && state.store.status().state == StoreState::Stamped
+        {
             let approved = super::GateSnapshot::from_store(&state.store.body()?.approved)?;
             state
                 .store
                 .observe(observed.proposal_snapshot(&approved).to_store()?)?;
         }
         let rollback = if let PlanKind::Rollback(id) = kind {
-            let target = super::GateSnapshot::from_store(&state.store.rollback_configuration(id)?)?;
+            let mut target =
+                super::GateSnapshot::from_store(&state.store.rollback_configuration(id)?)?;
+            target.inputs.retain(|key, _| !key.is_project());
             let delivery = state
                 .store
                 .body()?
@@ -1617,6 +1717,7 @@ impl RuntimeOwner {
             .diagnostic
             .changed_keys(&old)
             .iter()
+            .filter(|key| !key.is_project())
             .filter_map(|key| key.module().map(str::to_owned))
             .collect();
         if matches!(kind, PlanKind::Stamp | PlanKind::Unstamp) {
@@ -1641,6 +1742,9 @@ impl RuntimeOwner {
             .filter(|module|matches!(kind,PlanKind::Stamp|PlanKind::Unstamp) || candidate.diagnostic.changed_keys(&old).iter().any(|key|matches!(key,super::InputKey::Layer {module:owner,..}|super::InputKey::Declaration(owner) if owner==*module)))
             .cloned()
             .collect();
+        if let Some(projects) = &project_capture {
+            touched_modules.extend(projects.reviews.keys().map(|tuple| tuple.module.clone()));
+        }
         // A program change is approved launch-only: neither the build being
         // approved nor the one still running can review for it. Once the new
         // program is active, the next plan re-reviews the approved layers with
@@ -1760,6 +1864,7 @@ impl RuntimeOwner {
         Ok(PreparedPlan {
             edits: None,
             projects: None,
+            project_capture: project_capture.take(),
             candidate,
             bases,
             base_schemas,
@@ -1785,6 +1890,15 @@ impl RuntimeOwner {
             &mut state,
             matches!(prepared.kind, PlanKind::Stamp | PlanKind::Unstamp),
         )?;
+        let project_plan = prepared.project_capture.take();
+        if let Some(projects) = &project_plan {
+            if !projects.reviews.is_empty() || !projects.refusals.is_empty() {
+                return Err(GateError::new(
+                    "module_review_invalid",
+                    "project reviews were not accepted",
+                ));
+            }
+        }
         let active_generations = if state.store.status().state == StoreState::Stamped {
             state
                 .store
@@ -1799,6 +1913,12 @@ impl RuntimeOwner {
         };
         let mut current = if prepared.edits.is_some() {
             self.edit_baseline(&mut state, Some(&prepared.touched_modules))
+        } else if let Some(projects) = &project_plan {
+            self.capture_with_project_context(
+                &mut state,
+                &prepared.touched_modules,
+                &projects.context,
+            )
         } else {
             self.capture_modules(&mut state, &prepared.touched_modules)
         }
@@ -1848,6 +1968,36 @@ impl RuntimeOwner {
                     prepared.candidate.modules.insert(module, captured);
                 }
             }
+        }
+        let mut project_context = None;
+        let mut project_skips = Vec::new();
+        if let Some(projects) = project_plan {
+            let CapturePlan {
+                mut context,
+                witnesses,
+                skipped,
+                files,
+                ..
+            } = projects;
+            for (key, input) in &witnesses.inputs {
+                if matches!(key, super::InputKey::ProjectTuple { .. }) {
+                    context.witnesses.inputs.insert(key.clone(), input.clone());
+                }
+            }
+            current
+                .diagnostic
+                .inputs
+                .extend(context.witnesses.inputs.clone());
+            prepared
+                .candidate
+                .diagnostic
+                .inputs
+                .extend(witnesses.inputs);
+            if !files.is_empty() {
+                prepared.projects.get_or_insert_with(Default::default).files = files;
+            }
+            project_skips = skipped;
+            project_context = Some(context);
         }
         let delivery = DeliverySnapshot {
             daemon: Some(ConfigLayerSnapshot::file(
@@ -1925,7 +2075,7 @@ impl RuntimeOwner {
             );
         }
         let OwnerState { gate, store, .. } = &mut *state;
-        let view = gate.plan_reviewed_inner(
+        let mut view = gate.plan_reviewed_inner(
             store,
             prepared.kind,
             prepared.candidate.diagnostic,
@@ -1957,6 +2107,11 @@ impl RuntimeOwner {
                 Ok(changeset)
             },
         )?;
+        view.skipped = project_skips;
+        if let Some(plan) = gate.plans.get_mut(&view.digest) {
+            plan.project_capture = project_context;
+            plan.view.skipped.clone_from(&view.skipped);
+        }
         if let Err(error) = self.check_route_policy_authority(&view.plan.changeset) {
             gate.expire_plan(&view.digest);
             return Err(error);
@@ -2010,6 +2165,7 @@ impl RuntimeOwner {
         Self::check_authority(&mut state, true)?;
         let modules = state.gate.plan_modules(digest)?;
         let program_keys = state.gate.plan_program_keys(digest)?;
+        let projects = state.gate.plans[digest].project_capture.clone();
         let mut current = if state
             .gate
             .plans
@@ -2017,10 +2173,15 @@ impl RuntimeOwner {
             .is_some_and(|plan| plan.edits.is_some())
         {
             self.edit_baseline(&mut state, Some(&modules))
+        } else if let Some(capture) = &projects {
+            self.capture_with_project_context(&mut state, &modules, capture)
         } else {
             self.capture_modules(&mut state, &modules)
         }
         .map_err(|_| GateError::stale())?;
+        if let Some(capture) = projects {
+            current.diagnostic.inputs.extend(capture.witnesses.inputs);
+        }
         current
             .capture_programs(&program_keys)
             .map_err(|_| GateError::stale())?;
@@ -2066,9 +2227,11 @@ impl RuntimeOwner {
             now_ms,
             None,
             ApprovalRequest::for_attempt(attempt),
+            None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn finish_approval_with_commit_window(
         &self,
         attempt: u64,
@@ -2077,6 +2240,7 @@ impl RuntimeOwner {
         now_ms: u64,
         window: Option<std::sync::Arc<ApprovalCommitWindow>>,
         cancellation: std::sync::Arc<ApprovalRequest>,
+        project_apply: Option<CaptureApply>,
     ) -> Result<u64> {
         if cancellation.attempt() != attempt {
             return Err(GateError::new(
@@ -2086,6 +2250,24 @@ impl RuntimeOwner {
         }
         let mut state = self.lock()?;
         let digest = state.gate.approval_digest(attempt)?;
+        let project_capture = state.gate.plans[&digest].project_capture.clone();
+        if let Some(capture) = &project_capture {
+            if !capture.authority.is_empty()
+                && project_apply
+                    .as_ref()
+                    .is_none_or(|apply| apply.digest != digest)
+            {
+                return Err(capture_plan::changed());
+            }
+            if state.store.status().base_revision
+                != state.gate.plans[&digest].view.plan.base_revision
+            {
+                return Err(capture_plan::changed());
+            }
+        }
+        if let Some(enumeration) = project_apply.and_then(|apply| apply.enumeration) {
+            state.store.replace_registry_membership(Ok(&enumeration))?;
+        }
         let declarations_only = state
             .gate
             .plans
@@ -2110,10 +2292,24 @@ impl RuntimeOwner {
         let current = match Self::check_authority(&mut state, true).and_then(|_| {
             let mut current = if edit_plan.is_some() {
                 self.edit_baseline(&mut state, Some(&modules))
+            } else if let Some(capture) = &project_capture {
+                self.capture_with_project_context(&mut state, &modules, capture)
             } else {
                 self.capture_modules(&mut state, &modules)
             }
-            .map_err(|_| GateError::stale())?;
+            .map_err(|_| {
+                if project_capture.is_some() {
+                    capture_plan::changed()
+                } else {
+                    GateError::stale()
+                }
+            })?;
+            if let Some(capture) = &project_capture {
+                current
+                    .diagnostic
+                    .inputs
+                    .extend(capture.witnesses.inputs.clone());
+            }
             current
                 .capture_programs(&program_keys)
                 .map_err(|_| GateError::stale())?;

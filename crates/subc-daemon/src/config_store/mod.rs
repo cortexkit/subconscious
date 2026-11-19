@@ -1279,8 +1279,14 @@ impl ConfigStore {
         &mut self,
         reply: Result<&cortexkit_project_identity::EnumerateReply, crate::config_gate::GateError>,
     ) -> Result<bool, crate::config_gate::GateError> {
-        let membership = RegistryMembership::from_enumeration(reply?)?;
+        let mut membership = RegistryMembership::from_enumeration(reply?)?;
         self.delivery_ready()?;
+        membership.ever_had_projects |= self
+            .envelope
+            .body
+            .registry_membership
+            .as_ref()
+            .is_some_and(|previous| previous.ever_had_projects || !previous.projects.is_empty());
         if self.envelope.body.registry_membership.as_ref() == Some(&membership) {
             return Ok(false);
         }

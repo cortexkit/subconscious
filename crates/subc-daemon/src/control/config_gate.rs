@@ -780,9 +780,11 @@ impl ControlHandler {
                     let current_phone = self.config_phone_surface_snapshot().await;
                     let phone = checked_phone.filter(|phone| Some(phone) == current_phone.as_ref());
                     let facts = self.config_approval_facts_with_phone(ctx, phone).await;
-                    Ok::<_, GateError>((operation, module_gates, facts))
+                    let project_apply = runtime.recheck_capture_apply(attempt).await?;
+                    Ok::<_, GateError>((operation, module_gates, facts, project_apply))
                 };
-                let (operation, module_gates, facts) = if let Some(window) = &window {
+                let (operation, module_gates, facts, project_apply) = if let Some(window) = &window
+                {
                     timeout_at(window.deadline, locks)
                         .await
                         .map_err(|_| GateError::commit_timeout())??
@@ -802,6 +804,7 @@ impl ControlHandler {
                         now,
                         publish_window,
                         publication_request,
+                        project_apply,
                     )
                 });
                 tokio::pin!(work);
@@ -876,11 +879,24 @@ impl ControlHandler {
                         ))
                     }
                 };
-                let mut prepared = config_work(runtime.clone(), move |owner| match edits {
-                    Some((base, edits)) => owner.prepare_edits(base, edits),
-                    None => owner.prepare(kind),
-                })
-                .await?;
+                let mut prepared = match edits {
+                    Some((base, edits)) => {
+                        config_work(runtime.clone(), move |owner| {
+                            owner.prepare_edits(base, edits)
+                        })
+                        .await?
+                    }
+                    None => runtime.prepare_capture(kind).await?,
+                };
+                if prepared.capture_refused() {
+                    let view = config_work(runtime, move |owner| {
+                        owner.capture_refusal(&prepared)?.ok_or_else(|| {
+                            GateError::new("module_review_invalid", "project refusal is absent")
+                        })
+                    })
+                    .await?;
+                    return Ok(ConfigControlResponse::Plan { view });
+                }
                 let mut fields = Vec::new();
                 let mut edit_refusals = Vec::new();
                 let mut unavailable_rereviews = Vec::new();
@@ -889,62 +905,9 @@ impl ControlHandler {
                         continue;
                     }
                     let base = prepared.bases.get(module);
-                    let reply: std::result::Result<Vec<u8>, GateError> = async {
-                        #[cfg(test)]
-                        if let Some(reply) = &self.config_review_test_reply {
-                            return serde_json::to_vec(reply).map_err(|_| {
-                                GateError::new(
-                                    "module_review_invalid",
-                                    "could not encode the fixture review",
-                                )
-                            });
-                        }
-                        let registration = self
-                            .registry
-                            .get_module(module)
-                            .map_err(|_| {
-                                GateError::new("config_unavailable", "registry is unavailable")
-                            })?
-                            .ok_or_else(|| {
-                                GateError::new(
-                                    "module_review_unavailable",
-                                    format!("{module}: no active reviewer"),
-                                )
-                            })?;
-                        let admission = self.review_admission();
-                        let reviewer = registration.clone();
-                        config_work(runtime.clone(), move |_| admission.check(&reviewer)).await?;
-                        if !registration
-                            .control_ops
-                            .iter()
-                            .any(|op| op == "config.review")
-                        {
-                            return Err(GateError::new(
-                                "module_review_unavailable",
-                                format!("{module}: config.review is not opted in"),
-                            ));
-                        }
-                        let request = subc_protocol::config::ConfigReviewRequest::new(
-                            base.map_or(0, |b| b.generation),
-                            captured.view.layers.clone(),
-                            base.cloned(),
-                        );
-                        let bytes = serde_json::to_vec(&request).map_err(|_| {
-                            GateError::new(
-                                "config_unavailable",
-                                "could not encode immutable review",
-                            )
-                        })?;
-                        self.config_rpc(
-                            &runtime,
-                            module,
-                            registration.connection_id,
-                            "config.review",
-                            bytes,
-                        )
-                        .await
-                    }
-                    .await;
+                    let reply = self
+                        .review_config_tuple(&runtime, module, base, &captured.view)
+                        .await;
                     let reply = match reply {
                         Ok(reply) => reply,
                         // A re-review the new program cannot answer now stays
@@ -1006,17 +969,38 @@ impl ControlHandler {
                     prepared.review_modules.remove(&module);
                     prepared.rereview_modules.remove(&module);
                 }
+                let mut project_replies = Vec::new();
+                for (tuple, review) in prepared.project_reviews() {
+                    let bytes = self
+                        .review_config_tuple(
+                            &runtime,
+                            &tuple.module,
+                            review.base.as_ref(),
+                            &review.approval.view,
+                        )
+                        .await?;
+                    let reply = serde_json::from_slice(&bytes).map_err(|_| {
+                        GateError::new(
+                            "module_review_invalid",
+                            format!("{}: malformed project config.review reply", tuple.module),
+                        )
+                    })?;
+                    project_replies.push((tuple.clone(), reply));
+                }
+                for (tuple, reply) in project_replies {
+                    fields.extend(prepared.accept_project_review(&tuple, reply)?);
+                }
                 prepared.add_edit_refusals(edit_refusals);
                 let view = config_work(runtime, move |owner| {
                     owner.finish_plan(prepared, move |old, new| {
                         let mut changeset = crate::config_gate::runtime::daemon_review(old, new)?;
                         changeset.fields = fields;
                         let mut effects: std::collections::BTreeMap<String,std::collections::BTreeMap<String,Vec<String>>> = Default::default();
-                        for field in &changeset.fields {
+                        for field in changeset.fields.iter().filter(|field| field.project_id.is_none()) {
                             let kind = serde_json::to_value(field.apply).map_err(|_| GateError::new("schema_invalid", "could not encode apply kind"))?.as_str().ok_or_else(|| GateError::new("schema_invalid","apply kind is not a string"))?.to_owned();
                             effects.entry(field.module_id.clone()).or_default().entry(kind).or_default().push(field.path.clone());
                         }
-                        if changeset.fields.iter().any(|field| field.apply != subc_config::ApplyKind::Live) {
+                        if changeset.fields.iter().any(|field| field.project_id.is_none() && field.apply != subc_config::ApplyKind::Live) {
                             changeset.apply_plan = serde_json::json!({"daemon_effects":changeset.apply_plan,"modules":effects});
                         }
                         Ok(changeset)
@@ -1031,6 +1015,63 @@ impl ControlHandler {
                 })
             }
         }
+    }
+
+    async fn review_config_tuple(
+        &self,
+        runtime: &Arc<crate::config_gate::runtime::RuntimeOwner>,
+        module: &str,
+        base: Option<&subc_protocol::config::ConfigView>,
+        candidate: &subc_protocol::config::ConfigView,
+    ) -> Result<Vec<u8>, GateError> {
+        #[cfg(test)]
+        if let Some(reply) = &self.config_review_test_reply {
+            return serde_json::to_vec(reply).map_err(|_| {
+                GateError::new(
+                    "module_review_invalid",
+                    "could not encode the fixture review",
+                )
+            });
+        }
+        let registration = self
+            .registry
+            .get_module(module)
+            .map_err(|_| GateError::new("config_unavailable", "registry is unavailable"))?
+            .ok_or_else(|| {
+                GateError::new(
+                    "module_review_unavailable",
+                    format!("{module}: no active reviewer"),
+                )
+            })?;
+        let admission = self.review_admission();
+        let reviewer = registration.clone();
+        config_work(runtime.clone(), move |_| admission.check(&reviewer)).await?;
+        if !registration
+            .control_ops
+            .iter()
+            .any(|op| op == "config.review")
+        {
+            return Err(GateError::new(
+                "module_review_unavailable",
+                format!("{module}: config.review is not opted in"),
+            ));
+        }
+        let request = subc_protocol::config::ConfigReviewRequest::new(
+            base.map_or(0, |view| view.generation),
+            candidate.layers.clone(),
+            base.cloned(),
+        );
+        let bytes = serde_json::to_vec(&request).map_err(|_| {
+            GateError::new("config_unavailable", "could not encode immutable review")
+        })?;
+        self.config_rpc(
+            runtime,
+            module,
+            registration.connection_id,
+            "config.review",
+            bytes,
+        )
+        .await
     }
 
     async fn config_approval_facts(&self, ctx: &RouteCtx) -> ApprovalFacts {

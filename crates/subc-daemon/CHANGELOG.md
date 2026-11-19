@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.50.19
+
+- On installations that require settings approval, review workspace and project settings against the last approval for each project. Save both the user-only view and the view that includes workspace settings but omits project overrides. Defer shared changes when a project that reads the file is unavailable, and recheck the affected registry entries before approval.
+- Serve only active, approved project settings (or the active user fallback) while a new project declaration is awaiting approval.
+
 ## 0.50.18
 
 - Use subc-config 0.1.4: a settings object whose single `env` or `file` key holds a map or list

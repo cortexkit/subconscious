@@ -80,8 +80,12 @@ impl RuntimeOwner {
         state: &mut OwnerState,
     ) -> Result<super::super::capture::SettingsCapture> {
         let captured = self.capturer.capture_status(&Self::declarations(state)?)?;
-        let approved = super::super::GateSnapshot::from_store(&state.store.body()?.approved)?;
-        let proposal = captured.proposal_snapshot(&approved);
+        let body = state.store.body()?;
+        let approved = super::super::GateSnapshot::from_store(&body.approved)?;
+        let mut proposal = captured.proposal_snapshot(&approved);
+        proposal.carry_project_inputs(&super::super::GateSnapshot::from_store(
+            body.observed.as_ref().unwrap_or(&body.approved),
+        )?);
         state.store.observe(proposal.to_store()?)?;
         state.observed_snapshot = Some(proposal);
         Ok(captured)

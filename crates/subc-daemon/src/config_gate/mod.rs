@@ -9,6 +9,7 @@ mod anchor_retry;
 mod apply;
 mod approval;
 pub mod capture;
+mod capture_plan;
 pub(crate) mod program;
 pub mod project_layers;
 pub mod project_registry;
@@ -175,6 +176,7 @@ struct PendingPlan {
     recovery: bool,
     delivery: Option<crate::config_store::DeliverySnapshot>,
     project_files: Vec<crate::config_store::ProjectFileApproval>,
+    project_capture: Option<capture_plan::ProjectCapture>,
 }
 
 impl PendingPlan {
@@ -275,7 +277,7 @@ impl ConfigGate {
         &mut self,
         store: &mut ConfigStore,
         kind: PlanKind,
-        candidate: GateSnapshot,
+        mut candidate: GateSnapshot,
         observed: &GateSnapshot,
         record: ReviewRecord<'_>,
         edits: Option<runtime::edits::EditPlan>,
@@ -304,8 +306,11 @@ impl ConfigGate {
             if target
                 .inputs
                 .iter()
-                .filter(|(key, _)| !key.is_program())
-                .ne(candidate.inputs.iter().filter(|(key, _)| !key.is_program()))
+                .filter(|(key, _)| !key.is_program() && !key.is_project())
+                .ne(candidate
+                    .inputs
+                    .iter()
+                    .filter(|(key, _)| !key.is_program() && !key.is_project()))
             {
                 return Err(GateError::invalid(
                     "rollback must reverse the target configuration",
@@ -352,6 +357,9 @@ impl ConfigGate {
                     active,
                 )
             };
+        if !recovery {
+            candidate.carry_project_inputs(&approved);
+        }
         let changed: BTreeSet<InputKey> = approved
             .changed_keys(&candidate)
             .into_iter()
@@ -379,7 +387,7 @@ impl ConfigGate {
         };
         let mut user_modules: BTreeSet<String> = changed
             .iter()
-            .filter(|key| !matches!(key, InputKey::ProjectTuple { .. }))
+            .filter(|key| !key.is_project())
             .filter_map(|key| key.module().map(str::to_owned))
             .collect();
         let mut changeset = review(&approved, &candidate)?;
@@ -412,7 +420,7 @@ impl ConfigGate {
                     .inputs
                     .keys()
                     .chain(approved.inputs.keys())
-                    .filter(|key| !matches!(key, InputKey::ProjectTuple { .. }))
+                    .filter(|key| !key.is_project())
                     .filter_map(|key| key.module().map(str::to_owned)),
             );
         }
@@ -592,6 +600,7 @@ impl ConfigGate {
                 recovery,
                 delivery,
                 project_files,
+                project_capture: None,
             },
         );
         Ok(view)
@@ -670,6 +679,7 @@ impl ConfigGate {
         review: impl FnOnce(&GateSnapshot, &GateSnapshot) -> Result<Changeset>,
     ) -> Result<ConfigPlanView> {
         let mut target = GateSnapshot::from_store(&store.rollback_configuration(generation)?)?;
+        target.inputs.retain(|key, _| !key.is_project());
         target.restore_programs_from(current_programs)?;
         let copied = store
             .body()?
@@ -712,7 +722,13 @@ impl ConfigGate {
         plan.view
             .plan
             .check_fresh(base, &current.read_set(&plan.modules)?)
-            .map_err(|_| GateError::stale())
+            .map_err(|_| {
+                if plan.project_capture.is_some() {
+                    capture_plan::changed()
+                } else {
+                    GateError::stale()
+                }
+            })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -776,7 +792,35 @@ impl ConfigGate {
             delivery: plan.delivery.clone(),
         };
         let base_before = store.status().base_revision;
-        let observed = current.to_store()?;
+        let mut observed = current.clone();
+        if !plan.recovery {
+            let body = store.body()?;
+            let previous = body.observed.as_ref().unwrap_or(&body.approved);
+            let previous = GateSnapshot::from_store(previous)?;
+            // Project file observations are maintained by the project capture,
+            // not by the user-only file capturer. Keep deferred observations.
+            observed.inputs.retain(|key, _| !key.is_project());
+            observed.carry_project_inputs(&previous);
+            observed.carry_project_inputs(&plan.snapshot);
+            if let Some(capture) = &plan.project_capture {
+                for (key, input) in &plan.snapshot.inputs {
+                    if matches!(key, InputKey::ProjectTuple { .. }) {
+                        observed.inputs.insert(key.clone(), input.clone());
+                    }
+                }
+                for key in observed.inputs.keys().cloned().collect::<Vec<_>>() {
+                    if matches!(&key, InputKey::Layer { module, .. } if capture.held_user.contains(module))
+                    {
+                        if let Some(input) = previous.inputs.get(&key) {
+                            observed.inputs.insert(key, input.clone());
+                        } else {
+                            observed.inputs.remove(&key);
+                        }
+                    }
+                }
+            }
+        }
+        let observed = observed.to_store()?;
         before_publication()?;
         let result = if plan.recovery {
             store.recovery_exit(entry, snapshot, now_ms)

@@ -436,6 +436,20 @@ impl ConfigCapturer {
         self.capture_layers(daemon, declarations, selected, true, CapturedFile::open)
     }
 
+    pub(super) fn capture_with_retained_user(
+        &self,
+        declarations: &BTreeMap<String, ConfigDeclareRequest>,
+        selected: Option<&BTreeSet<String>>,
+        mut retained: BTreeMap<PathBuf, CapturedFile>,
+    ) -> Result<CapturedConfiguration> {
+        let daemon = CapturedFile::open(&self.daemon_path)?;
+        self.capture_layers(daemon, declarations, selected, true, |path| {
+            retained
+                .remove(path)
+                .map_or_else(|| CapturedFile::open(path), Ok)
+        })
+    }
+
     /// Re-evaluate saved raw configuration rather than today's edited files.
     /// Program capture still opens the files at the restored configured paths.
     pub(crate) fn capture_retained(
@@ -518,7 +532,7 @@ impl ConfigCapturer {
                 && target
                     .inputs
                     .iter()
-                    .filter(|(key, _)| !key.is_program())
+                    .filter(|(key, _)| !key.is_program() && !key.is_project())
                     .ne(captured
                         .diagnostic
                         .inputs
@@ -669,7 +683,7 @@ impl ConfigCapturer {
         })
     }
 
-    fn capture_module(
+    pub(super) fn capture_module(
         &self,
         module: &str,
         declaration: &ConfigDeclareRequest,
@@ -764,6 +778,17 @@ impl ConfigCapturer {
                 Ok(Some(ConfigFileError::new(error.code, error.detail)))
             }
             Err(error) => Err(error),
+        }
+    }
+}
+
+impl CapturedFile {
+    pub(super) fn retained(path: PathBuf, bytes: Option<Vec<u8>>, state: InputState) -> Self {
+        Self {
+            _file: None,
+            path,
+            bytes,
+            state,
         }
     }
 }

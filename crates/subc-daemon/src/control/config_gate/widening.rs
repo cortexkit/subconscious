@@ -131,6 +131,7 @@ impl ControlHandler {
                 now_ms(),
                 Some(window),
                 publication,
+                None,
             )
         })
         .await?;

@@ -33,7 +33,7 @@ pub struct LayerFile {
 }
 
 impl LayerLocation {
-    pub(super) fn same_identity(&self, current: &Self) -> bool {
+    pub(in crate::config_gate) fn same_identity(&self, current: &Self) -> bool {
         self.directory_id == current.directory_id
             && self.file.as_ref().map(|file| &file.id) == current.file.as_ref().map(|file| &file.id)
     }

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.46
+
+- On Windows, no-follow directory traversal shares writes so a directory open for writing does not block a scan. Traversal still checks each opened handle for reparse points and does not share delete access, keeping each checked directory pinned against rename or deletion while it is held. Regular file sharing is unchanged.
+
 ## 0.1.45
 
 - Add handle-relative no-follow directory and singly linked file opens, distinguishing missing entries, symlinks or reparse points, nonregular files and hardlinks.

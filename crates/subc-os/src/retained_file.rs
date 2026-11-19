@@ -146,24 +146,33 @@ fn open_nofollow_all(
     };
     use windows_sys::Win32::Storage::FileSystem::{
         GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT,
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
     };
     if !path.is_absolute() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "absolute path required").into());
     }
     let mut prefix = std::path::PathBuf::new();
     let mut ancestors = Vec::new();
-    for part in path.components() {
-        match part {
-            Component::CurDir => continue,
-            _ => prefix.push(part),
-        }
+    let mut parts = path
+        .components()
+        .filter(|part| *part != Component::CurDir)
+        .peekable();
+    while let Some(part) = parts.next() {
+        prefix.push(part);
         if !prefix.is_absolute() {
             continue;
         }
+        // Directory writers need not exclude traversal. Still deny delete
+        // sharing to pin each checked name, and leave regular leaves read-only.
+        let share = if want_directory || parts.peek().is_some() {
+            FILE_SHARE_READ | FILE_SHARE_WRITE
+        } else {
+            FILE_SHARE_READ
+        };
         let file = std::fs::OpenOptions::new()
             .read(true)
-            .share_mode(1)
+            .share_mode(share)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
             .open(&prefix)?;
         let mut information: BY_HANDLE_FILE_INFORMATION = Default::default();
@@ -328,6 +337,53 @@ mod tests {
         std::os::unix::fs::symlink(dir.join("real"), dir.join("link")).unwrap();
         assert!(open_directory_nofollow_all(&dir.join("link")).is_err());
         assert!(open_directory_nofollow_all(&dir.join("link/child")).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_directory_open_coexists_with_an_existing_directory_writer() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_ADD_FILE, FILE_FLAG_BACKUP_SEMANTICS};
+
+        let dir = cortexkit_test_support::ScratchDir::new("retained-directory-writer");
+        let child = dir.join("child");
+        std::fs::create_dir(&child).unwrap();
+        // FILE_ADD_FILE requests the directory right corresponding to write
+        // data on a file, so an opener that denies write sharing conflicts.
+        let writer = std::fs::OpenOptions::new()
+            .access_mode(FILE_ADD_FILE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&dir)
+            .unwrap();
+
+        let parent = open_directory_nofollow_all(&dir).unwrap();
+        let reopened = open_directory_nofollow_all(&dir).unwrap();
+        assert_eq!(
+            retained_file_identity(&parent).unwrap(),
+            retained_file_identity(&reopened).unwrap()
+        );
+        assert!(open_directory_nofollow_all(&child)
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .is_dir());
+        drop(writer);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_directory_open_still_blocks_rename_until_handle_closes() {
+        let dir = cortexkit_test_support::ScratchDir::new("retained-directory-rename");
+        let child = dir.join("child");
+        let renamed = dir.join("renamed");
+        std::fs::create_dir(&child).unwrap();
+        let handle = open_directory_nofollow_all(&child).unwrap();
+
+        assert!(std::fs::rename(&child, &renamed).is_err());
+        assert!(!renamed.exists());
+        drop(handle);
+        std::fs::rename(&child, &renamed).unwrap();
+        assert!(renamed.is_dir());
     }
 
     #[test]

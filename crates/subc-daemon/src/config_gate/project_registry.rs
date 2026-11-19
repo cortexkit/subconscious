@@ -166,7 +166,7 @@ pub struct RegistryProject {
 }
 
 impl RegistryProject {
-    fn roots(&self) -> impl Iterator<Item = &RegistryRoot> {
+    pub(super) fn roots(&self) -> impl Iterator<Item = &RegistryRoot> {
         self.project_roots.iter().chain(&self.workspace_root)
     }
 }
@@ -208,6 +208,10 @@ impl RegistryScope {
             all_registered: true,
             ..Self::default()
         }
+    }
+
+    pub(super) fn include_all(&mut self) {
+        self.all_registered = true;
     }
 
     fn includes(
@@ -584,6 +588,14 @@ impl RegistryRevision {
         .map_err(GateError::invalid)
     }
 
+    pub(super) fn digest_for_project(&self, id: &str) -> Result<Digest> {
+        subc_config::digest(
+            subc_config::PURPOSE_SNAPSHOT,
+            &serde_json::json!(["project-registry-entry-v1", self.module, self.project(id)?]),
+        )
+        .map_err(GateError::invalid)
+    }
+
     /// Compare freshly derived affected entries and touched layer identities,
     /// not the enumeration generation or bytes of other layer files.
     pub fn recheck(&self, current: &Self, scope: &RegistryScope) -> Result<()> {
@@ -665,7 +677,7 @@ fn validate_module(module: &str) -> Result<()> {
     Ok(())
 }
 
-fn layer_path(root: &Path, module: &str) -> PathBuf {
+pub(super) fn layer_path(root: &Path, module: &str) -> PathBuf {
     root.join(".cortexkit").join(format!("{module}.jsonc"))
 }
 
@@ -722,12 +734,33 @@ fn eligible(root: &RootRecord) -> bool {
 }
 
 pub type RegistryFuture<'a> = Pin<Box<dyn Future<Output = Result<RegistryRevision>> + Send + 'a>>;
+#[doc(hidden)]
+pub type RegistryBatch = (Option<EnumerateReply>, BTreeMap<String, RegistryRevision>);
+#[doc(hidden)]
+pub type RegistryBatchFuture<'a> = Pin<Box<dyn Future<Output = Result<RegistryBatch>> + Send + 'a>>;
+
 pub trait ProjectRegistry: Send + Sync {
     fn snapshot_scoped<'a>(
         &'a self,
         module: &'a str,
         scope: &'a RegistryScope,
     ) -> RegistryFuture<'a>;
+
+    /// Capture several modules against one complete enumeration when the
+    /// registry supplies it. Root I/O is independent of the runtime owner.
+    #[doc(hidden)]
+    fn capture_batch<'a>(
+        &'a self,
+        scopes: &'a BTreeMap<String, RegistryScope>,
+    ) -> RegistryBatchFuture<'a> {
+        Box::pin(async move {
+            let mut revisions = BTreeMap::new();
+            for (module, scope) in scopes {
+                revisions.insert(module.clone(), self.snapshot_scoped(module, scope).await?);
+            }
+            Ok((None, revisions))
+        })
+    }
 
     fn snapshot<'a>(
         &'a self,

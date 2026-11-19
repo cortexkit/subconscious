@@ -23,10 +23,11 @@ pub(crate) struct ProjectReview {
     pub cutoffs: ProjectCutoffs,
     pub declaration: ConfigDeclareRequest,
     pub reviewed_build: Digest,
+    pub registry_identity: Option<Digest>,
 }
 
 impl ProjectReview {
-    fn approval_digest(&self) -> Result<Digest> {
+    pub(super) fn approval_digest(&self) -> Result<Digest> {
         fn content(view: &ConfigView) -> impl serde::Serialize + '_ {
             (
                 &view.project_id,
@@ -44,6 +45,7 @@ impl ProjectReview {
                 content(&self.cutoffs.workspace),
                 self.declaration,
                 self.reviewed_build,
+                self.registry_identity,
             ]),
         )
         .map_err(GateError::invalid)

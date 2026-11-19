@@ -547,6 +547,14 @@ fn defaults(s: &Value) -> Option<Value> {
     if is_opaque(s) {
         return None;
     }
+    // An optional object with no default of its own stays absent until a
+    // layer sets it; its members' defaults apply only once it exists.
+    if s.get("x-ck-required") == Some(&Value::Bool(false)) {
+        return None;
+    }
+    member_defaults(s)
+}
+fn member_defaults(s: &Value) -> Option<Value> {
     let properties = s.get("properties")?.as_object()?;
     Some(Value::Object(
         properties
@@ -842,7 +850,16 @@ fn validate(
         }
     }
     if let Some(object) = value.as_object() {
-        if object.keys().any(|k| k == "env" || k == "file") && object.len() == 1 {
+        // `{"env": "NAME"}` and `{"file": "path"}` are the old value-reference
+        // forms: a module expanding them would read input nobody approved. Only
+        // that exact shape is refused; a lone `env` or `file` key holding a
+        // map or list is ordinary data, such as a declared map of shell
+        // environment variables.
+        if object.len() == 1
+            && object
+                .iter()
+                .any(|(k, v)| (k == "env" || k == "file") && v.is_string())
+        {
             return Err(invalid());
         }
         for (key, child) in object {
@@ -1035,13 +1052,23 @@ fn merge(
                     target.insert(key.clone(), value.clone());
                     continue;
                 }
-                let mut initial = default.unwrap_or_else(|| {
-                    if value.is_object() {
-                        serde_json::json!({})
-                    } else {
-                        value.clone()
-                    }
-                });
+                let mut initial = default
+                    .or_else(|| {
+                        // The first layer to set an optional object starts
+                        // from its members' defaults.
+                        if value.is_object() && !is_opaque(child) && !credential(child) {
+                            member_defaults(child)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| {
+                        if value.is_object() {
+                            serde_json::json!({})
+                        } else {
+                            value.clone()
+                        }
+                    });
                 merge(child, &mut initial, value, &child_path, layer, sources, c)?;
                 target.insert(key.clone(), initial);
             }
@@ -1577,6 +1604,29 @@ mod tests {
     }
 
     #[test]
+    fn declared_env_map_and_file_list_are_data_not_value_references() {
+        let mut env = object(json!({}));
+        env["patternProperties"] = json!({"^[A-Z_]+$": field("string", json!(""))});
+        let mut file = field("array", json!([]));
+        file["items"] = field("string", json!(""));
+        let s = schema(
+            json!({"bash": object(json!({"env": env})), "inputs": object(json!({"file": file}))}),
+        );
+        s.validate_layer(
+            Layer::User,
+            &json!({"bash":{"env":{"PATH":"/usr/bin"}}}),
+            &context(),
+        )
+        .unwrap();
+        s.validate_layer(
+            Layer::User,
+            &json!({"inputs":{"file":["a.txt"]}}),
+            &context(),
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn opaque_json_enforces_local_ref_siblings_and_object_and_array_constraints() {
         let mut field = opaque_field();
         field.as_object_mut().unwrap().remove("oneOf");
@@ -1673,6 +1723,33 @@ mod tests {
                 .unwrap()
                 .effective,
             json!({"map":{"key_a":1},"choice":{"kind":"a","number":2}})
+        );
+    }
+
+    #[test]
+    fn optional_object_without_default_stays_absent_until_set() {
+        let mut model = field("string", json!(""));
+        model.as_object_mut().unwrap().remove("default");
+        model["x-ck-required"] = json!(false);
+        let mut pin = object(json!({"model": model, "variant": field("string", json!("high"))}));
+        pin["required"] = json!(["model"]);
+        pin["x-ck-required"] = json!(false);
+        let s = schema(json!({"pin": pin, "n": field("number", json!(1))}));
+        assert_eq!(s.defaults(), json!({"n": 1}));
+        assert_eq!(
+            s.review_tuple(&[], &context()).unwrap().effective,
+            json!({"n": 1})
+        );
+        s.validate_layer(Layer::User, &json!({"n": 2}), &context())
+            .unwrap();
+        assert_eq!(
+            s.review_tuple(
+                &layers(json!({"pin": {"model": "m"}}), json!({})),
+                &context()
+            )
+            .unwrap()
+            .effective,
+            json!({"n": 1, "pin": {"model": "m", "variant": "high"}})
         );
     }
 

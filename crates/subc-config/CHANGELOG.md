@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.4
+
+- Refuse only the old value-reference shapes `{"env": "<string>"}` and `{"file": "<string>"}`.
+  An object whose single `env` or `file` key holds a map or list, such as a declared map of
+  shell environment variables, is ordinary data.
+- An optional object (`x-ck-required: false`) with no default stays absent until a layer sets
+  it, instead of being built from its members' defaults and failing its own required members.
+  The first layer that sets it starts from those member defaults.
+
 ## 0.1.3
 
 - Allow scalar type lists at managed fields and user-only opaque JSON fields.

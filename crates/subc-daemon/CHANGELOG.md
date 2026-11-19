@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.50.18
+
+- Use subc-config 0.1.4: a settings object whose single `env` or `file` key holds a map or list
+  validates as data; only the old `{"env": "<string>"}` and `{"file": "<string>"}` reference
+  shapes are refused. An optional settings object with no default stays absent until a layer
+  sets it.
+
 ## 0.50.17
 
 - Adopt subc-config 0.1.3 for scalar type lists and report opaque JSON as whole fields in reviews.

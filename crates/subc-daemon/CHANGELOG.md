@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.50.15
+
+- Refuse settings declarations before storing them if a number cannot be
+  encoded as canonical JSON, including integers outside ±9,007,199,254,740,991.
+  The refusal identifies the offending JSON pointer.
+- Keep configuration status, module listings and settings watches readable when
+  one module has an invalid declaration or user file. On an unstamped install,
+  which applies settings files directly, an edit plan reads only the modules it
+  edits; plans still refuse invalid inputs they select.
+- Development-only program placement and approvals to widen provider
+  declarations still read every module's live settings. If an unsupported
+  number in a user file blocks either operation, the refusal names the module,
+  file and JSON pointer.
+
 ## 0.50.14
 
 - Log the first `route.open` refusal and summarize identical repeats across

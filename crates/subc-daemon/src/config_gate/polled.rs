@@ -36,9 +36,7 @@ impl RuntimeOwner {
         let view = &snapshot.projection;
         let mut status = view.status.clone();
         if matches!(status.state.as_str(), "stamped" | "unstamped") && !status.anchor_pending {
-            let captured = self
-                .capturer
-                .capture_polled_configuration(&view.config_declarations)?;
+            let captured = self.capturer.capture_settings(&view.config_declarations)?;
             let candidate = captured.proposal_snapshot(&view.approved);
             if status.state == "stamped" {
                 let changed = candidate
@@ -50,6 +48,7 @@ impl RuntimeOwner {
             } else {
                 status_inputs::report_snapshot(&candidate, &mut status);
             }
+            captured.report_errors(&mut status);
         }
         status.root_io = self.capturer.projects.root_io_health();
         Ok(status)

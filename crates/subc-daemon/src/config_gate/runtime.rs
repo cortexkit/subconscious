@@ -1181,6 +1181,8 @@ impl RuntimeOwner {
         declaration: ConfigDeclareRequest,
         active: bool,
     ) -> Result<()> {
+        super::strict_json::check_canonical(&declaration.schema, "/schema")
+            .map_err(|error| GateError::new(&error.code, format!("{module}: {}", error.detail)))?;
         subc_config::Schema::new(declaration.schema.clone())
             .map_err(|r| GateError::new("schema_invalid", format!("{module}: {}", r.path)))?;
         let mut state = self.lock()?;
@@ -2186,14 +2188,7 @@ impl RuntimeOwner {
                 }
                 // Publication already succeeded. Refresh drift after reconciliation
                 // without turning a failed diagnostic capture into a failed approval.
-                let _ = (|| -> Result<()> {
-                    let captured = self.capture(&mut state)?;
-                    let approved = super::GateSnapshot::from_store(&state.store.body()?.approved)?;
-                    state
-                        .store
-                        .observe(captured.proposal_snapshot(&approved).to_store()?)?;
-                    Ok(())
-                })();
+                let _ = self.observe_proposal(&mut state);
             }
         }
         let stamped_files = committed_this_call
@@ -2335,6 +2330,7 @@ impl RuntimeOwner {
     pub fn status(&self) -> Result<subc_control::config::ConfigStatus> {
         let mut state = self.lock()?;
         let mut current_snapshot = None;
+        let mut observation = None;
         state.retry_anchor(true);
         let verified = state.store.check().is_ok();
         if verified
@@ -2345,12 +2341,8 @@ impl RuntimeOwner {
                 StoreState::Stamped | StoreState::Unstamped
             )
         {
-            let captured = self.capture(&mut state)?;
-            current_snapshot = Some(captured.diagnostic.clone());
-            let approved = super::GateSnapshot::from_store(&state.store.body()?.approved)?;
-            state
-                .store
-                .observe(captured.proposal_snapshot(&approved).to_store()?)?;
+            observation = Some(self.observe_proposal(&mut state)?);
+            current_snapshot = state.observed_snapshot.clone();
         }
         let store_status = state.store.status();
         let mut status = subc_control::config::ConfigStatus::default();
@@ -2475,6 +2467,9 @@ impl RuntimeOwner {
         }
         if let Some(snapshot) = current_snapshot {
             status_inputs::report_snapshot(&snapshot, &mut status);
+        }
+        if let Some(captured) = observation {
+            captured.report_errors(&mut status);
         }
         status.gated_modules = admission::AdmissionCache::from_state(&state).held_modules();
         if state.store.loaded_admission_state().0 == StoreState::Stamped {

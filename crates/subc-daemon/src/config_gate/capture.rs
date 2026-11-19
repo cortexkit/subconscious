@@ -231,8 +231,15 @@ impl CapturedFile {
     }
 
     pub(super) fn parse(&self) -> Result<Value> {
+        self.parse_with_canonical_context(|error| error)
+    }
+
+    fn parse_with_canonical_context(
+        &self,
+        with_context: impl FnOnce(GateError) -> GateError,
+    ) -> Result<Value> {
         match &self.bytes {
-            Some(bytes) => parse_layer(bytes),
+            Some(bytes) => parse_layer_with_canonical_context(bytes, with_context),
             None => Ok(json!({})),
         }
     }
@@ -243,9 +250,16 @@ impl CapturedFile {
 }
 
 pub(super) fn parse_layer(bytes: &[u8]) -> Result<Value> {
+    parse_layer_with_canonical_context(bytes, |error| error)
+}
+
+fn parse_layer_with_canonical_context(
+    bytes: &[u8],
+    with_context: impl FnOnce(GateError) -> GateError,
+) -> Result<Value> {
     let text = std::str::from_utf8(bytes).map_err(capture_error)?;
     let normalized = subc_jsonc::jsonc_to_json(text).map_err(capture_error)?;
-    super::strict_json::parse(&normalized)
+    super::strict_json::parse_with_canonical_context(&normalized, with_context)
 }
 
 pub struct CapturedModule {
@@ -265,6 +279,41 @@ pub struct CapturedConfiguration {
 pub(crate) struct SettingsCapture {
     pub configuration: CapturedConfiguration,
     pub file_errors: BTreeMap<String, ConfigFileError>,
+    pub module_errors: BTreeMap<String, GateError>,
+}
+
+impl SettingsCapture {
+    fn has_error(&self, module: &str) -> bool {
+        self.module_errors.contains_key(module) || self.file_errors.contains_key(module)
+    }
+
+    pub(super) fn proposal_snapshot(&self, approved: &GateSnapshot) -> GateSnapshot {
+        let mut snapshot = self.configuration.proposal_snapshot(approved);
+        // A failed observation is not evidence that the approved inputs vanished.
+        for (key, input) in &approved.inputs {
+            if let InputKey::Declaration(module) | InputKey::Layer { module, .. } = key {
+                if self.has_error(module) {
+                    snapshot.inputs.insert(key.clone(), input.clone());
+                }
+            }
+        }
+        snapshot
+    }
+
+    pub(super) fn report_errors(&self, status: &mut subc_control::config::ConfigStatus) {
+        status
+            .ungated_modules
+            .retain(|module| !self.has_error(module));
+        for (module, error) in &self.module_errors {
+            status.warnings.push(format!("module {module}: {error}"));
+        }
+        for (module, error) in &self.file_errors {
+            status.warnings.push(format!(
+                "module {module}: {}: {}",
+                error.code, error.message
+            ));
+        }
+    }
 }
 
 impl CapturedConfiguration {
@@ -345,14 +394,22 @@ impl ConfigCapturer {
         self.capture_layers(daemon, declarations, None, false, CapturedFile::open)
     }
 
-    /// Settings observations report invalid user files per module. Planning and
-    /// delivery still use the rejecting capture path and cannot adopt them.
+    /// Settings observations report invalid declarations and files per module.
+    /// Planning and delivery still reject invalid inputs they select.
     pub(crate) fn capture_settings(
         &self,
         declarations: &BTreeMap<String, ConfigDeclareRequest>,
     ) -> Result<SettingsCapture> {
         let daemon = CapturedFile::open(&self.daemon_path)?;
         self.capture_layers_observed::<true>(daemon, declarations, None, false, CapturedFile::open)
+    }
+
+    pub(super) fn capture_status(
+        &self,
+        declarations: &BTreeMap<String, ConfigDeclareRequest>,
+    ) -> Result<SettingsCapture> {
+        let daemon = CapturedFile::open(&self.daemon_path)?;
+        self.capture_layers_observed::<true>(daemon, declarations, None, true, CapturedFile::open)
     }
 
     pub fn capture(
@@ -485,7 +542,7 @@ impl ConfigCapturer {
             .map(|captured| captured.configuration)
     }
 
-    fn capture_layers_observed<const REPORT_FILE_ERRORS: bool>(
+    fn capture_layers_observed<const REPORT_MODULE_ERRORS: bool>(
         &self,
         daemon: CapturedFile,
         declarations: &BTreeMap<String, ConfigDeclareRequest>,
@@ -559,18 +616,31 @@ impl ConfigCapturer {
         }
         let mut modules = BTreeMap::new();
         let mut file_errors = BTreeMap::new();
+        let mut module_errors = BTreeMap::new();
         for (module, declaration) in declarations {
             if selected.is_some_and(|modules| !modules.contains(module)) {
                 continue;
             }
+            let decl_input = match declaration_input(module, declaration) {
+                Ok(input) => input,
+                Err(error) if REPORT_MODULE_ERRORS => {
+                    module_errors.insert(module.clone(), error);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let (captured, input) = match self.capture_module(module, declaration, &mut layer_file)
             {
                 Ok(captured) => captured,
-                Err(error) if REPORT_FILE_ERRORS && is_settings_file_error(&error) => {
-                    file_errors.insert(
-                        module.clone(),
-                        ConfigFileError::new(error.code, error.detail),
-                    );
+                Err(error) if REPORT_MODULE_ERRORS && !error.is_capture_race() => {
+                    if is_settings_file_error(&error) {
+                        file_errors.insert(
+                            module.clone(),
+                            ConfigFileError::new(error.code, error.detail),
+                        );
+                    } else {
+                        module_errors.insert(module.clone(), error);
+                    }
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -582,17 +652,9 @@ impl ConfigCapturer {
                 },
                 input,
             );
-            let decl = serde_json::to_value(declaration).map_err(GateError::invalid)?;
-            diagnostic.inputs.insert(
-                InputKey::Declaration(module.clone()),
-                CapturedInput {
-                    state: InputState::Present {
-                        digest: subc_config::digest(subc_config::PURPOSE_DECLARATION, &decl)
-                            .map_err(GateError::invalid)?,
-                    },
-                    value: RecordedValue::new(redact_launch_values(&decl)?),
-                },
-            );
+            diagnostic
+                .inputs
+                .insert(InputKey::Declaration(module.clone()), decl_input);
             modules.insert(module.clone(), captured);
         }
         Ok(SettingsCapture {
@@ -603,6 +665,7 @@ impl ConfigCapturer {
                 _program_handles: program_handles,
             },
             file_errors,
+            module_errors,
         })
     }
 
@@ -639,8 +702,12 @@ impl ConfigCapturer {
         let schema = Schema::new(declaration.schema.clone()).map_err(|refusal| {
             GateError::new("schema_invalid", format!("{module}: {}", refusal.path))
         })?;
+        let file_context = |mut error: GateError| {
+            error.detail = format!("{module}: {}: {}", expected.display(), error.detail);
+            error
+        };
         let file = layer_file(&expected)?;
-        let value = file.parse()?;
+        let value = file.parse_with_canonical_context(file_context)?;
         refuse_expansions(&value, module, "")?;
         // Record even invalid literals through the schema projection first;
         // nothing raw is retained on the refusal path.
@@ -699,6 +766,20 @@ impl ConfigCapturer {
             Err(error) => Err(error),
         }
     }
+}
+
+fn declaration_input(module: &str, declaration: &ConfigDeclareRequest) -> Result<CapturedInput> {
+    let value = serde_json::to_value(declaration).map_err(GateError::invalid)?;
+    let digest =
+        subc_config::digest(subc_config::PURPOSE_DECLARATION, &value).map_err(|error| {
+            let mut error = super::strict_json::canonical_error(error, &value, "");
+            error.detail = format!("{module}: {}", error.detail);
+            error
+        })?;
+    Ok(CapturedInput {
+        state: InputState::Present { digest },
+        value: RecordedValue::new(redact_launch_values(&value)?),
+    })
 }
 
 fn is_settings_file_error(error: &GateError) -> bool {

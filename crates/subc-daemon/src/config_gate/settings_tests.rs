@@ -1,10 +1,101 @@
 use super::*;
 use crate::config_gate::{ApprovalFacts, ApprovalReply, PresenceDecision};
 use serde_json::json;
+use subc_protocol::config::ConfigGetRequest;
 
 pub(crate) struct SettingsRig {
     pub(crate) root: cortexkit_test_support::ScratchDir,
     pub(crate) owner: std::sync::Arc<RuntimeOwner>,
+}
+
+#[test]
+fn config_bad_number_declaration_is_refused_with_pointer_before_storage() {
+    let rig = SettingsRig::new();
+    let (module, declaration) = rig.bad_number_declaration();
+    let connection = ConnectionId::new(11);
+    let error = rig
+        .owner
+        .declare(connection, &module, declaration, true)
+        .expect_err("declare must refuse an unrepresentable schema number");
+    assert_eq!(error.code, "value_invalid");
+    assert!(error.detail.contains("/schema/properties/limit/maximum"));
+    let state = rig.owner.lock().unwrap();
+    assert!(!state.declarations.contains_key(&connection));
+    assert!(!state.active_declarations.contains_key(&module));
+}
+
+#[test]
+fn config_bad_number_status_keeps_healthy_modules() {
+    let rig = SettingsRig::new();
+    std::fs::write(
+        rig.root.join("subc.jsonc"),
+        br#"{"version":1,"modules":{"healthy":{"program":"unused","enabled":false}}}"#,
+    )
+    .unwrap();
+    rig.inject_bad_number_declaration();
+    let status = rig
+        .owner
+        .polled_status()
+        .expect("status should remain readable");
+    assert_eq!(status.ungated_modules, ["healthy"]);
+    assert!(status.warnings.iter().any(|warning| {
+        warning.contains("sample-extra") && warning.contains("/schema/properties/limit/maximum")
+    }));
+}
+
+#[test]
+fn config_bad_number_file_is_isolated_in_delivery_and_targeted_planning() {
+    let rig = SettingsRig::new();
+    rig.declare("sample-extra", 11, true);
+    let path = rig.root.join("cortexkit/sample-extra.jsonc");
+    std::fs::write(
+        &path,
+        br#"{"limit":18446744073709551615,"credential":{"vault_ref":"sample-reference"}}"#,
+    )
+    .unwrap();
+    let check_error = |error: GateError| {
+        assert_eq!(error.code, "value_invalid");
+        assert!(error.detail.contains("sample-extra"));
+        // Windows may report the temp folder under its long or short (8.3) name,
+        // so match the file name rather than the whole path.
+        assert!(error.detail.contains("sample-extra.jsonc"));
+        assert!(error.detail.contains("JSON pointer \"/limit\""));
+        assert!(error.detail.contains("finite number"));
+    };
+    check_error(
+        rig.owner
+            .module_get(
+                ConnectionId::new(11),
+                "sample-extra",
+                ConfigGetRequest::new(),
+            )
+            .unwrap_err(),
+    );
+    let reply = rig
+        .owner
+        .module_get(
+            ConnectionId::new(10),
+            "sample-reader",
+            ConfigGetRequest::new(),
+        )
+        .unwrap();
+    assert_eq!(reply.active.unwrap().effective["limit"], 4);
+    check_error(rig.owner.prepare(PlanKind::Stamp).err().unwrap());
+    let prepare = |module: &str| {
+        let edit = serde_json::from_value(json!({
+            "module_id":module, "layer":"user", "path":"/limit", "set":8
+        }))
+        .unwrap();
+        rig.owner
+            .prepare_edits(BTreeMap::from([(module.into(), 0)]), vec![edit])
+    };
+    check_error(prepare("sample-extra").err().unwrap());
+    let prepared = prepare("sample-reader").unwrap();
+    assert_eq!(prepared.candidate.modules.len(), 1);
+    assert_eq!(
+        prepared.candidate.modules["sample-reader"].view.effective["limit"],
+        8
+    );
 }
 
 #[test]
@@ -124,6 +215,36 @@ fn config_settings_file_error_is_per_module_and_does_not_relax_planning() {
 }
 
 impl SettingsRig {
+    fn bad_number_declaration(&self) -> (String, ConfigDeclareRequest) {
+        let module = "sample-extra".to_owned();
+        let mut declaration = self.owner.lock().unwrap().declarations[&ConnectionId::new(10)]
+            .1
+            .clone();
+        declaration.schema["properties"]["limit"]["maximum"] = json!(u64::MAX);
+        declaration.user_file = self
+            .root
+            .join("cortexkit/sample-extra.jsonc")
+            .to_string_lossy()
+            .into_owned();
+        (module, declaration)
+    }
+
+    pub(crate) fn inject_bad_number_declaration(&self) {
+        // Reproduce an already-stored declaration without relying on admission.
+        let (module, declaration) = self.bad_number_declaration();
+        std::fs::write(
+            &declaration.user_file,
+            br#"{"limit":6,"credential":{"vault_ref":"sample-reference"}}"#,
+        )
+        .unwrap();
+        let connection = ConnectionId::new(11);
+        let mut state = self.owner.lock().unwrap();
+        state
+            .declarations
+            .insert(connection, (module.clone(), declaration));
+        state.active_declarations.insert(module, connection);
+    }
+
     pub(crate) fn new() -> Self {
         let root = cortexkit_test_support::ScratchDir::new("settings-reads");
         std::fs::create_dir_all(root.join("store")).unwrap();

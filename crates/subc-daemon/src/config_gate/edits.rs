@@ -261,7 +261,10 @@ impl RuntimeOwner {
         modules: Option<&BTreeSet<String>>,
     ) -> Result<CapturedConfiguration> {
         if state.store.status().state == StoreState::Unstamped {
-            return self.capture(state);
+            return match modules {
+                Some(modules) => self.capture_modules(state, modules),
+                None => self.capture(state),
+            };
         }
         let admitted = modules.map(|_| Self::declarations(state)).transpose()?;
         let body = state.store.body()?;
@@ -304,7 +307,7 @@ impl RuntimeOwner {
         Self::check_authority(&mut state, false)?;
         let unstamped = state.store.status().state == StoreState::Unstamped;
         let touched: BTreeSet<_> = edits.iter().map(|edit| edit.module_id.clone()).collect();
-        let approved = self.edit_baseline(&mut state, None)?;
+        let approved = self.edit_baseline(&mut state, unstamped.then_some(&touched))?;
         for module in &touched {
             let wanted = base_generations
                 .get(module)
@@ -367,6 +370,7 @@ impl RuntimeOwner {
                 )?;
                 let mut document = captured.file.parse()?;
                 patch(&mut document, &keys, &edit.action)?;
+                crate::config_gate::strict_json::check_canonical(&document, "")?;
                 let reviewed = captured
                     .schema
                     .review_tuple(

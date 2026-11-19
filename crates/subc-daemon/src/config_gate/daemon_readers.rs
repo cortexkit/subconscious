@@ -70,13 +70,21 @@ impl RuntimeOwner {
         let mut state = self.lock()?;
         Self::check_authority(&mut state, false)?;
         if !state.recovery_exit_hold && !state.store.status().anchor_pending {
-            let captured = self.capture(&mut state)?;
-            let approved = super::super::GateSnapshot::from_store(&state.store.body()?.approved)?;
-            state
-                .store
-                .observe(captured.proposal_snapshot(&approved).to_store()?)?;
+            self.observe_proposal(&mut state)?;
         }
         Ok(())
+    }
+
+    pub(super) fn observe_proposal(
+        &self,
+        state: &mut OwnerState,
+    ) -> Result<super::super::capture::SettingsCapture> {
+        let captured = self.capturer.capture_status(&Self::declarations(state)?)?;
+        let approved = super::super::GateSnapshot::from_store(&state.store.body()?.approved)?;
+        let proposal = captured.proposal_snapshot(&approved);
+        state.store.observe(proposal.to_store()?)?;
+        state.observed_snapshot = Some(proposal);
+        Ok(captured)
     }
 
     /// A daemon that booted from a restart intent is serving. Recording that

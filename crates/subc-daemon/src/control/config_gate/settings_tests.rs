@@ -63,6 +63,43 @@ async fn event(rx: &mut tokio::sync::mpsc::Receiver<crate::router::OutboundFrame
 }
 
 #[tokio::test]
+async fn config_bad_number_watch_keeps_healthy_modules() {
+    bad_number_rows().await;
+}
+
+async fn bad_number_rows() -> (Value, Value) {
+    let rig = SettingsRig::new();
+    rig.inject_bad_number_declaration();
+    let handler = handler(&rig);
+    let (ctx, mut rx) = context();
+    let reply = handler
+        .handle_control_frame(&ctx, request(json!({"op":"config.watch"})))
+        .await
+        .unwrap();
+    assert!(reply.is_empty(), "watch failed to open: {reply:?}");
+    let resync = event(&mut rx).await;
+    assert_eq!(resync["event"], "resync");
+    let rows = resync["modules"].as_array().unwrap();
+    let row = |module: &str| rows.iter().find(|row| row["module_id"] == module).unwrap();
+    assert!(row("sample-reader")["schema_digest"].is_string());
+    let bad = row("sample-extra");
+    assert_eq!(bad["status"], "value_invalid");
+    assert!(bad["status_reason"]
+        .as_str()
+        .unwrap()
+        .contains("/schema/properties/limit/maximum"));
+    assert!(handler.cancel_config_settings_subscription(ctx.connection_id, 91));
+    let reply = handler
+        .handle_control_frame(&ctx, request(json!({"op":"config.modules"})))
+        .await
+        .unwrap();
+    assert_eq!(reply[0].header.ty, FrameType::Response);
+    let modules: Value = serde_json::from_slice(&reply[0].body).unwrap();
+    assert_eq!(modules["modules"], resync["modules"]);
+    (modules, resync)
+}
+
+#[tokio::test]
 async fn config_settings_handler_refusals_and_capability_gate() {
     let rig = SettingsRig::new();
     let handler = handler(&rig);
@@ -935,6 +972,9 @@ async fn config_settings_vectors_match_real_handler_bytes() {
     }
     samples.push(("schema-setup.request.json".into(), body));
     samples.push(("schema-setup.reply.json".into(), reply));
+    let (modules, watch) = bad_number_rows().await;
+    samples.push(("modules.declaration-error.reply.json".into(), modules));
+    samples.push(("watch.declaration-error.resync.json".into(), watch));
     let directory =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vectors/config-settings-v1");
     let update = std::env::var_os("UPDATE_GOLDEN").is_some();

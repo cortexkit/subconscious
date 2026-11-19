@@ -159,9 +159,8 @@ impl RuntimeOwner {
         let Some((write_back, captured)) = observation else {
             return Ok(None);
         };
-        let file_errors = captured.file_errors;
         let observed = if snapshot.body.stamped {
-            Some(captured.configuration.proposal_snapshot(&approved))
+            Some(captured.proposal_snapshot(&approved))
         } else {
             None
         };
@@ -175,14 +174,21 @@ impl RuntimeOwner {
             let mut row = ConfigModule::default();
             row.module_id = module.clone();
             row.gated = snapshot.declarations.contains_key(module);
-            if let Some(declaration) = snapshot.declarations.get(module) {
-                let schema = schema(declaration)?;
-                row.display_name = schema
-                    .normalized()
-                    .get("title")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-                row.schema_digest = Some(schema.digest().map_err(GateError::invalid)?);
+            let mut module_error = captured.module_errors.get(module).cloned();
+            if module_error.is_none() {
+                if let Some(declaration) = snapshot.declarations.get(module) {
+                    match schema_with_digest(declaration) {
+                        Ok((schema, digest)) => {
+                            row.display_name = schema
+                                .normalized()
+                                .get("title")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned);
+                            row.schema_digest = Some(digest);
+                        }
+                        Err(error) => module_error = Some(error),
+                    }
+                }
             }
             let entry = approved_entry(&snapshot.body, module);
             row.approved_generation = entry.map(|entry| entry.generation.id);
@@ -193,13 +199,13 @@ impl RuntimeOwner {
                 .find(|(tuple, _)| tuple.module == *module && tuple.project.is_none())
                 .map(|(_, versions)| versions);
             row.active_generation = versions.and_then(|versions| versions.active);
-            if !snapshot.body.stamped && row.gated {
+            if !snapshot.body.stamped && row.gated && module_error.is_none() {
                 row.approved_generation = Some(0);
                 row.active_generation = Some(0);
             }
             row.pending_plan = snapshot.pending.get(module).cloned();
             row.declaration_pending = snapshot.declaration_pending.get(module).cloned();
-            row.file_error = file_errors.get(module).cloned();
+            row.file_error = captured.file_errors.get(module).cloned();
             let failed = entry.filter(|entry| entry.generation.never_redeliver.contains(module));
             let mut proposal = false;
             let mut formatting = false;
@@ -243,6 +249,10 @@ impl RuntimeOwner {
                 row.status_reason =
                     Some("Running last approved settings; declaration awaits approval.".into());
             }
+            if let Some(error) = module_error {
+                row.status = error.code;
+                row.status_reason = Some(error.detail);
+            }
             modules.push(row);
         }
         Ok(Some(ConfigControlResponse::Modules {
@@ -257,10 +267,12 @@ impl RuntimeOwner {
         module: String,
     ) -> Result<ConfigControlResponse> {
         let snapshot = self.settings_snapshot(known)?;
-        let schema = schema(snapshot.declaration(&module)?)?;
+        let declaration = snapshot.declaration(&module)?;
+        crate::config_gate::strict_json::check_canonical(&declaration.schema, "/schema")?;
+        let (schema, schema_digest) = schema_with_digest(declaration)?;
         Ok(ConfigControlResponse::Schema {
             module_id: module,
-            schema_digest: schema.digest().map_err(GateError::invalid)?,
+            schema_digest,
             schema: schema.normalized().clone(),
         })
     }
@@ -392,6 +404,14 @@ impl SettingsSnapshot {
 fn schema(declaration: &ConfigDeclareRequest) -> Result<Schema> {
     Schema::new(declaration.schema.clone())
         .map_err(|_| GateError::new("schema_invalid", "admitted schema is invalid"))
+}
+
+fn schema_with_digest(declaration: &ConfigDeclareRequest) -> Result<(Schema, Digest)> {
+    let schema = schema(declaration)?;
+    let digest = schema.digest().map_err(|error| {
+        crate::config_gate::strict_json::canonical_error(error, schema.normalized(), "/schema")
+    })?;
+    Ok((schema, digest))
 }
 
 fn approved_entry<'a>(body: &'a StoreBody, module: &str) -> Option<&'a HistoryEntry> {

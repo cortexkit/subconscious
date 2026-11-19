@@ -1,0 +1,22 @@
+{
+  "event": "resync",
+  "modules": [
+    {
+      "gated": true,
+      "module_id": "sample-extra",
+      "status": "value_invalid",
+      "status_reason": "sample-extra: number at JSON pointer \"/schema/properties/limit/maximum\" is not lossless; use a finite number with any integer in the range -9007199254740991 to 9007199254740991"
+    },
+    {
+      "active_generation": 0,
+      "approved_generation": 0,
+      "display_name": "Sample reader",
+      "gated": true,
+      "module_id": "sample-reader",
+      "schema_digest": "sha256:6265d0e7a8e4dfe6a8f467df89b3a91a14eeeda16a51a32f16bb54e69ea456aa",
+      "status": "adopted"
+    }
+  ],
+  "op": "config.watch",
+  "stamped": false
+}

@@ -10,6 +10,7 @@ invented. The credential reference is a reference, never a secret.
 | --- | --- |
 | `modules.request.json` | List settings modules |
 | `modules.reply.json` | Stamped module rows before activation |
+| `modules.declaration-error.reply.json` | Healthy settings row beside a stored declaration that cannot be encoded |
 | `schema.request.json` | Read the sample module's schema |
 | `schema.reply.json` | Normalized admitted schema and digest |
 | `schema-setup.request.json` | Read the invented setup module's schema |
@@ -21,6 +22,7 @@ invented. The credential reference is a reference, never a secret.
 | `show-default.reply.json` | Defaults and their sources |
 | `watch.request.json` | Watch only the sample module |
 | `watch.resync.json` | Initial complete replacement state |
+| `watch.declaration-error.resync.json` | Initial state with a declaration diagnostic on just the affected row |
 | `watch.change.json` | Activation changed the row's fields |
 | `watch.file-error.json` | A settled user-file failure without ending the watch |
 | `SHA256SUMS` | SHA-256 of every JSON sample in this directory |
@@ -39,6 +41,11 @@ events expose a matching failure only after the save-settling grace, and omit
 the member on recovery. A stamped show reply keeps its approved values and
 reports the file failure immediately. Unstamped show calls with no valid live
 view keep the file's refusal instead of inventing effective values or defaults.
+
+An invalid stored declaration can be reported in the affected row's `status`
+and `status_reason` fields. Readers must tolerate unfamiliar status strings.
+The list and watch still include healthy rows. New declarations with an
+unrepresentable number are refused at admission.
 
 Regenerate with:
 

@@ -37,6 +37,8 @@ refused. Structural objects require `unevaluatedProperties: false`. Dynamic maps
 `patternProperties` value schema, not arbitrary additional JSON. Every primitive, replacement
 array, item and map value needs a description and effective `x-ck-apply` and `x-ck-layers`.
 Except for credential references, these fields need a default or an explicit `x-ck-required`.
+An object marked `x-ck-required: false` with no default stays absent until a layer sets it;
+that layer starts from the defaults of the object's members.
 `true` requires an effective value; `false` with no default leaves the field absent until a layer
 sets it. With a default, `false` still uses the default. An absent overlay inherits the lower value;
 neither `null` nor an empty array means absent.
@@ -70,6 +72,8 @@ workspace and project writes give `layer_forbidden` at the field. Review diffs l
 one field with the whole old and new values. Defaults are allowed and validated. The field itself
 cannot be `null`, but nested JSON may contain nulls. Literal `{env:` and `{file:` tokens are still
 refused; singleton objects with `env` or `file` keys are ordinary data inside an opaque field.
+Outside opaque fields, `{"env": "<string>"}` and `{"file": "<string>"}` are refused as the old
+value-reference forms; a lone `env` or `file` key holding a map or list is ordinary data.
 
 An opaque field can omit `type` and other JSON assertions to accept any non-null JSON, or use
 constraints such as `"type": ["boolean", "object"]` or a `oneOf` without a discriminator.

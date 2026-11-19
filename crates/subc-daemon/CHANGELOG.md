@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.50.14
+
+- Log the first `route.open` refusal and summarize identical repeats across
+  reconnects, without changing the responses sent to clients.
+
 ## 0.50.13
 
 - Capture workspace and project layers through retained registry roots on the root I/O pool, with per-project refusals and shared physical file observations.

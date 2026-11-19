@@ -1,5 +1,6 @@
 #[path = "control/list_diagnostics.rs"]
 pub(crate) mod list_diagnostics;
+mod route_open_refusal_log;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -508,6 +509,7 @@ pub struct ControlHandler {
     /// the per-refusal INFO lines. Taken from the forwarding table, so every
     /// handler built over one table shares it.
     route_outages: Arc<crate::route_outage::RouteOutageTracker>,
+    route_refusal_log: route_open_refusal_log::RefusalLog,
     /// Consecutive relay timeouts that open a module's breaker.
     route_bind_breaker_threshold: u32,
     /// How long a breaker stays open before one probe is admitted.
@@ -1217,6 +1219,7 @@ impl ControlHandler {
             route_bind_breakers,
             route_bind_concurrency,
             route_outages,
+            route_refusal_log: Default::default(),
             route_bind_breaker_threshold: DEFAULT_ROUTE_BIND_BREAKER_THRESHOLD,
             route_bind_breaker_cooldown: DEFAULT_ROUTE_BIND_BREAKER_COOLDOWN,
             health_probe_timeout: DEFAULT_HEALTH_PROBE_TIMEOUT,
@@ -6208,11 +6211,6 @@ impl ControlHandler {
         )
     }
 
-    /// `code` is daemon vocabulary and prints plainly; `module_id` is the
-    /// requester's bytes (an unknown target is whatever the client sent) and
-    /// is Debug-formatted so control characters land in the log escaped
-    /// rather than as terminal sequences for whoever tails it.
-    ///
     /// `reason` names the check that refused, because one wire code has
     /// several senders: after a module registers, `target_unavailable` can
     /// come from a missing role, an inactive registration, a supervisor that
@@ -6229,17 +6227,8 @@ impl ControlHandler {
         code: &'static str,
     ) {
         self.counters.increment_route_open_refused(code);
-        info!(
-            target: "control",
-            code,
-            reason,
-            module_id = ?module_id,
-            connection_id = ctx.connection_id.get(),
-            principal = %caller.principal,
-            scope = %caller.scope,
-            harness = %caller.harness,
-            "route.open refused"
-        );
+        self.route_refusal_log
+            .record(module_id, code, reason, caller, ctx.connection_id.get());
         if ROUTE_OPEN_NOT_SERVING_REASONS.contains(&reason) {
             self.route_outages.record_not_serving(module_id, reason);
         }

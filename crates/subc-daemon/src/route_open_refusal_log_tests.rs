@@ -102,6 +102,89 @@ async fn refused_line_names_a_direct_unscoped_caller() {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn repeated_refusals_across_connections_log_once_and_flush_without_more_traffic() {
+    let mut rig = rig().await;
+    let target = "retired-provider";
+    rig.handler.supervisor.record_rescan_removal(target);
+    let (first_ctx, _first_rx, first_frame, _root) =
+        refusal_open_frame(&mut rig, None, target, None, "cli");
+    let (retry_ctx, _retry_rx, retry_frame, _root) =
+        refusal_open_frame(&mut rig, None, target, None, "cli");
+    let (output, _subscriber) = log_capture(tracing::Level::INFO);
+    let reply = rig
+        .handler
+        .handle_control_frame(&first_ctx, first_frame)
+        .await
+        .unwrap();
+    assert_eq!(parse_error(&reply[0])["code"], "module_removed");
+    let cloned_handler = rig.handler.clone();
+    for _ in 0..100 {
+        let reply = cloned_handler
+            .handle_control_frame(&retry_ctx, retry_frame.clone())
+            .await
+            .unwrap();
+        assert_eq!(parse_error(&reply[0])["code"], "module_removed");
+    }
+    assert_eq!(
+        rig.handler.counters().snapshot()["route_open_refused_by_code"]["module_removed"],
+        101
+    );
+    tokio::time::advance(Duration::from_secs(59)).await;
+    let before = captured_logs(&output);
+    let first = refused_line(&before);
+    assert!(!first.contains("repeated="), "{first}");
+
+    tokio::time::advance(Duration::from_secs(2)).await;
+    tokio::task::yield_now().await;
+    let after = captured_logs(&output);
+    let lines: Vec<_> = after
+        .lines()
+        .filter(|line| line.contains("route.open refused"))
+        .collect();
+    assert_eq!(lines.len(), 2, "{after}");
+    let sample_connection = format!("connection_id={}", first_ctx.connection_id.get());
+    for line in lines {
+        for field in [
+            "code=\"module_removed\"",
+            "reason=\"removed\"",
+            "module_id=\"retired-provider\"",
+            &sample_connection,
+            "principal=direct",
+            "scope=none",
+            "harness=\"cli\"",
+        ] {
+            assert!(line.contains(field), "missing {field} in {line}");
+        }
+    }
+    assert!(after.contains("repeated=100 window_ms=60000"), "{after}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn interleaved_refusals_with_different_harnesses_each_log_immediately() {
+    let mut rig = rig().await;
+    let (a_ctx, _a_rx, a_frame, _root) =
+        refusal_open_frame(&mut rig, None, "missing-provider", None, "cli");
+    let (b_ctx, _b_rx, b_frame, _root) =
+        refusal_open_frame(&mut rig, None, "missing-provider", None, "desktop");
+    let (output, _subscriber) = log_capture(tracing::Level::INFO);
+    for (ctx, frame) in [(&a_ctx, &a_frame), (&b_ctx, &b_frame), (&a_ctx, &a_frame)] {
+        rig.handler
+            .handle_control_frame(ctx, frame.clone())
+            .await
+            .unwrap();
+    }
+    let logs = captured_logs(&output);
+    let lines: Vec<_> = logs
+        .lines()
+        .filter(|line| line.contains("route.open refused"))
+        .collect();
+    assert_eq!(lines.len(), 2, "{logs}");
+    assert!(lines[0].contains("harness=\"cli\""), "{logs}");
+    assert!(lines[1].contains("harness=\"desktop\""), "{logs}");
+    assert!(!logs.contains("repeated="), "{logs}");
+}
+
 /// A consumer identity whose launch nonce does not verify is logged as
 /// `unattested`: the module id it claims is the caller's word, and printing
 /// it as the principal would let any client sign a refusal with another

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.50.20
+
+- Refuse a rollback plan whose target was approved for a different build of a
+  running module, and serve a pending generation only to a connection whose
+  declaration matches it; other connections keep the active view marked
+  `declaration_pending`.
+- Verify the approved settings store once per settings observation instead of
+  17 times, skip it on idle watch polls, and limit each connection to four open
+  `config.watch` subscriptions (`too_many_watches`).
+- Stop waking the configuration delivery workers for read-only settings
+  requests.
+
 ## 0.50.19
 
 - On installations that require settings approval, review workspace and project settings against the last approval for each project. Save both the user-only view and the view that includes workspace settings but omits project overrides. Defer shared changes when a project that reads the file is unavailable, and recheck the affected registry entries before approval.

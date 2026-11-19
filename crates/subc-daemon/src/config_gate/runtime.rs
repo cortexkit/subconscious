@@ -443,18 +443,34 @@ struct OwnerState {
 
 impl OwnerState {
     fn retry_anchor(&mut self, operator_command: bool) -> Option<tokio::time::Instant> {
-        let pending = self.store.status().anchor_pending;
+        self.retry_anchor_inner(operator_command, false)
+    }
+
+    fn retry_anchor_inner(
+        &mut self,
+        operator_command: bool,
+        verified: bool,
+    ) -> Option<tokio::time::Instant> {
+        if !verified {
+            let _ = self.store.check();
+        }
+        let pending = self.store.loaded_anchor_pending();
         let events = self.anchor_retry.poll(
             pending,
             tokio::time::Instant::now(),
             operator_command,
             || {
-                let error = self
-                    .store
-                    .retry_anchor()
-                    .err()
-                    .map(|error| error.to_string());
-                (self.store.status().anchor_pending, error)
+                let result = if verified {
+                    self.store.retry_verified_anchor()
+                } else {
+                    let result = self.store.retry_anchor();
+                    let _ = self.store.check();
+                    result
+                };
+                (
+                    self.store.loaded_anchor_pending(),
+                    result.err().map(|error| error.to_string()),
+                )
             },
         );
         for event in events {
@@ -471,7 +487,11 @@ impl OwnerState {
                 }
             }
         }
-        self.commit_anchored_route_policies();
+        if verified {
+            self.commit_verified_route_policies();
+        } else {
+            self.commit_anchored_route_policies();
+        }
         self.anchor_retry.next()
     }
     fn with_desktop_view(&self, digest: &Digest, facts: &ApprovalFacts) -> ApprovalFacts {
@@ -596,17 +616,20 @@ impl<'a> OwnerGuard<'a> {
     }
 
     fn check_authority_for_read(&mut self) -> Result<()> {
-        let before = store_witness(&self.state.store);
         let retry = self.state.anchor_retry.next();
-        let result = RuntimeOwner::check_authority(&mut self.state, false);
-        let after = store_witness(&self.state.store);
-        self.changed |= after != before;
+        let pending = self.state.store.loaded_anchor_pending();
+        self.store_read(ConfigStore::check)?;
+        let before = store_witness(&self.state.store);
+        self.state.retry_anchor_inner(true, true);
+        self.changed |= store_witness(&self.state.store) != before;
         // Verification can finish writing the committed store's integrity
         // anchor or schedule its first retry. Delivery waits for that write.
-        if before.2 != after.2 || retry != self.state.anchor_retry.next() {
+        if pending != self.state.store.loaded_anchor_pending()
+            || retry != self.state.anchor_retry.next()
+        {
             self.owner.notify_delivery_changed();
         }
-        result
+        Ok(self.state.store.usable()?)
     }
 
     fn publish(&mut self) {
@@ -817,6 +840,8 @@ mod admission;
 pub(crate) mod mark;
 #[path = "recovery.rs"]
 mod recovery;
+#[path = "rollback.rs"]
+mod rollback;
 #[path = "route_policy.rs"]
 mod route_policy;
 pub(crate) use admission::SpawnAdmission;
@@ -841,6 +866,8 @@ mod widening;
 pub(crate) use published::Published;
 #[path = "settings.rs"]
 pub(crate) mod settings;
+#[path = "settings_observation.rs"]
+pub(crate) mod settings_observation;
 #[path = "status_inputs.rs"]
 mod status_inputs;
 
@@ -1384,16 +1411,13 @@ impl RuntimeOwner {
             .ok_or_else(|| {
                 GateError::new("config_gated", "module is not in an approved generation")
             })?;
-        let approved_declaration = [versions.pending, versions.active]
-            .into_iter()
-            .flatten()
-            .any(|generation| {
-                body.generations
-                    .get(&generation)
-                    .and_then(|entry| entry.delivery.as_ref())
-                    .and_then(|snapshot| snapshot.declarations.get(module))
-                    == Some(&declaration)
-            });
+        let approved_declaration = versions
+            .pending
+            .or(versions.active)
+            .and_then(|generation| body.generations.get(&generation))
+            .and_then(|entry| entry.delivery.as_ref())
+            .and_then(|snapshot| snapshot.declarations.get(module))
+            == Some(&declaration);
         if !approved_declaration && versions.active.is_none() {
             return Err(GateError::new(
                 "config_gated",
@@ -1476,16 +1500,13 @@ impl RuntimeOwner {
             .1
             .clone();
         if versions.active.is_none()
-            || [versions.active, versions.pending]
-                .into_iter()
-                .flatten()
-                .any(|id| {
-                    body.generations
-                        .get(&id)
-                        .and_then(|entry| entry.delivery.as_ref())
-                        .and_then(|delivery| delivery.declarations.get(module))
-                        == Some(declaration)
-                })
+            || versions
+                .pending
+                .or(versions.active)
+                .and_then(|id| body.generations.get(&id))
+                .and_then(|entry| entry.delivery.as_ref())
+                .and_then(|delivery| delivery.declarations.get(module))
+                == Some(declaration)
         {
             return None;
         }
@@ -1508,11 +1529,16 @@ impl RuntimeOwner {
     }
 
     fn declarations(state: &mut OwnerState) -> Result<BTreeMap<String, ConfigDeclareRequest>> {
-        let mut declarations = if state.store.status().state == StoreState::Stamped {
-            state
-                .store
-                .body()?
-                .generations
+        if state.store.status().state == StoreState::Stamped {
+            state.store.body()?;
+        }
+        Ok(Self::loaded_declarations(state))
+    }
+
+    fn loaded_declarations(state: &OwnerState) -> BTreeMap<String, ConfigDeclareRequest> {
+        let (store, body) = state.store.loaded_admission_state();
+        let mut declarations = if store == StoreState::Stamped {
+            body.generations
                 .values()
                 .next_back()
                 .and_then(|entry| entry.delivery.as_ref())
@@ -1526,7 +1552,7 @@ impl RuntimeOwner {
                 declarations.insert(module.clone(), declaration.clone());
             }
         }
-        Ok(declarations)
+        declarations
     }
 
     fn capture(&self, state: &mut OwnerState) -> Result<CapturedConfiguration> {
@@ -1680,22 +1706,7 @@ impl RuntimeOwner {
                 .observe(observed.proposal_snapshot(&approved).to_store()?)?;
         }
         let rollback = if let PlanKind::Rollback(id) = kind {
-            let mut target =
-                super::GateSnapshot::from_store(&state.store.rollback_configuration(id)?)?;
-            target.inputs.retain(|key, _| !key.is_project());
-            let delivery = state
-                .store
-                .body()?
-                .generations
-                .get(&id)
-                .and_then(|entry| entry.delivery.as_ref())
-                .ok_or_else(|| {
-                    GateError::new(
-                        "rollback_snapshot_unavailable",
-                        "retained raw configuration is absent",
-                    )
-                })?;
-            Some((self.capturer.capture_retained(&target, delivery)?, target))
+            Some(rollback::prepare(self, &mut state, id)?)
         } else {
             None
         };

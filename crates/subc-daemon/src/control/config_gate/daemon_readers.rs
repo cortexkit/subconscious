@@ -331,7 +331,7 @@ impl ControlHandler {
         owner: &Arc<crate::config_gate::runtime::RuntimeOwner>,
         generation: u64,
     ) -> Result<bool, GateError> {
-        let configs = config_work(owner.clone(), move |owner| {
+        let configs = config_work(owner.clone(), ConfigWake::None, move |owner| {
             owner.generation_daemon_configurations(generation)
         })
         .await?;

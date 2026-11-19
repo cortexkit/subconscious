@@ -301,7 +301,10 @@ impl ControlHandler {
         // other entries are effective, release the global exit hold; Failed actors
         // are not parked and cannot be revived by that release. Unlatched errors
         // above retain the exit for a later reconciliation attempt.
-        config_work(owner, move |owner| owner.complete_authority_exit(&approved)).await?;
+        config_work(owner, ConfigWake::Delivery, move |owner| {
+            owner.complete_authority_exit(&approved)
+        })
+        .await?;
         #[cfg(test)]
         if let Some(completed) = self.recovery_exit_test_completed {
             completed(generation);

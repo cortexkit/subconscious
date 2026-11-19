@@ -1,8 +1,36 @@
 use super::*;
+use crate::config_gate::runtime::settings_observation::SettingsFiles;
 use std::collections::{BTreeMap, BTreeSet};
 use subc_control::config::{ConfigFileError, ConfigModule, ConfigWatchEvent, ConfigWatchResponse};
 
 const SETTINGS_CAPTURE_SPACING: Duration = Duration::from_millis(250);
+const SETTINGS_WATCH_LIMIT: usize = 4;
+type SettingsRows = (Vec<ConfigModule>, bool, Arc<SettingsFiles>);
+
+fn watch_refusal(
+    streams: &HashMap<(ConnectionId, u64), tokio::task::AbortHandle>,
+    key: (ConnectionId, u64),
+    frame: &Frame,
+) -> Result<Option<Frame>, RouterError> {
+    let error = if streams.contains_key(&key) {
+        control_error_frame(
+            frame,
+            "duplicate_subscription",
+            "config.watch correlation id already in use",
+        )?
+    } else if streams.keys().filter(|(owner, _)| *owner == key.0).count() >= SETTINGS_WATCH_LIMIT {
+        control_error_frame(
+            frame,
+            "too_many_watches",
+            format!(
+                "config.watch allows at most {SETTINGS_WATCH_LIMIT} subscriptions per connection"
+            ),
+        )?
+    } else {
+        return Ok(None);
+    };
+    Ok(Some(error))
+}
 
 #[derive(Default)]
 struct SettingsFileGrace {
@@ -62,11 +90,24 @@ impl ControlHandler {
         runtime: Arc<crate::config_gate::runtime::RuntimeOwner>,
         modules: Option<Vec<String>>,
     ) -> Result<Vec<Frame>, RouterError> {
+        let key = (ctx.connection_id, frame.header.corr);
+        {
+            let mut streams = self
+                .config_settings_streams
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            streams.retain(|_, task| !task.is_finished());
+            if let Some(error) = watch_refusal(&streams, key, &frame)? {
+                return Ok(vec![error]);
+            }
+        }
         let mut changes = runtime.subscribe_settings();
         let mut catalog = self
             .registry
             .subscribe_catalog_changes()
             .map_err(|error| RouterError::backend(0, frame.header.corr, error.to_string()))?;
+        let mut settings_version = *changes.borrow_and_update();
+        let mut catalog_version = *catalog.borrow_and_update();
         let mut initial = match self
             .config_settings_initial_rows(runtime.clone(), &modules)
             .await
@@ -75,6 +116,7 @@ impl ControlHandler {
             Err(error) => return Ok(vec![config_error_frame(&frame, error)?]),
         };
         let mut file_grace = SettingsFileGrace::default();
+        let mut latest = initial.0.clone();
         let settling = initial.0.iter().any(|row| row.file_error.is_some());
         file_grace.settle(&[], &mut initial.0, tokio::time::Instant::now());
         if settling {
@@ -87,20 +129,16 @@ impl ControlHandler {
                 Ok(rows) => rows,
                 Err(error) => return Ok(vec![config_error_frame(&frame, error)?]),
             };
+            latest = initial.0.clone();
             file_grace.settle(&[], &mut initial.0, tokio::time::Instant::now());
         }
-        let key = (ctx.connection_id, frame.header.corr);
         let mut streams = self
             .config_settings_streams
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         streams.retain(|_, task| !task.is_finished());
-        if streams.contains_key(&key) {
-            return Ok(vec![control_error_frame(
-                &frame,
-                "duplicate_subscription",
-                "config.watch correlation id already in use",
-            )?]);
+        if let Some(error) = watch_refusal(&streams, key, &frame)? {
+            return Ok(vec![error]);
         }
         let handler = self.clone();
         let sink = ctx.egress.clone();
@@ -121,7 +159,7 @@ impl ControlHandler {
                 )
                 .map_err(|error| RouterError::backend(0, frame.header.corr, error.to_string()))
             };
-            let (mut previous, mut stamped) = initial;
+            let (mut previous, mut stamped, mut files) = initial;
             let Ok(first) = push(ConfigWatchEvent::Resync {
                 modules: previous.clone(),
                 stamped,
@@ -153,20 +191,42 @@ impl ControlHandler {
                 }
                 // Coalesce both change sources before reading. Changes during
                 // the capture remain unread for the next pass.
-                changes.borrow_and_update();
-                catalog.borrow_and_update();
+                let new_settings_version = *changes.borrow_and_update();
+                let new_catalog_version = *catalog.borrow_and_update();
+                let changed = retry_capture
+                    || new_settings_version != settings_version
+                    || new_catalog_version != catalog_version
+                    || runtime.settings_projection_stale();
+                settings_version = new_settings_version;
+                catalog_version = new_catalog_version;
                 next_capture = Some(tokio::time::Instant::now() + SETTINGS_CAPTURE_SPACING);
-                poll.reset();
-                let next = handler
-                    .config_settings_rows(runtime.clone(), &modules)
-                    .await;
-                let (mut rows, next_stamped) = match next {
+                let next = if changed {
+                    handler
+                        .config_settings_rows(runtime.clone(), &modules)
+                        .await
+                } else {
+                    let probe = Arc::clone(&files);
+                    match runtime
+                        .on_blocking(move |_| Ok(probe.needs_observation()))
+                        .await
+                    {
+                        Ok(false) => Ok(Some((latest.clone(), stamped, Arc::clone(&files)))),
+                        Ok(true) => {
+                            handler
+                                .config_settings_rows(runtime.clone(), &modules)
+                                .await
+                        }
+                        Err(error) => Err(error),
+                    }
+                };
+                let (mut rows, next_stamped, next_files) = match next {
                     Ok(Some(next)) => next,
                     Ok(None) => {
                         // No consistent observation was made. Keep the stream
                         // open without advancing the file-error grace period.
                         retry_capture = true;
                         file_grace.pending.clear();
+                        poll.reset();
                         continue;
                     }
                     Err(error) if error.is_capture_race() => {
@@ -174,6 +234,7 @@ impl ControlHandler {
                         // Keep the last snapshot and retry on the next poll tick.
                         retry_capture = true;
                         file_grace.pending.clear();
+                        poll.reset();
                         continue;
                     }
                     Err(error) => {
@@ -184,7 +245,12 @@ impl ControlHandler {
                     }
                 };
                 retry_capture = false;
+                latest = rows.clone();
+                files = next_files;
                 file_grace.settle(&previous, &mut rows, tokio::time::Instant::now());
+                // The next confirmation is timed from the completed capture,
+                // not from when the (possibly slower) full observation started.
+                poll.reset();
                 for event in settings_events(&previous, stamped, &rows, next_stamped) {
                     let Ok(next) = push(event) else {
                         return;
@@ -205,7 +271,7 @@ impl ControlHandler {
         &self,
         runtime: Arc<crate::config_gate::runtime::RuntimeOwner>,
         filter: &Option<Vec<String>>,
-    ) -> std::result::Result<(Vec<ConfigModule>, bool), GateError> {
+    ) -> std::result::Result<SettingsRows, GateError> {
         let error = match self.config_settings_rows(runtime.clone(), filter).await {
             Ok(Some(rows)) => return Ok(rows),
             Ok(None) => GateError::capture_race(),
@@ -236,11 +302,11 @@ impl ControlHandler {
         &self,
         runtime: Arc<crate::config_gate::runtime::RuntimeOwner>,
         filter: &Option<Vec<String>>,
-    ) -> std::result::Result<Option<(Vec<ConfigModule>, bool)>, GateError> {
+    ) -> std::result::Result<Option<SettingsRows>, GateError> {
         let known = self.config_settings_known_modules()?;
         let response = runtime
             .on_blocking(move |owner| {
-                let response = owner.observe_settings_modules(known);
+                let response = owner.observe_settings(known, true);
                 #[cfg(test)]
                 if let Some(hook) = owner.settings_observation_hook.lock().unwrap().as_mut() {
                     hook();
@@ -248,20 +314,20 @@ impl ControlHandler {
                 response
             })
             .await?;
-        let Some(response) = response else {
+        let Some(observation) = response else {
             return Ok(None);
         };
         let ConfigControlResponse::Modules {
             mut modules,
             stamped,
-        } = response
+        } = observation.response
         else {
             unreachable!()
         };
         if let Some(filter) = filter {
             modules.retain(|module| filter.contains(&module.module_id));
         }
-        Ok(Some((modules, stamped)))
+        Ok(Some((modules, stamped, Arc::new(observation.files))))
     }
 
     pub(in crate::control) fn cancel_config_settings_subscription(

@@ -400,8 +400,16 @@ impl ConfigCapturer {
         &self,
         declarations: &BTreeMap<String, ConfigDeclareRequest>,
     ) -> Result<SettingsCapture> {
+        self.capture_settings_with(declarations, CapturedFile::open)
+    }
+
+    pub(crate) fn capture_settings_with(
+        &self,
+        declarations: &BTreeMap<String, ConfigDeclareRequest>,
+        layer_file: impl FnMut(&Path) -> Result<CapturedFile>,
+    ) -> Result<SettingsCapture> {
         let daemon = CapturedFile::open(&self.daemon_path)?;
-        self.capture_layers_observed::<true>(daemon, declarations, None, false, CapturedFile::open)
+        self.capture_layers_observed::<true>(daemon, declarations, None, false, layer_file)
     }
 
     pub(super) fn capture_status(

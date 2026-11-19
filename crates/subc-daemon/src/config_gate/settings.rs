@@ -1,5 +1,6 @@
 //! Settings reads separate admitted schema metadata from approved delivery values.
 
+use super::settings_observation::{SettingsFiles, SettingsObservation};
 use super::*;
 use crate::config_gate::{reviewed_build, GateSnapshot, InputKey};
 use crate::config_store::{HistoryEntry, StoreBody};
@@ -47,10 +48,18 @@ impl SettingsVersion {
 struct SettingsSnapshot {
     declaration_pending: BTreeMap<String, subc_protocol::config::ConfigDeclarationPending>,
     fallback_applied: BTreeSet<String>,
-    body: StoreBody,
+    stamped: bool,
     declarations: BTreeMap<String, ConfigDeclareRequest>,
     pending: BTreeMap<String, Digest>,
     known: BTreeSet<String>,
+}
+
+#[derive(Default)]
+struct ModuleApproval {
+    approved: Option<u64>,
+    active: Option<u64>,
+    pending: bool,
+    failed: Option<u64>,
 }
 
 impl RuntimeOwner {
@@ -58,11 +67,20 @@ impl RuntimeOwner {
         self.settings_changed.subscribe()
     }
 
-    fn settings_snapshot(&self, mut known: BTreeSet<String>) -> Result<SettingsSnapshot> {
-        let mut state = self.lock()?;
-        let body = state.checked_body()?.clone();
-        let declarations = Self::declarations(&mut state.state)?;
-        let approved = GateSnapshot::from_store(&body.approved)?;
+    pub(crate) fn settings_projection_stale(&self) -> bool {
+        // A disconnect can remove a declaration before a new version is published.
+        self.projection_stale
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn settings_snapshot(
+        &self,
+        state: &OwnerState,
+        approved: &GateSnapshot,
+        mut known: BTreeSet<String>,
+    ) -> Result<SettingsSnapshot> {
+        let (_, body) = state.store.loaded_admission_state();
+        let declarations = Self::loaded_declarations(state);
         known.extend(approved.inputs.keys().filter_map(|key| match key {
             InputKey::Entry(module) | InputKey::Declaration(module) => Some(module.clone()),
             _ => None,
@@ -91,7 +109,7 @@ impl RuntimeOwner {
         let declaration_pending = declarations
             .iter()
             .filter_map(|(module, declaration)| {
-                Self::declaration_pending(&state, module, declaration)
+                Self::declaration_pending(state, module, declaration)
                     .map(|marker| (module.clone(), marker))
             })
             .collect();
@@ -113,7 +131,7 @@ impl RuntimeOwner {
         Ok(SettingsSnapshot {
             declaration_pending,
             fallback_applied,
-            body,
+            stamped: body.stamped,
             declarations,
             pending,
             known,
@@ -128,47 +146,83 @@ impl RuntimeOwner {
             .ok_or_else(GateError::capture_race)
     }
 
-    // None means that concurrent edits prevented a consistent observation, not
-    // that a settings file is invalid. Watches retain their previous rows.
-    pub(crate) fn observe_settings_modules(
+    fn observe_settings_modules(
         &self,
         known: BTreeSet<String>,
     ) -> Result<Option<ConfigControlResponse>> {
+        Ok(self
+            .observe_settings(known, false)?
+            .map(|observation| observation.response))
+    }
+
+    // None means that concurrent edits prevented a consistent observation, not
+    // that a settings file is invalid. Watches retain their previous rows.
+    pub(crate) fn observe_settings(
+        &self,
+        known: BTreeSet<String>,
+        watch_files: bool,
+    ) -> Result<Option<SettingsObservation>> {
         #[cfg(test)]
         if let Some(hook) = self.settings_projection_hook.lock().unwrap().as_mut() {
             hook()?;
         }
-        let snapshot = self.settings_snapshot(known)?;
-        let approved = GateSnapshot::from_store(&snapshot.body.approved)?;
+        let mut state = self.lock()?;
+        state.check_authority_for_read()?;
+        let (_, body) = state.store.loaded_admission_state();
+        let approved = GateSnapshot::from_store(&body.approved)?;
+        let snapshot = self.settings_snapshot(&state, &approved, known)?;
         let mut observation = None;
         for _ in 0..3 {
-            let write_back = self.write_back_status()?;
+            let write_back = edits::loaded_write_back_status(&state)?;
             #[cfg(test)]
             if let Some(hook) = self.settings_status_hook.lock().unwrap().as_mut() {
                 hook()?;
             }
-            let captured = self.capturer.capture_settings(&snapshot.declarations)?;
-            // External editors do not take the owner lock. Bracket the file
-            // capture with status reads so a repair or write-back cannot pair
-            // fresh bytes with an obsolete write-back warning (or the reverse).
-            if write_back == self.write_back_status()? {
-                observation = Some((write_back, captured));
+            let mut files = SettingsFiles::default();
+            let captured = if watch_files {
+                self.capturer
+                    .capture_settings_with(&snapshot.declarations, |path| files.capture(path))?
+            } else {
+                self.capturer.capture_settings(&snapshot.declarations)?
+            };
+            // External editors can still write while the daemon holds its lock.
+            // Compare status on either side of capture using the same approval.
+            if write_back == edits::loaded_write_back_status(&state)? {
+                files.write_back_pending = !write_back.is_empty();
+                observation = Some((write_back, captured, files));
                 break;
             }
         }
-        let Some((write_back, captured)) = observation else {
+        let Some((write_back, captured, files)) = observation else {
             return Ok(None);
         };
-        let observed = if snapshot.body.stamped {
-            Some(captured.proposal_snapshot(&approved))
-        } else {
-            None
-        };
-        let rereview = if snapshot.body.stamped {
-            reviewed_build::pending(&snapshot.body, snapshot.declarations.keys())?
+        let rereview = if snapshot.stamped {
+            reviewed_build::pending(body, snapshot.declarations.keys())?
         } else {
             BTreeMap::new()
         };
+        let mut approvals = BTreeMap::new();
+        for module in &snapshot.known {
+            let entry = approved_entry(body, module);
+            let versions = body.versions.iter().find_map(|(tuple, versions)| {
+                (tuple.module == *module && tuple.project.is_none()).then_some(versions)
+            });
+            approvals.insert(
+                module.as_str(),
+                ModuleApproval {
+                    approved: entry.map(|entry| entry.generation.id),
+                    active: versions.and_then(|versions| versions.active),
+                    pending: versions.is_some_and(|versions| versions.pending.is_some()),
+                    failed: entry
+                        .filter(|entry| entry.generation.never_redeliver.contains(module))
+                        .map(|entry| entry.generation.id),
+                },
+            );
+        }
+        drop(state);
+        let observed = snapshot
+            .stamped
+            .then(|| captured.proposal_snapshot(&approved));
         let mut modules = Vec::new();
         for module in &snapshot.known {
             let mut row = ConfigModule::default();
@@ -190,23 +244,16 @@ impl RuntimeOwner {
                     }
                 }
             }
-            let entry = approved_entry(&snapshot.body, module);
-            row.approved_generation = entry.map(|entry| entry.generation.id);
-            let versions = snapshot
-                .body
-                .versions
-                .iter()
-                .find(|(tuple, _)| tuple.module == *module && tuple.project.is_none())
-                .map(|(_, versions)| versions);
-            row.active_generation = versions.and_then(|versions| versions.active);
-            if !snapshot.body.stamped && row.gated && module_error.is_none() {
+            let approval = &approvals[module.as_str()];
+            row.approved_generation = approval.approved;
+            row.active_generation = approval.active;
+            if !snapshot.stamped && row.gated && module_error.is_none() {
                 row.approved_generation = Some(0);
                 row.active_generation = Some(0);
             }
             row.pending_plan = snapshot.pending.get(module).cloned();
             row.declaration_pending = snapshot.declaration_pending.get(module).cloned();
             row.file_error = captured.file_errors.get(module).cloned();
-            let failed = entry.filter(|entry| entry.generation.never_redeliver.contains(module));
             let mut proposal = false;
             let mut formatting = false;
             if let Some(observed) = observed.as_ref().filter(|_| row.file_error.is_none()) {
@@ -227,17 +274,18 @@ impl RuntimeOwner {
             let behind = write_back.get(module).cloned();
             row.status = settings_status(
                 row.gated,
-                failed.is_some(),
+                approval.failed.is_some(),
                 rereview.contains_key(module),
-                versions.is_some_and(|versions| versions.pending.is_some()),
+                approval.pending,
                 behind.is_some(),
                 proposal,
                 formatting,
             )
             .into();
             row.status_reason = match row.status.as_str() {
-                "failed_delivery" => failed
-                    .map(|entry| format!("Generation {} failed delivery.", entry.generation.id)),
+                "failed_delivery" => approval
+                    .failed
+                    .map(|generation| format!("Generation {generation} failed delivery.")),
                 "needs_rereview" => {
                     Some("The admitted program awaits configuration review.".into())
                 }
@@ -255,9 +303,12 @@ impl RuntimeOwner {
             }
             modules.push(row);
         }
-        Ok(Some(ConfigControlResponse::Modules {
-            modules,
-            stamped: snapshot.body.stamped,
+        Ok(Some(SettingsObservation {
+            response: ConfigControlResponse::Modules {
+                modules,
+                stamped: snapshot.stamped,
+            },
+            files,
         }))
     }
 
@@ -266,7 +317,12 @@ impl RuntimeOwner {
         known: BTreeSet<String>,
         module: String,
     ) -> Result<ConfigControlResponse> {
-        let snapshot = self.settings_snapshot(known)?;
+        let mut state = self.lock()?;
+        state.check_authority_for_read()?;
+        let (_, body) = state.store.loaded_admission_state();
+        let approved = GateSnapshot::from_store(&body.approved)?;
+        let snapshot = self.settings_snapshot(&state, &approved, known)?;
+        drop(state);
         let declaration = snapshot.declaration(&module)?;
         crate::config_gate::strict_json::check_canonical(&declaration.schema, "/schema")?;
         let (schema, schema_digest) = schema_with_digest(declaration)?;
@@ -284,7 +340,11 @@ impl RuntimeOwner {
         project_id: Option<String>,
         through: Option<ConfigThrough>,
     ) -> Result<ConfigControlResponse> {
-        let snapshot = self.settings_snapshot(known)?;
+        let mut state = self.lock()?;
+        state.check_authority_for_read()?;
+        let (_, body) = state.store.loaded_admission_state();
+        let approved = GateSnapshot::from_store(&body.approved)?;
+        let snapshot = self.settings_snapshot(&state, &approved, known)?;
         let declaration = snapshot.declaration(&module)?;
         if project_id.is_some() {
             // Project tuples are not admitted by the current capture/delivery path.
@@ -293,8 +353,8 @@ impl RuntimeOwner {
                 "project has no approved configuration tuple",
             ));
         }
-        let (generation, view, approved_declaration) = if snapshot.body.stamped {
-            let entry = approved_entry(&snapshot.body, &module).ok_or_else(|| {
+        let (generation, view, approved_declaration) = if snapshot.stamped {
+            let entry = approved_entry(body, &module).ok_or_else(|| {
                 GateError::new("config_gated", "module has no approved configuration")
             })?;
             let delivery = entry.delivery.as_ref().ok_or_else(|| {
@@ -307,12 +367,11 @@ impl RuntimeOwner {
                 delivery.declarations.get(&module).cloned().ok_or_else(|| {
                     GateError::new("config_gated", "approved schema is unavailable")
                 })?;
-            (
-                crate::config_gate::module_base_generation(&snapshot.body, &module),
-                view,
-                declaration,
-            )
+            let generation = crate::config_gate::module_base_generation(body, &module);
+            drop(state);
+            (generation, view, declaration)
         } else {
+            drop(state);
             let captured = self.capturer.capture_modules(
                 &BTreeMap::from([(module.clone(), declaration.clone())]),
                 &BTreeSet::from([module.clone()]),
@@ -323,7 +382,7 @@ impl RuntimeOwner {
                 .ok_or_else(|| GateError::new("config_gated", "module view is unavailable"))?;
             (0, captured.view.clone(), declaration.clone())
         };
-        let file_error = if snapshot.body.stamped {
+        let file_error = if snapshot.stamped {
             self.capturer.settings_file_error(&module, declaration)?
         } else {
             None
@@ -378,7 +437,7 @@ impl RuntimeOwner {
             module_id: module.clone(),
             project_id,
             through,
-            stamped: snapshot.body.stamped,
+            stamped: snapshot.stamped,
             base_generation: generation,
             effective,
             sources,

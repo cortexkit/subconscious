@@ -3,15 +3,47 @@ use crate::config_gate::runtime::settings::tests::SettingsRig;
 use serde_json::{json, Value};
 
 fn request(body: Value) -> Frame {
+    request_with_corr(body, 91)
+}
+
+fn request_with_corr(body: Value, corr: u64) -> Frame {
     Frame::build(
         FrameType::Request,
         control_flags(),
         0,
         0,
-        91,
+        corr,
         serde_json::to_vec(&body).unwrap(),
     )
     .unwrap()
+}
+
+#[tokio::test]
+async fn config_settings_watch_caps_open_subscriptions_per_connection() {
+    let rig = SettingsRig::new();
+    let handler = handler(&rig);
+    let (ctx, _rx) = context();
+    let watch = |corr| request_with_corr(json!({"op":"config.watch"}), corr);
+    for corr in 1..=4 {
+        assert!(handler
+            .handle_control_frame(&ctx, watch(corr))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+    let fifth = handler.handle_control_frame(&ctx, watch(5)).await.unwrap();
+    assert_eq!(fifth.len(), 1);
+    assert_eq!(fifth[0].header.ty, FrameType::Error);
+    let body: Value = serde_json::from_slice(&fifth[0].body).unwrap();
+    assert_eq!(body["code"], "too_many_watches");
+    assert!(body["message"].as_str().unwrap().contains("at most 4"));
+    assert!(handler.cancel_config_settings_subscription(ctx.connection_id, 1));
+    assert!(handler
+        .handle_control_frame(&ctx, watch(5))
+        .await
+        .unwrap()
+        .is_empty());
+    handler.cleanup_connection(ctx.connection_id).unwrap();
 }
 
 fn handler(rig: &SettingsRig) -> ControlHandler {
@@ -449,6 +481,7 @@ async fn config_settings_watch_retries_ongoing_capture_race() {
         .unwrap();
     assert_eq!(event(&mut rx).await["modules"][0]["status"], "adopted");
     let raced = race_settings_captures(&rig, 1);
+    replace_settings_with_same_bytes(&rig);
     let changed = event(&mut rx).await;
     assert_eq!(changed["event"], "change");
     assert_eq!(changed["status"], "formatting_only");
@@ -553,6 +586,7 @@ async fn config_settings_watch_does_not_retry_other_refusals() {
         let fault = error.clone();
         *rig.owner.settings_projection_hook.lock().unwrap() =
             Some(Box::new(move || Err(fault.clone())));
+        replace_settings_with_same_bytes(&rig);
         let terminal = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .unwrap()
@@ -701,6 +735,7 @@ async fn probe_save_window(partial: bool) {
             }
         }
     }));
+    replace_settings_with_same_bytes(&rig);
     let changed = event(&mut rx).await;
     assert_eq!(changed["event"], "change");
     assert_eq!(changed["status"], "write_back_behind");
@@ -799,6 +834,7 @@ async fn config_settings_watch_skips_unstable_status_without_aging_file_error() 
     *rig.owner.settings_observation_hook.lock().unwrap() = Some(Box::new(move || {
         observed.send(()).unwrap();
     }));
+    replace_settings_with_same_bytes(&rig);
     // Let inconsistent captures span a full grace interval. They must neither
     // publish a warning nor help a later, genuinely bad file pass the grace.
     for _ in 0..2 {
@@ -819,6 +855,15 @@ async fn config_settings_watch_skips_unstable_status_without_aging_file_error() 
     assert_eq!(failed["file_error"]["code"], "value_invalid");
     assert!(since.elapsed() >= Duration::from_secs(2));
     handler.cleanup_connection(ctx.connection_id).unwrap();
+}
+
+fn replace_settings_with_same_bytes(rig: &SettingsRig) {
+    // Give the watch a different file identity to detect without changing
+    // the contents that the test hook will edit during observation.
+    let path = rig.root.join("cortexkit/sample-reader.jsonc");
+    let replacement = path.with_extension("replacement");
+    std::fs::copy(&path, &replacement).unwrap();
+    std::fs::rename(replacement, path).unwrap();
 }
 
 #[tokio::test]

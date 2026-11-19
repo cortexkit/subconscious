@@ -205,7 +205,7 @@ impl ControlHandler {
                 });
                 match declaration {
                     Ok(declaration) => {
-                        config_work(runtime.clone(), move |owner| {
+                        config_work(runtime.clone(), ConfigWake::None, move |owner| {
                             owner.declare(connection, &module, declaration, active)?;
                             Ok(serde_json::json!({"op":"config.declare"}))
                         })
@@ -221,8 +221,8 @@ impl ControlHandler {
                 match request {
                     Ok(request) => {
                         let module_id = module.clone();
-                        match config_work(runtime.clone(), move |owner| {
-                            owner.module_get(connection, &module_id, request)
+                        match config_work(runtime.clone(), ConfigWake::None, move |owner| {
+                            owner.module_get_for_rpc(connection, &module_id, request)
                         })
                         .await
                         {
@@ -245,7 +245,7 @@ impl ControlHandler {
             "config.applied" => {
                 match serde_json::from_slice::<subc_protocol::config::ConfigAppliedRequest>(&body) {
                     Ok(request) => {
-                        config_work(runtime.clone(), move |owner| {
+                        config_work(runtime.clone(), ConfigWake::Delivery, move |owner| {
                             owner.module_applied(connection, &module, request)?;
                             Ok(serde_json::json!({"op":"config.applied"}))
                         })
@@ -333,11 +333,15 @@ impl ControlHandler {
                             if active {
                                 if let Some((generation, attempt)) = selected {
                                     let module = registration.manifest.module_id.clone();
-                                    let _ = config_work(runtime.clone(), move |owner| {
-                                        owner.delivery_timeout(
-                                            connection, &module, generation, attempt,
-                                        )
-                                    })
+                                    let _ = config_work(
+                                        runtime.clone(),
+                                        ConfigWake::Delivery,
+                                        move |owner| {
+                                            owner.delivery_timeout(
+                                                connection, &module, generation, attempt,
+                                            )
+                                        },
+                                    )
                                     .await;
                                 }
                             }
@@ -348,7 +352,7 @@ impl ControlHandler {
                         }
                     }
                     let module = registration.manifest.module_id.clone();
-                    let delivered = config_work(runtime.clone(), move |owner| {
+                    let delivered = config_work(runtime.clone(), ConfigWake::None, move |owner| {
                         owner.module_view_delivered(connection, &module, &view, flushed_at, active)
                     })
                     .await;
@@ -363,11 +367,15 @@ impl ControlHandler {
                             if active {
                                 if let Some((generation, attempt)) = selected {
                                     let module = registration.manifest.module_id.clone();
-                                    let _ = config_work(runtime.clone(), move |owner| {
-                                        owner.delivery_timeout(
-                                            connection, &module, generation, attempt,
-                                        )
-                                    })
+                                    let _ = config_work(
+                                        runtime.clone(),
+                                        ConfigWake::Delivery,
+                                        move |owner| {
+                                            owner.delivery_timeout(
+                                                connection, &module, generation, attempt,
+                                            )
+                                        },
+                                    )
                                     .await;
                                 }
                             }
@@ -386,7 +394,7 @@ impl ControlHandler {
             }
             Err(error) => {
                 if error.code == "anchor_pending" {
-                    let _ = config_work(runtime.clone(), move |owner| {
+                    let _ = config_work(runtime.clone(), ConfigWake::Delivery, move |owner| {
                         owner.anchor_pending_served(connection)
                     })
                     .await;
@@ -507,7 +515,7 @@ impl ControlHandler {
             return;
         };
         let peers = self.captured_peers.clone();
-        let _ = config_work(runtime, move |owner| {
+        let _ = config_work(runtime, ConfigWake::Delivery, move |owner| {
             owner.desktop_view_delivered_when(connection, &view, || {
                 peers
                     .lock()
@@ -633,11 +641,14 @@ impl ControlHandler {
         match request {
             ConfigControlRequest::Modules {} => {
                 let known = self.config_settings_known_modules()?;
-                config_work(runtime, move |owner| owner.settings_modules(known)).await
+                config_work(runtime, ConfigWake::None, move |owner| {
+                    owner.settings_modules(known)
+                })
+                .await
             }
             ConfigControlRequest::Schema { module_id } => {
                 let known = self.config_settings_known_modules()?;
-                config_work(runtime, move |owner| {
+                config_work(runtime, ConfigWake::None, move |owner| {
                     owner.settings_schema(known, module_id)
                 })
                 .await
@@ -648,17 +659,23 @@ impl ControlHandler {
                 through,
             } => {
                 let known = self.config_settings_known_modules()?;
-                config_work(runtime, move |owner| {
+                config_work(runtime, ConfigWake::None, move |owner| {
                     owner.settings_show(known, module_id, project_id, through)
                 })
                 .await
             }
             ConfigControlRequest::PlanGet { digest } => {
-                let view = config_work(runtime, move |owner| owner.plan_get(&digest)).await?;
+                let view = config_work(runtime, ConfigWake::None, move |owner| {
+                    owner.plan_get(&digest)
+                })
+                .await?;
                 Ok(ConfigControlResponse::PlanGet { view })
             }
             ConfigControlRequest::PlanDiscard { digest } => {
-                config_work(runtime, move |owner| owner.plan_discard(&digest)).await?;
+                config_work(runtime, ConfigWake::Delivery, move |owner| {
+                    owner.plan_discard(&digest)
+                })
+                .await?;
                 Ok(ConfigControlResponse::PlanDiscard {})
             }
             ConfigControlRequest::PlaceProgram {
@@ -669,7 +686,7 @@ impl ControlHandler {
             } => {
                 let gate = runtime.module_gate(&module_id)?;
                 let _guard = gate.lock().await;
-                let generation = config_work(runtime, move |owner| {
+                let generation = config_work(runtime, ConfigWake::Delivery, move |owner| {
                     owner.place_program_with_manifest(&module_id, &path, &sha256, manifest.as_ref())
                 })
                 .await?;
@@ -696,7 +713,8 @@ impl ControlHandler {
                 Ok(ConfigControlResponse::Status { status })
             }
             ConfigControlRequest::History {} => {
-                let (generations, pruned) = config_work(runtime, |owner| owner.history()).await?;
+                let (generations, pruned) =
+                    config_work(runtime, ConfigWake::None, |owner| owner.history()).await?;
                 Ok(ConfigControlResponse::History {
                     generations,
                     pruned,
@@ -704,10 +722,11 @@ impl ControlHandler {
             }
             ConfigControlRequest::Apply { digest } => {
                 let apply_digest = digest.clone();
-                if let Some(generation) = config_work(runtime.clone(), move |owner| {
-                    owner.apply_unstamped_edits(&apply_digest)
-                })
-                .await?
+                if let Some(generation) =
+                    config_work(runtime.clone(), ConfigWake::Delivery, move |owner| {
+                        owner.apply_unstamped_edits(&apply_digest)
+                    })
+                    .await?
                 {
                     return Ok(ConfigControlResponse::Applied {
                         generation,
@@ -727,21 +746,25 @@ impl ControlHandler {
                 }
                 let facts = self.config_approval_facts(ctx).await;
                 let cancellation = request_guard.request.clone();
-                let (challenge, mut attempt_guard) = config_work(runtime.clone(), move |owner| {
-                    let challenge =
-                        owner.begin_approval_for_request(&digest, &facts, Some(&cancellation))?;
-                    // The job owns slot cleanup even if its async caller drops
-                    // before this blocking result can be delivered.
-                    let guard = phone::ApprovalAttemptGuard::new(&owner, challenge.attempt());
-                    owner.track_reserved_approval_request(
-                        challenge.attempt(),
-                        connection,
-                        corr,
-                        &cancellation,
-                    )?;
-                    Ok((challenge, guard))
-                })
-                .await?;
+                let (challenge, mut attempt_guard) =
+                    config_work(runtime.clone(), ConfigWake::Delivery, move |owner| {
+                        let challenge = owner.begin_approval_for_request(
+                            &digest,
+                            &facts,
+                            Some(&cancellation),
+                        )?;
+                        // The job owns slot cleanup even if its async caller drops
+                        // before this blocking result can be delivered.
+                        let guard = phone::ApprovalAttemptGuard::new(&owner, challenge.attempt());
+                        owner.track_reserved_approval_request(
+                            challenge.attempt(),
+                            connection,
+                            corr,
+                            &cancellation,
+                        )?;
+                        Ok((challenge, guard))
+                    })
+                    .await?;
                 request_guard.request.ensure_live()?;
                 let reply = match &challenge {
                     ApprovalChallenge::Desktop { .. } | ApprovalChallenge::OsPrompt { .. } => {
@@ -795,7 +818,7 @@ impl ControlHandler {
                 let publish_window = window.clone();
                 let publication_request = request_guard.request.clone();
                 let exit_runtime = runtime.clone();
-                let work = config_work(runtime, move |owner| {
+                let work = config_work(runtime, ConfigWake::Delivery, move |owner| {
                     let _owned_gates = (operation, module_gates);
                     owner.finish_approval_with_commit_window(
                         attempt,
@@ -820,10 +843,11 @@ impl ControlHandler {
                     work.await?
                 };
                 let approval_runtime = exit_runtime.clone();
-                if let Some(approval) = config_work(approval_runtime, move |owner| {
-                    owner.development_approval(generation)
-                })
-                .await?
+                if let Some(approval) =
+                    config_work(approval_runtime, ConfigWake::None, move |owner| {
+                        owner.development_approval(generation)
+                    })
+                    .await?
                 {
                     self.publish_development_approval(&approval);
                     return Ok(ConfigControlResponse::Applied {
@@ -881,15 +905,20 @@ impl ControlHandler {
                 };
                 let mut prepared = match edits {
                     Some((base, edits)) => {
-                        config_work(runtime.clone(), move |owner| {
+                        config_work(runtime.clone(), ConfigWake::Delivery, move |owner| {
                             owner.prepare_edits(base, edits)
                         })
                         .await?
                     }
-                    None => runtime.prepare_capture(kind).await?,
+                    None => {
+                        let prepared = runtime.prepare_capture(kind).await?;
+                        // Preparing a plan can record observations that delivery reads.
+                        runtime.notify_delivery_changed();
+                        prepared
+                    }
                 };
                 if prepared.capture_refused() {
-                    let view = config_work(runtime, move |owner| {
+                    let view = config_work(runtime, ConfigWake::None, move |owner| {
                         owner.capture_refusal(&prepared)?.ok_or_else(|| {
                             GateError::new("module_review_invalid", "project refusal is absent")
                         })
@@ -991,7 +1020,7 @@ impl ControlHandler {
                     fields.extend(prepared.accept_project_review(&tuple, reply)?);
                 }
                 prepared.add_edit_refusals(edit_refusals);
-                let view = config_work(runtime, move |owner| {
+                let view = config_work(runtime, ConfigWake::Delivery, move |owner| {
                     owner.finish_plan(prepared, move |old, new| {
                         let mut changeset = crate::config_gate::runtime::daemon_review(old, new)?;
                         changeset.fields = fields;
@@ -1045,7 +1074,10 @@ impl ControlHandler {
             })?;
         let admission = self.review_admission();
         let reviewer = registration.clone();
-        config_work(runtime.clone(), move |_| admission.check(&reviewer)).await?;
+        config_work(runtime.clone(), ConfigWake::None, move |_| {
+            admission.check(&reviewer)
+        })
+        .await?;
         if !registration
             .control_ops
             .iter()
@@ -1357,8 +1389,14 @@ fn config_os_prompt_available(provider_ready: bool, policy_present: bool) -> boo
     provider_ready && policy_present
 }
 
+enum ConfigWake {
+    None,
+    Delivery,
+}
+
 async fn config_work<T: Send + 'static>(
     runtime: Arc<crate::config_gate::runtime::RuntimeOwner>,
+    wake: ConfigWake,
     work: impl FnOnce(Arc<crate::config_gate::runtime::RuntimeOwner>) -> std::result::Result<T, GateError>
         + Send
         + 'static,
@@ -1366,7 +1404,9 @@ async fn config_work<T: Send + 'static>(
     runtime
         .on_blocking(move |owner| {
             let result = work(owner.clone());
-            owner.notify_delivery_changed();
+            if matches!(wake, ConfigWake::Delivery) {
+                owner.notify_delivery_changed();
+            }
             result
         })
         .await

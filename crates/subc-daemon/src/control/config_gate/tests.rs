@@ -261,3 +261,53 @@ async fn config_plan_proceeds_without_an_unavailable_rereview_and_keeps_it_owed(
     assert!(next.review_modules.contains("a"));
     assert!(next.rereview_modules.contains("a"));
 }
+
+#[tokio::test]
+async fn config_read_only_requests_do_not_wake_delivery() {
+    use crate::config_gate::runtime::settings::tests::SettingsRig;
+
+    let rig = SettingsRig::new();
+    rig.stamp();
+    rig.activate();
+    let handler = ControlHandler::new(Arc::new(Registry::default()));
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let ctx = RouteCtx {
+        connection_id: ConnectionId::new(11),
+        egress: crate::FrameSink::new(tx),
+    };
+    let notifications = rig.owner.delivery_notifications();
+    {
+        let prior = notifications.notified();
+        tokio::pin!(prior);
+        prior.as_mut().enable();
+    }
+
+    let mut woke_delivery = Vec::new();
+    for body in [
+        json!({"op":"config.modules"}),
+        json!({"op":"config.schema","module_id":"sample-reader"}),
+        json!({"op":"config.show","module_id":"sample-reader"}),
+        json!({"op":"config.plan_get","digest":subc_config::raw_digest(b"missing")}),
+        json!({"op":"config.history"}),
+    ] {
+        let request: ConfigControlRequest = serde_json::from_value(body.clone()).unwrap();
+        let op = request.op();
+        let reply = handler
+            .execute_config_request(&ctx, &frame(body), rig.owner.clone(), request)
+            .await;
+        if op == "config.plan_get" {
+            assert!(reply.is_err(), "the plan was never created");
+        } else {
+            reply.unwrap();
+        }
+        let notified = notifications.notified();
+        tokio::pin!(notified);
+        if notified.as_mut().enable() {
+            woke_delivery.push(op);
+        }
+    }
+    assert!(
+        woke_delivery.is_empty(),
+        "read-only calls notified delivery: {woke_delivery:?}"
+    );
+}

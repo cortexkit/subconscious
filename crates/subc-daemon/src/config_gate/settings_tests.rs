@@ -778,3 +778,72 @@ fn config_settings_written_back_edit_is_adopted_without_file_proposal() {
     assert_eq!(rig.modules()["modules"][1]["status"], "adopted");
     assert_eq!(rig.owner.status().unwrap().pending_proposals, 0);
 }
+
+#[test]
+fn settings_poll_verifies_the_store_once() {
+    let rig = SettingsRig::new();
+    rig.stamp();
+    rig.activate();
+    rig.edit_limit(8);
+    rig.activate_generation(2);
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    rig.owner
+        .lock()
+        .unwrap()
+        .store
+        .observe_io_threads(events.clone());
+
+    rig.owner
+        .observe_settings_modules(BTreeSet::new())
+        .unwrap()
+        .unwrap();
+    let hashes = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(operation, _)| *operation == "store_hash")
+        .count();
+    eprintln!("one settings poll: store_hash={hashes}");
+    assert_eq!(hashes, 1, "full store verifications in one settings poll");
+}
+
+#[test]
+fn settings_idle_file_probe_does_not_verify_store_and_detects_file_changes() {
+    let rig = SettingsRig::new();
+    rig.stamp();
+    rig.activate();
+    let observed = rig
+        .owner
+        .observe_settings(BTreeSet::new(), true)
+        .unwrap()
+        .unwrap();
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    rig.owner
+        .lock()
+        .unwrap()
+        .store
+        .observe_io_threads(events.clone());
+    assert!(!observed.files.needs_observation());
+    rig.write(b"{");
+    assert!(observed.files.needs_observation());
+    assert!(
+        events.lock().unwrap().is_empty(),
+        "a file probe must not read store authority"
+    );
+}
+
+#[test]
+fn settings_file_probe_retries_outstanding_write_back_without_a_file_change() {
+    let rig = SettingsRig::new();
+    rig.stamp();
+    rig.activate();
+    rig.edit_limit(8);
+    rig.activate_generation(2);
+    rig.write(br#"{"limit":99,"credential":{"vault_ref":"sample-reference"}}"#);
+    let observed = rig
+        .owner
+        .observe_settings(BTreeSet::new(), true)
+        .unwrap()
+        .unwrap();
+    assert!(observed.files.needs_observation());
+}

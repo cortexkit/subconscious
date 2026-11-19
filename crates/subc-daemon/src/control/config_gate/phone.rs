@@ -137,7 +137,7 @@ impl ControlHandler {
                 };
                 let binding = if pending.endpoint.connection_id == connection {
                     let corr = pending.corr;
-                    config_work(runtime.clone(), move |owner| {
+                    config_work(runtime.clone(), ConfigWake::Delivery, move |owner| {
                         owner.bind_phone_rpc(attempt, connection, corr)
                     })
                     .await

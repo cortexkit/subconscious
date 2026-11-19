@@ -652,7 +652,7 @@ impl ConfigStore {
             detail: detail.into(),
         });
     }
-    fn usable(&self) -> Result<(), StoreError> {
+    pub(crate) fn usable(&self) -> Result<(), StoreError> {
         match self.state {
             StoreState::StoreMissing => Err(StoreError::new(
                 StoreErrorCode::StoreMissing,
@@ -835,6 +835,11 @@ impl ConfigStore {
     }
     pub fn retry_anchor(&mut self) -> Result<(), StoreError> {
         self.check()?;
+        self.retry_verified_anchor()
+    }
+
+    /// The caller must hold exclusive access from the preceding `check`.
+    pub(crate) fn retry_verified_anchor(&mut self) -> Result<(), StoreError> {
         if let Some((pair, stamped)) = self.pending_anchor {
             self.backend.anchor(pair, stamped)?;
             self.pending_anchor = None;

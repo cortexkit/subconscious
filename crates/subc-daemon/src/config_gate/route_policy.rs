@@ -129,23 +129,27 @@ impl OwnerState {
     }
 
     pub(super) fn commit_anchored_route_policies(&mut self) {
-        if self.store.status().anchor_pending {
+        if self.store.check().is_ok() {
+            self.commit_verified_route_policies();
+        }
+    }
+
+    pub(super) fn commit_verified_route_policies(&mut self) {
+        if self.store.loaded_anchor_pending() || self.store.usable().is_err() {
             return;
         }
         let active = self
             .store
-            .body()
-            .map(|body| {
-                body.versions
-                    .iter()
-                    .filter_map(|(tuple, versions)| {
-                        versions
-                            .active
-                            .map(|generation| (tuple.module.clone(), generation))
-                    })
-                    .collect::<Vec<_>>()
+            .loaded_admission_state()
+            .1
+            .versions
+            .iter()
+            .filter_map(|(tuple, versions)| {
+                versions
+                    .active
+                    .map(|generation| (tuple.module.clone(), generation))
             })
-            .unwrap_or_default();
+            .collect::<Vec<_>>();
         for (module, generation) in active {
             self.commit_route_policy(&module, generation);
         }

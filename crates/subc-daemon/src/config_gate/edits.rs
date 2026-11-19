@@ -182,77 +182,81 @@ fn schema_path<'a>(
     Ok(schema)
 }
 
+pub(super) fn loaded_write_back_status(state: &OwnerState) -> Result<BTreeMap<String, String>> {
+    let (store, body) = state.store.loaded_admission_state();
+    if store != StoreState::Stamped {
+        return Ok(BTreeMap::new());
+    }
+    let entry = body
+        .generations
+        .get(&super::placement::last_approved_generation(body));
+    let Some(entry) = entry else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(intents) = entry
+        .generation
+        .changeset
+        .apply_plan
+        .pointer("/edit_plan/write_back")
+    else {
+        return Ok(BTreeMap::new());
+    };
+    let intents: Vec<WriteBackIntent> = serde_json::from_value(intents.clone()).map_err(|_| {
+        GateError::new(
+            "config_unavailable",
+            "approved write-back intents are invalid",
+        )
+    })?;
+    let mut behind = BTreeMap::new();
+    for intent in intents {
+        let disk = CapturedFile::open(&intent.path);
+        let raw = disk
+            .as_ref()
+            .ok()
+            .and_then(|file| file.bytes.as_deref())
+            .map(subc_config::raw_digest);
+        if raw.as_ref() == Some(&intent.candidate_digest) {
+            continue;
+        }
+        let reason = if let Some(note) = intent.note {
+            note
+        } else if disk.is_ok() && raw == intent.plan_time_digest {
+            let bytes = entry
+                .delivery
+                .as_ref()
+                .and_then(|delivery| delivery.modules.get(&intent.module_id))
+                .and_then(|view| view.layers.first())
+                .and_then(|layer| layer.bytes.clone());
+            if let Some(bytes) =
+                bytes.filter(|bytes| subc_config::raw_digest(bytes) == intent.candidate_digest)
+            {
+                let file = WriteBack {
+                    module: intent.module_id.clone(),
+                    path: intent.path,
+                    expected: intent.expected,
+                    bytes,
+                    plan_time_digest: intent.plan_time_digest,
+                    skipped: false,
+                };
+                if file.write_back().is_ok() {
+                    continue;
+                }
+            }
+            "the approved settings could not be safely written back".into()
+        } else {
+            "the file changed after this was approved".into()
+        };
+        behind.insert(intent.module_id, reason);
+    }
+    Ok(behind)
+}
+
 impl RuntimeOwner {
+    #[cfg(test)]
     pub fn write_back_status(&self) -> Result<BTreeMap<String, String>> {
         let mut state = self.lock()?;
         state.check_authority_for_read()?;
-        if state.store_read(ConfigStore::status).state != StoreState::Stamped {
-            return Ok(BTreeMap::new());
-        }
-        let body = state.checked_body()?;
-        let entry = body
-            .generations
-            .get(&super::placement::last_approved_generation(body));
-        let Some(entry) = entry else {
-            return Ok(BTreeMap::new());
-        };
-        let Some(intents) = entry
-            .generation
-            .changeset
-            .apply_plan
-            .pointer("/edit_plan/write_back")
-        else {
-            return Ok(BTreeMap::new());
-        };
-        let intents: Vec<WriteBackIntent> =
-            serde_json::from_value(intents.clone()).map_err(|_| {
-                GateError::new(
-                    "config_unavailable",
-                    "approved write-back intents are invalid",
-                )
-            })?;
-        let mut behind = BTreeMap::new();
-        for intent in intents {
-            let disk = CapturedFile::open(&intent.path);
-            let raw = disk
-                .as_ref()
-                .ok()
-                .and_then(|file| file.bytes.as_deref())
-                .map(subc_config::raw_digest);
-            if raw.as_ref() == Some(&intent.candidate_digest) {
-                continue;
-            }
-            let reason = if let Some(note) = intent.note {
-                note
-            } else if disk.is_ok() && raw == intent.plan_time_digest {
-                let bytes = entry
-                    .delivery
-                    .as_ref()
-                    .and_then(|delivery| delivery.modules.get(&intent.module_id))
-                    .and_then(|view| view.layers.first())
-                    .and_then(|layer| layer.bytes.clone());
-                if let Some(bytes) =
-                    bytes.filter(|bytes| subc_config::raw_digest(bytes) == intent.candidate_digest)
-                {
-                    let file = WriteBack {
-                        module: intent.module_id.clone(),
-                        path: intent.path,
-                        expected: intent.expected,
-                        bytes,
-                        plan_time_digest: intent.plan_time_digest,
-                        skipped: false,
-                    };
-                    if file.write_back().is_ok() {
-                        continue;
-                    }
-                }
-                "the approved settings could not be safely written back".into()
-            } else {
-                "the file changed after this was approved".into()
-            };
-            behind.insert(intent.module_id, reason);
-        }
-        Ok(behind)
+        loaded_write_back_status(&state)
     }
 
     pub(super) fn edit_baseline(

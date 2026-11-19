@@ -64,26 +64,27 @@ impl ControlHandler {
             .ok_or_else(|| GateError::new("stale_plan", "spawn registration ended"))?;
         let request_guard = runtime.claim_approval_request(connection, 0)?;
         let plan_record = record.clone();
-        let view = config_work(runtime.clone(), move |owner| {
+        let view = config_work(runtime.clone(), ConfigWake::Delivery, move |owner| {
             owner.plan_development_widening(&plan_record, entries)
         })
         .await?;
         let facts = self.development_approval_facts(connection).await;
         let cancellation = request_guard.request.clone();
         let digest = view.digest;
-        let (challenge, mut attempt_guard) = config_work(runtime.clone(), move |owner| {
-            let challenge =
-                owner.begin_approval_for_request(&digest, &facts, Some(&cancellation))?;
-            let guard = phone::ApprovalAttemptGuard::new(&owner, challenge.attempt());
-            owner.track_reserved_approval_request(
-                challenge.attempt(),
-                connection,
-                0,
-                &cancellation,
-            )?;
-            Ok((challenge, guard))
-        })
-        .await?;
+        let (challenge, mut attempt_guard) =
+            config_work(runtime.clone(), ConfigWake::Delivery, move |owner| {
+                let challenge =
+                    owner.begin_approval_for_request(&digest, &facts, Some(&cancellation))?;
+                let guard = phone::ApprovalAttemptGuard::new(&owner, challenge.attempt());
+                owner.track_reserved_approval_request(
+                    challenge.attempt(),
+                    connection,
+                    0,
+                    &cancellation,
+                )?;
+                Ok((challenge, guard))
+            })
+            .await?;
         let ApprovalChallenge::Phone {
             attempt,
             connection: phone_connection,
@@ -122,7 +123,7 @@ impl ControlHandler {
             return Err(GateError::new("stale_plan", "spawn ended before approval"));
         }
         let publication = request_guard.request.clone();
-        let generation = config_work(runtime.clone(), move |owner| {
+        let generation = config_work(runtime.clone(), ConfigWake::Delivery, move |owner| {
             let _gates = (operation, gates);
             owner.finish_approval_with_commit_window(
                 attempt,
@@ -135,8 +136,10 @@ impl ControlHandler {
             )
         })
         .await?;
-        if let Some(approval) =
-            config_work(runtime, move |owner| owner.development_approval(generation)).await?
+        if let Some(approval) = config_work(runtime, ConfigWake::Delivery, move |owner| {
+            owner.development_approval(generation)
+        })
+        .await?
         {
             self.publish_development_approval(&approval);
         }

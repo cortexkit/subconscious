@@ -295,3 +295,68 @@ async fn config_declaration_fallback_withholds_old_pending_then_activates_new_ap
         .declaration_pending
         .contains_key("a"));
 }
+
+#[test]
+fn rollback_requires_pending_declaration_match_for_delivery() {
+    let (rig, owner) = approved();
+    changed(&rig, &owner);
+    let generation = approve(&owner);
+    let reply = owner
+        .module_get(ConnectionId::new(10), "a", ConfigGetRequest::new())
+        .unwrap();
+    assert!(
+        reply.pending.is_none(),
+        "served mismatched generation {generation}"
+    );
+    assert!(reply.declaration_pending.is_some());
+    let active = reply.active.unwrap();
+    assert_eq!(active.generation, 1);
+    assert!(active.effective.get("new_setting").is_none());
+}
+
+#[tokio::test]
+async fn rollback_requires_the_admitted_build_to_match_the_target() {
+    let (rig, owner) = approved();
+    changed(&rig, &owner);
+    let generation = approve(&owner);
+    let connection = ConnectionId::new(20);
+    let reply = owner
+        .module_get(connection, "a", ConfigGetRequest::new())
+        .unwrap();
+    let pending = reply.pending.as_ref().unwrap();
+    owner
+        .module_view_delivered(connection, "a", &reply, tokio::time::Instant::now(), true)
+        .unwrap();
+    assert_eq!(
+        owner
+            .module_applied(
+                connection,
+                "a",
+                ConfigAppliedRequest::new(
+                    generation,
+                    pending.attempt.unwrap(),
+                    ConfigApplyResult::Ack,
+                    vec![]
+                ),
+            )
+            .unwrap(),
+        delivery::AppliedDisposition::Active,
+    );
+
+    let error = match owner.prepare(PlanKind::Rollback(1)) {
+        Ok(_) => panic!("rollback was planned for a different build of a"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, "rollback_declaration_mismatch");
+    assert!(
+        error.detail.contains("different build of a"),
+        "{}",
+        error.detail
+    );
+    assert!(error.detail.contains("ordinary edit"), "{}", error.detail);
+    let reply = owner
+        .module_get(connection, "a", ConfigGetRequest::new())
+        .unwrap();
+    assert!(reply.pending.is_none());
+    assert_eq!(reply.active.unwrap().generation, generation);
+}

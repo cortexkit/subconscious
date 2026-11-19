@@ -7,6 +7,10 @@ use super::*;
 use crate::config_gate::apply::Transition;
 use crate::config_store::Tuple;
 
+#[path = "rpc_delivery.rs"]
+mod rpc_delivery;
+use rpc_delivery::record_served_view;
+
 pub(crate) const CONFIG_LIVE_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const CONFIG_WARMUP_SLACK: Duration = Duration::from_secs(10);
 
@@ -1331,7 +1335,13 @@ impl RuntimeOwner {
                     "configuration connection has ended",
                 ));
             }
-            let body = state.store.body()?;
+            let before = store_witness(&state.store);
+            let checked = state.store_read(ConfigStore::check);
+            if store_witness(&state.store) != before {
+                self.notify_delivery_changed();
+            }
+            checked?;
+            let (_, body) = state.store.loaded_admission_state();
             if body.stamped {
                 let versions = body
                     .versions
@@ -1370,13 +1380,13 @@ impl RuntimeOwner {
             if reply.declaration_pending.is_some() {
                 if let Some(view) = &reply.active {
                     if let Some(attempt) = view.attempt {
-                        self.delivery_written(connection, view.generation, attempt, written_at)?;
+                        self.record_rpc_write(connection, view.generation, attempt, written_at)?;
                     }
                 }
             }
             if let Some(view) = &reply.pending {
                 if let Some(attempt) = view.attempt {
-                    self.delivery_written(connection, view.generation, attempt, written_at)?;
+                    self.record_rpc_write(connection, view.generation, attempt, written_at)?;
                 }
             }
         }
@@ -1391,24 +1401,8 @@ impl RuntimeOwner {
                 "configuration connection has ended",
             ));
         }
-        state.delivery.served.insert(
-            connection,
-            (
-                reply.active.as_ref().map(|view| view.generation),
-                reply.pending.as_ref().map(|view| view.generation),
-            ),
-        );
-        if let Some(view) = reply
-            .active
-            .as_ref()
-            .filter(|view| view.status == ConfigStatus::Unstamped)
-        {
-            state
-                .delivery
-                .unstamped_views
-                .insert(connection, std::sync::Arc::new(view.clone()));
-        } else {
-            state.delivery.unstamped_views.remove(&connection);
+        if record_served_view(&mut state, connection, reply) {
+            self.notify_delivery_changed();
         }
         Ok(())
     }
@@ -1620,6 +1614,17 @@ impl RuntimeOwner {
         attempt: u64,
         written_at: tokio::time::Instant,
     ) -> Result<()> {
+        self.record_delivery_written(connection, generation, attempt, written_at)?;
+        Ok(())
+    }
+
+    fn record_delivery_written(
+        &self,
+        connection: ConnectionId,
+        generation: u64,
+        attempt: u64,
+        written_at: tokio::time::Instant,
+    ) -> Result<bool> {
         let mut state = self.lock()?;
         let bound = state
             .delivery
@@ -1644,11 +1649,13 @@ impl RuntimeOwner {
                 "configuration delivery timed out",
             ));
         }
+        let mut changed = !bound.delivered;
         bound.delivered = true;
         if !bound.transition.requires_spawn() && bound.deadline.is_none() {
             bound.deadline = Some(written_at + CONFIG_LIVE_ACK_TIMEOUT);
+            changed = true;
         }
-        Ok(())
+        Ok(changed)
     }
 
     pub(crate) fn module_applied(

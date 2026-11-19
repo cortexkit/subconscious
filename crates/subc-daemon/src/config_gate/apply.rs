@@ -109,7 +109,11 @@ pub(super) fn bind_plan(changeset: &mut Changeset) -> Result<()> {
             );
         }
     } else {
-        for field in &changeset.fields {
+        for field in changeset
+            .fields
+            .iter()
+            .filter(|field| field.project_id.is_none())
+        {
             let (kind, live_fields) = policies
                 .entry(field.module_id.clone())
                 .or_insert((Transition::Live, vec![]));

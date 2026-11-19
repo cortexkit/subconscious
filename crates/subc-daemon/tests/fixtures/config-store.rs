@@ -75,6 +75,7 @@ fn main() {
         approval_id: "fixture-approval".into(),
         outcome: "pending".into(),
         tuples: BTreeSet::new(),
+        project_outcomes: Default::default(),
         configuration: Snapshot::default(),
     };
     let result = store.commit_generation(entry, Snapshot::default(), Snapshot::default(), 1);

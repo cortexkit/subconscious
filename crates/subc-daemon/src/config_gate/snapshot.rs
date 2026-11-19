@@ -13,9 +13,21 @@ use crate::config_store::Snapshot;
 pub enum InputKey {
     Daemon,
     Entry(String),
-    Layer { module: String, path: String },
+    Layer {
+        module: String,
+        path: String,
+    },
+    /// A project's read witness, including absent locations. The capturer binds
+    /// the workspace/project locations, identities and byte digests (no raw bytes).
+    ProjectTuple {
+        module: String,
+        project: String,
+    },
     Declaration(String),
-    Program { module: String, path: String },
+    Program {
+        module: String,
+        path: String,
+    },
 }
 
 impl InputKey {
@@ -23,7 +35,9 @@ impl InputKey {
         match self {
             Self::Daemon => None,
             Self::Entry(module) | Self::Declaration(module) => Some(module),
-            Self::Layer { module, .. } | Self::Program { module, .. } => Some(module),
+            Self::Layer { module, .. }
+            | Self::ProjectTuple { module, .. }
+            | Self::Program { module, .. } => Some(module),
         }
     }
     pub(super) fn is_program(&self) -> bool {
@@ -118,6 +132,21 @@ impl GateSnapshot {
                     ),
                 },
             );
+        }
+        for (key, value) in &self.inputs {
+            if let InputKey::ProjectTuple { module, project } = key {
+                if modules.contains(module) {
+                    let key = super::targets::project_input_key(module, project);
+                    inputs.insert(
+                        key,
+                        InputState::Present {
+                            digest: subc_config::raw_digest(
+                                &serde_json::to_vec(value).map_err(GateError::invalid)?,
+                            ),
+                        },
+                    );
+                }
+            }
         }
         Ok(InputVector::new(inputs))
     }

@@ -18,6 +18,7 @@ mod root_io;
 pub mod runtime;
 mod snapshot;
 mod strict_json;
+pub(crate) mod targets;
 
 pub use approval::*;
 pub use snapshot::{CapturedInput, GateSnapshot, InputKey};
@@ -173,6 +174,21 @@ struct PendingPlan {
     callosum_entry_changed: bool,
     recovery: bool,
     delivery: Option<crate::config_store::DeliverySnapshot>,
+    project_files: Vec<crate::config_store::ProjectFileApproval>,
+}
+
+impl PendingPlan {
+    fn targets(&self) -> Result<BTreeSet<Tuple>> {
+        let targets = targets::checked(&self.view.plan)?;
+        // Approving more provider declarations for a development build does
+        // not start config delivery. The module read set still detects changes
+        // while the operator reviews those declarations.
+        Ok(if self.development_approval.is_some() {
+            BTreeSet::new()
+        } else {
+            targets
+        })
+    }
 }
 
 /// Memory-only plans cannot be replayed across a daemon restart. A successful
@@ -251,7 +267,7 @@ impl ConfigGate {
         record: ReviewRecord<'_>,
         review: impl FnOnce(&GateSnapshot, &GateSnapshot) -> Result<Changeset>,
     ) -> Result<ConfigPlanView> {
-        self.plan_reviewed_inner(store, kind, candidate, observed, record, None, review)
+        self.plan_reviewed_inner(store, kind, candidate, observed, record, None, None, review)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -263,6 +279,7 @@ impl ConfigGate {
         observed: &GateSnapshot,
         record: ReviewRecord<'_>,
         edits: Option<runtime::edits::EditPlan>,
+        projects: Option<targets::ProjectReviews>,
         review: impl FnOnce(&GateSnapshot, &GateSnapshot) -> Result<Changeset>,
     ) -> Result<ConfigPlanView> {
         let status = store.status();
@@ -360,14 +377,15 @@ impl ConfigGate {
         } else {
             false
         };
-        let mut modules: BTreeSet<String> = changed
+        let mut user_modules: BTreeSet<String> = changed
             .iter()
+            .filter(|key| !matches!(key, InputKey::ProjectTuple { .. }))
             .filter_map(|key| key.module().map(str::to_owned))
             .collect();
         let mut changeset = review(&approved, &candidate)?;
         for difference in &rollback_programs {
             if let Some(module) = difference["module_id"].as_str() {
-                modules.insert(module.to_owned());
+                user_modules.insert(module.to_owned());
                 changeset
                     .launch_manifests
                     .entry(module.to_owned())
@@ -380,11 +398,23 @@ impl ConfigGate {
                     );
             }
         }
-        modules.extend(changeset.fields.iter().map(|field| field.module_id.clone()));
-        modules.extend(changeset.launch_manifests.keys().cloned());
+        user_modules.extend(
+            changeset
+                .fields
+                .iter()
+                .filter(|field| field.project_id.is_none())
+                .map(|field| field.module_id.clone()),
+        );
+        user_modules.extend(changeset.launch_manifests.keys().cloned());
         if matches!(kind, PlanKind::Stamp | PlanKind::Unstamp) {
-            modules.extend(observed.modules());
-            modules.extend(approved.modules());
+            user_modules.extend(
+                observed
+                    .inputs
+                    .keys()
+                    .chain(approved.inputs.keys())
+                    .filter(|key| !matches!(key, InputKey::ProjectTuple { .. }))
+                    .filter_map(|key| key.module().map(str::to_owned)),
+            );
         }
         // Bind the full retained view and operation, including identity-only and
         // declaration-only changes a module's scalar diff would not describe.
@@ -411,9 +441,13 @@ impl ConfigGate {
             "previous": approved.to_store()?,
             "snapshot": candidate.to_store()?,
         });
-        if let Some(transitions) = transitions {
-            if let Some(table) = transitions.as_object() {
-                modules.extend(table.keys().cloned());
+        if let Some(mut transitions) = transitions {
+            if let Some(table) = transitions.as_object_mut() {
+                if projects.is_some() {
+                    table.retain(|module, _| user_modules.contains(module));
+                } else {
+                    user_modules.extend(table.keys().cloned());
+                }
             }
             changeset.apply_plan["module_transitions"] = transitions;
         }
@@ -429,7 +463,7 @@ impl ConfigGate {
             // generation either, even though the program matches the last
             // approval.
             let body = store.body()?;
-            for module in &modules {
+            for module in &user_modules {
                 if reviewed_build::active(body, module)?
                     .is_some_and(|active| active != reviewed_build::identity(&candidate, module))
                 {
@@ -477,6 +511,9 @@ impl ConfigGate {
                 };
                 if let Some(previous) = record.get(module).filter(|previous| **previous != program)
                 {
+                    if projects.is_some() {
+                        user_modules.insert(module.clone());
+                    }
                     changeset.policy_changes.push(serde_json::json!({
                         "module_id": module,
                         "path": "reviewed_program",
@@ -501,14 +538,37 @@ impl ConfigGate {
                 changeset.apply_plan["edit_refusals"] = serde_json::json!(edit.refusals);
             }
         }
+        let mut modules = user_modules.clone();
+        modules.extend(changed.iter().filter_map(|key| match key {
+            InputKey::ProjectTuple { module, .. } => Some(module.clone()),
+            _ => None,
+        }));
+        if let Some(projects) = &projects {
+            modules.extend(projects.tuples.keys().map(|tuple| tuple.module.clone()));
+        }
+        let inputs = observed.read_set(&modules)?;
+        let (delivery, project_files) = if let Some(projects) = projects {
+            let body = if recovery { None } else { Some(store.body()?) };
+            let (delivery, files) = projects.bind(body, &inputs, &mut changeset, &user_modules)?;
+            if recovery && !files.is_empty() {
+                return Err(GateError::new(
+                    "apply_plan_invalid",
+                    "recovery cannot approve project file write-back",
+                ));
+            }
+            (Some(delivery), files)
+        } else {
+            (None, Vec::new())
+        };
         let mut plan = Plan::new(
             base_revision,
             base_generation,
             &self.incarnation,
-            observed.read_set(&modules)?,
+            inputs,
             changeset,
         );
         plan.active_generations = active;
+        targets::checked(&plan)?;
         let mut view = ConfigPlanView::new(plan).map_err(GateError::invalid)?;
         if let Some(edit) = &edits {
             view.refusals = edit.refusals.clone();
@@ -530,7 +590,8 @@ impl ConfigGate {
                 changed,
                 callosum_entry_changed,
                 recovery,
-                delivery: None,
+                delivery,
+                project_files,
             },
         );
         Ok(view)
@@ -561,12 +622,37 @@ impl ConfigGate {
     pub(crate) fn bind_delivery(
         &mut self,
         digest: &Digest,
-        delivery: crate::config_store::DeliverySnapshot,
+        mut delivery: crate::config_store::DeliverySnapshot,
     ) -> Result<()> {
-        self.plans
+        let plan = self
+            .plans
             .get_mut(digest)
-            .ok_or_else(|| GateError::new("plan_unknown", "plan is absent or already applied"))?
-            .delivery = Some(delivery);
+            .ok_or_else(|| GateError::new("plan_unknown", "plan is absent or already applied"))?;
+        if let Some(projects) = &plan.delivery {
+            for (module, declaration) in &projects.declarations {
+                if delivery
+                    .declarations
+                    .get(module)
+                    .is_some_and(|user| user != declaration)
+                {
+                    return Err(GateError::new(
+                        "apply_plan_invalid",
+                        "user and project views name different declarations of the same module",
+                    ));
+                }
+                delivery
+                    .declarations
+                    .insert(module.clone(), declaration.clone());
+            }
+            delivery.project_views.clone_from(&projects.project_views);
+            delivery
+                .project_cutoffs
+                .clone_from(&projects.project_cutoffs);
+            delivery
+                .project_approval_digests
+                .clone_from(&projects.project_approval_digests);
+        }
+        plan.delivery = Some(delivery);
         Ok(())
     }
 
@@ -608,6 +694,7 @@ impl ConfigGate {
     }
 
     fn fresh(plan: &PendingPlan, store: &mut ConfigStore, current: &GateSnapshot) -> Result<()> {
+        plan.targets()?;
         let status = store.status();
         let recovery = matches!(
             status.state,
@@ -652,10 +739,14 @@ impl ConfigGate {
         );
         let declarations_only = plan.development_approval.is_some();
         generation.active_generations = plan.view.plan.active_generations.clone();
-        for module in plan.modules.iter().filter(|_| !declarations_only) {
-            generation
-                .module_states
-                .insert(module.clone(), subc_config::GenerationState::Pending);
+        let tuples = plan.targets()?;
+        for tuple in &tuples {
+            let module = &tuple.module;
+            if tuple.project.is_none() {
+                generation
+                    .module_states
+                    .insert(module.clone(), subc_config::GenerationState::Pending);
+            }
             if let Some(CapturedInput {
                 state: subc_config::InputState::Present { digest },
                 ..
@@ -669,32 +760,6 @@ impl ConfigGate {
                     .insert(module.clone(), digest.clone());
             }
         }
-        let mut tuples: BTreeSet<Tuple> = plan
-            .modules
-            .iter()
-            .map(|module| Tuple {
-                module: module.clone(),
-                project: None,
-            })
-            .chain(plan.view.plan.changeset.fields.iter().map(|field| Tuple {
-                module: field.module_id.clone(),
-                project: field.project_id.clone(),
-            }))
-            .chain(plan.modules.iter().flat_map(|module| {
-                plan.view
-                    .plan
-                    .changeset
-                    .affected_projects
-                    .iter()
-                    .map(move |project| Tuple {
-                        module: module.clone(),
-                        project: Some(project.clone()),
-                    })
-            }))
-            .collect();
-        if declarations_only {
-            tuples.clear();
-        }
         let snapshot = plan.snapshot.to_store()?;
         let entry = HistoryEntry {
             generation,
@@ -706,6 +771,7 @@ impl ConfigGate {
             approval_id: digest.to_string(),
             outcome: "approved".into(),
             tuples,
+            project_outcomes: BTreeMap::new(),
             configuration: snapshot.clone(),
             delivery: plan.delivery.clone(),
         };
@@ -715,7 +781,13 @@ impl ConfigGate {
         let result = if plan.recovery {
             store.recovery_exit(entry, snapshot, now_ms)
         } else {
-            store.commit_generation(entry, snapshot, observed, now_ms)
+            store.commit_generation_with_project_files(
+                entry,
+                snapshot,
+                observed,
+                plan.project_files.clone(),
+                now_ms,
+            )
         };
         // The sealed store's external revision/digest anchor may fail to update
         // after a durable commit. The committed base makes the old plan stale;

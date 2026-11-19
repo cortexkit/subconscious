@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.50.16
+
+- Persist approved project views and cutoffs, tuple delivery outcomes, confirmed registry membership, and the newest write-back intent per project or workspace file.
+- Commit only the configuration tuples named by the reviewed plan. An absent tuple list means a user-only plan whose targets are derived from its digest-bound module inputs, preserving existing reply bytes.
+
 ## 0.50.15
 
 - Refuse settings declarations before storing them if a number cannot be

@@ -730,6 +730,9 @@ impl Drop for OwnerGuard<'_> {
 
 pub struct PreparedPlan {
     edits: Option<edits::EditPlan>,
+    /// Filled by project capture only after checking the module's reply. A
+    /// user-only plan leaves this absent to preserve its digest and view.
+    pub(crate) projects: Option<super::targets::ProjectReviews>,
     pub candidate: CapturedConfiguration,
     pub bases: BTreeMap<String, ConfigView>,
     pub base_schemas: BTreeMap<String, subc_config::Schema>,
@@ -1756,6 +1759,7 @@ impl RuntimeOwner {
         }
         Ok(PreparedPlan {
             edits: None,
+            projects: None,
             candidate,
             bases,
             base_schemas,
@@ -1864,6 +1868,7 @@ impl RuntimeOwner {
                 .iter()
                 .map(|(module, captured)| (module.clone(), captured.declaration.clone()))
                 .collect(),
+            ..DeliverySnapshot::default()
         };
         let mut handles = prepared.candidate.take_handles();
         handles.append(&mut prepared.observed_handles);
@@ -1877,6 +1882,7 @@ impl RuntimeOwner {
                 daemon: delivery.daemon.clone(),
                 modules: prepared.bases.clone(),
                 declarations: delivery.declarations.clone(),
+                ..DeliverySnapshot::default()
             })
         } else {
             None
@@ -1926,6 +1932,7 @@ impl RuntimeOwner {
             &current.diagnostic,
             super::ReviewRecord::Reviewed(&prepared.review_modules),
             prepared.edits,
+            prepared.projects,
             |old, new| {
                 let mut changeset = review(old, new)?;
                 layer_file_rows(
@@ -2086,6 +2093,12 @@ impl RuntimeOwner {
             .is_some_and(|plan| plan.development_approval.is_some());
         state.reviewed(&digest, Instant::now());
         let modules = state.gate.approval_modules(attempt)?;
+        let user_modules = state.gate.plans[&digest]
+            .targets()?
+            .into_iter()
+            .filter(|tuple| tuple.project.is_none())
+            .map(|tuple| tuple.module)
+            .collect();
         let program_keys = state.gate.plan_program_keys(&digest)?;
         // Reopen inputs after the operator's interactive confirmation, immediately
         // before freshness checking and atomic publication of the saved plan.
@@ -2169,7 +2182,7 @@ impl RuntimeOwner {
                     route_policy::restore_superseded(
                         route_policy_receipts,
                         installed_route_policies,
-                        &modules,
+                        &user_modules,
                         delivery,
                     );
                 }

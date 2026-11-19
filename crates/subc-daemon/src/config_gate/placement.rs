@@ -220,6 +220,7 @@ impl RuntimeOwner {
             approval_id: "development-placement (unapproved)".into(),
             outcome: "development".into(),
             tuples: BTreeSet::new(),
+            project_outcomes: BTreeMap::new(),
             configuration,
             delivery,
         };

@@ -7,6 +7,9 @@ use std::{
 };
 use subc_config::{raw_digest, Changeset, Generation, InputVector, RecordedValue};
 
+#[path = "project_tests.rs"]
+mod project_tests;
+
 #[derive(Default)]
 pub(super) struct MemoryKey {
     pub key: Option<[u8; 32]>,
@@ -107,7 +110,7 @@ fn snapshot(a: i32, b: i32) -> Snapshot {
 fn tuple() -> Tuple {
     Tuple {
         module: "sample".into(),
-        project: Some("project".into()),
+        project: None,
     }
 }
 
@@ -232,6 +235,7 @@ fn entry(kind: CommitKind) -> HistoryEntry {
         approval_id: "approval".into(),
         outcome: "pending".into(),
         tuples: BTreeSet::from([tuple()]),
+        project_outcomes: BTreeMap::new(),
         configuration: snapshot(1, 1),
     }
 }
@@ -814,8 +818,7 @@ fn daemon_byte_limit_entry(kind: CommitKind, version: &str, padding: usize) -> H
             "/approved/subc.jsonc",
             Some(bytes),
         )),
-        modules: BTreeMap::new(),
-        declarations: BTreeMap::new(),
+        ..DeliverySnapshot::default()
     });
     entry
 }

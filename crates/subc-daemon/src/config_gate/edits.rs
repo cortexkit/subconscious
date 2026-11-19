@@ -474,6 +474,7 @@ impl RuntimeOwner {
             .cloned()
             .collect();
         Ok(PreparedPlan {
+            projects: None,
             candidate,
             bases,
             base_schemas,

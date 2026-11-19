@@ -846,14 +846,11 @@ impl ConfigStore {
                     let still_pending = failure.versions.iter().any(|(tuple, versions)| {
                         tuple == &ack.tuple && versions.pending == Some(ack.generation)
                     });
-                    let failed_module =
-                        failure
-                            .generations
-                            .get(&ack.generation)
-                            .is_some_and(|entry| {
-                                entry.generation.never_redeliver.contains(&ack.tuple.module)
-                            });
-                    if still_pending && !failed_module {
+                    let suppressed = failure
+                        .generations
+                        .get(&ack.generation)
+                        .is_some_and(|entry| entry.redelivery_suppressed(&ack.tuple));
+                    if still_pending && !suppressed {
                         if let Some((_, approved)) = self
                             .envelope
                             .body
@@ -870,18 +867,7 @@ impl ConfigStore {
                             }
                         }
                         if let Some(entry) = failure.generations.get_mut(&ack.generation) {
-                            entry
-                                .generation
-                                .module_states
-                                .insert(ack.tuple.module, subc_config::GenerationState::Active);
-                            if !entry
-                                .generation
-                                .module_states
-                                .values()
-                                .any(|state| *state == subc_config::GenerationState::Failed)
-                            {
-                                entry.outcome = "active".into();
-                            }
+                            entry.record_tuple_delivery(&ack.tuple, true, true);
                         }
                     }
                 }
@@ -1056,9 +1042,22 @@ impl ConfigStore {
     /// proposal rebasing. The caller has checked plan freshness and approval.
     pub fn commit_generation(
         &mut self,
+        entry: HistoryEntry,
+        approved: Snapshot,
+        observed: Snapshot,
+        now_ms: u64,
+    ) -> Result<u64, StoreError> {
+        self.commit_generation_with_project_files(entry, approved, observed, Vec::new(), now_ms)
+    }
+
+    /// `files` contains only approved edits or captures, one update per physical
+    /// file. Publish their intents and the generation at the same commit point.
+    pub(crate) fn commit_generation_with_project_files(
+        &mut self,
         mut entry: HistoryEntry,
         approved: Snapshot,
         observed: Snapshot,
+        files: Vec<ProjectFileApproval>,
         now_ms: u64,
     ) -> Result<u64, StoreError> {
         self.delivery_ready()?;
@@ -1092,7 +1091,9 @@ impl ConfigStore {
                 )
             })?;
         entry.generation.id = id;
+        entry.initialize_project_outcomes();
         let mut body = self.envelope.body.clone();
+        body.apply_project_file_approvals(files, id)?;
         body.last_generation = id;
         body.base_revision = self.next_revision(
             self.envelope.integrity == IntegrityMode::Sealed,
@@ -1212,6 +1213,7 @@ impl ConfigStore {
         let revision =
             self.next_revision(self.envelope.integrity == IntegrityMode::Sealed, true)?;
         entry.generation.id = 1;
+        entry.initialize_project_outcomes();
         let stamped = entry.kind == CommitKind::Stamp;
         let mut body = StoreBody {
             stamped,
@@ -1270,6 +1272,28 @@ impl ConfigStore {
         Ok(changed)
     }
 
+    /// Supply the last complete successful enumeration, not an empty record
+    /// synthesized on failure or from a scoped capture. This is observed state,
+    /// not an approval, and does not advance the approval base revision.
+    pub fn replace_registry_membership(
+        &mut self,
+        reply: Result<&cortexkit_project_identity::EnumerateReply, crate::config_gate::GateError>,
+    ) -> Result<bool, crate::config_gate::GateError> {
+        let membership = RegistryMembership::from_enumeration(reply?)?;
+        self.delivery_ready()?;
+        if self.envelope.body.registry_membership.as_ref() == Some(&membership) {
+            return Ok(false);
+        }
+        let mut body = self.envelope.body.clone();
+        body.registry_membership = Some(membership);
+        if self.state == StoreState::Stamped {
+            self.publish(body, false, wall_time_ms())?;
+        } else {
+            self.envelope.body = body;
+        }
+        Ok(true)
+    }
+
     /// ACK/NACK for a superseded generation changes nothing. A failure restores
     /// the active pointer immediately, even if its durable mark must wait for an
     /// anchor retry. ACKs never change memory while an anchor is pending.
@@ -1314,18 +1338,7 @@ impl ConfigStore {
             .generations
             .get_mut(&generation)
             .ok_or_else(|| StoreError::new(StoreErrorCode::GenerationMissing, generation))?;
-        entry.generation.module_states.insert(
-            tuple.module.clone(),
-            if ack {
-                subc_config::GenerationState::Active
-            } else {
-                subc_config::GenerationState::Failed
-            },
-        );
-        if !ack && !entry.generation.never_redeliver.contains(&tuple.module) {
-            entry.generation.never_redeliver.push(tuple.module.clone());
-        }
-        entry.outcome = if ack { "active" } else { "failed" }.into();
+        entry.record_tuple_delivery(tuple, ack, false);
         if self.pending_anchor.is_some() {
             self.deferred_failure = Some(body);
             if !self.warnings.iter().any(|w| w.contains("redeliver")) {
@@ -1382,10 +1395,10 @@ impl ConfigStore {
             .generations
             .get_mut(&generation)
             .ok_or_else(|| StoreError::new(StoreErrorCode::GenerationMissing, generation))?;
-        if entry.generation.never_redeliver.contains(&tuple.module) {
+        if entry.redelivery_suppressed(tuple) {
             return Ok(false);
         }
-        entry.outcome = "resumed".into();
+        entry.resume_tuple_delivery(tuple);
         self.publish(body, false, wall_time_ms())?;
         Ok(true)
     }

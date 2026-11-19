@@ -1,7 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
-use subc_config::{Digest, Generation, RecordedValue};
+use subc_config::{Digest, Generation, GenerationState, RecordedValue};
+use subc_protocol::config::ConfigView;
+
+mod project_files;
+pub use project_files::*;
 
 /// Other than the active, recovery and pending versions, retained per tuple.
 pub const RECENT_HISTORY_LIMIT: usize = 20;
@@ -38,11 +42,40 @@ pub enum CommitKind {
     DeclarationApproval,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+type ByProject<T> = BTreeMap<String, BTreeMap<String, T>>;
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DeliverySnapshot {
     pub daemon: Option<subc_protocol::config::ConfigLayerSnapshot>,
     pub modules: BTreeMap<String, subc_protocol::config::ConfigView>,
     pub declarations: BTreeMap<String, subc_protocol::config::ConfigDeclareRequest>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub project_views: ByProject<ConfigView>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub project_cutoffs: ByProject<ProjectCutoffs>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub project_approval_digests: ByProject<Digest>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProjectCutoffs {
+    pub user: ConfigView,
+    pub workspace: ConfigView,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectDeliveryState {
+    Pending,
+    Resumed,
+    Active,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectOutcome {
+    pub state: ProjectDeliveryState,
+    pub never_redeliver: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -52,12 +85,102 @@ pub struct HistoryEntry {
     pub approval_id: String,
     pub outcome: String,
     pub tuples: BTreeSet<Tuple>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub project_outcomes: ByProject<ProjectOutcome>,
     /// Approved configuration only; program bytes are never rollback artifacts.
     pub configuration: Snapshot,
     /// Approved byte-exact inputs for delivery, never diagnostic plan/history
     /// output. Vault reference strings are allowed; literal secrets are not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery: Option<DeliverySnapshot>,
+}
+
+impl HistoryEntry {
+    pub(super) fn initialize_project_outcomes(&mut self) {
+        for tuple in &self.tuples {
+            if let Some(project) = &tuple.project {
+                self.project_outcomes
+                    .entry(tuple.module.clone())
+                    .or_default()
+                    .insert(
+                        project.clone(),
+                        ProjectOutcome {
+                            state: ProjectDeliveryState::Pending,
+                            never_redeliver: false,
+                        },
+                    );
+            }
+        }
+    }
+
+    pub fn redelivery_suppressed(&self, tuple: &Tuple) -> bool {
+        match &tuple.project {
+            Some(project) => self
+                .project_outcomes
+                .get(&tuple.module)
+                .and_then(|projects| projects.get(project))
+                .is_some_and(|outcome| outcome.never_redeliver),
+            None => self.generation.never_redeliver.contains(&tuple.module),
+        }
+    }
+
+    pub(super) fn record_tuple_delivery(&mut self, tuple: &Tuple, ack: bool, anchoring: bool) {
+        if let Some(project) = &tuple.project {
+            self.set_project_outcome(
+                &tuple.module,
+                project,
+                if ack {
+                    ProjectDeliveryState::Active
+                } else {
+                    ProjectDeliveryState::Failed
+                },
+            );
+            return;
+        }
+        self.generation.module_states.insert(
+            tuple.module.clone(),
+            if ack {
+                GenerationState::Active
+            } else {
+                GenerationState::Failed
+            },
+        );
+        if !ack && !self.redelivery_suppressed(tuple) {
+            self.generation.never_redeliver.push(tuple.module.clone());
+        }
+        // When merging a deferred failure, do not overwrite the user failure
+        // already made visible while this ACK was waiting for its anchor.
+        if !anchoring
+            || !self
+                .generation
+                .module_states
+                .values()
+                .any(|state| *state == GenerationState::Failed)
+        {
+            self.outcome = if ack { "active" } else { "failed" }.into();
+        }
+    }
+
+    pub(super) fn resume_tuple_delivery(&mut self, tuple: &Tuple) {
+        if let Some(project) = &tuple.project {
+            self.set_project_outcome(&tuple.module, project, ProjectDeliveryState::Resumed);
+        } else {
+            self.outcome = "resumed".into();
+        }
+    }
+
+    fn set_project_outcome(&mut self, module: &str, project: &str, state: ProjectDeliveryState) {
+        self.project_outcomes
+            .entry(module.into())
+            .or_default()
+            .insert(
+                project.into(),
+                ProjectOutcome {
+                    state,
+                    never_redeliver: state == ProjectDeliveryState::Failed,
+                },
+            );
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -137,19 +260,19 @@ pub struct StoreBody {
     /// Retained to recompute a proposal against the next approved base.
     pub observed: Option<Snapshot>,
     pub daemon: DaemonPointers,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_membership: Option<RegistryMembership>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub project_write_back: BTreeMap<std::path::PathBuf, ProjectWriteBackIntent>,
 }
 
 /// Some field of this generation only takes effect when the daemon restarts:
 /// a reviewed field with that apply kind, or a daemon setting that only
 /// bootstrap reads and that differs from `base`'s approved daemon bytes.
 fn requires_daemon_restart(base: Option<&HistoryEntry>, entry: &HistoryEntry) -> bool {
-    if entry
-        .generation
-        .changeset
-        .fields
-        .iter()
-        .any(|field| field.apply == subc_config::ApplyKind::DaemonRestart)
-    {
+    if entry.generation.changeset.fields.iter().any(|field| {
+        field.project_id.is_none() && field.apply == subc_config::ApplyKind::DaemonRestart
+    }) {
         return true;
     }
     if entry

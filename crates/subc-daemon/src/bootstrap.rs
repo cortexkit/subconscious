@@ -2588,6 +2588,7 @@ mod tests {
             approval_id: "approval".into(),
             outcome: "approved".into(),
             tuples: Default::default(),
+            project_outcomes: Default::default(),
             configuration: Default::default(),
             delivery: Some(crate::config_store::DeliverySnapshot {
                 daemon: Some(ConfigLayerSnapshot::file(
@@ -2596,8 +2597,7 @@ mod tests {
                     "/approved/subc.jsonc",
                     Some(format!(r#"{{"version":1,"port":{port},"modules":{{}}}}"#).into_bytes()),
                 )),
-                modules: Default::default(),
-                declarations: Default::default(),
+                ..crate::config_store::DeliverySnapshot::default()
             }),
         }
     }

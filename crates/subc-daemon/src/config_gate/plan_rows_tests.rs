@@ -303,6 +303,13 @@ fn assert_snapshot_differences_have_rows(view: &ConfigPlanView, case: &str) {
                         && row["layer"] == "user"
                 })
             }
+            InputKey::ProjectTuple { module, project } => changeset.apply_plan["tuple_targets"]
+                .as_array()
+                .is_some_and(|targets| {
+                    targets
+                        .iter()
+                        .any(|target| target["module"] == *module && target["project"] == *project)
+                }),
         };
         assert!(covered, "{case}: uncovered snapshot input {input:?}");
     }

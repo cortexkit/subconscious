@@ -7,6 +7,8 @@ use subc_protocol::consent::{ConsentDecision, ConsentResponse};
 
 #[path = "origin_tests.rs"]
 mod origin_tests;
+#[path = "project_commit_tests.rs"]
+mod project_commit_tests;
 
 fn captured(value: Value) -> CapturedInput {
     CapturedInput {

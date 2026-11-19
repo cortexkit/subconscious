@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add remote-pairing relaunch fixtures to `SubcFedTestSupport`. The product now requires `SubcFed` to be built with testing enabled and cannot be linked into a normal release build. The public `SubcFed` API is unchanged.
+
 - Add SubcFed remote pairing from the signed account device list. The SDK runs
   both Noise roles, derives the code independently, and offers a pin only after
   a local match and a grant for the authenticated computer key. A lost result

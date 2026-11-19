@@ -19,6 +19,8 @@ let package = Package(
     products: [
         .library(name: "SubcClient", targets: ["SubcClient"]),
         .library(name: "SubcFed", targets: ["SubcFed"]),
+        /// Test targets only. This product uses `@testable import SubcFed`, so
+        /// it cannot compile when `SubcFed` is built without testing enabled.
         .library(name: "SubcFedTestSupport", targets: ["SubcFedTestSupport"]),
         // Shared alfonso-surface models (Ask/Board/Observe/Projects) with the
         // decode-tolerance discipline. Exported as a product so native apps

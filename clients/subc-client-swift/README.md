@@ -519,11 +519,11 @@ no cases were added to existing public enums.
 ### Software signing in tests only
 
 Add the separate `SubcFedTestSupport` library product to your **test target only**.
-Nothing enforces that: it is an ordinary public product, so keep it out of app
-targets by convention and review. `SubcFed` itself has no public software-key path.
-Use ordinary
-`import SubcFed` and `import SubcFedTestSupport`; no `@testable`
-import is required. `SoftwareDeviceApprovalSigner()` creates a software P-256
+The product uses `@testable import SubcFed` internally. A release build that
+depends on it fails to compile because `SubcFed` is not built with testing
+enabled. `SubcFed` itself has no public software-key path. In your tests, use
+ordinary `import SubcFed` and `import SubcFedTestSupport`.
+`SoftwareDeviceApprovalSigner()` creates a software P-256
 key on the simulator or host. `init(rawRepresentation:)` accepts a deterministic
 test key. Its `actionKey` can be passed to
 `DeviceApprovalRequests.registrationChallenge(for:)` to build registration
@@ -634,6 +634,29 @@ session that sends one.
 
 Tests use a fake provider and pin the challenge bytes and exact frame bytes
 from the wire description.
+
+## Remote pairing relaunch tests
+
+In a test target that imports `SubcFedTestSupport`, use
+`RemotePairingTestSupport().seedMatchedReceipt(for:accountID:devicePublicKey:)`
+with a test account and device. This writes to the same Keychain store that a
+fresh `SubcFedClient` reads. Create a `statusDialFactory(for:accountID:devicePublicKey:reply:)`
+for the test target's Noise key pair, then pass the factory as the new client's
+`pairingDialFactory`. The target needs a signed rendezvous row with an eligible
+direct candidate; the factory answers in memory without opening a socket.
+
+Call the public `hasRemotePairingReceipt(rendezvous:)` and
+`remotePairingStatus(rendezvous:)` methods on the new client. `.granted` and
+`.notGranted` consume the receipt. `.statusUnreachable` makes the status call
+throw `.statusUnavailable` and keep the receipt. `.checkStatus` is an outcome of
+the original ceremony, not the status lookup.
+
+On an unsigned SwiftPM host without Keychain access, explicitly use
+`RemotePairingTestSupport(fileStoreDirectory:)` and construct the client with
+the helper's `makeClient`. Use a dedicated owner-only directory and reopen the
+same directory to simulate relaunch. The default Keychain path never falls
+back to files. This product is for test targets only; a normal release build
+that depends on it cannot compile its `@testable import SubcFed`.
 
 ## Verification
 

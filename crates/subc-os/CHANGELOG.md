@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.45
+
+- Add handle-relative no-follow directory and singly linked file opens, distinguishing missing entries, symlinks or reparse points, nonregular files and hardlinks.
+
 ## 0.1.44
 
 - Add retained-directory staging, metadata-preserving durable replacement, and

@@ -23,6 +23,72 @@ pub struct RetainedTempFile<'a> {
     for_publish: bool,
 }
 
+/// Refusals from a single-component read beneath a retained directory handle.
+#[derive(Debug)]
+pub enum OpenRetainedError {
+    Io(io::Error),
+    Symlink,
+    NotRegular,
+    Hardlinked,
+}
+
+impl From<io::Error> for OpenRetainedError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl std::fmt::Display for OpenRetainedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => error.fmt(f),
+            Self::Symlink => f.write_str("entry is a symlink or reparse point"),
+            Self::NotRegular => f.write_str("entry does not have the requested file type"),
+            Self::Hardlinked => f.write_str("entry is not a singly linked file"),
+        }
+    }
+}
+
+impl std::error::Error for OpenRetainedError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+/// Open one child directory without following a symlink or reparse point.
+/// `Ok(None)` means the child was absent when opened.
+pub fn open_directory_nofollow_at(
+    parent: &File,
+    child: &OsStr,
+) -> Result<Option<File>, OpenRetainedError> {
+    open_read_at(parent, child, true)
+}
+
+/// Open one singly linked regular file without following a symlink or reparse
+/// point. `Ok(None)` means the child was absent when opened.
+pub fn open_single_link_file_nofollow_at(
+    parent: &File,
+    child: &OsStr,
+) -> Result<Option<File>, OpenRetainedError> {
+    open_read_at(parent, child, false)
+}
+
+fn open_read_at(
+    parent: &File,
+    child: &OsStr,
+    directory: bool,
+) -> Result<Option<File>, OpenRetainedError> {
+    validate_leaf(child)?;
+    match platform::open_read_at(parent, child, directory) {
+        Ok(file) => Ok(Some(file)),
+        Err(OpenRetainedError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 impl<'a> RetainedTempFile<'a> {
     /// Stage a replacement. On Unix the staging mode is at most `0600`
     /// until the existing target's metadata is applied. On Windows the staging

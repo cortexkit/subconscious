@@ -114,18 +114,18 @@ impl EntorhinalProjectRegistry {
 }
 
 impl ProjectRegistry for EntorhinalProjectRegistry {
-    fn snapshot<'a>(
+    fn snapshot_scoped<'a>(
         &'a self,
         module: &'a str,
-        affected: &'a BTreeSet<String>,
+        scope: &'a RegistryScope,
     ) -> RegistryFuture<'a> {
         Box::pin(async move {
             let reply = self.enumerate().await?;
             let pool = self
                 .root_io
                 .as_ref()
-                .map_err(|_| unavailable("registry capture worker stopped"))?;
-            RegistryRevision::from_enumerate(pool, &reply, module, affected).await
+                .map_err(|_| layer_unavailable("registry capture worker stopped"))?;
+            RegistryRevision::from_scope(pool, &reply, module, scope).await
         })
     }
 

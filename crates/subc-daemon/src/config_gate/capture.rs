@@ -20,7 +20,7 @@ use super::{CapturedInput, GateError, GateSnapshot, InputKey, Result};
 
 // A configuration document is small control-plane input, not an unbounded stream.
 /// Bound untrusted JSONC reads and parsing to 1 MiB per document.
-const CONFIG_FILE_LIMIT: u64 = 1024 * 1024;
+pub(super) const CONFIG_FILE_LIMIT: u64 = 1024 * 1024;
 /// Bound streamed executable hashing so a proposal cannot demand an endless scan.
 const PROGRAM_FILE_LIMIT: u64 = 512 * 1024 * 1024;
 
@@ -58,7 +58,7 @@ pub(super) mod decimal_id {
     }
 }
 
-fn file_object_id(file: &File) -> Result<FileObjectId> {
+pub(super) fn file_object_id(file: &File) -> Result<FileObjectId> {
     let id = subc_os::retained_file_identity(file).map_err(capture_error)?;
     #[cfg(unix)]
     return Ok(FileObjectId::Unix {
@@ -232,11 +232,7 @@ impl CapturedFile {
 
     pub(super) fn parse(&self) -> Result<Value> {
         match &self.bytes {
-            Some(bytes) => {
-                let text = std::str::from_utf8(bytes).map_err(capture_error)?;
-                let normalized = subc_jsonc::jsonc_to_json(text).map_err(capture_error)?;
-                super::strict_json::parse(&normalized)
-            }
+            Some(bytes) => parse_layer(bytes),
             None => Ok(json!({})),
         }
     }
@@ -244,6 +240,12 @@ impl CapturedFile {
     pub(super) fn take_handles(&mut self) -> Vec<File> {
         self._file.take().into_iter().collect()
     }
+}
+
+pub(super) fn parse_layer(bytes: &[u8]) -> Result<Value> {
+    let text = std::str::from_utf8(bytes).map_err(capture_error)?;
+    let normalized = subc_jsonc::jsonc_to_json(text).map_err(capture_error)?;
+    super::strict_json::parse(&normalized)
 }
 
 pub struct CapturedModule {
@@ -865,7 +867,7 @@ pub(super) fn refusal_code(code: subc_config::RefusalCode) -> &'static str {
     }
 }
 
-fn refuse_expansions(value: &Value, module: &str, path: &str) -> Result<()> {
+pub(super) fn refuse_expansions(value: &Value, module: &str, path: &str) -> Result<()> {
     match value {
         Value::String(text) if text.contains("{env:") || text.contains("{file:") => {
             Err(GateError::new("value_invalid", format!("{module}: {path}")))

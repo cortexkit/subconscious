@@ -1,6 +1,6 @@
 #![allow(unsafe_code)]
 
-use super::{invalid, Stage};
+use super::{invalid, OpenRetainedError, Stage};
 use crate::{retained_file_identity, RetainedFileIdentity};
 use rustix::fs::{self, AtFlags, FileType, Gid, Mode, OFlags, Uid};
 use std::{ffi::OsStr, fs::File, io, os::unix::fs::MetadataExt};
@@ -76,6 +76,45 @@ pub(super) fn open_target(parent: &File, name: &OsStr) -> io::Result<File> {
     if !metadata.is_file() || metadata.nlink() != 1 || retained_file_identity(&file)? != identity {
         return Err(io::Error::other("replacement target changed during open"));
     }
+    Ok(file)
+}
+
+pub(super) fn open_read_at(
+    parent: &File,
+    name: &OsStr,
+    directory: bool,
+) -> Result<File, OpenRetainedError> {
+    let check = |ty, single_link| match ty {
+        FileType::Symlink => Err(OpenRetainedError::Symlink),
+        FileType::Directory if directory => Ok(()),
+        FileType::RegularFile if !directory && single_link => Ok(()),
+        FileType::RegularFile if !directory => Err(OpenRetainedError::Hardlinked),
+        _ => Err(OpenRetainedError::NotRegular),
+    };
+    let check_entry = || {
+        let stat = fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
+        check(FileType::from_raw_mode(stat.st_mode), stat.st_nlink == 1)
+    };
+    // Avoid opening special files, then check the actual handle in case the
+    // entry changed. A validated one-component lookup cannot escape parent.
+    check_entry()?;
+    let mut flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    if directory {
+        flags |= OFlags::DIRECTORY;
+    }
+    let file = match fs::openat(parent, name, flags, Mode::empty()) {
+        Ok(fd) => File::from(fd),
+        Err(rustix::io::Errno::LOOP) => return Err(OpenRetainedError::Symlink),
+        Err(error) => {
+            // Linux can report ENOTDIR rather than ELOOP for a directory link.
+            if error == rustix::io::Errno::NOTDIR {
+                check_entry()?;
+            }
+            return Err(io::Error::from(error).into());
+        }
+    };
+    let stat = fs::fstat(&file).map_err(io::Error::from)?;
+    check(FileType::from_raw_mode(stat.st_mode), stat.st_nlink == 1)?;
     Ok(file)
 }
 

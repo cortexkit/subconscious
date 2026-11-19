@@ -1,6 +1,6 @@
 #![allow(unsafe_code)]
 
-use super::{invalid, Stage};
+use super::{invalid, OpenRetainedError, Stage};
 use std::{
     ffi::OsStr,
     fs::File,
@@ -127,23 +127,54 @@ fn open_relative(
 }
 
 fn object_info(file: &File) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
+    match read_object_info(file) {
+        Err(OpenRetainedError::Symlink) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "refusing a reparse point",
+        )),
+        Err(OpenRetainedError::NotRegular) => {
+            Err(invalid("retained handle is not a disk file or directory"))
+        }
+        Err(OpenRetainedError::Io(error)) => Err(error),
+        Err(OpenRetainedError::Hardlinked) => Err(invalid("entry is not a singly linked file")),
+        Ok(info) => Ok(info),
+    }
+}
+
+fn read_object_info(file: &File) -> Result<BY_HANDLE_FILE_INFORMATION, OpenRetainedError> {
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     // SAFETY: file owns the live handle and info is a writable output buffer.
     unsafe {
         if GetFileType(file.as_raw_handle()) != FILE_TYPE_DISK {
-            return Err(invalid("retained handle is not a disk file or directory"));
+            return Err(OpenRetainedError::NotRegular);
         }
         if GetFileInformationByHandle(file.as_raw_handle(), &mut info) == 0 {
-            return Err(io::Error::last_os_error());
+            return Err(io::Error::last_os_error().into());
         }
     }
     if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "refusing a reparse point",
-        ));
+        return Err(OpenRetainedError::Symlink);
     }
     Ok(info)
+}
+
+pub(super) fn open_read_at(
+    parent: &File,
+    name: &OsStr,
+    directory: bool,
+) -> Result<File, OpenRetainedError> {
+    if read_object_info(parent)?.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+        return Err(OpenRetainedError::NotRegular);
+    }
+    let file = open_relative(parent, name, FILE_GENERIC_READ, SHARE_ALL, FILE_OPEN, 0)?;
+    let info = read_object_info(&file)?;
+    if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0) != directory {
+        return Err(OpenRetainedError::NotRegular);
+    }
+    if !directory && info.nNumberOfLinks != 1 {
+        return Err(OpenRetainedError::Hardlinked);
+    }
+    Ok(file)
 }
 
 pub(super) fn ensure_directory(parent: &File) -> io::Result<()> {

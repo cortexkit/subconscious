@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.50.13
+
+- Capture workspace and project layers through retained registry roots on the root I/O pool, with per-project refusals and shared physical file observations.
+- `ProjectRegistry` now implements `snapshot_scoped` (explicit-ID `snapshot` remains available); `recheck` takes the reviewed `RegistryScope` to detect new readers and changed root or layer identities.
+- Add shared validation for project-layer expansion, credential and apply-kind refusals.
+
 ## 0.50.12
 
 - Adopt subc-config 0.1.2 for tagged-union defaults and optional credential references.

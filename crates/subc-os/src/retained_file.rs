@@ -72,7 +72,7 @@ fn open_nofollow_all(
     path: &std::path::Path,
     want_directory: bool,
 ) -> Result<File, OpenRegularError> {
-    use rustix::fs::{open, openat, Mode, OFlags};
+    use rustix::fs::{open, openat, statat, AtFlags, FileType, Mode, OFlags};
     use std::path::Component;
     if !path.is_absolute() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "absolute path required").into());
@@ -100,8 +100,15 @@ fn open_nofollow_all(
                 OFlags::DIRECTORY
             };
         directory = openat(&directory, name, flags, Mode::empty()).map_err(|error| {
-            if error == rustix::io::Errno::LOOP {
+            if error == rustix::io::Errno::LOOP
+                || (error == rustix::io::Errno::NOTDIR
+                    && statat(&directory, name, AtFlags::SYMLINK_NOFOLLOW).is_ok_and(|stat| {
+                        FileType::from_raw_mode(stat.st_mode) == FileType::Symlink
+                    }))
+            {
                 OpenRegularError::Symlink
+            } else if error == rustix::io::Errno::NOTDIR {
+                OpenRegularError::NotRegularFile
             } else {
                 OpenRegularError::Io(error.into())
             }

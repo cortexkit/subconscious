@@ -82,6 +82,11 @@ pub(super) fn expected_fields(
         .record(&candidate.effective)
         .map_err(GateError::invalid)?;
     let mut expected = BTreeMap::new();
+    let apply = if candidate.project_id.is_some() {
+        apply_for_project
+    } else {
+        apply_for
+    };
     for path in paths {
         let old = base.and_then(|b| b.effective.pointer(&path));
         let new = candidate.effective.pointer(&path);
@@ -99,7 +104,7 @@ pub(super) fn expected_fields(
             recorded_leaf(new_recorded.pointer(&path)),
             if new.is_none() {
                 let old_view = base.ok_or_else(|| invalid(module))?;
-                apply_for(
+                apply(
                     base_schema
                         .ok_or_else(|| {
                             GateError::new(
@@ -112,7 +117,7 @@ pub(super) fn expected_fields(
                     &path,
                 )?
             } else {
-                apply_for(schema.normalized(), &candidate.effective, &path)?
+                apply(schema.normalized(), &candidate.effective, &path)?
             },
         );
         field.project_id = candidate.project_id.clone();
@@ -140,7 +145,7 @@ fn recorded_leaf(value: Option<&Value>) -> RecordedValue {
     RecordedValue::new(value)
 }
 
-fn source(sources: &BTreeMap<String, Layer>, path: &str) -> Option<Layer> {
+pub(super) fn source(sources: &BTreeMap<String, Layer>, path: &str) -> Option<Layer> {
     if let Some((_, layer)) = sources
         .iter()
         .find(|(p, _)| p.starts_with(&format!("{path}/")))
@@ -156,7 +161,7 @@ fn source(sources: &BTreeMap<String, Layer>, path: &str) -> Option<Layer> {
     }
 }
 
-fn leaf_paths(value: &Value, path: &str, paths: &mut BTreeSet<String>) {
+pub(super) fn leaf_paths(value: &Value, path: &str, paths: &mut BTreeSet<String>) {
     if let Value::Object(object) = value {
         if !object.is_empty() && !(object.len() == 1 && object.contains_key("vault_ref")) {
             for (key, value) in object {
@@ -175,6 +180,14 @@ fn leaf_paths(value: &Value, path: &str, paths: &mut BTreeSet<String>) {
 }
 
 fn apply_for(schema: &Value, value: &Value, path: &str) -> Result<ApplyKind> {
+    apply_for_path(schema, value, path, false)
+}
+
+pub(super) fn apply_for_project(schema: &Value, value: &Value, path: &str) -> Result<ApplyKind> {
+    apply_for_path(schema, value, path, true)
+}
+
+fn apply_for_path(schema: &Value, value: &Value, path: &str, patterns: bool) -> Result<ApplyKind> {
     let mut schema = schema;
     let mut value = Some(value);
     let mut apply = schema.get("x-ck-apply");
@@ -208,6 +221,20 @@ fn apply_for(schema: &Value, value: &Value, path: &str) -> Result<ApplyKind> {
             .get("properties")
             .and_then(|p| p.get(&key))
             .or_else(|| schema.get("properties").and_then(|p| p.get(&key)))
+            .or_else(|| {
+                if patterns {
+                    branch
+                        .get("patternProperties")
+                        .and_then(Value::as_object)?
+                        .iter()
+                        .find(|(pattern, _)| {
+                            regex::Regex::new(pattern).is_ok_and(|regex| regex.is_match(&key))
+                        })
+                        .map(|(_, schema)| schema)
+                } else {
+                    None
+                }
+            })
             .or_else(|| schema.get("additionalProperties").filter(|v| v.is_object()))
             .or_else(|| schema.get("items"))
             .ok_or_else(|| {

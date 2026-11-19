@@ -38,6 +38,64 @@ fn stage(parent: &File, publish: bool) -> RetainedTempFile<'_> {
 }
 
 #[test]
+fn retained_read_distinguishes_absent_directory_hardlink_and_file() {
+    use std::io::Read;
+    let scratch = ScratchDir::new("retained-read");
+    let parent = open_parent(&scratch);
+    assert!(open_directory_nofollow_at(&parent, leaf("config"))
+        .unwrap()
+        .is_none());
+    fs::create_dir(scratch.join("config")).unwrap();
+    assert!(matches!(
+        open_single_link_file_nofollow_at(&parent, leaf("config")),
+        Err(OpenRetainedError::NotRegular)
+    ));
+    let config = open_directory_nofollow_at(&parent, leaf("config"))
+        .unwrap()
+        .unwrap();
+    assert!(open_single_link_file_nofollow_at(&config, leaf("layer"))
+        .unwrap()
+        .is_none());
+    fs::write(scratch.join("config/layer"), b"retained contents").unwrap();
+    let mut opened = open_single_link_file_nofollow_at(&config, leaf("layer"))
+        .unwrap()
+        .unwrap();
+    let mut bytes = Vec::new();
+    opened.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, b"retained contents");
+    fs::hard_link(scratch.join("config/layer"), scratch.join("other")).unwrap();
+    assert!(matches!(
+        open_single_link_file_nofollow_at(&config, leaf("layer")),
+        Err(OpenRetainedError::Hardlinked)
+    ));
+    assert!(open_single_link_file_nofollow_at(&config, leaf("../other")).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn retained_read_stays_anchored_after_rename_and_rejects_link() {
+    use std::{io::Read, os::unix::fs::symlink};
+    let scratch = ScratchDir::new("retained-read-rename");
+    fs::create_dir(scratch.join("config")).unwrap();
+    fs::write(scratch.join("config/layer"), b"old").unwrap();
+    let config = open_parent(&scratch.join("config"));
+    fs::rename(scratch.join("config"), scratch.join("original")).unwrap();
+    fs::create_dir(scratch.join("config")).unwrap();
+    fs::write(scratch.join("config/layer"), b"new").unwrap();
+    let mut file = open_single_link_file_nofollow_at(&config, leaf("layer"))
+        .unwrap()
+        .unwrap();
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, b"old");
+    symlink(scratch.join("config"), scratch.join("original/link")).unwrap();
+    assert!(matches!(
+        open_directory_nofollow_at(&config, leaf("link")),
+        Err(OpenRetainedError::Symlink)
+    ));
+}
+
+#[test]
 fn no_replace_refuses_existing_file_and_directory() {
     let scratch = ScratchDir::new("retained-no-replace");
     let parent = open_parent(&scratch);
@@ -325,7 +383,7 @@ fn publishes_into_a_new_retained_directory_on_windows() {
 
 #[cfg(windows)]
 #[test]
-fn refuses_reparse_parent_and_reparse_leaf() {
+fn retained_read_and_replace_refuse_reparse_parent_and_leaf() {
     use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt, process::Command};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
@@ -355,6 +413,14 @@ fn refuses_reparse_parent_and_reparse_leaf() {
     );
 
     let parent = open_parent(&scratch);
+    assert!(matches!(
+        open_directory_nofollow_at(&parent, leaf("junction")),
+        Err(OpenRetainedError::Symlink)
+    ));
+    assert!(matches!(
+        open_single_link_file_nofollow_at(&parent, leaf("junction")),
+        Err(OpenRetainedError::Symlink)
+    ));
     fs::write(scratch.join("expected"), b"original").unwrap();
     let expected = File::open(scratch.join("expected")).unwrap();
     let error = stage(&parent, false)

@@ -152,14 +152,16 @@ async fn registry_offline_refuses_snapshot_but_active_user_tuple_delivery_contin
 
 #[tokio::test]
 async fn root_io_status_and_user_work_remain_responsive_during_a_stuck_job() {
-    use crate::config_gate::project_registry::{ProjectRegistry, RegistryFuture, RootIoPool};
+    use crate::config_gate::project_registry::{
+        ProjectRegistry, RegistryFuture, RegistryScope, RootIoPool,
+    };
     use std::sync::{mpsc, Arc};
     use subc_os::local_peer::{ObservedPeer, PeerObservation, PeerUser};
     use subc_protocol::{Frame, FrameType};
 
     struct RootReader(RootIoPool);
     impl ProjectRegistry for RootReader {
-        fn snapshot<'a>(&'a self, _: &'a str, _: &'a BTreeSet<String>) -> RegistryFuture<'a> {
+        fn snapshot_scoped<'a>(&'a self, _: &'a str, _: &'a RegistryScope) -> RegistryFuture<'a> {
             panic!("status, user delivery and a user plan must not enumerate project roots")
         }
 

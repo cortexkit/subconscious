@@ -36,7 +36,10 @@ recursive, unresolved references, conditional/ambiguous policy compositions and 
 refused. Structural objects require `unevaluatedProperties: false`. Dynamic maps use a constrained
 `patternProperties` value schema, not arbitrary additional JSON. Every primitive, replacement
 array, item and map value needs a description and effective `x-ck-apply` and `x-ck-layers`.
-Except for credential references, these fields need a default or `x-ck-required: true`.
+Except for credential references, these fields need a default or an explicit `x-ck-required`.
+`true` requires an effective value; `false` with no default leaves the field absent until a layer
+sets it. With a default, `false` still uses the default. An absent overlay inherits the lower value;
+neither `null` nor an empty array means absent.
 Structural policies propagate; children may narrow layers, not widen them.
 Apply transitions must agree or increase disruption (live to a deferred transition, or a
 transition to daemon restart). Process-wide restart fields are user-only.
@@ -50,7 +53,10 @@ layer changes, even when the changeset does not edit that project's file.
 
 Layer overlays inherit absent keys and source attribution. Objects/maps deep-merge; `{}` does not
 clear them. Arrays replace in order, including `[]`, with complete items and no id-based merge.
-Declared item ids must be unique. Null, unknown keys, and type changes are refused. Discriminated
+Declared item ids must be unique. Outside opaque values, unknown keys and `null` are refused.
+A managed field normally has one type, but a nonempty `type` list can combine `string`, `number`,
+`integer`, and `boolean`. A higher layer replaces the value and can use a different listed type;
+`object`, `array`, and `null` are not permitted in a managed type list. Discriminated
 `oneOf` branches must have a unique required const discriminator. The first layer to set a union
 may select a different variant and replace the schema default wholesale, or deep-merge into the
 default's variant. A lower layer's edits to any field in a variant fix it for higher layers, even
@@ -58,10 +64,28 @@ if the lower layer does not set the discriminator explicitly.
 Full effective schema and cross-field checks remain mandatory in the module's review reply; the
 shared helper's type/enum/range/required checks do not replace a full draft 2020-12 validator.
 
+Declare `"x-ck-kind": "json"` to treat a value as one opaque field. The settings key is still
+managed, but the module owns the value's inner keys. The user layer replaces the whole value;
+workspace and project writes give `layer_forbidden` at the field. Review diffs likewise report
+one field with the whole old and new values. Defaults are allowed and validated. The field itself
+cannot be `null`, but nested JSON may contain nulls. Literal `{env:` and `{file:` tokens are still
+refused; singleton objects with `env` or `file` keys are ordinary data inside an opaque field.
+
+An opaque field can omit `type` and other JSON assertions to accept any non-null JSON, or use
+constraints such as `"type": ["boolean", "object"]` or a `oneOf` without a discriminator.
+Supported assertions include `type`, `enum`, `const`, `oneOf`, `anyOf`, `allOf`, `not`, string
+lengths and regex patterns, numeric ranges, object properties, patterns, names, sizes and required
+keys, and array items, prefix items, lengths and uniqueness. Boolean subschemas and acyclic local
+JSON Pointer `$ref`s are supported. Unsupported keywords refuse the schema at the keyword's path.
+Do not put `x-ck-kind`, `x-ck-bound`, `x-ck-options`, or `x-ck-action` inside the opaque schema.
+
 `raise_only`/`lower_only` compare finite numbers against the effective lower value; `subset_only`
 compares sets of canonical scalars while preserving array order. Boolean and enum monotonic bounds
 require `x-ck-ordering`: an enum's values from lowest to highest, or exactly `[false,true]` for a
-boolean. No lexical order is inferred. Bounds refuse instead of clamping. Default 5, user 10,
+boolean. Scalar type lists need an explicit enum ordering unless all types are numeric. A bound on
+an opaque field requires a declared or inherited `x-ck-layers: ["user"]`; unbounded opaque fields
+normalize any layer list that includes `user` to `["user"]`. Bounds compare only when a lower value
+exists for an optional field. No lexical order is inferred. Bounds refuse instead of clamping. Default 5, user 10,
 project 15 is valid under raise_only; changing user to 20 refuses project 15 with `bound_violated`
 and the project id, until the project override is removed or corrected.
 

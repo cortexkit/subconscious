@@ -58,26 +58,26 @@ pub(super) fn expected_fields(
     base_schema: Option<&Schema>,
     candidate: &ConfigView,
 ) -> Result<BTreeMap<String, FieldChange>> {
-    let mut paths = BTreeSet::new();
-    leaf_paths(&candidate.effective, "", &mut paths);
-    if let Some(base) = base {
-        leaf_paths(&base.effective, "", &mut paths);
-    }
-    let old_recorded = if let Some(base) = base {
-        Some(
-            base_schema
-                .ok_or_else(|| {
-                    GateError::new(
-                        "approved_schema_unavailable",
-                        format!("{module}: approved old schema is missing or damaged"),
-                    )
-                })?
-                .record(&base.effective)
-                .map_err(GateError::invalid)?,
+    let new_leaves = leaves(schema, &candidate.effective);
+    let (old_leaves, old_recorded) = if let Some(base) = base {
+        let old_schema = base_schema.ok_or_else(|| {
+            GateError::new(
+                "approved_schema_unavailable",
+                format!("{module}: approved old schema is missing or damaged"),
+            )
+        })?;
+        (
+            leaves(old_schema, &base.effective),
+            Some(
+                old_schema
+                    .record(&base.effective)
+                    .map_err(GateError::invalid)?,
+            ),
         )
     } else {
-        None
+        (BTreeMap::new(), None)
     };
+    let paths: BTreeSet<_> = old_leaves.keys().chain(new_leaves.keys()).collect();
     let new_recorded = schema
         .record(&candidate.effective)
         .map_err(GateError::invalid)?;
@@ -88,42 +88,66 @@ pub(super) fn expected_fields(
         apply_for
     };
     for path in paths {
-        let old = base.and_then(|b| b.effective.pointer(&path));
-        let new = candidate.effective.pointer(&path);
+        let old_opaque = opaque_at(&old_leaves, path);
+        let new_opaque = opaque_at(&new_leaves, path);
+        let old_hidden = hidden_by_opacity(&old_leaves, path, new_opaque.is_some());
+        let new_hidden = hidden_by_opacity(&new_leaves, path, old_opaque.is_some());
+        let old = base
+            .filter(|_| !old_hidden)
+            .and_then(|b| b.effective.pointer(path));
+        let new = (!new_hidden)
+            .then(|| candidate.effective.pointer(path))
+            .flatten();
         let old_source = base
-            .and_then(|b| source(&b.sources, &path))
+            .filter(|_| !old_hidden)
+            .and_then(|b| source(&b.sources, path))
             .unwrap_or(Layer::Default);
-        let new_source = source(&candidate.sources, &path).unwrap_or(Layer::Default);
+        let new_source = (!new_hidden)
+            .then(|| source(&candidate.sources, path))
+            .flatten()
+            .unwrap_or(Layer::Default);
         if old == new && old_source == new_source {
             continue;
         }
         let mut field = FieldChange::new(
             module,
-            &path,
-            recorded_leaf(old_recorded.as_ref().and_then(|v| v.pointer(&path))),
-            recorded_leaf(new_recorded.pointer(&path)),
+            path,
+            recorded_leaf(
+                old.and_then(|_| old_recorded.as_ref()?.pointer(path)),
+                old_opaque.is_some(),
+            ),
+            recorded_leaf(
+                new.and_then(|_| new_recorded.pointer(path)),
+                new_opaque.is_some(),
+            ),
             if new.is_none() {
                 let old_view = base.ok_or_else(|| invalid(module))?;
-                apply(
-                    base_schema
-                        .ok_or_else(|| {
-                            GateError::new(
-                                "approved_schema_unavailable",
-                                format!("{module}: removed field has no approved old schema"),
-                            )
-                        })?
-                        .normalized(),
-                    &old_view.effective,
-                    &path,
-                )?
+                if let Some(schema) = old_opaque {
+                    apply_kind(schema.get("x-ck-apply"))?
+                } else {
+                    apply(
+                        base_schema
+                            .ok_or_else(|| {
+                                GateError::new(
+                                    "approved_schema_unavailable",
+                                    format!("{module}: removed field has no approved old schema"),
+                                )
+                            })?
+                            .normalized(),
+                        &old_view.effective,
+                        path,
+                    )?
+                }
+            } else if let Some(schema) = new_opaque {
+                apply_kind(schema.get("x-ck-apply"))?
             } else {
-                apply(schema.normalized(), &candidate.effective, &path)?
+                apply(schema.normalized(), &candidate.effective, path)?
             },
         );
         field.project_id = candidate.project_id.clone();
         field.old_source = old_source;
         field.new_source = new_source;
-        expected.insert(path, field);
+        expected.insert(path.clone(), field);
     }
     Ok(expected)
 }
@@ -135,9 +159,9 @@ fn invalid(module: &str) -> GateError {
     )
 }
 
-fn recorded_leaf(value: Option<&Value>) -> RecordedValue {
+fn recorded_leaf(value: Option<&Value>, opaque: bool) -> RecordedValue {
     let value = value.cloned().unwrap_or(Value::Null);
-    if value.get("kind").and_then(Value::as_str) == Some("redacted") {
+    if !opaque && value.get("kind").and_then(Value::as_str) == Some("redacted") {
         if let Ok(record) = serde_json::from_value(value.clone()) {
             return record;
         }
@@ -161,21 +185,91 @@ pub(super) fn source(sources: &BTreeMap<String, Layer>, path: &str) -> Option<La
     }
 }
 
-pub(super) fn leaf_paths(value: &Value, path: &str, paths: &mut BTreeSet<String>) {
+#[derive(Clone, Copy)]
+enum Leaf<'a> {
+    Regular,
+    Section,
+    Opaque(&'a Value),
+}
+
+fn opaque_at<'a>(leaves: &BTreeMap<String, Leaf<'a>>, path: &str) -> Option<&'a Value> {
+    match leaves.get(path) {
+        Some(Leaf::Opaque(schema)) => Some(schema),
+        _ => None,
+    }
+}
+
+fn hidden_by_opacity(
+    leaves: &BTreeMap<String, Leaf<'_>>,
+    mut path: &str,
+    other_opaque: bool,
+) -> bool {
+    if other_opaque && matches!(leaves.get(path), None | Some(Leaf::Section)) {
+        return true;
+    }
+    // An old or new JSON object may contain the same pointer as a managed
+    // field on the other side of a schema migration. It is not a field here.
+    while let Some((parent, _)) = path.rsplit_once('/') {
+        if opaque_at(leaves, parent).is_some() {
+            return true;
+        }
+        path = parent;
+    }
+    false
+}
+
+pub(super) fn leaf_paths<'a>(
+    schema: &'a Schema,
+    value: &Value,
+) -> impl Iterator<Item = String> + 'a {
+    leaves(schema, value).into_keys()
+}
+
+fn leaves<'a>(schema: &'a Schema, value: &Value) -> BTreeMap<String, Leaf<'a>> {
+    let mut leaves = BTreeMap::new();
+    visit_leaves(schema.normalized(), value, "", &mut leaves);
+    leaves
+}
+
+fn visit_leaves<'a>(
+    schema: &'a Value,
+    value: &Value,
+    path: &str,
+    leaves: &mut BTreeMap<String, Leaf<'a>>,
+) {
+    if schema.get("x-ck-kind").and_then(Value::as_str) == Some("json") {
+        leaves.insert(path.into(), Leaf::Opaque(schema));
+        return;
+    }
     if let Value::Object(object) = value {
-        if !object.is_empty() && !(object.len() == 1 && object.contains_key("vault_ref")) {
+        let branch = select_branch(schema, Some(value));
+        let vault = object.len() == 1 && object.contains_key("vault_ref");
+        if !object.is_empty()
+            && (!vault
+                || field_schema(schema, branch, "vault_ref", true).is_some_and(|child| {
+                    child.get("x-ck-kind").and_then(Value::as_str) == Some("json")
+                }))
+        {
             for (key, value) in object {
-                leaf_paths(
+                visit_leaves(
+                    field_schema(schema, branch, key, true).unwrap_or(&Value::Null),
                     value,
                     &format!("{path}/{}", key.replace('~', "~0").replace('/', "~1")),
-                    paths,
+                    leaves,
                 );
             }
             return;
         }
     }
     if !path.is_empty() {
-        paths.insert(path.into());
+        let leaf = if value.is_object()
+            && schema.get("x-ck-kind").and_then(Value::as_str) != Some("credential_ref")
+        {
+            Leaf::Section
+        } else {
+            Leaf::Regular
+        };
+        leaves.insert(path.into(), leaf);
     }
 }
 
@@ -193,56 +287,71 @@ fn apply_for_path(schema: &Value, value: &Value, path: &str, patterns: bool) -> 
     let mut apply = schema.get("x-ck-apply");
     for part in path.split('/').skip(1) {
         let key = part.replace("~1", "/").replace("~0", "~");
-        let branch = schema
-            .get("oneOf")
-            .and_then(Value::as_array)
-            .and_then(|branches| {
-                branches.iter().find(|branch| {
-                    let Some(properties) = branch.get("properties").and_then(Value::as_object)
-                    else {
-                        return false;
-                    };
-                    properties.iter().any(|(key, property)| {
-                        property
-                            .get("const")
-                            .is_some_and(|tag| value.and_then(|value| value.get(key)) == Some(tag))
-                    }) && properties.iter().all(|(key, property)| {
-                        property.get("const").is_none_or(|tag| {
-                            value
-                                .and_then(|value| value.get(key))
-                                .is_none_or(|value| value == tag)
-                        })
-                    })
-                })
-            })
-            .unwrap_or(schema);
+        let branch = select_branch(schema, value);
         apply = branch.get("x-ck-apply").or(apply);
-        schema = branch
-            .get("properties")
-            .and_then(|p| p.get(&key))
-            .or_else(|| schema.get("properties").and_then(|p| p.get(&key)))
-            .or_else(|| {
-                if patterns {
-                    branch
-                        .get("patternProperties")
-                        .and_then(Value::as_object)?
-                        .iter()
-                        .find(|(pattern, _)| {
-                            regex::Regex::new(pattern).is_ok_and(|regex| regex.is_match(&key))
-                        })
-                        .map(|(_, schema)| schema)
-                } else {
-                    None
-                }
-            })
-            .or_else(|| schema.get("additionalProperties").filter(|v| v.is_object()))
-            .or_else(|| schema.get("items"))
-            .ok_or_else(|| {
-                GateError::new("module_review_invalid", "field has no declared schema")
-            })?;
+        schema = field_schema(schema, branch, &key, patterns).ok_or_else(|| {
+            GateError::new("module_review_invalid", "field has no declared schema")
+        })?;
         value = value.and_then(|value| value.get(&key));
         apply = schema.get("x-ck-apply").or(apply);
     }
+    apply_kind(apply)
+}
+
+fn select_branch<'a>(schema: &'a Value, value: Option<&Value>) -> &'a Value {
+    schema
+        .get("oneOf")
+        .and_then(Value::as_array)
+        .and_then(|branches| {
+            branches.iter().find(|branch| {
+                let Some(properties) = branch.get("properties").and_then(Value::as_object) else {
+                    return false;
+                };
+                properties.iter().any(|(key, property)| {
+                    property
+                        .get("const")
+                        .is_some_and(|tag| value.and_then(|value| value.get(key)) == Some(tag))
+                }) && properties.iter().all(|(key, property)| {
+                    property.get("const").is_none_or(|tag| {
+                        value
+                            .and_then(|value| value.get(key))
+                            .is_none_or(|value| value == tag)
+                    })
+                })
+            })
+        })
+        .unwrap_or(schema)
+}
+
+fn field_schema<'a>(
+    schema: &'a Value,
+    branch: &'a Value,
+    key: &str,
+    patterns: bool,
+) -> Option<&'a Value> {
+    branch
+        .get("properties")
+        .and_then(|p| p.get(key))
+        .or_else(|| schema.get("properties").and_then(|p| p.get(key)))
+        .or_else(|| {
+            if patterns {
+                branch
+                    .get("patternProperties")
+                    .and_then(Value::as_object)?
+                    .iter()
+                    .find(|(pattern, _)| {
+                        regex::Regex::new(pattern).is_ok_and(|regex| regex.is_match(key))
+                    })
+                    .map(|(_, schema)| schema)
+            } else {
+                None
+            }
+        })
+        .or_else(|| schema.get("additionalProperties").filter(|v| v.is_object()))
+        .or_else(|| schema.get("items"))
+}
+
+fn apply_kind(apply: Option<&Value>) -> Result<ApplyKind> {
     serde_json::from_value(
         apply
             .cloned()
@@ -256,6 +365,114 @@ mod tests {
     use super::*;
     use serde_json::json;
     use subc_protocol::config::ConfigStatus;
+
+    fn settings_schema(opaque: bool) -> Schema {
+        let setting = if opaque {
+            json!({"x-ck-kind":"json","x-ck-layers":["user"],"x-ck-apply":"module_restart","description":"A settings object","default":{}})
+        } else {
+            json!({"type":"object","unevaluatedProperties":false,"properties":{
+                "a":{"type":"number","description":"A number","default":0,"x-ck-apply":"live","x-ck-layers":["user"]}
+            }})
+        };
+        Schema::new(json!({"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","unevaluatedProperties":false,"properties":{"setting":setting}})).unwrap()
+    }
+
+    fn settings_view(schema: &Schema, value: Value) -> ConfigView {
+        let tuple = schema
+            .review_tuple(
+                &[subc_config::LayerValue::new(
+                    Layer::User,
+                    json!({"setting":value}),
+                )],
+                &subc_config::ValidationContext::new("worker", None),
+            )
+            .unwrap();
+        ConfigView::new(
+            1,
+            tuple.effective,
+            tuple.sources,
+            vec![],
+            ConfigStatus::Active,
+        )
+    }
+
+    #[test]
+    fn config_review_reports_opaque_json_as_one_whole_field() {
+        let schema = settings_schema(true);
+        let old = json!(RecordedValue::redacted(&json!("ordinary data")).unwrap());
+        let new = json!({"a":2,"new":null});
+        let before = settings_view(&schema, old.clone());
+        let after = settings_view(&schema, new.clone());
+        let mut field = FieldChange::new(
+            "worker",
+            "/setting",
+            RecordedValue::new(old),
+            RecordedValue::new(new),
+            ApplyKind::ModuleRestart,
+        );
+        field.old_source = Layer::User;
+        field.new_source = Layer::User;
+        assert_eq!(
+            checked_fields(
+                "worker",
+                &schema,
+                Some(&before),
+                Some(&schema),
+                &after,
+                ConfigReviewReply::new(vec![field.clone()], vec![])
+            )
+            .unwrap(),
+            vec![field]
+        );
+    }
+
+    #[test]
+    fn config_review_migration_from_opaque_json_removes_whole_old_value() {
+        let old_schema = settings_schema(true);
+        let new_schema = settings_schema(false);
+        let value = json!({"a":1});
+        let before = settings_view(&old_schema, value.clone());
+        let after = settings_view(&new_schema, value.clone());
+        let fields = expected_fields(
+            "worker",
+            &new_schema,
+            Some(&before),
+            Some(&old_schema),
+            &after,
+        )
+        .unwrap();
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields["/setting"].old, RecordedValue::new(value));
+        assert_eq!(fields["/setting"].new, RecordedValue::new(Value::Null));
+        assert_eq!(fields["/setting"].apply, ApplyKind::ModuleRestart);
+        assert_eq!(fields["/setting/a"].old, RecordedValue::new(Value::Null));
+        assert_eq!(fields["/setting/a"].new, RecordedValue::new(json!(1)));
+        assert_eq!(fields["/setting/a"].apply, ApplyKind::Live);
+    }
+
+    #[test]
+    fn config_review_migration_to_opaque_json_adds_whole_new_value() {
+        let old_schema = settings_schema(false);
+        let new_schema = settings_schema(true);
+        let value = json!({"a":1});
+        let before = settings_view(&old_schema, value.clone());
+        let after = settings_view(&new_schema, value.clone());
+        let fields = expected_fields(
+            "worker",
+            &new_schema,
+            Some(&before),
+            Some(&old_schema),
+            &after,
+        )
+        .unwrap();
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields["/setting"].old, RecordedValue::new(Value::Null));
+        assert_eq!(fields["/setting"].new, RecordedValue::new(value));
+        assert_eq!(fields["/setting"].apply, ApplyKind::ModuleRestart);
+        assert_eq!(fields["/setting/a"].old, RecordedValue::new(json!(1)));
+        assert_eq!(fields["/setting/a"].new, RecordedValue::new(Value::Null));
+        assert_eq!(fields["/setting/a"].apply, ApplyKind::Live);
+    }
 
     #[test]
     fn config_review_checks_immutable_old_values_sources_and_apply() {

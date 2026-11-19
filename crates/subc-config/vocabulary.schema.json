@@ -8,7 +8,13 @@
     "x-ck-apply": { "enum": ["live", "module_restart", "daemon_restart", "next_supervision", "route_rebind"] },
     "x-ck-layers": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "enum": ["user", "workspace", "project"] } },
     "x-ck-bound": { "enum": ["raise_only", "lower_only", "subset_only"] },
-    "x-ck-kind": { "enum": ["credential_ref", "model_ref", "project_ref", "path", "duration", "bytes", "percent"] },
+    "x-ck-kind": { "enum": ["credential_ref", "model_ref", "project_ref", "path", "duration", "bytes", "percent", "json"] },
+    "type": {
+      "oneOf": [
+        { "enum": ["string", "number", "integer", "boolean", "object", "array"] },
+        { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "enum": ["string", "number", "integer", "boolean", "object", "array"] } }
+      ]
+    },
     "x-ck-ordering": { "type": "array", "minItems": 2, "uniqueItems": true, "items": { "type": ["string", "boolean", "number"] } },
     "x-ck-section": { "type": "string" },
     "x-ck-order": { "type": "number" },
@@ -40,6 +46,14 @@
       "additionalProperties": false
     },
     "x-ck-action": { "type": "object" }
+  },
+  "if": {
+    "required": ["type"],
+    "properties": { "type": { "type": "array" } },
+    "not": { "required": ["x-ck-kind"], "properties": { "x-ck-kind": { "const": "json" } } }
+  },
+  "then": {
+    "properties": { "type": { "items": { "enum": ["string", "number", "integer", "boolean"] } } }
   },
   "$defs": {
     "source": {

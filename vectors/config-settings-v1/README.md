@@ -15,6 +15,8 @@ invented. The credential reference is a reference, never a secret.
 | `schema.reply.json` | Normalized admitted schema and digest |
 | `schema-setup.request.json` | Read the invented setup module's schema |
 | `schema-setup.reply.json` | Two sections carrying unchanged `x-ck-setup` annotations |
+| `schema-flexible.request.json` | Read the invented module whose fields keep existing shapes |
+| `schema-flexible.reply.json` | An opaque `x-ck-kind: json` field (true or an object), a scalar type list, and an optional field with no default |
 | `show.request.json` | Read the complete approved settings |
 | `show.reply.json` | Effective settings, sources and default/user documents |
 | `show.file-error.reply.json` | Approved settings retained alongside an invalid user-file diagnostic |

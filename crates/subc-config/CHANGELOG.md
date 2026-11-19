@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.3
+
+- Allow scalar type lists at managed fields and user-only opaque JSON fields.
+  Opaque values replace atomically and use their declared JSON constraints.
+- Allow leaves marked `x-ck-required: false` to omit a default and remain absent until set.
+
 ## 0.1.2
 
 - Let the first settings layer choose a tagged-union variant even when the

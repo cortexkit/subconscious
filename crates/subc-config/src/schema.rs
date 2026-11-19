@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
+mod opaque;
+
 pub const VOCABULARY_META_SCHEMA: &str = include_str!("../vocabulary.schema.json");
 
 /// Approved schema, with local references expanded and use-site policies inherited.
@@ -73,7 +75,9 @@ impl Schema {
             return Err(schema_error(""));
         }
         let normalized = normalize(&schema, &schema, None, &mut Vec::new(), "")?;
-        if normalized.get("type").and_then(Value::as_str) != Some("object") {
+        if is_opaque(&normalized)
+            || normalized.get("type").and_then(Value::as_str) != Some("object")
+        {
             return Err(schema_error(""));
         }
         let result = Self { normalized };
@@ -112,7 +116,13 @@ impl Schema {
     ) -> Result<ReviewedTuple, Refusal> {
         let mut effective = self.defaults();
         let mut sources = BTreeMap::new();
-        mark_sources(&effective, "", Layer::Default, &mut sources);
+        mark_sources(
+            &self.normalized,
+            &effective,
+            "",
+            Layer::Default,
+            &mut sources,
+        );
         let mut previous = Layer::Default;
         let mut user_credentials = BTreeSet::new();
         for proposal in layers {
@@ -191,6 +201,9 @@ fn pointer(path: &str, key: &str) -> String {
 fn credential(s: &Value) -> bool {
     s.get("x-ck-kind").and_then(Value::as_str) == Some("credential_ref")
 }
+fn is_opaque(s: &Value) -> bool {
+    s.get("x-ck-kind").and_then(Value::as_str) == Some("json")
+}
 
 /// References contain opaque ids, not secret material, paths or env expansions.
 pub fn is_vault_reference(value: &Value) -> bool {
@@ -215,7 +228,8 @@ fn normalize(
         .as_object()
         .cloned()
         .ok_or_else(|| schema_error(path))?;
-    if let Some(reference) = node.remove("$ref") {
+    let opaque = is_opaque(input);
+    if let Some(reference) = (!opaque).then(|| node.remove("$ref")).flatten() {
         let reference = reference.as_str().ok_or_else(|| schema_error(path))?;
         if !reference.starts_with("#/") || stack.iter().any(|s| s == reference) {
             return Err(schema_error(path));
@@ -259,9 +273,10 @@ fn normalize(
         stack.pop();
         return result;
     }
-    if ["allOf", "anyOf", "if", "then", "else", "$dynamicRef"]
-        .iter()
-        .any(|k| node.contains_key(*k))
+    if !opaque
+        && ["allOf", "anyOf", "if", "then", "else", "$dynamicRef"]
+            .iter()
+            .any(|k| node.contains_key(*k))
     {
         // Policy intersections and conditional policies cannot be skipped safely.
         return Err(schema_error(path));
@@ -309,6 +324,16 @@ fn normalize(
             return Err(schema_error(path));
         }
     }
+    if opaque {
+        let user_only = serde_json::json!(["user"]);
+        let layers = node.get("x-ck-layers").and_then(Value::as_array);
+        if layers.is_none_or(|allowed| !allowed.iter().any(|layer| layer == "user"))
+            || (node.contains_key("x-ck-bound") && node.get("x-ck-layers") != Some(&user_only))
+        {
+            return Err(schema_error(path));
+        }
+        node.insert("x-ck-layers".into(), user_only);
+    }
     if let Some(apply) = node.get("x-ck-apply") {
         serde_json::from_value::<ApplyKind>(apply.clone()).map_err(|_| schema_error(path))?;
         if ["module_restart", "daemon_restart"].contains(&apply.as_str().unwrap_or_default())
@@ -317,7 +342,22 @@ fn normalize(
             return Err(schema_error(path));
         }
     }
-    if let Some(branches) = node.get_mut("oneOf") {
+    let types = node.get("type").and_then(Value::as_array);
+    if let Some(types) = types.filter(|_| !opaque) {
+        if credential(&policy)
+            || node.contains_key("oneOf")
+            || types.is_empty()
+            || types.iter().enumerate().any(|(i, t)| {
+                !matches!(
+                    t.as_str(),
+                    Some("string" | "number" | "integer" | "boolean")
+                ) || types[..i].contains(t)
+            })
+        {
+            return Err(schema_error(path));
+        }
+    }
+    if let Some(branches) = node.get_mut("oneOf").filter(|_| !opaque) {
         let branches = branches.as_array_mut().ok_or_else(|| schema_error(path))?;
         if branches.len() < 2 {
             return Err(schema_error(path));
@@ -325,19 +365,28 @@ fn normalize(
         for branch in branches.iter_mut() {
             *branch = normalize(root, branch, Some(&policy), stack, path)?;
         }
-        discriminator(branches).ok_or_else(|| schema_error(path))?;
+        if branches.iter().any(is_opaque) || discriminator(branches).is_none() {
+            return Err(schema_error(path));
+        }
         return Ok(Value::Object(node));
     }
     let kind = node
         .get("type")
         .and_then(Value::as_str)
-        .ok_or_else(|| schema_error(path))?
+        .unwrap_or_default()
         .to_owned();
-    if !["object", "array", "string", "number", "integer", "boolean"].contains(&kind.as_str()) {
+    let is_credential = credential(&policy);
+    let types = node.get("type").and_then(Value::as_array);
+    if !opaque
+        && types.is_none()
+        && !matches!(
+            kind.as_str(),
+            "object" | "array" | "string" | "number" | "integer" | "boolean"
+        )
+    {
         return Err(schema_error(path));
     }
-    let is_credential = credential(&policy);
-    let structural = kind == "object" && !is_credential;
+    let structural = kind == "object" && !is_credential && !opaque;
     if !structural
         && (node
             .get("description")
@@ -345,7 +394,7 @@ fn normalize(
             .is_none_or(str::is_empty)
             || (!is_credential
                 && !node.contains_key("default")
-                && node.get("x-ck-required") != Some(&Value::Bool(true)))
+                && !node.contains_key("x-ck-required"))
             || !node.contains_key("x-ck-apply")
             || !node.contains_key("x-ck-layers"))
     {
@@ -356,7 +405,13 @@ fn normalize(
         if bound == Bound::SubsetOnly && kind != "array" {
             return Err(schema_error(path));
         }
-        if bound != Bound::SubsetOnly && !["number", "integer"].contains(&kind.as_str()) {
+        let numeric = |kind: &str| matches!(kind, "number" | "integer");
+        if bound != Bound::SubsetOnly
+            && !numeric(&kind)
+            && !types.is_some_and(|types| {
+                !types.is_empty() && types.iter().all(|t| t.as_str().is_some_and(numeric))
+            })
+        {
             let order = node
                 .get("x-ck-ordering")
                 .and_then(Value::as_array)
@@ -380,6 +435,11 @@ fn normalize(
                 return Err(schema_error(path));
             }
         }
+    }
+    if opaque {
+        let mut schema = Value::Object(node);
+        opaque::normalize(root, &mut schema, stack, path, true)?;
+        return Ok(schema);
     }
     if structural {
         if node.get("unevaluatedProperties") != Some(&Value::Bool(false)) {
@@ -457,6 +517,9 @@ fn discriminator(branches: &[Value]) -> Option<String> {
     }
 }
 fn variant<'a>(s: &'a Value, value: &Value) -> Option<&'a Value> {
+    if is_opaque(s) {
+        return None;
+    }
     let branches = s.get("oneOf")?.as_array()?;
     let key = discriminator(branches)?;
     branches.iter().find(|b| {
@@ -481,6 +544,9 @@ fn defaults(s: &Value) -> Option<Value> {
     if let Some(v) = s.get("default") {
         return Some(v.clone());
     }
+    if is_opaque(s) {
+        return None;
+    }
     let properties = s.get("properties")?.as_object()?;
     Some(Value::Object(
         properties
@@ -502,6 +568,9 @@ fn validate_defaults(s: &Value, path: &str) -> Result<(), Refusal> {
             &ValidationContext::default(),
         )
         .map_err(|_| schema_error(path))?;
+    }
+    if is_opaque(s) {
+        return Ok(());
     }
     if let Some(props) = s.get("properties").and_then(Value::as_object) {
         for (key, child) in props {
@@ -541,6 +610,7 @@ fn validate_setup(
             || s.get("type").and_then(Value::as_str) != Some("object")
             || s.get("oneOf").is_some()
             || credential(s)
+            || is_opaque(s)
         {
             return Err(schema_error(path));
         }
@@ -578,6 +648,7 @@ fn validate_setup(
                 if field.get("type").and_then(Value::as_str) != Some("object")
                     || field.get("oneOf").is_some()
                     || credential(field)
+                    || is_opaque(field)
                 {
                     return Err(schema_error(path));
                 }
@@ -587,9 +658,10 @@ fn validate_setup(
                     .and_then(|props| props.get(&key))
                     .ok_or_else(|| schema_error(path))?;
             }
-            if field.get("type").and_then(Value::as_str) == Some("object")
-                || field.get("oneOf").is_some()
-                || schema_contains_credential(field)
+            if !is_opaque(field)
+                && (field.get("type").and_then(Value::as_str) == Some("object")
+                    || field.get("oneOf").is_some()
+                    || schema_contains_credential(field))
             {
                 return Err(schema_error(path));
             }
@@ -608,6 +680,9 @@ fn validate_setup(
             )
             .map_err(|_| schema_error(path))?;
         }
+    }
+    if is_opaque(s) {
+        return Ok(());
     }
     for keyword in ["properties", "patternProperties"] {
         if let Some(properties) = s.get(keyword).and_then(Value::as_object) {
@@ -660,6 +735,10 @@ fn validate(
     c: &ValidationContext,
 ) -> Result<(), Refusal> {
     let invalid = || refusal(RefusalCode::ValueInvalid, path, c);
+    let opaque = is_opaque(s);
+    if opaque && matches!(layer, Some(Layer::Workspace | Layer::Project)) {
+        return Err(refusal(RefusalCode::LayerForbidden, path, c));
+    }
     if value.is_null() || canonical_json(value).is_err() || contains_expansion(value) {
         return Err(invalid());
     }
@@ -678,7 +757,7 @@ fn validate(
             Err(invalid())
         };
     }
-    if s.get("oneOf").is_some() {
+    if !opaque && s.get("oneOf").is_some() {
         if let Some(branch) = variant(s, value) {
             return validate(branch, value, path, layer, partial, c);
         }
@@ -697,23 +776,16 @@ fn validate(
         }
         return Err(invalid());
     }
-    let matches = match s["type"].as_str() {
-        Some("object") => value.is_object(),
-        Some("array") => value.is_array(),
-        Some("string") => value.is_string(),
-        Some("boolean") => value.is_boolean(),
-        Some("number") => value.is_number(),
-        Some("integer") => value.as_f64().is_some_and(|n| n.fract() == 0.0),
-        _ => false,
+    let matches = if opaque {
+        opaque::matches(s, value)
+    } else {
+        matches_type(&s["type"], value)
+            && s.get("const").is_none_or(|v| same_scalar(v, value))
+            && s.get("enum")
+                .and_then(Value::as_array)
+                .is_none_or(|a| a.iter().any(|v| same_scalar(v, value)))
     };
     if !matches {
-        return Err(invalid());
-    }
-    if s.get("const").is_some_and(|v| !same_scalar(v, value))
-        || s.get("enum")
-            .and_then(Value::as_array)
-            .is_some_and(|a| !a.iter().any(|v| same_scalar(v, value)))
-    {
         return Err(invalid());
     }
     if let Some(options) = s.get("x-ck-options") {
@@ -725,6 +797,9 @@ fn validate(
                 return Err(invalid());
             }
         }
+    }
+    if opaque {
+        return Ok(());
     }
     if let Some(text) = value.as_str() {
         if text.contains("{env:") || text.contains("{file:") {
@@ -837,6 +912,20 @@ fn validate(
     }
     Ok(())
 }
+fn matches_type(kind: &Value, value: &Value) -> bool {
+    match kind.as_str() {
+        Some("object") => value.is_object(),
+        Some("array") => value.is_array(),
+        Some("string") => value.is_string(),
+        Some("boolean") => value.is_boolean(),
+        Some("number") => value.is_number(),
+        Some("integer") => value.as_f64().is_some_and(|n| n.fract() == 0.0),
+        Some("null") => value.is_null(),
+        _ => kind
+            .as_array()
+            .is_some_and(|types| types.iter().any(|kind| matches_type(kind, value))),
+    }
+}
 fn same_scalar(a: &Value, b: &Value) -> bool {
     match (canonical_json(a), canonical_json(b)) {
         (Ok(a), Ok(b)) => a == b,
@@ -889,7 +978,7 @@ fn merge(
     if !bound_ok(s, lower, higher) {
         return Err(refusal(RefusalCode::BoundViolated, path, c));
     }
-    if credential(s) {
+    if credential(s) || is_opaque(s) {
         *lower = higher.clone();
         sources.insert(path.into(), layer);
         return Ok(());
@@ -915,7 +1004,7 @@ fn merge(
             }
             *lower = higher.clone();
             sources.retain(|p, _| p != path && !p.starts_with(&prefix));
-            mark_sources(higher, path, layer, sources);
+            mark_sources(s, higher, path, layer, sources);
             return Ok(());
         }
         variant(s, higher)
@@ -936,7 +1025,17 @@ fn merge(
             if let Some(existing) = target.get_mut(key) {
                 merge(child, existing, value, &child_path, layer, sources, c)?;
             } else {
-                let mut initial = defaults(child).unwrap_or_else(|| {
+                let default = defaults(child);
+                if default.is_none()
+                    && child.get("x-ck-required") == Some(&Value::Bool(false))
+                    && (!value.is_object() || is_opaque(child) || credential(child))
+                {
+                    // An optional field has no lower value for a bound to compare.
+                    mark_sources(child, value, &child_path, layer, sources);
+                    target.insert(key.clone(), value.clone());
+                    continue;
+                }
+                let mut initial = default.unwrap_or_else(|| {
                     if value.is_object() {
                         serde_json::json!({})
                     } else {
@@ -953,17 +1052,34 @@ fn merge(
         }
         *lower = higher.clone();
         sources.retain(|p, _| p != path && !p.starts_with(&format!("{path}/")));
-        mark_sources(higher, path, layer, sources);
+        mark_sources(s, higher, path, layer, sources);
     }
     Ok(())
 }
-fn mark_sources(v: &Value, path: &str, layer: Layer, sources: &mut BTreeMap<String, Layer>) {
+fn mark_sources(
+    s: &Value,
+    v: &Value,
+    path: &str,
+    layer: Layer,
+    sources: &mut BTreeMap<String, Layer>,
+) {
+    if is_opaque(s) {
+        sources.insert(path.into(), layer);
+        return;
+    }
+    let s = variant(s, v).unwrap_or(s);
     if let Some(object) = v.as_object() {
         if is_vault_reference(v) {
             sources.insert(path.into(), layer);
         } else {
             for (key, value) in object {
-                mark_sources(value, &pointer(path, key), layer, sources);
+                mark_sources(
+                    child_schema(s, key).unwrap_or(&Value::Null),
+                    value,
+                    &pointer(path, key),
+                    layer,
+                    sources,
+                );
             }
         }
     } else {
@@ -971,6 +1087,9 @@ fn mark_sources(v: &Value, path: &str, layer: Layer, sources: &mut BTreeMap<Stri
     }
 }
 fn collect_credentials(s: &Value, value: &Value, out: &mut BTreeSet<Digest>) {
+    if is_opaque(s) {
+        return;
+    }
     let s = variant(s, value).unwrap_or(s);
     if credential(s) {
         if let Ok(d) = digest(PURPOSE_VALUE, value) {
@@ -995,6 +1114,9 @@ fn check_credentials(
     user: &BTreeSet<Digest>,
     c: &ValidationContext,
 ) -> Result<(), Refusal> {
+    if is_opaque(s) {
+        return Ok(());
+    }
     let s = variant(s, value).unwrap_or(s);
     if credential(s) {
         let d = digest(PURPOSE_VALUE, value)
@@ -1016,6 +1138,9 @@ fn check_credentials(
     Ok(())
 }
 fn record(s: &Value, value: &Value) -> Result<Value, crate::CanonicalError> {
+    if is_opaque(s) {
+        return Ok(value.clone());
+    }
     if credential(s) {
         return serde_json::to_value(RecordedValue::redacted(value)?)
             .map_err(|_| crate::CanonicalError::Serialization);
@@ -1047,19 +1172,25 @@ fn record(s: &Value, value: &Value) -> Result<Value, crate::CanonicalError> {
 }
 
 fn strip_options(s: &mut Value) {
-    match s {
-        Value::Object(o) => {
-            o.remove("x-ck-options");
-            for value in o.values_mut() {
-                strip_options(value);
-            }
+    let opaque = is_opaque(s);
+    let Some(node) = s.as_object_mut() else {
+        return;
+    };
+    node.remove("x-ck-options");
+    // Walk schema children, not literals such as defaults and enum values.
+    if opaque {
+        return;
+    }
+    for key in ["properties", "patternProperties"] {
+        if let Some(children) = node.get_mut(key).and_then(Value::as_object_mut) {
+            children.values_mut().for_each(strip_options);
         }
-        Value::Array(a) => {
-            for value in a {
-                strip_options(value);
-            }
-        }
-        _ => {}
+    }
+    if let Some(items) = node.get_mut("items") {
+        strip_options(items);
+    }
+    if let Some(branches) = node.get_mut("oneOf").and_then(Value::as_array_mut) {
+        branches.iter_mut().for_each(strip_options);
     }
 }
 fn validate_vocabulary(node: &Value, path: &str) -> Result<(), Refusal> {
@@ -1179,6 +1310,9 @@ fn valid_pointer(s: &str) -> bool {
 }
 
 fn overlay_schema(s: &Value, lower: &Value, higher: &Value) -> Value {
+    if is_opaque(s) {
+        return s.clone();
+    }
     let selected = variant(s, higher)
         .or_else(|| variant(s, lower))
         .unwrap_or(s);
@@ -1234,6 +1368,378 @@ mod tests {
             LayerValue::new(Layer::User, user),
             LayerValue::new(Layer::Project, project),
         ]
+    }
+
+    fn proposed_schema(field: Value) -> Result<Schema, Refusal> {
+        let mut root = object(json!({"setting": field}));
+        root["$schema"] = json!("https://json-schema.org/draft/2020-12/schema");
+        Schema::new(root)
+    }
+
+    fn scalar_type_list() -> Value {
+        let mut value = field("number", json!(30));
+        value["type"] = json!(["string", "number"]);
+        value
+    }
+
+    fn opaque_field() -> Value {
+        json!({
+            "description": "A configurable JSON value",
+            "default": true,
+            "x-ck-kind": "json",
+            "x-ck-apply": "live",
+            "x-ck-layers": ["user"],
+            "oneOf": [
+                {"type": "boolean"},
+                {"type": "object", "required": ["a"], "properties": {"a": {"type": "number"}}}
+            ]
+        })
+    }
+
+    #[test]
+    fn scalar_type_list_replaces_scalar_and_refuses_unlisted_values() {
+        let s = proposed_schema(scalar_type_list()).unwrap();
+        let result = s
+            .review_tuple(
+                &layers(json!({"setting":30}), json!({"setting":"1m"})),
+                &context(),
+            )
+            .unwrap();
+        assert_eq!(result.effective, json!({"setting":"1m"}));
+        assert_eq!(result.sources["/setting"], Layer::Project);
+        let error = s
+            .validate_layer(Layer::User, &json!({"setting":true}), &context())
+            .unwrap_err();
+        assert_eq!(error.code, RefusalCode::ValueInvalid);
+        assert_eq!(error.path, "/setting");
+    }
+
+    #[test]
+    fn scalar_type_list_refuses_object_array_and_null_members() {
+        let valid = scalar_type_list();
+        assert!(proposed_schema(valid.clone()).is_ok());
+        for forbidden in ["object", "array", "null"] {
+            let mut invalid = valid.clone();
+            invalid["type"][0] = json!(forbidden);
+            let error = proposed_schema(invalid).unwrap_err();
+            assert_eq!(error.code, RefusalCode::SchemaInvalid);
+            assert_eq!(error.path, "/setting");
+        }
+    }
+
+    #[test]
+    fn opaque_json_replaces_atomically_and_refuses_non_user_layers() {
+        let s = proposed_schema(opaque_field()).unwrap();
+        assert_eq!(s.defaults(), json!({"setting":true}));
+        let user = LayerValue::new(Layer::User, json!({"setting":{"a":1,"Module Owned!":null}}));
+        let result = s
+            .review_tuple(std::slice::from_ref(&user), &context())
+            .unwrap();
+        assert_eq!(result.effective, user.value);
+        assert_eq!(
+            result.sources,
+            BTreeMap::from([("/setting".into(), Layer::User)])
+        );
+        assert_eq!(s.record(&result.effective).unwrap(), result.effective);
+        let mut with_object_default = opaque_field();
+        with_object_default["default"] = json!({"a":0,"default_only":true});
+        let merged = proposed_schema(with_object_default)
+            .unwrap()
+            .review_tuple(std::slice::from_ref(&user), &context())
+            .unwrap();
+        assert_eq!(merged.effective, user.value);
+        for layer in [Layer::Workspace, Layer::Project] {
+            for value in [json!(false), json!({"a":2}), Value::Null] {
+                let error = s
+                    .review_tuple(
+                        &[
+                            user.clone(),
+                            LayerValue::new(layer, json!({"setting":value})),
+                        ],
+                        &context(),
+                    )
+                    .unwrap_err();
+                assert_eq!(error.code, RefusalCode::LayerForbidden);
+                assert_eq!(error.path, "/setting");
+            }
+        }
+    }
+
+    #[test]
+    fn opaque_json_refuses_invalid_values_and_defaults() {
+        let valid = opaque_field();
+        let s = proposed_schema(valid.clone()).unwrap();
+        for invalid in [json!("true"), json!({}), json!({"a":"1"}), json!(null)] {
+            let error = s
+                .validate_layer(Layer::User, &json!({"setting":invalid}), &context())
+                .unwrap_err();
+            assert_eq!(error.code, RefusalCode::ValueInvalid);
+            assert_eq!(error.path, "/setting");
+        }
+        assert_eq!(
+            s.validate_layer(
+                Layer::User,
+                &json!({"setting":{"a":1,"value":"{env:X}"}}),
+                &context()
+            )
+            .unwrap_err()
+            .code,
+            RefusalCode::ValueInvalid
+        );
+        let mut invalid_default = valid;
+        invalid_default["default"] = json!({"a":false});
+        let error = proposed_schema(invalid_default).unwrap_err();
+        assert_eq!(error.code, RefusalCode::SchemaInvalid);
+        assert_eq!(error.path, "/setting");
+    }
+
+    #[test]
+    fn opaque_json_refuses_policy_annotations_below_the_leaf() {
+        let valid = opaque_field();
+        assert!(proposed_schema(valid.clone()).is_ok());
+        for (keyword, value) in [
+            ("x-ck-kind", json!("credential_ref")),
+            ("x-ck-kind", json!("json")),
+            ("x-ck-bound", json!("raise_only")),
+            ("x-ck-options", json!({})),
+            ("x-ck-action", json!({})),
+        ] {
+            let mut invalid = valid.clone();
+            invalid["oneOf"][1]["properties"]["a"][keyword] = value;
+            let error = proposed_schema(invalid).unwrap_err();
+            assert_eq!(error.code, RefusalCode::SchemaInvalid);
+            assert!(error.path.starts_with("/setting/"));
+            assert!(error.path.ends_with(keyword));
+        }
+    }
+
+    #[test]
+    fn opaque_json_refuses_unimplemented_assertions() {
+        let valid = opaque_field();
+        assert!(proposed_schema(valid.clone()).is_ok());
+        let mut invalid = valid;
+        invalid["oneOf"][1]["dependentRequired"] = json!({"a":["b"]});
+        let error = proposed_schema(invalid).unwrap_err();
+        assert_eq!(error.code, RefusalCode::SchemaInvalid);
+        assert_eq!(error.path, "/setting/oneOf/1/dependentRequired");
+    }
+
+    #[test]
+    fn opaque_json_accepts_object_type_lists_and_normalizes_layers_to_user_only() {
+        let mut field = opaque_field();
+        field.as_object_mut().unwrap().remove("oneOf");
+        field["type"] = json!(["boolean", "object"]);
+        field["x-ck-layers"] = json!(["user", "workspace", "project"]);
+        let s = proposed_schema(field.clone()).unwrap();
+        assert_eq!(
+            s.normalized()["properties"]["setting"]["x-ck-layers"],
+            json!(["user"])
+        );
+        for value in [
+            json!(true),
+            json!({"Module Key":{"env":{"LANG":"C"}},"more":null}),
+            json!({"file":"settings.json"}),
+        ] {
+            let overlay = json!({"setting":value});
+            assert!(s.validate_layer(Layer::User, &overlay, &context()).is_ok());
+            assert_eq!(
+                s.validate_layer(Layer::Workspace, &overlay, &context())
+                    .unwrap_err()
+                    .code,
+                RefusalCode::LayerForbidden
+            );
+        }
+        field["type"] = json!(["boolean", "null"]);
+        let error = proposed_schema(field.clone()).unwrap_err();
+        assert_eq!(error.code, RefusalCode::SchemaInvalid);
+        assert_eq!(error.path, "/setting/type");
+        field["type"] = json!("number");
+        field["default"] = json!(1);
+        field["x-ck-bound"] = json!("raise_only");
+        assert_eq!(proposed_schema(field.clone()).unwrap_err().path, "/setting");
+        field["x-ck-layers"] = json!(["user"]);
+        let s = proposed_schema(field).unwrap();
+        let result = s.review_tuple(
+            &[LayerValue::new(Layer::User, json!({"setting":0}))],
+            &context(),
+        );
+        assert_eq!(result.unwrap_err().code, RefusalCode::BoundViolated);
+    }
+
+    #[test]
+    fn opaque_json_does_not_change_managed_singleton_expansion_object_refusal() {
+        let ordinary = proposed_schema(object(json!({"env":field("string", json!("C"))}))).unwrap();
+        let error = ordinary
+            .validate_layer(Layer::User, &json!({"setting":{"env":"C"}}), &context())
+            .unwrap_err();
+        assert_eq!(error.code, RefusalCode::ValueInvalid);
+        assert_eq!(error.path, "/setting");
+    }
+
+    #[test]
+    fn opaque_json_enforces_local_ref_siblings_and_object_and_array_constraints() {
+        let mut field = opaque_field();
+        field.as_object_mut().unwrap().remove("oneOf");
+        field["$defs"] = json!({"number_or_null":{"anyOf":[{"type":"number"},{"type":"null"}]}});
+        field["type"] = json!("object");
+        field["properties"] = json!({
+            "Items": {"type":"array", "items":{"$ref":"#/properties/setting/$defs/number_or_null","minimum":0},"minItems":2,"uniqueItems":true}
+        });
+        field["additionalProperties"] = json!(false);
+        field["required"] = json!(["Items"]);
+        field["default"] = json!({"Items":[0,null]});
+        let s = proposed_schema(field.clone()).unwrap();
+        assert_eq!(s.defaults(), json!({"setting":{"Items":[0,null]}}));
+        for invalid in [
+            json!({"Items":[1]}),
+            json!({"Items":[false,1]}),
+            json!({"Items":[-1,null]}),
+            json!({"Items":[1,1.0]}),
+            json!({"Items":[0,null],"more":null}),
+        ] {
+            let error = s
+                .validate_layer(Layer::User, &json!({"setting":invalid}), &context())
+                .unwrap_err();
+            assert_eq!(error.code, RefusalCode::ValueInvalid);
+            assert_eq!(error.path, "/setting");
+        }
+        field["$defs"]["number_or_null"]["x-ck-kind"] = json!("credential_ref");
+        assert!(proposed_schema(field)
+            .unwrap_err()
+            .path
+            .ends_with("/x-ck-kind"));
+    }
+
+    #[test]
+    fn scalar_type_list_numeric_and_ordered_bounds() {
+        let mut field = scalar_type_list();
+        field["x-ck-bound"] = json!("raise_only");
+        assert_eq!(proposed_schema(field.clone()).unwrap_err().path, "/setting");
+        field["enum"] = json!([30, "1m"]);
+        field["x-ck-ordering"] = json!([30, "1m"]);
+        let s = proposed_schema(field).unwrap();
+        assert!(s
+            .review_tuple(
+                &layers(json!({"setting":30}), json!({"setting":"1m"})),
+                &context()
+            )
+            .is_ok());
+        assert_eq!(
+            s.review_tuple(
+                &layers(json!({"setting":"1m"}), json!({"setting":30})),
+                &context()
+            )
+            .unwrap_err()
+            .code,
+            RefusalCode::BoundViolated
+        );
+
+        let mut numeric = scalar_type_list();
+        numeric["type"] = json!(["number", "integer"]);
+        numeric["x-ck-bound"] = json!("raise_only");
+        let s = proposed_schema(numeric).unwrap();
+        assert!(s
+            .review_tuple(
+                &layers(json!({"setting":30}), json!({"setting":30.5})),
+                &context()
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn optional_fields_work_in_maps_and_variants() {
+        let mut optional = field("number", json!(0));
+        optional.as_object_mut().unwrap().remove("default");
+        optional["x-ck-required"] = json!(false);
+        let mut a = field("string", json!("a"));
+        a["const"] = json!("a");
+        let mut b = field("string", json!("b"));
+        b["const"] = json!("b");
+        let mut first = object(json!({"kind":a,"number":optional}));
+        first["required"] = json!(["kind"]);
+        let mut second = object(json!({"kind":b}));
+        second["required"] = json!(["kind"]);
+        let s = schema(json!({
+            "map":{"type":"object","unevaluatedProperties":false,"patternProperties":{"^key_":optional}},
+            "choice":{"oneOf":[first,second],"default":{"kind":"a"}}
+        }));
+        assert_eq!(
+            s.review_tuple(&[], &context()).unwrap().effective,
+            json!({"choice":{"kind":"a"}})
+        );
+        let overlay = json!({"map":{"key_a":1},"choice":{"number":2}});
+        assert_eq!(
+            s.review_tuple(&layers(json!({}), overlay), &context())
+                .unwrap()
+                .effective,
+            json!({"map":{"key_a":1},"choice":{"kind":"a","number":2}})
+        );
+    }
+
+    #[test]
+    fn optional_fields_absent_without_defaults_and_inherit_when_not_set() {
+        let mut number = field("number", json!(0));
+        number.as_object_mut().unwrap().remove("default");
+        let error = proposed_schema(number.clone()).unwrap_err();
+        assert_eq!(error.code, RefusalCode::SchemaInvalid);
+        assert_eq!(error.path, "/setting");
+        number["x-ck-required"] = json!(false);
+        let s = proposed_schema(number.clone()).unwrap();
+        assert_eq!(s.defaults(), json!({}));
+        assert_eq!(
+            s.review_tuple(&[], &context()).unwrap().effective,
+            json!({})
+        );
+        let user = s
+            .review_tuple(&layers(json!({"setting":3}), json!({})), &context())
+            .unwrap();
+        assert_eq!(user.effective, json!({"setting":3}));
+        assert_eq!(user.sources["/setting"], Layer::User);
+        let project = s
+            .review_tuple(&layers(json!({}), json!({"setting":2})), &context())
+            .unwrap();
+        assert_eq!(project.effective, json!({"setting":2}));
+        assert_eq!(project.sources["/setting"], Layer::Project);
+        assert_eq!(
+            s.validate_layer(Layer::User, &json!({"setting":null}), &context())
+                .unwrap_err()
+                .code,
+            RefusalCode::ValueInvalid
+        );
+        number["default"] = json!(1);
+        assert_eq!(
+            proposed_schema(number).unwrap().defaults(),
+            json!({"setting":1})
+        );
+    }
+
+    #[test]
+    fn optional_fields_distinguish_empty_array_and_skip_bounds_without_a_lower_value() {
+        let mut list = field("array", json!([]));
+        list.as_object_mut().unwrap().remove("default");
+        list["x-ck-required"] = json!(false);
+        list["x-ck-bound"] = json!("subset_only");
+        list["items"] = object(json!({"a":field("number", json!(0))}));
+        let s = proposed_schema(list).unwrap();
+        assert_eq!(s.defaults(), json!({}));
+        let overlay = json!({"setting":[{"a":1}]});
+        assert_eq!(
+            s.review_tuple(&layers(json!({}), overlay.clone()), &context())
+                .unwrap()
+                .effective,
+            overlay
+        );
+        assert_eq!(
+            s.review_tuple(&layers(json!({"setting":[]}), json!({})), &context())
+                .unwrap()
+                .effective,
+            json!({"setting":[]})
+        );
+        let error = s
+            .review_tuple(&layers(json!({"setting":[]}), overlay), &context())
+            .unwrap_err();
+        assert_eq!(error.code, RefusalCode::BoundViolated);
+        assert_eq!(error.path, "/setting");
     }
 
     #[test]

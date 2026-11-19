@@ -972,6 +972,61 @@ async fn config_settings_vectors_match_real_handler_bytes() {
     }
     samples.push(("schema-setup.request.json".into(), body));
     samples.push(("schema-setup.reply.json".into(), reply));
+    // Fields that keep a module's existing shapes: an opaque JSON value (true or
+    // an object), a scalar type list, and an optional field with no default.
+    let flexible_schema = json!({
+        "$schema":"https://json-schema.org/draft/2020-12/schema",
+        "type":"object","unevaluatedProperties":false,
+        "x-ck-layers":["user"],"x-ck-apply":"live",
+        "properties":{
+            "language_server":{
+                "x-ck-kind":"json","type":["boolean","object"],
+                "description":"true for built-in options, or an options object.",
+                "default":true
+            },
+            "max_runs":{
+                "type":["integer","string"],
+                "description":"A run count, or \"none\" for no limit.",
+                "default":4
+            },
+            "rating_override":{
+                "type":"number",
+                "description":"Absent uses the catalog rating.",
+                "x-ck-required":false
+            }
+        }
+    });
+    let flexible_rig = SettingsRig::new();
+    flexible_rig
+        .owner
+        .declare(
+            ConnectionId::new(13),
+            "sample-flexible",
+            subc_protocol::config::ConfigDeclareRequest::new(
+                flexible_schema,
+                flexible_rig
+                    .root
+                    .join("cortexkit/sample-flexible.jsonc")
+                    .to_string_lossy(),
+                vec![],
+            ),
+            true,
+        )
+        .unwrap();
+    let flexible_handler = self::handler(&flexible_rig);
+    let body = json!({"op":"config.schema","module_id":"sample-flexible"});
+    let reply = flexible_handler
+        .handle_control_frame(&ctx, request(body.clone()))
+        .await
+        .unwrap();
+    assert_eq!(reply[0].header.ty, FrameType::Response);
+    let reply: Value = serde_json::from_slice(&reply[0].body).unwrap();
+    assert_eq!(
+        reply["schema"]["properties"]["language_server"]["x-ck-kind"],
+        "json"
+    );
+    samples.push(("schema-flexible.request.json".into(), body));
+    samples.push(("schema-flexible.reply.json".into(), reply));
     let (modules, watch) = bad_number_rows().await;
     samples.push(("modules.declaration-error.reply.json".into(), modules));
     samples.push(("watch.declaration-error.resync.json".into(), watch));

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.50.17
+
+- Adopt subc-config 0.1.3 for scalar type lists and report opaque JSON as whole fields in reviews.
+
 ## 0.50.16
 
 - Persist approved project views and cutoffs, tuple delivery outcomes, confirmed registry membership, and the newest write-back intent per project or workspace file.

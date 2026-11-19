@@ -1,0 +1,50 @@
+{
+  "module_id": "sample-flexible",
+  "op": "config.schema",
+  "schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "language_server": {
+        "default": true,
+        "description": "true for built-in options, or an options object.",
+        "type": [
+          "boolean",
+          "object"
+        ],
+        "x-ck-apply": "live",
+        "x-ck-kind": "json",
+        "x-ck-layers": [
+          "user"
+        ]
+      },
+      "max_runs": {
+        "default": 4,
+        "description": "A run count, or \"none\" for no limit.",
+        "type": [
+          "integer",
+          "string"
+        ],
+        "x-ck-apply": "live",
+        "x-ck-layers": [
+          "user"
+        ]
+      },
+      "rating_override": {
+        "description": "Absent uses the catalog rating.",
+        "type": "number",
+        "x-ck-apply": "live",
+        "x-ck-layers": [
+          "user"
+        ],
+        "x-ck-required": false
+      }
+    },
+    "type": "object",
+    "unevaluatedProperties": false,
+    "x-ck-apply": "live",
+    "x-ck-layers": [
+      "user"
+    ]
+  },
+  "schema_digest": "sha256:c8def7e79cd2c8c75ede553737f9765ae3ded94087aa2f8df4ab3bd37a173563"
+}

@@ -132,6 +132,16 @@ The [config vocabulary](../crates/subc-config/vocabulary.schema.json) defines th
 `x-ck-apply`, `x-ck-kind` and the `x-ck-options` picker metadata.
 `config.schema` preserves admitted annotations in the module's normalized schema.
 
+A managed value can list scalar types (`string`, `number`, `integer`, `boolean`).
+An overlay replaces it and may use a different listed type. For arbitrary JSON
+shapes, declare `x-ck-kind: json`: the user layer sets the whole field, optionally
+constrained by supported JSON Schema assertions, and review shows whole old and
+new values. The field's own settings key is managed; keys inside it are not.
+Workspace and project layers cannot set the field. A default, if declared, must
+validate. A top-level `null` value for the field is refused, but nested nulls are
+allowed. The [config crate guide](../crates/subc-config/README.md#schemas-and-layers)
+lists supported assertions, bounds, and annotations forbidden inside opaque JSON.
+
 An optional `x-ck-setup` on a top-level, named object property marks a settings
 section as a feature the setup wizard can offer:
 
@@ -154,8 +164,8 @@ keeping sections at one level prevents overlapping features.
 `recommended` is an object, possibly empty. Its keys are JSON Pointers from the
 module settings **root**, not from the section. Every pointer must resolve through
 named `properties` to a field inside that section; nested named descendants are
-allowed, but object targets, array-item targets, pattern-property targets and
-unresolved `oneOf` targets are refused. Values must pass the field's schema
+allowed, but structural object targets, array-item targets, pattern-property
+targets and unresolved discriminated `oneOf` targets are refused. Values must pass the field's schema
 validation, without checking membership in dynamic `x-ck-options` catalogs,
 just as declaration defaults do.
 A target whose schema contains `x-ck-kind: credential_ref` anywhere is forbidden,

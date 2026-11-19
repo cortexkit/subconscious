@@ -211,9 +211,7 @@ pub fn refuse_project_apply_kinds(
     candidate: &ReviewedTuple,
 ) -> Result<()> {
     let check = |schema: &Schema, effective: &Value, sources: &BTreeMap<String, Layer>| {
-        let mut paths = BTreeSet::new();
-        review::leaf_paths(effective, "", &mut paths);
-        for path in paths {
+        for path in review::leaf_paths(schema, effective) {
             if matches!(
                 review::source(sources, &path),
                 Some(Layer::Workspace | Layer::Project)

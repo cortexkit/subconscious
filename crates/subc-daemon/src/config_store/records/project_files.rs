@@ -14,6 +14,9 @@ use crate::config_store::{StoreBody, StoreError, StoreErrorCode};
 pub struct RegistryMembership {
     pub projects: BTreeMap<String, Option<String>>,
     pub revision: RegistryMembershipRevision,
+    /// An outage is not a legacy user-only install after projects have been seen.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) ever_had_projects: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +57,7 @@ impl RegistryMembership {
             }
         }
         Ok(Self {
+            ever_had_projects: !projects.is_empty(),
             projects,
             revision: RegistryMembershipRevision {
                 generation: reply.generation,

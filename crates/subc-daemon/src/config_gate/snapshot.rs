@@ -23,6 +23,11 @@ pub enum InputKey {
         module: String,
         project: String,
     },
+    /// One physical workspace or project file, irrespective of which role reads it.
+    ProjectFile {
+        module: String,
+        path: String,
+    },
     Declaration(String),
     Program {
         module: String,
@@ -37,11 +42,16 @@ impl InputKey {
             Self::Entry(module) | Self::Declaration(module) => Some(module),
             Self::Layer { module, .. }
             | Self::ProjectTuple { module, .. }
+            | Self::ProjectFile { module, .. }
             | Self::Program { module, .. } => Some(module),
         }
     }
     pub(super) fn is_program(&self) -> bool {
         matches!(self, Self::Program { .. })
+    }
+
+    pub(super) fn is_project(&self) -> bool {
+        matches!(self, Self::ProjectTuple { .. } | Self::ProjectFile { .. })
     }
 }
 
@@ -103,6 +113,16 @@ impl GateSnapshot {
             .chain(other.inputs.keys())
             .filter(|key| self.inputs.get(key) != other.inputs.get(key))
             .collect()
+    }
+
+    pub(super) fn carry_project_inputs(&mut self, previous: &Self) {
+        for (key, input) in &previous.inputs {
+            if key.is_project() {
+                self.inputs
+                    .entry(key.clone())
+                    .or_insert_with(|| input.clone());
+            }
+        }
     }
 
     /// Aggregate the whole module inventory, not just paths that changed. This

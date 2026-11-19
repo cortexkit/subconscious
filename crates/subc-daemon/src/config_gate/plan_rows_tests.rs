@@ -310,6 +310,21 @@ fn assert_snapshot_differences_have_rows(view: &ConfigPlanView, case: &str) {
                         .iter()
                         .any(|target| target["module"] == *module && target["project"] == *project)
                 }),
+            InputKey::ProjectFile { module, path } => changeset.apply_plan
+                ["project_file_approvals"]
+                .as_array()
+                .is_some_and(|files| {
+                    files.iter().any(|file| {
+                        file["target"]["module"] == *module
+                            && file["target"]["root"]
+                                .as_str()
+                                .zip(file["target"]["relative_path"].as_str())
+                                .is_some_and(|(root, relative)| {
+                                    std::path::Path::new(root).join(relative)
+                                        == std::path::Path::new(path)
+                                })
+                    })
+                }),
         };
         assert!(covered, "{case}: uncovered snapshot input {input:?}");
     }

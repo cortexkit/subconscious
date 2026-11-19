@@ -475,6 +475,7 @@ impl RuntimeOwner {
             .collect();
         Ok(PreparedPlan {
             projects: None,
+            project_capture: None,
             candidate,
             bases,
             base_schemas,

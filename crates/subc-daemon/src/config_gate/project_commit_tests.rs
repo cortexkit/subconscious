@@ -55,6 +55,7 @@ fn review(module: &str, project: &str, workspace_x: u64) -> ProjectReview {
             vec![],
         ),
         reviewed_build: subc_config::raw_digest(b"build-1"),
+        registry_identity: None,
     }
 }
 
@@ -226,6 +227,7 @@ fn project_commit_targets_cutoffs_declaration_and_build_without_field_changes() 
                         cutoffs: reviewed.cutoffs.clone(),
                         declaration: reviewed.declaration.clone(),
                         reviewed_build: reviewed.reviewed_build.clone(),
+                        registry_identity: None,
                     },
                 )]),
                 ..ProjectReviews::default()

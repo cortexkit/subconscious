@@ -132,6 +132,25 @@ impl ProjectRegistry for EntorhinalProjectRegistry {
     fn root_io_health(&self) -> Option<subc_control::config::ConfigRootIo> {
         self.root_io.as_ref().ok().and_then(RootIoPool::health)
     }
+
+    fn capture_batch<'a>(
+        &'a self,
+        scopes: &'a BTreeMap<String, RegistryScope>,
+    ) -> RegistryBatchFuture<'a> {
+        Box::pin(async move {
+            let reply = self.enumerate().await?;
+            let pool = self
+                .root_io
+                .as_ref()
+                .map_err(|_| layer_unavailable("registry capture worker stopped"))?;
+            let mut revisions = BTreeMap::new();
+            for (module, scope) in scopes {
+                let revision = RegistryRevision::from_scope(pool, &reply, module, scope).await?;
+                revisions.insert(module.clone(), revision);
+            }
+            Ok((Some(reply), revisions))
+        })
+    }
 }
 
 struct RpcGuard {

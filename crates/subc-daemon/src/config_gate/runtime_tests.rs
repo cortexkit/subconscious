@@ -16,6 +16,8 @@ mod edit_plans;
 mod key_access;
 #[path = "plan_rows_tests.rs"]
 mod plan_rows;
+#[path = "policy_root_tests.rs"]
+mod policy_root;
 #[path = "status_placement_tests.rs"]
 mod status_placement;
 

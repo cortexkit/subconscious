@@ -318,9 +318,16 @@ impl ConfigGate {
             if !facts.os_prompt_available {
                 return Err(unavailable());
             }
-            let prompt =
+            let prompt = if let Some(change) = plan
+                .edits
+                .as_ref()
+                .and_then(|edit| edit.policy_root.as_ref())
+            {
+                change.review.clone()
+            } else {
                 gate_prompt_text(&format!("Approve config plan {digest}"), &[], &facts.caller)
-                    .ok_or_else(unavailable)?;
+                    .ok_or_else(unavailable)?
+            };
             (
                 Surface::Desktop { channel },
                 ApprovalChallenge::Desktop {
@@ -386,15 +393,9 @@ impl ConfigGate {
         facts: &ApprovalFacts,
         now_ms: u64,
     ) -> Result<u64> {
-        self.finish_approval_with_precommit(
-            attempt,
-            reply,
-            store,
-            current,
-            facts,
-            now_ms,
-            || Ok(()),
-        )
+        self.finish_approval_with_precommit(attempt, reply, store, current, facts, now_ms, || {
+            Ok(None)
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -406,7 +407,7 @@ impl ConfigGate {
         current: &GateSnapshot,
         facts: &ApprovalFacts,
         now_ms: u64,
-        before_commit: impl FnOnce() -> Result<()>,
+        before_commit: impl FnOnce() -> Result<Option<crate::policy_root::ledger::Checkpoint>>,
     ) -> Result<u64> {
         let pending = self.attempts.remove(&attempt).ok_or_else(unavailable)?;
         if !facts.owner_uid || facts.connection != pending.caller {

@@ -207,6 +207,7 @@ pub struct DaemonConfig {
     /// that is not configured yet so an operator can reserve an interface before
     /// installing its provider.
     pub reserved_capabilities: BTreeMap<String, String>,
+    pub(crate) agent_policy_root: crate::policy_root::Section,
 }
 
 /// Central storage configuration: one backend for every managed module. subc
@@ -435,6 +436,8 @@ struct RawDaemonConfig {
     federated_scope_owner: String,
     #[serde(default)]
     reserved_capabilities: BTreeMap<String, String>,
+    #[serde(default, deserialize_with = "crate::policy_root::present_section")]
+    agent_policy_root: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1174,6 +1177,7 @@ fn parse_doc_with_activity(
             scope_authority_owners,
             federated_scope_owner: raw.federated_scope_owner,
             reserved_capabilities: raw.reserved_capabilities,
+            agent_policy_root: crate::policy_root::parse_section(raw.agent_policy_root),
         },
         raw.activity,
     ))

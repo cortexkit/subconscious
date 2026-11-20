@@ -38,5 +38,14 @@ pub(super) fn prepare(
             ),
         ));
     }
-    Ok((owner.capturer.capture_retained(&target, delivery)?, target))
+    let mut candidate = owner.capturer.capture_retained(&target, delivery)?;
+    let approved = GateSnapshot::from_store(&state.store.body()?.approved)?;
+    let root = super::policy_root::section_value(&approved);
+    if super::policy_root::section_value(&target) != root {
+        super::policy_root::patch_daemon(
+            &mut candidate,
+            super::policy_root::edit_for(root.cloned()),
+        )?;
+    }
+    Ok((candidate, target))
 }

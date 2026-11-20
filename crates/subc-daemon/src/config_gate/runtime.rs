@@ -24,6 +24,8 @@ use crate::{
 
 #[path = "edits.rs"]
 pub(super) mod edits;
+#[path = "policy_root.rs"]
+pub(super) mod policy_root;
 #[path = "runtime_project_edits.rs"]
 pub(super) mod project_edits;
 
@@ -83,6 +85,10 @@ pub struct RuntimeOwner {
     configured_modules: std::sync::RwLock<Option<admission::ConfiguredModuleSnapshot>>,
     inner: Mutex<OwnerState>,
     capturer: ConfigCapturer,
+    policy_root_ledger: Option<std::path::PathBuf>,
+    policy_root_unstamped: Mutex<crate::policy_root::Section>,
+    #[cfg(test)]
+    policy_root_fail_after_append: std::sync::atomic::AtomicBool,
     // Enable with the public project-settings capability. Until then an
     // unscoped config.plan must not return project targets or diagnostics.
     project_capture_enabled: bool,
@@ -1064,6 +1070,10 @@ impl RuntimeOwner {
                 after_approval_drain_hook: None,
             }),
             capturer,
+            policy_root_ledger: None,
+            policy_root_unstamped: Mutex::new(Ok(None)),
+            #[cfg(test)]
+            policy_root_fail_after_append: std::sync::atomic::AtomicBool::new(false),
             project_capture_enabled: false,
             #[cfg(test)]
             project_write_hook: std::sync::Mutex::new(None),
@@ -1983,8 +1993,18 @@ impl RuntimeOwner {
         if prepared.edits.is_some() {
             // Carry forward approvals for modules outside the edit set. Changes
             // to those approvals must neither refuse these edits nor be reverted by them.
+            let daemon_edit = prepared
+                .edits
+                .as_ref()
+                .is_some_and(|edit| edit.policy_root.is_some());
+            if daemon_edit {
+                Self::no_pending_policy_root(&state)?;
+            }
             let touched = &prepared.touched_modules;
             for (key, input) in &current.diagnostic.inputs {
+                if daemon_edit && *key == super::InputKey::Daemon {
+                    continue;
+                }
                 if key.module().is_none_or(|module| !touched.contains(module)) {
                     prepared
                         .candidate
@@ -2386,6 +2406,18 @@ impl RuntimeOwner {
         #[cfg(test)]
         let prepublication_hook = state.prepublication_hook.take();
         let publication_before = state.store.publication_sequence();
+        let (_, loaded) = state.store.loaded_admission_state();
+        let ledger_checkpoint = crate::policy_root::ledger::last_checkpoint(loaded)
+            .map(|(_, checkpoint)| checkpoint.clone());
+        let pin_history = edit_plan
+            .as_ref()
+            .is_some_and(|edit| edit.policy_root.is_some())
+            && policy_root::has_pin_history(loaded);
+        let stamp_ledger = state
+            .gate
+            .plans
+            .get(&digest)
+            .and_then(|plan| self.stamp_ledger_intent(loaded, plan));
         let OwnerState {
             gate,
             store,
@@ -2428,15 +2460,36 @@ impl RuntimeOwner {
                         delivery,
                     );
                 }
+                let checkpoint = if let Some(change) = edit_plan
+                    .as_ref()
+                    .and_then(|edit| edit.policy_root.as_ref())
+                {
+                    Some(self.publish_policy_root_ledger(
+                        change,
+                        now_ms,
+                        ledger_checkpoint.as_ref(),
+                        pin_history,
+                    )?)
+                } else if let Some(intent) = stamp_ledger {
+                    self.publish_stamp_ledger(intent, now_ms, ledger_checkpoint.as_ref())?
+                } else {
+                    None
+                };
                 #[cfg(test)]
                 if let Some(hook) = publication_hook {
                     hook();
                 }
-                Ok(())
+                Ok(checkpoint)
             },
         );
         let committed_this_call = state.store.publication_sequence() != publication_before;
         if committed_this_call {
+            if state.store.status().state == StoreState::Unstamped {
+                self.replace_unstamped_root(
+                    policy_root::captured_section(&current)
+                        .unwrap_or(Err("policy_root_not_canonical")),
+                );
+            }
             if let Some(edit_plan) = edit_plan {
                 for file in &edit_plan.files {
                     let _ = file.write_back();

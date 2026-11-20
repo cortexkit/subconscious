@@ -648,7 +648,7 @@ impl ControlHandler {
         }
     }
 
-    fn config_owner_connection(&self, connection: ConnectionId) -> bool {
+    pub(super) fn config_owner_connection(&self, connection: ConnectionId) -> bool {
         let peers = self
             .observed_peers
             .lock()
@@ -753,6 +753,14 @@ impl ControlHandler {
                     ));
                 self.report_daemon_configuration(&snapshot.approved_daemon, &mut status)
                     .await?;
+                if let Some(problem) = runtime
+                    .on_blocking(move |owner| {
+                        Ok(owner.policy_root_problem(&snapshot.approved_daemon))
+                    })
+                    .await?
+                {
+                    status.warnings.push(problem);
+                }
                 Ok(ConfigControlResponse::Status { status })
             }
             ConfigControlRequest::History {} => {
@@ -764,6 +772,12 @@ impl ControlHandler {
                 })
             }
             ConfigControlRequest::Apply { digest } => {
+                if let Some(result) = self
+                    .apply_unstamped_policy_root(ctx, frame, &runtime, &digest)
+                    .await?
+                {
+                    return Ok(result);
+                }
                 let apply_digest = digest.clone();
                 if let Some(generation) = runtime.apply_control_edits(apply_digest).await? {
                     return Ok(ConfigControlResponse::Applied {
@@ -1485,7 +1499,7 @@ pub(super) fn config_error_frame(frame: &Frame, error: GateError) -> Result<Fram
     )
 }
 
-fn now_ms() -> u64 {
+pub(super) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

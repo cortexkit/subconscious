@@ -2508,11 +2508,13 @@ async fn config_delivery_supervisor_pre_hello_crash_defers_respawn_without_spend
     );
     assert!(owner.delivery_exit_fence("a").unwrap().is_some());
     let _worker = WorkerGuard(handler.spawn_config_delivery_worker().unwrap());
+    // A deferred respawn attempt keeps its generation, so the
+    // replacement's number may skip; the launch count proves one more exec.
     wait_for_supervised_stage(
         &module,
         "pre-HELLO fence clears and one replacement starts",
         || {
-            module.status().unwrap().spawn_generation == fenced.spawn_generation + 1
+            module.status().unwrap().spawn_generation > fenced.spawn_generation
                 && std::fs::read_to_string(rig.path.join("a.launches"))
                     .is_ok_and(|text| text.lines().count() == 2)
         },
@@ -2695,8 +2697,11 @@ async fn exit_after_unavailable_image(
     // Let the replacement pass the image check and wait on the named pipe.
     supervisor.set_admission_hook_for_test(|_, _, _| true);
     let _worker = WorkerGuard(handler.spawn_config_delivery_worker().unwrap());
+    // A respawn attempt made before the worker lifts the fence is deferred but
+    // keeps the generation it was given, so the admitted replacement's number
+    // may skip. The launch count is what proves exactly one more exec.
     wait_for_supervised_stage(&module, "replacement admitted after the exit fence", || {
-        module.status().unwrap().spawn_generation == fenced.spawn_generation + 1
+        module.status().unwrap().spawn_generation > fenced.spawn_generation
             && std::fs::read_to_string(rig.path.join("a.launches"))
                 .is_ok_and(|text| text.lines().count() == 2)
     })

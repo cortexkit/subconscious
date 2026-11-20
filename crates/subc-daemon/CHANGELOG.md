@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.50.27
+
+- Hold the agent policy trust root in approved daemon settings; review all pin
+  moves and keep an independent history of rotated and retired keys.
+- Checkpoint stamped pin history, retire a known prior pin when a stamp or
+  store recovery replaces it, and refuse recreation of a deleted pin ledger.
+
 ## 0.50.26
 
 - Read workspace and project settings directly on unstamped installs when project

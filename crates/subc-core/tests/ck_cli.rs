@@ -909,6 +909,7 @@ fn hidden_cli_face_reserved_names_list_every_builtin_domain() {
             "help",
             "machine",
             "module",
+            "policy-root",
             "provenance",
             "quota",
             "routes",

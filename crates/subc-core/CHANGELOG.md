@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.21.32
+
+- Add `ck policy-root show`, `set` and `recover` for the daemon's agent policy
+  trust root. Setting or recovering a root prepares a plan for approval.
+- Require subc-daemon 0.50.27.
+
 ## 0.21.31
 
 - `ck health <id>` names the nested metric groups of a module that headlines none,

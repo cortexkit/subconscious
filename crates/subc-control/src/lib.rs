@@ -85,6 +85,7 @@ macro_rules! open_string_enum {
     };
 }
 
+pub mod policy_root;
 mod rescan_checked;
 pub use rescan_checked::*;
 
@@ -183,6 +184,12 @@ pub mod ops {
 // are markers; retain the direct public wire shape instead of boxing its fields.
 #[allow(clippy::large_enum_variant)]
 pub enum ClientControlRequest {
+    #[serde(rename = "policy_root.get")]
+    PolicyRoot(subc_protocol::policy_root::GetPolicyRoot),
+    #[serde(rename = "policy_root.set")]
+    PolicyRootSet(policy_root::SetPolicyRoot),
+    #[serde(rename = "policy_root.recover")]
+    PolicyRootRecover(policy_root::RecoverPolicyRoot),
     /// Announce a planned daemon restart. Other values, including an absent
     /// intent, are refused by the daemon with `invalid_params`.
     #[serde(rename = "daemon.shutdown_intent")]
@@ -448,6 +455,12 @@ pub enum ClientControlRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "op")]
 pub enum ClientControlResponse {
+    #[serde(rename = "policy_root.get")]
+    PolicyRoot(subc_protocol::policy_root::PolicyRoot),
+    #[serde(rename = "policy_root.set")]
+    PolicyRootSet(subc_protocol::policy_root::PolicyRootChange),
+    #[serde(rename = "policy_root.recover")]
+    PolicyRootRecover(subc_protocol::policy_root::PolicyRootChange),
     #[serde(rename = "daemon.shutdown_intent")]
     DaemonShutdownIntent { intent: String, expires_at_ms: u64 },
     #[serde(rename = "server.describe")]

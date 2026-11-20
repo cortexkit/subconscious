@@ -8,6 +8,7 @@ pub(crate) enum ApprovedDaemonView {
     Approved {
         generation: u64,
         config: std::sync::Arc<DaemonConfig>,
+        policy_root_checkpoint: Option<serde_json::Value>,
     },
 }
 
@@ -33,12 +34,14 @@ impl ApprovedDaemonView {
             .map(|config| Self::Approved {
                 generation: body.last_generation,
                 config: std::sync::Arc::new(config),
+                policy_root_checkpoint: crate::policy_root::ledger::last_checkpoint(body)
+                    .map(|(_, value)| value.clone()),
             })
             .unwrap_or(Self::Unavailable)
     }
 }
 
-fn parse_daemon(snapshot: &DeliverySnapshot) -> Result<DaemonConfig> {
+pub(super) fn parse_daemon(snapshot: &DeliverySnapshot) -> Result<DaemonConfig> {
     let layer = snapshot
         .daemon
         .as_ref()

@@ -102,60 +102,8 @@ const CAP_PING_PONG: &str = "ping_pong_v1";
 const CAP_SESSION_ATTACH: &str = "session_attach_v1";
 const CAP_ADMISSION_FACTS_RELAY: &str = "admission_facts_relay_v1";
 
-const SUBC_CONTROL_OPS: &[&str] = &[
-    "claim.mint",
-    "claim.present",
-    ops::DAEMON_SHUTDOWN_INTENT,
-    ops::ACTIVITY_RECORD,
-    ops::ACTIVITY_QUERY,
-    ops::ACTIVITY_SUBSCRIBE,
-    ops::SERVER_DESCRIBE,
-    ops::CATALOG_LIST,
-    ops::CATALOG_WATCH,
-    ops::ROUTE_OPEN,
-    ops::ROUTE_POLL,
-    ops::ROUTE_CLOSING,
-    ops::ROUTE_CLOSED,
-    ops::SUPERVISOR_LIST,
-    ops::SUPERVISOR_RESTART,
-    ops::SUPERVISOR_SWAP,
-    ops::SUPERVISOR_RELOAD,
-    ops::SUPERVISOR_RESCAN,
-    ops::SUPERVISOR_RELEASE_RESERVED,
-    ops::SUPERVISOR_SET_ENABLED,
-    ops::SUPERVISOR_HEALTH_PROBE,
-    ops::SUPERVISOR_HEALTH,
-    ops::SUPERVISOR_STDERR_TAIL,
-    ops::SUPERVISOR_TERMINALS,
-    ops::SUPERVISOR_ROUTES,
-    ops::SUPERVISOR_PROVENANCE,
-    ops::SUPERVISOR_SPAWN_SNAPSHOT,
-    ops::SUPERVISOR_SPAWN_SUBSCRIBE,
-];
-
-/// Client ops the daemon serves but leaves out of `subc_ops`. Each is
-/// announced by a capability in `server.describe` instead, and clients check
-/// that capability before sending it. `ck daemon --json` prints `subc_ops`
-/// verbatim and scripts read that output, so a new name there would change it.
-/// A malformed body for one of these is still refused `invalid_control_body`
-/// rather than as an unknown op.
-const SUBC_UNADVERTISED_CONTROL_OPS: &[&str] = &[
-    ops::SUPERVISOR_RESCAN_CHECKED,
-    "config.modules",
-    "config.schema",
-    "config.show",
-    "config.watch",
-    "config.status",
-    "config.plan",
-    "config.plan_get",
-    "config.plan_discard",
-    "config.apply",
-    "config.stamp",
-    "config.unstamp",
-    "config.history",
-    "config.rollback",
-];
-
+mod advertised_ops;
+use advertised_ops::*;
 mod caller_attestation;
 mod channel_operations;
 #[cfg(all(test, unix, feature = "test-support"))]
@@ -181,23 +129,9 @@ mod usage;
 
 mod agent_commands;
 pub(crate) mod catalog;
+mod policy_root;
 mod rescan_checked;
 use rescan_checked::{RescanMode, RescanPlan};
-
-const MODULE_TO_SUBC_CONTROL_OPS: &[&str] = &[
-    "claim.mint",
-    "claim.present",
-    MODULE_TO_SUBC_OP_CATALOG_UPDATE,
-    MODULE_TO_SUBC_OP_CATALOG_UPDATE_ROLE_DECLARATIONS,
-    "supervisor.live_roots",
-    "supervisor.agent_commands",
-    SCOPE_SYNC_OP,
-    SCOPE_APPLY_OP,
-    SCOPE_DESCRIBE_OP,
-    ops::SCOPE_WATCH,
-    subc_protocol::scope::ROUTE_AUTHORIZE_OP,
-    "operator.confirm",
-];
 
 /// Module-originated ops the daemon answers but does not advertise in
 /// `HELLO_ACK`. Empty today; an op is served from here while the feature it
@@ -2235,6 +2169,7 @@ impl ControlHandler {
                                 | "scope.describe"
                                 | "scope.watch"
                                 | "supervisor.live_roots"
+                                | subc_protocol::policy_root::GET_OP
                                 | "activity.record"
                         )
                     });
@@ -2440,6 +2375,9 @@ impl ControlHandler {
                     op.as_ref().map(|probe| probe.op.as_str()),
                 )? {
                     return Ok(vec![refusal]);
+                }
+                if let Some(probe) = op.as_ref().filter(|probe| policy_root::is_op(&probe.op)) {
+                    return self.handle_policy_root(ctx, frame, &probe.op).await;
                 }
                 if op
                     .as_ref()
@@ -4386,6 +4324,11 @@ impl ControlHandler {
                 )?])
             }
             ClientControlRequest::ServerDescribe {} => self.handle_server_describe(frame),
+            ClientControlRequest::PolicyRoot(_)
+            | ClientControlRequest::PolicyRootSet(_)
+            | ClientControlRequest::PolicyRootRecover(_) => {
+                unreachable!("policy root ops dispatch before the client-only path")
+            }
             ClientControlRequest::CatalogList { module_id } => {
                 self.handle_catalog_list(frame, module_id)
             }
@@ -8459,6 +8402,7 @@ impl ControlHandler {
             }
         };
         if !preview {
+            self.rescan_policy_root(config.agent_policy_root).await;
             if let Some(ledger) = &self.activity {
                 ledger.module_rescanned(&result.added, &result.removed, requester.clone());
                 ledger.config_changed(&result.added, &result.removed, &changed, requester);
@@ -9866,6 +9810,9 @@ impl PrivilegedRequest for ClientControlRequest {
             Some(PrivilegedOperation::ReleaseReserved { module_id })
         }
         ClientControlRequest::ServerDescribe {}
+        | ClientControlRequest::PolicyRoot(_)
+        | ClientControlRequest::PolicyRootSet(_)
+        | ClientControlRequest::PolicyRootRecover(_)
         // The announcement uses the same client admission as supervisor.restart,
         // but cannot stop anything itself and needs no operator confirmation.
         | ClientControlRequest::DaemonShutdownIntent { .. }
@@ -9887,6 +9834,9 @@ impl PrivilegedRequest for ClientControlRequest {
 
 fn client_control_request_op(request: &ClientControlRequest) -> &'static str {
     match request {
+        ClientControlRequest::PolicyRoot(_) => subc_protocol::policy_root::GET_OP,
+        ClientControlRequest::PolicyRootSet(_) => subc_control::policy_root::SET_OP,
+        ClientControlRequest::PolicyRootRecover(_) => subc_control::policy_root::RECOVER_OP,
         ClientControlRequest::DaemonShutdownIntent { .. } => ops::DAEMON_SHUTDOWN_INTENT,
         ClientControlRequest::ServerDescribe {} => ops::SERVER_DESCRIBE,
         ClientControlRequest::SupervisorProvenance { .. } => ops::SUPERVISOR_PROVENANCE,
@@ -10019,6 +9969,10 @@ fn principal_label(principal: &Principal) -> String {
 
 fn module_control_request_op(request: &ModuleControlRequestFromModule) -> &'static str {
     match request {
+        ModuleControlRequestFromModule::PolicyRoot(_) => subc_protocol::policy_root::GET_OP,
+        ModuleControlRequestFromModule::PolicyRootRotate(_) => {
+            subc_protocol::policy_root::ROTATE_OP
+        }
         ModuleControlRequestFromModule::CatalogUpdate { .. } => MODULE_TO_SUBC_OP_CATALOG_UPDATE,
         ModuleControlRequestFromModule::CatalogUpdateRoleDeclarations { .. } => {
             MODULE_TO_SUBC_OP_CATALOG_UPDATE_ROLE_DECLARATIONS

@@ -303,7 +303,8 @@ impl ConfigGate {
         }
         let mut rollback_programs = Vec::new();
         if let PlanKind::Rollback(id) = kind {
-            let target = GateSnapshot::from_store(&store.rollback_configuration(id)?)?;
+            let mut target = GateSnapshot::from_store(&store.rollback_configuration(id)?)?;
+            runtime::policy_root::preserve_root_on_rollback(store.body()?, id, &mut target)?;
             if target
                 .inputs
                 .iter()
@@ -360,6 +361,17 @@ impl ConfigGate {
             };
         if !recovery {
             candidate.carry_project_inputs(&approved);
+        }
+        if status.state == StoreState::Stamped
+            && kind == PlanKind::Change
+            && edits.as_ref().is_none_or(|edit| edit.policy_root.is_none())
+            && runtime::policy_root::section_value(&candidate)
+                != runtime::policy_root::section_value(&approved)
+        {
+            return Err(GateError::new(
+                "value_invalid",
+                "use a policy_root operation to change the stamped agent policy trust root",
+            ));
         }
         let changed: BTreeSet<InputKey> = approved
             .changed_keys(&candidate)
@@ -680,6 +692,7 @@ impl ConfigGate {
         review: impl FnOnce(&GateSnapshot, &GateSnapshot) -> Result<Changeset>,
     ) -> Result<ConfigPlanView> {
         let mut target = GateSnapshot::from_store(&store.rollback_configuration(generation)?)?;
+        runtime::policy_root::preserve_root_on_rollback(store.body()?, generation, &mut target)?;
         target.inputs.retain(|key, _| !key.is_project());
         target.restore_programs_from(current_programs)?;
         let copied = store
@@ -740,7 +753,7 @@ impl ConfigGate {
         store: &mut ConfigStore,
         current: &GateSnapshot,
         now_ms: u64,
-        before_publication: impl FnOnce() -> Result<()>,
+        before_publication: impl FnOnce() -> Result<Option<crate::policy_root::ledger::Checkpoint>>,
     ) -> Result<u64> {
         let plan = self
             .plans
@@ -778,7 +791,7 @@ impl ConfigGate {
             }
         }
         let snapshot = plan.snapshot.to_store()?;
-        let entry = HistoryEntry {
+        let mut entry = HistoryEntry {
             generation,
             kind: if declarations_only {
                 CommitKind::DeclarationApproval
@@ -825,7 +838,12 @@ impl ConfigGate {
             }
         }
         let observed = observed.to_store()?;
-        before_publication()?;
+        if let Some(checkpoint) = before_publication()? {
+            // This is a publication receipt, not a change to the reviewed
+            // inputs: it describes the ledger after the durable append.
+            entry.generation.changeset.apply_plan[crate::policy_root::ledger::CHECKPOINT_FIELD] =
+                serde_json::to_value(checkpoint).map_err(GateError::invalid)?;
+        }
         let result = if plan.recovery {
             store.recovery_exit(entry, snapshot, now_ms)
         } else {

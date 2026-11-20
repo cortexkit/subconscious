@@ -260,6 +260,42 @@ keychain deletion, old-binary and program-identity platform gaps. Release builds
 currently cannot approve a stamp; development approval does not enable release
 surfaces.
 
+### Agent policy trust root
+
+These channel-0 requests reject unknown fields. `server.describe` advertises the
+operator ops; `HELLO_ACK` advertises the module ops.
+
+| Op | Caller | Body fields | Reply fields |
+| --- | --- | --- | --- |
+| `policy_root.get` | Local operator client or registered module | none | `pin`, `generation` |
+| `policy_root.set` | Local operator client | `key_id`, `public_key_hex` | `digest`, `state: "pending"` |
+| `policy_root.rotate` | The vault only: principal `reserved:claustrum`, a module the daemon launched and verified by its launch nonce ([principal.md](principal.md)) | `statement_b64`, `signature_hex` | `digest`, `state: "pending"` |
+| `policy_root.recover` | Local operator client | `body_b64` | `digest`, `state: "pending"` |
+
+`pin` is either `null` or `{key_id, public_key_hex, retired_key_ids}`. `generation`
+is the approved configuration generation, or zero on an unstamped install. The
+pin is not a secret; an enforcer should re-read it when verifying a policy.
+
+Rotation signs `ck-policy-root-rotation/v1` followed by a zero byte and the body
+encoded using the JSON Canonicalization Scheme (RFC 8785). Recovery submits the vault's canonically encoded
+`ck-policy-root-recovery/v1` body without an old-root signature. Body encoding is
+standard padded Base64; signatures and public keys use lowercase hex. A pending
+move refuses a second with `policy_root_change_pending`. An already-used
+destination refuses with `policy_root_key_reused`.
+
+`policy_root.set` refuses a valid pin (`policy_root_pin_exists`), but may replace
+a malformed or null section. A missing ledger on an install with pin history,
+or one that no longer extends its stamped checkpoint, is refused with
+`policy_root_ledger_unavailable`.
+
+The digest is an ordinary configuration plan digest. Apply it with
+`ck config apply <digest>`. On stamped installs, follow the existing configuration
+review process. On unstamped installs, apply requires interactive OS presence;
+the module-facing `operator.confirm` operation is unchanged. A pending reply
+means the pin has not changed: the vault keeps signing with the old key until
+`policy_root.get` reports the new pin. A direct `config.plan` edit targeting the
+daemon section is refused.
+
 ### `app.open` and `connection.describe`
 
 `{"op":"app.open","app":"<id>"}` replies with
@@ -440,7 +476,9 @@ to a module that lists it.
 | `route.status` | Push | Report a status string for one of the module's routes, read back by `route.poll`. |
 | `catalog.update` | Request | Replace the module's `provides` roles, optionally its capability declaration, and optionally its readiness, without re-registering. Test: `catalog_update_refreshes_catalog_without_disrupting_bound_routes` (`crates/subc-core/tests/catalog_update.rs`). |
 | `catalog.update_role_declarations` | Request | Replace the module's complete `role_declarations` map, or clear it with `{}`, without changing provider roles, capabilities or readiness. Served since daemon 0.44.9. |
-| `supervisor.live_roots` | Request | Count live and pending routes per canonical project root, also including the workdir of each bound scoped route. A route contributes once when both paths match. |
+ | `supervisor.live_roots` | Request | Count live and pending routes per canonical project root, also including the workdir of each bound scoped route. A route contributes once when both paths match. |
+ | `policy_root.get` | Request | Read the current agent policy trust root and its generation. |
+ | `policy_root.rotate` | Request | Propose a signed trust-root rotation from the launch-verified vault. |
 | `scope.sync`, `scope.apply`, `scope.describe` | Request | Register, change and read scopes. See [`scopes.md`](scopes.md). |
 | `scope.watch` | Subscription | Snapshot and follow the lifetime of selected scope epochs (below). |
 | `operator.confirm` | Request | Ask the person at the machine to confirm one in-flight write (section 5.1). |

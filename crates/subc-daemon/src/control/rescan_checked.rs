@@ -94,6 +94,11 @@ pub(super) struct ModuleEntries {
 }
 
 impl ModuleEntries {
+    pub(super) fn reserved(&self, module_id: &str) -> bool {
+        self.configured
+            .get(module_id)
+            .is_some_and(|entry| entry.reserved)
+    }
     pub(super) fn seed(&mut self, modules: &[ConfiguredModule]) {
         self.configured = modules
             .iter()

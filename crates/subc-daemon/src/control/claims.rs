@@ -3162,6 +3162,7 @@ pub(crate) mod tests {
             serde_json::json!({"op":"catalog.update","provides":[],"ready":false}),
             serde_json::json!({"op":"catalog.update_role_declarations","role_declarations":{}}),
             serde_json::json!({"op":"supervisor.live_roots"}),
+            serde_json::json!({"op":"policy_root.get"}),
             serde_json::json!({"op":"activity.record","kind":"claims:brokered.settled","summary":"Worker settled"}),
             serde_json::json!({"op":"scope.describe","owner":{"kind":"reserved","module_id":"claims-module"},"ref":"missing"}),
         ] {
@@ -3200,6 +3201,7 @@ pub(crate) mod tests {
             "config.stamp",
             "config.unstamp",
             "config.apply",
+            "policy_root.rotate",
         ] {
             error(
                 &child.call(request(serde_json::json!({"op":op}))).await,

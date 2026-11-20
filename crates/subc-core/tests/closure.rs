@@ -773,6 +773,9 @@ fn thin_core_ops() -> BTreeSet<&'static str> {
     BTreeSet::from([
         "claim.mint",
         "claim.present",
+        "policy_root.get",
+        "policy_root.set",
+        "policy_root.recover",
         ops::DAEMON_SHUTDOWN_INTENT,
         ops::SERVER_DESCRIBE,
         ops::CATALOG_LIST,

@@ -210,6 +210,10 @@ pub enum ModuleControlRequestFromModule {
     },
     #[serde(rename = "supervisor.live_roots")]
     LiveRoots {},
+    #[serde(rename = "policy_root.get")]
+    PolicyRoot(crate::policy_root::GetPolicyRoot),
+    #[serde(rename = "policy_root.rotate")]
+    PolicyRootRotate(crate::policy_root::RotatePolicyRoot),
     /// Attribute agent-requested command roots to the declaring module.
     /// Only the module's supervised connection may send this operation.
     /// `known`, when present, replaces its complete live root set. The reply
@@ -292,6 +296,10 @@ pub enum ModuleControlResponseToModule {
         unknown_root_bindings: u64,
         total_bindings: u64,
     },
+    #[serde(rename = "policy_root.get")]
+    PolicyRoot(crate::policy_root::PolicyRoot),
+    #[serde(rename = "policy_root.rotate")]
+    PolicyRootRotate(crate::policy_root::PolicyRootChange),
     #[serde(rename = "scope.sync")]
     ScopeSync {
         generation: u64,

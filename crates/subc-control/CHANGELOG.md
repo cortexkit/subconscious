@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.42.4
+
+- Add local operator control bodies for reading, setting and recovering the
+  agent policy trust root. Require subc-protocol 0.37.6.
+
 ## 0.42.3
 
 - Define the `config.settings.projects/v1` wire capability, opt-in project watches,

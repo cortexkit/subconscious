@@ -28,6 +28,7 @@ mod ckni;
 mod config_cli;
 mod inline_actions;
 mod inline_views;
+mod policy_root_cli;
 use ckni::JsonOutput;
 
 use std::{
@@ -102,6 +103,7 @@ const BUILTIN_DOMAINS: &[&str] = &[
     "help",
     "machine",
     "module",
+    "policy-root",
     "provenance",
     "quota",
     "routes",
@@ -629,7 +631,7 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
 
     let resolved = discover_connection_file(args.subc.as_deref())
         .map_err(|error| decorate_error(error, args.json, args.subc.as_deref()))?;
-    let connected = if matches!(args.command, Command::Config(_)) {
+    let connected = if matches!(args.command, Command::Config(_) | Command::PolicyRoot(_)) {
         CkClient::connect_config_local(resolved).await
     } else {
         CkClient::connect(resolved).await
@@ -680,6 +682,7 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
 
     let result = match args.command {
         Command::Config(request) => config_cli::run(&mut client, request, json_output).await,
+        Command::PolicyRoot(action) => policy_root_cli::run(&mut client, action, json_output).await,
         Command::Dashboard => unreachable!("handled before connecting"),
         Command::Module(ModuleCommand::CheckScript { .. }) => unreachable!("handled before connecting"),
         Command::Module(ModuleCommand::List) => {
@@ -1556,6 +1559,7 @@ enum Command {
     },
     Module(ModuleCommand),
     Config(subc_control::config::ConfigControlRequest),
+    PolicyRoot(policy_root_cli::Action),
     Activity(activity::Options),
     Routes {
         module_id: Option<String>,
@@ -1822,32 +1826,7 @@ impl CkClient {
     }
 
     async fn route_open_management(&mut self, module_id: &str) -> Result<RouteHandle, CkError> {
-        let request = ClientControlRequest::RouteOpen {
-            busy_refusals: None,
-            target: RouteTarget::ManagementSurface {
-                module_id: module_id.to_string(),
-            },
-            identity: BindIdentity::new(CK_HARNESS, "quota"),
-            consumer_identity: None,
-            consumer_capabilities: None,
-            role_versions: None,
-            admission_facts: None,
-            scope: None,
-        };
-        let value = self.rpc_value(request).await?;
-        match serde_json::from_value::<ClientControlResponse>(value)? {
-            ClientControlResponse::RouteOpen {
-                route_channel,
-                route_epoch,
-                ..
-            } => Ok(RouteHandle {
-                channel: route_channel,
-                epoch: route_epoch,
-            }),
-            other => Err(CkError::Message(format!(
-                "unexpected route.open response: {other:?}"
-            ))),
-        }
+        policy_root_cli::open_management(self, module_id, "quota").await
     }
 
     async fn route_request_value(
@@ -8634,6 +8613,7 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
                 Some("upgrade") => UPGRADE_HELP.into(),
                 Some("module") => MODULE_HELP.into(),
                 Some("config") => config_cli::HELP.into(),
+                Some("policy-root") => policy_root_cli::HELP.into(),
                 Some("routes") => ROUTES_HELP.into(),
                 Some("catalog") => CATALOG_HELP.into(),
                 Some("provenance") => PROVENANCE_HELP.into(),
@@ -8647,6 +8627,7 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
         }
         "activity" => activity::parse(tail),
         "config" => config_cli::parse(tail),
+        "policy-root" => policy_root_cli::parse(tail),
         "setup"
             if tail
                 .iter()

@@ -218,6 +218,43 @@ ck module release old-module
 While stamped, release checks membership in the approved generation. A pending
 file edit that re-adds an approved-removed module does not block release.
 
+### Agent policy trust root
+
+The optional `agent_policy_root` section of `subc.jsonc` pins the public Ed25519
+key used to verify agent policies. It contains `key_id` (the first eight bytes
+of SHA-256 of the raw key, as lowercase hex) and `public_key_hex` (the raw
+32-byte key, as lowercase hex). A missing or invalid section means no pin, not
+an implicit trust root. Check `ck config status` for configuration problems.
+
+- `ck policy-root show` prints the current key id, fingerprint and retired ids,
+  or `no pin`.
+- `ck policy-root set --vault-key <name>` reads the named public key from the
+  vault and prepares a pin when no valid pin exists. It can replace a malformed
+  or null section, but cannot replace a valid pin or bypass the ledger checks.
+- `ck policy-root recover --body <file>` submits the recovery statement prepared
+  by the vault. Recovery retires the old key without its consent; use it only if
+  that key is lost or leaked.
+
+Check the fingerprints before running the printed `ck config apply <digest>`.
+Stamped installs use the existing configuration review; unstamped installs
+require interactive OS presence for these commands. Pin moves do not require a
+restart. On an unstamped development install, hand-editing the section and
+rescanning is an operator override outside the pin-move guarantees.
+
+The daemon keeps rotated and retired ids in its owner-only
+`policy-root/ledger.json` under the absolute daemon data directory. Do not edit
+or delete the ledger. If it is deleted, restore it from backup; removing the
+section does not make a previously pinned install eligible for a fresh ledger.
+Stamped approvals record the ledger digest and row count. A ledger must retain
+that prefix to authorize a pin. Config rollback preserves the current pin.
+Stamping or recovering the store retires a known prior pin if the approved
+section replaces or removes it. A cold recovery has no trusted prior pin and
+starts its checkpoint from the readable ledger, if available.
+
+If a move is interrupted after the ledger append, the daemon refuses the old
+pin; retry the same plan, or after a restart re-submit the original statement
+and approve the new digest.
+
 ### Remove the stamp
 
 `ck config unstamp` builds a plan; `ck config apply <digest>` needs the same

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.37.6
+
+- Define the module wire bodies for reading the agent policy trust root and
+  proposing a signed rotation, with a pending approval digest in the reply.
+
 ## 0.37.5
 
 - Define the shared workspace and project configuration refusal codes.

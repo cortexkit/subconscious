@@ -49,6 +49,7 @@ pub mod machine_id;
 pub mod manifest;
 pub mod module_id;
 pub mod peer;
+pub mod policy_root;
 pub mod provider_declarations;
 pub mod scope;
 pub mod session;

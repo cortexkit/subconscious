@@ -15,6 +15,7 @@ pub(crate) struct EditPlan {
     pub refusals: Vec<ConfigPlanRefusal>,
     pub files: Vec<WriteBack>,
     pub user_modules: BTreeSet<String>,
+    pub policy_root: Option<crate::policy_root::Change>,
 }
 
 #[derive(Clone)]
@@ -227,8 +228,13 @@ pub(super) fn loaded_write_back_status(state: &OwnerState) -> Result<BTreeMap<St
             let bytes = entry
                 .delivery
                 .as_ref()
-                .and_then(|delivery| delivery.modules.get(&intent.module_id))
-                .and_then(|view| view.layers.first())
+                .and_then(|delivery| {
+                    if intent.module_id == policy_root::DAEMON {
+                        delivery.daemon.as_ref()
+                    } else {
+                        delivery.modules.get(&intent.module_id)?.layers.first()
+                    }
+                })
                 .and_then(|layer| layer.bytes.clone());
             if let Some(bytes) =
                 bytes.filter(|bytes| subc_config::raw_digest(bytes) == intent.candidate_digest)
@@ -320,6 +326,23 @@ impl RuntimeOwner {
         edits: Vec<ConfigEdit>,
         touched: BTreeSet<String>,
     ) -> Result<PreparedPlan> {
+        self.prepare_edit_base_inner(base_generations, edits, touched, None)
+    }
+
+    pub(super) fn prepare_policy_root_edit(
+        &self,
+        movement: crate::policy_root::Move,
+    ) -> Result<PreparedPlan> {
+        self.prepare_edit_base_inner(BTreeMap::new(), Vec::new(), BTreeSet::new(), Some(movement))
+    }
+
+    fn prepare_edit_base_inner(
+        &self,
+        base_generations: BTreeMap<String, u64>,
+        mut edits: Vec<ConfigEdit>,
+        touched: BTreeSet<String>,
+        movement: Option<crate::policy_root::Move>,
+    ) -> Result<PreparedPlan> {
         let mut state = self.lock()?;
         Self::check_authority(&mut state, false)?;
         let unstamped = state.store.status().state == StoreState::Unstamped;
@@ -352,12 +375,22 @@ impl RuntimeOwner {
         } else {
             self.edit_baseline(&mut state, Some(&user_modules))?
         };
+        let policy_root = movement
+            .map(|movement| self.check_policy_root_move(&state, &candidate, movement, unstamped))
+            .transpose()?;
+        if let Some(change) = &policy_root {
+            edits.push(policy_root::edit_for(Some(json!(&change.next))));
+        }
+        let daemon_base = policy_root.as_ref().map(|_| candidate.daemon.bytes.clone());
         let baseline = candidate.diagnostic.clone();
         let mut refusals = Vec::new();
         let mut accepted: BTreeMap<String, Vec<ConfigEdit>> = BTreeMap::new();
         for edit in edits {
             let result: Result<()> = (|| {
                 if edit.module_id == "subc" {
+                    if policy_root.is_some() && edit.path == crate::policy_root::POINTER {
+                        return policy_root::patch_daemon(&mut candidate, edit.clone());
+                    }
                     return Err(GateError::new(
                         "value_invalid",
                         "daemon settings cannot be edited in this version",
@@ -448,13 +481,22 @@ impl RuntimeOwner {
         let mut files = Vec::new();
         let mut observed_handles = Vec::new();
         for (module, _) in accepted {
-            let captured = &candidate.modules[&module];
-            let mut disk = CapturedFile::open(&captured.file.path)?;
+            let (file, base) = if module == policy_root::DAEMON {
+                (
+                    &candidate.daemon,
+                    daemon_base.as_ref().and_then(|bytes| bytes.as_deref()),
+                )
+            } else {
+                (
+                    &candidate.modules[&module].file,
+                    bases[&module].layers[0].bytes.as_deref(),
+                )
+            };
+            let mut disk = CapturedFile::open(&file.path)?;
             // Never sweep an unrelated dirty file value into an approved edit.
             // If it differs from the baseline, retain the approval but leave reconciliation pending.
-            let base = bases[&module].layers[0].bytes.as_deref();
             let skipped = disk.bytes.as_deref() != base;
-            let bytes = captured.file.bytes.clone().unwrap_or_default();
+            let bytes = file.bytes.clone().unwrap_or_default();
             files.push(WriteBack {
                 module,
                 path: disk.path.clone(),
@@ -516,6 +558,7 @@ impl RuntimeOwner {
                 refusals,
                 files,
                 user_modules,
+                policy_root,
             }),
         })
     }
@@ -652,6 +695,16 @@ impl RuntimeOwner {
     /// Returns generation zero only for unstamped edit plans. No approval or
     /// approved-store write takes place while files remain authoritative.
     pub(crate) fn apply_unstamped_edits(&self, digest: &Digest) -> Result<Option<u64>> {
+        self.apply_unstamped_edits_after_presence(digest, false, 0, || Ok(()))
+    }
+
+    pub(crate) fn apply_unstamped_edits_after_presence(
+        &self,
+        digest: &Digest,
+        presence: bool,
+        now_ms: u64,
+        before_write: impl FnOnce() -> Result<()>,
+    ) -> Result<Option<u64>> {
         let mut state = self.lock()?;
         let Some(plan) = state.gate.plans.get(digest) else {
             return Ok(None);
@@ -686,8 +739,27 @@ impl RuntimeOwner {
         for file in &edit.files {
             file.unchanged()?;
         }
+        if let Some(change) = &edit.policy_root {
+            if !presence {
+                return Err(GateError::new(
+                    "approval_surface_unavailable",
+                    "policy root changes require interactive operator presence",
+                ));
+            }
+            if !self.unstamped_root_matches(change)? {
+                return Err(GateError::stale());
+            }
+            if edit.files.iter().any(|file| file.skipped) {
+                return Err(GateError::stale());
+            }
+            before_write()?;
+            self.publish_policy_root_ledger(change, now_ms, None, false)?;
+        }
         for file in &edit.files {
             file.write_back()?;
+        }
+        if let Some(change) = edit.policy_root {
+            self.replace_unstamped_root(Ok(Some(change.next)));
         }
         state.gate.expire_plan(digest);
         state.plan_deadlines.remove(digest);

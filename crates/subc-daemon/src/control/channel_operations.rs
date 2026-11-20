@@ -62,6 +62,8 @@ pub(super) const REGISTRATION_OPERATIONS: &[&str] = &[
     ops::SCOPE_WATCH,
     subc_protocol::scope::ROUTE_AUTHORIZE_OP,
     "supervisor.live_roots",
+    subc_protocol::policy_root::GET_OP,
+    subc_protocol::policy_root::ROTATE_OP,
     "supervisor.agent_commands",
     subc_control::SCOPE_SERVED_BY_OP,
 ];

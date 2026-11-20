@@ -478,6 +478,11 @@ impl StoreBody {
     /// active/recovery versions even when recent history must be discarded.
     pub(super) fn protected_generations(&self) -> BTreeSet<u64> {
         let mut keep = BTreeSet::new();
+        // The ledger prefix remains authoritative even when unrelated daemon
+        // approvals make the generation that recorded it old history.
+        if let Some((id, _)) = crate::policy_root::ledger::last_checkpoint(self) {
+            keep.insert(id);
+        }
         // Program-only placements have no configuration tuple pointer. Retain
         // each module's newest placement until a person-approved generation
         // supersedes the development overlay.

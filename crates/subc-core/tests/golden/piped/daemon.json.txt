@@ -61,7 +61,10 @@ exit: Some(0)
     "supervisor.routes",
     "supervisor.provenance",
     "supervisor.spawn_snapshot",
-    "supervisor.spawn_subscribe"
+    "supervisor.spawn_subscribe",
+    "policy_root.get",
+    "policy_root.set",
+    "policy_root.recover"
   ]
 }
 --- stderr ---

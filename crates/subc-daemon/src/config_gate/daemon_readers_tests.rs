@@ -417,7 +417,9 @@ fn config_readers_cached_view_tracks_commits_boot_and_detected_tamper() {
         enabled: bool,
     ) -> Arc<crate::daemon_config::DaemonConfig> {
         match owner.approved_daemon_view() {
-            ApprovedDaemonView::Approved { generation, config } => {
+            ApprovedDaemonView::Approved {
+                generation, config, ..
+            } => {
                 assert_eq!(generation, expected_generation);
                 assert_eq!(config.modules[0].enabled, enabled);
                 config

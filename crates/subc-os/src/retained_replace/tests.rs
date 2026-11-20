@@ -114,6 +114,39 @@ fn no_replace_refuses_existing_file_and_directory() {
 }
 
 #[test]
+fn checked_replace_refuses_changed_contents_without_publishing() {
+    let scratch = ScratchDir::new("retained-checked-replace");
+    let parent = open_parent(&scratch);
+    let path = scratch.join("layer");
+    fs::write(&path, b"old").unwrap();
+    let expected = open_single_link_file_nofollow_at(&parent, leaf("layer"))
+        .unwrap()
+        .unwrap();
+    let temp = stage(&parent, false);
+    fs::write(&path, b"other writer").unwrap();
+
+    let mut checks = 0;
+    let error = temp
+        .replace_checked(leaf("layer"), &expected, || {
+            checks += 1;
+            if fs::read(&path)? == b"old" {
+                Ok(())
+            } else {
+                Err(io::Error::other("target contents changed"))
+            }
+        })
+        .unwrap_err();
+    assert!(!error.renamed());
+    assert_eq!(
+        io::Error::from(error).to_string(),
+        "target contents changed"
+    );
+    assert_eq!(checks, 1);
+    assert_eq!(fs::read(&path).unwrap(), b"other writer");
+    assert_eq!(fs::read_dir(&*scratch).unwrap().count(), 1);
+}
+
+#[test]
 fn error_after_rename_reports_publication() {
     let scratch = ScratchDir::new("retained-published-error");
     let parent = open_parent(&scratch);

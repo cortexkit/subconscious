@@ -130,7 +130,19 @@ impl<'a> RetainedTempFile<'a> {
     /// preserved or replacement fails. Audit rules (which record access in
     /// the security log) are not copied from the old file. The staging file
     /// inherits those rules from the parent without requiring audit privileges.
-    pub fn replace(mut self, leaf: &OsStr, expected: &File) -> Result<(), DurableReplaceError> {
+    pub fn replace(self, leaf: &OsStr, expected: &File) -> Result<(), DurableReplaceError> {
+        self.replace_checked(leaf, expected, || Ok(()))
+    }
+
+    /// Like [`Self::replace`], but check the target after flushing staging and
+    /// immediately before each rename attempt. A failed check is not retried
+    /// and leaves the target unpublished.
+    pub fn replace_checked(
+        mut self,
+        leaf: &OsStr,
+        expected: &File,
+        mut check: impl FnMut() -> io::Result<()>,
+    ) -> Result<(), DurableReplaceError> {
         if self.for_publish {
             return Err(before(invalid("replacement requires private staging")));
         }
@@ -153,11 +165,16 @@ impl<'a> RetainedTempFile<'a> {
         })?;
         drop(current);
         platform::flush_staging(&self.stage.file, false).map_err(before)?;
-        platform::retry(|| {
+        platform::retry(|| -> io::Result<io::Result<()>> {
             self.stage.verify()?;
             open_expected()?;
-            platform::rename(&self.stage, leaf, true)
+            if let Err(error) = check() {
+                return Ok(Err(error));
+            }
+            platform::rename(&self.stage, leaf, true)?;
+            Ok(Ok(()))
         })
+        .and_then(|checked| checked)
         .map_err(before)?;
         self.stage.published = true;
         self.stage.flush_publication()

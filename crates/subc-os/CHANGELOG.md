@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.48
+
+- Allow a caller to check the target's contents after flushing the staging file
+  and immediately before each rename attempt. A failed check leaves the target intact.
+
 ## 0.1.47
 
 - Preserve the root separator and other path components when opening canonical Windows paths. Open directories without requesting permission to list their contents, while still refusing reparse points in every component.

@@ -1924,21 +1924,42 @@ describe("scoped route opens", () => {
       } finally { client.close(); }
     });
 
-    test(`${code} stops scoped retries at the caller deadline`, async () => {
-      const { connFile } = tempConnectionFile();
-      const stats = newStats();
-      const daemon = await startFakeDaemon({ stats, routeOpenError: { code, message: "retry scope" } });
-      writeConnectionFile(connFile, daemon.port);
-      const clock = { now: 0 };
-      const client = await SubcClient.connect({ connectionFile: connFile, identity: IDENTITY, reconnectBackoff: BACKOFF,
-        now: () => clock.now, random: () => 1, sleep: async (ms) => { clock.now += ms; } });
-      try {
-        expect(await rejectionOf(client.call("retry", "echo", {}, { scope, consumerIdentity: null, timeoutMs: 20 }))).toMatchObject({ code, kind: "not_sent" });
-        expect(clock.now).toBe(20);
-        expect(stats.routeOpens).toBeGreaterThan(1);
-        expect(stats.dataRequests).toBe(0);
-      } finally { client.close(); }
-    });
+    for (const finalReply of [true, false]) {
+      test(`${code} stops scoped retries at the caller deadline${finalReply ? "" : " with no final reply"}`, async () => {
+        const { connFile } = tempConnectionFile();
+        const stats = newStats();
+        const openBudgets: number[] = [];
+        let controlTimer!: { ms: number; fire: () => void };
+        const daemon = await startFakeDaemon({
+          stats,
+          onRouteOpen: (_moduleId, answer) => {
+            openBudgets.push(controlTimer.ms);
+            if (!finalReply && stats.routeOpens === 3) controlTimer.fire();
+            else void answer({ code, message: "retry scope" });
+          },
+        });
+        writeConnectionFile(connFile, daemon.port);
+        const clock = { now: 0 };
+        const client = await SubcClient.connect({
+          connectionFile: connFile, identity: IDENTITY, reconnectBackoff: BACKOFF,
+          now: () => clock.now, random: () => 1, sleep: async (ms) => { clock.now += ms; },
+        });
+        // Drive control deadlines independently of both TCP scheduling and the
+        // retry clock. The fake daemon can respond or fire the pending timeout.
+        client["armRequestTimeout"] = (key, pending, channel, corr, ms) => {
+          controlTimer = { ms, fire: () => client["arbitrateTimeout"](key, pending, channel, corr, ms) };
+        };
+        try {
+          const error = await rejectionOf(client.call("retry", "echo", {}, { scope, consumerIdentity: null, timeoutMs: 20 }));
+          expect(error).toMatchObject({ code, kind: "not_sent" });
+          expect(openBudgets).toEqual([20, 15, 5]);
+          // A refusal spends the last 5 ms in backoff; an unanswered open
+          // spends it in the control timer, which does not move the retry clock.
+          expect(clock.now).toBe(finalReply ? 20 : 15);
+          expect(stats.dataRequests).toBe(0);
+        } finally { client.close(); }
+      });
+    }
   }
 });
 

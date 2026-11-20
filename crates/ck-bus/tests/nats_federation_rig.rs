@@ -1315,6 +1315,31 @@ mod leaf_link {
                 .is_err(),
             "a stream already at the shipped settings must not receive an update request"
         );
+
+        let vault_streams = [HubStream::VaultSharedLogins, HubStream::VaultManifestActive];
+        hub.ensure_streams(&record, &vault_streams).await.unwrap();
+        for (bucket, max_value, max_bytes) in [
+            ("vault-shared-logins", 256 * 1024, 64 * 1024 * 1024),
+            ("vault-manifest-active", 16 * 1024, 16 * 1024 * 1024),
+        ] {
+            let kv = js.get_key_value(bucket).await.unwrap();
+            let mut stream = js.get_stream(format!("KV_{bucket}")).await.unwrap();
+            let mut config = stream.cached_info().config.clone();
+            assert_eq!(config.max_messages_per_subject, 1, "{bucket}: history");
+            assert_eq!(config.max_message_size, max_value, "{bucket}: value limit");
+            assert_eq!(config.max_bytes, max_bytes, "{bucket}: bucket limit");
+            assert!(config.deny_delete && !config.allow_rollup, "{bucket}");
+
+            kv.put("probe", "keep".into()).await.unwrap();
+            config.max_message_size = 1024;
+            js.update_stream(config).await.unwrap();
+            hub.ensure_streams(&record, &vault_streams).await.unwrap();
+            assert_eq!(
+                stream.info().await.unwrap().config.max_message_size,
+                max_value
+            );
+            assert_eq!(kv.get("probe").await.unwrap().unwrap().as_ref(), b"keep");
+        }
     }
 
     fn binary(var: &str) -> PathBuf {

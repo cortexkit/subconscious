@@ -813,12 +813,13 @@ fn vendored_foundation_and_golden_match_their_source_record() {
     // so it moves with the pin in Cargo.toml.
     assert_eq!(
         field("golden_commit"),
-        "0657ad6c1ca23b82124d6ee4cbe15b1942f63277"
+        "79aa6eaee418578d7f52e6cfcc983bf27518f880"
     );
-    assert_eq!(field("golden_crate_version"), "cortexkit-bus-naming 0.5.6");
+    assert_eq!(field("golden_crate_version"), "cortexkit-bus-naming 0.5.8");
     for (file, digest_field) in [
         ("nats-message-plane-foundation.md", "source_sha256"),
         ("permission_golden.txt", "golden_sha256"),
+        ("hub.json", "hub_golden_sha256"),
     ] {
         let bytes = fs::read(fixture_dir().join(file)).expect("vendored file");
         let digest = Sha256::digest(&bytes)

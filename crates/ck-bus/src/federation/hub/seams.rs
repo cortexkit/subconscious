@@ -34,6 +34,8 @@ pub enum HubStream {
     Cuts,
     Rooms,
     Memory,
+    VaultSharedLogins,
+    VaultManifestActive,
 }
 
 /// The hub instance, through ck-bus's own users on its loopback admin listener.
@@ -48,7 +50,7 @@ pub trait HubServer: Send + Sync {
         account_public: &str,
         jwt: &str,
     ) -> Result<(), String>;
-    /// Creates each stream that does not exist yet; an existing one is left as it is.
+    /// Creates missing streams and reconciles existing streams in place.
     async fn ensure_streams(&self, record: &HubRecord, streams: &[HubStream])
         -> Result<(), String>;
     /// The leaf connections bound to the hub account.

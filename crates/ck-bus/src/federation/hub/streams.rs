@@ -3,7 +3,8 @@
 use async_nats::jetstream::stream;
 use cortexkit_bus_naming::federation::{
     cuts_object_store, hub_idlog_stream, hub_inbox_stream, hub_memory_stream, hub_rooms_stream,
-    residence_bucket, BoxId, HubKind, HubStreamSpec,
+    residence_bucket, vault_manifest_active_bucket, vault_shared_logins_bucket, BoxId, HubKind,
+    HubStreamSpec,
 };
 
 use super::seams::HubStream;
@@ -17,11 +18,16 @@ pub fn config_for(hub_stream: &HubStream) -> Result<stream::Config, String> {
             hub_inbox_stream(&BoxId::parse(box_id).map_err(|error| format!("{box_id:?}: {error}"))?)
         }
         HubStream::IdLog => hub_idlog_stream(),
-        // One server, so one replica.
         HubStream::Residence => residence_bucket(HubKind::SelfHosted).backing_stream,
         HubStream::Cuts => cuts_object_store(),
         HubStream::Rooms => hub_rooms_stream(),
         HubStream::Memory => hub_memory_stream(),
+        HubStream::VaultSharedLogins => {
+            vault_shared_logins_bucket(HubKind::SelfHosted).backing_stream
+        }
+        HubStream::VaultManifestActive => {
+            vault_manifest_active_bucket(HubKind::SelfHosted).backing_stream
+        }
     };
     Ok(hub_config(&spec))
 }

@@ -343,7 +343,9 @@ async fn setup_writes_the_conf_and_record_then_listens_and_brings_the_instance_u
             HubStream::Residence,
             HubStream::Cuts,
             HubStream::Rooms,
-            HubStream::Memory
+            HubStream::Memory,
+            HubStream::VaultSharedLogins,
+            HubStream::VaultManifestActive,
         ]
     );
     assert_eq!(fixture.metric("fed.hub_setup"), json!("ready"));
@@ -588,10 +590,17 @@ async fn the_hub_machines_own_leaf_uses_its_machine_id_and_the_local_identity() 
     assert_eq!(identity.spki_sha256, fixture.record().spki_sha256);
     let nkey = leaf_nkey();
     let jwt = local.issue(&nkey).await.unwrap();
-    let (publish, _) = leaf_permissions(OWN_BOX).unwrap();
+    let golden: Value =
+        serde_json::from_str(include_str!("../../../tests/fixtures/foundation/hub.json")).unwrap();
+    assert_eq!(golden["box_id"], OWN_BOX);
+    let claims = decode_claims(&jwt).unwrap();
     assert_eq!(
-        decode_claims(&jwt).unwrap()["nats"]["pub"]["allow"],
-        json!(publish)
+        claims["nats"]["pub"],
+        json!({ "allow": golden["grant"]["publish"] })
+    );
+    assert_eq!(
+        claims["nats"]["sub"],
+        json!({ "allow": golden["grant"]["subscribe"] })
     );
     assert_eq!(issued(&fixture.area)[HUB_FP], (OWN_BOX.to_string(), nkey));
 }

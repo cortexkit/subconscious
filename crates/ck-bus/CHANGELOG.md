@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.12.1
+
+- Use cortexkit-bus-naming 0.5.8 to issue hub credentials to the vault and manifest reader, provision the two vault KV buckets in place, and include their scoped permissions in leaf JWTs.
+
 ## 0.12.0
 
 - Add `ckbus.event_probe` to verify the latest stored event on an exact local subject without granting EVENT reads or returning the body.

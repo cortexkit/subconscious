@@ -742,6 +742,8 @@ impl HubArea {
             HubStream::Cuts,
             HubStream::Rooms,
             HubStream::Memory,
+            HubStream::VaultSharedLogins,
+            HubStream::VaultManifestActive,
         ];
         let mut boxes: Vec<&str> = record.issued.values().map(|i| i.box_id.as_str()).collect();
         boxes.sort_unstable();

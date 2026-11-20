@@ -119,7 +119,7 @@ async fn hub_credential_refuses_non_hub_attested_caller_even_if_it_claims_a_hub_
             &handler,
             "non-hub",
             issuance::HUB_CREDENTIAL_OP,
-            json!({"module_id": "magic-context"}),
+            json!({"module_id": "claustrum"}),
         )
         .await,
         "hub_not_granted",
@@ -129,7 +129,7 @@ async fn hub_credential_refuses_non_hub_attested_caller_even_if_it_claims_a_hub_
             &handler,
             "non-hub",
             issuance::HUB_CREDENTIAL_RENEW_OP,
-            json!({"credential_public": "a key", "module_id": "magic-context"}),
+            json!({"credential_public": "a key", "module_id": "plexus"}),
         )
         .await,
         "hub_not_granted",
@@ -255,6 +255,31 @@ async fn hub_credential_issued_by_ckbus_runs_the_real_memory_probes() {
         .await,
     );
     let answer = result(issue().await);
+    for module_id in ["claustrum", "plexus"] {
+        let issued = result(
+            request(
+                &handler,
+                module_id,
+                issuance::HUB_CREDENTIAL_OP,
+                json!({"module_id": "not-the-attested-id"}),
+            )
+            .await,
+        );
+        assert_eq!(issued["account_public"], fixture.federation);
+        let claims = decode_claims(issued["jwt"].as_str().unwrap()).unwrap();
+        assert_eq!(claims["sub"], issued["credential_public"]);
+        assert_eq!(claims["nats"]["issuer_account"], fixture.federation);
+        assert_eq!(
+            claims["nats"]["sub"]["allow"],
+            json!([format!("ckdel.{box_id}.{module_id}.>")])
+        );
+        let publish = claims["nats"]["pub"]["allow"].as_array().unwrap();
+        assert!(publish.contains(&json!("$JS.hub.API.DIRECT.GET.KV_vault-manifest-active")));
+        assert_eq!(
+            publish.contains(&json!(format!("$KV.vault-shared-logins.{box_id}.>"))),
+            module_id == "claustrum"
+        );
+    }
     assert_eq!(answer["acct"], format!("fed_{box_id}"));
     assert_eq!(answer["account_public"], fixture.federation);
     assert_eq!(answer["box_id"], box_id.as_str());

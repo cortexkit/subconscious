@@ -1,0 +1,346 @@
+{
+  "api_prefix": "$JS.hub.API",
+  "box_id": "0123456789abcdef0123456789abcdef",
+  "domain": "hub",
+  "families": [
+    "room",
+    "wake",
+    "peer",
+    "sync"
+  ],
+  "grant": {
+    "publish": [
+      "ck.*.room.>",
+      "ck.*.wake.>",
+      "ck.*.peer.>",
+      "ck.*.sync.>",
+      "$JS.FC.>",
+      "$JS.ACK.>",
+      "_INBOX.>",
+      "$JS.hub.API.CONSUMER.CREATE.HUB_INBOX_0123456789abcdef0123456789abcdef",
+      "$JS.hub.API.CONSUMER.CREATE.HUB_INBOX_0123456789abcdef0123456789abcdef.>",
+      "$JS.hub.API.CONSUMER.INFO.HUB_INBOX_0123456789abcdef0123456789abcdef.>",
+      "$JS.hub.API.CONSUMER.DELETE.HUB_INBOX_0123456789abcdef0123456789abcdef.>",
+      "$JS.hub.API.STREAM.INFO.HUB_INBOX_0123456789abcdef0123456789abcdef",
+      "$JS.hub.API.STREAM.PURGE.HUB_INBOX_0123456789abcdef0123456789abcdef",
+      "$JS.hub.API.$KV.residence.>",
+      "$KV.vault-shared-logins.0123456789abcdef0123456789abcdef.>",
+      "$JS.hub.API.$KV.vault-shared-logins.0123456789abcdef0123456789abcdef.>",
+      "$JS.hub.API.$KV.vault-manifest-active.0123456789abcdef0123456789abcdef",
+      "$O.cuts.>",
+      "ck.fleet.idlog",
+      "ck.fleet.room.>",
+      "ck.fleet.memory.*.*",
+      "$JS.hub.API.STREAM.INFO.HUB_IDLOG",
+      "$JS.hub.API.STREAM.MSG.GET.HUB_IDLOG",
+      "$JS.hub.API.DIRECT.GET.HUB_IDLOG",
+      "$JS.hub.API.DIRECT.GET.HUB_IDLOG.>",
+      "$JS.hub.API.CONSUMER.CREATE.HUB_IDLOG",
+      "$JS.hub.API.CONSUMER.CREATE.HUB_IDLOG.>",
+      "$JS.hub.API.CONSUMER.INFO.HUB_IDLOG.>",
+      "$JS.hub.API.CONSUMER.DELETE.HUB_IDLOG.>",
+      "$JS.hub.API.STREAM.INFO.HUB_ROOMS",
+      "$JS.hub.API.STREAM.MSG.GET.HUB_ROOMS",
+      "$JS.hub.API.DIRECT.GET.HUB_ROOMS",
+      "$JS.hub.API.DIRECT.GET.HUB_ROOMS.>",
+      "$JS.hub.API.CONSUMER.CREATE.HUB_ROOMS",
+      "$JS.hub.API.CONSUMER.CREATE.HUB_ROOMS.>",
+      "$JS.hub.API.CONSUMER.INFO.HUB_ROOMS.>",
+      "$JS.hub.API.CONSUMER.DELETE.HUB_ROOMS.>",
+      "$JS.hub.API.STREAM.INFO.HUB_MEMORY",
+      "$JS.hub.API.STREAM.MSG.GET.HUB_MEMORY",
+      "$JS.hub.API.DIRECT.GET.HUB_MEMORY",
+      "$JS.hub.API.DIRECT.GET.HUB_MEMORY.>",
+      "$JS.hub.API.CONSUMER.CREATE.HUB_MEMORY",
+      "$JS.hub.API.CONSUMER.CREATE.HUB_MEMORY.>",
+      "$JS.hub.API.CONSUMER.INFO.HUB_MEMORY.>",
+      "$JS.hub.API.CONSUMER.DELETE.HUB_MEMORY.>",
+      "$JS.hub.API.STREAM.INFO.KV_residence",
+      "$JS.hub.API.STREAM.MSG.GET.KV_residence",
+      "$JS.hub.API.DIRECT.GET.KV_residence",
+      "$JS.hub.API.DIRECT.GET.KV_residence.>",
+      "$JS.hub.API.CONSUMER.CREATE.KV_residence",
+      "$JS.hub.API.CONSUMER.CREATE.KV_residence.>",
+      "$JS.hub.API.CONSUMER.INFO.KV_residence.>",
+      "$JS.hub.API.CONSUMER.DELETE.KV_residence.>",
+      "$JS.hub.API.STREAM.INFO.OBJ_cuts",
+      "$JS.hub.API.STREAM.MSG.GET.OBJ_cuts",
+      "$JS.hub.API.DIRECT.GET.OBJ_cuts",
+      "$JS.hub.API.DIRECT.GET.OBJ_cuts.>",
+      "$JS.hub.API.CONSUMER.CREATE.OBJ_cuts",
+      "$JS.hub.API.CONSUMER.CREATE.OBJ_cuts.>",
+      "$JS.hub.API.CONSUMER.INFO.OBJ_cuts.>",
+      "$JS.hub.API.CONSUMER.DELETE.OBJ_cuts.>",
+      "$JS.hub.API.STREAM.INFO.KV_vault-shared-logins",
+      "$JS.hub.API.STREAM.MSG.GET.KV_vault-shared-logins",
+      "$JS.hub.API.DIRECT.GET.KV_vault-shared-logins",
+      "$JS.hub.API.DIRECT.GET.KV_vault-shared-logins.>",
+      "$JS.hub.API.CONSUMER.CREATE.KV_vault-shared-logins",
+      "$JS.hub.API.CONSUMER.CREATE.KV_vault-shared-logins.>",
+      "$JS.hub.API.CONSUMER.INFO.KV_vault-shared-logins.>",
+      "$JS.hub.API.CONSUMER.DELETE.KV_vault-shared-logins.>",
+      "$JS.hub.API.STREAM.INFO.KV_vault-manifest-active",
+      "$JS.hub.API.DIRECT.GET.KV_vault-manifest-active",
+      "$JS.hub.API.DIRECT.GET.KV_vault-manifest-active.>",
+      "$JS.hub.API.CONSUMER.CREATE.KV_vault-manifest-active",
+      "$JS.hub.API.CONSUMER.CREATE.KV_vault-manifest-active.>",
+      "$JS.hub.API.CONSUMER.INFO.KV_vault-manifest-active.>",
+      "$JS.hub.API.CONSUMER.DELETE.KV_vault-manifest-active.>",
+      "$JS.hub.API.STREAM.PURGE.OBJ_cuts"
+    ],
+    "subscribe": [
+      "ck.0123456789abcdef0123456789abcdef.>",
+      "_INBOX.>",
+      "ckdel.0123456789abcdef0123456789abcdef.>",
+      "$JS.FC.>",
+      "$JSC.R.>"
+    ]
+  },
+  "names": {
+    "cuts_bucket": "cuts",
+    "deliver_prefix": "ckdel.0123456789abcdef0123456789abcdef",
+    "hub_memory": "ck.fleet.memory.project.pj-example",
+    "hub_room": "ck.fleet.room.room_a",
+    "inbox_stream": "INBOX_0123456789abcdef0123456789abcdef",
+    "module_deliver_prefix": "ckdel.0123456789abcdef0123456789abcdef.example-module"
+  },
+  "streams": {
+    "cuts": {
+      "allow_direct": true,
+      "allow_rollup_hdrs": true,
+      "deny_delete": false,
+      "discard": "new",
+      "duplicate_window_seconds": null,
+      "kind": "obj_cuts",
+      "max_age_seconds": 604800,
+      "max_bytes": 4294967296,
+      "max_message_size": null,
+      "max_msgs_per_subject": null,
+      "name": "OBJ_cuts",
+      "replicas": null,
+      "storage": "file",
+      "subjects": [
+        "$O.cuts.C.>",
+        "$O.cuts.M.>"
+      ],
+      "work_queue": false
+    },
+    "hub_idlog": {
+      "allow_direct": true,
+      "allow_rollup_hdrs": false,
+      "deny_delete": false,
+      "discard": "new",
+      "duplicate_window_seconds": null,
+      "kind": "hub_idlog",
+      "max_age_seconds": 0,
+      "max_bytes": 0,
+      "max_message_size": null,
+      "max_msgs_per_subject": null,
+      "name": "HUB_IDLOG",
+      "replicas": null,
+      "storage": "file",
+      "subjects": [
+        "ck.fleet.idlog"
+      ],
+      "work_queue": false
+    },
+    "hub_inbox": {
+      "allow_direct": false,
+      "allow_rollup_hdrs": false,
+      "deny_delete": false,
+      "discard": "new",
+      "duplicate_window_seconds": null,
+      "kind": "hub_inbox",
+      "max_age_seconds": 604800,
+      "max_bytes": 0,
+      "max_message_size": null,
+      "max_msgs_per_subject": null,
+      "name": "HUB_INBOX_0123456789abcdef0123456789abcdef",
+      "replicas": null,
+      "storage": "file",
+      "subjects": [
+        "ck.0123456789abcdef0123456789abcdef.room.>",
+        "ck.0123456789abcdef0123456789abcdef.wake.>",
+        "ck.0123456789abcdef0123456789abcdef.peer.>",
+        "ck.0123456789abcdef0123456789abcdef.sync.>"
+      ],
+      "work_queue": false
+    },
+    "hub_memory": {
+      "allow_direct": true,
+      "allow_rollup_hdrs": false,
+      "deny_delete": false,
+      "discard": "new",
+      "duplicate_window_seconds": null,
+      "kind": "hub_memory",
+      "max_age_seconds": 0,
+      "max_bytes": 1073741824,
+      "max_message_size": 65536,
+      "max_msgs_per_subject": null,
+      "name": "HUB_MEMORY",
+      "replicas": null,
+      "storage": "file",
+      "subjects": [
+        "ck.fleet.memory.*.*"
+      ],
+      "work_queue": false
+    },
+    "hub_rooms": {
+      "allow_direct": true,
+      "allow_rollup_hdrs": false,
+      "deny_delete": false,
+      "discard": "old",
+      "duplicate_window_seconds": null,
+      "kind": "hub_rooms",
+      "max_age_seconds": 0,
+      "max_bytes": 0,
+      "max_message_size": 262144,
+      "max_msgs_per_subject": 100000,
+      "name": "HUB_ROOMS",
+      "replicas": null,
+      "storage": "file",
+      "subjects": [
+        "ck.fleet.room.>"
+      ],
+      "work_queue": false
+    },
+    "residence_hosted": {
+      "backing_stream": {
+        "allow_direct": true,
+        "allow_rollup_hdrs": true,
+        "deny_delete": true,
+        "discard": "new",
+        "duplicate_window_seconds": null,
+        "kind": "kv_residence",
+        "max_age_seconds": 0,
+        "max_bytes": 67108864,
+        "max_message_size": 16384,
+        "max_msgs_per_subject": 1,
+        "name": "KV_residence",
+        "replicas": 3,
+        "storage": "file",
+        "subjects": [
+          "$KV.residence.>"
+        ],
+        "work_queue": false
+      },
+      "bucket": "residence",
+      "history": 1
+    },
+    "residence_self_hosted": {
+      "backing_stream": {
+        "allow_direct": true,
+        "allow_rollup_hdrs": true,
+        "deny_delete": true,
+        "discard": "new",
+        "duplicate_window_seconds": null,
+        "kind": "kv_residence",
+        "max_age_seconds": 0,
+        "max_bytes": 67108864,
+        "max_message_size": 16384,
+        "max_msgs_per_subject": 1,
+        "name": "KV_residence",
+        "replicas": 1,
+        "storage": "file",
+        "subjects": [
+          "$KV.residence.>"
+        ],
+        "work_queue": false
+      },
+      "bucket": "residence",
+      "history": 1
+    },
+    "vault_manifest_active_hosted": {
+      "backing_stream": {
+        "allow_direct": true,
+        "allow_rollup_hdrs": false,
+        "deny_delete": true,
+        "discard": "new",
+        "duplicate_window_seconds": null,
+        "kind": "kv_vault_manifest_active",
+        "max_age_seconds": 0,
+        "max_bytes": 16777216,
+        "max_message_size": 16384,
+        "max_msgs_per_subject": 1,
+        "name": "KV_vault-manifest-active",
+        "replicas": 3,
+        "storage": "file",
+        "subjects": [
+          "$KV.vault-manifest-active.>"
+        ],
+        "work_queue": false
+      },
+      "bucket": "vault-manifest-active",
+      "history": 1
+    },
+    "vault_manifest_active_self_hosted": {
+      "backing_stream": {
+        "allow_direct": true,
+        "allow_rollup_hdrs": false,
+        "deny_delete": true,
+        "discard": "new",
+        "duplicate_window_seconds": null,
+        "kind": "kv_vault_manifest_active",
+        "max_age_seconds": 0,
+        "max_bytes": 16777216,
+        "max_message_size": 16384,
+        "max_msgs_per_subject": 1,
+        "name": "KV_vault-manifest-active",
+        "replicas": 1,
+        "storage": "file",
+        "subjects": [
+          "$KV.vault-manifest-active.>"
+        ],
+        "work_queue": false
+      },
+      "bucket": "vault-manifest-active",
+      "history": 1
+    },
+    "vault_shared_logins_hosted": {
+      "backing_stream": {
+        "allow_direct": true,
+        "allow_rollup_hdrs": false,
+        "deny_delete": true,
+        "discard": "new",
+        "duplicate_window_seconds": null,
+        "kind": "kv_vault_shared_logins",
+        "max_age_seconds": 0,
+        "max_bytes": 67108864,
+        "max_message_size": 262144,
+        "max_msgs_per_subject": 1,
+        "name": "KV_vault-shared-logins",
+        "replicas": 3,
+        "storage": "file",
+        "subjects": [
+          "$KV.vault-shared-logins.>"
+        ],
+        "work_queue": false
+      },
+      "bucket": "vault-shared-logins",
+      "history": 1
+    },
+    "vault_shared_logins_self_hosted": {
+      "backing_stream": {
+        "allow_direct": true,
+        "allow_rollup_hdrs": false,
+        "deny_delete": true,
+        "discard": "new",
+        "duplicate_window_seconds": null,
+        "kind": "kv_vault_shared_logins",
+        "max_age_seconds": 0,
+        "max_bytes": 67108864,
+        "max_message_size": 262144,
+        "max_msgs_per_subject": 1,
+        "name": "KV_vault-shared-logins",
+        "replicas": 1,
+        "storage": "file",
+        "subjects": [
+          "$KV.vault-shared-logins.>"
+        ],
+        "work_queue": false
+      },
+      "bucket": "vault-shared-logins",
+      "history": 1
+    }
+  }
+}

@@ -219,6 +219,14 @@ pub fn remove_member(document: &mut String, path: &[&str]) -> Result<bool, Strin
     let Lookup::Found { member, parent } = lookup(&root, path)? else {
         return Ok(false);
     };
+    if parent
+        .members
+        .iter()
+        .any(|other| other.key == member.key && other.key_start != member.key_start)
+    {
+        // Removing the copy readers see would expose an older one instead.
+        return Err(format!("{} is written more than once", path.join(".")));
+    }
     let is_last = parent
         .members
         .last()
@@ -344,7 +352,8 @@ fn lookup<'a>(root: &'a ParsedObject, path: &[&str]) -> Result<Lookup<'a>, Strin
     }
     let mut object = root;
     for (depth, segment) in path.iter().enumerate() {
-        let Some(member) = object.members.iter().find(|member| member.key == *segment) else {
+        // JSON readers keep the last of repeated keys, so edit the copy they read.
+        let Some(member) = object.members.iter().rfind(|member| member.key == *segment) else {
             return Ok(Lookup::Missing { depth });
         };
         if depth + 1 == path.len() {
@@ -588,6 +597,28 @@ fn render_value(value: &Value, line_indent: &str, indentation: &str, newline: &s
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn edits_target_the_last_of_repeated_keys_like_json_readers() {
+        let mut document = "{\n  \"a\": {\"x\": 1},\n  \"a\": {\"x\": 2} // read\n}\n".to_string();
+        set_member(&mut document, &["a", "x"], &serde_json::json!(3)).unwrap();
+        assert_eq!(
+            document,
+            "{\n  \"a\": {\"x\": 1},\n  \"a\": {\"x\": 3} // read\n}\n"
+        );
+        let read: Value = serde_json::from_str(&jsonc_to_json(&document).unwrap()).unwrap();
+        assert_eq!(read["a"]["x"], 3);
+    }
+
+    #[test]
+    fn removing_a_repeated_key_is_refused() {
+        let original = "{\"a\": 1, \"a\": 2, \"b\": 3}";
+        let mut document = original.to_string();
+        let error = remove_member(&mut document, &["a"]).unwrap_err();
+        assert!(error.contains("more than once"), "{error}");
+        assert_eq!(document, original);
+        assert!(remove_member(&mut document, &["b"]).unwrap());
+    }
+
     use super::*;
     use serde_json::json;
 

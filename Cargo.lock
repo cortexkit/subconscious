@@ -3297,7 +3297,7 @@ dependencies = [
 
 [[package]]
 name = "subc-jsonc"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "cortexkit-test-support",
  "serde_json",

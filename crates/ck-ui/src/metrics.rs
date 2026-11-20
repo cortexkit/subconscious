@@ -37,6 +37,33 @@ pub fn headline_metric_entries(metrics: &Value) -> Option<Vec<(&str, &Value)>> {
     })
 }
 
+/// The line shown, indented `depth` levels, when [`headline_metric_entries`] picks nothing. A module
+/// whose metrics are all nested groups, with no `headline` list, still has
+/// metrics; name the groups and point at the full view rather than claim
+/// there are none.
+pub fn no_headline_line(metrics: &Value, depth: usize) -> String {
+    let indent = "  ".repeat(depth);
+    let mut groups: Vec<&str> = metrics
+        .as_object()
+        .map(|map| {
+            map.keys()
+                .map(String::as_str)
+                .filter(|key| !matches!(*key, "headline" | "_headline"))
+                .collect()
+        })
+        .unwrap_or_default();
+    // Sorted so the line doesn't depend on whether serde_json keeps insertion order.
+    groups.sort_unstable();
+    if groups.is_empty() {
+        format!("{indent}metrics: none")
+    } else {
+        format!(
+            "{indent}metrics: {} (--verbose shows them)",
+            groups.join(", ")
+        )
+    }
+}
+
 /// A metric value in words. Byte counts, ages and millisecond durations are
 /// recognized by their key's name and humanized; a millisecond value large
 /// enough to be a Unix time is shown as an age through `epoch_age`, which
@@ -368,6 +395,21 @@ mod tests {
             .collect();
         assert_eq!(keys, ["a", "b"]);
         assert_eq!(headline_metric_entries(&json!([1])), None);
+    }
+
+    #[test]
+    fn nested_only_metrics_name_their_groups_instead_of_none() {
+        let nested = json!({"store": {"context": 112}, "bus": {"connected": true}});
+        assert_eq!(
+            no_headline_line(&nested, 0),
+            "metrics: bus, store (--verbose shows them)"
+        );
+        let marked = json!({"headline": ["missing"], "dreamer": {"runs": 3}});
+        assert_eq!(
+            no_headline_line(&marked, 0),
+            "metrics: dreamer (--verbose shows them)"
+        );
+        assert_eq!(no_headline_line(&json!({}), 1), "  metrics: none");
     }
 
     #[test]

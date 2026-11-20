@@ -4301,7 +4301,7 @@ fn print_headline_metrics(metrics: &Value, depth: usize) {
         return;
     };
     if entries.is_empty() {
-        println!("{}metrics: none", "  ".repeat(depth));
+        println!("{}", ck_ui::metrics::no_headline_line(metrics, depth));
         return;
     }
     for (key, value) in entries {

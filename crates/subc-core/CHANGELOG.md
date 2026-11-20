@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.21.31
+
+- `ck health <id>` names the nested metric groups of a module that headlines none,
+  instead of printing "metrics: none" (requires ck-ui 0.9.6).
+
 ## 0.21.30
 
 - Require subc-daemon 0.50.25 and subc-os 0.1.48.

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.9.6
+
+- `metrics::no_headline_line` names a module's nested metric groups, and points at the
+  verbose view, instead of reporting "metrics: none" when no top-level value is headlined.
+
 ## 0.9.5
 
 - The agents screen reads agent residence from the prefrontal module under

@@ -177,6 +177,19 @@ async function run(mode: string): Promise<{code: number; out: string; err: strin
   }
 }
 
+test.skipIf(process.platform !== "win32")("the registration launcher times out before a child opens its named pipe", async () => {
+  // This child stays alive without opening the pipe. Its sleep is shorter
+  // than the outer guard so a broken launcher cannot leave the child behind.
+  const child = Bun.spawn(["python", launcher, "--timeout-seconds=0.5", "0",
+    "python", "-c", "import time; time.sleep(3)"], {env, stderr: "pipe"});
+  const timer = setTimeout(() => child.kill(), 5000);
+  try {
+    const [code, err] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+    expect({code, err: err.trim()}).toEqual({code: 124,
+      err: "registration launcher: timed out waiting for the child to connect to the named pipe"});
+  } finally { clearTimeout(timer); }
+}, 10000);
+
 test("own id then two prefix ids mint and present exact prefix claims without a nonce", async () => {
   const result = await run("providers-own-first");
   expect(result.out).toContain("PROVIDERS_OK");

@@ -6,10 +6,23 @@ import sys
 import threading
 import time
 
+
+def timed_out(process, step):
+    # Reap the child before returning so it cannot retain the captured output pipes.
+    process.kill()
+    process.wait()
+    print(f"registration launcher: timed out waiting for {step}", file=sys.stderr, flush=True)
+    sys.exit(124)
+
+
 env = dict(os.environ)
 env["SUBC_DAEMON_PID"] = str(os.getpid())
+timeout_seconds = 8
+if sys.argv[1].startswith("--timeout-seconds="):
+    timeout_seconds = float(sys.argv.pop(1).split("=", 1)[1])
 mode = sys.argv[4]
 fallback = mode.startswith("fallback-")
+deadline = None
 if os.name == "nt":
     if fallback:
         env["SUBC_LAUNCH_NONCE"] = "inherited-nonce"
@@ -34,13 +47,23 @@ if os.name == "nt":
     handle = kernel.CreateNamedPipeW(name, 3 | 0x00080000, 1, 1, 65536, 65536, 0, None)
     assert handle != ctypes.c_void_p(-1).value
     env["SUBC_REGISTRATION_PIPE"] = name
+    # The child may never open the pipe. Include connection setup in the
+    # child budget so the outer test doesn't have to kill the launcher.
+    deadline = time.monotonic() + timeout_seconds
     process = subprocess.Popen(sys.argv[2:], env=env)
     while not kernel.ConnectNamedPipe(handle, None):
         error = ctypes.get_last_error()
         if error == 535:
             break
+        code = process.poll()
+        if code is not None:
+            print(f"registration launcher: child exited ({code}) before connecting to the named pipe", file=sys.stderr)
+            sys.exit(code or 1)
         assert error == 536
-        time.sleep(0.005)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            timed_out(process, "the child to connect to the named pipe")
+        time.sleep(min(0.005, remaining))
     client = wintypes.ULONG()
     assert kernel.GetNamedPipeClientProcessId(handle, ctypes.byref(client)) and client.value == process.pid
 
@@ -119,10 +142,6 @@ def copy(source, target):
 for source, target in [(parent, remote), (remote, parent)]:
     threading.Thread(target=copy, args=(source, target), daemon=True).start()
 try:
-    sys.exit(process.wait(timeout=8))
+    sys.exit(process.wait(timeout=timeout_seconds if deadline is None else max(0, deadline - time.monotonic())))
 except subprocess.TimeoutExpired:
-    # A negative-control child must not outlive its test launcher or retain the
-    # captured output pipes after the outer test kills the launcher.
-    process.kill()
-    process.wait()
-    sys.exit(124)
+    timed_out(process, "the child to exit")

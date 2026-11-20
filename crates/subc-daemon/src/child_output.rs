@@ -11,6 +11,13 @@ use std::time::SystemTime;
 use tokio::process::Child;
 use tokio::sync::oneshot;
 
+#[cfg(unix)]
+mod interruptible;
+#[cfg(unix)]
+pub(crate) use interruptible::StopReaders;
+#[cfg(unix)]
+pub(crate) const PLAIN_PIPE_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
+
 // Charge small lines for their allocation and queue entries as well as their
 // bytes, so a burst of empty lines cannot grow the queue without bound.
 const QUEUE_BYTES: usize = 2 * 1024 * 1024;
@@ -128,12 +135,20 @@ pub(crate) struct StderrPump<F = oneshot::Receiver<()>> {
     pub(crate) generation: u64,
 }
 
+pub(crate) struct Pumps {
+    pub(crate) stdout: Option<oneshot::Receiver<()>>,
+    pub(crate) stderr: Option<StderrPump>,
+    #[cfg(unix)]
+    pub(crate) stop: Option<StopReaders>,
+}
+
 pub(crate) fn start(
     child: &mut Child,
     sink: ChildOutputSink,
     ring: &Arc<Mutex<StderrRing>>,
     module_id: &str,
-) -> (Option<oneshot::Receiver<()>>, Option<StderrPump>) {
+    #[cfg(unix)] interruptible: bool,
+) -> Pumps {
     // Tokio's owned-handle conversion restores blocking mode on Unix; Windows
     // gives back the standard synchronous pipe handle, before any async reads.
     #[cfg(unix)]
@@ -158,6 +173,18 @@ pub(crate) fn start(
             .take()
             .map(|pipe| pipe.into_owned_handle().map(File::from)),
     );
+    #[cfg(unix)]
+    let (stdout, stderr, stop, wake) = if interruptible {
+        match StopReaders::pair() {
+            Ok((stop, wake)) => (stdout, stderr, Some(stop), Some(wake)),
+            Err(error) => {
+                tracing::warn!(module_id, %error, "could not make capture stoppable; closing child pipes");
+                (None, None, None, None)
+            }
+        }
+    } else {
+        (stdout, stderr, None, None)
+    };
     let generation = stderr.as_ref().map(|_| {
         ring.lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -194,27 +221,47 @@ pub(crate) fn start(
         }
     }
     for (pipe, source) in [(Pipe::Stdout, stdout), (Pipe::Stderr, stderr)] {
+        #[cfg(unix)]
+        let thread_wake = wake.clone();
         if let Some(source) = source {
             let reader_queue = Arc::clone(&queue);
             let started = source.and_then(|file| {
                 thread::Builder::new()
                     .name(format!("child-{}-reader", pipe.name()))
                     .spawn(move || {
-                        let result = read_pipe(file, pipe, &reader_queue);
+                        let result = read_pipe(
+                            file,
+                            pipe,
+                            &reader_queue,
+                            #[cfg(unix)]
+                            thread_wake.as_ref(),
+                        );
+                        #[cfg(unix)]
+                        if let Some(wake) = thread_wake {
+                            wake.finish(pipe);
+                        }
                         reader_queue.end(pipe, result);
                     })
             });
             if let Err(error) = started {
                 queue.end(pipe, Err(error));
+            } else {
+                continue;
             }
         }
+        #[cfg(unix)]
+        if let Some(wake) = &wake {
+            wake.finish(pipe);
+        }
     }
-    (
-        stdout_wait,
-        stderr_wait
+    Pumps {
+        stdout: stdout_wait,
+        stderr: stderr_wait
             .zip(generation)
             .map(|(task, generation)| StderrPump { task, generation }),
-    )
+        #[cfg(unix)]
+        stop,
+    }
 }
 
 fn completion(enabled: bool) -> (Option<oneshot::Sender<()>>, Option<oneshot::Receiver<()>>) {
@@ -226,12 +273,24 @@ fn completion(enabled: bool) -> (Option<oneshot::Sender<()>>, Option<oneshot::Re
     }
 }
 
-fn read_pipe(mut source: File, pipe: Pipe, queue: &Queue) -> io::Result<()> {
+fn read_pipe(
+    mut source: File,
+    pipe: Pipe,
+    queue: &Queue,
+    #[cfg(unix)] wake: Option<&interruptible::ReaderWake>,
+) -> io::Result<()> {
     let mut framer = LineFramer::default();
     let mut buf = [0; 8192];
     let send = |raw: &[u8], terminated| queue.line(pipe, raw, terminated);
     loop {
-        match source.read(&mut buf) {
+        #[cfg(unix)]
+        let read = match wake {
+            Some(wake) => wake.read(&mut source, &mut buf),
+            None => source.read(&mut buf),
+        };
+        #[cfg(not(unix))]
+        let read = source.read(&mut buf);
+        match read {
             Ok(0) => break,
             Ok(n) => framer.push(&buf[..n], send),
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,

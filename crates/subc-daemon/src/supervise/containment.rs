@@ -578,6 +578,8 @@ pub(super) fn terminate_blocking(slot: &Slot) {
 #[derive(Debug)]
 pub(super) struct ProcessChild {
     process: Option<Child>,
+    #[cfg(unix)]
+    pub(super) plain_group: Option<Arc<super::plain_group::PlainGroup>>,
     container: Weak<CarriedContainment>,
     slot: Weak<Mutex<Option<Arc<CarriedContainment>>>>,
     #[cfg(unix)]
@@ -589,6 +591,10 @@ pub(super) struct ProcessChild {
 
 impl ProcessChild {
     pub(super) fn reject(&mut self, #[cfg(unix)] group: GroupTarget) {
+        #[cfg(unix)]
+        if let Some(owned) = &self.plain_group {
+            owned.close();
+        }
         if let Some(child) = &mut self.process {
             super::kill_and_reap_rejected_child(
                 child,
@@ -601,6 +607,8 @@ impl ProcessChild {
         let _ = pid;
         Self {
             process: Some(process),
+            #[cfg(unix)]
+            plain_group: None,
             container: Weak::new(),
             slot: Weak::new(),
             #[cfg(unix)]
@@ -632,6 +640,13 @@ impl ProcessChild {
 
     pub(super) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         #[cfg(unix)]
+        if let Some(group) = &self.plain_group {
+            if self.observed.is_none() {
+                self.observed = group.observe()?;
+            }
+            return Ok(self.observed);
+        }
+        #[cfg(unix)]
         if self.container().is_some() {
             if self.observed.is_none() {
                 self.observed = match subc_os::child_exit::observe(self.pid) {
@@ -654,6 +669,13 @@ impl ProcessChild {
 
     pub(super) async fn wait(&mut self) -> io::Result<ExitStatus> {
         #[cfg(unix)]
+        if let Some(group) = &self.plain_group {
+            if self.observed.is_none() {
+                self.observed = Some(group.wait_for_exit().await?);
+            }
+            return Ok(self.observed.expect("plain group exit was observed"));
+        }
+        #[cfg(unix)]
         if self.container().is_some() {
             loop {
                 if let Some(status) = self.try_wait()? {
@@ -674,6 +696,10 @@ impl ProcessChild {
     }
 
     pub(super) fn start_kill(&mut self) -> io::Result<()> {
+        #[cfg(unix)]
+        if let Some(group) = &self.plain_group {
+            return group.signal(rustix::process::Signal::KILL);
+        }
         #[cfg(unix)]
         if let Some(container) = self.container() {
             if let Err(error) = subc_os::child_exit::observe(self.pid) {
@@ -700,6 +726,14 @@ impl ProcessChild {
     }
 
     pub(super) async fn reap(&mut self) -> io::Result<()> {
+        if self.settled {
+            return Ok(());
+        }
+        #[cfg(unix)]
+        if let Some(group) = &self.plain_group {
+            group.settle().await;
+            group.close();
+        }
         if let Some(process) = &mut self.process {
             process.wait().await?;
         }
@@ -940,6 +974,7 @@ impl CarriedContainment {
                 },
             }),
             carried: Some(Arc::downgrade(self)),
+            plain_group: None,
             #[cfg(target_os = "linux")]
             cgroup_placement: self.cgroup().map(|(placement, _)| placement.clone()),
         };
@@ -1016,7 +1051,10 @@ impl GroupTarget {
     pub(super) fn signal_rejected(&self, child: &Child) {
         match self {
             Self::OwnLeader => {
-                if let Some(pid) = child.id() {
+                if let Some(pid) = child
+                    .id()
+                    .filter(|pid| *pid > 1 && subc_os::child_exit::observe(*pid).is_ok())
+                {
                     signal_group(pid, rustix::process::Signal::KILL);
                 }
             }
@@ -1029,6 +1067,11 @@ impl GroupTarget {
 impl Drop for ProcessChild {
     fn drop(&mut self) {
         if !self.settled {
+            #[cfg(unix)]
+            if let Some(group) = &self.plain_group {
+                let _ = group.signal(rustix::process::Signal::KILL);
+                group.close();
+            }
             if let Some(container) = self.container() {
                 container.hard_kill();
                 let _ = self.start_kill();
@@ -1359,6 +1402,7 @@ mod anchor_tests {
         });
         let mut observed = ProcessChild {
             process: None,
+            plain_group: None,
             container: Arc::downgrade(&container),
             slot: Weak::new(),
             pid: pgid,

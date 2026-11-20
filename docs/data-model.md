@@ -121,7 +121,9 @@ shutdown. Retention: 1 MiB per file, three rotated files, 30 days
 
 The journal is best-effort. If it cannot be opened the daemon keeps an
 in-memory ring and continues; a torn final line is skipped on read and the line
-boundary is repaired on the next append. `supervisor.terminals` and
+boundary is repaired on the next append. `journal_write_failures` includes
+records dropped when the writer queue fills or filesystem writes stall.
+`supervisor.terminals` and
 `ck module terminals` merge the journal with the in-memory ring, so exits from
 before a daemon restart remain visible. Tests:
 `daemon_restart_recovers_terminal_when_the_ring_is_empty` (`crates/subc-core/tests/durable_terminals.rs`),

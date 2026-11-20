@@ -605,7 +605,9 @@ async fn run(config: StubConfig) -> Result<(), StubError> {
             let inherited: std::os::fd::OwnedFd = socket.try_clone().map_err(StubError::Io)?.into();
             // Command installs this duplicate as stdin, clearing CLOEXEC for
             // that descriptor without unsafe fork code inside a Tokio runtime.
-            let holder = Command::new(env::current_exe().map_err(StubError::Io)?)
+            let mut holder = Command::new(env::current_exe().map_err(StubError::Io)?);
+            configure_fixture_descendant(&mut holder);
+            let holder = holder
                 .env("FAKE_AFT_SOCKET_HOLDER_MODE", "1")
                 .env_remove(FAKE_AFT_PID_PATH_ENV)
                 .stdin(Stdio::from(inherited))
@@ -675,6 +677,8 @@ async fn run_detached_orphan_writer() -> Result<(), StubError> {
 fn spawn_orphan_writer(delay: Duration, line: Option<String>) -> Result<(), StubError> {
     let exe = env::current_exe().map_err(StubError::Io)?;
     let mut command = Command::new(exe);
+    #[cfg(unix)]
+    configure_fixture_descendant(&mut command);
     command
         .env(FAKE_AFT_ORPHAN_WRITER_MODE_ENV, "1")
         .env(
@@ -689,6 +693,15 @@ fn spawn_orphan_writer(delay: Duration, line: Option<String>) -> Result<(), Stub
     }
     command.spawn().map_err(StubError::Io)?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn configure_fixture_descendant(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    if env_flag("FAKE_AFT_DESCENDANT_OWN_GROUP") {
+        command.process_group(0);
+    }
 }
 
 /// Substitutes a `{pid}` token in a configured stderr line with this

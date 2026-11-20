@@ -4,6 +4,7 @@
 use crate::live_children::{RetainedReason, SweepBounds, SweepDecision};
 use std::{
     fs, io,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -18,20 +19,36 @@ fn trusted_path(
     path: &Path,
 ) -> Result<Option<PathBuf>, RetainedReason> {
     let placement = placement.ok_or_else(root_unavailable)?;
-    placement.existing_module_path(path).map_err(|error| {
+    let path = placement.existing_module_path(path).map_err(|error| {
         if error.kind() == io::ErrorKind::InvalidInput {
             root_unavailable()
         } else {
             RetainedReason::ContainerUnverifiable(error.to_string())
         }
-    })
+    })?;
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    match fs::symlink_metadata(&path) {
+        Ok(metadata)
+            if metadata.is_dir() && metadata.uid() == rustix::process::geteuid().as_raw() =>
+        {
+            Ok(Some(path))
+        }
+        Ok(_) => Err(RetainedReason::ContainerUnverifiable(format!(
+            "cgroup {} is not a daemon-owned directory",
+            path.display()
+        ))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(RetainedReason::ContainerUnverifiable(error.to_string())),
+    }
 }
 
 fn root_unavailable() -> RetainedReason {
     RetainedReason::ContainerUnverifiable("container root unavailable".into())
 }
 
-fn populated(path: &Path) -> io::Result<bool> {
+pub(crate) fn populated(path: &Path) -> io::Result<bool> {
     let events = fs::read_to_string(path.join("cgroup.events"))?;
     match events
         .lines()
@@ -85,7 +102,7 @@ fn remove_empty(placement: &Placement, path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn state(placement: Option<&Placement>, path: &Path) -> Option<RetainedReason> {
+pub(crate) fn state(placement: Option<&Placement>, path: &Path) -> Option<RetainedReason> {
     let path = match trusted_path(placement, path) {
         Ok(Some(path)) => path,
         Ok(None) => return None,
@@ -113,7 +130,7 @@ fn state(placement: Option<&Placement>, path: &Path) -> Option<RetainedReason> {
     }
 }
 
-fn signal_frozen(frozen: &FrozenModule, signal: Signal) -> io::Result<()> {
+pub(crate) fn signal_frozen(frozen: &FrozenModule, signal: Signal) -> io::Result<()> {
     let ProcsOutcome::Listed(pids) = frozen.processes() else {
         return Err(io::Error::other("cannot list frozen cgroup members"));
     };

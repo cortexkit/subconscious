@@ -58,6 +58,8 @@ pub(crate) struct RecordedIdentity {
     pub(crate) container: Option<crate::live_children::ContainerIdentity>,
     #[cfg(unix)]
     pub(crate) carried: Option<std::sync::Weak<crate::supervise::containment::CarriedContainment>>,
+    #[cfg(unix)]
+    pub(crate) plain_group: Option<std::sync::Weak<crate::supervise::plain_group::PlainGroup>>,
     /// The owning subtree for shutdown tree kills; not persisted in the record.
     #[cfg(target_os = "linux")]
     pub(crate) cgroup_placement: Option<subc_cgroup::Placement>,
@@ -107,6 +109,7 @@ struct RosterInner {
     pending_admissions: Mutex<HashMap<String, (u32, String)>>,
     unquarantined_record: std::sync::atomic::AtomicBool,
     retained: Mutex<Vec<(LiveChild, crate::live_children::RetainedReason)>>,
+    rechecking: AtomicBool,
     #[cfg(target_os = "macos")]
     privacy_trampoline: OnceLock<Result<PathBuf, String>>,
     /// Test-only: called before the record is serialized and written, so a
@@ -150,6 +153,24 @@ impl std::fmt::Debug for RecordWriteHook {
 }
 
 impl RosterInner {
+    fn ensure_rechecks(self: &Arc<Self>) {
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            if self.rechecking.swap(true, Ordering::Relaxed) {
+                return;
+            }
+            let weak = Arc::downgrade(self);
+            runtime.spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    let Some(inner) = weak.upgrade() else {
+                        return;
+                    };
+                    inner.recheck_retained();
+                }
+            });
+        }
+    }
+
     /// Run roster work that may wait on the record write without holding up
     /// the rest of the async runtime.
     ///
@@ -349,8 +370,13 @@ impl RetainedView {
             return false;
         };
         let live = lock(&inner.live);
-        live.values()
-            .any(|entry| entry.module_id == module_id && entry.recorded.container.is_some())
+        live.values().any(|entry| {
+            #[cfg(unix)]
+            let carried = entry.recorded.carried.is_some();
+            #[cfg(not(unix))]
+            let carried = entry.recorded.container.is_some();
+            entry.module_id == module_id && carried
+        })
     }
 
     pub(crate) fn recovery_block(&self) -> Option<String> {
@@ -399,6 +425,24 @@ impl RosterGuard {
     }
     #[cfg(unix)]
     pub(crate) fn retain(self, reason: crate::live_children::RetainedReason) {
+        self.retain_with_identity(reason, None);
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn retain_cgroup(
+        self,
+        identity: crate::live_children::ContainerIdentity,
+        reason: crate::live_children::RetainedReason,
+    ) {
+        self.retain_with_identity(reason, Some(identity));
+    }
+
+    #[cfg(unix)]
+    fn retain_with_identity(
+        self,
+        reason: crate::live_children::RetainedReason,
+        identity: Option<crate::live_children::ContainerIdentity>,
+    ) {
         self.inner.without_stalling_runtime(|| {
             let _write = lock(&self.inner.record_write);
             let Some(entry) = lock(&self.inner.live).remove(&self.key) else {
@@ -411,7 +455,7 @@ impl RosterGuard {
                 start_time: entry.recorded.start_time,
                 executable: entry.recorded.executable,
                 cgroup_name: entry.recorded.cgroup_name,
-                container: entry.recorded.container,
+                container: entry.recorded.container.or(identity),
             };
             if reason.blocks_fresh_copy() {
                 tracing::error!(module_id = %recorded.module_id, container = ?recorded.container,
@@ -422,6 +466,7 @@ impl RosterGuard {
             let live = lock(&self.inner.live).clone();
             let _ = self.inner.write_record(&live);
         });
+        self.inner.ensure_rechecks();
     }
 }
 
@@ -590,19 +635,8 @@ impl ChildRoster {
                     (entry, reason)
                 })
                 .collect();
-            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                let weak = Arc::downgrade(&self.inner);
-                runtime.spawn(async move {
-                    loop {
-                        tokio::time::sleep(Duration::from_secs(5)).await;
-                        let Some(inner) = weak.upgrade() else {
-                            return;
-                        };
-                        inner.recheck_retained();
-                    }
-                });
-            }
         }
+        self.inner.ensure_rechecks();
     }
 
     pub(crate) fn recovery_block(&self) -> Option<&str> {
@@ -643,6 +677,18 @@ impl ChildRoster {
 
     pub(crate) fn admission_pending(&self, module_id: &str) -> bool {
         lock(&self.inner.pending_admissions).contains_key(module_id)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn has_retained_cgroup(&self, module_id: &str) -> bool {
+        lock(&self.inner.retained).iter().any(|(entry, reason)| {
+            entry.module_id == module_id
+                && reason.blocks_fresh_copy()
+                && entry
+                    .container
+                    .as_ref()
+                    .is_some_and(|identity| identity.cgroup_path.is_some())
+        })
     }
 
     #[cfg(all(test, unix))]
@@ -834,6 +880,7 @@ mod unix_shutdown {
     use tracing::{debug, info, warn};
 
     use super::{lock, ChildRoster, RosterEntry};
+    use crate::supervise::plain_group::TERM_GRACE;
     use subc_control::ModuleProtocol;
 
     /// The longest any one child is waited on before escalation, whatever its
@@ -845,7 +892,8 @@ mod unix_shutdown {
     /// and finishes its own teardown regardless, but a `protocol: "none"` child
     /// would be orphaned. So the whole shutdown must fit inside the service
     /// manager's stop timeout: the 0.5 s notice and 2 s drain before this, this
-    /// cap, [`TERM_TO_KILL`] and [`CHILD_REAP_BOUND`] after it come to 28.25 s,
+    /// cap, group TERM grace and pipe drain, and [`CHILD_REAP_BOUND`] after it
+    /// come to less than 32 s,
     /// under the 35 s `ExitTimeOut` / `TimeoutStopSec` that `ck setup` writes
     /// (see `desired_definition`). 25 s covers BROCA's teardown (10 s run grace,
     /// then a seal, inside a 20 s budget; 12 s measured) with room to spare.
@@ -871,8 +919,9 @@ mod unix_shutdown {
     /// Escalation happens per child, at that child's own deadline: its
     /// resolved drain budget (per-module `drain_timeout_ms`, else the daemon
     /// default), capped at [`CHILD_SHUTDOWN_CAP`]. At the deadline a subc
-    /// module still running gets SIGTERM and, [`TERM_TO_KILL`] later, SIGKILL;
-    /// a `protocol: "none"` child, already asked, gets SIGKILL. All children are
+    /// module still running gets SIGTERM and then SIGKILL after [`TERM_TO_KILL`],
+    /// whether the target is an ordinary group or an individual child.
+    /// A `protocol: "none"` child has already been asked. All children are
     /// waited on concurrently, so the whole stop takes as long as the longest
     /// single deadline, and returns as soon as every child has been reaped.
     /// A fixed short bound for everyone would SIGKILL a module whose teardown
@@ -917,13 +966,19 @@ mod unix_shutdown {
                     continue;
                 }
                 let deadline = started + budget(entry);
-                let due = shutdown_signal(
-                    entry.protocol,
-                    now,
-                    deadline,
-                    termed.get(key).copied(),
-                    escalated,
-                );
+                let term_sent = termed.get(key).copied();
+                let due =
+                    if !escalated && entry.recorded.plain_group.is_some() && term_sent.is_some() {
+                        let grace = match entry.protocol {
+                            ModuleProtocol::None => budget(entry).min(TERM_GRACE),
+                            ModuleProtocol::Subc => TERM_TO_KILL,
+                        };
+                        term_sent
+                            .filter(|at| now >= *at + grace)
+                            .map(|_| Signal::KILL)
+                    } else {
+                        shutdown_signal(entry.protocol, now, deadline, term_sent, escalated)
+                    };
                 if due == Some(Signal::KILL) {
                     warn!(
                         module_id = %entry.module_id,
@@ -959,8 +1014,17 @@ mod unix_shutdown {
                 }
             }
             // Everything left has been SIGKILLed: wait only for the reaps.
+            let reap_bound = CHILD_REAP_BOUND
+                + if live
+                    .iter()
+                    .any(|(_, entry)| entry.recorded.plain_group.is_some())
+                {
+                    crate::child_output::PLAIN_PIPE_DRAIN
+                } else {
+                    Duration::ZERO
+                };
             if live.iter().all(|(key, _)| killed.contains(key))
-                && last_kill.is_some_and(|at| now >= at + CHILD_REAP_BOUND)
+                && last_kill.is_some_and(|at| now >= at + reap_bound)
             {
                 break;
             }
@@ -1187,6 +1251,14 @@ mod unix_shutdown {
     }
 
     fn signal(entry: &RosterEntry, signal: Signal) {
+        if let Some(group) = &entry.recorded.plain_group {
+            if let Some(group) = group.upgrade() {
+                if let Err(error) = group.signal(signal) {
+                    debug!(module_id = %entry.module_id, %error, "shutdown group signal was not delivered");
+                }
+            }
+            return;
+        }
         if let Some(carried) = &entry.recorded.carried {
             if let Some(container) = carried.upgrade() {
                 if signal == Signal::KILL {
@@ -1207,7 +1279,11 @@ mod unix_shutdown {
                 return;
             }
         }
-        let Some(pid) = i32::try_from(entry.pid).ok().and_then(Pid::from_raw) else {
+        let Some(pid) = i32::try_from(entry.pid)
+            .ok()
+            .filter(|pid| *pid > 1)
+            .and_then(Pid::from_raw)
+        else {
             return;
         };
         if let Err(error) = kill_process(pid, signal) {

@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.50.21
+
+- Stop ordinary Unix process groups before reaping their leaders, so a stopped,
+  restarted or crashed module no longer leaves helpers running beside its next
+  process. Capture pipes that outlive the group are closed after a short grace,
+  and the lost late output is recorded.
+- Bound ordinary Linux cgroup teardown, and refuse a replacement while the previous
+  subtree still contains processes or cannot be inspected.
+- Recover ordinary Linux module cgroups at daemon startup, after checking that the
+  recorded path is inside the current daemon-owned delegation.
+- Keep a swapped-out process's exit in terminal history and its own spawn
+  generation, without replacing the active module's last exit.
+- Record abandoned swap candidates in terminal history, and report their observed
+  or forced exit in the swap failure reply, without charging the active module's
+  restart budget.
+- Append terminal records on a dedicated writer. Blocked storage no longer delays
+  supervision or shutdown; dropped writes count in `journal_write_failures`.
+- Fit Linux cgroup labels within the filesystem's encoded component limit without
+  shortening their per-spawn identity suffix.
+- Count automatic crash-budget replacements when they spawn, so backoff or a
+  configuration publication cannot age a restart out of the window before it starts.
 ## 0.50.20
 
 - Refuse a rollback plan whose target was approved for a different build of a

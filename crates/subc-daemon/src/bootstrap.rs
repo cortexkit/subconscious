@@ -1552,7 +1552,7 @@ async fn serve_bound_daemon(
         // First, before the notice, the drain, or any connection close: from
         // here on a module exit is recorded as `daemon_shutdown` and never
         // respawned. Also before allowing a second signal to cut the bounded
-        // wait short, so the journal marker is always written.
+        // wait short, so the journal marker is queued first.
         supervisor.begin_daemon_shutdown();
         // Stop the self-watchdog before closing the listener. Its next tick would
         // connect to that listener, fail, and log an ERROR indistinguishable from

@@ -4,15 +4,19 @@ use std::{
     collections::HashMap,
     fmt,
     fs::File,
-    io::{self, BufRead, BufReader, Read, Seek, SeekFrom},
+    io::{self, BufRead, BufReader, Read},
     path::PathBuf,
-    sync::Mutex,
+    sync::{Arc, Mutex, TryLockError},
 };
 
 use serde::{Deserialize, Serialize};
 use subc_control::{TerminalEntry, TerminalHistory};
 
 use crate::terminal_ring::{TerminalHistorySnapshot, TerminalRecord};
+
+#[path = "supervise/journal_writer.rs"]
+mod journal_writer;
+use journal_writer::JournalWriter;
 
 const RETENTION: cortexkit_log::Retention = cortexkit_log::Retention {
     max_file_mb: 1,
@@ -41,22 +45,19 @@ enum DaemonMarker {
 struct JournalEntry {
     module_id: String,
     daemon_incarnation: String,
+    #[serde(default)]
+    sequence: u64,
     #[serde(flatten)]
     record: TerminalRecord,
 }
 
-struct Writer {
-    sink: Option<cortexkit_log::LineSink>,
-    failures: u64,
-}
-
-/// One shared sink serializes append and rotation across all modules. A history
-/// read holds the same lock only to pin the files it will read, never while
-/// reading them; see [`TerminalJournal::capture_read`].
+/// The writer owns the sink. Readers use the file gate only to pin generations;
+/// the in-memory ring and append queue do not depend on it.
 pub(crate) struct TerminalJournal {
     path: PathBuf,
     incarnation: String,
-    writer: Mutex<Writer>,
+    writer: JournalWriter,
+    file_gate: Arc<Mutex<()>>,
 }
 
 impl fmt::Debug for TerminalJournal {
@@ -70,111 +71,90 @@ impl fmt::Debug for TerminalJournal {
 
 impl TerminalJournal {
     pub(crate) fn open(path: PathBuf, incarnation: String) -> Self {
-        let sink = match cortexkit_log::LineSink::open(&path, RETENTION) {
-            Ok(mut sink) => {
-                // A killed append can leave a fragment without a newline. Frame
-                // it off before the next exit so that corruption costs only the
-                // damaged record, rather than swallowing the next valid append.
-                let boundary = (|| -> io::Result<()> {
-                    let mut file = File::open(&path)?;
-                    if file.metadata()?.len() > 0 {
-                        file.seek(SeekFrom::End(-1))?;
-                        let mut last = [0];
-                        file.read_exact(&mut last)?;
-                        if last[0] != b'\n' {
-                            sink.write_line(b"")?;
-                        }
-                    }
-                    Ok(())
-                })();
-                if let Err(error) = boundary {
-                    tracing::warn!(path = %path.display(), %error, "terminal journal boundary check failed");
-                }
-                Some(sink)
-            }
-            Err(error) => {
-                tracing::warn!(path = %path.display(), %error, "terminal journal unavailable; keeping the in-memory ring");
-                None
-            }
-        };
+        let file_gate = Arc::new(Mutex::new(()));
         Self {
+            writer: JournalWriter::open(path.clone(), file_gate.clone()),
             path,
             incarnation,
-            writer: Mutex::new(Writer { sink, failures: 0 }),
+            file_gate,
         }
     }
 
     #[cfg(unix)]
     pub(crate) fn stamp_shutdown(&self) {
-        self.append_serialized(serde_json::to_vec(&DaemonMarker::DaemonShutdown {
+        self.writer.stamp_shutdown(DaemonMarker::DaemonShutdown {
             daemon_incarnation: self.incarnation.clone(),
             at_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64,
-        }));
-    }
-
-    pub(crate) fn append(&self, module_id: &str, record: &TerminalRecord) {
-        let entry = JournalEntry {
-            module_id: module_id.to_owned(),
-            daemon_incarnation: self.incarnation.clone(),
-            record: record.clone(),
-        };
-        self.append_serialized(serde_json::to_vec(&entry));
-    }
-
-    fn append_serialized(&self, line: Result<Vec<u8>, serde_json::Error>) {
-        let mut writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
-        let result = line.map_err(io::Error::other).and_then(|line| {
-            writer
-                .sink
-                .as_mut()
-                .ok_or_else(|| io::Error::other("terminal journal was not opened"))?
-                .write_line(&line)
         });
-        if let Err(error) = result {
-            writer.failures = writer.failures.saturating_add(1);
-            tracing::warn!(path = %self.path.display(), %error, "terminal journal append failed");
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn flush_shutdown(&self) {
+        if !self.writer.flush(std::time::Duration::from_secs(2)).await {
+            tracing::warn!("terminal journal did not flush within the shutdown budget");
         }
     }
 
-    /// Capture and read in one step, for tests that own the journal directly.
+    pub(crate) fn append(&self, module_id: &str, record: &TerminalRecord) {
+        self.writer.append(JournalEntry {
+            module_id: module_id.to_owned(),
+            daemon_incarnation: self.incarnation.clone(),
+            sequence: 0,
+            record: record.clone(),
+        });
+    }
+
+    pub(crate) fn sequence(&self) -> u64 {
+        self.writer.sequence()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn flush_for_test(&self) {
+        self.writer.flush_for_test();
+    }
+
     #[cfg(test)]
     pub(crate) fn merge(
         &self,
         module_id: &str,
         snapshot: TerminalHistorySnapshot,
     ) -> TerminalHistory {
-        self.capture_read(snapshot).read(module_id)
+        self.flush_for_test();
+        self.capture_read(snapshot, self.sequence()).read(module_id)
     }
 
-    /// Pin what a history read will see, holding the writer lock only for that.
-    ///
-    /// Under the lock no append or rotation is in flight, so every generation
-    /// file ends on a line boundary. Each existing generation is OPENED here and
-    /// its current length recorded; the slow part (reading and parsing up to
-    /// every retained generation) happens later in [`JournalRead::read`], with
-    /// the lock released, so exit recording for every module proceeds while a
-    /// history is read.
-    ///
-    /// How a write racing that read is handled: an append lands past the
-    /// recorded length and is not read, and a rotation renames or prunes paths
-    /// but not the files already open here (Unix keeps an open file's inode;
-    /// Rust's Windows `rename`/`remove_file` use POSIX semantics against the
-    /// delete-sharing handles `File::open` makes). So the read describes the
-    /// journal exactly as of this call. Callers take the ring snapshot at the
-    /// same moment, under the ring lock that recording also holds across its
-    /// append and push, so an exit recorded after this call is in neither half
-    /// of the merge and the next read has it once.
-    pub(crate) fn capture_read(&self, snapshot: TerminalHistorySnapshot) -> JournalRead {
-        let writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+    /// Pin files and their lengths before parsing, so rotation cannot change
+    /// the read. The sequence captured with the ring excludes newer appends.
+    pub(crate) fn capture_read(
+        &self,
+        snapshot: TerminalHistorySnapshot,
+        sequence: u64,
+    ) -> JournalRead {
         let mut history = ring_history(snapshot, Some(&self.incarnation));
-        history.journal_write_failures = writer.failures;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let files = loop {
+            match self.file_gate.try_lock() {
+                Ok(files) => break Some(files),
+                Err(TryLockError::Poisoned(p)) => break Some(p.into_inner()),
+                Err(TryLockError::WouldBlock)
+                    if self.writer.is_stalled() || std::time::Instant::now() >= deadline =>
+                {
+                    history.journal_read_errors += 1;
+                    break None;
+                }
+                Err(TryLockError::WouldBlock) => {
+                    std::thread::sleep(std::time::Duration::from_millis(5))
+                }
+            }
+        };
+        history.journal_write_failures = self.writer.failures();
         let mut generations = Vec::new();
         // LineSink names generations by appending .1, .2, ...; only the sink
         // rotates or prunes them. Read oldest first for stable timestamp ties.
-        for generation in (0..=RETENTION.keep).rev() {
+        for generation in (0..=RETENTION.keep).rev().filter(|_| files.is_some()) {
             let path = if generation == 0 {
                 self.path.clone()
             } else {
@@ -195,12 +175,13 @@ impl TerminalJournal {
                 }
             }
         }
-        drop(writer);
         JournalRead {
             #[cfg(test)]
             journal_path: self.path.clone(),
             history,
             generations,
+            sequence,
+            incarnation: self.incarnation.clone(),
         }
     }
 }
@@ -214,6 +195,8 @@ pub(crate) struct JournalRead {
     history: TerminalHistory,
     /// Open generation files, oldest first, each with its length at capture.
     generations: Vec<(PathBuf, File, u64)>,
+    sequence: u64,
+    incarnation: String,
 }
 
 impl JournalRead {
@@ -233,7 +216,10 @@ impl JournalRead {
                     Ok(0) => break,
                     Ok(_) => match serde_json::from_slice::<JournalEntry>(&line) {
                         Ok(entry) if line.ends_with(b"\n") => {
-                            if entry.module_id == module_id {
+                            if entry.module_id == module_id
+                                && (entry.daemon_incarnation != self.incarnation
+                                    || entry.sequence <= self.sequence)
+                            {
                                 entries.push(wire_entry(
                                     entry.record,
                                     Some(&entry.daemon_incarnation),
@@ -386,6 +372,54 @@ mod tests {
     }
 
     #[test]
+    fn stalled_writer_does_not_block_terminal_publication() {
+        let dir = ScratchDir::new("terminal-journal-stall");
+        let journal = Arc::new(TerminalJournal::open(
+            dir.join("terminals.jsonl"),
+            "daemon".into(),
+        ));
+        let writer = journal.file_gate.lock().unwrap();
+        let mut ring = TerminalRing::new(TerminalRingConfig::default(), 10)
+            .with_journal(Some(journal.clone()));
+        let (published, read) = std::sync::mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            ring.record_exit("module", record(12));
+            published.send(ring.snapshot()).unwrap();
+        });
+        let result = read.recv_timeout(std::time::Duration::from_secs(1));
+        drop(writer);
+        producer.join().unwrap();
+        let snapshot = result.expect("terminal publication must not wait for the file writer");
+        assert_eq!(snapshot.entries, [record(12)]);
+        journal.flush_for_test();
+    }
+
+    #[test]
+    fn full_and_stalled_queue_drop_records_but_keep_ring_history() {
+        let dir = ScratchDir::new("terminal-journal-losses");
+        let journal = Arc::new(TerminalJournal::open(
+            dir.join("terminals.jsonl"),
+            "daemon".into(),
+        ));
+        journal.flush_for_test();
+        let writer = journal.file_gate.lock().unwrap();
+        let mut ring =
+            TerminalRing::new(TerminalRingConfig::new(1), 10).with_journal(Some(journal.clone()));
+        for at_ms in 0..256 {
+            ring.record_exit("module", record(at_ms));
+        }
+        let overflow = journal.writer.failures();
+        assert!(overflow > 0, "queue must be bounded");
+        journal.writer.age_pending_for_test();
+        ring.record_exit("module", record(256));
+        let observed = ring.capture_durable_history().read("module");
+        assert_eq!(observed.entries[0].at_ms, 256);
+        assert_eq!(observed.journal_write_failures, overflow + 1);
+        drop(writer);
+        journal.flush_for_test();
+    }
+
+    #[test]
     #[cfg(unix)]
     fn shutdown_marker_survives_reopen_without_becoming_corruption_or_an_exit() {
         let dir = ScratchDir::new("terminal-journal-shutdown");
@@ -393,6 +427,7 @@ mod tests {
         let journal = TerminalJournal::open(path.clone(), "cut-daemon".into());
         journal.append("module", &record(8));
         journal.stamp_shutdown();
+        journal.flush_for_test();
         drop(journal);
         let journal = TerminalJournal::open(path, "next-daemon".into());
         let history = journal.merge(
@@ -473,6 +508,7 @@ mod tests {
         journal.append("module", &large);
         large.at_ms = 2;
         journal.append("module", &large);
+        journal.flush_for_test();
         drop(journal);
         let journal = TerminalJournal::open(path, "second".into());
         let history = journal.merge(

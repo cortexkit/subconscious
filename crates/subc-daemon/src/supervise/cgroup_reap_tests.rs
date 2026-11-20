@@ -2,6 +2,13 @@ use super::*;
 use cortexkit_test_support::ScratchDir;
 use std::{fs, path::Path};
 
+async fn cleanup_reaped_cgroup(
+    placement: &subc_cgroup::Placement,
+    name: &str,
+) -> Option<ordinary_cgroup::Unresolved> {
+    ordinary_cgroup::cleanup(placement, &placement.module_path(name).unwrap()).await
+}
+
 struct KernelCgroup {
     root: PathBuf,
     placement: subc_cgroup::Placement,
@@ -79,7 +86,7 @@ impl Drop for KernelCgroup {
         for module in self.module_cgroups() {
             let _ = fs::write(module.join("cgroup.kill"), "1");
             let deadline = std::time::Instant::now() + Duration::from_secs(1);
-            while cgroup_is_populated(&module) && std::time::Instant::now() < deadline {
+            while !ordinary_cgroup::is_empty(&module) && std::time::Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(1));
             }
             fn remove_empty_tree(path: &Path) {
@@ -323,6 +330,7 @@ async fn scratch_leftover(test_name: &str, ignore_term: bool, freezer: &str) -> 
                 fs::remove_file(path).unwrap();
             }
         }
+        fs::remove_dir(&module).unwrap();
     };
     let started = Instant::now();
     timeout(Duration::from_secs(5), async {
@@ -374,13 +382,121 @@ async fn scratch_reaped_cgroup_empty_skips_freeze_and_kill() {
     fs::write(module.join("cgroup.freeze"), "unchanged").unwrap();
     fs::write(module.join("cgroup.kill"), "unchanged").unwrap();
     let started = Instant::now();
-    cleanup_reaped_cgroup(&placement, "reaped-module").await;
+    assert!(cleanup_reaped_cgroup(&placement, "reaped-module")
+        .await
+        .is_none());
     assert_eq!(started.elapsed(), Duration::ZERO);
     assert_eq!(
         fs::read(module.join("cgroup.freeze")).unwrap(),
         b"unchanged"
     );
     assert_eq!(fs::read(module.join("cgroup.kill")).unwrap(), b"unchanged");
+}
+
+#[tokio::test(start_paused = true)]
+async fn scratch_reaped_cgroup_stays_populated_after_kill() {
+    let dir = ScratchDir::new("scratch-reap-stuck");
+    fs::write(dir.join("cgroup.procs"), "").unwrap();
+    let placement = subc_cgroup::prepare_at(&dir).unwrap().unwrap();
+    let module = placement.module_path("reaped-module").unwrap();
+    fs::write(module.join("cgroup.events"), "populated 1\n").unwrap();
+    fs::write(module.join("cgroup.kill"), "0").unwrap();
+    let started = Instant::now();
+    let unresolved = timeout(
+        Duration::from_secs(11),
+        cleanup_reaped_cgroup(&placement, "reaped-module"),
+    )
+    .await
+    .expect("leader cleanup must return even when cgroup.kill leaves survivors")
+    .expect("surviving cgroup must be retained");
+    assert_eq!(started.elapsed(), Duration::from_secs(10));
+    assert_eq!(fs::read(module.join("cgroup.kill")).unwrap(), b"1");
+    assert!(module.is_dir(), "the unresolved subtree must be retained");
+    assert!(unresolved.detail().contains(&module.display().to_string()));
+}
+
+#[tokio::test]
+async fn ordinary_cgroup_is_recovered_when_its_recorded_leader_is_gone() {
+    use crate::{live_children, run_dir_lock::RunDirLock};
+
+    let dir = ScratchDir::new("ordinary-cgroup-recovery");
+    fs::write(dir.join("cgroup.procs"), "").unwrap();
+    let placement = subc_cgroup::prepare_at(&dir).unwrap().unwrap();
+    let record = dir.join("live-children.json");
+    let roster = ChildRoster::default();
+    roster.record_to(record.clone());
+    let spec = ModuleSpec {
+        script: None,
+        carry_containment: false,
+        module_id: "ordinary-boot-recovery".into(),
+        program: PathBuf::from("/bin/true"),
+        args: vec![],
+        env: vec![],
+        reserved: false,
+        reserved_prefixes: vec![],
+        protocol: ModuleProtocol::None,
+        overlap: Default::default(),
+    };
+    let mut prepared = prepare_child_in_slot(
+        &spec,
+        None,
+        None,
+        None,
+        &roster,
+        None,
+        None,
+        SpawnRole::Plain,
+        false,
+        false,
+    )
+    .unwrap();
+    // Install scratch control files before placing the real leader; they model
+    // a subtree with a survivor but cannot send a signal to a real process.
+    let module = placement.module_path(&prepared.cgroup_name).unwrap();
+    fs::write(module.join("cgroup.procs"), "").unwrap();
+    fs::write(module.join("cgroup.kill"), "0").unwrap();
+    fs::write(module.join("cgroup.events"), "populated 1\n").unwrap();
+    apply_cgroup_placement(&mut prepared.command, &spec, &module).unwrap();
+    prepared.cgroup_placement = Some(placement.clone());
+    prepared.cgroup_path = Some(module.clone());
+    let mut child = launch_child_in_slot(
+        &spec,
+        &Arc::new(Mutex::new(StderrRing::new(StderrTailConfig::default()))),
+        &roster,
+        prepared,
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let pid = child.pid;
+    child.wait().await.unwrap();
+    fs::write(module.join("cgroup.procs"), "42\n").unwrap();
+
+    let owner = RunDirLock::acquire(&record).unwrap();
+    let decisions = live_children::sweep_orphans_with_placement(
+        &owner,
+        &live_children::AdoptedPids::default(),
+        live_children::SweepBounds {
+            term_grace: Duration::ZERO,
+            kill_bound: Duration::ZERO,
+        },
+        Some(&placement),
+    )
+    .await;
+    assert!(
+        matches!(decisions.as_slice(), [(entry, live_children::SweepDecision::ContainerSurvivors(pids))] if entry.pid == pid && pids == &[42]),
+        "recovery lost the ordinary cgroup: {decisions:?}"
+    );
+    let restarted = ChildRoster::default();
+    restarted.set_cgroup_placement(Some(placement));
+    restarted.record_to(record);
+    assert_eq!(fs::read(module.join("cgroup.kill")).unwrap(), b"1");
+    assert!(restarted
+        .retained_view()
+        .waiting_detail(&spec.module_id)
+        .is_some());
+    assert_eq!(restarted.previous_instance_pid(&spec.module_id), Some(pid));
+    fs::write(module.join("cgroup.events"), "populated 0\n").unwrap();
+    assert_eq!(restarted.previous_instance_pid(&spec.module_id), None);
 }
 
 #[tokio::test]

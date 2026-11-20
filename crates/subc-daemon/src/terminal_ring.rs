@@ -2,7 +2,7 @@ use std::{collections::VecDeque, sync::Arc};
 
 use crate::{
     child_roster::DaemonShutdownFlag,
-    terminal_journal::{ring_history, JournalRead, TerminalJournal},
+    terminal_journal::{ring_history, TerminalJournal},
 };
 
 use subc_control::{TerminalDisposition, TerminalExitKind};
@@ -58,7 +58,7 @@ pub struct TerminalHistorySnapshot {
 /// A durable history read captured under the ring lock and finished after it.
 pub(crate) enum DurableHistoryRead {
     RingOnly(TerminalHistorySnapshot),
-    Journal(JournalRead),
+    Journal(Arc<TerminalJournal>, TerminalHistorySnapshot, u64),
 }
 
 impl DurableHistoryRead {
@@ -66,7 +66,9 @@ impl DurableHistoryRead {
     pub(crate) fn read(self, module_id: &str) -> subc_control::TerminalHistory {
         match self {
             Self::RingOnly(snapshot) => ring_history(snapshot, None),
-            Self::Journal(read) => read.read(module_id),
+            Self::Journal(journal, snapshot, sequence) => {
+                journal.capture_read(snapshot, sequence).read(module_id)
+            }
         }
     }
 }
@@ -145,15 +147,18 @@ impl TerminalRing {
     /// Capture and read in one step, for tests that own the ring directly.
     #[cfg(test)]
     pub(crate) fn durable_history(&self, module_id: &str) -> subc_control::TerminalHistory {
+        if let Some(journal) = &self.journal {
+            journal.flush_for_test();
+        }
         self.capture_durable_history().read(module_id)
     }
 
-    /// Pin this ring's snapshot and the journal files a history read will
-    /// see. Cheap; the caller may then release the ring lock before the
-    /// file reading in [`DurableHistoryRead::read`].
+    /// Copy the ring and its journal cutoff without touching the filesystem.
     pub(crate) fn capture_durable_history(&self) -> DurableHistoryRead {
         match &self.journal {
-            Some(journal) => DurableHistoryRead::Journal(journal.capture_read(self.snapshot())),
+            Some(journal) => {
+                DurableHistoryRead::Journal(journal.clone(), self.snapshot(), journal.sequence())
+            }
             None => DurableHistoryRead::RingOnly(self.snapshot()),
         }
     }

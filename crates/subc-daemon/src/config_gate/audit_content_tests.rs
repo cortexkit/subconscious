@@ -81,9 +81,19 @@ async fn superseded_program_exit_cannot_park_under_a_different_current_program_h
     })
     .await;
     let after = fixture.module.status().unwrap();
+    let history = fixture.module.terminal_history();
     drop(fixture.primary);
     fixture.module.stop().await.unwrap();
-    assert_eq!(after.restart_count, before.restart_count + 1, "the old program's refusal must take ordinary crash accounting before its new attempted start parks under the new program's hold");
+    assert_eq!(
+        history.entries.last().unwrap().disposition,
+        subc_control::TerminalDisposition::Restarting,
+        "the old exit must request crash recovery, not adopt the new program's hold"
+    );
+    // Count the replacement at spawn admission; the new approval's hold prevents it.
+    assert_eq!(
+        (after.restart_count, after.lifetime_restarts),
+        (before.restart_count, before.lifetime_restarts)
+    );
     assert_eq!(
         after.spawn_generation, before.spawn_generation,
         "the new held program must not execute"

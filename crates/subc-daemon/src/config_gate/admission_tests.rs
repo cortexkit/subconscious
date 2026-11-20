@@ -58,6 +58,13 @@ async fn refused_live_binding_without_a_current_approval_uses_ordinary_exit_acco
     .await
     .unwrap();
     fixture.module.config_exit_hold().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while fixture.module.status().unwrap().spawn_generation == before.spawn_generation {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("an exit with no current hold must admit a replacement");
     let after = fixture.module.status().unwrap();
     drop(fixture.primary);
     fixture.module.set_enabled(false).await.unwrap();
@@ -67,8 +74,12 @@ async fn refused_live_binding_without_a_current_approval_uses_ordinary_exit_acco
         ModuleState::Stopped,
         "a removed approval has no current hold under which this exit can park"
     );
-    assert_eq!(after.restart_count, before.restart_count + 1,
-        "a superseded refusal follows normal crash accounting rather than the budget-free admission retry");
+    // Count the replacement at spawn admission, not at the superseded refusal.
+    assert_eq!(
+        (after.restart_count, after.lifetime_restarts),
+        (before.restart_count + 1, before.lifetime_restarts + 1),
+        "a superseded refusal follows normal crash accounting rather than the budget-free admission retry"
+    );
 }
 
 async fn gated_claim_fixture_with_support(support: Option<bool>) -> GatedClaimFixture {
@@ -2326,10 +2337,9 @@ async fn config_admission_crash_during_approval_defers_without_parking_the_actor
     );
     assert_eq!(during.spawn_generation, before.spawn_generation);
     assert_eq!(after.spawn_generation, before.spawn_generation + 1);
-    assert_eq!(
-        after.restart_count, during.restart_count,
-        "deferred admission cannot spend another restart-budget entry"
-    );
+    // Count the replacement at spawn admission, not while approval defers it.
+    assert_eq!((during.restart_count, during.lifetime_restarts), (0, 0));
+    assert_eq!((after.restart_count, after.lifetime_restarts), (1, 1));
 }
 
 #[tokio::test]

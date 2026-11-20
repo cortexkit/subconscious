@@ -246,6 +246,7 @@ async fn assert_disable_cancels_backoff(kind: &str) {
     }
     let module = Arc::new(supervisor.spawn(spec.clone()).unwrap());
     wait_for_registration(&server.registry, &spec.module_id, Duration::from_secs(10)).await;
+    let original = module.status().unwrap();
     let reload = if kind != "health" {
         if kind == "spawn-retry" {
             std::fs::remove_file(&spec.program).unwrap();
@@ -255,13 +256,23 @@ async fn assert_disable_cancels_backoff(kind: &str) {
     } else {
         None
     };
-    let retry = kind.ends_with("retry");
+    // A failed spawn admits no replacement. Wait for reload's error to prove
+    // that this is the retry backoff, not the initial reload backoff.
+    if kind == "spawn-retry" {
+        wait_for_status(&module, Duration::from_secs(5), |_| {
+            reload.as_ref().is_some_and(|reload| reload.is_finished())
+        })
+        .await;
+    }
     let pending = wait_for_status(&module, Duration::from_secs(5), |status| {
         status.state == ModuleState::Restarting
             && !status.process_alive
-            && (!retry || status.restart_count > 0)
+            && (kind != "registration-retry" || status.restart_count > 0)
     })
     .await;
+    if kind == "spawn-retry" {
+        assert_eq!(pending.spawn_generation, original.spawn_generation);
+    }
     timeout(Duration::from_millis(500), module.set_enabled(false))
         .await
         .unwrap_or_else(|_| panic!("disable blocked by {kind} backoff"))
@@ -279,6 +290,7 @@ async fn assert_disable_cancels_backoff(kind: &str) {
     sleep(Duration::from_millis(2200)).await;
     let stopped = module.status().unwrap();
     assert_eq!(stopped.state, ModuleState::Disabled);
+    assert_eq!(stopped.lifetime_restarts, pending.lifetime_restarts);
     assert_eq!(
         stopped.spawn_generation, pending.spawn_generation,
         "{kind} respawned despite disable"
@@ -367,6 +379,7 @@ async fn health_restart_evicts_registration_held_by_inherited_socket() {
                 "FAKE_AFT_SOCKET_HOLDER_FIRST_PATH",
                 holder_path.to_str().unwrap(),
             ),
+            ("FAKE_AFT_DESCENDANT_OWN_GROUP", "1"),
             ("FAKE_AFT_ADVERTISE_HEALTH", "1"),
             (
                 "FAKE_AFT_HEALTH_NEVER_REPLY_FIRST_PATH",
@@ -1441,25 +1454,10 @@ async fn stderr_from_before_a_restart_survives_with_a_marked_boundary() {
     );
 }
 
-/// A process that exits while a descendant still holds its stderr pipe.
-///
-/// The restart must not wait on that descendant, the tail must say it is
-/// incomplete while the pipe is open, and what the descendant writes later
-/// belongs to the process that spawned it: it lands in front of the next
-/// process's boundary, never after it. The orphan writes 3s after its parent
-/// exits, far past the supervisor's wait, so a restart observed before the
-/// orphan's line is a restart the held pipe did not delay.
-///
-/// Not on Windows: there each module runs in a job object that is closed when
-/// the module's handle is released, and closing it kills every process the
-/// module started. The descendant holding the pipe dies with its parent, so the
-/// pipe closes at once and a held pipe cannot happen.
-#[cfg(not(windows))]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_held_stderr_pipe_marks_the_tail_incomplete_and_its_late_output_stays_with_its_process() {
-    let server = TestServer::start().await;
-    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
-    let module = supervisor
+/// Escape the group so that the inherited pipe actually outlives group teardown.
+#[cfg(unix)]
+fn spawn_escaped_stderr_writer(supervisor: &Supervisor, delay_ms: &str) -> SupervisedModule {
+    supervisor
         .spawn(ModuleSpec {
             script: None,
             carry_containment: false,
@@ -1471,41 +1469,40 @@ async fn a_held_stderr_pipe_marks_the_tail_incomplete_and_its_late_output_stays_
                 ("FAKE_AFT_EXIT_CODE".to_string(), "1".to_string()),
                 (
                     "FAKE_AFT_ORPHAN_WRITER_DELAY_MS".to_string(),
-                    "3000".to_string(),
+                    delay_ms.to_string(),
                 ),
                 (
                     "FAKE_AFT_ORPHAN_WRITER_LINE".to_string(),
                     "old-trailing".to_string(),
                 ),
+                ("FAKE_AFT_DESCENDANT_OWN_GROUP".into(), "1".into()),
             ],
             reserved: false,
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
             overlap: Default::default(),
         })
-        .unwrap();
+        .unwrap()
+}
 
-    let restarted = wait_for_tail(&module, Duration::from_secs(5), |tail| {
-        tail.entries
-            .iter()
-            .any(|entry| matches!(entry, TailEntry::ProcessStart))
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_stderr_pipe_marks_the_tail_incomplete_and_its_late_output_stays_with_its_process() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 1, Duration::from_millis(10));
+    let module = spawn_escaped_stderr_writer(&supervisor, "1000");
+    let pending = wait_for_tail(&module, Duration::from_secs(5), |tail| {
+        matches!(&tail.capture, CaptureState::Incomplete { reason } if reason.contains("had not reached EOF"))
     })
     .await;
     assert!(
-        !restarted
+        !pending
             .entries
             .iter()
             .any(|entry| matches!(entry, TailEntry::Line { text, .. } if text == "old-trailing")),
-        "the restart waited for the descendant holding the pipe: {:?}",
-        restarted.entries
+        "the capture should report the open pipe before its late output: {:?}",
+        pending.entries
     );
-    match &restarted.capture {
-        CaptureState::Incomplete { reason } => assert!(
-            reason.contains("had not reached EOF"),
-            "the reason must name the open pipe: {reason}"
-        ),
-        other => panic!("expected Incomplete while a descendant holds the pipe, got {other:?}"),
-    }
 
     // Both processes spawn an orphan, so each section ends with its own
     // orphan's line once both pipes close.
@@ -1542,6 +1539,33 @@ async fn a_held_stderr_pipe_marks_the_tail_incomplete_and_its_late_output_stays_
         ],
         "a descendant's late output crossed into its successor's section"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_escaped_stderr_writer_past_the_drain_bound_is_recorded_as_lost() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 0, Duration::ZERO);
+    let module = spawn_escaped_stderr_writer(&supervisor, "3500");
+    wait_for_status(&module, Duration::from_secs(5), |status| {
+        status.state == ModuleState::Failed
+    })
+    .await;
+    assert!(module.terminal_history().entries.iter().any(|entry| entry
+        .disposition_detail
+        .as_deref()
+        .is_some_and(|detail| detail.contains("late child output lost"))));
+    let tail = wait_for_tail(&module, Duration::from_secs(5), |tail| {
+        matches!(&tail.capture, CaptureState::Incomplete { reason } if reason.contains("late child output lost"))
+    }).await;
+    assert!(tail
+        .entries
+        .iter()
+        .any(|entry| matches!(entry, TailEntry::Line { text, .. } if text == "old-start")));
+    assert!(!tail
+        .entries
+        .iter()
+        .any(|entry| matches!(entry, TailEntry::Line { text, .. } if text == "old-trailing")));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

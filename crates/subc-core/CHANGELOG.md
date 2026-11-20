@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.21.27
+
+- Test fixtures: the fake module stub can start helpers outside its process group, so
+  supervision tests can exercise stale registrations and pipes held past a group's exit.
+
 ## 0.21.26
 
 - Grant ck-bus read and sign access to the federation-account signing key during setup and upgrade.

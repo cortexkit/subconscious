@@ -104,6 +104,9 @@ finish warming during a daemon-wide boot storm: a fixed short delay can make a
 module repeatedly probe a peer before it is ready and exhaust its restart budget
 while the fleet is still settling.
 
+A budgeted replacement enters the window and lifetime count when it spawns,
+not while it waits for backoff or configuration publication.
+
 When the budget refuses a respawn, the module goes to `failed` and both the log
 line and the retained terminal record name the limit AND the window:
 

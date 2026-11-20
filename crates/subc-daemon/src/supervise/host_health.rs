@@ -162,8 +162,8 @@ mod tests {
 
     use super::*;
     use crate::supervise::{
-        handle_health_probe_failure, HealthAction, HealthConfig, HealthProbeError, RestartPolicy,
-        SupervisedModule, Supervisor, SupervisorHandle, SupervisorRuntimeConfig,
+        handle_health_probe_failure, HealthAction, HealthConfig, HealthProbeError, RespawnKind,
+        RestartPolicy, SupervisedModule, Supervisor, SupervisorHandle, SupervisorRuntimeConfig,
     };
 
     #[derive(Clone, Default)]
@@ -298,10 +298,14 @@ mod tests {
             let module = &self.modules[index];
             let status = module.handle.status().unwrap();
             assert_eq!(status.state, ModuleState::Restarting);
-            assert_eq!(status.restart_count, 1);
-            assert_eq!(status.lifetime_restarts, 1);
+            // Count the replacement at spawn admission; this harness only schedules it.
+            assert_eq!((status.restart_count, status.lifetime_restarts), (0, 0));
             assert_eq!(status.health.last_action.as_deref(), Some("restart"));
-            assert!(module.runtime.scheduled_respawn.lock().unwrap().is_some());
+            let pending = module.runtime.scheduled_respawn.lock().unwrap();
+            assert!(matches!(
+                pending.as_ref().unwrap().kind,
+                RespawnKind::CrashRestart
+            ));
         }
     }
 

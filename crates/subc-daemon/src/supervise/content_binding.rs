@@ -28,6 +28,8 @@ pub(super) struct LiveProgramBinding {
     #[cfg(all(test, unix))]
     kill_deferred: AtomicBool,
     container: Option<Arc<containment::CarriedContainment>>,
+    #[cfg(unix)]
+    plain_group: Option<std::sync::Weak<plain_group::PlainGroup>>,
     #[cfg(target_os = "linux")]
     cgroup: Option<(subc_cgroup::Placement, String)>,
     #[cfg(windows)]
@@ -63,6 +65,8 @@ impl LiveProgramBinding {
             #[cfg(all(test, unix))]
             kill_deferred: AtomicBool::new(false),
             container: child.child.container(),
+            #[cfg(unix)]
+            plain_group: child.child.plain_group.as_ref().map(Arc::downgrade),
             #[cfg(target_os = "linux")]
             cgroup: child
                 .cgroup_placement
@@ -279,10 +283,8 @@ impl LiveProgramBinding {
             kill_module_cgroup(Some(placement), name);
         }
         #[cfg(unix)]
-        if self.container.is_none() {
-            if let Some(group) = rustix::process::Pid::from_raw(self.process.pid() as i32) {
-                let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
-            }
+        if let Some(group) = self.plain_group.as_ref().and_then(std::sync::Weak::upgrade) {
+            let _ = group.signal(rustix::process::Signal::KILL);
         }
         #[cfg(windows)]
         if let Some(job) = &self.job {

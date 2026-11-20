@@ -2473,11 +2473,9 @@ async fn config_delivery_supervisor_pre_hello_crash_defers_respawn_without_spend
             .count(),
         1
     );
-    assert_eq!(
-        module.status().unwrap().restart_count,
-        1,
-        "the real crash spends one entry, waiting on its fence spends none"
-    );
+    // Count the replacement at spawn admission, not while it waits at the fence.
+    let fenced = module.status().unwrap();
+    assert_eq!((fenced.restart_count, fenced.lifetime_restarts), (0, 0));
     let probe = crate::supervise::Supervisor::new_for_test(
         std::sync::Arc::new(crate::Registry::default()),
         crate::supervise::RestartPolicy::default(),
@@ -2514,13 +2512,15 @@ async fn config_delivery_supervisor_pre_hello_crash_defers_respawn_without_spend
         &module,
         "pre-HELLO fence clears and one replacement starts",
         || {
-            std::fs::read_to_string(rig.path.join("a.launches"))
-                .is_ok_and(|text| text.lines().count() == 2)
+            module.status().unwrap().spawn_generation == fenced.spawn_generation + 1
+                && std::fs::read_to_string(rig.path.join("a.launches"))
+                    .is_ok_and(|text| text.lines().count() == 2)
         },
     )
     .await;
     assert!(owner.delivery_exit_fence("a").unwrap().is_none());
-    assert_eq!(module.status().unwrap().restart_count, 1);
+    let admitted = module.status().unwrap();
+    assert_eq!((admitted.restart_count, admitted.lifetime_restarts), (1, 1));
     rig.declare(&owner, 30);
     let view = owner
         .module_get(ConnectionId::new(30), "a", ConfigGetRequest::new())
@@ -2580,7 +2580,7 @@ async fn exit_after_unavailable_image(
     registration_before_exit: bool,
 ) {
     use std::io::Write;
-    let (rig, owner, supervisor, _handler) =
+    let (rig, owner, supervisor, handler) =
         supervised_fixture_with_program(true, false, "fifo-exit23");
     let release = rig.path.join("a.seen");
     assert!(std::process::Command::new("mkfifo")
@@ -2664,20 +2664,16 @@ async fn exit_after_unavailable_image(
         kill_sent.load(std::sync::atomic::Ordering::SeqCst),
         "the admission kill must have been sent, even if the program's own exit won"
     );
-    let status = module.status().unwrap();
+    let fenced = module.status().unwrap();
+    // Count the replacement at spawn admission, not when classifying the original exit.
+    assert_eq!((fenced.restart_count, fenced.lifetime_restarts), (0, 0));
+    let exit = fenced.last_exit.unwrap();
     if child_exits {
-        assert_eq!(
-            status.restart_count, 1,
-            "a real exit 23 after exec spends one entry even when its witness was unavailable"
-        );
-        assert_eq!(status.lifetime_restarts, 1);
-        assert_eq!(status.last_exit.unwrap().code, Some(23));
+        assert_eq!(exit.code, Some(23));
     } else {
-        assert_eq!(status.restart_count, 0, "an admission kill is not a crash");
-        assert_eq!(status.lifetime_restarts, 0);
-        assert_eq!(status.last_exit.unwrap().signal, Some(9));
+        assert_eq!(exit.signal, Some(9));
     }
-    assert!(!status.process_alive);
+    assert!(!fenced.process_alive);
     assert!(owner.delivery_exit_fence("a").unwrap().is_some());
     assert_eq!(
         std::fs::read_to_string(rig.path.join("a.launches"))
@@ -2695,6 +2691,24 @@ async fn exit_after_unavailable_image(
     let deferred = probe.spawn(supervised_spec(&rig, "a")).unwrap();
     assert_eq!(deferred.status().unwrap().restart_count, 0);
     deferred.stop().await.unwrap();
+
+    // Let the replacement pass the image check and wait on the named pipe.
+    supervisor.set_admission_hook_for_test(|_, _, _| true);
+    let _worker = WorkerGuard(handler.spawn_config_delivery_worker().unwrap());
+    wait_for_supervised_stage(&module, "replacement admitted after the exit fence", || {
+        module.status().unwrap().spawn_generation == fenced.spawn_generation + 1
+            && std::fs::read_to_string(rig.path.join("a.launches"))
+                .is_ok_and(|text| text.lines().count() == 2)
+    })
+    .await;
+    assert!(owner.delivery_exit_fence("a").unwrap().is_none());
+    let admitted = module.status().unwrap();
+    let expected = if child_exits { 1 } else { 0 };
+    assert_eq!(
+        (admitted.restart_count, admitted.lifetime_restarts),
+        (expected, expected),
+        "only recovery from the program's own exit spends budget"
+    );
     module.stop().await.unwrap();
 }
 
@@ -3871,6 +3885,7 @@ async fn config_delivery_route_worker_requests_immediate_health_and_uses_deliver
         let mut spec = supervised_spec(&rig, "a");
         spec.protocol = subc_control::ModuleProtocol::Subc;
         let module = supervisor.spawn(spec).unwrap();
+        let original_generation = module.status().unwrap().spawn_generation;
         registry
             .register_with_control_ops(
                 subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build(),
@@ -3972,21 +3987,32 @@ async fn config_delivery_route_worker_requests_immediate_health_and_uses_deliver
             }
         );
         if answer != Some(HealthStatus::Ok) {
-            wait_for_delivery_condition(|| {
-                module
-                    .status()
-                    .is_ok_and(|status| status.restart_count == 1)
+            wait_for_supervised_stage(&module, "unhealthy incumbent is retired", || {
+                let status = module.status().unwrap();
+                status.state == crate::supervise::ModuleState::Restarting && !status.process_alive
             })
             .await;
+            // Count the replacement at spawn admission, after the fake peer disconnects.
+            let retired = module.status().unwrap();
+            assert_eq!((retired.restart_count, retired.lifetime_restarts), (0, 0));
+            assert_eq!(retired.spawn_generation, original_generation);
+        }
+        registry.deregister_connection(INCUMBENT).unwrap();
+        if answer != Some(HealthStatus::Ok) {
+            wait_for_supervised_stage(&module, "delivery recovery admits a replacement", || {
+                module.status().unwrap().spawn_generation > original_generation
+            })
+            .await;
+            let admitted = module.status().unwrap();
+            assert_eq!(admitted.spawn_generation, original_generation + 1);
             assert_eq!(
-                module.status().unwrap().restart_count,
-                1,
+                (admitted.restart_count, admitted.lifetime_restarts),
+                (1, 1),
                 "config failure spends once, not a second time through health supervision"
             );
         } else {
             assert_eq!(module.status().unwrap().restart_count, 0);
         }
-        registry.deregister_connection(INCUMBENT).unwrap();
         module.stop().await.unwrap();
     }
 }

@@ -3,6 +3,40 @@ use cortexkit_test_support::ScratchDir;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+#[tokio::test]
+async fn closing_capture_control_releases_pipes_with_live_writers() {
+    let mut child = tokio::process::Command::new("/bin/sleep")
+        .arg("30")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let ring = Arc::new(Mutex::new(StderrRing::new(Default::default())));
+    let Pumps {
+        stdout,
+        stderr,
+        stop,
+    } = start(
+        &mut child,
+        ChildOutputSink::Stderr,
+        &ring,
+        "held-pipes",
+        true,
+    );
+    assert!(stop.unwrap().had_open_readers());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        stdout.unwrap().await.unwrap();
+        stderr.unwrap().task.await.unwrap();
+    })
+    .await
+    .expect("reader and writer threads must finish even though the pipes never reached EOF");
+    assert!(child.try_wait().unwrap().is_none());
+    assert!(matches!(ring.lock().unwrap().snapshot(None, None).capture,
+        crate::stderr_tail::CaptureState::Incomplete { reason } if reason.contains("late child output lost")));
+    child.kill().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn child_exits_with_a_stalled_sink_and_reports_drops() {
     let dir = ScratchDir::new("module-output-stall");
@@ -24,7 +58,7 @@ async fn child_exits_with_a_stalled_sink_and_reports_drops() {
         .kill_on_drop(true)
         .spawn()
         .unwrap();
-    let (_, stderr) = start(&mut child, sink, &ring, "two-pipe");
+    let Pumps { stderr, .. } = start(&mut child, sink, &ring, "two-pipe", false);
 
     // Poll from the test thread without driving Tokio timers, so the test also
     // fails if a pump blocked on the sink starves the runtime's I/O driver.

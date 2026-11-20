@@ -1,6 +1,6 @@
 [package]
 name = "subc-daemon"
-version = "0.50.20"
+version = "0.50.21"
 edition = "2021"
 publish = true
 description = "Embeddable subc daemon: bootstrap, module supervision, and opaque-byte splice routing."
@@ -79,10 +79,11 @@ subc-jobobject = { path = "../subc-jobobject", version = "0.2.4" }
 subc-presence = { path = "../subc-presence", version = "0.2.1" }
 
 [target.'cfg(unix)'.dependencies]
-# SIGTERM for `protocol: "none"` teardown. This crate forbids unsafe code, so
-# `libc::kill` is not reachable from here; rustix wraps the same syscall safely
-# and is already in the tree via subc-transport.
-rustix = { version = "1", default-features = false, features = ["process", "fs"] }
+# SIGTERM for `protocol: "none"` teardown, and poll(2) so a module's output
+# pipes can be read with a stop signal. This crate forbids unsafe code, so libc
+# is not reachable from here; rustix wraps the same syscalls safely and is
+# already in the tree via subc-transport.
+rustix = { version = "1", default-features = false, features = ["event", "process", "fs"] }
 
 [dev-dependencies]
 subc-control-published = { package = "subc-control", version = "=0.35.0" }

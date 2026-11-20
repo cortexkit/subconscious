@@ -9222,7 +9222,29 @@ async fn swap_whose_candidate_never_becomes_ready_leaves_the_incumbent_undrained
         );
     }
     let error = read_control_error_on_stream(&mut control, 2, "swap_failed").await;
-    assert_eq!(error.detail.unwrap()["arm"], "never_ready");
+    let detail = error.detail.unwrap();
+    assert_eq!(detail["arm"], "never_ready");
+    let history = module.terminal_history();
+    assert_eq!(
+        history.entries.len(),
+        1,
+        "the killed candidate has one record"
+    );
+    let exit = &history.entries[0];
+    assert!(exit.exit_code.is_some() || exit.exit_signal.is_some());
+    assert_eq!(
+        detail["candidate_exit_code"].as_i64(),
+        exit.exit_code.map(i64::from)
+    );
+    assert_eq!(
+        detail["candidate_exit_signal"].as_i64(),
+        exit.exit_signal.map(i64::from)
+    );
+    assert!(exit
+        .disposition_detail
+        .as_deref()
+        .unwrap()
+        .contains("never_ready"));
     assert_eq!(
         events_of_kind(&incumbent_events, "draining"),
         0,
@@ -9286,17 +9308,34 @@ async fn swap_candidate_dying_mid_warm_spends_no_restart_budget() {
         .swap(Some(Duration::from_secs(10)))
         .await
         .expect_err("a candidate that crashes while warming fails the swap");
-    match error {
+    let exit = match error {
         SuperviseError::SwapFailed {
             arm,
             candidate_exit,
             ..
         } => {
             assert_eq!(arm, SwapFailureArm::CandidateExited);
-            assert_eq!(candidate_exit.unwrap().kind, ExitKind::Crash);
+            candidate_exit.unwrap()
         }
         other => panic!("expected SwapFailed, got {other:?}"),
-    }
+    };
+    assert_eq!(exit.kind, ExitKind::Crash);
+    let history = module.terminal_history();
+    assert_eq!(
+        history.entries.len(),
+        1,
+        "the reaped candidate has one record"
+    );
+    let terminal = &history.entries[0];
+    assert_eq!(
+        (terminal.exit_code, terminal.exit_signal, terminal.at_ms),
+        (exit.code, exit.signal, exit.at_ms)
+    );
+    assert!(terminal
+        .disposition_detail
+        .as_deref()
+        .unwrap()
+        .contains("candidate_exited"));
 
     let after = module.status().unwrap();
     assert_eq!(after.state, ModuleState::Running);

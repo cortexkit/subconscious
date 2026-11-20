@@ -2137,6 +2137,8 @@ pub(crate) mod tests {
             container: None,
             #[cfg(unix)]
             carried: None,
+            #[cfg(unix)]
+            plain_group: None,
             start_time: Some(5),
             executable: Some(ExecutableIdentity {
                 device: 1,

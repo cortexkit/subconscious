@@ -115,8 +115,11 @@ p50 and p99, not one call timed either way.
 Failure arms, which are the point:
 
 - Candidate never registers, never flips ready, or fails its first health
-  probe within a budget: **kill the candidate, incumbent untouched, swap
-  reported failed with the candidate's terminal record**; candidate spawn must leave the incumbent's nonce, cgroup, capture file, and registration untouched.
+  probe within a budget: **kill the candidate and leave the incumbent
+  untouched**. The failure reply includes the candidate's exit code or signal
+  when available, and [terminal history](data-model.md#4-terminal-journal)
+  records how it exited and why the swap failed. Candidate spawn leaves the
+  incumbent's nonce, cgroup, capture file, and registration untouched.
 - Candidate registers but the incumbent dies during the swap: promote the
   candidate immediately (it is the only live process); if it is not ready,
   callers get `module_warming` as in a plain restart.
@@ -292,7 +295,9 @@ The candidate's admission and promotion follow these rules:
 7. The incumbent is retired by its own
    function, which drains with `begin_endpoint_drain` (reason `Restart`),
    reaps the process, and waits for release by `Connection`. The module's
-   state is not touched, since it describes the promoted candidate.
+   state, including `last_exit`, still describes the active lifecycle. The
+   retired process's exit appears only in [terminal history](data-model.md#4-terminal-journal)
+   and in the exit notification for that process's own spawn generation.
 
 The candidate gets the same health probe once
 before cutover (`failing` or no usable answer fails the swap, `degraded` does

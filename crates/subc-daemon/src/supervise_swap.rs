@@ -28,6 +28,9 @@
 use super::*;
 use crate::registry::RegistrationSlot;
 
+#[path = "supervise/swap_terminal.rs"]
+mod swap_terminal;
+
 // Gate publication can spend several seconds in disk-bound work under fsync load.
 // Allow that work the same 30 s as a live config ACK, but do not retain a warmed
 // candidate indefinitely if cutover still cannot acquire the gate.
@@ -44,11 +47,8 @@ const SWAP_CUTOVER_DEADLINE: Duration = Duration::from_secs(30);
 /// cgroup, swap or not. Bytes outside `[A-Za-z0-9.-]`, the underscore
 /// included, are written as `_` and two lowercase hex digits; so every `_`
 /// the encoding produces is followed by two hex digits, and `_swap` (with `s`
-/// not a hex digit) can only be the suffix. The cgroup library's own escaping
-/// leaves this alphabet untouched. Before swap existed the library's encoding
-/// was used directly, and it passes `_` through, so `a_40swap` and `a@swap`
-/// (and `a` + `_40swap`) named one directory; for ids containing `_` the
-/// primary name therefore differs from what earlier daemons created.
+/// not a hex digit) can only be the suffix. Placement then escapes `_` again:
+/// this label is not yet the filesystem component.
 #[cfg(any(target_os = "linux", test))]
 pub(crate) fn cgroup_name(module_id: &str, alternate: bool) -> String {
     let mut name = String::with_capacity(module_id.len() + 5);
@@ -102,12 +102,12 @@ struct CandidateFailure {
 }
 
 impl CandidateFailure {
-    fn into_error(self, module_id: &str) -> SuperviseError {
+    fn into_error(self, module_id: &str, exit: ExitReport) -> SuperviseError {
         SuperviseError::SwapFailed {
             module_id: module_id.to_string(),
             arm: self.arm,
             detail: self.detail,
-            candidate_exit: self.exit,
+            candidate_exit: Some(exit),
         }
     }
 }
@@ -240,7 +240,7 @@ async fn run_swap_inner(
     .await;
     let candidate_connection = match warm {
         Warm::Superseded { generation } => {
-            abandon_candidate(module_id, registry, &forwarding, &handle, candidate, None).await;
+            abandon_candidate(module_id, registry, &forwarding, runtime, candidate, None).await;
             update_snapshot(snapshot, Some(module_id), |state| {
                 state.swap_outcome = Some(SwapOutcome::SupersededByConfigRestart)
             })
@@ -264,16 +264,16 @@ async fn run_swap_inner(
                 exit: None,
                 connection,
             };
-            abandon_candidate(
+            let exit = abandon_candidate(
                 module_id,
                 registry,
                 &forwarding,
-                &handle,
+                runtime,
                 candidate,
                 Some(&failure),
             )
             .await;
-            let _ = reply.send(Err(failure.into_error(module_id)));
+            let _ = reply.send(Err(failure.into_error(module_id, exit)));
             // Stop/disable/hold must take effect before retained restart
             // commands; the actor then discards restarts for the stopped child.
             if let Some(command) = command {
@@ -282,16 +282,16 @@ async fn run_swap_inner(
             return;
         }
         Warm::Failed(failure) => {
-            abandon_candidate(
+            let exit = abandon_candidate(
                 module_id,
                 registry,
                 &forwarding,
-                &handle,
+                runtime,
                 candidate,
                 Some(&failure),
             )
             .await;
-            let _ = reply.send(Err(failure.into_error(module_id)));
+            let _ = reply.send(Err(failure.into_error(module_id, exit)));
             return;
         }
     };
@@ -306,16 +306,16 @@ async fn run_swap_inner(
     )
     .await
     {
-        abandon_candidate(
+        let exit = abandon_candidate(
             module_id,
             registry,
             &forwarding,
-            &handle,
+            runtime,
             candidate,
             Some(&failure),
         )
         .await;
-        let _ = reply.send(Err(failure.into_error(module_id)));
+        let _ = reply.send(Err(failure.into_error(module_id, exit)));
         return;
     }
 
@@ -333,16 +333,16 @@ async fn run_swap_inner(
                     exit: None,
                     connection: Some(candidate_connection),
                 };
-                abandon_candidate(
+                let exit = abandon_candidate(
                     module_id,
                     registry,
                     &forwarding,
-                    &handle,
+                    runtime,
                     candidate,
                     Some(&failure),
                 )
                 .await;
-                let _ = reply.send(Err(failure.into_error(module_id)));
+                let _ = reply.send(Err(failure.into_error(module_id, exit)));
                 return;
             }
         },
@@ -359,6 +359,7 @@ async fn run_swap_inner(
                 .any(|op| op == "config.review")
         });
     let mut cutover_deadline = None;
+    let mut candidate_exit = None;
     let (forwarding_cutover, promoted) = loop {
         let attempt = if cutover_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             Err(CutoverDeferred::DeadlineExceeded)
@@ -381,23 +382,35 @@ async fn run_swap_inner(
                     *cutover_deadline.get_or_insert_with(|| Instant::now() + SWAP_CUTOVER_DEADLINE);
                 let retry = tokio::select! {
                     ready=wait_for_config_gate(runtime,module_id,commands,end,Some(deadline))=>ready,
-                    _=candidate.wait()=>false,
+                    status=candidate.wait()=>{
+                        candidate_exit = Some(swap_terminal::observed_exit(module_id, status));
+                        false
+                    },
                     _=async {match child.as_mut() {Some(incumbent)=>{let _=incumbent.wait().await;},None=>std::future::pending::<()>().await}}=>false,
                 };
                 if retry || Instant::now() >= deadline {
                     continue;
                 }
-                abandon_candidate(module_id, registry, &forwarding, &handle, candidate, None).await;
-                let _ = reply.send(Err(SuperviseError::SwapFailed {
-                    module_id: module_id.into(),
+                let failure = CandidateFailure {
                     arm: SwapFailureArm::Interrupted,
                     detail: "swap interrupted before configuration cutover".into(),
-                    candidate_exit: None,
-                }));
+                    exit: candidate_exit.take(),
+                    connection: Some(candidate_connection),
+                };
+                let exit = abandon_candidate(
+                    module_id,
+                    registry,
+                    &forwarding,
+                    runtime,
+                    candidate,
+                    Some(&failure),
+                )
+                .await;
+                let _ = reply.send(Err(failure.into_error(module_id, exit)));
                 return;
             }
             Err(CutoverDeferred::NewGeneration(generation)) => {
-                abandon_candidate(module_id, registry, &forwarding, &handle, candidate, None).await;
+                abandon_candidate(module_id, registry, &forwarding, runtime, candidate, None).await;
                 update_snapshot(snapshot, Some(module_id), |state| {
                     state.swap_outcome = Some(SwapOutcome::SupersededByConfigRestart)
                 })
@@ -428,19 +441,19 @@ async fn run_swap_inner(
                         }
                         _ => "the candidate connection closed just before cutover".into(),
                     },
-                    exit: None,
+                    exit: candidate_exit.take(),
                     connection: Some(candidate_connection),
                 };
-                abandon_candidate(
+                let exit = abandon_candidate(
                     module_id,
                     registry,
                     &forwarding,
-                    &handle,
+                    runtime,
                     candidate,
                     Some(&failure),
                 )
                 .await;
-                let _ = reply.send(Err(failure.into_error(module_id)));
+                let _ = reply.send(Err(failure.into_error(module_id, exit)));
                 if restart {
                     if let Err(error) = restart_child(
                         spec,
@@ -996,10 +1009,7 @@ async fn warm_candidate_until_outcome(
             status = candidate.wait() => {
                 // Classified on its own: the module snapshot's severance marker
                 // belongs to the incumbent and must not be consumed here.
-                let exit = match status {
-                    Ok(status) => classify_exit(&status),
-                    Err(_) => wait_error_exit_report(),
-                };
+                let exit = swap_terminal::observed_exit(module_id, status);
                 return Warm::Failed(CandidateFailure {
                     arm: SwapFailureArm::CandidateExited,
                     detail: candidate.spawn_failure.clone().unwrap_or_else(|| format!(
@@ -1147,10 +1157,10 @@ async fn abandon_candidate(
     module_id: &str,
     registry: &Registry,
     forwarding: &ForwardingTable,
-    handle: &SupervisorHandle,
+    runtime: &SupervisorRuntimeConfig,
     mut candidate: SupervisedChild,
     failure: Option<&CandidateFailure>,
-) {
+) -> ExitReport {
     candidate.retire_registration();
     if let Some(failure) = failure {
         warn!(module_id, arm=failure.arm.as_str(), detail=%failure.detail, candidate_pid=candidate.pid,
@@ -1163,15 +1173,9 @@ async fn abandon_candidate(
             "swap superseded by approved configuration restart; leaving the incumbent serving"
         );
     }
-    if failure.is_none_or(|failure| failure.exit.is_none()) {
-        if let Err(err) = candidate.start_kill() {
-            debug!(module_id, error = %err, "swap candidate kill failed; it may already have exited");
-        }
-        if let Err(err) = candidate.wait().await {
-            warn!(module_id, error = %err, "could not reap the abandoned swap candidate");
-        }
-    }
+    let exit = swap_terminal::abandoned_exit(module_id, &mut candidate, failure).await;
     candidate.drain_stderr(module_id).await;
+    swap_terminal::record_abandonment(module_id, runtime, &exit, failure);
     if let Err(error) = candidate.finish_exit(false).await {
         warn!(module_id, %error, "could not finalize the abandoned swap candidate");
     }
@@ -1203,7 +1207,10 @@ async fn abandon_candidate(
             );
         }
     }
-    handle.close_swap(module_id);
+    if let Some(handle) = &runtime.supervisor_handle {
+        handle.close_swap(module_id);
+    }
+    exit
 }
 
 /// Drain and reap the incumbent a swap has just replaced.
@@ -1276,7 +1283,12 @@ pub(super) async fn retire_incumbent(
     // budget a plain restart gives the child it drains, then kill it.
     let status = match observed_exit {
         Some(status) => status,
-        None => match timeout(runtime.drain_timeout, incumbent.wait()).await {
+        None => match timeout(
+            incumbent.group_drain_budget(runtime.drain_timeout, stop_notice),
+            incumbent.wait(),
+        )
+        .await
+        {
             Ok(status) => status,
             Err(_) => {
                 warn!(
@@ -1316,7 +1328,8 @@ pub(super) async fn retire_incumbent(
             at_ms: exit_report.at_ms,
             disposition: TerminalDisposition::Restarting,
             exit_kind: exit_report.kind.into(),
-            disposition_detail: Some("replaced by a blue/green swap".to_string()),
+            disposition_detail: incumbent
+                .exit_cleanup_detail(Some("replaced by a blue/green swap".into())),
         };
         // Recorded as `daemon_shutdown` instead if the daemon has begun
         // shutting down (see `TerminalRing::record_exit`).
@@ -1326,11 +1339,8 @@ pub(super) async fn retire_incumbent(
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .record_exit(module_id, record);
     }
-    let _ = update_snapshot(snapshot, Some(module_id), |state| {
-        state.last_exit = Some(exit_report.clone());
-    });
-    // A shutdown waits for the roster to empty. Release only after writing
-    // the durable terminal record, never merely after wait() reaps the pid.
+    // Shutdown waits for the roster to empty before flushing the journal.
+    // Enqueue the record before releasing this roster entry.
     if let Err(error) = incumbent.finish_exit(false).await {
         warn!(module_id, %error, "could not finalize the swapped-out incumbent");
     }
@@ -2161,6 +2171,9 @@ mod tests {
         )
         .unwrap();
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+        let mut active_exit = wait_error_exit_report();
+        active_exit.code = Some(42);
+        snapshot.lock().unwrap().last_exit = Some(active_exit);
         let forwarding = Arc::new(ForwardingTable::default());
         timeout(
             Duration::from_millis(100),
@@ -2188,6 +2201,11 @@ mod tests {
             "shutdown must wait for the incumbent's terminal record: {records}"
         );
         assert!(records.contains("daemon_shutdown"));
+        assert_eq!(
+            snapshot.lock().unwrap().last_exit.as_ref().unwrap().code,
+            Some(42),
+            "retirement must not replace the active lifecycle's exit"
+        );
     }
 
     /// During a swap two processes of the module are alive, and consumers

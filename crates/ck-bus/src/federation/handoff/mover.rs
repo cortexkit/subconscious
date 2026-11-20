@@ -15,7 +15,7 @@ use async_nats::{
     },
 };
 use cortexkit_bus_naming::{
-    federation::{hub_inbox_stream_name, inbox_stream_name, BoxId, FEDOUT_STREAM},
+    federation::{hub_inbox_stream_name, inbox_stream_name, BoxId, HubName, FEDOUT_STREAM},
     AccountNames,
 };
 use futures_util::{future::join_all, stream::FuturesUnordered, StreamExt as _};
@@ -24,7 +24,7 @@ use tokio::sync::{Mutex, Notify};
 
 use super::{
     in_durable, out_durable,
-    purge::{Generation, Purger},
+    purge::Purger,
     store::{unix_secs, Source, Store},
     wire::{self, Envelope, Frame, Refusal, Stamp},
     Address, Health, OpenError, Opener, Peer, Peers, RECEIVE_FAMILIES, SEND_DURABLE,
@@ -52,7 +52,8 @@ pub(crate) struct Mover {
     journal: Mutex<Store>,
     recipient_changed: Notify,
     receiving: PendingReceipts,
-    purger: Option<Purger>,
+    hub: Option<HubName>,
+    purger: Purger,
     open_rate_limit_delay: Duration,
 }
 
@@ -67,16 +68,16 @@ pub(crate) struct Inputs {
     pub(crate) signing: Arc<dyn VaultSigning>,
     pub(crate) opener: Arc<dyn Opener>,
     pub(crate) health: Arc<Health>,
-    pub(crate) purge_generation: Option<Generation>,
+    pub(crate) hub: Option<HubName>,
+    pub(crate) sources: Vec<String>,
+    pub(crate) inbox_floor: u64,
 }
 
 impl Mover {
     pub(crate) fn new(input: Inputs, path: &std::path::Path) -> rusqlite::Result<Self> {
-        let mut journal = Store::open(path)?;
-        let purger = input
-            .purge_generation
-            .map(|generation| Purger::new(generation, &input.machine, &mut journal))
-            .transpose()?;
+        let journal = Store::open(path)?;
+        journal.initialize_inbox_prefix(input.inbox_floor)?;
+        let purger = Purger::new(input.sources, &journal)?;
         Ok(Self {
             machine: input.machine,
             names: input.names,
@@ -89,6 +90,7 @@ impl Mover {
             journal: Mutex::new(journal),
             recipient_changed: Notify::new(),
             receiving: std::sync::Mutex::new(HashSet::new()),
+            hub: input.hub,
             purger,
             open_rate_limit_delay: Duration::from_secs(60),
         })
@@ -106,11 +108,7 @@ impl Mover {
             self.run_forwarders(),
             join_all(RECEIVE_FAMILIES.map(|family| self.run_lane(Lane::Receive(family)))),
             self.run_pruner(),
-            async {
-                if let Some(purger) = &self.purger {
-                    purger.run(&self.fed_js, &self.health).await;
-                }
-            },
+            self.purger.run(&self.fed_js, &self.health),
         );
     }
 
@@ -329,14 +327,13 @@ impl Mover {
     }
 
     async fn confirm_inbox_ack(&self, message: &Message, sequence: u64, verified: bool) {
-        if let Some(purger) = &self.purger {
-            let result = purger
-                .confirmed(&self.journal, message, sequence, verified)
-                .await;
-            let error = result.err().map(|error| error.to_string());
-            self.health
-                .state("fed.hub_purge_journal_waiting", error.as_deref());
-        }
+        let result = self
+            .purger
+            .confirmed(&self.journal, message, sequence, verified)
+            .await;
+        let error = result.err().map(|error| error.to_string());
+        self.health
+            .state("fed.hub_purge_journal_waiting", error.as_deref());
     }
 
     async fn send(&self, message: &Message, source: &Source) -> Result<(), Retry> {
@@ -443,6 +440,10 @@ impl Mover {
     }
 
     async fn forward(&self, message: &Message, peer: &BoxId) -> Result<(), Retry> {
+        let hub = self
+            .hub
+            .as_ref()
+            .ok_or_else(|| Retry::new("no pinned hub"))?;
         let tail = message
             .subject
             .strip_prefix(&format!("fedout.{peer}."))
@@ -453,7 +454,7 @@ impl Mover {
             &format!("ck.{peer}.{tail}"),
             id,
             message.payload.to_vec(),
-            &hub_inbox_stream_name(peer),
+            &hub_inbox_stream_name(peer, hub),
         )
         .await;
         if let Err(error) = &result {

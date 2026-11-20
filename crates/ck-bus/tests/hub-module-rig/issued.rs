@@ -275,8 +275,11 @@ async fn hub_credential_issued_by_ckbus_runs_the_real_memory_probes() {
         );
         let publish = claims["nats"]["pub"]["allow"].as_array().unwrap();
         assert!(publish.contains(&json!("$JS.hub.API.DIRECT.GET.KV_vault-manifest-active")));
+        assert!(!publish.contains(&json!(format!("$KV.vault-shared-logins.{box_id}.>"))));
         assert_eq!(
-            publish.contains(&json!(format!("$KV.vault-shared-logins.{box_id}.>"))),
+            publish.contains(&json!(format!(
+                "$JS.hub.API.$KV.vault-shared-logins.{box_id}.>"
+            ))),
             module_id == "claustrum"
         );
     }

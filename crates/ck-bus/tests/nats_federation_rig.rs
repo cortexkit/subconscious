@@ -2534,7 +2534,8 @@ mod leaf_link {
                     .and_then(|reply| serde_json::from_slice::<Value>(&reply.payload).ok())
             }
         };
-        let own = format!("HUB_INBOX_{LEAF_BOX}");
+        let hub_name = &pin[..16];
+        let own = format!("HUB_INBOX_{LEAF_BOX}_{hub_name}");
         let mut answered = None;
         for _ in 0..20 {
             answered = ask(format!("$JS.hub.API.STREAM.INFO.{own}")).await;
@@ -2545,7 +2546,7 @@ mod leaf_link {
         }
         let answered = answered.expect("the own inbox's info crosses the leaf");
         assert_eq!(answered["config"]["name"], json!(own), "{answered}");
-        let other = format!("HUB_INBOX_{OTHER_BOX}");
+        let other = format!("HUB_INBOX_{OTHER_BOX}_{hub_name}");
         for verb in [
             "STREAM.INFO",
             "STREAM.PURGE",

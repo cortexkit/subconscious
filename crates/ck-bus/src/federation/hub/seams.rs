@@ -1,7 +1,10 @@
 //! What the hub area reaches outside itself, each behind a trait so the unit tests can
 //! stand in for callosum, the hub instance and this machine's identity.
 
+use std::collections::BTreeMap;
+
 use async_trait::async_trait;
+use cortexkit_bus_naming::federation::HubName;
 use tokio::sync::mpsc;
 
 use super::record::HubRecord;
@@ -21,10 +24,10 @@ pub trait PairedDevices: Send + Sync {
 /// A stream the hub's ck-bus creates in the hub account.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HubStream {
-    /// `HUB_INBOX_{box}`, one per machine, created when that machine's first leaf JWT
-    /// is issued.
+    /// The inbox for a machine under the hub's current key.
     Inbox {
         box_id: String,
+        hub: HubName,
     },
     /// The account-wide shared identity log, `HUB_IDLOG`.
     IdLog,
@@ -50,9 +53,13 @@ pub trait HubServer: Send + Sync {
         account_public: &str,
         jwt: &str,
     ) -> Result<(), String>;
-    /// Creates missing streams and reconciles existing streams in place.
-    async fn ensure_streams(&self, record: &HubRecord, streams: &[HubStream])
-        -> Result<(), String>;
+    /// Reconciles streams in place. For an inbox, returns the previous hub names
+    /// that still hold messages and must be included in the box's leaf grant.
+    async fn ensure_streams(
+        &self,
+        record: &HubRecord,
+        streams: &[HubStream],
+    ) -> Result<BTreeMap<String, Vec<HubName>>, String>;
     /// The leaf connections bound to the hub account.
     async fn leaf_count(&self, record: &HubRecord) -> Result<usize, String>;
 }

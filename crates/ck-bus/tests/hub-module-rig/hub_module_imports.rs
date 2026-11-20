@@ -21,9 +21,9 @@ use async_nats::{
 };
 use cortexkit_bus_naming::federation::{
     hub_inbox_stream, hub_memory_subject, hub_room_subject, hub_streams, leaf_user_grant,
-    module_deliver_prefix, BoxId, HubKind, CUTS_BUCKET, CUTS_STREAM, HUB_API_PREFIX, HUB_DOMAIN,
-    HUB_IDLOG_STREAM, HUB_MEMORY_STREAM, HUB_MEMORY_SUBJECT, HUB_ROOMS_STREAM, HUB_ROOMS_SUBJECT,
-    IDLOG_SUBJECT, MEMORY_KIND_GLOBAL, RESIDENCE_BUCKET, RESIDENCE_STREAM,
+    module_deliver_prefix, BoxId, HubKind, HubName, CUTS_BUCKET, CUTS_STREAM, HUB_API_PREFIX,
+    HUB_DOMAIN, HUB_IDLOG_STREAM, HUB_MEMORY_STREAM, HUB_MEMORY_SUBJECT, HUB_ROOMS_STREAM,
+    HUB_ROOMS_SUBJECT, IDLOG_SUBJECT, MEMORY_KIND_GLOBAL, RESIDENCE_BUCKET, RESIDENCE_STREAM,
 };
 use cortexkit_bus_naming::DiscardPolicy;
 use futures_util::StreamExt;
@@ -35,6 +35,10 @@ use fixture::*;
 const BOX_ID: &str = "11111111111111111111111111111111";
 const LIMIT: Duration = Duration::from_secs(10);
 const FEDERATION_ONLY: [&str; 3] = ["fedlocal.>", "fedout.>", "fedsend.>"];
+
+fn hub_name() -> HubName {
+    HubName::parse("0123456789abcdef").unwrap()
+}
 
 pub(crate) struct Module {
     name: &'static str,
@@ -142,7 +146,7 @@ impl Topology {
         let root = tempfile::tempdir().unwrap();
         let hub_operator = Operator::new("hub-operator");
         let hub_account = Account::new("user-u", true);
-        let grant = leaf_user_grant(box_id);
+        let grant = leaf_user_grant(box_id, &hub_name());
         let leaf = hub_account.user_with_permissions("leaf", &grant.publish, &grant.subscribe);
         let mut hub = Server::configure(
             &bin,
@@ -164,7 +168,7 @@ impl Topology {
         let leaf_port = u16::try_from(varz["leaf"]["port"].as_u64().unwrap()).unwrap();
         let proxy = Proxy::start(leaf_port).await;
         let hub_js = jetstream::new(connect(&hub.url(), &hub_account.user("hub-admin")).await);
-        for spec in hub_streams(box_id, HubKind::SelfHosted) {
+        for spec in hub_streams(box_id, &hub_name(), HubKind::SelfHosted) {
             let base = spec.stream;
             hub_js
                 .create_stream(stream::Config {
@@ -904,7 +908,7 @@ fn shared_streams(
     memory_subject: String,
     room_subject: String,
 ) -> [(String, Vec<String>); 6] {
-    let inbox = hub_inbox_stream(box_id);
+    let inbox = hub_inbox_stream(box_id, &hub_name());
     [
         (HUB_MEMORY_STREAM.into(), vec![memory_subject]),
         (HUB_ROOMS_STREAM.into(), vec![room_subject]),

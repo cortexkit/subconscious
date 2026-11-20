@@ -185,16 +185,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let callosum = Arc::new(federation::leaf::production::SubcFederation::new(
         connection_file.clone(),
     ));
-    let handoff = federation::handoff::production::start(
-        callosum.clone(),
-        Arc::new(credentials::vault::ClaustrumRoute::new(
-            connection_file,
-            None,
-        )),
-        credentials.clone(),
-        store_root.clone(),
-        bootstrap.ready(),
-    );
     let hub = federation::hub::production::start(
         callosum.clone(),
         credentials.clone(),
@@ -202,11 +192,22 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         bootstrap.ready(),
     );
     let leaf = federation::leaf::production::start(
-        callosum,
+        callosum.clone(),
         hub.clone(),
         credentials.clone(),
         &store_root,
         bootstrap.ready(),
+    );
+    let handoff = federation::handoff::production::start(
+        callosum,
+        Arc::new(credentials::vault::ClaustrumRoute::new(
+            connection_file,
+            None,
+        )),
+        credentials.clone(),
+        store_root.clone(),
+        bootstrap.ready(),
+        leaf.subscribe_inbox(),
     );
     let linked = leaf.clone();
     issuance.set_hub_source(Arc::new(issuance::handler::ReadyHub {

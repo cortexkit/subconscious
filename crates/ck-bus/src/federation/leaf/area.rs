@@ -13,6 +13,7 @@ use std::{
 };
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use cortexkit_bus_naming::federation::HubName;
 use serde_json::{json, Map, Value};
 use tokio::{
     sync::{mpsc, watch, Notify},
@@ -91,6 +92,12 @@ pub struct LeafState {
     pub generation: u64,
     pub remotes: Vec<Remote>,
     decided: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InboxRoute {
+    pub(crate) hub: HubName,
+    pub(crate) purge_streams: Vec<String>,
 }
 
 impl LeafState {
@@ -175,6 +182,7 @@ struct Inner {
     key_next_poll: Option<Instant>,
     key_backoff: Backoff,
     credential: Option<LeafCredential>,
+    credential_pin: Option<String>,
     renew_due: Option<Instant>,
     issue_retry: Retry,
     /// Set when the current JWT was dropped because the leaf key changed, so the one that
@@ -200,6 +208,7 @@ impl Inner {
             key_next_poll: None,
             key_backoff: Backoff::default(),
             credential: None,
+            credential_pin: None,
             renew_due: None,
             issue_retry: Retry::default(),
             replacing: false,
@@ -216,6 +225,7 @@ impl Inner {
         self.local_retry = None;
         self.local_failure = None;
         self.credential = None;
+        self.credential_pin = None;
         self.renew_due = None;
         self.issue_retry = Retry::default();
         self.replacing = false;
@@ -231,6 +241,7 @@ pub struct LeafArea {
     leaf_key_id: String,
     inner: Mutex<Inner>,
     published: watch::Sender<LeafState>,
+    inbox_route: watch::Sender<Option<InboxRoute>>,
     /// Wakes the driving task early, for example when a signature shows the key moved.
     wake: Notify,
     wall_clock: Box<dyn Fn() -> i64 + Send + Sync>,
@@ -260,6 +271,7 @@ impl LeafArea {
             leaf_key_id,
             inner: Mutex::new(Inner::new()),
             published,
+            inbox_route: watch::channel(None).0,
             wake: Notify::new(),
             wall_clock: Box::new(wall_clock),
         })
@@ -279,6 +291,10 @@ impl LeafArea {
 
     pub fn current(&self) -> LeafState {
         self.published.borrow().clone()
+    }
+
+    pub(crate) fn subscribe_inbox(&self) -> watch::Receiver<Option<InboxRoute>> {
+        self.inbox_route.subscribe()
     }
 
     pub fn has_hub_link(&self) -> bool {
@@ -338,8 +354,7 @@ impl LeafArea {
     }
 
     /// Takes in a hub notice. A different hub computer drops the credential, bridge and
-    /// link state of the old one; a changed address list or pin for the same hub keeps
-    /// the credential.
+    /// link state of the old one. An address change alone keeps the credential.
     pub fn apply_hub(&self, view: HubView) {
         let mut inner = self.inner();
         inner.hub_known = true;
@@ -394,7 +409,12 @@ impl LeafArea {
         let Some(key) = self.ensure_key(now).await else {
             return self.settle("waiting_leaf_key", false);
         };
-        if !self.ensure_credential(now, &hub, &key).await {
+        let pin = match (&hub, &local) {
+            (HubView::Peer { spki_sha256, .. }, _) => spki_sha256,
+            (HubView::SelfHub { .. }, Some(local)) => &local.spki_sha256,
+            _ => return,
+        };
+        if !self.ensure_credential(now, &hub, &key, pin).await {
             return self.settle("waiting_credential", false);
         }
         // The leaf report first: a bridge it opens joins this pass's remote.
@@ -449,6 +469,18 @@ impl LeafArea {
     }
 
     fn publish(&self, remotes: Vec<Remote>) {
+        let route = remotes.first().and_then(|remote| {
+            let hub = HubName::from_key_pin(&remote.pin.sha256_hex).ok()?;
+            let purge_streams = self.inner().credential.as_ref()?.purge_streams.clone();
+            Some(InboxRoute { hub, purge_streams })
+        });
+        self.inbox_route.send_if_modified(|old| {
+            if *old == route {
+                return false;
+            }
+            *old = route;
+            true
+        });
         self.published.send_if_modified(|state| {
             if state.decided && state.remotes == remotes {
                 return false;
@@ -580,12 +612,24 @@ impl LeafArea {
 
     /// Gets a JWT when there is none and renews it at half its life. Returns whether a
     /// usable one is held.
-    async fn ensure_credential(&self, now: Instant, hub: &HubView, key: &LeafKey) -> bool {
+    async fn ensure_credential(
+        &self,
+        now: Instant,
+        hub: &HubView,
+        key: &LeafKey,
+        pin: &str,
+    ) -> bool {
         let Some(fingerprint) = hub.fingerprint().map(str::to_string) else {
             return false;
         };
         {
-            let inner = self.inner();
+            let mut inner = self.inner();
+            if inner.credential_pin.as_deref() != Some(pin) {
+                inner.credential_pin = Some(pin.to_owned());
+                inner.credential = None;
+                inner.renew_due = None;
+                inner.issue_retry = Retry::default();
+            }
             let renewing = inner
                 .credential
                 .as_ref()

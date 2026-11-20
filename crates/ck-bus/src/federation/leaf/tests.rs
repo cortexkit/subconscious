@@ -52,14 +52,16 @@ fn leaf_id() -> String {
 
 /// An unsigned JWT with the claims the area reads; the hub's signature is not its
 /// concern.
-fn jwt_at(subject: &str, now: i64) -> String {
+fn jwt_at(subject: &str, now: i64, publish: &[String]) -> String {
     static ISSUED: AtomicUsize = AtomicUsize::new(0);
     let jti = ISSUED.fetch_add(1, Ordering::SeqCst);
     format!(
         "{}.{}.sig",
         URL_SAFE_NO_PAD.encode(br#"{"typ":"JWT","alg":"ed25519-nkey"}"#),
         URL_SAFE_NO_PAD.encode(
-            json!({"jti": jti, "sub": subject, "iat": now, "exp": now + JWT_LIFE}).to_string()
+            json!({"jti": jti, "sub": subject, "iat": now, "exp": now + JWT_LIFE,
+                "nats": {"pub": {"allow": publish}}})
+            .to_string()
         )
     )
 }
@@ -103,6 +105,7 @@ struct FakeIssuer {
     calls: Mutex<Vec<(String, String)>>,
     failures: Mutex<usize>,
     clock: Arc<AtomicI64>,
+    publish: Mutex<Vec<String>>,
 }
 
 #[async_trait]
@@ -117,26 +120,31 @@ impl PeerIssuer for FakeIssuer {
             *failures -= 1;
             return Err("the hub is unreachable".to_string());
         }
-        Ok(jwt_at(leaf_nkey, self.clock.load(Ordering::SeqCst)))
+        Ok(jwt_at(
+            leaf_nkey,
+            self.clock.load(Ordering::SeqCst),
+            &self.publish.lock().unwrap(),
+        ))
     }
 }
 
 struct FakeLocalHub {
     issued: AtomicUsize,
+    pin: Mutex<String>,
 }
 
 #[async_trait]
 impl LocalHub for FakeLocalHub {
     async fn identity(&self) -> Result<LocalHubIdentity, String> {
         Ok(LocalHubIdentity {
-            spki_sha256: "cd".repeat(32),
+            spki_sha256: self.pin.lock().unwrap().clone(),
             leaf_port: 7422,
         })
     }
 
     async fn issue(&self, leaf_nkey: &str) -> Result<String, String> {
         self.issued.fetch_add(1, Ordering::SeqCst);
-        Ok(jwt_at(leaf_nkey, WALL_START))
+        Ok(jwt_at(leaf_nkey, WALL_START, &[]))
     }
 }
 
@@ -213,6 +221,7 @@ impl Fixture {
         vault.mint(&leaf_id(), KeyPair::new_user());
         let clock = Arc::new(AtomicI64::new(WALL_START));
         let issuer = Arc::new(FakeIssuer {
+            publish: Mutex::new(Vec::new()),
             clock: clock.clone(),
             calls: Mutex::default(),
             failures: Mutex::default(),
@@ -408,6 +417,7 @@ async fn a_self_hub_waits_for_the_local_hub_seam() {
 
     let local = Arc::new(FakeLocalHub {
         issued: AtomicUsize::new(0),
+        pin: Mutex::new("cd".repeat(32)),
     });
     let fixture = Fixture::with(local.clone(), Arc::new(AlwaysQuiet));
     fixture.area.apply_hub(HubView::SelfHub {
@@ -418,10 +428,54 @@ async fn a_self_hub_waits_for_the_local_hub_seam() {
     assert_eq!(remotes[0]["urls"], json!(["tls://127.0.0.1:7422"]));
     assert_eq!(remotes[0]["pin"]["sha256_hex"], "cd".repeat(32));
     assert_eq!(local.issued.load(Ordering::SeqCst), 1);
+    *local.pin.lock().unwrap() = "ef".repeat(32);
+    fixture.at(Timing::default().key_poll.as_secs()).await;
+    assert_eq!(fixture.remotes()[0]["pin"]["sha256_hex"], "ef".repeat(32));
+    assert_eq!(local.issued.load(Ordering::SeqCst), 2);
     assert!(
         fixture.issuer.calls.lock().unwrap().is_empty(),
         "a self hub is never asked through callosum"
     );
+}
+
+#[tokio::test]
+async fn a_new_peer_pin_reissues_the_leaf_grant_and_publishes_its_inbox_route() {
+    let fixture = Fixture::new();
+    let route = fixture.area.subscribe_inbox();
+    let old = "HUB_INBOX_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_abababababababab";
+    let new = "HUB_INBOX_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_cdcdcdcdcdcdcdcd";
+    let grant = |streams: &[&str]| {
+        *fixture.issuer.publish.lock().unwrap() = streams
+            .iter()
+            .map(|name| format!("$JS.hub.API.STREAM.PURGE.{name}"))
+            .collect();
+    };
+    grant(&[old]);
+    let peer = peer(&[("10.0.0.1", 7422)]);
+    fixture.area.apply_hub(peer.clone());
+    fixture.at(0).await;
+    assert_eq!(route.borrow().as_ref().unwrap().purge_streams, [old]);
+
+    grant(&[old, new]);
+    let HubView::Peer {
+        fingerprint,
+        candidates,
+        ..
+    } = peer
+    else {
+        unreachable!()
+    };
+    fixture.area.apply_hub(HubView::Peer {
+        fingerprint,
+        candidates,
+        spki_sha256: "cd".repeat(32),
+    });
+    fixture.at(1).await;
+    assert_eq!(fixture.issuer.calls.lock().unwrap().len(), 2);
+    let next = route.borrow();
+    let next = next.as_ref().unwrap();
+    assert_eq!(next.hub.as_str(), "cdcdcdcdcdcdcdcd");
+    assert_eq!(next.purge_streams, [old, new]);
 }
 
 #[tokio::test]

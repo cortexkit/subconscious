@@ -17,6 +17,7 @@ use std::{
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use cortexkit_bus_naming::federation::{BoxId, HubName};
 use nkeys::KeyPair;
 use serde_json::{json, Map, Value};
 use tokio::{
@@ -748,8 +749,10 @@ impl HubArea {
         let mut boxes: Vec<&str> = record.issued.values().map(|i| i.box_id.as_str()).collect();
         boxes.sort_unstable();
         boxes.dedup();
+        let hub = HubName::from_key_pin(&record.spki_sha256).map_err(|error| error.to_string())?;
         streams.extend(boxes.into_iter().map(|box_id| HubStream::Inbox {
             box_id: box_id.to_string(),
+            hub: hub.clone(),
         }));
         self.deps.server.ensure_streams(record, &streams).await?;
         Ok(iat)
@@ -1073,14 +1076,32 @@ impl HubArea {
         box_id: &str,
         leaf_nkey: &str,
     ) -> Result<String, Refusal> {
-        let (publish, subscribe) = leaf_permissions(box_id)
-            .map_err(|error| Refusal::new(issue_code::INVALID_MACHINE_ID, error))?;
+        let machine = BoxId::parse(box_id)
+            .map_err(|error| Refusal::new(issue_code::INVALID_MACHINE_ID, error.to_string()))?;
         let guard = self.record_lock.lock().await;
         let mut record = self
             .inner()
             .record
             .clone()
             .ok_or_else(|| Refusal::new(issue_code::HUB_NOT_READY, "hub setup has not run"))?;
+        let hub = HubName::from_key_pin(&record.spki_sha256)
+            .map_err(|error| Refusal::new(issue_code::HUB_NOT_READY, error.to_string()))?;
+        // Renewals also reconcile the inbox: a stream draining after a key rotation
+        // can disappear from the grant as soon as it has no messages left.
+        let mut draining = self
+            .deps
+            .server
+            .ensure_streams(
+                &record,
+                &[HubStream::Inbox {
+                    box_id: box_id.to_string(),
+                    hub: hub.clone(),
+                }],
+            )
+            .await
+            .map_err(|error| Refusal::new(issue_code::HUB_UNAVAILABLE, error))?;
+        let (publish, subscribe) =
+            leaf_permissions(&machine, &hub, &draining.remove(box_id).unwrap_or_default());
         // A key revoked at second `t` refuses every JWT issued at or before `t`, so a
         // re-paired computer's new JWT must be issued after its old cutoff.
         let now = unix_secs();
@@ -1115,19 +1136,6 @@ impl HubArea {
                 issue_code::HUB_NOT_READY,
                 "the hub account key changed since the hub account was signed",
             ));
-        }
-        let first_for_box = !record.issued.values().any(|i| i.box_id == box_id);
-        if first_for_box || !record.issued.contains_key(fingerprint) {
-            self.deps
-                .server
-                .ensure_streams(
-                    &record,
-                    &[HubStream::Inbox {
-                        box_id: box_id.to_string(),
-                    }],
-                )
-                .await
-                .map_err(|error| Refusal::new(issue_code::HUB_UNAVAILABLE, error))?;
         }
         let previous = record.issued.get(fingerprint);
         let mut previous_keys = previous

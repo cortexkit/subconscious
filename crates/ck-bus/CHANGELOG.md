@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.13.0
+
+- Require cortexkit-bus-naming 0.5.9. Name each hub inbox and its grant after the pinned hub key, and purge only that stream's confirmed deliveries. Preserve local deliveries across hub switches and drain an inbox under the previous key before retiring it on a self-hosted hub.
+
 ## 0.12.1
 
 - Use cortexkit-bus-naming 0.5.8 to issue hub credentials to the vault and manifest reader, provision the two vault KV buckets in place, and include their scoped permissions in leaf JWTs.

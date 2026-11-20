@@ -5,7 +5,6 @@ use hpke::{
 use rand_core::{CryptoRng, RngCore};
 
 use super::{
-    purge::Generation,
     store::{unix_secs, Source, Store},
     wire::{self, Envelope, Frame, Refusal, SizeLimit, Stamp},
     Address, BoxId,
@@ -15,57 +14,51 @@ pub(crate) const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 pub(crate) const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 #[test]
-fn handoff_purge_journal_preserves_the_gap_and_restarts_the_cut_on_a_new_pin() {
+fn handoff_purge_journal_preserves_gaps_and_saves_each_sources_cut() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("handoff.sqlite3");
-    let old = Generation {
-        pin: [1; 32],
-        floor: 15,
-    };
+    let (old, new) = ("old-source", "new-source");
     {
         let mut store = Store::open(&path).unwrap();
-        assert_eq!(store.set_purge_generation(old).unwrap(), 0);
+        store.initialize_inbox_prefix(15).unwrap();
         assert_eq!(
-            store.confirm_purge_receipt(old, 16, 100, true).unwrap(),
-            Some(101)
+            store
+                .confirm_purge_receipt(16, old, Some(101), |name| name == old)
+                .unwrap(),
+            [(old.to_owned(), 101)]
         );
-        assert_eq!(
-            store.confirm_purge_receipt(old, 18, 102, true).unwrap(),
-            None
-        );
+        assert!(store
+            .confirm_purge_receipt(18, old, Some(103), |name| name == old)
+            .unwrap()
+            .is_empty());
     }
     let mut store = Store::open(&path).unwrap();
-    assert_eq!(store.set_purge_generation(old).unwrap(), 101);
+    store.initialize_inbox_prefix(999).unwrap();
+    assert_eq!(store.purge_cut(old).unwrap(), 101);
+    assert_eq!(store.purge_cut(new).unwrap(), 0);
+    assert!(store
+        .confirm_purge_receipt(19, new, Some(2), |name| name == new)
+        .unwrap()
+        .is_empty());
     assert_eq!(
-        store.confirm_purge_receipt(old, 19, 103, true).unwrap(),
-        None
+        store
+            .confirm_purge_receipt(17, old, None, |name| name == new)
+            .unwrap(),
+        [(new.to_owned(), 2)]
     );
+    assert_eq!(store.purge_cut(old).unwrap(), 101);
+    // Returning to the earlier hub finds its own cut, not the new source's.
+    assert!(store
+        .confirm_purge_receipt(20, old, Some(101), |name| name == old)
+        .unwrap()
+        .is_empty());
     assert_eq!(
-        store.confirm_purge_receipt(old, 17, 101, false).unwrap(),
-        Some(104)
+        store
+            .confirm_purge_receipt(21, old, Some(105), |name| name == old)
+            .unwrap(),
+        [(old.to_owned(), 105)]
     );
-
-    let new = Generation {
-        pin: [2; 32],
-        floor: 20,
-    };
-    assert_eq!(store.set_purge_generation(new).unwrap(), 0);
-    assert_eq!(
-        store.confirm_purge_receipt(new, 20, 104, true).unwrap(),
-        None
-    );
-    assert_eq!(
-        store.confirm_purge_receipt(old, 21, 105, true).unwrap(),
-        None
-    );
-    assert_eq!(
-        store.confirm_purge_receipt(new, 21, 1, false).unwrap(),
-        None
-    );
-    assert_eq!(
-        store.confirm_purge_receipt(new, 22, 2, true).unwrap(),
-        Some(3)
-    );
+    assert_eq!(store.purge_cut(new).unwrap(), 2);
 }
 
 #[test]

@@ -11,6 +11,7 @@ use std::{
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use cortexkit_bus_naming::federation::{BoxId, HubName};
 use nkeys::KeyPair;
 use serde_json::{json, Value};
 use subc_client_rs::HandlerOutcome;
@@ -139,7 +140,7 @@ impl HubServer for FakeServer {
         &self,
         _record: &HubRecord,
         streams: &[HubStream],
-    ) -> Result<(), String> {
+    ) -> Result<std::collections::BTreeMap<String, Vec<HubName>>, String> {
         if self.down.load(Ordering::SeqCst) {
             return Err("the hub instance is not up".into());
         }
@@ -149,7 +150,7 @@ impl HubServer for FakeServer {
                 known.push(stream.clone());
             }
         }
-        Ok(())
+        Ok(Default::default())
     }
 
     async fn leaf_count(&self, _record: &HubRecord) -> Result<usize, String> {
@@ -446,7 +447,8 @@ async fn a_live_paired_computer_gets_a_24_hour_jwt_with_exactly_its_boxs_grant()
         claims["exp"].as_i64().unwrap() - claims["iat"].as_i64().unwrap(),
         86_400
     );
-    let (publish, subscribe) = leaf_permissions(PEER_BOX).unwrap();
+    let hub = HubName::from_key_pin(&record.spki_sha256).unwrap();
+    let (publish, subscribe) = leaf_permissions(&BoxId::parse(PEER_BOX).unwrap(), &hub, &[]);
     assert_eq!(claims["nats"]["pub"], json!({ "allow": publish }));
     assert_eq!(claims["nats"]["sub"], json!({ "allow": subscribe }));
     assert!(fixture
@@ -455,7 +457,8 @@ async fn a_live_paired_computer_gets_a_24_hour_jwt_with_exactly_its_boxs_grant()
         .lock()
         .unwrap()
         .contains(&HubStream::Inbox {
-            box_id: PEER_BOX.to_string()
+            box_id: PEER_BOX.to_string(),
+            hub,
         }));
     assert_eq!(
         issued(&fixture.area)[PEER_FP],
@@ -594,10 +597,18 @@ async fn the_hub_machines_own_leaf_uses_its_machine_id_and_the_local_identity() 
         serde_json::from_str(include_str!("../../../tests/fixtures/foundation/hub.json")).unwrap();
     assert_eq!(golden["box_id"], OWN_BOX);
     let claims = decode_claims(&jwt).unwrap();
-    assert_eq!(
-        claims["nats"]["pub"],
-        json!({ "allow": golden["grant"]["publish"] })
-    );
+    let publish: Vec<_> = golden["grant"]["publish"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|subject| {
+            subject
+                .as_str()
+                .unwrap()
+                .replace("0f1e2d3c4b5a6978", &identity.spki_sha256[..16])
+        })
+        .collect();
+    assert_eq!(claims["nats"]["pub"], json!({ "allow": publish }));
     assert_eq!(
         claims["nats"]["sub"],
         json!({ "allow": golden["grant"]["subscribe"] })

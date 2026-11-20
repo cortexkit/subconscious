@@ -813,9 +813,9 @@ fn vendored_foundation_and_golden_match_their_source_record() {
     // so it moves with the pin in Cargo.toml.
     assert_eq!(
         field("golden_commit"),
-        "79aa6eaee418578d7f52e6cfcc983bf27518f880"
+        "906c36ae313112de60b4d63553c73a1336b2e7e9"
     );
-    assert_eq!(field("golden_crate_version"), "cortexkit-bus-naming 0.5.8");
+    assert_eq!(field("golden_crate_version"), "cortexkit-bus-naming 0.5.9");
     for (file, digest_field) in [
         ("nats-message-plane-foundation.md", "source_sha256"),
         ("permission_golden.txt", "golden_sha256"),

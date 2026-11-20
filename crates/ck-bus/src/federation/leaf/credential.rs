@@ -39,6 +39,7 @@ pub struct LeafCredential {
     pub key_id: String,
     /// The hub (fingerprint) that issued it.
     pub hub: String,
+    pub(crate) purge_streams: Vec<String>,
 }
 
 impl LeafCredential {
@@ -61,12 +62,25 @@ impl LeafCredential {
         if expires_at <= now {
             return Err(format!("the issued leaf JWT expired at {expires_at}"));
         }
+        let prefix = format!(
+            "{}.STREAM.PURGE.",
+            cortexkit_bus_naming::federation::HUB_API_PREFIX
+        );
+        let mut purge_streams: Vec<_> = claims["nats"]["pub"]["allow"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|subject| subject.as_str()?.strip_prefix(&prefix).map(str::to_owned))
+            .collect();
+        purge_streams.sort_unstable();
+        purge_streams.dedup();
         Ok(Self {
             jwt: jwt.to_string(),
             issued_at,
             expires_at,
             key_id: key.key_id.clone(),
             hub: hub.to_string(),
+            purge_streams,
         })
     }
 

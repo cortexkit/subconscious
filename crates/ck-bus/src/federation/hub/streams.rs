@@ -14,9 +14,10 @@ use crate::bootstrap::plane::stream_config;
 /// spelling.
 pub fn config_for(hub_stream: &HubStream) -> Result<stream::Config, String> {
     let spec = match hub_stream {
-        HubStream::Inbox { box_id } => {
-            hub_inbox_stream(&BoxId::parse(box_id).map_err(|error| format!("{box_id:?}: {error}"))?)
-        }
+        HubStream::Inbox { box_id, hub } => hub_inbox_stream(
+            &BoxId::parse(box_id).map_err(|error| format!("{box_id:?}: {error}"))?,
+            hub,
+        ),
         HubStream::IdLog => hub_idlog_stream(),
         HubStream::Residence => residence_bucket(HubKind::SelfHosted).backing_stream,
         HubStream::Cuts => cuts_object_store(),
@@ -52,15 +53,23 @@ mod tests {
 
     #[test]
     fn hub_streams_follow_the_naming_crate() {
+        let hub =
+            cortexkit_bus_naming::federation::HubName::from_key_pin(&"0f1e2d3c4b5a6978".repeat(4))
+                .unwrap();
         let inbox = config_for(&HubStream::Inbox {
             box_id: "0123456789abcdef0123456789abcdef".to_string(),
+            hub: hub.clone(),
         })
         .unwrap();
-        assert_eq!(inbox.name, "HUB_INBOX_0123456789abcdef0123456789abcdef");
+        assert_eq!(
+            inbox.name,
+            "HUB_INBOX_0123456789abcdef0123456789abcdef_0f1e2d3c4b5a6978"
+        );
         assert_eq!(inbox.discard, stream::DiscardPolicy::New);
         assert_eq!(inbox.max_age, Duration::from_secs(7 * 24 * 3600));
         assert!(config_for(&HubStream::Inbox {
-            box_id: "0123456789ABCDEF0123456789ABCDEF".to_string()
+            box_id: "0123456789ABCDEF0123456789ABCDEF".to_string(),
+            hub,
         })
         .is_err());
 

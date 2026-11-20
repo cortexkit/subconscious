@@ -11,8 +11,6 @@ use rand_core::{OsRng, TryRngCore as _};
 use rusqlite::{params, Connection, OptionalExtension as _};
 use sha2::{Digest, Sha256};
 
-use super::purge::Generation;
-
 // Retain receipt identities beyond every hand-off stream's seven-day max age.
 const RECEIPT_RETENTION_SECS: i64 = 8 * 24 * 60 * 60;
 
@@ -71,14 +69,14 @@ impl Store {
                  origin TEXT, reason TEXT NOT NULL, size INTEGER NOT NULL, digest BLOB NOT NULL,
                  PRIMARY KEY(source, hash)
              ) WITHOUT ROWID;
-             CREATE TABLE IF NOT EXISTS hub_purge (
-                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                 pin BLOB NOT NULL, floor BLOB NOT NULL, finished BLOB NOT NULL,
-                 hub_sequence BLOB NOT NULL, cut BLOB NOT NULL
+             CREATE TABLE IF NOT EXISTS inbox_prefix (
+                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1), finished BLOB NOT NULL
              );
-             CREATE TABLE IF NOT EXISTS hub_purge_acked (
-                 sequence BLOB PRIMARY KEY, hub_sequence BLOB NOT NULL,
-                 verified INTEGER NOT NULL
+             CREATE TABLE IF NOT EXISTS inbox_acked (
+                 sequence BLOB PRIMARY KEY, stream TEXT NOT NULL, cut BLOB
+             ) WITHOUT ROWID;
+             CREATE TABLE IF NOT EXISTS hub_purge_cuts (
+                 stream TEXT PRIMARY KEY, cut BLOB NOT NULL
              ) WITHOUT ROWID;",
         )?;
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -118,108 +116,92 @@ impl Store {
         self.epoch
     }
 
-    pub(super) fn set_purge_generation(&mut self, generation: Generation) -> rusqlite::Result<u64> {
-        let tx = self.db.transaction()?;
-        let current = tx
-            .query_row(
-                "SELECT pin, floor, cut FROM hub_purge WHERE singleton = 1",
-                [],
-                |row| {
-                    Ok((
-                        row.get::<_, [u8; 32]>(0)?,
-                        row.get::<_, [u8; 8]>(1)?,
-                        row.get::<_, [u8; 8]>(2)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let floor = generation.floor.to_be_bytes();
-        if let Some((pin, old_floor, cut)) = current {
-            if generation.pin == pin && floor == old_floor {
-                return Ok(u64::from_be_bytes(cut));
-            }
-        }
-        tx.execute("DELETE FROM hub_purge_acked", [])?;
-        tx.execute(
-            "INSERT OR REPLACE INTO hub_purge VALUES (1, ?1, ?2, ?2, ?3, ?3)",
-            params![generation.pin, floor, 0_u64.to_be_bytes()],
+    pub(super) fn initialize_inbox_prefix(&self, floor: u64) -> rusqlite::Result<()> {
+        self.db.execute(
+            "INSERT OR IGNORE INTO inbox_prefix VALUES (1, ?)",
+            [floor.to_be_bytes()],
         )?;
-        tx.commit()?;
-        Ok(0)
+        Ok(())
+    }
+
+    pub(super) fn purge_cut(&self, stream: &str) -> rusqlite::Result<u64> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT cut FROM hub_purge_cuts WHERE stream = ?",
+                [stream],
+                |row| row.get(0).map(u64::from_be_bytes),
+            )
+            .optional()?
+            .unwrap_or(0))
     }
 
     /// Advance only through a contiguous prefix of journaled ACKs. An ACK that
     /// wasn't journaled or a deferred frame that expired leaves a gap; max-age
-    /// remains the bound rather than purging past either unconfirmed sequence.
+    /// remains the bound rather than purging past either unconfirmed sequence. An ACK
+    /// from a source no longer attached can fill a local gap but cannot set a hub cut.
     pub(super) fn confirm_purge_receipt(
         &mut self,
-        generation: Generation,
         local_sequence: u64,
-        hub_sequence: u64,
-        verified: bool,
-    ) -> rusqlite::Result<Option<u64>> {
+        source: &str,
+        verified_cut: Option<u64>,
+        active: impl Fn(&str) -> bool,
+    ) -> rusqlite::Result<Vec<(String, u64)>> {
         let tx = self.db.transaction()?;
-        let state = tx
-            .query_row(
-                "SELECT finished, hub_sequence, cut FROM hub_purge WHERE pin = ? AND floor = ?",
-                params![generation.pin, generation.floor.to_be_bytes()],
-                |row| {
-                    Ok((
-                        u64::from_be_bytes(row.get(0)?),
-                        u64::from_be_bytes(row.get(1)?),
-                        u64::from_be_bytes(row.get(2)?),
-                    ))
-                },
-            )
-            .optional()?;
-        let Some((mut finished, mut last, old_cut)) = state else {
-            return Ok(None);
-        };
+        let mut finished = tx.query_row(
+            "SELECT finished FROM inbox_prefix WHERE singleton = 1",
+            [],
+            |row| row.get(0).map(u64::from_be_bytes),
+        )?;
         if local_sequence <= finished {
-            return Ok(None);
+            return Ok(Vec::new());
         }
         tx.execute(
-            "INSERT OR IGNORE INTO hub_purge_acked VALUES (?, ?, ?)",
+            "INSERT OR IGNORE INTO inbox_acked VALUES (?, ?, ?)",
             params![
                 local_sequence.to_be_bytes(),
-                hub_sequence.to_be_bytes(),
-                verified
+                source,
+                verified_cut.map(u64::to_be_bytes)
             ],
         )?;
-        let mut cut = old_cut;
+        let mut advanced = std::collections::BTreeMap::new();
         if finished.checked_add(1) == Some(local_sequence) {
             let mut statement = tx.prepare_cached(
-                "SELECT sequence, hub_sequence, verified FROM hub_purge_acked ORDER BY sequence",
+                "SELECT sequence, stream, cut FROM inbox_acked ORDER BY sequence",
             )?;
             let mut pending = statement.query([])?;
             while let Some(row) = pending.next()? {
                 let local = u64::from_be_bytes(row.get(0)?);
-                let hub = u64::from_be_bytes(row.get(1)?);
-                if finished.checked_add(1) != Some(local) || hub <= last {
+                if finished.checked_add(1) != Some(local) {
                     break;
                 }
                 finished = local;
-                last = hub;
-                // Quarantined frames are settled but only verified frames set a cut.
-                if row.get::<_, bool>(2)? {
-                    cut = hub.checked_add(1).unwrap_or(cut);
+                let stream: String = row.get(1)?;
+                if let Some(cut) = row
+                    .get::<_, Option<[u8; 8]>>(2)?
+                    .filter(|_| active(&stream))
+                {
+                    let changed = tx.execute(
+                        "INSERT INTO hub_purge_cuts VALUES (?, ?) ON CONFLICT(stream)
+                         DO UPDATE SET cut = excluded.cut WHERE excluded.cut > hub_purge_cuts.cut",
+                        params![stream, cut],
+                    )?;
+                    if changed != 0 {
+                        advanced.insert(stream, u64::from_be_bytes(cut));
+                    }
                 }
             }
         }
         tx.execute(
-            "DELETE FROM hub_purge_acked WHERE sequence <= ?",
+            "DELETE FROM inbox_acked WHERE sequence <= ?",
             [finished.to_be_bytes()],
         )?;
         tx.execute(
-            "UPDATE hub_purge SET finished = ?, hub_sequence = ?, cut = ? WHERE singleton = 1",
-            params![
-                finished.to_be_bytes(),
-                last.to_be_bytes(),
-                cut.to_be_bytes()
-            ],
+            "UPDATE inbox_prefix SET finished = ? WHERE singleton = 1",
+            [finished.to_be_bytes()],
         )?;
         tx.commit()?;
-        Ok((cut > old_cut).then_some(cut))
+        Ok(advanced.into_iter().collect())
     }
 
     pub(super) fn sealed(&self, source: &Source) -> rusqlite::Result<Option<Vec<u8>>> {

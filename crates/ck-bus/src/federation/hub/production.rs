@@ -9,6 +9,7 @@
 //! most a few times an hour for them.
 
 use std::{
+    collections::BTreeMap,
     path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -16,6 +17,8 @@ use std::{
 
 use async_nats::jetstream;
 use async_trait::async_trait;
+use cortexkit_bus_naming::federation::HubName;
+use futures_util::TryStreamExt as _;
 use serde_json::json;
 use subc_client_rs::consumer::SubscribeOptions;
 use subc_protocol::RouteTarget;
@@ -243,6 +246,50 @@ impl NatsHubServer {
     }
 }
 
+/// Release the legacy or previous pin's subjects before assigning them to the new
+/// inbox. No leaf grant allows publishing on the retired stream's own name.
+async fn retire_inbox(context: &jetstream::Context, name: &str) -> Result<bool, String> {
+    let mut stream = context
+        .get_stream(name)
+        .await
+        .map_err(|error| format!("stream info {name}: {error}"))?;
+    let mut config = stream.cached_info().config.clone();
+    let detached = config.subjects != [name];
+    if detached {
+        config.subjects = vec![name.to_owned()];
+        context
+            .update_stream(config)
+            .await
+            .map_err(|error| format!("retire {name}: {error}"))?;
+    }
+    let messages = stream
+        .info()
+        .await
+        .map_err(|error| format!("stream info {name}: {error}"))?
+        .state
+        .messages;
+    if messages == 0 {
+        let reply = context
+            .delete_stream(name)
+            .await
+            .map_err(|error| format!("delete {name}: {error}"))?;
+        if !reply.success {
+            return Err(format!("delete {name} refused"));
+        }
+        log_event(
+            "ckbus.federation.hub_inbox_retired",
+            json!({"stream": name, "messages": 0}),
+        );
+    } else if detached {
+        let legacy = name.len() == "HUB_INBOX_".len() + 32;
+        log_event(
+            "ckbus.federation.hub_inbox_retained",
+            json!({"stream": name, "messages": messages, "level": if legacy { "ERROR" } else { "INFO" }, "legacy": legacy}),
+        );
+    }
+    Ok(messages != 0)
+}
+
 #[async_trait]
 impl HubServer for NatsHubServer {
     async fn apply_account(
@@ -261,11 +308,43 @@ impl HubServer for NatsHubServer {
         &self,
         record: &HubRecord,
         streams: &[HubStream],
-    ) -> Result<(), String> {
+    ) -> Result<BTreeMap<String, Vec<HubName>>, String> {
         let client = self.admin(record).await?;
         let context = jetstream::new(client);
+        let mut draining = BTreeMap::new();
+        let names: Vec<String> = if streams
+            .iter()
+            .any(|spec| matches!(spec, HubStream::Inbox { .. }))
+        {
+            context
+                .stream_names()
+                .try_collect()
+                .await
+                .map_err(|error| error.to_string())?
+        } else {
+            Vec::new()
+        };
         for hub_stream in streams {
             let mut config = config_for(hub_stream)?;
+            if let HubStream::Inbox { box_id, hub } = hub_stream {
+                let legacy = format!("HUB_INBOX_{box_id}");
+                let prefix = format!("{legacy}_");
+                let mut previous = Vec::new();
+                for name in &names {
+                    if name == &legacy {
+                        retire_inbox(&context, name).await?;
+                    } else if let Some(other) = name
+                        .strip_prefix(&prefix)
+                        .and_then(|suffix| HubName::parse(suffix).ok())
+                    {
+                        if &other != hub && retire_inbox(&context, name).await? {
+                            previous.push(other);
+                        }
+                    }
+                }
+                previous.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+                draining.insert(box_id.clone(), previous);
+            }
             // Naming uses zero for unlimited bytes; NATS reports the same limit as -1.
             if config.max_bytes == 0 {
                 config.max_bytes = -1;
@@ -331,7 +410,7 @@ impl HubServer for NatsHubServer {
                 .await
                 .map_err(|error| format!("create {name}: {error}"))?;
         }
-        Ok(())
+        Ok(draining)
     }
 
     async fn leaf_count(&self, record: &HubRecord) -> Result<usize, String> {

@@ -23,6 +23,8 @@ use super::{
 };
 use crate::grants::Grant;
 
+pub(crate) const WALL_CLOCK_RECHECK: Duration = Duration::from_secs(30);
+
 /// The JWT each of ck-bus's own users presents on its next connect.
 #[derive(Debug, Default)]
 pub struct OwnJwts {
@@ -79,7 +81,7 @@ async fn run(credentials: Arc<Credentials>, renewal: OwnRenewal, mut issued_at: 
     let retry = (lifetime.lifetime.saturating_sub(lifetime.renew_after) / 10)
         .clamp(Duration::from_millis(100), Duration::from_secs(5));
     loop {
-        tokio::time::sleep(until(issued_at, lifetime.renew_delay())).await;
+        wait_for_renewal(issued_at, lifetime.renew_delay(), SystemTime::now).await;
         loop {
             let now = unix_now();
             let signed = sign_user_jwt(
@@ -128,12 +130,16 @@ async fn run(credentials: Arc<Credentials>, renewal: OwnRenewal, mut issued_at: 
     }
 }
 
-/// How long from now until `delay` after `issued_at`; zero once that has passed.
-fn until(issued_at: i64, delay: Duration) -> Duration {
+/// Monotonic sleeps can pause during suspend, so recheck the wall clock between sleeps.
+async fn wait_for_renewal(issued_at: i64, delay: Duration, now: impl Fn() -> SystemTime) {
     let issued = UNIX_EPOCH + Duration::from_secs(issued_at.max(0) as u64);
-    (issued + delay)
-        .duration_since(SystemTime::now())
-        .unwrap_or_default()
+    loop {
+        let remaining = (issued + delay).duration_since(now()).unwrap_or_default();
+        if remaining.is_zero() {
+            return;
+        }
+        tokio::time::sleep(remaining.min(WALL_CLOCK_RECHECK)).await;
+    }
 }
 
 fn unix_now() -> i64 {
@@ -153,4 +159,23 @@ fn log_event(event: &str, fields: serde_json::Value) {
         line.extend(fields);
     }
     eprintln!("{line}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[tokio::test(start_paused = true)]
+    async fn wall_clock_jump_rechecks_own_jwt_within_thirty_seconds() {
+        let clock = Arc::new(AtomicU64::new(100_000));
+        let mut renewal = Box::pin(wait_for_renewal(100_000, Duration::from_secs(600), || {
+            UNIX_EPOCH + Duration::from_secs(clock.load(Ordering::SeqCst))
+        }));
+        assert!(futures_util::poll!(&mut renewal).is_pending());
+        clock.store(101_000, Ordering::SeqCst);
+        assert!(tokio::time::timeout(Duration::from_secs(30), &mut renewal)
+            .await
+            .is_ok());
+    }
 }

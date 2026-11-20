@@ -90,9 +90,14 @@ pub struct LeafDeps {
 pub struct LeafState {
     pub generation: u64,
     pub remotes: Vec<Remote>,
+    decided: bool,
 }
 
 impl LeafState {
+    pub fn watch_json(&self) -> Option<Value> {
+        self.decided.then(|| self.to_json())
+    }
+
     pub fn to_json(&self) -> Value {
         json!({
             "generation": self.generation,
@@ -160,6 +165,7 @@ impl Retry {
 
 struct Inner {
     hub: HubView,
+    hub_known: bool,
     account: Option<String>,
     account_retry: Retry,
     local: Option<LocalHubIdentity>,
@@ -184,6 +190,7 @@ impl Inner {
     fn new() -> Self {
         Self {
             hub: HubView::None,
+            hub_known: false,
             account: None,
             account_retry: Retry::default(),
             local: None,
@@ -226,16 +233,26 @@ pub struct LeafArea {
     published: watch::Sender<LeafState>,
     /// Wakes the driving task early, for example when a signature shows the key moved.
     wake: Notify,
+    wall_clock: Box<dyn Fn() -> i64 + Send + Sync>,
 }
 
 impl LeafArea {
     pub fn new(deps: LeafDeps, timing: Timing) -> Arc<Self> {
+        Self::with_clock(deps, timing, unix_secs)
+    }
+
+    pub(crate) fn with_clock(
+        deps: LeafDeps,
+        timing: Timing,
+        wall_clock: impl Fn() -> i64 + Send + Sync + 'static,
+    ) -> Arc<Self> {
         let leaf_key_id = RootCredential::BusLeaf
             .credential_id()
             .expect("the naming crate accepts the bus-leaf provider token");
         let (published, _) = watch::channel(LeafState {
             generation: unix_ms(),
             remotes: Vec::new(),
+            decided: false,
         });
         Arc::new(Self {
             deps,
@@ -244,6 +261,7 @@ impl LeafArea {
             inner: Mutex::new(Inner::new()),
             published,
             wake: Notify::new(),
+            wall_clock: Box::new(wall_clock),
         })
     }
 
@@ -300,13 +318,21 @@ impl LeafArea {
     async fn run(self: Arc<Self>, mut hub_views: mpsc::Receiver<HubView>) {
         loop {
             self.step(Instant::now()).await;
+            let now = Instant::now();
+            let mut sleep = self
+                .timing
+                .tick
+                .min(crate::credentials::renewal::WALL_CLOCK_RECHECK);
+            if let Some(hint) = self.inner().renew_due.filter(|hint| *hint > now) {
+                sleep = sleep.min(hint - now);
+            }
             tokio::select! {
                 view = hub_views.recv() => match view {
                     Some(view) => self.apply_hub(view),
                     None => return,
                 },
                 _ = self.wake.notified() => {}
-                _ = tokio::time::sleep(self.timing.tick) => {}
+                _ = tokio::time::sleep(sleep) => {}
             }
         }
     }
@@ -316,6 +342,7 @@ impl LeafArea {
     /// the credential.
     pub fn apply_hub(&self, view: HubView) {
         let mut inner = self.inner();
+        inner.hub_known = true;
         if inner.hub == view {
             return;
         }
@@ -338,7 +365,13 @@ impl LeafArea {
 
     /// One pass over everything due at `now`.
     pub async fn step(&self, now: Instant) {
-        let hub = self.inner().hub.clone();
+        let hub = {
+            let inner = self.inner();
+            if !inner.hub_known {
+                return;
+            }
+            inner.hub.clone()
+        };
         let state = match hub {
             HubView::None => "none",
             HubView::Hosted => "hosted_unsupported",
@@ -346,23 +379,23 @@ impl LeafArea {
             _ => "",
         };
         if !state.is_empty() {
-            return self.settle(state);
+            return self.settle(state, true);
         }
         let Some(account) = self.ensure_account(now).await else {
-            return self.settle("waiting_account");
+            return self.settle("waiting_account", false);
         };
         let local = match &hub {
             HubView::SelfHub { .. } => match self.ensure_local(now).await {
                 Some(local) => Some(local),
-                None => return self.settle("self_hub_unavailable"),
+                None => return self.settle("self_hub_unavailable", false),
             },
             _ => None,
         };
         let Some(key) = self.ensure_key(now).await else {
-            return self.settle("waiting_leaf_key");
+            return self.settle("waiting_leaf_key", false);
         };
         if !self.ensure_credential(now, &hub, &key).await {
-            return self.settle("waiting_credential");
+            return self.settle("waiting_credential", false);
         }
         // The leaf report first: a bridge it opens joins this pass's remote.
         self.watch_link(now, &hub, &account).await;
@@ -406,15 +439,18 @@ impl LeafArea {
         };
     }
 
-    /// Records `remote_state` and publishes no remote.
-    fn settle(&self, remote_state: &'static str) {
+    /// Once the first decision has been published, a later loss of credentials still
+    /// withdraws the old remote. Before that, leave the engine's running link alone.
+    fn settle(&self, remote_state: &'static str, complete: bool) {
         self.inner().remote_state = remote_state;
-        self.publish(Vec::new());
+        if complete || self.published.borrow().decided {
+            self.publish(Vec::new());
+        }
     }
 
     fn publish(&self, remotes: Vec<Remote>) {
         self.published.send_if_modified(|state| {
-            if state.remotes == remotes {
+            if state.decided && state.remotes == remotes {
                 return false;
             }
             // The engine ignores a state at or below the generation it holds, and it
@@ -422,6 +458,7 @@ impl LeafArea {
             // milliseconds: a restarted ck-bus is always ahead of its predecessor.
             state.generation = (state.generation + 1).max(unix_ms());
             state.remotes = remotes;
+            state.decided = true;
             log_event(
                 "ckbus.federation.leaf_state",
                 json!({
@@ -549,7 +586,10 @@ impl LeafArea {
         };
         {
             let inner = self.inner();
-            let renewing = inner.renew_due.is_some_and(|at| now >= at);
+            let renewing = inner
+                .credential
+                .as_ref()
+                .is_some_and(|credential| credential.renew_in((self.wall_clock)()) == 0);
             if (inner.credential.is_some() && !renewing) || !inner.issue_retry.due(now) {
                 return inner.credential.is_some();
             }
@@ -563,7 +603,7 @@ impl LeafArea {
                     .await
             }
         };
-        let unix = unix_secs();
+        let unix = (self.wall_clock)();
         let accepted = issued.and_then(|jwt| LeafCredential::accept(&jwt, key, &fingerprint, unix));
         let mut inner = self.inner();
         match accepted {
@@ -737,7 +777,7 @@ impl LeafArea {
                 "nonce_b64 must be the 15-character base64url nonce nats-server sends",
             ));
         }
-        let (jwt, key_id) = {
+        let (jwt, key_id, expires_at) = {
             let known = self
                 .published
                 .borrow()
@@ -757,7 +797,12 @@ impl LeafArea {
                     "no leaf JWT is held for the hub",
                 ));
             };
-            (credential.jwt.clone(), credential.key_id.clone())
+            self.check_sign_expiry(credential.expires_at)?;
+            (
+                credential.jwt.clone(),
+                credential.key_id.clone(),
+                credential.expires_at,
+            )
         };
         let signed = tokio::time::timeout(
             self.timing.sign_timeout,
@@ -794,10 +839,22 @@ impl LeafArea {
                 "the leaf key changed since its JWT was issued; a new JWT is being requested",
             ));
         }
+        self.check_sign_expiry(expires_at)?;
         Ok(json!({
             "jwt": jwt,
             "signature_b64": URL_SAFE_NO_PAD.encode(signature.signature),
         }))
+    }
+
+    fn check_sign_expiry(&self, expires_at: i64) -> Result<(), SignRefusal> {
+        if expires_at <= (self.wall_clock)().saturating_add(60) {
+            self.wake.notify_one();
+            return Err(SignRefusal::new(
+                sign_code::NO_CREDENTIAL,
+                "the leaf JWT expires within 60 seconds; a fresh JWT is needed",
+            ));
+        }
+        Ok(())
     }
 }
 

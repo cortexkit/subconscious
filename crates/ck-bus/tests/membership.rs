@@ -638,6 +638,15 @@ async fn register_module(run: &SignerRun, module_id: &str) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn live_catalog_moves_delivery_readers_back_to_prefrontal_core() {
+    move_delivery_readers(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delivery_reader_move_retries_without_another_catalog_event() {
+    move_delivery_readers(true).await;
+}
+
+async fn move_delivery_readers(with_refusal: bool) {
     let _gate = harness::acceptance_gate().await;
     harness::install_tracing();
     let Some(live) = start(&["prefrontal"]).await else {
@@ -673,7 +682,26 @@ async fn live_catalog_moves_delivery_readers_back_to_prefrontal_core() {
         .contains("m_prefrontal-core"));
     let info = consumer_info(&observer, &streams.inbox, "m_prefrontal").await;
     let subject = info.config.filter_subjects[0].replace('*', "rollback");
-    stored_publish(&observer, subject, b"queued through rollback").await;
+    stored_publish(&observer, subject.clone(), b"queued through rollback").await;
+    let inbox = observer.get_stream(&streams.inbox).await.unwrap();
+    let replace_old = |filters| {
+        let inbox = inbox.clone();
+        async move {
+            inbox.delete_consumer("m_prefrontal").await.unwrap();
+            inbox
+                .create_consumer(pull::Config {
+                    durable_name: Some("m_prefrontal".into()),
+                    ack_policy: jetstream::consumer::AckPolicy::Explicit,
+                    filter_subjects: filters,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+    };
+    if with_refusal {
+        replace_old(vec![subject]).await;
+    }
     let mut config: Value =
         serde_json::from_slice(&fs::read(&live.run.config_file).unwrap()).unwrap();
     config["modules"]["prefrontal"]["enabled"] = json!(false);
@@ -691,7 +719,33 @@ async fn live_catalog_moves_delivery_readers_back_to_prefrontal_core() {
         !matches!(reload, control::ControlReply::Error(_)),
         "{reload:?}"
     );
-    wait_owner("prefrontal-core").await;
+    if with_refusal {
+        let failed = bus::wait_event(
+            live.run.root.path(),
+            "ckbus.bootstrap.delivery_reconcile_failed",
+            1,
+            BOOT_LIMIT,
+        )
+        .await;
+        assert!(failed["error"]
+            .as_str()
+            .unwrap()
+            .contains("unexpected workqueue filters"));
+        let catalog = SubcConsumer::connect(live.connection_file(), ConsumerOptions::default())
+            .await
+            .unwrap();
+        let generation = catalog.catalog_list().await.unwrap().generation;
+        replace_old(info.config.filter_subjects.clone()).await;
+        wait_owner("prefrontal-core").await;
+        assert_eq!(
+            catalog.catalog_list().await.unwrap().generation,
+            generation,
+            "no catalog event should trigger recovery"
+        );
+        catalog.close().await;
+    } else {
+        wait_owner("prefrontal-core").await;
+    }
     let moves = bus::events(
         live.run.root.path(),
         "ckbus.bootstrap.delivery_durable_moved",

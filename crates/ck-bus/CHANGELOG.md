@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.10.1
+
+- Hold federation watches until a decision so ck-bus restarts leave the hub and its leaf links running.
+- Recheck JWT renewal against the wall clock after sleep, and refuse to sign leaf connects with a JWT expiring within a minute.
+- Revoke rotated leaf keys immediately and retain recent keys so removing a computer revokes them all.
+- Skip damaged census rows at boot and replace them on issuance, revoking recoverable keys.
+- Retry failed delivery-reader moves even when the module catalog has stopped changing.
+- Drop stale connection targets when the system connection reaches a different NATS server.
+- Reconcile hub stream limits in place, preserving stored messages and warning about immutable drift.
+
 ## 0.10.0
 
 - Require cortexkit-bus-naming 0.5.4. Reconcile ROOM, WAKE and PEER in place with seven-day retention, discard-new, and exact inbound federation bindings. Provision the hand-off and shared hub streams and the federation-only readers.

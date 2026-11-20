@@ -1162,7 +1162,7 @@ mod leaf_link {
         path::{Path, PathBuf},
         process::Stdio,
         sync::{
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicI64, AtomicUsize, Ordering},
             Arc, Mutex as StdMutex,
         },
         time::Duration,
@@ -1170,6 +1170,7 @@ mod leaf_link {
 
     use async_trait::async_trait;
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use futures_util::StreamExt;
     use nkeys::KeyPair;
     use serde_json::{json, Value};
     use sha2::{Digest, Sha256};
@@ -1185,7 +1186,7 @@ mod leaf_link {
         read_frame, write_frame,
     };
     use tokio::{
-        io::AsyncWriteExt,
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
         net::{TcpListener, TcpStream},
         process::{Child, Command},
         sync::mpsc,
@@ -1206,7 +1207,9 @@ mod leaf_link {
                 conf::admin_url,
                 issue_code,
                 production::NatsHubServer,
-                seams::{OwnMachine, PairedDevices},
+                record::HubRecord,
+                seams::{HubServer, HubStream, OwnMachine, PairedDevices},
+                streams::config_for,
                 tls_code,
             },
             leaf::{
@@ -1221,8 +1224,98 @@ mod leaf_link {
 
     const HUB_FINGERPRINT: &str = "11111111111111111111111111111111";
     const LIMIT: Duration = Duration::from_secs(30);
-    /// The hub's leaf JWTs live 20 s here, so the renewal at half life comes after 10 s.
-    const JWT_LIFETIME: i64 = 20;
+    const JWT_LIFETIME: i64 = 3600;
+
+    #[tokio::test]
+    #[ignore = "needs real nats-server"]
+    async fn hub_reconciles_stream_limits_without_replacing_the_stream() {
+        let _serial = RIG_LOCK.lock().await;
+        let root = tempfile::tempdir().unwrap();
+        let operator = Operator::new("hub");
+        let account = Account::new("hub-user", true);
+        let mut server = Server::configure(
+            &nats_server_bin(),
+            root.path(),
+            "hub",
+            "hub",
+            &operator,
+            &[&account],
+            Resolver::Memory,
+            "",
+        );
+        server.start().await;
+        let client = super::connect(&server.url(), &account.user("test")).await;
+        let js = async_nats::jetstream::new(client.clone());
+        let vault = Arc::new(KeyVault::default());
+        vault.mint(
+            &RootCredential::BusHubAccount.credential_id().unwrap(),
+            KeyPair::from_seed(&account.kp.seed().unwrap()).unwrap(),
+        );
+        let hub = NatsHubServer::new(server.url(), Arc::new(Credentials::new(vault)));
+        let record = HubRecord {
+            hub_account: account.public_key(),
+            operator_public: String::new(),
+            operator_key_id: String::new(),
+            account_key_id: String::new(),
+            tls_key_id: String::new(),
+            system_account: String::new(),
+            cert_der: vec![],
+            spki_sha256: String::new(),
+            issued: Default::default(),
+            removed: Default::default(),
+            revocations: Default::default(),
+            revocations_pushed: true,
+        };
+
+        let desired = config_for(&HubStream::Memory).unwrap();
+        js.create_stream(async_nats::jetstream::stream::Config {
+            max_message_size: 1024,
+            ..desired.clone()
+        })
+        .await
+        .unwrap();
+        js.publish("ck.fleet.memory.a.b", "keep".into())
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+
+        let mut immutable = config_for(&HubStream::Rooms).unwrap();
+        immutable.storage = async_nats::jetstream::stream::StorageType::Memory;
+        js.create_stream(immutable.clone()).await.unwrap();
+        hub.ensure_streams(&record, &[HubStream::Rooms, HubStream::Memory])
+            .await
+            .unwrap();
+
+        let mut stream = js.get_stream(&desired.name).await.unwrap();
+        let info = stream.info().await.unwrap();
+        assert_eq!(info.config.max_message_size, desired.max_message_size);
+        assert_eq!(info.state.messages, 1);
+        let mut stream = js.get_stream(&immutable.name).await.unwrap();
+        assert_eq!(
+            stream.info().await.unwrap().config.storage,
+            immutable.storage
+        );
+
+        hub.ensure_streams(&record, &[HubStream::IdLog])
+            .await
+            .unwrap();
+        let idlog = config_for(&HubStream::IdLog).unwrap();
+        let mut updates = client
+            .subscribe(format!("$JS.API.STREAM.UPDATE.{}", idlog.name))
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+        hub.ensure_streams(&record, &[HubStream::IdLog])
+            .await
+            .unwrap();
+        assert!(
+            timeout(Duration::from_millis(250), updates.next())
+                .await
+                .is_err(),
+            "a stream already at the shipped settings must not receive an update request"
+        );
+    }
 
     fn binary(var: &str) -> PathBuf {
         let path = PathBuf::from(std::env::var_os(var).unwrap_or_else(|| {
@@ -1313,7 +1406,14 @@ mod leaf_link {
 
     /// A leaf user JWT issued by the hub account, expiring after `JWT_LIFETIME`.
     fn leaf_user_jwt(account: &KeyPair, leaf_nkey: &str, serial: usize) -> String {
-        let now = unix_now();
+        // Place the first JWT just before its midpoint. The test jumps only the leaf's
+        // wall clock to reach renewal without waiting for the broker's real clock.
+        let now = unix_now()
+            - if serial == 0 {
+                JWT_LIFETIME / 2 - 60
+            } else {
+                0
+            };
         let mut claims = json!({
             "jti": "",
             "iat": now,
@@ -1458,6 +1558,7 @@ mod leaf_link {
         _bus: JoinHandle<()>,
         signs: Arc<StdMutex<Vec<SignSeen>>>,
         client_port: u16,
+        replace_area: mpsc::Sender<Arc<LeafArea>>,
     }
 
     async fn send(stream: &mut TcpStream, ty: FrameType, channel: u16, corr: u64, body: Value) {
@@ -1561,10 +1662,11 @@ mod leaf_link {
             let (child, primary, listener, info) = start_wrapper(dir, conf, "nats-server").await;
             let signs = Arc::new(StdMutex::new(Vec::new()));
             let bus_signs = signs.clone();
+            let (replace_area, replacements) = mpsc::channel(1);
             let bus = tokio::spawn(async move {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 authenticate(&mut stream, &info).await;
-                stand_in_daemon(stream, area, bus_signs).await;
+                stand_in_daemon(stream, area, bus_signs, replacements).await;
             });
             let client_port = wait_for_client_port(&ports_dir).await;
             Self {
@@ -1573,6 +1675,7 @@ mod leaf_link {
                 _bus: bus,
                 signs,
                 client_port,
+                replace_area,
             }
         }
 
@@ -1609,18 +1712,24 @@ mod leaf_link {
     /// answered by `area`.
     async fn stand_in_daemon(
         mut stream: TcpStream,
-        area: Arc<LeafArea>,
+        mut area: Arc<LeafArea>,
         signs: Arc<StdMutex<Vec<SignSeen>>>,
+        mut replacements: mpsc::Receiver<Arc<LeafArea>>,
     ) {
         let mut states = area.subscribe();
         let mut leaf_corr: Option<u64> = None;
         loop {
             tokio::select! {
+                Some(replacement) = replacements.recv() => {
+                    area = replacement;
+                    states = area.subscribe();
+                    states.mark_changed();
+                }
                 changed = states.changed(), if leaf_corr.is_some() => {
                     if changed.is_err() {
                         return;
                     }
-                    let state = states.borrow_and_update().to_json();
+                    let Some(state) = states.borrow_and_update().watch_json() else { continue };
                     send(&mut stream, FrameType::StreamData, 41, leaf_corr.unwrap(), json!({"result": state})).await;
                 }
                 frame = read_frame(&mut stream) => {
@@ -1662,7 +1771,7 @@ mod leaf_link {
                         None => match body["method"].as_str() {
                             Some("ckbus.leaf_watch") => {
                                 leaf_corr = Some(frame.header.corr);
-                                let state = states.borrow_and_update().to_json();
+                                let Some(state) = states.borrow_and_update().watch_json() else { continue };
                                 send(&mut stream, FrameType::StreamData, 41, frame.header.corr, json!({"result": state})).await;
                                 continue;
                             }
@@ -1694,6 +1803,7 @@ mod leaf_link {
         area: Arc<LeafArea>,
         issued: Arc<StdMutex<Vec<String>>>,
         links: Arc<SystemLinks>,
+        wall_offset: Arc<AtomicI64>,
     }
 
     impl Leaf {
@@ -1726,7 +1836,9 @@ mod leaf_link {
             "spki_sha256": pin,
             "candidates": [{"host": "127.0.0.1", "port": hub_leaf_port, "kind": "lan"}],
         }});
-        let area = LeafArea::new(
+        let wall_offset = Arc::new(AtomicI64::new(0));
+        let offset = wall_offset.clone();
+        let area = LeafArea::with_clock(
             LeafDeps {
                 callosum: Arc::new(OneHub {
                     body: serde_json::to_vec(&body).unwrap(),
@@ -1748,12 +1860,14 @@ mod leaf_link {
                 tick: Duration::from_millis(200),
                 ..Timing::default()
             },
+            move || unix_now() + offset.load(Ordering::SeqCst),
         );
         area.spawn();
         Leaf {
             area,
             issued,
             links,
+            wall_offset,
         }
     }
 
@@ -1890,6 +2004,7 @@ mod leaf_link {
         note(7, format!("right pin: leaf up at the hub after {took:?}"));
 
         // Renewal at half life: a second JWT, one kick, and the reconnect signs with it.
+        leaf.wall_offset.store(60, Ordering::SeqCst);
         let issued = leaf.issued.clone();
         wait_for("the renewal", LIMIT, || {
             let issued = issued.clone();
@@ -2038,18 +2153,24 @@ mod leaf_link {
     /// `ckbus.hub_server_watch` and `ckbus.hub_tls_sign`, answered by `area`.
     async fn stand_in_hub_daemon(
         mut stream: TcpStream,
-        area: Arc<HubArea>,
+        mut area: Arc<HubArea>,
         tls_signs: Arc<AtomicUsize>,
+        mut replacements: mpsc::Receiver<Arc<HubArea>>,
     ) {
         let mut states = area.subscribe();
         let mut watch_corr: Option<u64> = None;
         loop {
             tokio::select! {
+                Some(replacement) = replacements.recv() => {
+                    area = replacement;
+                    states = area.subscribe();
+                    states.mark_changed();
+                }
                 changed = states.changed(), if watch_corr.is_some() => {
                     if changed.is_err() {
                         return;
                     }
-                    let state = states.borrow_and_update().to_json();
+                    let Some(state) = states.borrow_and_update().watch_json() else { continue };
                     send(&mut stream, FrameType::StreamData, 41, watch_corr.unwrap(), json!({"result": state})).await;
                 }
                 frame = read_frame(&mut stream) => {
@@ -2091,7 +2212,7 @@ mod leaf_link {
                         None => match body["method"].as_str() {
                             Some("ckbus.hub_server_watch") => {
                                 watch_corr = Some(frame.header.corr);
-                                let state = states.borrow_and_update().to_json();
+                                let Some(state) = states.borrow_and_update().watch_json() else { continue };
                                 send(&mut stream, FrameType::StreamData, 41, frame.header.corr, json!({"result": state})).await;
                                 continue;
                             }
@@ -2120,6 +2241,7 @@ mod leaf_link {
         _primary: TcpStream,
         _bus: JoinHandle<()>,
         tls_signs: Arc<AtomicUsize>,
+        replace_area: mpsc::Sender<Arc<HubArea>>,
     }
 
     impl HubPair {
@@ -2127,16 +2249,18 @@ mod leaf_link {
             let (child, primary, listener, info) = start_wrapper(dir, conf, "nats-hub").await;
             let tls_signs = Arc::new(AtomicUsize::new(0));
             let bus_signs = tls_signs.clone();
+            let (replace_area, replacements) = mpsc::channel(1);
             let bus = tokio::spawn(async move {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 authenticate(&mut stream, &info).await;
-                stand_in_hub_daemon(stream, area, bus_signs).await;
+                stand_in_hub_daemon(stream, area, bus_signs, replacements).await;
             });
             Self {
                 _child: child,
                 _primary: primary,
                 _bus: bus,
                 tls_signs,
+                replace_area,
             }
         }
     }
@@ -2147,6 +2271,17 @@ mod leaf_link {
         message.extend_from_slice(b"TLS 1.3, server CertificateVerify\0");
         message.extend_from_slice(&[9; 32]);
         message
+    }
+
+    async fn hub_server_id() -> String {
+        let stream = TcpStream::connect(("127.0.0.1", 17422)).await.unwrap();
+        let mut line = String::new();
+        timeout(LIMIT, BufReader::new(stream).read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        let info: Value = serde_json::from_str(line.strip_prefix("INFO ").unwrap()).unwrap();
+        info["server_id"].as_str().unwrap().to_owned()
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2178,27 +2313,30 @@ mod leaf_link {
             "source": "self", "fingerprint": HUB_FINGERPRINT, "generation": "1",
             "spki_sha256": "ab".repeat(32), "candidates": [],
         }});
-        let hub = HubArea::new(
-            HubDeps {
-                callosum: Arc::new(OneHub {
-                    body: serde_json::to_vec(&self_hub).unwrap(),
-                }),
-                devices: devices.clone(),
-                vault: vault.clone(),
-                server: Arc::new(NatsHubServer::new(
-                    admin_url(),
-                    Arc::new(Credentials::new(vault.clone())),
-                )),
-                own: Arc::new(RigOwn),
-                files: files.clone(),
-                local_server_url: None,
-            },
-            HubTiming {
-                leaf_poll: Duration::from_millis(500),
-                tick: Duration::from_millis(200),
-                ..HubTiming::default()
-            },
-        );
+        let new_hub = || {
+            HubArea::new(
+                HubDeps {
+                    callosum: Arc::new(OneHub {
+                        body: serde_json::to_vec(&self_hub).unwrap(),
+                    }),
+                    devices: devices.clone(),
+                    vault: vault.clone(),
+                    server: Arc::new(NatsHubServer::new(
+                        admin_url(),
+                        Arc::new(Credentials::new(vault.clone())),
+                    )),
+                    own: Arc::new(RigOwn),
+                    files: files.clone(),
+                    local_server_url: None,
+                },
+                HubTiming {
+                    leaf_poll: Duration::from_millis(500),
+                    tick: Duration::from_millis(200),
+                    ..HubTiming::default()
+                },
+            )
+        };
+        let hub = new_hub();
         hub.spawn();
         let area = hub.clone();
         wait_for("hub setup writes its listener", LIMIT, || {
@@ -2260,28 +2398,31 @@ mod leaf_link {
             "spki_sha256": pin,
             "candidates": [{"host": "127.0.0.1", "port": 7422, "kind": "lan"}],
         }});
-        let leaf = LeafArea::new(
-            LeafDeps {
-                callosum: Arc::new(OneHub {
-                    body: serde_json::to_vec(&peer_row).unwrap(),
-                }),
-                issuer: Arc::new(ForwardedIssue {
-                    hub: hub.clone(),
-                    issued: issued.clone(),
-                }),
-                local_hub: Arc::new(NoLocalHub),
-                vault: leaf_vault,
-                links: links.clone(),
-                quiet: Arc::new(AlwaysQuiet),
-                accounts: Arc::new(FixedAccount(fed.public_key())),
-            },
-            Timing {
-                link_poll: Duration::from_millis(500),
-                round_per_url: Duration::from_secs(3600),
-                tick: Duration::from_millis(200),
-                ..Timing::default()
-            },
-        );
+        let new_leaf = || {
+            LeafArea::new(
+                LeafDeps {
+                    callosum: Arc::new(OneHub {
+                        body: serde_json::to_vec(&peer_row).unwrap(),
+                    }),
+                    issuer: Arc::new(ForwardedIssue {
+                        hub: hub.clone(),
+                        issued: issued.clone(),
+                    }),
+                    local_hub: Arc::new(NoLocalHub),
+                    vault: leaf_vault.clone(),
+                    links: links.clone(),
+                    quiet: Arc::new(AlwaysQuiet),
+                    accounts: Arc::new(FixedAccount(fed.public_key())),
+                },
+                Timing {
+                    link_poll: Duration::from_millis(500),
+                    round_per_url: Duration::from_secs(3600),
+                    tick: Duration::from_millis(200),
+                    ..Timing::default()
+                },
+            )
+        };
+        let leaf = new_leaf();
         leaf.spawn();
         let pair = EnginePair::start(&root.path().join("pair"), &box_conf, leaf.clone()).await;
         let box_url = format!("nats://127.0.0.1:{}", pair.client_port);
@@ -2305,9 +2446,58 @@ mod leaf_link {
             format!("leaf up at the hub after {took:?} with the issued JWT"),
         );
 
+        // Put fresh bus areas behind the existing watches, withholding their hub views
+        // as happens while callosum is still delivering its initial snapshot.
+        let fed_public = fed.public_key();
+        let before = links.leafs(&fed_public).await.unwrap();
+        assert_eq!(before.len(), 1);
+        let hub_record = crate::federation::hub::record::read(&files.store_root);
+        let crate::federation::hub::record::RecordFile::Present(record) = hub_record else {
+            panic!("missing persisted hub record");
+        };
+        let original_hub = hub_server_id().await;
+        let restarted_hub = new_hub();
+        let restarted_leaf = new_leaf();
+        hub_pair
+            .replace_area
+            .send(restarted_hub.clone())
+            .await
+            .unwrap();
+        pair.replace_area
+            .send(restarted_leaf.clone())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            links.leafs(&fed_public).await.unwrap(),
+            before,
+            "the original leaf link must survive undecided watches"
+        );
+        assert_eq!(hub_server_id().await, original_hub);
+        restarted_hub.apply_hub(crate::federation::leaf::hub::parse_hub_body(
+            &serde_json::to_vec(&self_hub).unwrap(),
+        ));
+        restarted_hub.step(tokio::time::Instant::now()).await;
+        restarted_leaf.apply_hub(crate::federation::leaf::hub::parse_hub_body(
+            &serde_json::to_vec(&peer_row).unwrap(),
+        ));
+        restarted_leaf.step(tokio::time::Instant::now()).await;
+        assert_eq!(restarted_hub.current().listener, Some(record.cert_der));
+        assert_eq!(restarted_leaf.current().remotes, leaf.current().remotes);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            links.leafs(&fed_public).await.unwrap(),
+            before,
+            "the unchanged decisions must not replace the link"
+        );
+        assert_eq!(hub_server_id().await, original_hub);
+
         // 2. Its own hub inbox answers across the leaf; another box's never does.
-        let other_nkey = KeyPair::new_user().public_key();
-        hub.leaf_issue(OTHER_FP, &other_nkey).await.unwrap();
+        let other_key = Arc::new(KeyPair::new_user());
+        let other_jwt = hub
+            .leaf_issue(OTHER_FP, &other_key.public_key())
+            .await
+            .unwrap();
         let probe = super::connect(&box_url, &fed.user("probe")).await;
         let ask = |subject: String| {
             let probe = probe.clone();
@@ -2385,10 +2575,36 @@ mod leaf_link {
             "the 41st immediate TLS signature is refused, and one passes 100 ms later",
         );
 
-        // 4. Removal: the computer leaves callosum's list. Its leaf key is revoked in the
+        // 4. The hub refuses the old JWT after the other computer rotates its key.
+        let connect_other = |jwt, key: Arc<KeyPair>| async move {
+            async_nats::ConnectOptions::with_jwt(jwt, move |nonce| {
+                let key = key.clone();
+                async move { key.sign(&nonce).map_err(async_nats::AuthError::new) }
+            })
+            .connect(admin_url())
+            .await
+        };
+        connect_other(other_jwt.clone(), other_key.clone())
+            .await
+            .unwrap();
+        let next_key = Arc::new(KeyPair::new_user());
+        let next_jwt = hub
+            .leaf_issue(OTHER_FP, &next_key.public_key())
+            .await
+            .unwrap();
+        connect_other(next_jwt.clone(), next_key.clone())
+            .await
+            .unwrap();
+        assert!(
+            connect_other(other_jwt, other_key.clone()).await.is_err(),
+            "rotation must revoke the previous key before returning"
+        );
+
+        // 5. Removal: the computer leaves callosum's list. Its leaf key is revoked in the
         // hub account, the claims update drops its connection, it stays out, and a
         // re-issue is refused.
-        devices.set(paired(&[OTHER_FP])).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        devices.set(paired(&[])).await;
         let took = wait_for("the removed leaf dropped at the hub", LIMIT, || {
             let area = area.clone();
             async move { area.health_metrics()["fed.hub_leafs_connected"] == 0 }
@@ -2412,6 +2628,19 @@ mod leaf_link {
         assert!(links.leafs(&fed_public).await.unwrap().is_empty());
         let refused = hub.leaf_issue(LEAF_FP, &leaf_nkey).await.unwrap_err();
         assert_eq!(refused.code, issue_code::NOT_PAIRED);
+        assert!(connect_other(next_jwt, next_key.clone()).await.is_err());
+        let crate::federation::hub::record::RecordFile::Present(removed) =
+            crate::federation::hub::record::read(&files.store_root)
+        else {
+            panic!("missing removal record")
+        };
+        let removal_cutoff = removed.removed[OTHER_FP].removed_at;
+        assert_eq!(removed.revocations[&next_key.public_key()], removal_cutoff);
+        assert_eq!(
+            removed.revocations[&other_key.public_key()],
+            removal_cutoff,
+            "removal revokes historical keys at the removal cutoff too"
+        );
         note(
             8,
             format!("removal: revoked and dropped after {took:?}, stays out, re-issue refused"),

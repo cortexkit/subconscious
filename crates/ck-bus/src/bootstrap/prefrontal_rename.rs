@@ -94,7 +94,15 @@ pub(crate) async fn reconcile<'a>(
                 // The workqueue owns the messages, not the consumer. NATS won't
                 // admit two consumers with these filters, so delete first.
                 let deleted = plane.delete_durable(&spec.stream, &other_durable).await?;
-                let replacement = plane.ensure_module_durable(&spec).await;
+                let mut replacement = plane.ensure_module_durable(&spec).await;
+                for attempt in 1..=3 {
+                    let Err(error) = &replacement else { break };
+                    log_event(
+                        "ckbus.bootstrap.delivery_durable_create_retry",
+                        json!({"stream": spec.stream, "durable": target, "retry": attempt, "error": error.message}),
+                    );
+                    replacement = plane.ensure_module_durable(&spec).await;
+                }
                 if deleted {
                     log_move(
                         &spec.stream,
@@ -157,7 +165,7 @@ pub(super) async fn follow(
 ) {
     let mut initial = Some(initial);
     loop {
-        let result = follow_connection(connection, ready, &mut initial).await;
+        let result = follow_connection(connection, ready, &mut initial, retry).await;
         log_event(
             "ckbus.bootstrap.delivery_catalog_unavailable",
             json!({"error": result}),
@@ -170,6 +178,7 @@ async fn follow_connection(
     connection: &Path,
     ready: &Ready,
     initial: &mut Option<oneshot::Sender<()>>,
+    retry: Duration,
 ) -> String {
     let consumer = match SubcConsumer::connect(connection, ConsumerOptions::default()).await {
         Ok(consumer) => consumer,
@@ -181,12 +190,17 @@ async fn follow_connection(
             .await
             .map_err(|error| error.to_string())?;
         let mut observed = None;
-        while watch
-            .next()
-            .await
-            .map_err(|error| error.to_string())?
-            .is_some()
-        {
+        let mut pending = false;
+        loop {
+            let retrying = tokio::select! {
+                event = watch.next() => {
+                    if event.map_err(|error| error.to_string())?.is_none() {
+                        break;
+                    }
+                    pending
+                }
+                _ = tokio::time::sleep(retry), if pending => true,
+            };
             let catalog = consumer
                 .catalog_list()
                 .await
@@ -199,14 +213,26 @@ async fn follow_connection(
             };
             let current = owner(registered());
             if observed != Some(current) {
+                if retrying {
+                    log_event(
+                        "ckbus.bootstrap.delivery_reconcile_retry",
+                        json!({"owner": current}),
+                    );
+                }
                 match reconcile(ready, registered()).await {
                     Ok(()) => observed = Some(current),
-                    Err(error) => log_event(
-                        "ckbus.bootstrap.delivery_reconcile_failed",
-                        json!({"owner": current, "error": error.message}),
-                    ),
+                    Err(error) => {
+                        // The move may already have deleted a reader. Recheck even if
+                        // the catalog returns to the previously reconciled owner.
+                        observed = None;
+                        log_event(
+                            "ckbus.bootstrap.delivery_reconcile_failed",
+                            json!({"owner": current, "error": error.message}),
+                        );
+                    }
                 }
             }
+            pending = observed != Some(current);
             if let Some(done) = initial.take() {
                 let _ = done.send(());
             }

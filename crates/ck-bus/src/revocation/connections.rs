@@ -8,32 +8,45 @@
 
 use std::{
     collections::{BTreeSet, HashMap},
-    sync::Mutex,
+    sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use tokio::sync::mpsc;
 
-use super::progress::KickTarget;
-use crate::bootstrap::plane::ConnectionEvent;
+use super::{log_event, progress::KickTarget};
+use crate::bootstrap::plane::{ConnectionEvent, SystemPlane};
+use serde_json::json;
 
 #[derive(Debug, Default)]
 pub struct Connections {
-    live: Mutex<HashMap<String, BTreeSet<KickTarget>>>,
+    state: Mutex<State>,
 }
 
-impl Connections {
-    pub fn apply(&self, event: ConnectionEvent) {
-        let mut live = self.lock();
+#[derive(Debug, Default)]
+struct State {
+    server_id: Option<String>,
+    live: HashMap<String, BTreeSet<KickTarget>>,
+}
+
+impl State {
+    fn apply(&mut self, event: ConnectionEvent) {
         match event {
             ConnectionEvent::Connected {
                 server_id,
                 client_id,
                 user,
             } => {
-                live.entry(user).or_default().insert(KickTarget {
-                    server_id,
-                    client_id,
-                });
+                if self
+                    .server_id
+                    .as_ref()
+                    .is_none_or(|current| *current == server_id)
+                {
+                    self.live.entry(user).or_default().insert(KickTarget {
+                        server_id,
+                        client_id,
+                    });
+                }
             }
             ConnectionEvent::Disconnected {
                 server_id,
@@ -41,34 +54,78 @@ impl Connections {
                 user,
                 ..
             } => {
-                if let Some(targets) = live.get_mut(&user) {
+                if let Some(targets) = self.live.get_mut(&user) {
                     targets.remove(&KickTarget {
                         server_id,
                         client_id,
                     });
                     if targets.is_empty() {
-                        live.remove(&user);
+                        self.live.remove(&user);
                     }
                 }
             }
         }
     }
 
+    fn refresh_server(&mut self, system: &dyn SystemPlane) {
+        let Some(current) = system.server_id() else {
+            return;
+        };
+        if self.server_id.as_ref() == Some(&current) {
+            return;
+        }
+        let mut dropped = 0;
+        self.live.retain(|_, targets| {
+            let before = targets.len();
+            targets.retain(|target| target.server_id == current);
+            dropped += before - targets.len();
+            !targets.is_empty()
+        });
+        let previous = self.server_id.replace(current);
+        if previous.is_some() || dropped != 0 {
+            log_event(
+                "ckbus.revocation.connection_targets_pruned",
+                json!({
+                    "server_id": self.server_id, "previous_server_id": previous, "dropped": dropped,
+                }),
+            );
+        }
+    }
+}
+
+impl Connections {
     /// The live connections of `user` this process has seen connect.
     pub fn targets(&self, user: &str) -> BTreeSet<KickTarget> {
-        self.lock().get(user).cloned().unwrap_or_default()
+        self.lock().live.get(user).cloned().unwrap_or_default()
     }
 
-    /// Applies every event from `events` until the watch ends.
-    pub async fn follow(&self, mut events: mpsc::UnboundedReceiver<ConnectionEvent>) {
-        while let Some(event) = events.recv().await {
-            self.apply(event);
+    /// Check the system connection even when the event stream is idle. A server
+    /// restart can leave no disconnect events and no new module connections yet.
+    pub async fn follow(
+        &self,
+        system: Arc<dyn SystemPlane>,
+        mut events: mpsc::UnboundedReceiver<ConnectionEvent>,
+    ) {
+        let mut recheck = tokio::time::interval(Duration::from_secs(1));
+        recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            let event = tokio::select! {
+                event = events.recv() => match event {
+                    Some(event) => Some(event),
+                    None => return,
+                },
+                _ = recheck.tick() => None,
+            };
+            let mut state = self.lock();
+            state.refresh_server(system.as_ref());
+            if let Some(event) = event {
+                state.apply(event);
+            }
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, BTreeSet<KickTarget>>> {
-        // Each mutation is one insert or remove, so a poisoned map is still whole.
-        self.live
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -86,10 +143,10 @@ mod tests {
             client_id,
             user: "UA".to_string(),
         };
-        connections.apply(connected(1));
-        connections.apply(connected(2));
+        connections.lock().apply(connected(1));
+        connections.lock().apply(connected(2));
         assert_eq!(connections.targets("UA").len(), 2);
-        connections.apply(ConnectionEvent::Disconnected {
+        connections.lock().apply(ConnectionEvent::Disconnected {
             server_id: "S".to_string(),
             client_id: 1,
             user: "UA".to_string(),

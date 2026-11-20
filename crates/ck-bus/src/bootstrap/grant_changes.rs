@@ -3,7 +3,7 @@
 use super::{
     account_jwt::{sign_account_jwt, AccountClaims},
     cause,
-    census::CensusValue,
+    census::{recover_credential_public, CensusValue},
     log_event,
     plane::{apply_account_jwt, ApplyError, BoxPlane, SystemPlane},
     unix_now, Failure,
@@ -39,8 +39,21 @@ pub(crate) async fn revoke_changed(
         else {
             continue;
         };
-        let value = CensusValue::parse(&record.value)
-            .map_err(|error| census_failure(format!("census {module_id}: {error}")))?;
+        let value = match CensusValue::parse(&record.value) {
+            Ok(value) => value,
+            Err(reason) => {
+                log_event(
+                    "ckbus.bootstrap.census_value_damaged",
+                    json!({"level": "WARN", "key": module_id, "reason": reason}),
+                );
+                if let Some(key) = recover_credential_public(&record.value) {
+                    if !claims.revocations.contains_key(&key) {
+                        changed.push((module_id, key, "census_damaged"));
+                    }
+                }
+                continue;
+            }
+        };
         if claims.revocations.contains_key(&value.credential_public) {
             continue;
         }

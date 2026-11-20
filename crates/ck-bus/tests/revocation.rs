@@ -77,8 +77,8 @@ use async_nats::ConnectErrorKind;
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use bootstrap::plane::{
-    BoxPlane, Broker, CensusRecord, ConnectionEvent, DurableConsumer, NatsBroker, PlaneError,
-    SystemPlane,
+    BoxPlane, Broker, CensusRecord, ConnectionEvent, DurableConsumer, NatsBroker, NatsSystem,
+    PlaneError, SystemPlane,
 };
 use cortexkit_bus_naming::{AccountNames, Operation, StreamSpec};
 use credentials::{
@@ -399,7 +399,8 @@ async fn process(plane: &RevocationPlane, signer: HarnessSigner, store: &Path) -
         .await
         .expect("the system user watches connections");
     let following = connections.clone();
-    tokio::spawn(async move { following.follow(events).await });
+    let system = plane.system.clone();
+    tokio::spawn(async move { following.follow(system, events).await });
     Arc::new(Revoker::new(credentials_over(signer), store, connections))
 }
 
@@ -1174,7 +1175,7 @@ async fn a_census_read_lost_at_box_reconnect_is_replayed_within_its_original_bud
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn census_replacement_refuses_unreadable_or_malformed_predecessors() {
+async fn census_replacement_refuses_predecessors_when_the_read_fails() {
     struct Live;
     #[async_trait]
     impl issuance::LiveGenerations for Live {
@@ -1196,7 +1197,7 @@ async fn census_replacement_refuses_unreadable_or_malformed_predecessors() {
     };
     retire_supervised_ckbus(&run).await;
     let plane = plane(&run).await;
-    for malformed in [false, true] {
+    {
         let store = tempfile::tempdir().unwrap();
         let module = "unreadablepredecessor";
         let key = AccountNames::census_key(module).unwrap();
@@ -1222,11 +1223,7 @@ async fn census_replacement_refuses_unreadable_or_malformed_predecessors() {
                 names: plane.names.clone(),
                 account_public: plane.account_public.clone(),
                 server_url: run.server.url.clone(),
-                box_plane: if malformed {
-                    plane.box_plane.clone()
-                } else {
-                    Arc::new(UnreadableCensus(plane.box_plane.clone()))
-                },
+                box_plane: Arc::new(UnreadableCensus(plane.box_plane.clone())),
             })),
         );
         issuing.set_replacement_guard(area);
@@ -1400,6 +1397,90 @@ async fn a_damaged_record_is_recovered_from_the_census_or_deferred() {
     passed();
     run.server.stop().await;
     run.run.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connection_watch_drops_old_targets_on_system_server_change() {
+    let _gate = harness::acceptance_gate().await;
+    let Some(run) = start(false).await else {
+        return;
+    };
+    retire_supervised_ckbus(&run).await;
+    let mut plane = plane(&run).await;
+    let next_dir = tempfile::tempdir().unwrap();
+    let next = BusServer::start(&run.bin, next_dir.path(), &run.trust, LOOPBACK).await;
+    let next_system = NatsSystem::from_client(bus::system_client(&run.trust, &next).await);
+    let account_jwt = run.account_jwt().await;
+    bootstrap::plane::apply_account_jwt(&next_system, &plane.account_public, &account_jwt)
+        .await
+        .unwrap();
+
+    let user = KeyPair::new_user();
+    let jwt = run.trust.user_jwt(
+        &bus::system_root_id(),
+        &run.trust.system_account,
+        &user,
+        unix_now() - 60,
+    );
+    let user = Arc::new(user);
+    let system = async_nats::ConnectOptions::with_jwt(jwt, move |nonce| {
+        let user = user.clone();
+        async move { user.sign(&nonce).map_err(async_nats::AuthError::new) }
+    })
+    .retain_servers_order()
+    .connect(vec![run.server.url.clone(), next.url.clone()])
+    .await
+    .unwrap();
+    let old_id = system.server_info().server_id;
+    assert_ne!(Some(old_id.clone()), next_system.server_id());
+    plane.system = Arc::new(NatsSystem::from_client(system.clone()));
+    let store = tempfile::tempdir().unwrap();
+    let revoker = process(&plane, run.trust.signer.clone(), store.path()).await;
+    let victim = Victim::enter(&run, &plane, "watchfailover", 1).await;
+    victim.tracked_by(&revoker).await;
+    assert_eq!(
+        revoker
+            .connections()
+            .targets(&victim.public)
+            .iter()
+            .next()
+            .unwrap()
+            .server_id,
+        old_id
+    );
+
+    run.server.stop().await;
+    tokio::time::timeout(RECONNECT_BOUND, async {
+        while plane.system.server_id() != next_system.server_id() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        system.flush().await.unwrap();
+    })
+    .await
+    .expect("the same system client must reconnect to the second server");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !revoker.connections().targets(&victim.public).is_empty() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the old server's target must disappear without a new connect event");
+
+    let (client, _) = connect_once(&next.url, &victim.jwt, seed_signer(victim.seed.clone()))
+        .await
+        .unwrap();
+    victim.tracked_by(&revoker).await;
+    let info = client.server_info();
+    assert_eq!(
+        revoker.connections().targets(&victim.public),
+        BTreeSet::from([KickTarget {
+            server_id: info.server_id,
+            client_id: info.client_id,
+        }])
+    );
+    next.stop().await;
+    run.run.shutdown().await;
+    passed();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1870,15 +1951,20 @@ async fn a_killed_ckbus_restarts_and_revokes_the_superseded_user_it_finds_in_the
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_restart_revokes_a_changed_grant_before_readiness_and_reissues_the_new_grant() {
-    restart_with_previous_grant(false).await;
+    restart_with_previous_grant("changed").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_restart_revokes_a_legacy_grant_without_a_digest() {
-    restart_with_previous_grant(true).await;
+    restart_with_previous_grant("legacy").await;
 }
 
-async fn restart_with_previous_grant(legacy: bool) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_revokes_a_readable_key_and_skips_a_damaged_census_row() {
+    restart_with_previous_grant("damaged").await;
+}
+
+async fn restart_with_previous_grant(mode: &str) {
     let _gate = harness::acceptance_gate().await;
     harness::install_tracing();
     // Without a nats-server, `start` reports the row skipped (as every other
@@ -1892,6 +1978,7 @@ async fn restart_with_previous_grant(legacy: bool) {
     let public = pair.public_key();
     let grant_b = grants::issued_grant(&names, PARTICIPANT, &public, &[]).unwrap();
     let added_permission = grant_b.publish_allow().iter().next().unwrap().clone();
+    let legacy = mode == "legacy";
     // Model an earlier build by signing its smaller permission set, rather than
     // merely falsifying the digest of an otherwise current credential.
     let grant_a = grants::Grant::from_entries(
@@ -1940,9 +2027,24 @@ async fn restart_with_previous_grant(legacy: bool) {
         identities: vec![],
         rooms: vec![],
     };
+    let old = if mode == "damaged" {
+        plane
+            .box_plane
+            .census_put(
+                &names.census_subject("unreadablerow").unwrap(),
+                b"not JSON".to_vec(),
+            )
+            .await
+            .unwrap();
+        json!({"credential_public": public, "schema_versions": {"census": 2}})
+            .to_string()
+            .into_bytes()
+    } else {
+        old.to_bytes()
+    };
     plane
         .box_plane
-        .census_put(&names.census_subject(PARTICIPANT).unwrap(), old.to_bytes())
+        .census_put(&names.census_subject(PARTICIPANT).unwrap(), old)
         .await
         .unwrap();
     let (client, _) = connect_once(
@@ -1969,9 +2071,14 @@ async fn restart_with_previous_grant(legacy: bool) {
     let mut changed = changed[0].clone();
     assert!(changed["at_ms"].is_u64());
     changed.as_object_mut().unwrap().remove("at_ms");
+    let cause = if mode == "damaged" {
+        "census_damaged"
+    } else {
+        "grant_changed"
+    };
     assert_eq!(
         changed,
-        json!({"event": "ckbus.bootstrap.module_revoked", "module_id": PARTICIPANT, "cause": "grant_changed"})
+        json!({"event": "ckbus.bootstrap.module_revoked", "module_id": PARTICIPANT, "cause": cause})
     );
     let next = credential(&run.run).await;
     let next_public = next["credential_public"].as_str().unwrap();
@@ -1987,6 +2094,44 @@ async fn restart_with_previous_grant(legacy: bool) {
         run.census_value(PARTICIPANT).await.unwrap().grant_digest,
         Some(expected.permission_digest())
     );
+    run.server.stop().await;
+    run.run.shutdown().await;
+    passed();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn issuance_overwrites_a_damaged_census_row_and_revokes_its_readable_key() {
+    let _gate = harness::acceptance_gate().await;
+    let Some(run) = start(true).await else { return };
+    let first = credential(&run.run).await;
+    let public = first["credential_public"].as_str().unwrap();
+    let (client, _) = connect_participant(&run, &first).await.unwrap();
+    client.flush().await.unwrap();
+    let plane = plane(&run).await;
+    let subject = run.names().census_subject(PARTICIPANT).unwrap();
+    plane
+        .box_plane
+        .census_put(
+            &subject,
+            json!({"credential_public": public})
+                .to_string()
+                .into_bytes(),
+        )
+        .await
+        .unwrap();
+
+    let next = credential(&run.run).await;
+    let next_public = next["credential_public"].as_str().unwrap();
+    assert_ne!(next_public, public);
+    assert_eq!(
+        run.census_value(PARTICIPANT)
+            .await
+            .unwrap()
+            .credential_public,
+        next_public
+    );
+    assert!(run.revocations().await.contains_key(public));
+    wait_severed(&client).await;
     run.server.stop().await;
     run.run.shutdown().await;
     passed();
@@ -2149,14 +2294,14 @@ async fn boot_grant_sweep_batches_changes_and_preserves_unchanged_users_and_data
 }
 
 #[tokio::test]
-async fn boot_grant_sweep_refuses_bad_or_unreadable_census_before_pushing() {
+async fn boot_grant_sweep_refuses_census_transport_failures_before_pushing() {
     let trust = TrustChain::generate();
     let credentials = credentials_over(trust.signer.clone());
     let names = grants::derive_account("box_test").unwrap();
     let signer = credentials::roots::RootCredential::OperatorSigner
         .credential_id()
         .unwrap();
-    for mode in ["malformed", "list", "read"] {
+    for mode in ["list", "read"] {
         let system = StoredAccount {
             jwt: Mutex::new(String::new()),
             updates: Mutex::new(vec![]),

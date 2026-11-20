@@ -220,16 +220,17 @@ pub async fn query(
     }
 }
 
-/// Sends the current listener state at once and each later one, until the caller
-/// cancels or the route goes away.
+/// Waits for the first listener decision, then sends it and each later state.
 async fn serve_watch(area: &HubArea, ctx: &RequestCtx) -> HandlerOutcome {
     let mut states = area.subscribe();
     loop {
-        let state = states.borrow_and_update().clone();
-        let body =
-            serde_json::to_vec(&json!({ "result": state.to_json() })).expect("a hub state encodes");
-        if ctx.emit(body).await.is_err() {
-            return HandlerOutcome::Streamed;
+        let state = states.borrow_and_update().watch_json();
+        if let Some(state) = state {
+            let body =
+                serde_json::to_vec(&json!({ "result": state })).expect("a hub state encodes");
+            if ctx.emit(body).await.is_err() {
+                return HandlerOutcome::Streamed;
+            }
         }
         tokio::select! {
             _ = ctx.cancelled() => return HandlerOutcome::Streamed,

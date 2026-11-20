@@ -36,11 +36,14 @@ use super::{
 use crate::{
     bootstrap::{
         config::NATS_URL_ENV,
-        plane::{apply_account_jwt, NatsBroker, NatsSystem, SystemPlane},
+        plane::{apply_account_jwt, reconcile_stream_config, NatsBroker, NatsSystem, SystemPlane},
         Ready,
     },
     credentials::{nkey::NkeyRole, roots::RootCredential, Credentials},
-    federation::leaf::production::{body, describe, SubcFederation, CALLOSUM_MODULE_ID},
+    federation::leaf::{
+        area::log_event,
+        production::{body, describe, SubcFederation, CALLOSUM_MODULE_ID},
+    },
 };
 
 #[async_trait]
@@ -262,10 +265,59 @@ impl HubServer for NatsHubServer {
         let client = self.admin(record).await?;
         let context = jetstream::new(client);
         for hub_stream in streams {
-            let config = config_for(hub_stream)?;
+            let mut config = config_for(hub_stream)?;
+            // Naming uses zero for unlimited bytes; NATS reports the same limit as -1.
+            if config.max_bytes == 0 {
+                config.max_bytes = -1;
+            }
             let name = config.name.clone();
             match context.get_stream(&name).await {
-                Ok(_) => continue,
+                Ok(existing) => {
+                    let current = existing.cached_info().config.clone();
+                    if current.storage != config.storage
+                        || current.retention != config.retention
+                        || (current.deny_delete && !config.deny_delete)
+                    {
+                        log_event(
+                            "ckbus.stream.update_refused",
+                            json!({
+                                "level": "WARN", "stream": name,
+                                "reason": "immutable stream settings differ",
+                                "storage": current.storage, "desired_storage": config.storage,
+                                "retention": current.retention, "desired_retention": config.retention,
+                                "deny_delete": current.deny_delete, "desired_deny_delete": config.deny_delete,
+                            }),
+                        );
+                        continue;
+                    }
+                    reconcile_stream_config(
+                        &context,
+                        current,
+                        |current| {
+                            current.subjects = config.subjects;
+                            current.max_age = config.max_age;
+                            current.max_bytes = config.max_bytes;
+                            current.discard = config.discard;
+                            if config.max_messages_per_subject != 0 {
+                                current.max_messages_per_subject = config.max_messages_per_subject;
+                            }
+                            if config.max_message_size != 0 {
+                                current.max_message_size = config.max_message_size;
+                            }
+                            if !config.duplicate_window.is_zero() {
+                                current.duplicate_window = config.duplicate_window;
+                            }
+                            current.num_replicas = config.num_replicas;
+                            current.allow_rollup = config.allow_rollup;
+                            current.allow_direct = config.allow_direct;
+                            current.deny_delete = config.deny_delete;
+                        },
+                        |_| {},
+                    )
+                    .await
+                    .map_err(|error| error.message)?;
+                    continue;
+                }
                 Err(error)
                     if matches!(
                         error.kind(),

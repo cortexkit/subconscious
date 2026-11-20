@@ -7,9 +7,8 @@
 //! state `ckbus.hub_server_watch` sends. The ops (`hub_tls_sign`, `hub_identity_read`,
 //! `hub_leaf_issue`) read what the task published and never wait on it.
 
-#[cfg(test)]
-use std::collections::BTreeMap;
 use std::{
+    collections::BTreeMap,
     fs, io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
@@ -127,9 +126,14 @@ pub struct HubDeps {
 pub struct HubServerState {
     pub generation: u64,
     pub listener: Option<Vec<u8>>,
+    decided: bool,
 }
 
 impl HubServerState {
+    pub fn watch_json(&self) -> Option<Value> {
+        self.decided.then(|| self.to_json())
+    }
+
     pub fn to_json(&self) -> Value {
         let mut state = json!({ "generation": self.generation });
         if let Some(cert) = &self.listener {
@@ -201,6 +205,7 @@ impl Retry {
 
 struct Inner {
     view: HubView,
+    view_known: bool,
     record: Option<HubRecord>,
     /// Set once `hub.json` has been read this process (present or absent).
     record_read: bool,
@@ -245,6 +250,7 @@ impl HubArea {
         let (published, _) = watch::channel(HubServerState {
             generation: unix_ms(),
             listener: None,
+            decided: false,
         });
         Arc::new(Self {
             deps,
@@ -254,6 +260,7 @@ impl HubArea {
             tls_key: credential_id(RootCredential::BusHubTls),
             inner: Mutex::new(Inner {
                 view: HubView::None,
+                view_known: false,
                 record: None,
                 record_read: false,
                 setup: SetupState::NotHub,
@@ -353,6 +360,7 @@ impl HubArea {
     /// Takes in a hub notice.
     pub fn apply_hub(&self, view: HubView) {
         let mut inner = self.inner();
+        inner.view_known = true;
         if inner.view == view {
             return;
         }
@@ -386,6 +394,10 @@ impl HubArea {
 
     /// One pass over everything due at `now`.
     pub async fn step(&self, now: Instant) {
+        // A default view is not a decision to withdraw a running listener.
+        if !self.inner().view_known {
+            return;
+        }
         if self.self_fingerprint().is_none() {
             self.inner().setup = SetupState::NotHub;
             // The store under nats-hub and `hub.json` stay; only the listener goes.
@@ -411,7 +423,7 @@ impl HubArea {
 
     fn publish(&self, listener: Option<Vec<u8>>) {
         self.published.send_if_modified(|state| {
-            if state.listener == listener {
+            if state.decided && state.listener == listener {
                 return false;
             }
             // The engine ignores a state at or below the generation it holds, and it
@@ -419,6 +431,7 @@ impl HubArea {
             // milliseconds: a restarted ck-bus is always ahead of its predecessor.
             state.generation = (state.generation + 1).max(unix_ms());
             state.listener = listener;
+            state.decided = true;
             log_event(
                 "ckbus.federation.hub_listener",
                 json!({
@@ -483,6 +496,7 @@ impl HubArea {
     /// Runs setup when there is no record, or when a hub key's `key_id` moved since the
     /// record was made; otherwise only re-reads the keys once per `key_poll`.
     async fn ensure_setup(&self, now: Instant) {
+        let _guard = self.record_lock.lock().await;
         {
             let inner = self.inner();
             let polled = inner.key_next_poll.is_some_and(|at| now < at);
@@ -676,6 +690,7 @@ impl HubArea {
     /// system account and creates the account-wide streams and every issued box's
     /// inbox. Until the instance answers, setup stays `setting_up` and is retried.
     async fn ensure_online(&self, now: Instant) {
+        let _guard = self.record_lock.lock().await;
         let record = {
             let inner = self.inner();
             if inner.online || !inner.online_retry.due(now) {
@@ -772,7 +787,7 @@ impl HubArea {
     }
 
     /// Moves every issued computer that the paired devices no longer list as live to
-    /// the removed list and revokes its leaf key in the record. The push follows.
+    /// the removed list and revokes every key that could still have a valid JWT.
     async fn revoke_removed(&self) {
         let _guard = self.record_lock.lock().await;
         let self_fp = self.self_fingerprint();
@@ -805,7 +820,16 @@ impl HubArea {
                     "leaf_nkey": issued.leaf_nkey,
                 }),
             );
-            record.revocations.insert(issued.leaf_nkey.clone(), now);
+            revoke_key(
+                &mut record.revocations,
+                &issued.leaf_nkey,
+                now.max(issued.issued_at),
+            );
+            for (key, last_issue) in issued.previous_keys {
+                if last_issue.saturating_add(LEAF_JWT_LIFETIME_SECS) > now {
+                    revoke_key(&mut record.revocations, &key, now.max(last_issue));
+                }
+            }
             record.removed.insert(
                 fingerprint,
                 Removed {
@@ -830,6 +854,7 @@ impl HubArea {
     /// Pushes recorded revocations the instance has not read back yet. The claims
     /// update itself closes the revoked leaf's connection.
     async fn push_revocations(&self, now: Instant) {
+        let _guard = self.record_lock.lock().await;
         let record = {
             let inner = self.inner();
             if !inner.online || !inner.revocation_retry.due(now) {
@@ -1048,8 +1073,8 @@ impl HubArea {
     ) -> Result<String, Refusal> {
         let (publish, subscribe) = leaf_permissions(box_id)
             .map_err(|error| Refusal::new(issue_code::INVALID_MACHINE_ID, error))?;
-        let _guard = self.record_lock.lock().await;
-        let record = self
+        let guard = self.record_lock.lock().await;
+        let mut record = self
             .inner()
             .record
             .clone()
@@ -1102,27 +1127,45 @@ impl HubArea {
                 .await
                 .map_err(|error| Refusal::new(issue_code::HUB_UNAVAILABLE, error))?;
         }
+        let previous = record.issued.get(fingerprint);
+        let mut previous_keys = previous
+            .map(|issued| issued.previous_keys.clone())
+            .unwrap_or_default();
+        let mut rotated = false;
+        if let Some(previous) = previous.filter(|issued| issued.leaf_nkey != leaf_nkey) {
+            // A same-second re-pair can put the old JWT's issue time just ahead of now.
+            revoke_key(
+                &mut record.revocations,
+                &previous.leaf_nkey,
+                now.max(previous.issued_at),
+            );
+            previous_keys.insert(previous.leaf_nkey.clone(), previous.issued_at);
+            record.revocations_pushed = false;
+            rotated = true;
+        }
+        previous_keys.retain(|key, last_issue| {
+            key != leaf_nkey && last_issue.saturating_add(LEAF_JWT_LIFETIME_SECS) > now
+        });
         let entry = Issued {
             box_id: box_id.to_string(),
             leaf_nkey: leaf_nkey.to_string(),
             issued_at,
+            previous_keys,
         };
-        let snapshot = {
-            let mut inner = self.inner();
-            let Some(current) = inner.record.as_mut() else {
-                return Err(Refusal::new(
-                    issue_code::HUB_NOT_READY,
-                    "hub setup has not run",
-                ));
-            };
-            let changed = current.issued.get(fingerprint) != Some(&entry);
-            current.removed.remove(fingerprint);
-            current.issued.insert(fingerprint.to_string(), entry);
-            changed.then(|| current.clone())
-        };
-        if let Some(snapshot) = snapshot {
-            record::write(&self.deps.files.store_root, &snapshot)
+        if previous != Some(&entry) {
+            record.removed.remove(fingerprint);
+            record.issued.insert(fingerprint.to_string(), entry);
+            record::write(&self.deps.files.store_root, &record)
                 .map_err(|error| Refusal::new(issue_code::HUB_UNAVAILABLE, error))?;
+            let mut inner = self.inner();
+            inner.record = Some(record);
+            if rotated {
+                inner.revocation_retry = Retry::default();
+            }
+        }
+        drop(guard);
+        if rotated {
+            self.push_revocations(Instant::now()).await;
         }
         log_event(
             "ckbus.federation.hub_leaf_issued",
@@ -1135,6 +1178,13 @@ impl HubArea {
         );
         Ok(signed.jwt)
     }
+}
+
+fn revoke_key(revocations: &mut BTreeMap<String, i64>, key: &str, cutoff: i64) {
+    revocations
+        .entry(key.to_owned())
+        .and_modify(|at| *at = (*at).max(cutoff))
+        .or_insert(cutoff);
 }
 
 /// The three hub keys' public halves as the vault reports them.

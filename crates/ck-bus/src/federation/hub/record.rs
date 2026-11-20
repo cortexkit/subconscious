@@ -25,6 +25,8 @@ pub struct Issued {
     pub box_id: String,
     pub leaf_nkey: String,
     pub issued_at: i64,
+    /// The last issue time of each earlier key whose JWT may still be live.
+    pub previous_keys: BTreeMap<String, i64>,
 }
 
 /// A computer the hub stopped serving.
@@ -98,6 +100,7 @@ pub fn to_json(record: &HubRecord) -> Value {
                     "box": issued.box_id,
                     "leaf_nkey": issued.leaf_nkey,
                     "issued_at": issued.issued_at,
+                    "previous_keys": issued.previous_keys,
                 }),
             )
         })
@@ -159,6 +162,14 @@ pub fn parse(value: &Value) -> Result<HubRecord, String> {
                 box_id: field(&entry, "box", &fingerprint)?,
                 leaf_nkey: field(&entry, "leaf_nkey", &fingerprint)?,
                 issued_at: entry["issued_at"].as_i64().unwrap_or_default(),
+                previous_keys: entry
+                    .get("previous_keys")
+                    .map(|keys| {
+                        serde_json::from_value(keys.clone())
+                            .map_err(|error| format!("{fingerprint}: previous_keys: {error}"))
+                    })
+                    .transpose()?
+                    .unwrap_or_default(),
             },
         );
     }
@@ -226,6 +237,7 @@ mod tests {
                 box_id: "0".repeat(32),
                 leaf_nkey: "UKEY".into(),
                 issued_at: 5,
+                previous_keys: BTreeMap::from([("UOLDER".to_string(), 3)]),
             },
         );
         assert!(matches!(read(dir.path()), RecordFile::Absent));

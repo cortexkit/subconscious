@@ -454,7 +454,9 @@ impl Revoker {
         let _serial = self.serial.lock().await;
         let mut completed = Completed::default();
         if record.highest_completed_step < 1 {
-            completed.pushed = self.push_revocation(plane, &record).await?;
+            completed.pushed = self
+                .push_revocation(plane, &record.identity.module_id, &record.user_public)
+                .await?;
             #[cfg(test)]
             self.stop(Boundary::Step1Done)?;
             record.highest_completed_step = 1;
@@ -505,18 +507,30 @@ impl Revoker {
         })
     }
 
+    /// Push the account revocation without deleting a census row or kicking its clients:
+    /// a damaged row does not identify a process generation for a durable revocation.
+    pub(crate) async fn revoke_key(
+        &self,
+        plane: &RevocationPlane,
+        census_key: &str,
+        user_public: &str,
+    ) -> Result<(), RevocationError> {
+        self.credentials.custody.mark_revoked(user_public);
+        let _serial = self.serial.lock().await;
+        self.push_revocation(plane, census_key, user_public).await?;
+        Ok(())
+    }
+
     /// Step (1). `Ok(true)` when this call pushed the update, `Ok(false)` when the
     /// looked-up account JWT already carried the revocation (that lookup is itself the
     /// read-back, and a second push would change nothing).
     async fn push_revocation(
         &self,
         plane: &RevocationPlane,
-        record: &Record,
+        census_key: &str,
+        user_public: &str,
     ) -> Result<bool, RevocationError> {
-        let hub = record
-            .identity
-            .module_id
-            .starts_with(crate::bootstrap::census::HUB_PREFIX);
+        let hub = census_key.starts_with(crate::bootstrap::census::HUB_PREFIX);
         let _account_update = if hub {
             Some(self.credentials.federation_account_update.lock().await)
         } else {
@@ -563,7 +577,7 @@ impl Revoker {
             ));
         }
         let mut revoked = revocations(&claims);
-        if revoked.contains_key(&record.user_public) {
+        if revoked.contains_key(user_public) {
             return Ok(false);
         }
         let signing_keys = claims["nats"]["signing_keys"]
@@ -614,7 +628,7 @@ impl Revoker {
             now,
             self.credentials.lifetime,
         );
-        revoked.insert(record.user_public.clone(), now);
+        revoked.insert(user_public.to_owned(), now);
         // The server keeps the newer of two account JWTs by `iat`, so an update in the
         // same second as the one it replaces is dated one second later.
         let updated = AccountClaims {

@@ -4,7 +4,7 @@
 use std::{
     collections::VecDeque,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -42,6 +42,9 @@ const PIN: &str = "ababababababababababababababababababababababababababababababa
 const ACCOUNT: &str = "AFEDERATIONACCOUNTFORTESTS";
 /// What nats-server sends: 11 random bytes in unpadded base64url.
 const NONCE: &str = "abcdefghijklmn0";
+const WALL_START: i64 = 100_000;
+const JWT_LIFE: i64 = 86_400;
+const HALF_LIFE: u64 = JWT_LIFE as u64 / 2;
 
 fn leaf_id() -> String {
     RootCredential::BusLeaf.credential_id().unwrap()
@@ -49,18 +52,14 @@ fn leaf_id() -> String {
 
 /// An unsigned JWT with the claims the area reads; the hub's signature is not its
 /// concern.
-fn jwt(subject: &str, lifetime: i64) -> String {
+fn jwt_at(subject: &str, now: i64) -> String {
     static ISSUED: AtomicUsize = AtomicUsize::new(0);
     let jti = ISSUED.fetch_add(1, Ordering::SeqCst);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
     format!(
         "{}.{}.sig",
         URL_SAFE_NO_PAD.encode(br#"{"typ":"JWT","alg":"ed25519-nkey"}"#),
         URL_SAFE_NO_PAD.encode(
-            json!({"jti": jti, "sub": subject, "iat": now, "exp": now + lifetime}).to_string()
+            json!({"jti": jti, "sub": subject, "iat": now, "exp": now + JWT_LIFE}).to_string()
         )
     )
 }
@@ -99,11 +98,11 @@ impl Callosum for FakeCallosum {
     }
 }
 
-/// Issues 20-second JWTs, after failing as many times as `failures` says.
-#[derive(Default)]
+/// Signs JWTs on the fixture's wall clock, after any configured failures.
 struct FakeIssuer {
     calls: Mutex<Vec<(String, String)>>,
     failures: Mutex<usize>,
+    clock: Arc<AtomicI64>,
 }
 
 #[async_trait]
@@ -118,7 +117,7 @@ impl PeerIssuer for FakeIssuer {
             *failures -= 1;
             return Err("the hub is unreachable".to_string());
         }
-        Ok(jwt(leaf_nkey, 20))
+        Ok(jwt_at(leaf_nkey, self.clock.load(Ordering::SeqCst)))
     }
 }
 
@@ -137,7 +136,7 @@ impl LocalHub for FakeLocalHub {
 
     async fn issue(&self, leaf_nkey: &str) -> Result<String, String> {
         self.issued.fetch_add(1, Ordering::SeqCst);
-        Ok(jwt(leaf_nkey, 20))
+        Ok(jwt_at(leaf_nkey, WALL_START))
     }
 }
 
@@ -201,6 +200,7 @@ struct Fixture {
     callosum: Arc<FakeCallosum>,
     links: Arc<FakeLinks>,
     t0: Instant,
+    clock: Arc<AtomicI64>,
 }
 
 impl Fixture {
@@ -211,25 +211,30 @@ impl Fixture {
     fn with(local_hub: Arc<dyn LocalHub>, quiet: Arc<dyn OutboundQuiet>) -> Self {
         let vault = Arc::new(KeyVault::default());
         vault.mint(&leaf_id(), KeyPair::new_user());
-        let issuer = Arc::new(FakeIssuer::default());
+        let clock = Arc::new(AtomicI64::new(WALL_START));
+        let issuer = Arc::new(FakeIssuer {
+            clock: clock.clone(),
+            calls: Mutex::default(),
+            failures: Mutex::default(),
+        });
         let callosum = Arc::new(FakeCallosum::default());
         let links = Arc::new(FakeLinks::default());
-        let area = LeafArea::new(
-            LeafDeps {
-                callosum: callosum.clone(),
-                issuer: issuer.clone(),
-                local_hub,
-                vault: vault.clone(),
-                links: links.clone(),
-                quiet,
-                accounts: Arc::new(FixedAccount),
-            },
-            Timing {
-                // The report is read on every step, so each step sees the fake's answer.
-                link_poll: Duration::ZERO,
-                ..Timing::default()
-            },
-        );
+        let deps = LeafDeps {
+            callosum: callosum.clone(),
+            issuer: issuer.clone(),
+            local_hub,
+            vault: vault.clone(),
+            links: links.clone(),
+            quiet,
+            accounts: Arc::new(FixedAccount),
+        };
+        let timing = Timing {
+            // The report is read on every step, so each step sees the fake's answer.
+            link_poll: Duration::ZERO,
+            ..Timing::default()
+        };
+        let area_clock = clock.clone();
+        let area = LeafArea::with_clock(deps, timing, move || area_clock.load(Ordering::SeqCst));
         Self {
             area,
             vault,
@@ -237,10 +242,13 @@ impl Fixture {
             callosum,
             links,
             t0: Instant::now(),
+            clock,
         }
     }
 
     async fn at(&self, seconds: u64) {
+        self.clock
+            .store(WALL_START + seconds as i64, Ordering::SeqCst);
         self.area.step(self.t0 + Duration::from_secs(seconds)).await;
     }
 
@@ -263,6 +271,27 @@ impl Fixture {
     fn metric(&self, name: &str) -> Value {
         self.area.health_metrics()[name].clone()
     }
+}
+
+#[tokio::test]
+async fn wall_clock_jump_refuses_leaf_signature_and_renews_without_monotonic_advance() {
+    let fixture = Fixture::new();
+    fixture.area.apply_hub(peer(&[("10.0.0.1", 7422)]));
+    fixture.at(0).await;
+    let first = fixture.area.sign(&name(&fixture), NONCE).await.unwrap();
+
+    fixture
+        .clock
+        .store(WALL_START + JWT_LIFE - 60, Ordering::SeqCst);
+    let refused = fixture.area.sign(&name(&fixture), NONCE).await.unwrap_err();
+    assert_eq!(refused.code, sign_code::NO_CREDENTIAL);
+    fixture
+        .clock
+        .store(WALL_START + JWT_LIFE + 1, Ordering::SeqCst);
+    fixture.area.step(fixture.t0).await;
+    let renewed = fixture.area.sign(&name(&fixture), NONCE).await.unwrap();
+    assert_ne!(first["jwt"], renewed["jwt"]);
+    assert_eq!(fixture.issuer.calls.lock().unwrap().len(), 2);
 }
 
 fn peer(candidates: &[(&str, u16)]) -> HubView {
@@ -419,17 +448,17 @@ async fn renewal_at_half_life_kicks_the_link_once_at_a_quiet_moment() {
     fixture.area.apply_hub(peer(&[("10.0.0.1", 7422)]));
     fixture.at(0).await;
     let first_jwt = fixture.area.sign(&name(&fixture), NONCE).await.unwrap()["jwt"].clone();
-    fixture.at(9).await;
+    fixture.at(HALF_LIFE - 1).await;
     assert_eq!(fixture.issuer.calls.lock().unwrap().len(), 1);
     assert!(fixture.links.kicks.lock().unwrap().is_empty());
 
-    // The 20 s JWT is renewed at 10 s, and the live connection is bounced once.
-    fixture.at(10).await;
+    // Renewal at the midpoint bounces the live connection once.
+    fixture.at(HALF_LIFE).await;
     assert_eq!(fixture.issuer.calls.lock().unwrap().len(), 2);
     assert_eq!(*fixture.links.kicks.lock().unwrap(), vec![7]);
     let second_jwt = fixture.area.sign(&name(&fixture), NONCE).await.unwrap()["jwt"].clone();
     assert_ne!(first_jwt, second_jwt, "the reconnect presents the new JWT");
-    fixture.at(11).await;
+    fixture.at(HALF_LIFE + 1).await;
     assert_eq!(
         *fixture.links.kicks.lock().unwrap(),
         vec![7],
@@ -443,11 +472,11 @@ async fn a_busy_link_is_kicked_no_later_than_an_hour_after_renewal() {
     fixture.links.up.store(true, Ordering::SeqCst);
     fixture.area.apply_hub(peer(&[("10.0.0.1", 7422)]));
     fixture.at(0).await;
-    fixture.at(10).await;
+    fixture.at(HALF_LIFE).await;
     assert!(fixture.links.kicks.lock().unwrap().is_empty());
-    fixture.at(10 + 3599).await;
+    fixture.at(HALF_LIFE + 3599).await;
     assert!(fixture.links.kicks.lock().unwrap().is_empty());
-    fixture.at(10 + 3600).await;
+    fixture.at(HALF_LIFE + 3600).await;
     assert_eq!(*fixture.links.kicks.lock().unwrap(), vec![7]);
 }
 

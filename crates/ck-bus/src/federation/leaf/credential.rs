@@ -70,13 +70,14 @@ impl LeafCredential {
         })
     }
 
-    /// Seconds from receipt until renewal: half the JWT's life, measured from now so the
-    /// hub's clock and this machine's need not agree, but never later than three quarters
-    /// of what is left of it here.
+    /// Seconds until the wall-clock renewal point. Renew at half-life or when fewer
+    /// than ten minutes remain, whichever comes first.
     pub fn renew_in(&self, now: i64) -> u64 {
-        let half_life = (self.expires_at - self.issued_at) / 2;
-        let remaining = (self.expires_at - now).max(0);
-        u64::try_from(half_life.min(remaining * 3 / 4)).unwrap_or(0)
+        let midpoint = self
+            .issued_at
+            .saturating_add(self.expires_at.saturating_sub(self.issued_at) / 2);
+        let expiry_margin = self.expires_at.saturating_sub(599);
+        u64::try_from(midpoint.min(expiry_margin).saturating_sub(now)).unwrap_or(0)
     }
 }
 
@@ -142,8 +143,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(credential.renew_in(1_000), 43_200);
-        // Received late (or by a machine whose clock runs ahead): still well before expiry.
-        assert_eq!(credential.renew_in(1_000 + 80_000), 4_800);
+        assert_eq!(credential.renew_in(1_000 + 43_199), 1);
+        assert_eq!(credential.renew_in(1_000 + 80_000), 0);
+        let short = LeafCredential {
+            expires_at: 1_800,
+            ..credential
+        };
+        assert_eq!(short.renew_in(1_200), 1);
+        assert_eq!(short.renew_in(1_201), 0);
     }
 
     #[test]

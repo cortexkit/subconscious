@@ -11,6 +11,14 @@ use serde_json::{json, Value};
 /// `census_key` validates module IDs as single tokens, so none can contain a dot.
 pub(crate) const HUB_PREFIX: &str = "hub.";
 
+/// Recover only a user key from an unknown layout. Never treat an arbitrary string
+/// (including the account-wide revocation wildcard) as a credential.
+pub(crate) fn recover_credential_public(bytes: &[u8]) -> Option<String> {
+    let value: Value = serde_json::from_slice(bytes).ok()?;
+    let key = value["credential_public"].as_str()?;
+    (key.starts_with('U') && nkeys::KeyPair::from_public_key(key).is_ok()).then(|| key.to_owned())
+}
+
 pub(crate) fn module_for_key(key: &str) -> Option<&str> {
     let module = match key.strip_prefix(HUB_PREFIX) {
         Some(module) if cortexkit_bus_naming::federation::is_hub_module(module) => module,

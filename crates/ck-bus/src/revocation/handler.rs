@@ -111,7 +111,8 @@ impl Area {
                     Ok(events) => {
                         watching = true;
                         let connections = self.revoker.connections().clone();
-                        tokio::spawn(async move { connections.follow(events).await });
+                        let system = plane.system.clone();
+                        tokio::spawn(async move { connections.follow(system, events).await });
                         log_event(
                             "ckbus.revocation.watching",
                             json!({ "account_public": plane.account_public }),
@@ -133,7 +134,8 @@ impl Area {
                     if let Ok(events) = current.system.watch_connections(account).await {
                         watching_federation = true;
                         let connections = self.revoker.connections().clone();
-                        tokio::spawn(async move { connections.follow(events).await });
+                        let system = current.system.clone();
+                        tokio::spawn(async move { connections.follow(system, events).await });
                     }
                 }
             }
@@ -146,6 +148,7 @@ impl Area {
     }
 }
 
+#[async_trait]
 impl issuance::CensusReplacement for Area {
     fn prepare(&self, module_id: &str, previous: &CensusValue) -> Result<(), issuance::Refusal> {
         self.revoker
@@ -153,6 +156,18 @@ impl issuance::CensusReplacement for Area {
             .map_err(|error| {
                 issuance::Refusal::new(issuance::code::REVOCATION_UNWRITABLE, error.to_string())
             })
+    }
+
+    async fn revoke_damaged(
+        &self,
+        census_key: &str,
+        credential_public: &str,
+    ) -> Result<(), String> {
+        let plane = self.plane().ok_or("revocation plane not ready")?;
+        self.revoker
+            .revoke_key(&plane, census_key, credential_public)
+            .await
+            .map_err(|error| error.to_string())
     }
 }
 

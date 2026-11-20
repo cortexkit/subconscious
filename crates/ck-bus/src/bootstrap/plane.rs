@@ -150,6 +150,35 @@ pub fn stream_config(spec: &StreamSpec) -> stream::Config {
     config
 }
 
+/// Update the settings owned by the provisioner while keeping the stream and its data.
+pub(crate) async fn reconcile_stream_config(
+    context: &jetstream::Context,
+    mut config: stream::Config,
+    edit: impl FnOnce(&mut stream::Config),
+    prepare_update: impl FnOnce(&mut stream::Config),
+) -> Result<(), PlaneError> {
+    let name = config.name.clone();
+    let what = format!("stream config {name}");
+    let encode = |config: &stream::Config| {
+        serde_json::to_value(config).map_err(|error| PlaneError::new(format!("{what}: {error}")))
+    };
+    let old = encode(&config)?;
+    edit(&mut config);
+    let new = encode(&config)?;
+    if old != new {
+        prepare_update(&mut config);
+        context
+            .update_stream(config)
+            .await
+            .map_err(|error| PlaneError::new(format!("update stream {name}: {error}")))?;
+        super::log_event(
+            "ckbus.stream.limit_updated",
+            json!({"stream": name, "config_old": old, "config_new": new}),
+        );
+    }
+    Ok(())
+}
+
 /// One stored census value and the KV revision it is stored at. The revision is what a
 /// compare-and-delete names, so a value overwritten since it was read is never deleted.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -860,53 +889,41 @@ impl BoxPlane for NatsBox {
                 .await?;
             if api_error_code(&reply) != Some(STREAM_NOT_FOUND) {
                 api_refusal(&reply, &what)?;
-                let mut config: stream::Config = serde_json::from_value(reply["config"].clone())
+                let config: stream::Config = serde_json::from_value(reply["config"].clone())
                     .map_err(|error| PlaneError::new(format!("{what}: {error}")))?;
-                let old = serde_json::to_value(&config)
-                    .map_err(|error| PlaneError::new(format!("{what}: {error}")))?;
-                if let Some(cap) = spec.max_msgs_per_subject {
-                    config.max_messages_per_subject = cap;
-                }
-                if let Some(cap) = spec.max_message_size {
-                    config.max_message_size = cap;
-                }
-                if let Some(window) = spec.duplicate_window {
-                    config.duplicate_window = window;
-                }
-                if spec.kind == StreamKind::Effect || handoff_destination {
-                    config.max_age = spec.max_age;
-                }
-                if handoff_destination {
-                    let desired = stream_config(spec);
-                    config.discard = desired.discard;
-                    config.subjects = desired.subjects;
-                }
-                let new = serde_json::to_value(&config)
-                    .map_err(|error| PlaneError::new(format!("{what}: {error}")))?;
-                if old != new {
-                    // Change only the settings being upgraded, preserving the stream's
-                    // messages and all other stored settings.
-                    // Zero is the client's omission sentinel, not a wire value.
-                    if !handoff_destination && spec.max_message_size.is_none() {
-                        config.max_message_size = 0;
-                    }
-                    if !handoff_destination && spec.duplicate_window.is_none() {
-                        config.duplicate_window = Duration::ZERO;
-                    }
-                    self.jetstream
-                        .update_stream(config)
-                        .await
-                        .map_err(|error| {
-                            PlaneError::new(format!("update stream {}: {error}", spec.name))
-                        })?;
-                    super::log_event(
-                        "ckbus.stream.limit_updated",
-                        json!({
-                            "stream": spec.name, "config_old": old, "config_new": new,
-                        }),
-                    );
-                }
-                return Ok(());
+                return reconcile_stream_config(
+                    &self.jetstream,
+                    config,
+                    |config| {
+                        if let Some(cap) = spec.max_msgs_per_subject {
+                            config.max_messages_per_subject = cap;
+                        }
+                        if let Some(cap) = spec.max_message_size {
+                            config.max_message_size = cap;
+                        }
+                        if let Some(window) = spec.duplicate_window {
+                            config.duplicate_window = window;
+                        }
+                        if spec.kind == StreamKind::Effect || handoff_destination {
+                            config.max_age = spec.max_age;
+                        }
+                        if handoff_destination {
+                            let desired = stream_config(spec);
+                            config.discard = desired.discard;
+                            config.subjects = desired.subjects;
+                        }
+                    },
+                    |config| {
+                        // Zero tells the client to omit the setting from the update.
+                        if !handoff_destination && spec.max_message_size.is_none() {
+                            config.max_message_size = 0;
+                        }
+                        if !handoff_destination && spec.duplicate_window.is_none() {
+                            config.duplicate_window = Duration::ZERO;
+                        }
+                    },
+                )
+                .await;
             }
         }
         self.create(stream_config(spec)).await

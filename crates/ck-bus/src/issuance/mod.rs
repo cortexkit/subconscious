@@ -60,6 +60,7 @@ use cortexkit_bus_naming::{
     AccountNames,
 };
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::{
     bootstrap::{
@@ -180,8 +181,11 @@ pub trait HubSource: Send + Sync {
 /// durably records a revocation of the credential that entry names (`previous`, the
 /// module's previous credential), so the old key can still be revoked after the entry
 /// that named it is gone, even across a crash.
+#[async_trait]
 pub trait CensusReplacement: Send + Sync {
     fn prepare(&self, module_id: &str, previous: &CensusValue) -> Result<(), Refusal>;
+    async fn revoke_damaged(&self, census_key: &str, credential_public: &str)
+        -> Result<(), String>;
 }
 
 /// A credential ck-bus issued and still holds the key for.
@@ -493,9 +497,29 @@ impl Issuance {
                     .await
                     .map_err(|error| Refusal::new(code::CENSUS_UNAVAILABLE, error.message))?;
                 if let Some(previous) = previous {
-                    let previous = CensusValue::parse(&previous.value)
-                        .map_err(|reason| Refusal::new(code::CENSUS_UNAVAILABLE, reason))?;
-                    guard.prepare(&names_check, &previous)?;
+                    match CensusValue::parse(&previous.value) {
+                        Ok(previous) => guard.prepare(&names_check, &previous)?,
+                        Err(reason) => {
+                            log_event(
+                                "ckbus.issuance.census_value_damaged",
+                                json!({"level": "WARN", "key": names_check, "reason": reason}),
+                            );
+                            if let Some(key) = census::recover_credential_public(&previous.value) {
+                                if let Err(error) = guard.revoke_damaged(&names_check, &key).await {
+                                    log_event(
+                                        "ckbus.issuance.damaged_census_revocation_failed",
+                                        json!({
+                                            "level": "WARN", "key": names_check,
+                                            "fingerprint": format!("{:x}", Sha256::digest(key.as_bytes())),
+                                            "reason": error,
+                                        }),
+                                    );
+                                }
+                            }
+                            // Overwrite even when the old key could not be revoked. Its
+                            // JWT expires 15 minutes after it was signed.
+                        }
+                    }
                 }
                 Ok::<_, Refusal>(())
             }

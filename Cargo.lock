@@ -3137,7 +3137,7 @@ dependencies = [
 
 [[package]]
 name = "subc-os"
-version = "0.1.46"
+version = "0.1.47"
 dependencies = [
  "cortexkit-test-support",
  "libc",

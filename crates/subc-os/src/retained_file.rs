@@ -140,41 +140,36 @@ fn open_nofollow_all(
     path: &std::path::Path,
     want_directory: bool,
 ) -> Result<File, OpenRegularError> {
-    use std::{
-        os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
-        path::Component,
-    };
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
     use windows_sys::Win32::Storage::FileSystem::{
         GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT,
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
-        FILE_SHARE_WRITE,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
     };
     if !path.is_absolute() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "absolute path required").into());
     }
-    let mut prefix = std::path::PathBuf::new();
     let mut ancestors = Vec::new();
-    let mut parts = path
-        .components()
-        .filter(|part| *part != Component::CurDir)
-        .peekable();
-    while let Some(part) = parts.next() {
-        prefix.push(part);
-        if !prefix.is_absolute() {
-            continue;
-        }
+    // Use slices of the original path. Rebuilding it with PathBuf::push can
+    // lose the root separator on verbatim drive paths such as \\?\C:\.
+    let prefixes: Vec<_> = path
+        .ancestors()
+        .take_while(|prefix| prefix.is_absolute())
+        .collect();
+    for prefix in prefixes.into_iter().rev() {
         // Directory writers need not exclude traversal. Still deny delete
         // sharing to pin each checked name, and leave regular leaves read-only.
-        let share = if want_directory || parts.peek().is_some() {
-            FILE_SHARE_READ | FILE_SHARE_WRITE
+        let mut options = std::fs::OpenOptions::new();
+        if want_directory || prefix != path {
+            options
+                .access_mode(FILE_READ_ATTRIBUTES | FILE_TRAVERSE)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
         } else {
-            FILE_SHARE_READ
-        };
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .share_mode(share)
+            options.read(true).share_mode(FILE_SHARE_READ);
+        }
+        let file = options
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(&prefix)?;
+            .open(prefix)?;
         let mut information: BY_HANDLE_FILE_INFORMATION = Default::default();
         // SAFETY: file owns the queried handle and information is writable.
         if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
@@ -337,6 +332,20 @@ mod tests {
         std::os::unix::fs::symlink(dir.join("real"), dir.join("link")).unwrap();
         assert!(open_directory_nofollow_all(&dir.join("link")).is_err());
         assert!(open_directory_nofollow_all(&dir.join("link/child")).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_directory_open_can_publish_under_a_canonical_windows_path() {
+        use std::{ffi::OsStr, io::Write};
+
+        let root = cortexkit_test_support::ScratchDir::new("retained-canonical-directory");
+        let canonical = std::fs::canonicalize(root.path()).unwrap();
+        let parent = open_directory_nofollow_all(&canonical).unwrap();
+        let mut file = crate::RetainedTempFile::create_for_publish(&parent).unwrap();
+        file.file_mut().write_all(b"published").unwrap();
+        file.publish(OsStr::new("published")).unwrap();
+        assert_eq!(std::fs::read(root.join("published")).unwrap(), b"published");
     }
 
     #[cfg(windows)]

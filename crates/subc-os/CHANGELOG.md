@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.47
+
+- Preserve the root separator and other path components when opening canonical Windows paths. Open directories without requesting permission to list their contents, while still refusing reparse points in every component.
+
 ## 0.1.46
 
 - On Windows, no-follow directory traversal shares writes so a directory open for writing does not block a scan. Traversal still checks each opened handle for reparse points and does not share delete access, keeping each checked directory pinned against rename or deletion while it is held. Regular file sharing is unchanged.

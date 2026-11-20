@@ -4,25 +4,30 @@ use std::{
     ffi::OsString,
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex, RwLock,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde_json::{json, Map, Value};
 use subc_client_rs::{
-    async_trait, CallOptions, ConsumerIdentity, ConsumerOptions, HandlerOutcome, ModuleHandler,
-    RequestCtx, SubcConsumer,
+    async_trait,
+    config::{
+        ConfigDeclareRequest, ConfigReviewReply, ConfigReviewRequest, ConfigState, ConfigView,
+    },
+    BindDecision, CallOptions, ConsumerOptions, HandlerOutcome, ModuleHandler, RequestCtx,
+    RouteBindRequest, SubcConsumer,
 };
 use subc_protocol::{
+    error_codes::MODULE_WARMING,
     session::{HealthReport, HealthStatus},
-    BindIdentity, RouteTarget,
+    BindIdentity, ModuleHelloAckBody, RouteTarget,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
-    sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore},
+    sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, RwLock as AsyncRwLock, Semaphore},
     time::{sleep_until, timeout, Instant as TokioInstant},
 };
 use tokio_util::sync::CancellationToken;
@@ -33,9 +38,11 @@ use crate::{
         SPAWN_ATTEMPT_BUDGET, SPAWN_INITIALIZE_BUDGET_MS, SPAWN_RETRY_COOLDOWN_MS,
     },
     registry::{EnvironmentValue, ServerConfig, ServerRegistry},
+    settings::{self, UserSettings},
 };
 
 const BAD_REQUEST: &str = "bad_request";
+const SETTINGS_WARMING: &str = "MCP adapter is waiting for its initial settings";
 const CLAUSTRUM_MODULE_ID: &str = "claustrum";
 const SPAWN_SHAPED_FIELDS: &[&str] = &[
     "command",
@@ -130,7 +137,7 @@ pub struct ClaustrumCredentialResolver {
 impl ClaustrumCredentialResolver {
     /// The legacy identity argument is retained for source compatibility. The
     /// SDK attests the current process using its connection claim or launch nonce.
-    pub fn new(connection_file: PathBuf, _consumer_identity: ConsumerIdentity) -> Self {
+    pub fn new(connection_file: PathBuf) -> Self {
         Self { connection_file }
     }
 }
@@ -202,8 +209,26 @@ impl Default for LifecycleSettings {
 
 pub struct AdapterHandler {
     metrics: Arc<HealthMetrics>,
-    registry: ServerRegistry,
+    registry: RwLock<BTreeMap<String, Arc<ConfiguredServer>>>,
+    registry_ready: AtomicBool,
+    updating: AsyncMutex<()>,
     lifecycle: Arc<ChildLifecycle>,
+    user_settings: Option<UserSettings>,
+    config_state: Mutex<Option<&'static str>>,
+}
+
+struct ConfiguredServer {
+    config: ServerConfig,
+    accepting: Arc<AsyncRwLock<bool>>,
+}
+
+impl ConfiguredServer {
+    fn new(config: ServerConfig) -> Arc<Self> {
+        Arc::new(Self {
+            config,
+            accepting: Arc::new(AsyncRwLock::new(true)),
+        })
+    }
 }
 
 impl AdapterHandler {
@@ -223,9 +248,79 @@ impl AdapterHandler {
         let metrics = Arc::new(HealthMetrics::default());
         Self {
             metrics: Arc::clone(&metrics),
-            registry,
+            registry: RwLock::new(
+                registry
+                    .servers()
+                    .iter()
+                    .map(|(name, config)| (name.clone(), ConfiguredServer::new(config.clone())))
+                    .collect(),
+            ),
+            registry_ready: AtomicBool::new(true),
+            updating: AsyncMutex::new(()),
             lifecycle: Arc::new(ChildLifecycle::new(metrics, resolver, settings)),
+            user_settings: None,
+            config_state: Mutex::new(None),
         }
+    }
+
+    pub fn managed(user_settings: UserSettings, resolver: Arc<dyn CredentialResolver>) -> Self {
+        let mut handler = Self::with_resolver(
+            ServerRegistry::default(),
+            resolver,
+            LifecycleSettings::default(),
+        );
+        handler.user_settings = Some(user_settings);
+        handler.registry_ready = AtomicBool::new(false);
+        handler
+    }
+
+    async fn apply_registry(&self, next: ServerRegistry) {
+        let _update = self.updating.lock().await;
+        let before = self.registry.read().expect("server registry lock").clone();
+        let changed: Vec<_> = before
+            .iter()
+            .filter(|(name, old)| next.servers().get(*name) != Some(&old.config))
+            .collect();
+        let mut old_admissions = Vec::with_capacity(changed.len());
+        for (_, server) in &changed {
+            old_admissions.push(server.accepting.write().await);
+        }
+
+        // Keep routes to unchanged servers independent of restarting children.
+        // Routes waiting on a retired entry retry admission against the new map.
+        let mut restarts = tokio::task::JoinSet::new();
+        for (name, _) in changed {
+            let lifecycle = Arc::clone(&self.lifecycle);
+            let name = name.clone();
+            let config = next
+                .servers()
+                .get(&name)
+                .filter(|config| !config.disabled)
+                .cloned();
+            restarts.spawn(async move { lifecycle.reconfigure(&name, config).await });
+        }
+        while let Some(result) = restarts.join_next().await {
+            if let Err(error) = result {
+                tracing::error!(%error, "MCP child reconfiguration task failed");
+            }
+        }
+        let map = next
+            .servers()
+            .iter()
+            .map(|(name, config)| {
+                let server = before
+                    .get(name)
+                    .filter(|server| &server.config == config)
+                    .cloned()
+                    .unwrap_or_else(|| ConfiguredServer::new(config.clone()));
+                (name.clone(), server)
+            })
+            .collect();
+        *self.registry.write().expect("server registry lock") = map;
+        for mut admission in old_admissions {
+            *admission = false;
+        }
+        self.registry_ready.store(true, Ordering::Release);
     }
 
     pub fn metrics(&self) -> &Arc<HealthMetrics> {
@@ -246,18 +341,45 @@ impl AdapterHandler {
         body: &[u8],
         cancel: CancellationToken,
     ) -> HandlerOutcome {
+        // A route can reach the handler before the SDK has delivered settings.
+        // Never mistake the startup placeholder for an applied, empty registry.
+        if !self.registry_ready.load(Ordering::Acquire) {
+            return AdapterRefusal::with_detail(MODULE_WARMING, SETTINGS_WARMING, json!({}))
+                .into_handler_outcome();
+        }
         let request = match parse_envelope(body) {
             Ok(request) => request,
             Err(error) => return error.into_handler_outcome(),
         };
-        let Some(config) = self.registry.servers().get(&request.server).cloned() else {
-            return AdapterRefusal::with_detail(
-                "server_unknown",
-                "MCP server is not configured",
-                json!({}),
-            )
-            .into_handler_outcome();
-        };
+        let server;
+        let _admission;
+        loop {
+            let next = self
+                .registry
+                .read()
+                .expect("server registry lock")
+                .get(&request.server)
+                .cloned();
+            let Some(next) = next else {
+                return AdapterRefusal::with_detail(
+                    "server_unknown",
+                    "MCP server is not configured",
+                    json!({}),
+                )
+                .into_handler_outcome();
+            };
+            let admission = tokio::select! {
+                guard = Arc::clone(&next.accepting).read_owned() => guard,
+                () = cancel.cancelled() => return LifecycleError::ChildUnresponsive.into_handler_outcome(),
+            };
+            if *admission {
+                // Use this entry through the cache read/write and every child attempt.
+                server = next;
+                _admission = admission;
+                break;
+            }
+        }
+        let config = &server.config;
         if config.disabled {
             return AdapterRefusal::with_detail(
                 "server_disabled",
@@ -290,7 +412,7 @@ impl AdapterHandler {
             .lifecycle
             .forward(
                 &request.server,
-                config,
+                config.clone(),
                 request.op,
                 request.payload,
                 &cancel,
@@ -321,6 +443,15 @@ impl AdapterHandler {
 
 #[async_trait]
 impl ModuleHandler for AdapterHandler {
+    async fn on_bind(&self, _: &RouteBindRequest) -> BindDecision {
+        // The SDK automatically retries a warming refusal at route.open.
+        if self.registry_ready.load(Ordering::Acquire) {
+            BindDecision::accept()
+        } else {
+            BindDecision::reject(MODULE_WARMING, SETTINGS_WARMING)
+        }
+    }
+
     async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
         self.route_outcome_with_cancellation(&body, ctx.cancellation_token())
             .await
@@ -329,11 +460,68 @@ impl ModuleHandler for AdapterHandler {
     async fn health(&self) -> HealthReport {
         // The flight bookkeeping lock covers only timestamp insert/remove/snapshot.
         // No child-state lock or subprocess work can delay this health lane.
+        let mut metrics = self.metrics.snapshot();
+        if let Some(settings) = &self.user_settings {
+            metrics["settings"] = json!({
+                "state": *self.config_state.lock().expect("config state lock"),
+                "user_file": settings.path,
+                "migration_notice": settings.migration_notice(),
+            });
+        }
         HealthReport {
             status: HealthStatus::Ok,
             detail: Some("stdio MCP child lifecycle metrics".to_string()),
-            metrics: Some(self.metrics.snapshot()),
+            metrics: Some(metrics),
         }
+    }
+
+    fn config_declaration(&self) -> Option<ConfigDeclareRequest> {
+        self.user_settings
+            .as_ref()
+            .map(|settings| settings::declaration(&settings.path))
+    }
+
+    async fn on_hello_ack(&self, _: &ModuleHelloAckBody) {
+        // The SDK sends config.declare only after this authenticated callback.
+        if let Some(settings) = &self.user_settings {
+            settings.convert_legacy_file();
+        }
+    }
+
+    async fn config_review(&self, request: ConfigReviewRequest) -> ConfigReviewReply {
+        settings::review(request)
+    }
+
+    async fn config_apply(&self, view: ConfigView) -> Result<(), Vec<String>> {
+        let approved = settings::registry_from_view(&view)?;
+        if let Some(settings) = &self.user_settings {
+            let legacy = settings.registry_after_migration_failure(&view)?;
+            let in_effect = legacy.is_some();
+            self.apply_registry(legacy.unwrap_or(approved)).await;
+            settings.set_legacy_in_effect(in_effect);
+        } else {
+            self.apply_registry(approved).await;
+        }
+        Ok(())
+    }
+
+    async fn config_files(&self) {
+        if let Some(settings) = &self.user_settings {
+            match settings.unprotected_registry() {
+                Ok((registry, legacy_in_effect)) => {
+                    self.apply_registry(registry).await;
+                    settings.set_legacy_in_effect(legacy_in_effect);
+                    *self.config_state.lock().expect("config state lock") = Some("unprotected");
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "could not load unprotected MCP adapter settings")
+                }
+            }
+        }
+    }
+
+    async fn on_config_state(&self, state: ConfigState) {
+        *self.config_state.lock().expect("config state lock") = Some(state.as_str());
     }
 }
 
@@ -391,6 +579,56 @@ impl ChildLifecycle {
             .insert(key, cached);
     }
 
+    async fn reconfigure(self: &Arc<Self>, server: &str, replacement: Option<ServerConfig>) {
+        self.cached_tools
+            .lock()
+            .expect("tools cache lock")
+            .retain(|(name, _), _| name != server);
+        let slot = self.slots.lock().expect("server slots lock").remove(server);
+        let Some(slot) = slot else { return };
+        let mut state = slot.state.lock().await;
+        if let Some(timer) = state.eviction_timer.take() {
+            timer.abort();
+        }
+        let Some(mut session) = state.session.take() else {
+            return;
+        };
+        let was_live =
+            session.initialized_at.is_some() && matches!(session.child.try_wait(), Ok(None));
+        let reserved = self.terminate_session(session).await;
+        drop(state);
+        let Some((config, permit)) = replacement.zip(reserved).filter(|_| was_live) else {
+            return;
+        };
+
+        // Keep the old child's permit for its replacement; updating a live
+        // server must not evict a different server to make room.
+        let slot = self.slot(server);
+        let mut state = slot.state.lock().await;
+        let deadline = Instant::now() + Duration::from_millis(config.deadline_ms);
+        if self
+            .ensure_child(&config, &mut state, deadline, Some(permit))
+            .await
+            .is_ok()
+        {
+            let ttl = self
+                .settings
+                .idle_ttl_override
+                .unwrap_or_else(|| Duration::from_millis(config.idle_ttl_ms));
+            state
+                .session
+                .as_mut()
+                .expect("initialized session")
+                .last_idle = Instant::now();
+            self.schedule_idle_eviction(Arc::clone(&slot), &mut state, ttl);
+        } else {
+            tracing::warn!(
+                server,
+                "MCP child could not restart with the applied settings"
+            );
+        }
+    }
+
     async fn forward(
         self: &Arc<Self>,
         server: &str,
@@ -441,7 +679,7 @@ impl ChildLifecycle {
             () = cancel.cancelled() => return Err(LifecycleError::ChildUnresponsive),
         };
         let spawned_at = self
-            .ensure_child(server, config, &mut state, deadline)
+            .ensure_child(config, &mut state, deadline, None)
             .await?;
         // Capture the handshake cost before writing the tool request. Vendor
         // execution latency must not be attributed to the adapter's cold start.
@@ -523,10 +761,10 @@ impl ChildLifecycle {
 
     async fn ensure_child(
         self: &Arc<Self>,
-        _server: &str,
         config: &ServerConfig,
         state: &mut SlotState,
         deadline: Instant,
+        reserved: Option<OwnedSemaphorePermit>,
     ) -> Result<Option<Instant>, LifecycleError> {
         if let Some(session) = state.session.as_mut() {
             match session.child.try_wait() {
@@ -561,7 +799,10 @@ impl ChildLifecycle {
             state.cooldown_until = None;
         }
 
-        let capacity = self.reserve_capacity().await?;
+        let capacity = match reserved {
+            Some(permit) => permit,
+            None => self.reserve_capacity().await?,
+        };
         let child_env = match tokio::time::timeout_at(
             TokioInstant::from_std(deadline),
             self.construct_environment(config),
@@ -657,7 +898,7 @@ impl ChildLifecycle {
         for (variable, value) in &config.env {
             let value = match value {
                 EnvironmentValue::Literal(value) => OsString::from(value),
-                EnvironmentValue::Handle(handle) => self
+                EnvironmentValue::CredentialRef(handle) => self
                     .resolver
                     .resolve(handle)
                     .await
@@ -765,11 +1006,11 @@ impl ChildLifecycle {
 
     async fn remove_session(&self, state: &mut SlotState) {
         if let Some(session) = state.session.take() {
-            self.terminate_session(session).await;
+            let _ = self.terminate_session(session).await;
         }
     }
 
-    async fn terminate_session(&self, mut session: ChildSession) {
+    async fn terminate_session(&self, mut session: ChildSession) -> Option<OwnedSemaphorePermit> {
         let metrics = Arc::clone(&self.metrics);
         let grace = self.settings.eviction_grace;
         // Teardown owns the capacity permit through reaping even if its caller
@@ -784,8 +1025,9 @@ impl ChildLifecycle {
                 let _ = session.child.wait().await;
             }
             metrics.children_live.fetch_sub(1, Ordering::Relaxed);
+            session._capacity
         });
-        let _ = cleanup.await;
+        cleanup.await.ok()
     }
 
     /// Re-arms the slot's single eviction timer after a successful call. The
@@ -800,11 +1042,17 @@ impl ChildLifecycle {
     ) {
         state.eviction_ttl = ttl;
         if state.eviction_timer.is_none() {
-            let task = tokio::spawn(run_idle_eviction_timer(Arc::clone(self), Arc::clone(&slot)));
-            state.eviction_timer = Some(task.abort_handle());
             self.metrics
                 .eviction_timers_live
                 .fetch_add(1, Ordering::Relaxed);
+            let guard = EvictionTimerGuard::new(Arc::clone(&self.metrics));
+            let lifecycle = Arc::clone(self);
+            let slot = Arc::clone(&slot);
+            let task = tokio::spawn(async move {
+                let _live = guard;
+                run_idle_eviction_timer(lifecycle, slot).await;
+            });
+            state.eviction_timer = Some(task.abort_handle());
         }
         slot.eviction_wakeup.notify_one();
     }
@@ -815,7 +1063,6 @@ impl ChildLifecycle {
 /// deadline, so the task count stays at one per slot instead of growing with
 /// call rate.
 async fn run_idle_eviction_timer(lifecycle: Arc<ChildLifecycle>, slot: Arc<ServerSlot>) {
-    let _live = EvictionTimerGuard::new(Arc::clone(&lifecycle.metrics));
     loop {
         let wake_at = {
             let state = slot.state.lock().await;
@@ -1423,7 +1670,7 @@ mod tests {
     fn handler() -> AdapterHandler {
         let (registry, warnings) = parse_document(
             Path::new("registry.jsonc"),
-            r#"{ "github": { "command": "mcp" } }"#,
+            r#"{ "servers": { "github": { "command": "mcp" } } }"#,
         )
         .unwrap();
         assert!(warnings.is_empty());

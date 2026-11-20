@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.7
+
+- Return a retryable `module_warming` error until the adapter has applied its first settings, instead of reporting a configured server as unknown during startup.
+- Put server settings under daemon management in the user layer. Convert the old settings file and its vault credential identifiers after daemon registration, preserving comments and keeping a private backup.
+- Stop or restart only live children whose settings changed; leave cold servers to start on demand.
+- If conversion fails where the daemon does not approve settings (an older daemon without the settings gate, or an unstamped install with no new settings file yet), keep the validated legacy settings in effect and report the error on the adapter's settings status. A stamped install, where the daemon approves every settings change, uses only daemon-approved settings and never reads the old file.
+
 ## 0.8.6
 
 - Require subc-client-rs 0.41.2 and subc-daemon 0.50.0 for the settings release.

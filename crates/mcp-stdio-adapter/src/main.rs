@@ -3,18 +3,17 @@
 use std::{env, error::Error, ffi::OsString, path::PathBuf, process};
 
 use mcp_stdio_adapter::{
-    adapter::{AdapterHandler, ClaustrumCredentialResolver, LifecycleSettings},
+    adapter::{AdapterHandler, ClaustrumCredentialResolver},
     attestation::StartupAttestation,
-    registry::{default_config_path, load},
+    settings::{UserSettings, MODULE_ID},
 };
 use serde_json::json;
-use subc_client_rs::{serve_with_handle, ConsumerIdentity};
+use subc_client_rs::serve_with_handle;
 use subc_protocol::manifest::{
     Concurrency, IdentityScope, ManagementOperation, ManagementOperationKind, ModuleManifest,
     ObservabilityKind, ObservabilitySurface, ProviderRole,
 };
 
-const MODULE_ID: &str = "mcp-stdio-adapter";
 static LOGGER_INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
@@ -38,7 +37,7 @@ async fn main() {
 
 async fn run() -> Result<()> {
     // Emit static discovery data before attestation, config, or daemon setup so
-    // offline fleet lint can inspect the binary without runtime side effects.
+    // offline checks can inspect the binary without runtime side effects.
     if env::args_os()
         .nth(1)
         .is_some_and(|argument| argument == "--manifest")
@@ -52,25 +51,19 @@ async fn run() -> Result<()> {
         return Ok(());
     }
     if env::args_os().any(|arg| arg == "--help" || arg == "-h") {
-        println!("usage: ck-mcp-stdio-adapter --subc <connection-file> [--config <path>]");
+        println!("usage: ck-mcp-stdio-adapter --subc <connection-file>");
         return Ok(());
     }
 
     // This is intentionally first: no config read or daemon connection may occur
     // before a hand-launched process is refused.
-    // It also reads the launch nonce, which the SDK's HELLO later takes from
-    // the same cached accessor.
-    let attestation = StartupAttestation::require()?;
+    // The SDK reuses the same validated channel or cached legacy launch nonce.
+    StartupAttestation::require()?;
     let _logger = cortexkit_log::init_from_env()?;
     LOGGER_INSTALLED.store(true, std::sync::atomic::Ordering::Relaxed);
     tracing::info!("adapter starting");
 
     let args = StartupArgs::parse(env::args_os().skip(1))?;
-    let config_path = args.config.unwrap_or(default_config_path()?);
-    let (registry, warnings) = load(&config_path)?;
-    for warning in warnings {
-        tracing::warn!(target: "registry", "{warning}");
-    }
     let connection_file = args.subc_connection_file.ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -78,17 +71,10 @@ async fn run() -> Result<()> {
         )
     })?;
 
-    let credential_resolver = ClaustrumCredentialResolver::new(
-        connection_file.clone(),
-        ConsumerIdentity {
-            module_id: attestation.module_id().to_string(),
-            launch_nonce: attestation.launch_nonce().to_string(),
-        },
-    );
-    let handler = AdapterHandler::with_resolver(
-        registry,
+    let credential_resolver = ClaustrumCredentialResolver::new(connection_file.clone());
+    let handler = AdapterHandler::managed(
+        UserSettings::locate()?,
         std::sync::Arc::new(credential_resolver),
-        LifecycleSettings::default(),
     );
     let (_handle, serve_future) = serve_with_handle(&connection_file, manifest(), handler).await?;
     serve_future.await?;
@@ -149,7 +135,6 @@ fn manifest() -> ModuleManifest {
 
 #[derive(Debug, Default)]
 struct StartupArgs {
-    config: Option<PathBuf>,
     subc_connection_file: Option<PathBuf>,
 }
 
@@ -159,20 +144,12 @@ impl StartupArgs {
         let mut arguments = arguments.into_iter();
         while let Some(argument) = arguments.next() {
             match argument.to_str() {
-                Some("--config") => {
-                    parsed.config = Some(PathBuf::from(required_value(&mut arguments, "--config")?))
-                }
                 Some("--subc") => {
                     parsed.subc_connection_file =
                         Some(PathBuf::from(required_value(&mut arguments, "--subc")?))
                 }
                 Some(argument) => {
-                    if let Some(value) = argument.strip_prefix("--config=") {
-                        if value.is_empty() {
-                            return Err("missing value for --config".into());
-                        }
-                        parsed.config = Some(PathBuf::from(value));
-                    } else if let Some(value) = argument.strip_prefix("--subc=") {
+                    if let Some(value) = argument.strip_prefix("--subc=") {
                         if value.is_empty() {
                             return Err("missing value for --subc".into());
                         }
@@ -225,21 +202,13 @@ mod tests {
     }
 
     #[test]
-    fn config_override_and_subc_path_are_parsed() {
-        let parsed = StartupArgs::parse([
-            "--config".into(),
-            "/tmp/registry.jsonc".into(),
-            "--subc=/tmp/subc.json".into(),
-        ])
-        .unwrap();
+    fn only_the_daemon_connection_path_can_be_overridden() {
+        let parsed = StartupArgs::parse(["--subc=/tmp/subc.json".into()]).unwrap();
 
-        assert_eq!(
-            parsed.config.unwrap().to_string_lossy(),
-            "/tmp/registry.jsonc"
-        );
         assert_eq!(
             parsed.subc_connection_file.unwrap().to_string_lossy(),
             "/tmp/subc.json"
         );
+        assert!(StartupArgs::parse(["--config=/tmp/registry.jsonc".into()]).is_err());
     }
 }

@@ -63,6 +63,38 @@ fn unattested_binary_exits_before_any_startup_connection_work() {
 }
 
 #[test]
+fn forged_registration_handoff_exits_before_reading_or_converting_settings() {
+    use subc_os::registration_channel::{
+        DAEMON_PID_ENV, REGISTRATION_FD_ENV, REGISTRATION_PIPE_ENV,
+    };
+
+    let home = ScratchDir::new("mcp-forged-registration");
+    fs::create_dir(home.join("cortexkit")).unwrap();
+    let legacy = home.join("cortexkit/mcp-servers.jsonc");
+    let original = r#"{"fixture":{"command":"do-not-start"}}"#;
+    fs::write(&legacy, original).unwrap();
+    let output = cortexkit_test_support::dev_command(cortexkit_test_support::ckdev_binary(env!(
+        "CARGO_BIN_EXE_ck-mcp-stdio-adapter"
+    )))
+    .env_clear()
+    .env("XDG_DATA_HOME", home.path())
+    .env("XDG_CONFIG_HOME", home.path())
+    .env("SUBC_MODULE_ID", "mcp-stdio-adapter")
+    .env(DAEMON_PID_ENV, std::process::id().to_string())
+    .env(REGISTRATION_FD_ENV, "forged")
+    .env(REGISTRATION_PIPE_ENV, "forged")
+    .arg("--subc")
+    .arg(home.join("missing-connection.json"))
+    .output()
+    .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(String::from_utf8(output.stderr).unwrap(), "ck-mcp-stdio-adapter: startup attestation requires a validated registration channel or SUBC_LAUNCH_NONCE\n");
+    assert_eq!(fs::read_to_string(&legacy).unwrap(), original);
+    assert!(!home.join("cortexkit/mcp-stdio-adapter.jsonc").exists());
+    assert!(!home.join("cortexkit/mcp-stdio-adapter").exists());
+}
+
+#[test]
 fn adapter_startup_writes_dated_r2_segment() {
     let home = ScratchDir::new("mcp-adapter-log");
     let output = cortexkit_test_support::dev_command(cortexkit_test_support::ckdev_binary(env!(
@@ -74,8 +106,8 @@ fn adapter_startup_writes_dated_r2_segment() {
     .env("CK_LOG", "info")
     .env("SUBC_MODULE_ID", "mcp-stdio-adapter")
     .env("SUBC_LAUNCH_NONCE", "test-nonce")
-    .arg("--config")
-    .arg(home.join("missing-config.jsonc"))
+    .arg("--subc")
+    .arg(home.join("missing-connection.json"))
     .output()
     .unwrap();
     assert!(!output.status.success());

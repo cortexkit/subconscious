@@ -3,16 +3,20 @@ use std::{fs, sync::Arc, time::Duration};
 use cortexkit_test_support::ScratchDir;
 use serde_json::{json, Value};
 use subc_client_rs::{
-    async_trait, BindDecision, CallOptions, ConsumerOptions, HandlerOutcome, ModuleHandler,
-    RequestCtx, RouteBindRequest, SubcConsumer,
+    async_trait, BindDecision, CallError, CallOptions, ConsumerOptions, HandlerOutcome,
+    ModuleHandler, RequestCtx, RouteBindRequest, SubcConsumer,
 };
 use subc_protocol::{
+    error_codes::MODULE_WARMING,
     manifest::{
         Concurrency, ManagementOperation, ManagementOperationKind, ModuleManifest, ProviderRole,
     },
     BindIdentity, Principal, RouteTarget,
 };
-use tokio::{sync::Mutex, time::timeout};
+use tokio::{
+    sync::Mutex,
+    time::{sleep, timeout},
+};
 
 const ADAPTER: &str = "mcp-stdio-adapter";
 const BUDGET: Duration = Duration::from_secs(15);
@@ -48,10 +52,10 @@ impl ModuleHandler for Vault {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn vault_consumer_succeeds_after_registration_channel_adoption() {
     let root = ScratchDir::new("adapter-credential-channel");
-    for directory in ["config", "data", "run/logs"] {
+    for directory in ["config/cortexkit", "data", "run/logs"] {
         fs::create_dir_all(root.join(directory)).unwrap();
     }
-    let registry = root.join("config/mcp-servers.jsonc");
+    let registry = root.join("config/cortexkit/mcp-servers.jsonc");
     fs::write(
         &registry,
         serde_json::to_vec(&json!({"fixture":{
@@ -64,7 +68,7 @@ async fn vault_consumer_succeeds_after_registration_channel_adoption() {
     let config = root.join("config/subc.jsonc");
     fs::write(&config, serde_json::to_vec(&json!({"version":1,"modules":{ADAPTER:{
         "program":cortexkit_test_support::ckdev_binary(env!("CARGO_BIN_EXE_ck-mcp-stdio-adapter")),
-        "args":["--config",registry], "reserved":true,"registration_channel":true,
+        "reserved":true,"registration_channel":true,
         "env":{"XDG_DATA_HOME":root.join("data"),"XDG_CONFIG_HOME":root.join("config"),"XDG_RUNTIME_DIR":root.join("run")}
     }}})).unwrap()).unwrap();
     let connection = root.join("run/subc-connection.json");
@@ -116,24 +120,36 @@ async fn vault_consumer_succeeds_after_registration_channel_adoption() {
             .await
             .unwrap();
     let vault = tokio::spawn(serving);
-    let outcome = timeout(
-        BUDGET,
-        client.call(
-            RouteTarget::ManagementSurface {
-                module_id: ADAPTER.into(),
-            },
-            BindIdentity::new("adapter-test", "credential-channel"),
-            serde_json::to_vec(&json!({
-                "server":"fixture", "op":"tools/call",
-                "payload":{"method":"tools/call","params":{"check":"credential"}}
-            }))
-            .unwrap(),
-            CallOptions {
-                timeout: BUDGET,
-                ..CallOptions::default()
-            },
-        ),
-    )
+    let outcome = timeout(BUDGET, async {
+        let request = serde_json::to_vec(&json!({
+            "server":"fixture", "op":"tools/call",
+            "payload":{"method":"tools/call","params":{"check":"credential"}}
+        }))
+        .unwrap();
+        loop {
+            let result = client
+                .call(
+                    RouteTarget::ManagementSurface {
+                        module_id: ADAPTER.into(),
+                    },
+                    BindIdentity::new("adapter-test", "credential-channel"),
+                    request.clone(),
+                    CallOptions {
+                        timeout: BUDGET,
+                        ..CallOptions::default()
+                    },
+                )
+                .await;
+            // New route opens retry warming in the SDK. For a reply on a
+            // bound route, warming also means the adapter did not run the call.
+            match result {
+                Err(CallError::Module(error)) if error.code == MODULE_WARMING => {
+                    sleep(Duration::from_millis(20)).await;
+                }
+                result => break result,
+            }
+        }
+    })
     .await;
     let stopped = client.supervisor_set_enabled(ADAPTER, false).await;
     client.close().await;

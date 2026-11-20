@@ -1786,9 +1786,10 @@ dependencies = [
 
 [[package]]
 name = "mcp-stdio-adapter"
-version = "0.8.6"
+version = "0.8.7"
 dependencies = [
  "cortexkit-log",
+ "cortexkit-store-types",
  "cortexkit-test-support",
  "rustix",
  "serde",
@@ -1797,7 +1798,9 @@ dependencies = [
  "subc-daemon",
  "subc-jobobject",
  "subc-jsonc",
+ "subc-os",
  "subc-protocol 0.37.5",
+ "subc-transport",
  "tokio",
  "tokio-util",
  "tracing",

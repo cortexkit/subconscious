@@ -3,69 +3,44 @@ use std::{env, fmt};
 use subc_client_rs::launch_nonce::LaunchNonceError;
 use subc_protocol::{SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV};
 
-/// The daemon attestation this adapter starts with: its module id and the
-/// launch nonce read through the process's one launch-nonce accessor.
-#[derive(Clone, PartialEq, Eq)]
+/// A validated registration handoff or the legacy launch-nonce preflight.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartupAttestation {
     module_id: String,
-    launch_nonce: String,
-}
-
-// Hand-written so the launch nonce is never printed. The nonce is the credential
-// that attributes a connection to a supervised module, and a derived Debug would
-// write it into any log line or panic message that formats this value. Same
-// reasoning as ConnectionInfo's Debug in subc-transport.
-impl fmt::Debug for StartupAttestation {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("StartupAttestation")
-            .field("module_id", &self.module_id)
-            .field(
-                "launch_nonce",
-                &format_args!("<{} bytes redacted>", self.launch_nonce.len()),
-            )
-            .finish()
-    }
 }
 
 impl StartupAttestation {
-    /// Require daemon injection before any connection is opened or any child is
-    /// spawned: reading the nonce first is what closes the inherited nonce
-    /// descriptor before a child could inherit it.
+    /// Refuse hand launches before opening any local files. The SDK takes the
+    /// same validated channel, or uses the cached nonce on older launches.
+    /// The daemon still has to accept our HELLO before settings can be changed.
     ///
-    /// The environment is left as it is. The accessor caches the nonce for
-    /// every later reader in this process (the SDK's HELLO among them), and
-    /// removing the variable from a multi-threaded process is unsound. Child
-    /// servers do not see it anyway: they are spawned with a cleared
-    /// environment.
+    /// Reading the nonce also closes its inherited descriptor, when present,
+    /// so the adapter's child servers cannot inherit it.
     pub fn require() -> Result<Self, AttestationError> {
         Self::from_parts(
             required_environment_value(SUBC_MODULE_ID_ENV),
+            subc_os::registration_channel::supervised(),
             subc_client_rs::launch_nonce(),
         )
     }
 
     fn from_parts(
         module_id: Option<String>,
+        registration_validated: bool,
         launch_nonce: Result<Option<subc_client_rs::launch_nonce::LaunchNonce>, LaunchNonceError>,
     ) -> Result<Self, AttestationError> {
         let module_id = module_id.ok_or(AttestationError::MissingModuleId)?;
-        let launch_nonce = launch_nonce
-            .map_err(AttestationError::LaunchNonce)?
-            .map(|nonce| nonce.value().to_string())
-            .filter(|value| !value.trim().is_empty())
-            .ok_or(AttestationError::MissingLaunchNonce)?;
-        Ok(Self {
-            module_id,
-            launch_nonce,
-        })
+        if !registration_validated {
+            launch_nonce
+                .map_err(AttestationError::LaunchNonce)?
+                .filter(|nonce| !nonce.value().trim().is_empty())
+                .ok_or(AttestationError::MissingLaunchNonce)?;
+        }
+        Ok(Self { module_id })
     }
 
     pub fn module_id(&self) -> &str {
         &self.module_id
-    }
-
-    pub fn launch_nonce(&self) -> &str {
-        &self.launch_nonce
     }
 }
 
@@ -91,7 +66,7 @@ impl fmt::Display for AttestationError {
             Self::MissingLaunchNonce => {
                 write!(
                     formatter,
-                    "startup attestation requires {SUBC_LAUNCH_NONCE_ENV}"
+                    "startup attestation requires a validated registration channel or {SUBC_LAUNCH_NONCE_ENV}"
                 )
             }
             Self::LaunchNonce(error) => {
@@ -120,14 +95,14 @@ mod tests {
 
     #[test]
     fn missing_module_id_has_a_specific_refusal() {
-        let result = StartupAttestation::from_parts(None, Ok(None));
+        let result = StartupAttestation::from_parts(None, false, Ok(None));
         assert_eq!(result, Err(AttestationError::MissingModuleId));
     }
 
     #[test]
     fn missing_nonce_has_a_specific_refusal() {
         let result =
-            StartupAttestation::from_parts(Some("mcp-stdio-adapter".to_string()), Ok(None));
+            StartupAttestation::from_parts(Some("mcp-stdio-adapter".to_string()), false, Ok(None));
         assert_eq!(result, Err(AttestationError::MissingLaunchNonce));
     }
 
@@ -136,6 +111,7 @@ mod tests {
         let error = LaunchNonceError::NotOpen { fd: 3, errno: 9 };
         let result = StartupAttestation::from_parts(
             Some("mcp-stdio-adapter".to_string()),
+            false,
             Err(error.clone()),
         );
         assert_eq!(result, Err(AttestationError::LaunchNonce(error)));
@@ -164,7 +140,7 @@ mod tests {
         restore_environment(LAUNCH_NONCE_FD_ENV, nonce_fd);
         let attestation = attestation.unwrap();
         assert_eq!(attestation.module_id(), "mcp-stdio-adapter");
-        assert_eq!(attestation.launch_nonce(), "nonce-kept-in-memory");
+        assert!(!format!("{attestation:?}").contains("nonce-kept-in-memory"));
         assert_eq!(left.as_deref(), Some("nonce-kept-in-memory".as_ref()));
     }
 
@@ -181,23 +157,11 @@ mod tests {
             None => env::remove_var(name),
         }
     }
-}
-
-#[cfg(test)]
-mod launch_nonce_redaction_tests {
-    use super::*;
-
     #[test]
-    fn startup_attestation_debug_never_prints_the_nonce() {
-        let attestation = StartupAttestation {
-            module_id: "mcp-stdio".to_string(),
-            launch_nonce: "nonce-f00dfeed1234abcd".to_string(),
-        };
-        let printed = format!("{attestation:?}");
-        assert!(printed.contains("mcp-stdio"), "{printed}");
-        assert!(
-            !printed.contains("nonce-f00dfeed1234abcd"),
-            "launch nonce printed: {printed}"
-        );
+    fn startup_accepts_a_validated_channel_without_a_nonce() {
+        let attestation =
+            StartupAttestation::from_parts(Some("mcp-stdio-adapter".to_string()), true, Ok(None))
+                .unwrap();
+        assert_eq!(attestation.module_id(), "mcp-stdio-adapter");
     }
 }

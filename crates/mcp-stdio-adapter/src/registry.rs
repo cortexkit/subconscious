@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    env, fmt, fs,
+    fmt,
     path::{Path, PathBuf},
 };
 
@@ -10,10 +10,9 @@ use subc_jsonc::jsonc_to_json;
 
 use crate::constants::{DEFAULT_DEADLINE_MS, DEFAULT_FRAME_CEILING_BYTES, DEFAULT_IDLE_TTL_MS};
 
-pub const CONFIG_RELATIVE_PATH: &str = "cortexkit/mcp-servers.jsonc";
 const MIN_IDLE_TTL_WARNING_MS: u64 = 10_000;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ServerRegistry {
     servers: BTreeMap<String, ServerConfig>,
 }
@@ -41,7 +40,7 @@ pub struct ServerConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvironmentValue {
-    Handle(String),
+    CredentialRef(String),
     Literal(String),
 }
 
@@ -66,11 +65,10 @@ impl fmt::Display for RegistryWarning {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegistryError {
-    MissingConfigHome,
-    Read { path: PathBuf },
     Jsonc { path: PathBuf, message: String },
     Json { path: PathBuf, message: String },
-    RootMustBeObject { path: PathBuf },
+    InvalidRoot,
+    ServersMustBeObject,
     InvalidServerName { server: String },
     ServerMustBeObject { server: String },
     InvalidServerConfig { server: String },
@@ -78,7 +76,7 @@ pub enum RegistryError {
     EnvironmentMustBeObject { server: String },
     InvalidEnvironmentBinding { server: String, variable: String },
     EnvironmentTagCount { server: String, variable: String },
-    InvalidHandle { server: String, variable: String },
+    InvalidCredentialRef { server: String, variable: String },
     InvalidLiteralValue { server: String, variable: String },
     ReservedSubcEnvironment { server: String, variable: String },
     HandleNamespaceLiteral { server: String, variable: String },
@@ -87,14 +85,11 @@ pub enum RegistryError {
 impl fmt::Display for RegistryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MissingConfigHome => write!(formatter, "XDG_CONFIG_HOME is required to locate the MCP registry"),
-            Self::Read { path } => write!(formatter, "could not read MCP registry {}", path.display()),
             Self::Jsonc { path, .. } | Self::Json { path, .. } => {
                 write!(formatter, "could not parse MCP registry {}", path.display())
             }
-            Self::RootMustBeObject { path } => {
-                write!(formatter, "MCP registry {} must be a server object", path.display())
-            }
+            Self::InvalidRoot => write!(formatter, "MCP settings must be an object containing only the servers field"),
+            Self::ServersMustBeObject => write!(formatter, "MCP settings servers must be an object"),
             Self::InvalidServerName { server } => write!(formatter, "invalid MCP server name '{server}'"),
             Self::ServerMustBeObject { server } => {
                 write!(formatter, "MCP server '{server}' must be an object")
@@ -115,11 +110,11 @@ impl fmt::Display for RegistryError {
             ),
             Self::EnvironmentTagCount { server, variable } => write!(
                 formatter,
-                "MCP server '{server}' environment variable '{variable}' must have exactly one of handle or value"
+                "MCP server '{server}' environment variable '{variable}' must have exactly one of credential_ref or value"
             ),
-            Self::InvalidHandle { server, variable } => write!(
+            Self::InvalidCredentialRef { server, variable } => write!(
                 formatter,
-                "MCP server '{server}' environment variable '{variable}' has a non-string handle"
+                "MCP server '{server}' environment variable '{variable}' must reference a vault credential"
             ),
             Self::InvalidLiteralValue { server, variable } => write!(
                 formatter,
@@ -139,35 +134,64 @@ impl fmt::Display for RegistryError {
 
 impl std::error::Error for RegistryError {}
 
-pub fn default_config_path() -> Result<PathBuf, RegistryError> {
-    let config_home = env::var_os("XDG_CONFIG_HOME").ok_or(RegistryError::MissingConfigHome)?;
-    Ok(PathBuf::from(config_home).join(CONFIG_RELATIVE_PATH))
+impl RegistryError {
+    pub(crate) fn pointer(&self) -> String {
+        match self {
+            Self::ServersMustBeObject => "/servers".into(),
+            Self::InvalidServerName { server }
+            | Self::ServerMustBeObject { server }
+            | Self::InvalidServerConfig { server } => pointer("/servers", server),
+            Self::BareEnvironmentList { server } | Self::EnvironmentMustBeObject { server } => {
+                format!("{}/env", pointer("/servers", server))
+            }
+            Self::InvalidEnvironmentBinding { server, variable }
+            | Self::EnvironmentTagCount { server, variable }
+            | Self::InvalidCredentialRef { server, variable }
+            | Self::InvalidLiteralValue { server, variable }
+            | Self::ReservedSubcEnvironment { server, variable }
+            | Self::HandleNamespaceLiteral { server, variable } => {
+                pointer(&format!("{}/env", pointer("/servers", server)), variable)
+            }
+            Self::Jsonc { .. } | Self::Json { .. } | Self::InvalidRoot => String::new(),
+        }
+    }
 }
 
-pub fn load(path: &Path) -> Result<(ServerRegistry, Vec<RegistryWarning>), RegistryError> {
-    let document = fs::read_to_string(path).map_err(|_| RegistryError::Read {
-        path: path.to_path_buf(),
-    })?;
-    parse_document(path, &document)
+pub(crate) fn pointer(parent: &str, name: &str) -> String {
+    format!("{parent}/{}", name.replace('~', "~0").replace('/', "~1"))
 }
 
 pub fn parse_document(
     path: &Path,
     document: &str,
 ) -> Result<(ServerRegistry, Vec<RegistryWarning>), RegistryError> {
+    parse_effective(&parse_jsonc(path, document)?)
+}
+
+pub(crate) fn parse_jsonc(path: &Path, document: &str) -> Result<Value, RegistryError> {
     let normalized = jsonc_to_json(document).map_err(|message| RegistryError::Jsonc {
         path: path.to_path_buf(),
         message,
     })?;
-    let root: Value = serde_json::from_str(&normalized).map_err(|error| RegistryError::Json {
+    serde_json::from_str(&normalized).map_err(|error| RegistryError::Json {
         path: path.to_path_buf(),
         message: error.to_string(),
-    })?;
-    let servers = root
+    })
+}
+
+pub(crate) fn parse_effective(
+    root: &Value,
+) -> Result<(ServerRegistry, Vec<RegistryWarning>), RegistryError> {
+    let root = root
         .as_object()
-        .ok_or_else(|| RegistryError::RootMustBeObject {
-            path: path.to_path_buf(),
-        })?;
+        .filter(|object| object.keys().all(|key| key == "servers"))
+        .ok_or(RegistryError::InvalidRoot)?;
+    let Some(servers) = root.get("servers") else {
+        return Ok((ServerRegistry::default(), vec![]));
+    };
+    let servers = servers
+        .as_object()
+        .ok_or(RegistryError::ServersMustBeObject)?;
 
     let mut parsed_servers = BTreeMap::new();
     let mut warnings = Vec::new();
@@ -296,14 +320,25 @@ fn parse_environment(
                     variable,
                 });
             }
-            if let Some(handle) = binding.get("handle") {
-                let handle = handle
-                    .as_str()
-                    .ok_or_else(|| RegistryError::InvalidHandle {
+            if let Some(reference) = binding.get("credential_ref") {
+                let handle = reference
+                    .as_object()
+                    .filter(|object| object.len() == 1)
+                    .and_then(|object| object.get("vault_ref"))
+                    .and_then(Value::as_str)
+                    .filter(|id| {
+                        !id.is_empty()
+                            && id.len() <= 256
+                            && id.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+                    })
+                    .ok_or_else(|| RegistryError::InvalidCredentialRef {
                         server: server.to_string(),
                         variable: variable.clone(),
                     })?;
-                return Ok((variable, EnvironmentValue::Handle(handle.to_string())));
+                return Ok((
+                    variable,
+                    EnvironmentValue::CredentialRef(handle.to_string()),
+                ));
             }
             if let Some(value) = binding.get("value") {
                 let value = value
@@ -356,22 +391,17 @@ struct RawServerConfig {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        path::PathBuf,
-        sync::atomic::{AtomicU64, Ordering},
-    };
+    use std::path::PathBuf;
 
-    use super::{
-        parse_document, EnvironmentValue, RegistryError, RegistryWarning, CONFIG_RELATIVE_PATH,
-    };
+    use super::{parse_document, EnvironmentValue, RegistryError, RegistryWarning};
     use crate::constants::{DEFAULT_DEADLINE_MS, DEFAULT_FRAME_CEILING_BYTES, DEFAULT_IDLE_TTL_MS};
 
-    static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(1);
-
     fn parse(document: &str) -> Result<super::ServerRegistry, RegistryError> {
-        parse_document(PathBuf::from("test-registry.jsonc").as_path(), document)
-            .map(|(registry, _)| registry)
+        parse_document(
+            PathBuf::from("test-registry.jsonc").as_path(),
+            &format!(r#"{{"servers":{document}}}"#),
+        )
+        .map(|(registry, _)| registry)
     }
 
     #[test]
@@ -379,14 +409,14 @@ mod tests {
         let (registry, warnings) = parse_document(
             PathBuf::from("registry.jsonc").as_path(),
             r#"
-            {
+            { "servers": {
               // this comment and comma exercise JSONC normalization
               "github": {
                 "command": "/usr/local/bin/github-mcp",
                 "args": ["--stdio",],
                 "cwd": "/work/project",
                 "env": {
-                  "TOKEN": { "handle": "vault:github-token" },
+                  "TOKEN": { "credential_ref": {"vault_ref": "vault:github-token"} },
                   "MODE": { "value": "readonly" },
                 },
                 "idle_ttl_ms": 0,
@@ -397,7 +427,7 @@ mod tests {
               },
               "defaults": { "command": "defaults" },
               "zero-deadline": { "command": "zero", "deadline_ms": 0 },
-            }
+            } }
             "#,
         )
         .unwrap();
@@ -408,7 +438,7 @@ mod tests {
         assert_eq!(github.cwd, Some(PathBuf::from("/work/project")));
         assert_eq!(
             github.env["TOKEN"],
-            EnvironmentValue::Handle("vault:github-token".to_string())
+            EnvironmentValue::CredentialRef("vault:github-token".to_string())
         );
         assert_eq!(
             github.env["MODE"],
@@ -507,7 +537,7 @@ mod tests {
         let missing =
             parse(r#"{ "github": { "command": "mcp", "env": { "TOKEN": {} } } }"#).unwrap_err();
         let multiple = parse(
-            r#"{ "github": { "command": "mcp", "env": { "TOKEN": { "handle": "x", "value": "y" } } } }"#,
+            r#"{ "github": { "command": "mcp", "env": { "TOKEN": { "credential_ref": {"vault_ref":"x"}, "value": "y" } } } }"#,
         )
         .unwrap_err();
 
@@ -520,14 +550,14 @@ mod tests {
     }
 
     #[test]
-    fn non_string_handle_is_refused_with_server_and_variable() {
+    fn non_string_reference_is_refused_with_server_and_variable() {
         let error =
-            parse(r#"{ "github": { "command": "mcp", "env": { "TOKEN": { "handle": 7 } } } }"#)
+            parse(r#"{ "github": { "command": "mcp", "env": { "TOKEN": { "credential_ref": {"vault_ref":7} } } } }"#)
                 .unwrap_err();
 
         assert_eq!(
             error,
-            RegistryError::InvalidHandle {
+            RegistryError::InvalidCredentialRef {
                 server: "github".to_string(),
                 variable: "TOKEN".to_string(),
             }
@@ -604,7 +634,7 @@ mod tests {
     fn short_ttl_parses_and_warns_with_the_server_name() {
         let (registry, warnings) = parse_document(
             PathBuf::from("registry.jsonc").as_path(),
-            r#"{ "github": { "command": "mcp", "idle_ttl_ms": 9999 } }"#,
+            r#"{ "servers": { "github": { "command": "mcp", "idle_ttl_ms": 9999 } } }"#,
         )
         .unwrap();
 
@@ -621,22 +651,9 @@ mod tests {
 
     #[test]
     fn unparseable_file_error_names_the_file() {
-        let path = std::env::temp_dir().join(format!(
-            "mcp-stdio-adapter-registry-{}-{}.jsonc",
-            std::process::id(),
-            NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::write(&path, "{ invalid").unwrap();
-
-        let error = super::load(&path).unwrap_err();
-
-        let _ = fs::remove_file(&path);
+        let path = PathBuf::from("mcp-stdio-adapter.jsonc");
+        let error = parse_document(&path, "{ invalid").unwrap_err();
         assert!(matches!(error, RegistryError::Json { path: ref actual, .. } if actual == &path));
         assert!(error.to_string().contains(&path.display().to_string()));
-    }
-
-    #[test]
-    fn configured_relative_path_is_stable() {
-        assert_eq!(CONFIG_RELATIVE_PATH, "cortexkit/mcp-servers.jsonc");
     }
 }

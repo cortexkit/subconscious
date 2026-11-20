@@ -87,9 +87,12 @@ fn test_settings() -> LifecycleSettings {
 }
 
 fn registry(servers: Value) -> ServerRegistry {
-    parse_document(Path::new("fixture-registry.jsonc"), &servers.to_string())
-        .expect("fixture registry parses")
-        .0
+    parse_document(
+        Path::new("fixture-registry.jsonc"),
+        &json!({"servers":servers}).to_string(),
+    )
+    .expect("fixture registry parses")
+    .0
 }
 
 fn server(env: Value) -> Value {
@@ -164,7 +167,10 @@ async fn real_stdio_child_is_lazily_spawned_isolated_and_resolved_again_after_id
     let mut env = serde_json::Map::new();
     env.insert("FIXTURE_MODE".to_string(), json!({"value": "normal"}));
     env.insert("PATH".to_string(), json!({"value": "shadowed-path"}));
-    env.insert("TAGGED".to_string(), json!({"handle": "vault:fixture"}));
+    env.insert(
+        "TAGGED".to_string(),
+        json!({"credential_ref": {"vault_ref":"vault:fixture"}}),
+    );
     let handler = AdapterHandler::with_resolver(
         registry(json!({"fixture": server(Value::Object(env))})),
         resolver.clone(),
@@ -234,7 +240,7 @@ async fn spawn_failed_refusal_fence_has_retry_after_ms_for_an_unexecutable_child
 async fn vault_miss_spawn_failed_refusal_fence_names_variable_not_handle_or_secret() {
     let handler = AdapterHandler::with_resolver(
         registry(json!({
-            "vaulted": server(json!({"TOKEN": {"handle": "vault:never-echo-this"}}))
+            "vaulted": server(json!({"TOKEN": {"credential_ref": {"vault_ref":"vault:never-echo-this"}}}))
         })),
         Arc::new(MissingResolver),
         test_settings(),
@@ -665,4 +671,88 @@ async fn busy_children_refuse_at_global_capacity() {
     assert_eq!(code, "child_capacity");
     assert_eq!(handler.metrics().snapshot()["children_live"], 0);
     assert_eq!(handler.metrics().snapshot()["spawns_total"], 8);
+}
+
+#[tokio::test]
+async fn managed_settings_restarts_only_changed_live_children_and_retires_old_cache() {
+    use subc_client_rs::{
+        config::{ConfigStatus, ConfigView},
+        ModuleHandler,
+    };
+
+    let old = json!({
+        "change": server(json!({"LEVEL":{"value":"old"}})),
+        "keep": server(json!({})),
+        "remove": server(json!({})),
+        "disable": server(json!({})),
+    });
+    let handler = AdapterHandler::with_resolver(
+        registry(old.clone()),
+        Arc::new(MissingResolver),
+        LifecycleSettings {
+            idle_ttl_override: None,
+            ..test_settings()
+        },
+    );
+    let old_changed = call(&handler, "change", "tools/call", json!({})).await;
+    let kept = call(&handler, "keep", "tools/call", json!({})).await;
+    call(&handler, "remove", "tools/call", json!({})).await;
+    call(&handler, "disable", "tools/call", json!({})).await;
+    for server in ["keep", "change"] {
+        assert_eq!(
+            call(&handler, server, "tools/list", json!({})).await["served_from"],
+            "live"
+        );
+        assert_eq!(
+            call(&handler, server, "tools/list", json!({})).await["served_from"],
+            "cache"
+        );
+    }
+
+    let mut updated = old.clone();
+    updated["change"]["env"]["LEVEL"]["value"] = json!("new");
+    updated["disable"]["disabled"] = json!(true);
+    updated.as_object_mut().unwrap().remove("remove");
+    updated["cold"] = server(json!({}));
+    let view = ConfigView::new(
+        1,
+        json!({"servers":updated}),
+        BTreeMap::new(),
+        vec![],
+        ConfigStatus::Active,
+    );
+    handler.config_apply(view).await.unwrap();
+
+    let metrics = handler.metrics().snapshot();
+    assert_eq!(
+        metrics["spawns_total"], 5,
+        "only the changed live child restarted"
+    );
+    assert_eq!(
+        metrics["children_live"], 2,
+        "removed and disabled live children stopped"
+    );
+    assert_eq!(
+        call(&handler, "keep", "tools/list", json!({})).await["served_from"],
+        "cache"
+    );
+    assert_eq!(
+        call(&handler, "change", "tools/list", json!({})).await["served_from"],
+        "live"
+    );
+    let still_kept = call(&handler, "keep", "tools/call", json!({})).await;
+    assert_eq!(kept["payload"]["pid"], still_kept["payload"]["pid"]);
+    let changed = call(&handler, "change", "tools/call", json!({})).await;
+    assert_ne!(old_changed["payload"]["pid"], changed["payload"]["pid"]);
+    assert_eq!(changed["payload"]["environment"]["LEVEL"], "new");
+    assert_eq!(
+        refusal(&handler, "remove", "tools/call").await.0,
+        "server_unknown"
+    );
+    assert_eq!(
+        refusal(&handler, "disable", "tools/call").await.0,
+        "server_disabled"
+    );
+    call(&handler, "cold", "tools/call", json!({})).await;
+    assert_eq!(handler.metrics().snapshot()["spawns_total"], 6);
 }

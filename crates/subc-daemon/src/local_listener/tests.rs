@@ -554,3 +554,59 @@ mod windows {
         server.abort();
     }
 }
+
+/// Linux's `sockaddr_un` holds a 108-byte path including its terminating NUL,
+/// so pathname sockets of up to 107 bytes bind. The guard must not refuse a
+/// path the kernel accepts, or the daemon starts without its local endpoint.
+#[cfg(target_os = "linux")]
+mod linux_socket_path_length {
+    use std::{os::unix::ffi::OsStrExt, path::PathBuf};
+
+    use super::*;
+
+    /// A socket path of exactly `length` bytes inside `scratch`, with the
+    /// directories in front of the socket file created.
+    fn socket_path_of_length(scratch: &ScratchDir, length: usize) -> PathBuf {
+        let base = scratch.path().as_os_str().as_bytes().len();
+        let file = "/subc.sock".len();
+        let padding = length
+            .checked_sub(base + 1 + file)
+            .expect("the scratch directory leaves room for the padding");
+        let dir = scratch.path().join("p".repeat(padding));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("subc.sock");
+        assert_eq!(path.as_os_str().as_bytes().len(), length);
+        path
+    }
+
+    #[test]
+    fn guard_accepts_every_socket_path_length_linux_can_bind() {
+        let mut refused = Vec::new();
+        for length in 103..=107 {
+            let scratch = ScratchDir::new("sl");
+            let path = socket_path_of_length(&scratch, length);
+            // The kernel itself accepts this length.
+            drop(
+                std::os::unix::net::UnixListener::bind(&path).unwrap_or_else(|error| {
+                    panic!("Linux refused a {length}-byte socket path: {error}")
+                }),
+            );
+            std::fs::remove_file(&path).unwrap();
+            if let Err(error) = local_listener::unix::refuse_overlong_path(&path) {
+                refused.push((length, error.to_string()));
+            }
+        }
+        assert!(
+            refused.is_empty(),
+            "the guard refused socket paths Linux binds: {refused:?}"
+        );
+    }
+
+    #[test]
+    fn guard_refuses_a_path_linux_cannot_bind() {
+        let scratch = ScratchDir::new("sl");
+        let path = socket_path_of_length(&scratch, 108);
+        assert!(std::os::unix::net::UnixListener::bind(&path).is_err());
+        assert!(local_listener::unix::refuse_overlong_path(&path).is_err());
+    }
+}

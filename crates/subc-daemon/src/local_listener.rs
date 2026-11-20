@@ -182,9 +182,13 @@ mod unix {
 
     use crate::server::ServerError;
 
-    /// The longest Unix-domain socket path the kernel accepts, minus the
-    /// terminating NUL.
-    pub(super) const MAX_SOCKET_PATH: usize = 104;
+    /// The size of `sockaddr_un.sun_path` on this platform. A pathname socket
+    /// must fit in it with its terminating NUL, so the longest usable path is
+    /// one byte shorter: 107 bytes on Linux, 103 on macOS and the BSDs.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(super) const SUN_PATH_CAPACITY: usize = 108;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    pub(super) const SUN_PATH_CAPACITY: usize = 104;
 
     /// The socket's file name in the run directory.
     ///
@@ -253,7 +257,7 @@ mod unix {
     /// Refuse a socket path the kernel cannot represent, instead of letting the
     /// bind fail with a message that names no cause.
     pub(super) fn refuse_overlong_path(path: &Path) -> Result<(), ServerError> {
-        if path.as_os_str().len() < MAX_SOCKET_PATH {
+        if path.as_os_str().len() < SUN_PATH_CAPACITY {
             return Ok(());
         }
         remove_socket(path);

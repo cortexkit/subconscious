@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.21.28
+
+- Requires subc-daemon 0.50.22 (the router audit fixes).
+
 ## 0.21.27
 
 - Test fixtures: the fake module stub can start helpers outside its process group, so

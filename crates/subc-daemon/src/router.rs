@@ -1038,6 +1038,17 @@ impl Router {
         self.control.record_local_connection(connection);
     }
 
+    /// Reserve an `activity.subscribe` correlation before the reader hands the
+    /// request to a task; hold the result for the task's lifetime.
+    pub(crate) fn reserve_activity_subscription(
+        &self,
+        ctx: &RouteCtx,
+        frame: &Frame,
+    ) -> Option<impl Send + 'static> {
+        self.control
+            .reserve_activity_subscription(ctx.connection_id, frame)
+    }
+
     pub(crate) fn record_captured_peer(
         &self,
         connection: ConnectionId,
@@ -1363,6 +1374,17 @@ impl Router {
                     return Ok(());
                 }
 
+                // A request whose client delivery already ended with
+                // frame_too_large is still running at the module; its frames
+                // are dropped here until its terminal releases the credit.
+                if frame.header.ty != FrameType::Request
+                    && route
+                        .flow
+                        .drop_refused_frame(corr, is_terminal_frame(frame.header.ty))
+                {
+                    return Ok(());
+                }
+
                 // Accounting allows an oversized frame to occupy an empty queue
                 // on other send paths. Refuse it at this splice before admission,
                 // so the next ordinary reply cannot close a multiplexed client.
@@ -1377,15 +1399,13 @@ impl Router {
                         .await;
                 }
 
-                // A terminal frame ends the request at the module whether or not
-                // the client can still take it, so its credit is released before
-                // delivery is attempted. Releasing only after a successful
-                // enqueue would leave a drain counting a finished request until
-                // the client connection's cleanup removes the route.
+                // A terminal frame ends the request at the module. Its credit
+                // is retired once the reply is on the client's queue, or once
+                // the bounded send has failed and the delivery-failure path
+                // below owns settlement, but not while the reply still waits
+                // for room: a restart drain must not report quiescence and
+                // close the route ahead of the final reply.
                 let releases_credit = is_terminal_frame(frame.header.ty);
-                if releases_credit {
-                    route.flow.release_corr(corr);
-                }
                 let mut frame = frame;
                 frame.header.channel = route.client_channel;
                 frame.header.epoch = route.client_epoch;
@@ -1395,40 +1415,43 @@ impl Router {
                 // module may have set is cleared; every other flag bit and
                 // the body travel unchanged.
                 frame.header.flags = frame.header.flags.without_daemon_origin();
-                if let Err(err) = self
+                let delivered = self
                     .counters
                     .observe_reader_wait(
                         || (route.module_id.clone(), principal_label(&route.principal)),
                         "module_to_client",
                         route.client_sink.send_to_client(frame),
                     )
-                    .await
-                {
-                    if self
-                        .forwarding
-                        .escalate_client_delivery_failure_diagnosed(
-                            route.client_connection_id,
-                            route.client_channel,
-                            route.client_epoch,
-                            CloseReason::new(
-                                "module_to_client_delivery_failed",
-                                format!(
-                                    "failed to enqueue module frame for client channel {} corr {corr}: {err}",
-                                    route.client_channel
-                                ),
+                    .await;
+                // On a failure, the credit is retired only after the escalation
+                // has marked the client closing, so a drain cannot see the
+                // request finished before the delivery-failure path owns it.
+                let escalated = match &delivered {
+                    Ok(()) => Ok(false),
+                    Err(err) => self.forwarding.escalate_client_delivery_failure_diagnosed(
+                        route.client_connection_id,
+                        route.client_channel,
+                        route.client_epoch,
+                        CloseReason::new(
+                            "module_to_client_delivery_failed",
+                            format!(
+                                "failed to enqueue module frame for client channel {} corr {corr}: {err}",
+                                route.client_channel
                             ),
-                            UndeliveredFrame {
-                                module_id: Some(&route.module_id),
-                                sink: &route.client_sink,
-                            },
-                            Some(&err.diagnosis),
-                        )
-                        .map_err(RouterError::Forwarding)?
-                    {
-                        self.counters
-                            .increment_client_egress_close_delivery_failed();
-                    }
-                    return Ok(());
+                        ),
+                        UndeliveredFrame {
+                            module_id: Some(&route.module_id),
+                            sink: &route.client_sink,
+                        },
+                        Some(&err.diagnosis),
+                    ),
+                };
+                if releases_credit {
+                    route.flow.release_corr(corr);
+                }
+                if escalated.map_err(RouterError::Forwarding)? {
+                    self.counters
+                        .increment_client_egress_close_delivery_failed();
                 }
                 return Ok(());
             }
@@ -1600,9 +1623,14 @@ impl Router {
             self.observe_connection_wait(ctx, "reply_egress", ctx.egress.send(error))
                 .await?;
         } else {
-            // A refused stream chunk also ends the waiting request. Releasing
-            // its credit prevents a finished request from keeping a drain alive.
-            route.flow.release_corr(corr);
+            let terminal = is_terminal_frame(ty);
+            if !terminal {
+                // A refused stream chunk ends the request for the client only:
+                // the module is still running it, so it keeps its credit, its
+                // later frames are dropped, and the module is asked to stop.
+                route.flow.refuse_client_delivery(corr);
+                self.cancel_refused_module_request(route, corr);
+            }
             let error = frame_too_large_error(
                 route.client_channel,
                 route.client_epoch,
@@ -1612,42 +1640,78 @@ impl Router {
             )?;
             // The replacement shares the reply's bounded burst grace, so a
             // stopped client cannot indefinitely stall the module frame reader.
-            if let Err(err) = self
+            let delivered = self
                 .counters
                 .observe_reader_wait(
                     || (route.module_id.clone(), principal_label(&route.principal)),
                     "module_to_client",
                     route.client_sink.send_to_client(error),
                 )
-                .await
-            {
-                if self
-                    .forwarding
-                    .escalate_client_delivery_failure_diagnosed(
-                        route.client_connection_id,
-                        route.client_channel,
-                        route.client_epoch,
-                        CloseReason::new(
-                            "module_to_client_delivery_failed",
-                            format!(
-                                "failed to enqueue frame_too_large for client channel {} corr {corr}: {err}",
-                                route.client_channel
-                            ),
+                .await;
+            let escalated = match &delivered {
+                Ok(()) => Ok(false),
+                Err(err) => self.forwarding.escalate_client_delivery_failure_diagnosed(
+                    route.client_connection_id,
+                    route.client_channel,
+                    route.client_epoch,
+                    CloseReason::new(
+                        "module_to_client_delivery_failed",
+                        format!(
+                            "failed to enqueue frame_too_large for client channel {} corr {corr}: {err}",
+                            route.client_channel
                         ),
-                        UndeliveredFrame {
-                            module_id: Some(&route.module_id),
-                            sink: &route.client_sink,
-                        },
-                        Some(&err.diagnosis),
-                    )
-                    .map_err(RouterError::Forwarding)?
-                {
-                    self.counters
-                        .increment_client_egress_close_delivery_failed();
-                }
+                    ),
+                    UndeliveredFrame {
+                        module_id: Some(&route.module_id),
+                        sink: &route.client_sink,
+                    },
+                    Some(&err.diagnosis),
+                ),
+            };
+            if terminal {
+                // A refused terminal also ended the request at the module. Its
+                // credit is retired once the replacement is queued, or once
+                // its send has failed and the escalation above owns it, as for
+                // a delivered terminal.
+                route.flow.release_corr(corr);
+            }
+            if escalated.map_err(RouterError::Forwarding)? {
+                self.counters
+                    .increment_client_egress_close_delivery_failed();
             }
         }
         Ok(())
+    }
+
+    /// Ask the module to stop a request whose client delivery was refused. The
+    /// CANCEL is best effort and never waits: the module's own reader must not
+    /// stall on that module's egress, and the request keeps its credit either
+    /// way until the module's terminal arrives.
+    fn cancel_refused_module_request(&self, route: &RouteBinding, corr: u64) {
+        let cancel = Frame::build_with_version(
+            route.module_negotiated_ver,
+            FrameType::Cancel,
+            Flags::new(false, Priority::Passive, false),
+            route.module_channel,
+            route.module_epoch,
+            corr,
+            Vec::new(),
+        );
+        let sent = cancel.map_err(|err| err.to_string()).and_then(|cancel| {
+            route
+                .module_sink
+                .try_send(cancel)
+                .map_err(|err| err.to_string())
+        });
+        if let Err(error) = sent {
+            warn!(
+                module_id = %route.module_id,
+                module_channel = route.module_channel,
+                corr,
+                %error,
+                "could not send CANCEL for a request whose stream chunk was refused as too large"
+            );
+        }
     }
 }
 
@@ -1819,53 +1883,24 @@ impl ForwardBackend {
                     })
                 }
             }
-        } else if acquired_credit {
-            let counters = self.forwarding.counters_ref();
-            if let Err(err) = counters
-                .observe_reader_wait(
-                    || (route.module_id.clone(), principal_label(&route.principal)),
-                    "legacy_credit",
-                    route
-                        .flow
-                        .acquire_tagged(corr, frame.header.flags.is_subscription()),
-                )
-                .await
-            {
-                self.forwarding.warn_frame_drop(
-                    route.client_connection_id,
-                    channel,
-                    frame.header.epoch,
-                    "client_to_module",
-                    "endpoint_gone",
-                );
-                // `module_reloading` here is answered BEFORE the frame is
-                // forwarded, so the module never sees the request and callers
-                // may re-dispatch it after reopening the route. That is a wire
-                // guarantee documented on `error_codes::MODULE_RELOADING`; do
-                // not emit this code for a request that already reached
-                // `module_sink.send` below.
-                if self
-                    .forwarding
-                    .endpoint_is_draining(route.module_endpoint)
-                    .map_err(RouterError::Forwarding)?
-                {
-                    return Err(RouterError::route_error_with_epoch(
-                        channel,
-                        frame.header.epoch,
-                        corr,
-                        "module_reloading",
-                        format!("module endpoint for route channel {channel} is reloading"),
-                    ));
-                }
-                return Err(RouterError::backend_with_epoch(
-                    channel,
-                    frame.header.epoch,
-                    corr,
-                    format!("{err} for route channel {channel}"),
-                ));
-            }
+        } else if !route.flow.busy_refusals() {
+            // A legacy route queues a request that must wait for credit
+            // instead of parking the connection reader on it.
+            return self.offer_to_legacy_route(frame, route).await;
         }
+        self.forward_to_module(frame, &route, acquired_credit).await
+    }
 
+    /// Put a client frame on the module's queue. A frame that holds a request
+    /// credit (`credited`) gives it back if it cannot be queued.
+    async fn forward_to_module(
+        &self,
+        frame: Frame,
+        route: &RouteBinding,
+        credited: bool,
+    ) -> Result<(), RouterError> {
+        let channel = frame.header.channel;
+        let corr = frame.header.corr;
         let mut frame = frame;
         frame.header.channel = route.module_channel;
         frame.header.epoch = route.module_epoch;
@@ -1891,12 +1926,15 @@ impl ForwardBackend {
                 );
                 RouterError::backend_with_epoch(channel, route.client_epoch, corr, err.to_string())
             });
-        if acquired_credit && result.is_err() {
+        if credited && result.is_err() {
             route.flow.release_corr(corr);
         }
         result
     }
 }
+
+#[path = "router_legacy_waiting.rs"]
+mod legacy_waiting;
 
 fn is_terminal_frame(frame_type: FrameType) -> bool {
     matches!(
@@ -3821,6 +3859,24 @@ mod tests {
                 401,
                 limit + 1,
             );
+            if ty == FrameType::StreamData {
+                // The module is still running the request: it keeps its
+                // credit until the module's own terminal, which the client,
+                // already told frame_too_large, never sees.
+                assert_eq!(binding.flow.drain_in_flight(), 1);
+                router
+                    .route_for_connection(
+                        &ctx,
+                        route_frame(
+                            FrameType::StreamEnd,
+                            routes[0].module_channel,
+                            routes[0].module_epoch,
+                            401,
+                        ),
+                    )
+                    .await
+                    .unwrap();
+            }
             assert_eq!(binding.flow.drain_in_flight(), 0, "{ty:?} ends the request");
             assert!(rx.try_recv().is_err());
         }
@@ -4880,5 +4936,10 @@ mod tests {
         let err = router.register_backend(0, EchoBackend).unwrap_err();
 
         assert_eq!(err, RouterError::ReservedChannelZero);
+    }
+
+    mod audit_findings {
+        use super::*;
+        include!("router_audit_tests.rs");
     }
 }

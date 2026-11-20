@@ -1212,9 +1212,13 @@ where
                 };
                 send_result.map_err(ConnectionError::Router)?;
             } else {
+                // Reserved before the hand-off, so a CANCEL the reader handles
+                // next finds this subscription even before it is installed.
+                let reservation = router.reserve_activity_subscription(&ctx, &frame);
                 let task_router = Arc::clone(&router);
                 let task_ctx = ctx.clone();
                 activity_tasks.spawn(async move {
+                    let _reservation = reservation;
                     route_open_tail(task_router, task_ctx, frame, Instant::now(), first).await
                 });
             }
@@ -3230,5 +3234,10 @@ mod tests {
 
         drop(client);
         server.await.unwrap().unwrap();
+    }
+
+    mod audit_findings {
+        use super::*;
+        include!("server_audit_tests.rs");
     }
 }

@@ -341,6 +341,19 @@ struct ScopeBindLease {
     released: std::sync::atomic::AtomicBool,
     presence: Option<Arc<std::sync::atomic::AtomicBool>>,
     served_modules: Arc<std::sync::Mutex<BTreeSet<String>>>,
+    /// The scope's absolute deadline when the bind was admitted, and the wall
+    /// clock the scope table judges expiry by, so the commit can refuse a bind
+    /// that outlived its scope without taking the scope lock again.
+    expires_at_ms: Option<u64>,
+    wall_clock: LeaseWallClock,
+}
+
+struct LeaseWallClock(Arc<dyn Fn() -> u64 + Send + Sync>);
+
+impl std::fmt::Debug for LeaseWallClock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LeaseWallClock")
+    }
 }
 
 impl PartialEq for ScopeBindLease {
@@ -393,6 +406,23 @@ impl BoundScope {
     /// usage at table removal rather than waiting for those snapshots to drop.
     pub(crate) fn release_bind(&self) {
         self._lease.release();
+    }
+
+    /// The refusal for a bind whose scope's absolute deadline has passed by
+    /// the scope table's wall clock, even if no expiry sweep has published
+    /// that yet. It is the refusal an open gets when it arrives after expiry.
+    pub(crate) fn deadline_refusal(&self) -> Option<subc_protocol::ErrorBody> {
+        let deadline = self
+            ._lease
+            .expires_at_ms
+            .filter(|deadline| *deadline <= (self._lease.wall_clock.0)())?;
+        Some(subc_protocol::ErrorBody::new(
+            error_codes::SCOPE_NOT_LIVE,
+            format!(
+                "scope '{}' of {} deadline {deadline} has passed",
+                self.scope_ref, self.owner
+            ),
+        ))
     }
 }
 
@@ -2241,6 +2271,8 @@ impl ScopeTable {
                 released: std::sync::atomic::AtomicBool::new(!counts_for_idle),
                 presence,
                 served_modules: Arc::clone(&held.served_modules),
+                expires_at_ms: held.record.expires_at_ms,
+                wall_clock: LeaseWallClock(Arc::clone(&self.wall_clock)),
             }),
         }
     }

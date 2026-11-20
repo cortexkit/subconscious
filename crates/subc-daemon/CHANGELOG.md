@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.50.22
+
+Fixes from a review of the router and forwarding code:
+
+- Fence an attested opener's route.bind to the target registration admission
+  checked: refuse a reservation on a different registration, and recheck the
+  opener's `must_never_reach` against the current manifests when the target
+  acknowledges, refusing with `capability_forbidden` and a channel-scoped
+  GOODBYE for the module's binding.
+- Spend `route.open`'s absolute relay deadline on its egress waits too. A bind
+  never queued by the deadline is refused with `module_timeout` without charging
+  the target's ack-timeout breaker.
+- Retire a request's drain credit only once its terminal reply is on the
+  client's queue, or its bounded send has failed, so a restart drain no longer
+  sends the route GOODBYE ahead of a final reply.
+- When a module stream chunk is too large for the client, end the request for
+  the client with one `frame_too_large`, drop the module's later frames for it,
+  send the module a CANCEL, and keep the credit until the module's terminal.
+- Reserve an `activity.subscribe` correlation when the reader hands it off, so
+  an immediate CANCEL ends it with one STREAM_END.
+- Refuse a scoped route.bind acknowledged after its scope's deadline with
+  `scope_not_live`, even before the expiry sweep publishes the end.
+- On routes opened without `busy_refusals`, queue a request waiting for credit
+  in a per-route FIFO of 64 frames instead of parking the connection reader. A
+  CANCEL for a waiting request goes directly behind it; other frames bypass the
+  queue when it is empty; the queue's task ends when the route closes.
+- Build a busy refusal's occupancy from exact counters instead of walking every
+  held credit under the flow lock.
+- Accept local Unix socket paths up to the platform's real `sun_path` capacity
+  minus its terminating NUL, so a long run directory no longer drops the local
+  endpoint on Linux.
+
 ## 0.50.21
 
 - Stop ordinary Unix process groups before reaping their leaders, so a stopped,

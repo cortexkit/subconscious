@@ -216,7 +216,8 @@ async fn route_busy_full_ordinary_window_refuses_and_reads_the_next_frame() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn route_busy_unopted_connection_keeps_waiting_and_reports_its_credit_wait() {
+async fn route_busy_unopted_connection_queues_a_waiting_request_and_forwards_it_when_credit_frees()
+{
     let server = TestServer::start().await;
     let mut module = busy_module(&server, "busy-legacy").await;
     let mut client = connect_authed_client(&server.connection_file_path)
@@ -227,6 +228,9 @@ async fn route_busy_unopted_connection_keeps_waiting_and_reports_its_credit_wait
         busy_send(&mut client, route, corr, true).await;
         assert_eq!(read_frame_timeout(&mut module).await.header.corr, corr);
     }
+    // No credit is free: request 133 is queued, neither refused nor
+    // forwarded, and the connection reader goes on to answer the control
+    // request behind it.
     busy_send(&mut client, route, 133, false).await;
     write_frame(
         &mut client,
@@ -235,7 +239,16 @@ async fn route_busy_unopted_connection_keeps_waiting_and_reports_its_credit_wait
     .await
     .unwrap();
     client.flush().await.unwrap();
-    assert_no_frame_within(&mut client, Duration::from_millis(100)).await;
+    let describe = read_frame_timeout_for(&mut client, Duration::from_secs(1)).await;
+    assert_eq!(describe.header.corr, 999, "the reader is not held by 133");
+    assert_no_frame_within(&mut module, Duration::from_millis(100)).await;
+
+    // Only a full queue makes the reader wait: 133 and 134..=196 fill the
+    // route's 64 waiting frames, so the reader waits on 197, and that wait is
+    // reported as the legacy credit wait.
+    for corr in 134..=197 {
+        busy_send(&mut client, route, corr, false).await;
+    }
     let mut inspector = connect_authed_client(&server.connection_file_path)
         .await
         .unwrap();
@@ -261,17 +274,11 @@ async fn route_busy_unopted_connection_keeps_waiting_and_reports_its_credit_wait
     }
     assert_no_frame_within(&mut client, Duration::from_millis(100)).await;
     assert_no_frame_within(&mut module, Duration::from_millis(100)).await;
+
+    // Request 101 ends: its credit forwards the first waiting request.
     busy_terminal(&mut module, route, 101, FrameType::StreamEnd).await;
     assert_eq!(read_frame_timeout(&mut module).await.header.corr, 133);
-    let first = read_frame_timeout(&mut client).await;
-    let second = read_frame_timeout(&mut client).await;
-    let mut corrs = [first.header.corr, second.header.corr];
-    corrs.sort();
-    assert_eq!(
-        corrs,
-        [101, 999],
-        "release unblocks both the queued request and the reader"
-    );
+    assert_eq!(read_frame_timeout(&mut client).await.header.corr, 101);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

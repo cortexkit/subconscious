@@ -184,7 +184,14 @@ pub(crate) struct RouteAuthority {
     pub(crate) incarnation: String,
     /// The opener's spawn and epoch, captured once at admission.
     pub(crate) caller: Option<AuthorityPair>,
+    /// The admitted capability deny check, for an attested opener.
+    pub(crate) capability_fence: Option<CapabilityFence>,
 }
+
+#[path = "forwarding_capability_fence.rs"]
+mod capability_fence;
+use capability_fence::refuse_acked_bind_locked;
+pub(crate) use capability_fence::CapabilityFence;
 
 /// What the reservation found serving the route.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -640,6 +647,8 @@ struct PendingRouteBindRelayEntry {
     /// What served the reserved endpoint, read under the write lock that
     /// reserved it; commit compares a spawn's epoch with `spawn_epochs`.
     target_authority: TargetAuthority,
+    /// Rechecked when the target acknowledges; see `capability_fence`.
+    capability_fence: Option<CapabilityFence>,
     /// The daemon incarnation for the reply's `target` if commit rebuilds it.
     incarnation: String,
     deadline: Instant,
@@ -1605,13 +1614,13 @@ impl ForwardingTable {
         // Reserve egress capacity before taking the forwarding lock. The permit is
         // held until the bind reaches one terminal state, so an accepted bind can
         // publish its table entry and RouteOpen response in one critical section.
-        let client_permit =
-            client_sink
-                .reserve_owned()
-                .await
-                .map_err(|_| ForwardingError::ClientEgressClosed {
-                    connection_id: client_connection_id,
-                })?;
+        // The wait spends the open's relay deadline, like the bind's own send.
+        let client_permit = tokio::time::timeout_at(deadline, client_sink.reserve_owned())
+            .await
+            .map_err(|_| ForwardingError::RelayDeadlineElapsed)?
+            .map_err(|_| ForwardingError::ClientEgressClosed {
+                connection_id: client_connection_id,
+            })?;
         self.begin_route_bind_relay_inner(
             client_connection_id,
             client_sink,
@@ -1899,6 +1908,13 @@ impl ForwardingTable {
                 module_id: expected_module_id.to_string(),
             });
         }
+        if let Some(fence) = authority.capability_fence.as_ref() {
+            if fence.target_connection != module.endpoint.connection_id {
+                return Err(ForwardingError::TargetRegistrationChanged(
+                    fence.registration_changed().message,
+                ));
+            }
+        }
         if inner
             .closing_connections
             .contains(&module.endpoint.connection_id)
@@ -1985,6 +2001,7 @@ impl ForwardingTable {
                 operator_app,
                 caller_authority: authority.caller,
                 target_authority,
+                capability_fence: authority.capability_fence,
                 incarnation: authority.incarnation,
                 deadline,
                 relay_enqueued: false,
@@ -2183,6 +2200,18 @@ impl ForwardingTable {
         corr: u64,
         outcome: RouteBindRelayOutcome,
     ) -> Result<PendingRelayCompletion, ForwardingError> {
+        self.complete_pending_relay_fenced(connection_id, corr, outcome, |_| None)
+    }
+
+    /// Settle a route.bind reply. An accepted bind with a capability fence
+    /// commits only if `fence_refusal` finds nothing wrong with it now.
+    pub(crate) fn complete_pending_relay_fenced(
+        &self,
+        connection_id: ConnectionId,
+        corr: u64,
+        outcome: RouteBindRelayOutcome,
+        fence_refusal: impl FnOnce(&CapabilityFence) -> Option<ErrorBody>,
+    ) -> Result<PendingRelayCompletion, ForwardingError> {
         let mut inner = self.write_inner()?;
         let Some(endpoint) = inner.endpoint_by_connection.get(&connection_id).copied() else {
             return Ok(PendingRelayCompletion {
@@ -2219,6 +2248,16 @@ impl ForwardingTable {
             });
         }
 
+        let fence_refusal = match (&outcome, &pending.capability_fence) {
+            (RouteBindRelayOutcome::Accepted, Some(fence)) => fence_refusal(fence),
+            _ => None,
+        };
+        // Read once: the scope check reads the wall clock, which can step
+        // backwards, so a guard and a body that each read it could disagree.
+        let scope_refusal = match (&outcome, &pending.scope) {
+            (RouteBindRelayOutcome::Accepted, Some(scope)) => scope_refusal_locked(&inner, scope),
+            _ => None,
+        };
         // These readiness reads are not atomic with publication: a route may
         // commit after Dead. Taking a spawn transition lock here would invert
         // the publication lock order. Retirement, in one critical section,
@@ -2338,30 +2377,10 @@ impl ForwardingTable {
             // connection and every other client's routes to it: release the
             // pair, answer the waiting route.open by name, and hand back the
             // module-side channel for one channel-scoped GOODBYE.
-            RouteBindRelayOutcome::Accepted
-                if pending
-                    .scope
-                    .as_ref()
-                    .is_some_and(|scope| scope_refusal_locked(&inner, scope).is_some()) =>
-            {
-                let refusal = pending
-                    .scope
-                    .as_ref()
-                    .and_then(|scope| scope_refusal_locked(&inner, scope))
-                    .expect("guard matched a refusal under the same lock");
-                release_reserved_route_locked(
-                    &mut inner,
-                    pending.reservation.client_key,
-                    pending.reservation.module_key,
-                );
-                let abandoned = abandoned_route_target(&inner, &pending.reservation);
-                let _ = pending
-                    .sender
-                    .send(RouteBindRelayOutcome::DaemonRejected(refusal));
-                return Ok(PendingRelayCompletion {
-                    settled: true,
-                    abandoned,
-                });
+            RouteBindRelayOutcome::Accepted if scope_refusal.is_some() => {
+                let refusal = scope_refusal.expect("guard checked the refusal");
+                let refused = RouteBindRelayOutcome::DaemonRejected(refusal);
+                return Ok(refuse_acked_bind_locked(&mut inner, pending, refused));
             }
             // The caller's or the target's authority changed after the open
             // was attested, so the attestation the module bound on is no
@@ -2373,22 +2392,19 @@ impl ForwardingTable {
                 if authority_stale_locked(&inner, pending.caller_authority.as_ref())
                     || authority_stale_locked(&inner, pending.target_authority.pair()) =>
             {
-                release_reserved_route_locked(
-                    &mut inner,
-                    pending.reservation.client_key,
-                    pending.reservation.module_key,
-                );
-                let abandoned = abandoned_route_target(&inner, &pending.reservation);
-                let _ = pending
-                    .sender
-                    .send(RouteBindRelayOutcome::DaemonRejected(ErrorBody::new(
-                        subc_protocol::error_codes::STALE_AUTHORITY_EPOCH,
-                        "the caller's or target's authority changed while the route was binding",
-                    )));
-                return Ok(PendingRelayCompletion {
-                    settled: true,
-                    abandoned,
-                });
+                let refused = RouteBindRelayOutcome::DaemonRejected(ErrorBody::new(
+                    subc_protocol::error_codes::STALE_AUTHORITY_EPOCH,
+                    "the caller's or target's authority changed while the route was binding",
+                ));
+                return Ok(refuse_acked_bind_locked(&mut inner, pending, refused));
+            }
+            // The opener's capability deny check no longer holds: the target
+            // now provides a capability the opener must never reach, or the
+            // admitted registration is gone. Settled like the arms above.
+            RouteBindRelayOutcome::Accepted if fence_refusal.is_some() => {
+                let refusal = fence_refusal.expect("guard checked the refusal");
+                let refused = RouteBindRelayOutcome::DaemonRejected(refusal);
+                return Ok(refuse_acked_bind_locked(&mut inner, pending, refused));
             }
             RouteBindRelayOutcome::Accepted => {
                 #[cfg(all(test, target_os = "linux"))]
@@ -3959,10 +3975,14 @@ fn endpoint_routes_locked(
     routes
 }
 
-/// Why a bind admitted under `scope` may no longer commit, read from the
-/// published tags: `scope_ended` when the scope is gone or at another epoch,
-/// `scope_changed` (retryable) when only its content moved.
+/// Why a bind admitted under `scope` may no longer commit: its absolute
+/// deadline has passed (whether or not a sweep has published that yet), or,
+/// read from the published tags, `scope_ended` when the scope is gone or at
+/// another epoch, `scope_changed` (retryable) when only its content moved.
 fn scope_refusal_locked(inner: &ForwardingInner, scope: &BoundScope) -> Option<ErrorBody> {
+    if let Some(expired) = scope.deadline_refusal() {
+        return Some(expired);
+    }
     let key = (scope.owner.clone(), scope.scope_ref.clone());
     match inner.scope_tags.get(&key) {
         Some(current) if *current == scope.tag => None,
@@ -4482,13 +4502,19 @@ struct RequestCredit {
     excluded_from_drain: bool,
 }
 
+/// Held credits by correlation, with exact totals kept beside them so a busy
+/// refusal can report the occupancy without walking every held credit.
 #[derive(Debug, Default)]
 struct CreditLedger {
     by_corr: HashMap<u64, Vec<RequestCredit>>,
+    total: usize,
+    subscriptions: usize,
 }
 
 impl CreditLedger {
     fn acquire(&mut self, corr: u64, subscription: bool, watch_credit: bool) {
+        self.total += 1;
+        self.subscriptions += usize::from(subscription);
         self.by_corr.entry(corr).or_default().push(RequestCredit {
             subscription,
             watch_credit,
@@ -4501,6 +4527,10 @@ impl CreditLedger {
         let released = credits.pop();
         if credits.is_empty() {
             self.by_corr.remove(&corr);
+        }
+        if let Some(credit) = &released {
+            self.total -= 1;
+            self.subscriptions -= usize::from(credit.subscription);
         }
         released
     }
@@ -4517,7 +4547,7 @@ impl CreditLedger {
     }
 
     fn in_flight(&self) -> usize {
-        self.by_corr.values().map(Vec::len).sum()
+        self.total
     }
 
     fn drain_in_flight(&self) -> usize {
@@ -4551,7 +4581,20 @@ struct ChannelFlowState {
     closed: bool,
     credits: CreditLedger,
     last_busy_warn: Option<tokio::time::Instant>,
+    /// Requests whose client delivery ended with `frame_too_large` while the
+    /// module may still be running them; see `refused_streams`.
+    refused: std::collections::HashSet<u64>,
+    /// Client frames waiting for this legacy route's credit.
+    waiting: waiting_requests::WaitingRequests,
 }
+
+#[path = "forwarding_refused_streams.rs"]
+mod refused_streams;
+#[path = "forwarding_waiting_requests.rs"]
+mod waiting_requests;
+pub(crate) use waiting_requests::LegacyArrival;
+#[cfg(test)]
+pub(crate) use waiting_requests::WAITING_REQUESTS_PER_ROUTE;
 
 /// Per-channel request-credit accounting shared by the client and module route halves.
 #[derive(Debug)]
@@ -4562,6 +4605,12 @@ pub(crate) struct ChannelFlow {
     watch_sem: Option<Semaphore>,
     watch_window: Option<usize>,
     state: Mutex<ChannelFlowState>,
+    /// How many entries `ChannelFlowState::refused` holds, read without the lock.
+    refused_count: std::sync::atomic::AtomicUsize,
+    /// How many frames wait in `ChannelFlowState::waiting`, and the wake-up
+    /// for a reader waiting for room there.
+    waiting_len: std::sync::atomic::AtomicUsize,
+    waiting_room: tokio::sync::Notify,
 }
 
 impl ChannelFlow {
@@ -4578,6 +4627,9 @@ impl ChannelFlow {
             watch_sem: watch_window.map(Semaphore::new),
             watch_window,
             state: Mutex::new(ChannelFlowState::default()),
+            refused_count: std::sync::atomic::AtomicUsize::new(0),
+            waiting_len: std::sync::atomic::AtomicUsize::new(0),
+            waiting_room: tokio::sync::Notify::new(),
         }
     }
 
@@ -4597,13 +4649,7 @@ impl ChannelFlow {
             RequestAdmission::Busy(subc_protocol::RouteBusyDetail {
                 reason: "no_credit".into(),
                 request_in_flight: state.credits.in_flight(),
-                watch_in_flight: state
-                    .credits
-                    .by_corr
-                    .values()
-                    .flatten()
-                    .filter(|credit| credit.subscription)
-                    .count(),
+                watch_in_flight: state.credits.subscriptions,
                 request_window: self.window,
                 watch_window: self.watch_window,
             })
@@ -4756,6 +4802,8 @@ impl ChannelFlow {
         if let Some(sem) = &self.watch_sem {
             sem.close();
         }
+        // Ends the wait of a task forwarding this route's waiting requests.
+        self.waiting_room.notify_waiters();
     }
 }
 
@@ -4829,6 +4877,11 @@ pub enum ForwardingError {
     ModuleEgressUnavailable {
         connection_id: ConnectionId,
     },
+    /// A capability-fenced bind's admitted target registration was replaced
+    /// before the bind was reserved.
+    TargetRegistrationChanged(String),
+    /// `route.open`'s relay deadline passed before the bind could be reserved.
+    RelayDeadlineElapsed,
     Poisoned,
 }
 
@@ -4883,6 +4936,11 @@ impl fmt::Display for ForwardingError {
                 f,
                 "module connection {} egress is unavailable; HELLO_ACK could not be queued",
                 connection_id.get()
+            ),
+            Self::TargetRegistrationChanged(message) => write!(f, "{message}"),
+            Self::RelayDeadlineElapsed => write!(
+                f,
+                "the route.bind relay deadline passed while waiting for client egress"
             ),
             Self::Poisoned => write!(f, "forwarding table lock was poisoned"),
         }
@@ -6369,6 +6427,16 @@ mod tests {
         // left to protect for this id.
         forwarding.cleanup_connection(client).unwrap();
         assert_eq!(forwarding.closing_connection_count().unwrap(), 0);
+    }
+
+    mod audit_measurements {
+        use super::*;
+        include!("forwarding_audit_measurements.rs");
+    }
+
+    mod waiting_requests {
+        use super::*;
+        include!("forwarding_waiting_requests_tests.rs");
     }
 }
 

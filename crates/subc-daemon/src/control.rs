@@ -169,9 +169,12 @@ mod config_gate;
 #[path = "operator_apps/connection.rs"]
 mod peer_identity;
 use caller_attestation::{caller_for_target, scope_acts_for_another};
+mod activity_reservations;
 #[cfg(all(test, unix, feature = "test-support"))]
 #[path = "control/caller_attestation_tests.rs"]
 mod caller_attestation_tests;
+mod capability_census;
+mod route_bind_settlement;
 mod scope_expiry;
 mod scope_watch;
 mod usage;
@@ -480,6 +483,7 @@ pub struct ControlHandler {
     config_review_admission_is_default: bool,
     activity: Option<crate::activity::ActivityLedger>,
     activity_streams: Arc<Mutex<HashMap<(ConnectionId, u64), tokio::task::AbortHandle>>>,
+    activity_reservations: activity_reservations::ActivityReservations,
     catalog_streams: Arc<Mutex<HashMap<(ConnectionId, u64), tokio::task::AbortHandle>>>,
     config_settings_streams: Arc<Mutex<HashMap<(ConnectionId, u64), tokio::task::AbortHandle>>>,
     scope_streams: Arc<Mutex<HashMap<(ConnectionId, u64), tokio::task::AbortHandle>>>,
@@ -1179,6 +1183,7 @@ impl ControlHandler {
             config_review_admission_is_default: true,
             activity: None,
             activity_streams: Arc::new(Mutex::new(HashMap::new())),
+            activity_reservations: Default::default(),
             catalog_streams: Arc::new(Mutex::new(HashMap::new())),
             config_settings_streams: Arc::new(Mutex::new(HashMap::new())),
             scope_streams: Arc::new(Mutex::new(HashMap::new())),
@@ -1772,106 +1777,6 @@ impl ControlHandler {
                 log_requirement_events(events, &self.daemon_shutdown);
             }
             Err(err) => warn!(error = %err, "failed to recompute capability requirements"),
-        }
-    }
-
-    /// Reconcile only live, attested route bindings after a capability deny edge
-    /// or target claim was added. This is deliberately a control-plane census:
-    /// the opaque forwarding hot path must not grow a per-frame capability check.
-    fn enforce_capability_denies(&self) {
-        let registrations = match self.registry.list_registered_modules() {
-            Ok(snapshot) => snapshot,
-            Err(err) => {
-                warn!(error = %err, "failed to read registrations for capability deny census");
-                return;
-            }
-        };
-        let manifests = registrations
-            .into_iter()
-            .map(|registration| {
-                (
-                    registration.manifest.module_id.clone(),
-                    registration.manifest,
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        let census = match self.forwarding.route_census(None) {
-            Ok(census) => census,
-            Err(err) => {
-                warn!(error = %err, "failed to read route census for capability deny enforcement");
-                return;
-            }
-        };
-
-        for (target_module_id, routes) in census {
-            let Some(target_manifest) = manifests.get(&target_module_id) else {
-                continue;
-            };
-            let mut closed_routes = Vec::new();
-            let mut goodbyes = Vec::new();
-            for route in routes {
-                let Principal::Reserved {
-                    module_id: opening_module_id,
-                } = &route.principal
-                else {
-                    continue;
-                };
-                let Some(opening_manifest) = manifests.get(opening_module_id) else {
-                    continue;
-                };
-                let Some(capability) = denied_capability(
-                    opening_manifest.capabilities.as_ref(),
-                    target_manifest.capabilities.as_ref(),
-                ) else {
-                    continue;
-                };
-
-                match self.forwarding.release_client_route(
-                    route.goodbye_target.connection_id,
-                    route.goodbye_target.channel,
-                    route.goodbye_target.epoch,
-                ) {
-                    Ok(RouteRelease::Removed(module_goodbye)) => {
-                        warn!(
-                            opening_module_id,
-                            target_module_id,
-                            capability,
-                            "force-closing route because an attested capability deny edge now matches"
-                        );
-                        goodbyes.push(module_goodbye);
-                        goodbyes.push(route.goodbye_target.clone());
-                        closed_routes.push(route);
-                    }
-                    Ok(RouteRelease::Stale | RouteRelease::Absent) => {}
-                    Err(err) => warn!(
-                        opening_module_id,
-                        target_module_id,
-                        capability,
-                        error = %err,
-                        "failed to force-close capability-denied route"
-                    ),
-                }
-            }
-
-            if closed_routes.is_empty() {
-                continue;
-            }
-            send_route_control_pushes(
-                &self.forwarding,
-                closed_routes,
-                ClientControlPush::RouteClosed {
-                    module_id: target_module_id,
-                    channels: Vec::new(),
-                    reason: RouteCloseReason::CapabilityDenied,
-                    drained: false,
-                    abandoned: 0,
-                    excluded_subscriptions: 0,
-                    terminal: Some(false),
-                },
-            );
-            // route.closed records the reason; the route GOODBYE ends the
-            // client's handle and settles any calls still pending on it.
-            self.emit_route_goodbyes(goodbyes);
         }
     }
 
@@ -2583,7 +2488,10 @@ impl ControlHandler {
                 if op.as_ref().is_some_and(|probe| {
                     probe.op == ops::ACTIVITY_QUERY || probe.op == ops::ACTIVITY_SUBSCRIBE
                 }) {
-                    return self.handle_activity_read(ctx, frame).await;
+                    // A refusal and a CANCEL that won must not both end the stream.
+                    let key = (ctx.connection_id, frame.header.corr);
+                    let replies = self.handle_activity_read(ctx, frame).await?;
+                    return Ok(self.activity_reservations.settle(key, replies));
                 }
                 if op
                     .as_ref()
@@ -5418,15 +5326,19 @@ impl ControlHandler {
         ctx: &RouteCtx,
         frame: &Frame,
     ) -> Result<bool, RouterError> {
-        let task = self
+        let key = (ctx.connection_id, frame.header.corr);
+        let mut streams = self
             .activity_streams
             .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&(ctx.connection_id, frame.header.corr));
-        let Some(task) = task else {
-            return Ok(false);
-        };
-        task.abort();
+            .unwrap_or_else(|p| p.into_inner());
+        // A subscription still being set up is cancelled through the
+        // reservation the reader made, under the same stream lock.
+        match streams.remove(&key) {
+            Some(task) => task.abort(),
+            None if self.activity_reservations.cancel(key) => {}
+            None => return Ok(false),
+        }
+        drop(streams);
         let end = Frame::build_with_version(
             response_version(frame),
             FrameType::StreamEnd,
@@ -5584,6 +5496,9 @@ impl ControlHandler {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         streams.retain(|_, task| !task.is_finished());
+        if self.activity_reservations.cancelled(key) {
+            return Ok(Vec::new()); // Its CANCEL already sent STREAM_END.
+        }
         if streams.get(&key).is_some_and(|task| !task.is_finished()) {
             return Ok(vec![control_error_frame(
                 &frame,
@@ -6811,8 +6726,8 @@ impl ControlHandler {
         // This is attested, control-plane policy for supervised module origins.
         // Keep it before route reservation and out of the opaque forwarding hot
         // path: data frames must never acquire a per-frame capability check.
-        if let Some(opening_registration) = self.caller_registration(&attested, &admission_registry)
-        {
+        let opening_registration = self.caller_registration(&attested, &admission_registry);
+        if let Some(opening_registration) = &opening_registration {
             let opening_module_id = opening_registration.module_id.as_str();
             if let Some(capability) = denied_capability(
                 opening_registration.capabilities.as_ref(),
@@ -7058,6 +6973,10 @@ impl ControlHandler {
                     caller: caller_capture
                         .as_ref()
                         .map(|caller| caller.authority.pair()),
+                    capability_fence: route_bind_settlement::fence(
+                        &opening_registration,
+                        registration,
+                    ),
                 },
                 relay_deadline,
                 busy_refusals == Some(true),
@@ -7311,8 +7230,21 @@ impl ControlHandler {
         .map_err(RouterError::FrameBuild)?;
 
         timings.enter(RouteOpenPhase::BindSend);
-        let sent = module_sink.send(relay_frame).await;
+        // Enqueueing the bind spends the same absolute budget as its ack.
+        let sent = timeout_at(relay_deadline, module_sink.send(relay_frame)).await;
         timings.enter(RouteOpenPhase::Admission);
+        let Ok(sent) = sent else {
+            // Never enqueued: the module's queue, not its bind handler, was
+            // slow, so the ack-timeout breaker is not charged.
+            reservation.release_and_disarm();
+            breaker.record_inconclusive();
+            return Ok(vec![self.unsent_bind_timeout_refusal(
+                ctx,
+                &caller,
+                &frame,
+                &target_module_id,
+            )?]);
+        };
         if let Err(err) = sent {
             reservation.release_and_disarm();
             return Ok(vec![self.route_open_refusal_frame(
@@ -9645,9 +9577,7 @@ impl ControlHandler {
             }
         };
 
-        let settled =
-            self.forwarding
-                .complete_pending_relay(connection_id, frame.header.corr, outcome);
+        let settled = self.settle_route_bind_relay(connection_id, frame.header.corr, outcome);
         let completion = match settled {
             Ok(completion) => completion,
             Err(err) => {
@@ -10515,6 +10445,8 @@ fn forwarding_error_code(err: &ForwardingError) -> &'static str {
         // Only a swap candidate's registration can produce this, and it means
         // exactly what a second active HELLO for a live id means.
         ForwardingError::CandidateSlotOccupied { .. } => "duplicate_module_id",
+        ForwardingError::TargetRegistrationChanged(_) => "capability_forbidden",
+        ForwardingError::RelayDeadlineElapsed => "module_timeout",
         ForwardingError::RelayCorrelationExhausted
         | ForwardingError::RouteOpenBuild(_)
         | ForwardingError::Poisoned => "forwarding_error",
@@ -10686,6 +10618,10 @@ mod tests {
     include!("control/supervisor_health_vectors_tests.rs");
     include!("control/resource_revision_tests.rs");
     include!("control/route_open_recovery_tests.rs");
+    mod router_audit {
+        use super::*;
+        include!("control/router_audit_tests.rs");
+    }
     #[tokio::test]
     async fn route_busy_wait_attribution_resolves_targets_instead_of_trusting_selectors() {
         let registry = Arc::new(Registry::default());
@@ -20207,6 +20143,10 @@ mod tests {
         }
         mod call_modes {
             include!("scope_call_mode_tests.rs");
+        }
+        mod router_audit {
+            use super::*;
+            include!("control/router_audit_scope_tests.rs");
         }
         mod federated {
             include!("scope_federated_tests.rs");

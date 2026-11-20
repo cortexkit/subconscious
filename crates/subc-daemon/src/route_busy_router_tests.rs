@@ -233,7 +233,21 @@ async fn route_busy_legacy_credit_wait_stays_pending_and_is_logged_and_counted()
             .unwrap();
         busy_router_receive(&mut rig.module_rx).await;
     }
-    let request = busy_router_request(&rig, 33, false);
+    // A request that must wait for credit is queued, not refused, and the
+    // reader goes on at once; only a full queue makes the reader wait.
+    let waiting = crate::forwarding::WAITING_REQUESTS_PER_ROUTE as u64;
+    for corr in 33..33 + waiting {
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            rig.router
+                .route_for_connection(&rig.client, busy_router_request(&rig, corr, false)),
+        )
+        .await
+        .expect("a waiting legacy request is queued without holding the reader")
+        .unwrap();
+    }
+    assert!(rig.module_rx.try_recv().is_err(), "no credit, nothing forwarded");
+    let request = busy_router_request(&rig, 33 + waiting, false);
     let router = Arc::clone(&rig.router);
     let client = rig.client.clone();
     let pending = tokio::spawn(async move { router.route_for_connection(&client, request).await });

@@ -192,6 +192,28 @@ pub struct Registry {
     next_lock_attempt: Mutex<Option<std::sync::mpsc::Sender<bool>>>,
 }
 
+/// Registrations as of a held registry lock; see
+/// [`Registry::with_registrations_locked`].
+pub(crate) struct RegistrationView<'a>(&'a RegistryInner);
+
+impl RegistrationView<'_> {
+    /// The active registration for `module_id`.
+    pub(crate) fn active(&self, module_id: &str) -> Option<&ModuleRegistration> {
+        self.0.modules.get(module_id)
+    }
+
+    /// The registration `connection_id` holds, in whichever slot: active, swap
+    /// candidate, or a superseded incumbent that is still draining.
+    pub(crate) fn by_connection(&self, connection_id: ConnectionId) -> Option<&ModuleRegistration> {
+        self.0
+            .modules
+            .values()
+            .chain(self.0.candidates.values())
+            .chain(self.0.superseded.iter())
+            .find(|registration| registration.connection_id == connection_id)
+    }
+}
+
 #[derive(Debug, Default)]
 struct RegistryInner {
     admission_cache: Option<Arc<RouteAdmissionSnapshot>>,
@@ -507,6 +529,19 @@ impl Registry {
     pub fn publish_registration(&self, connection_id: ConnectionId) -> Result<bool, RegistryError> {
         let mut inner = self.lock_inner()?;
         Ok(inner.publish_registration(connection_id))
+    }
+
+    /// Run `settle` with the registry lock held, reading registrations through
+    /// the view it is given. A capability-fenced route.bind settles inside this
+    /// so a concurrent manifest change lands wholly before or after it. The
+    /// lock order is Registry -> ForwardingTable::inner: `settle` may take
+    /// forwarding's lock, but must not re-enter the registry.
+    pub(crate) fn with_registrations_locked<R>(
+        &self,
+        settle: impl FnOnce(&RegistrationView<'_>) -> R,
+    ) -> Result<R, RegistryError> {
+        let inner = self.lock_inner()?;
+        Ok(settle(&RegistrationView(&inner)))
     }
 
     /// Install forwarding and publish without letting a registry reader observe

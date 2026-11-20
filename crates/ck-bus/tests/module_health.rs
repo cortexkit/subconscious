@@ -104,6 +104,7 @@ async fn start(
     side: impl FnOnce(&TrustChain) -> ClaustrumSide<'static>,
     prepare: impl FnOnce(&Path),
 ) -> Option<Plane> {
+    harness::require_sentinel_test_support();
     let arm_started = Instant::now();
     let bin = match nats_server_bin() {
         Ok((bin, _)) => bin,

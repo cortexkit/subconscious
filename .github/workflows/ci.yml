@@ -309,6 +309,7 @@ jobs:
       - name: Test
         if: ${{ !cancelled() }}
         timeout-minutes: 60
+        # The workspace gate enables ck-bus/test-support for its integration tests.
         run: bash scripts/gate.sh test workspace
 
       # Root can create cgroup v2 directories under /sys/fs/cgroup; require these tests so they cannot skip in CI.

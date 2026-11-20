@@ -116,8 +116,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let credentials = Arc::new(credentials::Credentials::supervised()?);
 
-    let sentinel_period_ms = positive_env_ms("CKBUS_SENTINEL_PERIOD_MS", SENTINEL_PERIOD_MS)?;
-    let sentinel_timeout_ms = positive_env_ms("CKBUS_SENTINEL_TIMEOUT_MS", SENTINEL_TIMEOUT_MS)?;
+    let (sentinel_period_ms, sentinel_timeout_ms) = (SENTINEL_PERIOD_MS, SENTINEL_TIMEOUT_MS);
+    #[cfg(feature = "test-support")]
+    let (sentinel_period_ms, sentinel_timeout_ms) = (
+        positive_env_ms("CKBUS_SENTINEL_PERIOD_MS", sentinel_period_ms)?,
+        positive_env_ms("CKBUS_SENTINEL_TIMEOUT_MS", sentinel_timeout_ms)?,
+    );
     let incarnation = process_incarnation();
     let bootstrap = bootstrap::Bootstrap::new(
         bootstrap::BootDeps {
@@ -246,6 +250,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     Ok(())
 }
 
+#[cfg(feature = "test-support")]
 fn positive_env_ms(name: &str, default: u64) -> Result<u64, Box<dyn Error + Send + Sync>> {
     let Some(raw) = env::var_os(name) else {
         return Ok(default);

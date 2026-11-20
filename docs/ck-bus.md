@@ -89,6 +89,9 @@ Repository and dependencies.
   `Running tests/<file>.rs` line and at least one listed test name under it. A target
   with zero listed tests fails. A build with no `Running tests/` line for a landed
   target is never reported green.
+- Run the ck-bus suite with `cargo test -p ck-bus --features test-support --no-fail-fast`.
+  The feature lets integration tests set sentinel timings in the ck-bus binary they
+  launch; ordinary builds ignore those environment variables.
 - Unix scope is Linux and macOS. `a1-signal-unix-only` records one condition, a
   non-unix host (Windows), where the A1 rows assert nothing. No row is restricted to
   Linux. The argv read is the portable `ps -ww -o args= -p <pid>`.
@@ -565,8 +568,8 @@ Ownership of acts.
   through the server, period 10 s, timeout 2 s. Three failures report down (`Message bus is down.`).
   A permissions violation on its own sentinel or inbox subjects within the period wins
   over the requester's timeout. These are the shipped defaults, with no operator-facing
-  key. The test seam is `CKBUS_SENTINEL_PERIOD_MS` and `CKBUS_SENTINEL_TIMEOUT_MS`,
-  set by the harness renderer in the `ckbus` block's `env` list (slice 0). At start the
+  key. The harness sets `CKBUS_SENTINEL_PERIOD_MS` and `CKBUS_SENTINEL_TIMEOUT_MS`
+  in the `ckbus` block's `env` list; only `test-support` builds read them. At start the
   module emits exactly one structured log line carrying `sentinel_period_ms`,
   `sentinel_timeout_ms` and its incarnation id. Every arm computing `3 * period +
   timeout` parses that line and fails when it is absent. The harness sets 1000 ms and

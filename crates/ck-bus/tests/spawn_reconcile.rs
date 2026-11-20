@@ -221,6 +221,7 @@ impl Run {
 }
 
 async fn start(with_participant: bool) -> Option<Run> {
+    harness::require_sentinel_test_support();
     let bin = match nats_server_bin() {
         Ok((bin, _)) => bin,
         Err((gate, observation)) => {

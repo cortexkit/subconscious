@@ -15,6 +15,9 @@ path = "src/main.rs"
 name = "hub_module_issuance"
 path = "tests/hub-module-rig/issued.rs"
 
+[features]
+test-support = []
+
 [dependencies]
 # ck-bus's own broker connections (system and box users) and stream creation.
 async-nats = "0.50"

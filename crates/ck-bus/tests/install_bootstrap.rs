@@ -109,6 +109,7 @@ struct Plane {
 
 /// Starts the server and a supervised ck-bus whose `claustrum` is `side`.
 async fn start(side: impl FnOnce(&TrustChain) -> ClaustrumSide<'static>) -> Option<Plane> {
+    harness::require_sentinel_test_support();
     let bin = server_bin()?;
     let trust = TrustChain::generate();
     let root = SignerRun::tree();

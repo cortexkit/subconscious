@@ -14,6 +14,11 @@ use std::sync::Once;
 static ACCEPTANCE_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static TRACING: Once = Once::new();
 
+pub fn require_sentinel_test_support() {
+    #[cfg(not(feature = "test-support"))]
+    panic!("this test requires `cargo test -p ck-bus --features test-support`");
+}
+
 pub async fn acceptance_gate() -> tokio::sync::MutexGuard<'static, ()> {
     // Prepare the macOS launcher before an arm starts measuring live-server
     // latency: a cold Cargo build is setup, not daemon or broker response time.

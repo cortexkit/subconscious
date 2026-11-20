@@ -266,7 +266,8 @@ test_check() {
       # Daemon tests launch feature-gated fixtures from both packages. Cargo's
       # test scheduling does not guarantee those binaries exist before a test.
       step 'Build helper binaries (test-support)' cargo build --locked -p subc-core -p subc-daemon --bins --features subc-core/test-support,subc-daemon/test-support
-      step 'Whole-workspace tests (except the daemon)' cargo test --workspace --exclude subc-daemon --all-targets --locked --no-fail-fast
+      # ck-bus integration tests shorten sentinel timings in the spawned binary.
+      step 'Whole-workspace tests (except the daemon)' cargo test --workspace --exclude subc-daemon --all-targets --locked --no-fail-fast --features ck-bus/test-support
       # The config gate's approval tests approve settings changes from a desktop
       # app the daemon can't verify, which the daemon accepts only when built
       # with dev-desktop-approval (release daemons never are). Turning the

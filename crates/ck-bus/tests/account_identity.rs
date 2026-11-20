@@ -125,6 +125,7 @@ async fn start_run(
     server: &BusServer,
     machine_id: &str,
 ) -> SignerRun {
+    harness::require_sentinel_test_support();
     let mut env = server.ckbus_env();
     env.push(("CKBUS_SENTINEL_PERIOD_MS".to_string(), "500".to_string()));
     SignerRun::start_with(

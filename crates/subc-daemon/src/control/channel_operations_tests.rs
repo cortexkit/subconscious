@@ -839,7 +839,9 @@ async fn channel_operations_busy_launch_record_is_retryable_for_the_serving_spaw
     let holder = std::thread::spawn(move || {
         held.with_resource_snapshot_locked_for_test(|| {
             locked.send(()).unwrap();
-            let _ = wait_release.recv_timeout(Duration::from_secs(5));
+            // Hold the lock until the test releases it, however slow the run.
+            // A panic drops the sender, which ends this wait too.
+            let _ = wait_release.recv();
         })
     });
     wait_locked.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -1219,7 +1221,9 @@ async fn channel_operations_busy_launch_read_after_admission_is_retryable() {
     let holder = std::thread::spawn(move || {
         held.with_resource_snapshot_locked_for_test(|| {
             locked.send(()).unwrap();
-            let _ = wait_unlock.recv_timeout(Duration::from_secs(5));
+            // Hold the lock until the test releases it, however slow the run.
+            // A panic drops the sender, which ends this wait too.
+            let _ = wait_unlock.recv();
         })
     });
     wait_locked.recv_timeout(Duration::from_secs(5)).unwrap();

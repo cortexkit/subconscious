@@ -208,7 +208,16 @@ impl ConfigGate {
     fn pending_file_plan(&self, module: &str) -> Option<Digest> {
         self.plans
             .values()
-            .filter(|plan| plan.edits.is_none() && plan.modules.contains(module))
+            .filter(|plan| {
+                plan.edits.is_none()
+                    && plan.modules.contains(module)
+                    && plan.targets().is_ok_and(|targets| {
+                        targets
+                            .iter()
+                            .any(|tuple| tuple.module == module && tuple.project.is_none())
+                            || !targets.iter().any(|tuple| tuple.module == module)
+                    })
+            })
             .max_by_key(|plan| plan.creation_sequence)
             .map(|plan| plan.view.digest.clone())
     }

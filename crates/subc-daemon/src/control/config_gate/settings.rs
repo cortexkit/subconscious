@@ -34,7 +34,11 @@ fn watch_refusal(
 
 #[derive(Default)]
 struct SettingsFileGrace {
-    pending: BTreeMap<String, (ConfigFileError, tokio::time::Instant)>,
+    pending: BTreeMap<(String, Option<String>), (ConfigFileError, tokio::time::Instant)>,
+}
+
+fn row_key(row: &ConfigModule) -> (&str, Option<&str>) {
+    (&row.module_id, row.project_id.as_deref())
 }
 
 impl SettingsFileGrace {
@@ -44,9 +48,10 @@ impl SettingsFileGrace {
         rows: &mut [ConfigModule],
         now: tokio::time::Instant,
     ) {
-        self.pending.retain(|module, _| {
-            rows.iter()
-                .any(|row| &row.module_id == module && row.file_error.is_some())
+        self.pending.retain(|(module, project), _| {
+            rows.iter().any(|row| {
+                row_key(row) == (module.as_str(), project.as_deref()) && row.file_error.is_some()
+            })
         });
         for row in rows {
             let Some(error) = row.file_error.clone() else {
@@ -54,7 +59,7 @@ impl SettingsFileGrace {
             };
             let candidate = self
                 .pending
-                .entry(row.module_id.clone())
+                .entry((row.module_id.clone(), row.project_id.clone()))
                 .or_insert((error.clone(), now));
             if candidate.0 != error {
                 *candidate = (error, now);
@@ -64,7 +69,7 @@ impl SettingsFileGrace {
             if now.duration_since(candidate.1)
                 < crate::config_gate::runtime::unstamped::USER_FILE_POLL_INTERVAL
             {
-                if let Some(old) = previous.iter().find(|old| old.module_id == row.module_id) {
+                if let Some(old) = previous.iter().find(|old| row_key(old) == row_key(row)) {
                     *row = old.clone();
                 } else {
                     row.file_error = None;
@@ -89,6 +94,7 @@ impl ControlHandler {
         frame: Frame,
         runtime: Arc<crate::config_gate::runtime::RuntimeOwner>,
         modules: Option<Vec<String>>,
+        projects: bool,
     ) -> Result<Vec<Frame>, RouterError> {
         let key = (ctx.connection_id, frame.header.corr);
         {
@@ -108,8 +114,11 @@ impl ControlHandler {
             .map_err(|error| RouterError::backend(0, frame.header.corr, error.to_string()))?;
         let mut settings_version = *changes.borrow_and_update();
         let mut catalog_version = *catalog.borrow_and_update();
+        if projects {
+            let _ = runtime.refresh_settings_projects(true).await;
+        }
         let mut initial = match self
-            .config_settings_initial_rows(runtime.clone(), &modules)
+            .config_settings_initial_rows(runtime.clone(), &modules, projects)
             .await
         {
             Ok(initial) => initial,
@@ -122,8 +131,11 @@ impl ControlHandler {
         if settling {
             tokio::time::sleep(crate::config_gate::runtime::unstamped::USER_FILE_POLL_INTERVAL)
                 .await;
+            if projects {
+                let _ = runtime.refresh_settings_projects(true).await;
+            }
             initial = match self
-                .config_settings_initial_rows(runtime.clone(), &modules)
+                .config_settings_initial_rows(runtime.clone(), &modules, projects)
                 .await
             {
                 Ok(rows) => rows,
@@ -177,17 +189,24 @@ impl ControlHandler {
             poll.tick().await;
             let mut retry_capture = false;
             let mut next_capture = None;
+            let project_interval = crate::config_gate::runtime::unstamped::USER_FILE_POLL_INTERVAL;
+            let mut next_project_capture = tokio::time::Instant::now() + project_interval;
             loop {
                 tokio::select! {
                     result = changes.changed(), if !retry_capture => if result.is_err() { return; },
                     result = catalog.changed(), if !retry_capture => if result.is_err() { return; },
                     _ = poll.tick() => {},
+                    _ = tokio::time::sleep_until(next_project_capture), if projects => {},
                 }
                 if let Some(at) = next_capture {
                     tokio::time::sleep_until(at).await;
                 }
                 if sink.is_closed() {
                     return;
+                }
+                if projects && tokio::time::Instant::now() >= next_project_capture {
+                    let _ = runtime.refresh_settings_projects(true).await;
+                    next_project_capture = tokio::time::Instant::now() + project_interval;
                 }
                 // Coalesce both change sources before reading. Changes during
                 // the capture remain unread for the next pass.
@@ -202,7 +221,7 @@ impl ControlHandler {
                 next_capture = Some(tokio::time::Instant::now() + SETTINGS_CAPTURE_SPACING);
                 let next = if changed {
                     handler
-                        .config_settings_rows(runtime.clone(), &modules)
+                        .config_settings_rows(runtime.clone(), &modules, projects)
                         .await
                 } else {
                     let probe = Arc::clone(&files);
@@ -213,7 +232,7 @@ impl ControlHandler {
                         Ok(false) => Ok(Some((latest.clone(), stamped, Arc::clone(&files)))),
                         Ok(true) => {
                             handler
-                                .config_settings_rows(runtime.clone(), &modules)
+                                .config_settings_rows(runtime.clone(), &modules, projects)
                                 .await
                         }
                         Err(error) => Err(error),
@@ -271,8 +290,12 @@ impl ControlHandler {
         &self,
         runtime: Arc<crate::config_gate::runtime::RuntimeOwner>,
         filter: &Option<Vec<String>>,
+        projects: bool,
     ) -> std::result::Result<SettingsRows, GateError> {
-        let error = match self.config_settings_rows(runtime.clone(), filter).await {
+        let error = match self
+            .config_settings_rows(runtime.clone(), filter, projects)
+            .await
+        {
             Ok(Some(rows)) => return Ok(rows),
             Ok(None) => GateError::capture_race(),
             Err(error) if error.is_capture_race() => error,
@@ -285,7 +308,10 @@ impl ControlHandler {
             let mut last = error;
             for delay in [50, 100, 200] {
                 tokio::time::sleep(Duration::from_millis(delay)).await;
-                match self.config_settings_rows(runtime.clone(), filter).await {
+                match self
+                    .config_settings_rows(runtime.clone(), filter, projects)
+                    .await
+                {
                     Ok(Some(rows)) => return Ok(rows),
                     Ok(None) => last = GateError::capture_race(),
                     Err(error) if error.is_capture_race() => last = error,
@@ -302,11 +328,12 @@ impl ControlHandler {
         &self,
         runtime: Arc<crate::config_gate::runtime::RuntimeOwner>,
         filter: &Option<Vec<String>>,
+        projects: bool,
     ) -> std::result::Result<Option<SettingsRows>, GateError> {
         let known = self.config_settings_known_modules()?;
         let response = runtime
             .on_blocking(move |owner| {
-                let response = owner.observe_settings(known, true);
+                let response = owner.observe_settings_rows(known, true, projects);
                 #[cfg(test)]
                 if let Some(hook) = owner.settings_observation_hook.lock().unwrap().as_mut() {
                     hook();
@@ -369,11 +396,12 @@ fn settings_events(
     rows: &[ConfigModule],
     next_stamped: bool,
 ) -> Vec<ConfigWatchEvent> {
+    let previous_by_key: BTreeMap<_, _> = previous.iter().map(|row| (row_key(row), row)).collect();
     if stamped != next_stamped
         || previous.len() != rows.len()
-        || previous
+        || rows
             .iter()
-            .any(|old| !rows.iter().any(|row| row.module_id == old.module_id))
+            .any(|row| !previous_by_key.contains_key(&row_key(row)))
     {
         return vec![ConfigWatchEvent::Resync {
             modules: rows.to_vec(),
@@ -382,9 +410,8 @@ fn settings_events(
     }
     rows.iter()
         .filter(|row| {
-            previous
-                .iter()
-                .find(|old| old.module_id == row.module_id)
+            previous_by_key
+                .get(&row_key(row))
                 .is_none_or(|old| ConfigWatchEvent::change(old) != ConfigWatchEvent::change(row))
         })
         .map(ConfigWatchEvent::change)

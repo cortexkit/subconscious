@@ -201,7 +201,7 @@ fn config_settings_file_error_is_per_module_and_does_not_relax_planning() {
     assert!(healthy.file_error.is_none());
     let shown = serde_json::to_value(
         rig.owner
-            .settings_show(BTreeSet::new(), "sample-extra".into(), None, None)
+            .settings_show(BTreeSet::new(), "sample-extra".into(), None)
             .unwrap(),
     )
     .unwrap();
@@ -390,7 +390,7 @@ impl SettingsRig {
     fn show(&self, through: Option<ConfigThrough>) -> Value {
         serde_json::to_value(
             self.owner
-                .settings_show(BTreeSet::new(), "sample-reader".into(), None, through)
+                .settings_show(BTreeSet::new(), "sample-reader".into(), through)
                 .unwrap(),
         )
         .unwrap()
@@ -547,24 +547,12 @@ fn config_settings_schema_annotations_titles_ungated_and_refusals() {
         );
         assert_eq!(
             rig.owner
-                .settings_show(known, module.into(), None, None)
+                .settings_show(known, module.into(), None)
                 .unwrap_err()
                 .code,
             code
         );
     }
-    assert_eq!(
-        rig.owner
-            .settings_show(
-                BTreeSet::new(),
-                "sample-reader".into(),
-                Some("unknown-project".into()),
-                None
-            )
-            .unwrap_err()
-            .code,
-        "unknown_project"
-    );
     rig.declare("sample-untitled", 11, false);
     assert!(
         !serde_json::to_string(&rig.owner.settings_modules(BTreeSet::new()).unwrap())
@@ -652,7 +640,7 @@ fn config_settings_failed_delivery_reason_and_missing_approved_view() {
     rig.declare("sample-unapproved", 11, false);
     assert_eq!(
         rig.owner
-            .settings_show(BTreeSet::new(), "sample-unapproved".into(), None, None)
+            .settings_show(BTreeSet::new(), "sample-unapproved".into(), None)
             .unwrap_err()
             .code,
         "config_gated"

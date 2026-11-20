@@ -161,7 +161,7 @@ async fn config_settings_handler_refusals_and_capability_gate() {
         ),
         (
             json!({"op":"config.show","module_id":"sample-reader","project_id":"unknown"}),
-            "unknown_project",
+            "invalid_params",
         ),
         (
             json!({"op":"config.show","module_id":"sample-reader","through":"project"}),

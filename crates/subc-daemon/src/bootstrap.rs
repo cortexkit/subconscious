@@ -1236,6 +1236,7 @@ async fn serve_bound_daemon(
                     },
                 )
                 .with_policy_root_data(daemon_config::default_data_home().join("cortexkit"))
+                .enable_project_settings()
                 .retain_writer_lock(writer_lock)
                 .map_err(io::Error::other)
             })

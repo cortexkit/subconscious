@@ -194,6 +194,11 @@ fn load_view(
 }
 
 impl RuntimeOwner {
+    pub(crate) fn enable_project_settings(mut self) -> Self {
+        self.project_capture_enabled = true;
+        self
+    }
+
     pub(crate) fn project_settings_enabled(&self) -> bool {
         self.project_capture_enabled
     }

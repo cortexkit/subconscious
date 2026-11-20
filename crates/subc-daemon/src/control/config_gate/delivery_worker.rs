@@ -444,7 +444,10 @@ async fn poll_project_membership(handler: std::sync::Weak<ControlHandler>) {
                 let hints = hints.clone();
                 // A root in a previous pass can still be running. The pool
                 // keeps its reservation while later ticks observe other roots.
-                tasks.spawn(async move { let _ = owner.poll_unstamped_projects(hints).await; });
+                tasks.spawn(async move {
+                    let _ = owner.poll_unstamped_projects(hints).await;
+                    let _ = owner.refresh_settings_projects(false).await;
+                });
             }
             Some(hint) = ready.recv() => {
                 let Some(control) = handler.upgrade() else { break };

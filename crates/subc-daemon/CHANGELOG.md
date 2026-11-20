@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.50.28
+
+- Advertise project settings. Show a project's effective settings and approval
+  cutoffs, and include project rows in settings watches that opt in.
+
 ## 0.50.27
 
 - Hold the agent policy trust root in approved daemon settings; review all pin

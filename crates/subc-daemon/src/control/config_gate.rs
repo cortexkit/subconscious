@@ -630,9 +630,10 @@ impl ControlHandler {
                 "configuration control requires a kernel-observed owner-user connection",
             )?]);
         }
-        if let ConfigControlRequest::Watch { modules, .. } = request {
+        if let ConfigControlRequest::Watch { modules, projects } = request {
+            let projects = projects == Some(true) && runtime.project_settings_enabled();
             return self
-                .handle_config_settings_watch(ctx, frame, runtime, modules)
+                .handle_config_settings_watch(ctx, frame, runtime, modules, projects)
                 .await;
         }
         let result = self
@@ -702,8 +703,13 @@ impl ControlHandler {
                 through,
             } => {
                 let known = self.config_settings_known_modules()?;
+                if let Some(project) = project_id {
+                    return runtime
+                        .settings_show_project(known, module_id, project, through)
+                        .await;
+                }
                 config_work(runtime, ConfigWake::None, move |owner| {
-                    owner.settings_show(known, module_id, project_id, through)
+                    owner.settings_show(known, module_id, through)
                 })
                 .await
             }

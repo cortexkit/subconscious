@@ -10,6 +10,9 @@ use subc_control::config::{
     ConfigControlResponse, ConfigModule, ConfigSettingsLayer, ConfigThrough,
 };
 
+#[path = "settings_projects.rs"]
+pub(super) mod projects;
+
 /// Owner inputs that can change a settings row without a file or catalog edit.
 /// The publication separately compares the ungated module IDs from `config.status`.
 #[derive(PartialEq, Eq)]
@@ -164,6 +167,15 @@ impl RuntimeOwner {
         known: BTreeSet<String>,
         watch_files: bool,
     ) -> Result<Option<SettingsObservation>> {
+        self.observe_settings_rows(known, watch_files, false)
+    }
+
+    pub(crate) fn observe_settings_rows(
+        &self,
+        known: BTreeSet<String>,
+        watch_files: bool,
+        projects: bool,
+    ) -> Result<Option<SettingsObservation>> {
         #[cfg(test)]
         if let Some(hook) = self.settings_projection_hook.lock().unwrap().as_mut() {
             hook()?;
@@ -221,7 +233,7 @@ impl RuntimeOwner {
                 },
             );
         }
-        drop(state);
+        let project_state = projects.then_some(state);
         let observed = snapshot
             .stamped
             .then(|| captured.proposal_snapshot(&approved));
@@ -259,11 +271,9 @@ impl RuntimeOwner {
             let mut proposal = false;
             let mut formatting = false;
             if let Some(observed) = observed.as_ref().filter(|_| row.file_error.is_none()) {
-                for key in approved
-                    .changed_keys(observed)
-                    .into_iter()
-                    .filter(|key| key.module() == Some(module.as_str()) && !key.is_program())
-                {
+                for key in approved.changed_keys(observed).into_iter().filter(|key| {
+                    key.module() == Some(module.as_str()) && !key.is_program() && !key.is_project()
+                }) {
                     if approved.inputs.get(key).map(|input| &input.value)
                         == observed.inputs.get(key).map(|input| &input.value)
                     {
@@ -305,6 +315,15 @@ impl RuntimeOwner {
             }
             modules.push(row);
         }
+        if let Some(state) = project_state {
+            self.append_project_settings_rows(
+                &state,
+                &snapshot,
+                &rereview,
+                &write_back,
+                &mut modules,
+            )?;
+        }
         Ok(Some(SettingsObservation {
             response: ConfigControlResponse::Modules {
                 modules,
@@ -339,59 +358,88 @@ impl RuntimeOwner {
         &self,
         known: BTreeSet<String>,
         module: String,
-        project_id: Option<String>,
         through: Option<ConfigThrough>,
     ) -> Result<ConfigControlResponse> {
+        self.user_show_view(known, &module)?
+            .response(module, None, through)
+    }
+
+    fn user_show_view(&self, known: BTreeSet<String>, module: &str) -> Result<ShowView> {
         let mut state = self.lock()?;
         state.check_authority_for_read()?;
         let (_, body) = state.store.loaded_admission_state();
         let approved = GateSnapshot::from_store(&body.approved)?;
         let snapshot = self.settings_snapshot(&state, &approved, known)?;
-        let declaration = snapshot.declaration(&module)?;
-        if project_id.is_some() {
-            // Project tuples are not admitted by the current capture/delivery path.
-            return Err(GateError::new(
-                "unknown_project",
-                "project has no approved configuration tuple",
-            ));
-        }
+        let declaration = snapshot.declaration(module)?;
         let (generation, view, approved_declaration) = if snapshot.stamped {
-            let entry = approved_entry(body, &module).ok_or_else(|| {
+            let entry = approved_entry(body, module).ok_or_else(|| {
                 GateError::new("config_gated", "module has no approved configuration")
             })?;
             let delivery = entry.delivery.as_ref().ok_or_else(|| {
                 GateError::new("config_gated", "approved delivery is unavailable")
             })?;
-            let view = delivery.modules.get(&module).cloned().ok_or_else(|| {
+            let view = delivery.modules.get(module).cloned().ok_or_else(|| {
                 GateError::new("config_gated", "approved module view is unavailable")
             })?;
             let declaration =
-                delivery.declarations.get(&module).cloned().ok_or_else(|| {
+                delivery.declarations.get(module).cloned().ok_or_else(|| {
                     GateError::new("config_gated", "approved schema is unavailable")
                 })?;
-            let generation = crate::config_gate::module_base_generation(body, &module);
+            let generation = crate::config_gate::module_base_generation(body, module);
             drop(state);
             (generation, view, declaration)
         } else {
             drop(state);
             let captured = self.capturer.capture_modules(
-                &BTreeMap::from([(module.clone(), declaration.clone())]),
-                &BTreeSet::from([module.clone()]),
+                &BTreeMap::from([(module.into(), declaration.clone())]),
+                &BTreeSet::from([module.into()]),
             )?;
             let captured = captured
                 .modules
-                .get(&module)
+                .get(module)
                 .ok_or_else(|| GateError::new("config_gated", "module view is unavailable"))?;
             (0, captured.view.clone(), declaration.clone())
         };
         let file_error = if snapshot.stamped {
-            self.capturer.settings_file_error(&module, declaration)?
+            self.capturer.settings_file_error(module, declaration)?
         } else {
             None
         };
-        let defaults = schema(&approved_declaration)?.defaults();
-        let mut layers = vec![ConfigSettingsLayer::new(Layer::Default, defaults.clone())];
-        for layer in &view.layers {
+        Ok(ShowView {
+            declaration: approved_declaration,
+            view,
+            stamped: snapshot.stamped,
+            base_generation: generation,
+            file_error,
+            pending_plan: snapshot.pending.get(module).cloned(),
+            declaration_pending: snapshot.declaration_pending.get(module).cloned(),
+        })
+    }
+}
+
+struct ShowView {
+    declaration: ConfigDeclareRequest,
+    view: ConfigView,
+    stamped: bool,
+    base_generation: u64,
+    file_error: Option<subc_control::config::ConfigFileError>,
+    pending_plan: Option<Digest>,
+    declaration_pending: Option<subc_protocol::config::ConfigDeclarationPending>,
+}
+
+impl ShowView {
+    fn response(
+        self,
+        module: String,
+        project_id: Option<String>,
+        through: Option<ConfigThrough>,
+    ) -> Result<ConfigControlResponse> {
+        let defaults = schema(&self.declaration)?.defaults();
+        let mut layers = Vec::new();
+        if project_id.is_none() {
+            layers.push(ConfigSettingsLayer::new(Layer::Default, defaults.clone()));
+        }
+        for layer in &self.view.layers {
             let layer_name = match layer.layer {
                 subc_protocol::config::ConfigLayer::User => Layer::User,
                 subc_protocol::config::ConfigLayer::Workspace => Layer::Workspace,
@@ -406,6 +454,9 @@ impl RuntimeOwner {
             if !included(layer_name, through) {
                 continue;
             }
+            if project_id.is_some() && layer.bytes.is_none() {
+                continue;
+            }
             let document = match &layer.bytes {
                 Some(bytes) => {
                     let text = std::str::from_utf8(bytes).map_err(GateError::invalid)?;
@@ -415,8 +466,12 @@ impl RuntimeOwner {
                 None => serde_json::json!({}),
             };
             let mut document = ConfigSettingsLayer::new(layer_name, document);
-            document.workspace_id = layer.workspace_id.clone();
-            document.project_id = layer.project_id.clone();
+            if project_id.is_none() || layer_name == Layer::Workspace {
+                document.workspace_id.clone_from(&layer.workspace_id);
+            }
+            if project_id.is_none() || layer_name == Layer::Project {
+                document.project_id.clone_from(&layer.project_id);
+            }
             layers.push(document);
         }
         layers.sort_by_key(|layer| match layer.layer {
@@ -431,22 +486,20 @@ impl RuntimeOwner {
             default_sources(&defaults, "", &mut sources);
             (defaults, sources)
         } else {
-            // Only user layers are admitted today. Keep the stored reviewed result,
-            // rather than merging it again under a newer declaration's defaults.
-            (view.effective, view.sources)
+            (self.view.effective, self.view.sources)
         };
         Ok(ConfigControlResponse::Show {
-            module_id: module.clone(),
+            module_id: module,
             project_id,
             through,
-            stamped: snapshot.stamped,
-            base_generation: generation,
+            stamped: self.stamped,
+            base_generation: self.base_generation,
             effective,
             sources,
             layers,
-            file_error,
-            pending_plan: snapshot.pending.get(&module).cloned(),
-            declaration_pending: snapshot.declaration_pending.get(&module).cloned(),
+            file_error: self.file_error,
+            pending_plan: self.pending_plan,
+            declaration_pending: self.declaration_pending,
         })
     }
 }

@@ -298,7 +298,17 @@ impl RuntimeOwner {
                 ]),
             )
             .map_err(GateError::invalid)?;
-            Ok((live_view(read, user, layers)?, fingerprint))
+            Ok((
+                live_view(
+                    &read.module,
+                    &read.project,
+                    &read.declaration.schema,
+                    user,
+                    layers,
+                    None,
+                )?,
+                fingerprint,
+            ))
         })();
         observation
     }
@@ -416,19 +426,22 @@ fn superseded() -> GateError {
     )
 }
 
-fn live_view(
-    read: &UnstampedProjectRead,
+pub(super) fn live_view(
+    module: &str,
+    project: &str,
+    schema: &ProjectLayerSchema,
     user: &CapturedModule,
     layers: Vec<subc_protocol::config::ConfigLayerSnapshot>,
+    through: Option<subc_control::config::ConfigThrough>,
 ) -> Result<ConfigView> {
+    use subc_control::config::ConfigThrough;
     let mut view = user.view.clone();
-    view.project_id = Some(read.project.clone());
+    view.project_id = Some(project.into());
     // The bare user result is the fallback only after both locations have
     // been read successfully and no workspace or project file is present.
     if layers.is_empty() {
         return Ok(view);
     }
-    let schema = &read.declaration.schema;
     let recorded = layers
         .iter()
         .map(|layer| {
@@ -440,16 +453,30 @@ fn live_view(
             schema.record_layer(
                 kind,
                 layer.bytes.as_deref().expect("only present project layers"),
-                &read.module,
-                &read.project,
+                module,
+                project,
             )
         })
         .collect::<Result<Vec<_>>>()?;
     let user = user.file.bytes.as_deref().map(parse_layer).transpose()?;
-    let reviewed = schema.review_tuple(&read.module, &read.project, user, &recorded, None)?;
+    let mut reviewed = schema.review_tuple(module, project, user.clone(), &recorded, None)?;
+    let mut keep = layers.len();
+    match through {
+        Some(ConfigThrough::Default | ConfigThrough::User) => return Ok(view),
+        Some(ConfigThrough::Workspace) => {
+            keep = usize::from(layers[0].layer == ConfigLayer::Workspace);
+            if keep == 0 {
+                return Ok(view);
+            }
+            if keep < layers.len() {
+                reviewed = schema.review_tuple(module, project, user, &recorded[..keep], None)?;
+            }
+        }
+        None => {}
+    }
     view.effective = reviewed.effective;
     view.sources = reviewed.sources;
     view.layers[0].project_id = view.project_id.clone();
-    view.layers.extend(layers);
+    view.layers.extend(layers.into_iter().take(keep));
     Ok(view)
 }

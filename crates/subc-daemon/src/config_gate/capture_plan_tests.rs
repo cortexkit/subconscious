@@ -239,6 +239,8 @@ impl CaptureRig {
 
 #[path = "project_edit_tests.rs"]
 mod project_edit_tests;
+#[path = "project_settings_tests.rs"]
+mod project_settings_tests;
 #[path = "unstamped_project_tests.rs"]
 mod unstamped_project_tests;
 

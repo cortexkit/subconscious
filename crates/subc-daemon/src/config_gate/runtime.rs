@@ -92,6 +92,7 @@ pub struct RuntimeOwner {
     // Enable with the public project-settings capability. Until then an
     // unscoped config.plan must not return project targets or diagnostics.
     project_capture_enabled: bool,
+    settings_projects: settings::projects::ProjectObservations,
     #[cfg(test)]
     project_write_hook: std::sync::Mutex<Option<ProjectWriteHook>>,
     startup_overrides: Vec<String>,
@@ -1075,6 +1076,7 @@ impl RuntimeOwner {
             #[cfg(test)]
             policy_root_fail_after_append: std::sync::atomic::AtomicBool::new(false),
             project_capture_enabled: false,
+            settings_projects: Default::default(),
             #[cfg(test)]
             project_write_hook: std::sync::Mutex::new(None),
             startup_overrides: status_inputs::present_overrides(|name| {

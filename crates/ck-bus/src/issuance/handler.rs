@@ -1,13 +1,15 @@
 //! The daemon-route side of issuance (requests arriving over the subconscious daemon's
-//! module wire): the credential ops and the membership area's agent-durable
-//! ops advertised on ck-bus's management surface, the principal each route was bound
-//! with, and the wiring `main.rs` calls.
+//! module wire): the credential, agent-durable and event probe operations advertised
+//! on ck-bus's management surface, the principal each route was bound with, and the
+//! wiring `main.rs` calls.
 //!
 //! The daemon stamps a route's principal once, in `route.bind`, never per request, so
 //! the handler records it by route in `on_bind` and looks it up for every request on
-//! that route. A request on a route with no recorded principal is answered as `Direct`.
+//! that route. A request on a route with no recorded principal is not attested.
 //! Every other request, and health, goes to the wrapped handler; only a damaged
 //! `epoch_high_water.json` overrides health to down.
+
+mod event_probe;
 
 use std::{
     collections::HashMap,
@@ -54,8 +56,8 @@ fn route_key(handle: &RouteHandle) -> RouteKey {
     (handle.channel, handle.epoch)
 }
 
-/// Adds the issuance and agent-durable ops to the module's manifest as a management
-/// surface, which is how a participant's (or prefrontal's) `route.open` reaches ck-bus.
+/// Adds the issuance, agent-durable and event probe ops to the module's manifest
+/// as a management surface, which is how a client's `route.open` reaches ck-bus.
 ///
 /// It also declares `bind-no-project/v1`: ck-bus never reads a project from a route's
 /// bind, so the daemon sends it none instead of filling a placeholder folder.
@@ -85,6 +87,11 @@ pub fn advertise(builder: ModuleManifestBuilder) -> ModuleManifest {
     });
     let operations = issuance
         .chain(agent_durables)
+        .chain([(
+            event_probe::OP,
+            ManagementOperationKind::Query,
+            "verify the newest stored event on an exact subject without reading its payload",
+        )])
         .map(|(name, kind, description)| ManagementOperation {
             name: name.to_string(),
             kind,
@@ -144,8 +151,14 @@ impl<H> IssuanceHandler<H> {
     ) -> Option<HandlerOutcome> {
         let request: Value = serde_json::from_slice(body).ok()?;
         let method = request.get("method").and_then(Value::as_str)?;
-        let params = request.get("params").cloned().unwrap_or(Value::Null);
-        if let Some(outcome) = self.membership.answer(principal, method, &params).await {
+        let params = request.get("params").unwrap_or(&Value::Null);
+        if method == event_probe::OP {
+            let source = self.issuance.plane_source();
+            return Some(frame(
+                event_probe::answer(principal, params, &*source).await,
+            ));
+        }
+        if let Some(outcome) = self.membership.answer(principal, method, params).await {
             return Some(frame(outcome));
         }
         if ![

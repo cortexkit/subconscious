@@ -38,6 +38,37 @@ backing stream binds only its `$KV` branch. No stream uses a broad `ck.{acct}.>`
 capture, so none needs narrowing. The stream-configuration test rejects any binding
 that could capture a live descendant, including broad wildcard captures.
 
+## Event probe
+
+Call the read-only `ckbus.event_probe` operation on the `ckbus` management surface:
+
+```json
+{"method":"ckbus.event_probe","params":{"subject":"ck.box_example.event.publisher.notice.v1","msg_id":"notice-42"}}
+```
+
+Any authenticated client can call it, including a client that connects with the
+daemon's connection key and no module identity (a `direct` principal). No EVENT
+reader grant is required or added. The box's ck-bus connection performs a direct
+get of the newest message on that exact EVENT subject; it does not search older
+messages. The operation returns `not_found` if the subject has no stored message
+or the newest one's single `Nats-Msg-Id` differs from the supplied ID.
+
+The `result` contains `stream_sequence`, `stored_at` (RFC 3339), `payload_len`
+(bytes), `payload_sha256` (lowercase hex), `headers`, and `omitted_header_count`.
+It never includes the payload. `headers` contains the matched `Nats-Msg-Id` and,
+if the stored header is a single value matching the computed SHA-256,
+`Ck-Content-Digest`. All other header names and values are omitted: auth, cookie,
+token or other credential headers can carry secrets, and arbitrary extension
+names or values can do so too. The count covers omitted header names, not the
+metadata that NATS adds to the direct-get reply.
+
+Both parameters must be nonempty strings (`ckbus_bad_request`). The limits are
+512 bytes for `subject` and 256 bytes for `msg_id` (`ckbus_event_probe_input_too_large`).
+Wildcards return `ckbus_event_probe_wildcard`; malformed subjects or subjects
+outside this box's EVENT namespace return `ckbus_event_probe_subject`. An
+unreadable or not-yet-ready EVENT stream returns `ckbus_event_probe_unavailable`.
+There is no `ck bus` command-line interface; use the management surface directly.
+
 ## Non-goals
 
 - Porting any workload (rooms, wakes, peer deliveries, effect intents, Pi pushes) onto

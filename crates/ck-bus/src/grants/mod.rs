@@ -515,13 +515,23 @@ pub fn issued_grant(
 
 /// ck-bus's own box-account grant: census read and write, management of the nine
 /// streams and their consumers (the dead-letter durable and the module durables among
-/// them), deletion of the retired prefrontal-core liveness bucket, and the sentinel
-/// subjects. No workload publish.
+/// them), EVENT direct get, deletion of the retired prefrontal-core liveness bucket,
+/// and the sentinel subjects (the periodic round trip ck-bus publishes through the
+/// server to decide whether the bus is up). No workload publish.
 pub fn bus_module_grant(
     account: &AccountNames,
     credential_public: &str,
 ) -> Result<Grant, GrantRefusal> {
     let mut entries = bus_permissions(account, credential_public)?;
+    entries.push(AllowEntry {
+        principal: Principal::Bus,
+        operation: Operation::Publish,
+        subject: format!(
+            "$JS.API.DIRECT.GET.{}.{}",
+            account.streams().event,
+            account.event_binding()
+        ),
+    });
     for stream in [
         &account.streams().event,
         &account.streams().room,

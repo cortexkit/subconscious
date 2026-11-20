@@ -935,6 +935,7 @@ async fn bootstrap_raises_existing_event_cap_to_100000_without_losing_messages()
         .unwrap();
     let mut config = bootstrap::plane::stream_config(&spec);
     config.max_messages_per_subject = 10_000;
+    config.allow_direct = false;
     plane.js.create_stream(config).await.unwrap();
     let sequence = plane.store_event("broca", "run.started").await;
     let before = stream_state(&plane.js, &spec.name).await;
@@ -942,6 +943,7 @@ async fn bootstrap_raises_existing_event_cap_to_100000_without_losing_messages()
     drop(plane.bootstrap().await);
     let after = stream_state(&plane.js, &spec.name).await;
     assert_eq!(after.0["max_msgs_per_subject"], 100_000);
+    assert_eq!(after.0["allow_direct"], true);
     assert_eq!(after.1, before.1, "the stream was not recreated");
     assert_eq!(after.2, before.2, "messages survived the cap update");
     let message = plane

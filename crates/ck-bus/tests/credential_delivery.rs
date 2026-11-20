@@ -142,6 +142,117 @@ fn relayed_signer(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn event_probe_returns_only_safe_metadata_for_the_latest_exact_event() {
+    let _gate = harness::acceptance_gate().await;
+    harness::install_tracing();
+    let Some(plane) = start().await else {
+        return;
+    };
+    let connection = &plane.run.connection_file;
+    let credential = rows::relay(connection, true, issuance::CREDENTIAL_OP, json!({}))
+        .await
+        .unwrap();
+    let user = credential["credential_public"].as_str().unwrap();
+    let jwt = credential["jwt"].as_str().unwrap();
+    let publisher = VerdictClient::connect(
+        &plane.server.url,
+        jwt,
+        relayed_signer(connection.clone(), user.to_owned()),
+        Some(format!("_INBOX.{user}")),
+    )
+    .await
+    .unwrap();
+    let names = grants::derive_account(plane.ready["acct"].as_str().unwrap()).unwrap();
+    let subject = names.event_subject(PARTICIPANT, "probe_test", 1).unwrap();
+    let direct_get = format!("$JS.API.DIRECT.GET.{}.{subject}", names.streams().event);
+
+    let probe = |subject: String, id: String| async move {
+        rows::relay(
+            connection,
+            false,
+            "ckbus.event_probe",
+            json!({"subject": subject, "msg_id": id}),
+        )
+        .await
+    };
+    assert_eq!(
+        probe(subject.clone(), "absent".into()).await.unwrap_err().0,
+        "not_found"
+    );
+    assert_eq!(
+        probe(names.event_binding(), "absent".into())
+            .await
+            .unwrap_err()
+            .0,
+        "ckbus_event_probe_wildcard"
+    );
+    assert_eq!(
+        probe(
+            "ck.box_elsewhere.event.other.test.v1".into(),
+            "absent".into()
+        )
+        .await
+        .unwrap_err()
+        .0,
+        "ckbus_event_probe_subject"
+    );
+    assert_eq!(
+        probe(subject.clone(), "x".repeat(257)).await.unwrap_err().0,
+        "ckbus_event_probe_input_too_large"
+    );
+
+    const SHA256_ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    let js = async_nats::jetstream::new(publisher.client.clone());
+    let mut headers = async_nats::HeaderMap::new();
+    headers.insert("Nats-Msg-Id", "first");
+    headers.insert("Ck-Content-Digest", SHA256_ABC);
+    headers.insert("Authorization", "Bearer fixture-credential");
+    headers.insert("X-Fixture-Private-Header", "not public");
+    let first = js
+        .publish_with_headers(subject.clone(), headers, "abc".into())
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+    publisher
+        .client
+        .publish(direct_get.clone(), Default::default())
+        .await
+        .unwrap();
+    publisher.expect_denied(&direct_get).await;
+    let reply = probe(subject.clone(), "first".into()).await.unwrap();
+    let stored_at = reply["stored_at"].as_str().unwrap();
+    assert!(async_nats::datetime::parse_rfc3339(stored_at).is_ok());
+    assert_eq!(
+        reply,
+        json!({
+            "stream_sequence": first.sequence,
+            "stored_at": stored_at,
+            "headers": {"Nats-Msg-Id": "first", "Ck-Content-Digest": SHA256_ABC},
+            "omitted_header_count": 2,
+            "payload_len": 3,
+            "payload_sha256": SHA256_ABC,
+        })
+    );
+
+    let mut headers = async_nats::HeaderMap::new();
+    headers.insert("Nats-Msg-Id", "second");
+    headers.insert("Ck-Content-Digest", "not a digest; can carry a secret");
+    js.publish_with_headers(subject.clone(), headers, "abc".into())
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+    assert_eq!(
+        probe(subject.clone(), "first".into()).await.unwrap_err().0,
+        "not_found"
+    );
+    let reply = probe(subject, "second".into()).await.unwrap();
+    assert_eq!(reply["headers"], json!({"Nats-Msg-Id": "second"}));
+    assert_eq!(reply["omitted_header_count"], 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_attested_participant_gets_its_credential_and_connects_through_nonce_sign() {
     let _gate = harness::acceptance_gate().await;
     harness::install_tracing();

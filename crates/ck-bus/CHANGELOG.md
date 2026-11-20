@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.12.0
+
+- Add `ckbus.event_probe` to verify the latest stored event on an exact local subject without granting EVENT reads or returning the body.
+- Compile the sentinel's timing overrides (the period and timeout of the round trip ck-bus
+  publishes through the server to decide whether the bus is up) only when the `test-support`
+  feature is enabled.
+
 ## 0.11.1
 
 - Add and exercise a hub inbox purge fence based on confirmed acknowledgements and the current hub generation. Keep purging disabled in production until it can be coordinated with leaf remote changes; seven-day retention is unchanged there.

@@ -136,6 +136,7 @@ pub fn stream_config(spec: &StreamSpec) -> stream::Config {
         },
         storage: stream::StorageType::File,
         num_replicas: 1,
+        allow_direct: spec.kind == StreamKind::Event,
         ..Default::default()
     };
     if let Some(cap) = spec.max_msgs_per_subject {
@@ -265,6 +266,15 @@ pub struct LeafLink {
 
 #[async_trait]
 pub trait BoxPlane: Send + Sync {
+    /// The newest stored event on exactly one subject, without creating a consumer.
+    async fn last_event(
+        &self,
+        _account: &AccountNames,
+        _subject: &str,
+    ) -> Result<Option<jetstream::message::StreamMessage>, PlaneError> {
+        Err(PlaneError::new("EVENT direct get is unavailable"))
+    }
+
     fn handoff_jetstream(&self) -> Option<jetstream::Context> {
         None
     }
@@ -808,6 +818,23 @@ pub struct NatsBox {
 
 #[async_trait]
 impl BoxPlane for NatsBox {
+    async fn last_event(
+        &self,
+        account: &AccountNames,
+        subject: &str,
+    ) -> Result<Option<jetstream::message::StreamMessage>, PlaneError> {
+        let stream = self
+            .jetstream
+            .get_stream_no_info(&account.streams().event)
+            .await
+            .map_err(|err| PlaneError::new(format!("open EVENT: {err}")))?;
+        match stream.direct_get_last_for_subject(subject).await {
+            Ok(message) => Ok(Some(message)),
+            Err(err) if err.kind() == stream::DirectGetErrorKind::NotFound => Ok(None),
+            Err(err) => Err(PlaneError::new(format!("EVENT direct get: {err}"))),
+        }
+    }
+
     fn handoff_jetstream(&self) -> Option<jetstream::Context> {
         Some(self.jetstream.clone())
     }
@@ -887,6 +914,7 @@ impl BoxPlane for NatsBox {
             || spec.max_message_size.is_some()
             || spec.duplicate_window.is_some()
             || spec.kind == StreamKind::Effect
+            || spec.kind == StreamKind::Event
             || handoff_destination
         {
             let what = format!("stream info {}", spec.name);
@@ -912,6 +940,9 @@ impl BoxPlane for NatsBox {
                         }
                         if spec.kind == StreamKind::Effect || handoff_destination {
                             config.max_age = spec.max_age;
+                        }
+                        if spec.kind == StreamKind::Event {
+                            config.allow_direct = true;
                         }
                         if handoff_destination {
                             let desired = stream_config(spec);

@@ -1120,8 +1120,11 @@ pub(crate) mod tests {
         }
 
         pub(crate) async fn recv(&mut self) -> Option<Frame> {
+            // Generous on purpose: this waits for a reply that must arrive, and a loaded CI
+            // runner has taken longer than 2 s to schedule the server task. Tests that a reply
+            // does not come use `assert_no_reply`, which keeps its own short window.
             tokio::time::timeout(
-                Duration::from_secs(2),
+                Duration::from_secs(10),
                 subc_transport::read_frame(&mut self.client),
             )
             .await

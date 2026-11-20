@@ -603,3 +603,83 @@ async fn project_edit_unstamped_checks_only_target_and_distinguishes_late_public
     assert_eq!(std::fs::read(&workspace).unwrap(), b"{\"limit\":7}");
     assert!(intents(&rig).is_empty());
 }
+
+#[tokio::test]
+async fn project_edit_unstamped_refuses_invalid_or_unreadable_affected_tuple() {
+    let rig = CaptureRig::with_state(true, RootIoPool::new().unwrap(), false);
+    let b = root(&rig.project_scratch, "b");
+    let projects = vec![member("A", Some("W"), &[]), member("B", Some("W"), &[&b])];
+    rig.set_projects(projects);
+    let workspace = write_layer(&rig.workspace, 4);
+    let sibling = write_layer(&b, 6);
+    let request = edit("workspace", None, Some("W"), 7);
+    let prepared = prepare(&rig, vec![request.clone()]).await.unwrap();
+    assert_eq!(prepared.project_reviews().count(), 0);
+    let view = rig.owner.capture_refusal(&prepared).unwrap().unwrap();
+    assert_eq!(view.refusals.len(), 1);
+    assert_eq!(view.refusals[0].project_id.as_deref(), Some("B"));
+    assert_eq!(
+        rig.owner.apply_control_edits(view.digest).await.unwrap(),
+        None
+    );
+    assert_eq!(std::fs::read(&workspace).unwrap(), br#"{"limit":4}"#);
+
+    std::fs::remove_file(&sibling).unwrap();
+    std::fs::create_dir(&sibling).unwrap();
+    let prepared = prepare(&rig, vec![request]).await.unwrap();
+    let view = rig.owner.capture_refusal(&prepared).unwrap().unwrap();
+    assert_eq!(view.refusals.len(), 1);
+    assert_eq!(view.refusals[0].project_id.as_deref(), Some("B"));
+    assert_eq!(view.refusals[0].code, "layer_not_regular");
+    assert!(view.refusals[0].message.contains(b.to_str().unwrap()));
+    assert_eq!(std::fs::read(&workspace).unwrap(), br#"{"limit":4}"#);
+}
+
+#[tokio::test]
+async fn project_edit_unstamped_rechecks_membership_target_bytes_and_registry_outage() {
+    let rig = CaptureRig::with_state(true, RootIoPool::new().unwrap(), false);
+    let a = member("A", Some("W"), &[]);
+    rig.set_projects(vec![a.clone()]);
+    let target = write_layer(&rig.workspace, 4);
+    let plan = || async {
+        finish(
+            &rig.owner,
+            prepare(&rig, vec![edit("workspace", None, Some("W"), 6)])
+                .await
+                .unwrap(),
+        )
+    };
+    let view = plan().await;
+    rig.set_projects(vec![a.clone(), member("B", Some("W"), &[])]);
+    assert_eq!(
+        rig.owner
+            .apply_control_edits(view.digest)
+            .await
+            .unwrap_err()
+            .code,
+        "config_changed_since_review"
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), br#"{"limit":4}"#);
+    rig.set_projects(vec![a.clone()]);
+    let view = plan().await;
+    *rig.registry.reply.lock().unwrap() = None;
+    assert_eq!(
+        rig.owner
+            .apply_control_edits(view.digest.clone())
+            .await
+            .unwrap_err()
+            .code,
+        "project_registry_unavailable"
+    );
+    rig.set_projects(vec![a]);
+    std::fs::write(&target, br#"{"limit":5}"#).unwrap();
+    assert_eq!(
+        rig.owner
+            .apply_control_edits(view.digest)
+            .await
+            .unwrap_err()
+            .code,
+        "config_changed_since_review"
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), br#"{"limit":5}"#);
+}

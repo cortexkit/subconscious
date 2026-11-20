@@ -17,6 +17,7 @@ pub(super) struct SettingsVersion {
     store: (StoreState, u64),
     active: Vec<(ConnectionId, Option<u64>)>,
     plans: (u64, usize),
+    live_projects: u64,
 }
 
 impl SettingsVersion {
@@ -41,6 +42,7 @@ impl SettingsVersion {
             // Insertion (including replacement) advances the sequence; removal
             // alone changes the count. Neither requires inspecting plan bodies.
             plans: (state.gate.next_plan_sequence, state.gate.plans.len()),
+            live_projects: state.delivery.live_projects.settings_revision,
         }
     }
 }

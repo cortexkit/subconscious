@@ -20,7 +20,12 @@ const ROOT_IO_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct RootIoPool {
     shared: Arc<Shared>,
     timeout: Duration,
+    #[cfg(test)]
+    pub(super) before_work: Mutex<Option<RootWorkHook>>,
 }
+
+#[cfg(test)]
+type RootWorkHook = Arc<dyn Fn(&std::path::Path) + Send + Sync>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RootIoError {
@@ -129,6 +134,8 @@ impl RootIoPool {
         let pool = Self {
             shared: Arc::default(),
             timeout,
+            #[cfg(test)]
+            before_work: Mutex::default(),
         };
         for index in 0..ROOT_IO_WORKERS {
             let shared = pool.shared.clone();
@@ -148,7 +155,18 @@ impl RootIoPool {
     ) -> Result<RootIoJob<T>, RootIoError> {
         let deadline = Instant::now() + self.timeout;
         let (send, result) = oneshot::channel();
+        #[cfg(test)]
+        let before = self
+            .before_work
+            .lock()
+            .unwrap()
+            .clone()
+            .map(|hook| (hook, root.clone()));
         let run = Box::new(move |running| {
+            #[cfg(test)]
+            if let Some((hook, root)) = before {
+                hook(&root);
+            }
             let result = work();
             let in_time = Instant::now() < deadline;
             // Release the reservation before waking a caller that may submit
@@ -208,6 +226,16 @@ impl RootIoPool {
                 .queue
                 .iter()
                 .any(|job| job.root == root && job.deadline > Instant::now())
+    }
+
+    pub(super) fn is_charged(&self, root: &std::path::Path) -> bool {
+        self.shared
+            .state
+            .lock()
+            .unwrap()
+            .running
+            .get(root)
+            .is_some_and(|deadline| *deadline <= Instant::now())
     }
 
     pub(super) fn health(&self) -> Option<ConfigRootIo> {

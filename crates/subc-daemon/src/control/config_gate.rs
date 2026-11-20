@@ -172,7 +172,7 @@ impl ControlHandler {
         let gate = runtime
             .module_gate(&module)
             .map_err(|e| RouterError::backend(0, frame.header.corr, e.to_string()))?;
-        let _gate = gate.lock().await;
+        let mut module_guard = Some(gate.lock().await);
         let active = self
             .registry
             .get_module(&module)
@@ -215,17 +215,39 @@ impl ControlHandler {
                 }
             }
             "config.get" => {
-                let request = serde_json::from_slice(&body).map_err(|_| {
-                    GateError::new("invalid_control_body", "malformed config.get request")
-                });
+                let request =
+                    serde_json::from_slice::<subc_protocol::config::ConfigGetRequest>(&body)
+                        .map_err(|_| {
+                            GateError::new("invalid_control_body", "malformed config.get request")
+                        });
                 match request {
                     Ok(request) => {
                         let module_id = module.clone();
-                        match config_work(runtime.clone(), ConfigWake::None, move |owner| {
-                            owner.module_get_for_rpc(connection, &module_id, request)
-                        })
-                        .await
-                        {
+                        let get = async {
+                            if runtime.project_settings_enabled() && request.project_id.is_some() {
+                                let request = request.clone();
+                                let module = module_id.clone();
+                                let read = runtime
+                                    .on_blocking(move |owner| {
+                                        owner.begin_unstamped_project_get(
+                                            connection, module, request,
+                                        )
+                                    })
+                                    .await?;
+                                if let Some(read) = read {
+                                    // No delivery or module gate may wait on a repository mount.
+                                    drop(module_guard.take());
+                                    let reply = runtime.read_unstamped_project(read).await?;
+                                    module_guard = Some(gate.lock().await);
+                                    return Ok(reply);
+                                }
+                            }
+                            config_work(runtime.clone(), ConfigWake::None, move |owner| {
+                                owner.module_get_for_rpc(connection, &module_id, request)
+                            })
+                            .await
+                        };
+                        match get.await {
                             Ok(reply) => {
                                 let encoded = serde_json::to_value(&reply).map_err(|_| {
                                     GateError::new(
@@ -310,7 +332,18 @@ impl ControlHandler {
                                 deadline.min(tokio::time::Instant::now() + CONFIG_LIVE_ACK_TIMEOUT)
                             },
                         );
-                    drop(_gate);
+                    if view.active.as_ref().is_some_and(|view| {
+                        view.project_id.is_some()
+                            && view.status == subc_protocol::config::ConfigStatus::Unstamped
+                    }) && !self.config_delivery_target_current(
+                        &registration.manifest.module_id,
+                        connection,
+                        active,
+                        frame.header.corr,
+                    )? {
+                        return Ok(vec![]);
+                    }
+                    drop(module_guard.take());
                     let flushed =
                         tokio::time::timeout_at(write_deadline, ctx.egress.send_flushed(response))
                             .await;

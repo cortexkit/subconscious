@@ -425,6 +425,8 @@ struct OwnerState {
     retained_plan_files: BTreeMap<Digest, Vec<std::fs::File>>,
     expired_plans: VecDeque<Digest>,
     declarations: HashMap<ConnectionId, (String, ConfigDeclareRequest)>,
+    live_project_schemas:
+        HashMap<ConnectionId, std::sync::Arc<super::project_layers::ProjectLayerSchema>>,
     active_declarations: BTreeMap<String, ConnectionId>,
     activity: Option<crate::activity::ActivityLedger>,
     refused_generations: BTreeMap<String, Digest>,
@@ -868,6 +870,8 @@ mod polled;
 mod published;
 #[path = "unstamped.rs"]
 pub(crate) mod unstamped;
+#[path = "unstamped_projects.rs"]
+pub(crate) mod unstamped_projects;
 #[path = "widening.rs"]
 mod widening;
 pub(crate) use published::Published;
@@ -1037,6 +1041,7 @@ impl RuntimeOwner {
                 retained_plan_files: BTreeMap::new(),
                 expired_plans: VecDeque::new(),
                 declarations: HashMap::new(),
+                live_project_schemas: HashMap::new(),
                 active_declarations: BTreeMap::new(),
                 activity: None,
                 refused_generations: BTreeMap::new(),
@@ -1233,8 +1238,11 @@ impl RuntimeOwner {
     ) -> Result<()> {
         super::strict_json::check_canonical(&declaration.schema, "/schema")
             .map_err(|error| GateError::new(&error.code, format!("{module}: {}", error.detail)))?;
-        subc_config::Schema::new(declaration.schema.clone())
+        let schema = subc_config::Schema::new(declaration.schema.clone())
             .map_err(|r| GateError::new("schema_invalid", format!("{module}: {}", r.path)))?;
+        let live_schema = self
+            .project_settings_enabled()
+            .then(|| std::sync::Arc::new(super::project_layers::ProjectLayerSchema::new(schema)));
         let mut state = self.lock()?;
         if state.store.status().state == StoreState::StoreMissing
             || state.store.status().state == StoreState::StoreUnverified
@@ -1253,6 +1261,9 @@ impl RuntimeOwner {
         state
             .declarations
             .insert(connection, (module.into(), declaration));
+        if let Some(schema) = live_schema {
+            state.live_project_schemas.insert(connection, schema);
+        }
         state.delivery.declared(connection, module, active);
         if active {
             state.active_declarations.insert(module.into(), connection);

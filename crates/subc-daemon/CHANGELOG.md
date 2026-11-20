@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.50.26
+
+- Read workspace and project settings directly on unstamped installs when project
+  settings are enabled. Poll requested projects independently, so invalid project
+  settings or a stuck repository do not block unrelated project notifications.
+
 ## 0.50.25
 
 - Prepare workspace and project edits behind the project settings guard. Review

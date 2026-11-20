@@ -440,11 +440,11 @@ async fn registry_root_outcomes_keep_healthy_and_refused_roots_distinct() {
         .unwrap();
     let outcomes = &revision.opened;
     assert!(matches!(
-        outcomes[&blocked],
+        outcomes[&blocked].as_ref(),
         Err(RootCheckFailure::Pool(RootIoError::RootBusy))
     ));
     assert!(matches!(
-        outcomes[&gone],
+        outcomes[&gone].as_ref(),
         Err(RootCheckFailure::OpenRefused(_))
     ));
     let mismatch = revision
@@ -453,7 +453,12 @@ async fn registry_root_outcomes_keep_healthy_and_refused_roots_distinct() {
         .unwrap();
     assert_eq!(mismatch.code, "config_unavailable");
     assert!(mismatch.detail.contains("fileId changed"));
-    assert!(outcomes[&mismatched].as_ref().unwrap().layer.is_none());
+    assert!(outcomes[&mismatched]
+        .as_ref()
+        .as_ref()
+        .unwrap()
+        .layer
+        .is_none());
     assert!(revision.layer_location("project", &healthy).is_ok());
     assert!(revision.layer_location("project", &dir).is_ok());
     let project = revision.project_layers("project").err().unwrap();

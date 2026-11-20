@@ -33,6 +33,7 @@ impl OwnerState {
             .retain(|(caller, _), _| *caller != connection);
         held |= self.approval_requests.len() != requests;
         held |= self.declarations.remove(&connection).is_some();
+        self.live_project_schemas.remove(&connection);
         held |= self.anchor_waiters.remove(&connection);
         held |= self.anchor_hints.remove(&connection);
         let active = self.active_declarations.len();

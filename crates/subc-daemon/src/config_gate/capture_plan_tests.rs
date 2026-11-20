@@ -34,6 +34,12 @@ impl Registry {
 }
 
 impl ProjectRegistry for Registry {
+    fn enumerate_live(
+        &self,
+    ) -> crate::config_gate::project_registry::RegistryEnumerationFuture<'_> {
+        Box::pin(async { self.reply() })
+    }
+
     fn root_io(&self) -> Option<&RootIoPool> {
         Some(&self.pool)
     }
@@ -233,6 +239,8 @@ impl CaptureRig {
 
 #[path = "project_edit_tests.rs"]
 mod project_edit_tests;
+#[path = "unstamped_project_tests.rs"]
+mod unstamped_project_tests;
 
 fn reply(review: &crate::config_gate::capture_plan::CaptureReview) -> ConfigReviewReply {
     ConfigReviewReply::new(

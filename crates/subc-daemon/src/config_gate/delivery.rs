@@ -174,6 +174,7 @@ pub(super) struct DeliveryState {
     projects: HashMap<ConnectionId, BTreeMap<String, projects::ProjectSlot>>,
     served: HashMap<ConnectionId, (Option<u64>, Option<u64>)>,
     pub(super) unstamped_views: HashMap<ConnectionId, std::sync::Arc<ConfigView>>,
+    pub(super) live_projects: super::unstamped_projects::LiveProjects,
     stamp_running: HashSet<ConnectionId>,
     initial_generation: u64,
     children: HashMap<ConnectionId, DeliverySpawn>,
@@ -378,6 +379,7 @@ impl DeliveryState {
         held |= self.fallback_applied.remove(&connection).is_some();
         held |= self.served.remove(&connection).is_some();
         held |= self.unstamped_views.remove(&connection).is_some();
+        held |= self.live_projects.disconnected(connection);
         held |= self.stamp_running.remove(&connection);
         held |= self.children.remove(&connection).is_some();
         let observed = self.healthy_children.len() + self.readiness_observed.len();
@@ -1402,6 +1404,15 @@ impl RuntimeOwner {
                 .or(reply.active.as_ref())
                 .and_then(|view| view.project_id.as_deref())
             {
+                if reply
+                    .active
+                    .as_ref()
+                    .is_some_and(|view| view.status == ConfigStatus::Unstamped)
+                    && state.store.loaded_admission_state().0 == StoreState::Unstamped
+                {
+                    // A live view has no delivery attempt or approved generation to confirm.
+                    return Ok(());
+                }
                 let wrote = Self::project_view_delivered(
                     &mut state, connection, module, project, reply, written_at, active,
                 )?;

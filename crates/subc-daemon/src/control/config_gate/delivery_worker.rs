@@ -426,20 +426,68 @@ async fn config_recovery_exit_retry_backoff_caps_and_does_not_postpone_on_owner_
 }
 
 async fn poll_project_membership(handler: std::sync::Weak<ControlHandler>) {
-    use crate::config_gate::runtime::unstamped::USER_FILE_POLL_INTERVAL;
+    use crate::config_gate::runtime::{
+        unstamped::USER_FILE_POLL_INTERVAL, unstamped_projects::UnstampedProjectHint,
+    };
 
     let mut poll = tokio::time::interval(USER_FILE_POLL_INTERVAL);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let (hints, mut ready) = tokio::sync::mpsc::unbounded_channel::<UnstampedProjectHint>();
+    let mut tasks = JoinSet::new();
     loop {
-        poll.tick().await;
-        let Some(control) = handler.upgrade() else {
-            break;
-        };
-        let Some(owner) = &control.config_runtime else {
-            break;
-        };
-        let _ = owner.refresh_project_membership().await;
+        tokio::select! {
+            _ = poll.tick() => {
+                let Some(control) = handler.upgrade() else { break };
+                let Some(owner) = &control.config_runtime else { break };
+                let _ = owner.refresh_project_membership().await;
+                let owner = owner.clone();
+                let hints = hints.clone();
+                // A root in a previous pass can still be running. The pool
+                // keeps its reservation while later ticks observe other roots.
+                tasks.spawn(async move { let _ = owner.poll_unstamped_projects(hints).await; });
+            }
+            Some(hint) = ready.recv() => {
+                let Some(control) = handler.upgrade() else { break };
+                tasks.spawn(send_live_project_hint(control, hint));
+            }
+            Some(result) = tasks.join_next(), if !tasks.is_empty() => {
+                if let Err(error) = result {
+                    warn!(%error, "live project configuration task stopped");
+                }
+            }
+        }
     }
+}
+
+async fn send_live_project_hint(
+    control: Arc<ControlHandler>,
+    hint: crate::config_gate::runtime::unstamped_projects::UnstampedProjectHint,
+) {
+    let Some(owner) = &control.config_runtime else {
+        return;
+    };
+    let Ok(Some(hint)) = owner
+        .on_blocking(move |owner| Ok(owner.unstamped_project_hint_current(&hint)?.then_some(hint)))
+        .await
+    else {
+        return;
+    };
+    let Ok(Some((sink, version))) = control
+        .forwarding
+        .live_project_hint_target(&hint.module, hint.connection)
+    else {
+        return;
+    };
+    let Some(frame) = serde_json::to_vec(&hint.hint).ok().and_then(|body| {
+        Frame::build_with_version(version, FrameType::Push, control_flags(), 0, 0, 0, body).ok()
+    }) else {
+        return;
+    };
+    let _ = timeout_at(
+        Instant::now() + CONFIG_LIVE_ACK_TIMEOUT,
+        sink.send_flushed(frame),
+    )
+    .await;
 }
 
 async fn module_worker(

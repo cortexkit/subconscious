@@ -13,7 +13,7 @@ use crate::config_gate::{
 
 pub(super) struct OpenedRoot {
     pub id: RegistryFileId,
-    pub handle: File,
+    pub handle: std::sync::Arc<File>,
     pub layer: Option<Result<LayerLocation>>,
 }
 
@@ -72,7 +72,11 @@ pub(super) fn open_root(
                 .any(|expected| expected.as_ref().is_none_or(|expected| expected == &id))
         })
         .map(|leaf| read_layer(&handle, leaf));
-    Ok(OpenedRoot { id, handle, layer })
+    Ok(OpenedRoot {
+        id,
+        handle: std::sync::Arc::new(handle),
+        layer,
+    })
 }
 
 pub(super) fn read_layer(root: &File, leaf: &OsStr) -> Result<LayerLocation> {

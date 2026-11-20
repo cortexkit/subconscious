@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use subc_config::Digest;
 
 mod layers;
+pub(super) mod live;
 mod rpc;
 mod write_back;
 use layers::{open_root, OpenedRoot};
@@ -249,10 +250,12 @@ pub struct RegistryRevision {
     pub module: String,
     pub projects: Vec<RegistryProject>,
     #[serde(skip)]
-    opened: Arc<BTreeMap<PathBuf, std::result::Result<OpenedRoot, RootCheckFailure>>>,
+    opened: Arc<BTreeMap<PathBuf, Arc<RootProbe>>>,
     #[serde(skip)]
     metadata_errors: BTreeMap<String, GateError>,
 }
+
+type RootProbe = std::result::Result<OpenedRoot, RootCheckFailure>;
 
 impl std::fmt::Debug for RegistryRevision {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -460,9 +463,11 @@ impl RegistryRevision {
                 };
                 observed.insert(
                     root,
-                    result
-                        .map_err(RootCheckFailure::Pool)
-                        .and_then(|probe| probe),
+                    Arc::new(
+                        result
+                            .map_err(RootCheckFailure::Pool)
+                            .and_then(|probe| probe),
+                    ),
                 );
             }
         }
@@ -470,13 +475,19 @@ impl RegistryRevision {
         // from the identity of the root handle we actually opened, so a later
         // recheck can tell when the folder at that path was swapped, even when
         // the registry's own token is unchanged.
+        self.set_opened(observed);
+    }
+
+    fn set_opened(&mut self, observed: BTreeMap<PathBuf, Arc<RootProbe>>) {
         for project in &mut self.projects {
             for root in project
                 .project_roots
                 .iter_mut()
                 .chain(&mut project.workspace_root)
             {
-                if let (None, Some(Ok(opened))) = (&root.file_id, observed.get(&root.path)) {
+                if let (None, Some(Ok(opened))) =
+                    (&root.file_id, observed.get(&root.path).map(AsRef::as_ref))
+                {
                     root.file_id = Some(opened.id.clone());
                 }
             }
@@ -494,6 +505,7 @@ impl RegistryRevision {
             .opened
             .get(&root.path)
             .ok_or_else(|| layer_unavailable("registry root was not captured"))?
+            .as_ref()
             .as_ref()
             .map_err(|error| error.error(project, &root.path, rechecking))?;
         if root.file_id.as_ref() != Some(&opened.id) {
@@ -744,6 +756,8 @@ pub type RegistryFuture<'a> = Pin<Box<dyn Future<Output = Result<RegistryRevisio
 pub type RegistryBatch = (Option<EnumerateReply>, BTreeMap<String, RegistryRevision>);
 #[doc(hidden)]
 pub type RegistryBatchFuture<'a> = Pin<Box<dyn Future<Output = Result<RegistryBatch>> + Send + 'a>>;
+pub type RegistryEnumerationFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<EnumerateReply>> + Send + 'a>>;
 
 pub trait ProjectRegistry: Send + Sync {
     fn snapshot_scoped<'a>(
@@ -751,6 +765,16 @@ pub trait ProjectRegistry: Send + Sync {
         module: &'a str,
         scope: &'a RegistryScope,
     ) -> RegistryFuture<'a>;
+
+    /// Fetch membership without opening roots, for independent live tuple reads.
+    #[doc(hidden)]
+    fn enumerate_live(&self) -> RegistryEnumerationFuture<'_> {
+        Box::pin(async {
+            Err(unavailable(
+                "project registry cannot enumerate live projects",
+            ))
+        })
+    }
 
     /// Capture several modules against one complete enumeration when the
     /// registry supplies it. Empty scopes request membership alone, without

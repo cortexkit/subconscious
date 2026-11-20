@@ -114,6 +114,10 @@ impl EntorhinalProjectRegistry {
 }
 
 impl ProjectRegistry for EntorhinalProjectRegistry {
+    fn enumerate_live(&self) -> RegistryEnumerationFuture<'_> {
+        Box::pin(self.enumerate())
+    }
+
     fn snapshot_scoped<'a>(
         &'a self,
         module: &'a str,

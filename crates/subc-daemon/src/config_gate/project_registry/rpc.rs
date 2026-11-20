@@ -133,6 +133,10 @@ impl ProjectRegistry for EntorhinalProjectRegistry {
         self.root_io.as_ref().ok().and_then(RootIoPool::health)
     }
 
+    fn root_io(&self) -> Option<&RootIoPool> {
+        self.root_io.as_ref().ok()
+    }
+
     fn capture_batch<'a>(
         &'a self,
         scopes: &'a BTreeMap<String, RegistryScope>,

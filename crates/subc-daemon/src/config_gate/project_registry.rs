@@ -19,6 +19,7 @@ use subc_config::Digest;
 
 mod layers;
 mod rpc;
+mod write_back;
 use layers::{open_root, OpenedRoot};
 pub use layers::{LayerFile, LayerLocation};
 pub use rpc::EntorhinalProjectRegistry;
@@ -189,6 +190,11 @@ enum CaptureLayers {
 }
 
 impl RegistryScope {
+    pub(super) fn targets_only(mut self) -> Self {
+        self.capture = CaptureLayers::Targets;
+        self
+    }
+
     pub fn new(
         projects: BTreeSet<String>,
         paths: BTreeSet<PathBuf>,
@@ -496,7 +502,7 @@ impl RegistryRevision {
         Ok(opened)
     }
 
-    fn project(&self, id: &str) -> Result<&RegistryProject> {
+    pub(super) fn project(&self, id: &str) -> Result<&RegistryProject> {
         self.projects
             .iter()
             .find(|project| project.project_id == id)
@@ -779,6 +785,11 @@ pub trait ProjectRegistry: Send + Sync {
 
     #[doc(hidden)]
     fn root_io_health(&self) -> Option<subc_control::config::ConfigRootIo> {
+        None
+    }
+
+    #[doc(hidden)]
+    fn root_io(&self) -> Option<&RootIoPool> {
         None
     }
 

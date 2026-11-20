@@ -201,6 +201,15 @@ impl RootIoPool {
         (ROOT_IO_WORKERS - state.charged(Instant::now()).count()).max(1)
     }
 
+    pub(super) fn is_busy(&self, root: &std::path::Path) -> bool {
+        let state = self.shared.state.lock().unwrap();
+        state.running.contains_key(root)
+            || state
+                .queue
+                .iter()
+                .any(|job| job.root == root && job.deadline > Instant::now())
+    }
+
     pub(super) fn health(&self) -> Option<ConfigRootIo> {
         let state = self.shared.state.lock().unwrap();
         let mut stuck_roots: Vec<_> = state

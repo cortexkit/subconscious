@@ -203,16 +203,23 @@ impl RuntimeOwner {
             .on_blocking(|owner| {
                 let guard = owner.lock()?;
                 let (state, body) = guard.store.loaded_admission_state();
-                Ok((state == crate::config_store::StoreState::Stamped)
-                    .then(|| body.registry_membership.clone()))
+                Ok(
+                    (state == crate::config_store::StoreState::Stamped).then(|| {
+                        (
+                            body.registry_membership.clone(),
+                            body.project_write_back.clone(),
+                        )
+                    }),
+                )
             })
             .await?;
-        let Some(before) = before else { return Ok(()) };
-        let (reply, _) = self
-            .capturer
-            .projects
-            .capture_batch(&BTreeMap::new())
-            .await?;
+        let Some((before, intents)) = before else {
+            return Ok(());
+        };
+        let scopes = super::project_edits::reconciliation_scopes(&intents);
+        let (reply, revisions) = self.capturer.projects.capture_batch(&scopes).await?;
+        let matches = super::project_edits::matching_project_writes(&intents, &revisions);
+        self.record_project_write_adoptions(matches).await?;
         let Some(reply) = reply else { return Ok(()) };
         self.on_blocking(move |owner| {
             let mut guard = owner.lock()?;

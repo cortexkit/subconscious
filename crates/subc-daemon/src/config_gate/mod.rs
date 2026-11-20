@@ -804,6 +804,9 @@ impl ConfigGate {
             observed.carry_project_inputs(&previous);
             observed.carry_project_inputs(&plan.snapshot);
             if let Some(capture) = &plan.project_capture {
+                observed
+                    .inputs
+                    .extend(capture.edit_observations.inputs.clone());
                 for (key, input) in &plan.snapshot.inputs {
                     if matches!(key, InputKey::ProjectTuple { .. }) {
                         observed.inputs.insert(key.clone(), input.clone());

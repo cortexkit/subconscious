@@ -37,6 +37,32 @@ pub(super) struct CaptureAuthority {
 }
 
 impl CaptureAuthority {
+    pub fn for_edit(scope: RegistryScope, saved: RegistryRevision) -> Self {
+        Self {
+            scope: scope.targets_only(),
+            saved,
+            held: BTreeSet::new(),
+            readers: BTreeSet::new(),
+        }
+    }
+
+    pub fn revision_digest(&self) -> Result<Digest> {
+        self.saved.digest()
+    }
+
+    pub fn check_busy(&self, pool: &super::root_io::RootIoPool) -> Result<()> {
+        if self
+            .saved
+            .projects
+            .iter()
+            .flat_map(RegistryProject::roots)
+            .any(|root| pool.is_busy(&root.path))
+        {
+            return Err(GateError::from(super::root_io::RootIoError::RootBusy));
+        }
+        Ok(())
+    }
+
     pub fn recheck(&self, current: &RegistryRevision) -> Result<()> {
         self.saved.recheck(current, &self.scope)?;
         for project in &current.projects {
@@ -100,7 +126,7 @@ pub(super) fn known_projects(body: &StoreBody) -> bool {
             .any(|(tuple, _)| tuple.project.is_some())
 }
 
-fn notice(
+pub(super) fn notice(
     module: &str,
     project: Option<&RegistryProject>,
     path: String,
@@ -116,14 +142,14 @@ fn notice(
     }
 }
 
-fn file_key(module: &str, path: &Path) -> InputKey {
+pub(super) fn file_key(module: &str, path: &Path) -> InputKey {
     InputKey::ProjectFile {
         module: module.into(),
         path: path.to_string_lossy().into_owned(),
     }
 }
 
-fn file_input(digest: Option<Digest>) -> CapturedInput {
+pub(super) fn file_input(digest: Option<Digest>) -> CapturedInput {
     CapturedInput {
         state: digest.map_or(InputState::Absent, |digest| InputState::Present { digest }),
         value: RecordedValue::new(serde_json::Value::Null),
@@ -271,30 +297,7 @@ impl ModuleRoots {
     ) -> Result<Option<CaptureAuthority>> {
         let module = &self.revision.module;
         let schema = ProjectLayerSchema::new(captured.schema.clone());
-        let mut approved_files = BTreeMap::new();
-        for entry in body.generations.values() {
-            if let Some(projects) = entry
-                .delivery
-                .as_ref()
-                .and_then(|d| d.project_views.get(module))
-            {
-                for view in projects.values() {
-                    for layer in &view.layers {
-                        if layer.layer != ConfigLayer::User {
-                            if let Some(path) = &layer.path {
-                                let path = PathBuf::from(path);
-                                let key = file_key(module, &path);
-                                if approved.inputs.get(&key).is_some_and(|input| {
-                                    matches!(&input.state, InputState::Present { digest } if Some(digest) == layer.digest.as_ref())
-                                }) {
-                                    approved_files.insert(path, layer);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let approved_files = approved_files(body, approved, module);
         let user_snapshot = &captured.view.layers[0];
         let user_changed =
             previous_user.and_then(|view| view.layers.first()) != Some(user_snapshot);
@@ -318,11 +321,12 @@ impl ModuleRoots {
             let key = file_key(module, path);
             let input = file_input(digest.clone());
             if self.held.contains(path)
-                || input.state
-                    == approved
-                        .inputs
-                        .get(&key)
-                        .map_or(InputState::Absent, |input| input.state.clone())
+                || (!body.project_write_back.contains_key(path)
+                    && input.state
+                        == approved
+                            .inputs
+                            .get(&key)
+                            .map_or(InputState::Absent, |input| input.state.clone()))
             {
                 continue;
             }
@@ -464,53 +468,79 @@ impl ModuleRoots {
         project: &RegistryProject,
         approved: &BTreeMap<PathBuf, &ConfigLayerSnapshot>,
     ) -> Result<Vec<ConfigLayerSnapshot>> {
-        let module = &self.revision.module;
-        let input = |root: &Path, layer| -> Result<Option<ConfigLayerSnapshot>> {
-            let path = layer_path(root, module);
-            let bytes = if self.held.contains(&path) {
-                approved.get(&path).and_then(|layer| layer.bytes.clone())
+        tuple_layers(&self.revision.module, project, |root, path| {
+            if self.held.contains(path) {
+                Ok(approved.get(path).and_then(|layer| layer.bytes.clone()))
             } else {
                 let (_, location) = self.revision.layer_location(&project.project_id, root)?;
-                location.file.as_ref().map(|file| file.bytes.clone())
-            };
-            Ok(bytes.map(|bytes| {
-                let mut snapshot =
-                    ConfigLayerSnapshot::file(module, layer, path.to_string_lossy(), Some(bytes));
-                snapshot.project_id = Some(project.project_id.clone());
-                if snapshot.layer == ConfigLayer::Workspace {
-                    snapshot.workspace_id.clone_from(&project.workspace_id);
-                }
-                snapshot
-            }))
-        };
-        let mut higher = None;
-        for root in &project.project_roots {
-            if let Some(layer) = input(&root.path, ConfigLayer::Project)? {
-                if higher.is_some() {
-                    return Err(GateError::new(
-                        "layer_root_ambiguous",
-                        "more than one approved project root supplies a layer",
-                    ));
-                }
-                higher = Some(layer);
+                Ok(location.file.as_ref().map(|file| file.bytes.clone()))
             }
-        }
-        let lower = project
-            .workspace_root
-            .as_ref()
-            .map(|root| input(&root.path, ConfigLayer::Workspace))
-            .transpose()?
-            .flatten();
-        Ok(lower
-            .filter(|lower| {
-                higher
-                    .as_ref()
-                    .is_none_or(|higher| higher.path != lower.path)
-            })
-            .into_iter()
-            .chain(higher)
-            .collect())
+        })
     }
+}
+
+pub(super) fn tuple_layers(
+    module: &str,
+    project: &RegistryProject,
+    mut bytes: impl FnMut(&Path, &Path) -> Result<Option<Vec<u8>>>,
+) -> Result<Vec<ConfigLayerSnapshot>> {
+    let mut input = |root: &Path, layer| -> Result<Option<ConfigLayerSnapshot>> {
+        let path = layer_path(root, module);
+        let bytes = bytes(root, &path)?;
+        Ok(bytes.map(|bytes| {
+            let mut snapshot =
+                ConfigLayerSnapshot::file(module, layer, path.to_string_lossy(), Some(bytes));
+            snapshot.project_id = Some(project.project_id.clone());
+            if snapshot.layer == ConfigLayer::Workspace {
+                snapshot.workspace_id.clone_from(&project.workspace_id);
+            }
+            snapshot
+        }))
+    };
+    let mut higher = None;
+    for root in &project.project_roots {
+        if let Some(layer) = input(&root.path, ConfigLayer::Project)? {
+            if higher.is_some() {
+                return Err(GateError::new(
+                    "layer_root_ambiguous",
+                    "more than one approved project root supplies a layer",
+                ));
+            }
+            higher = Some(layer);
+        }
+    }
+    let lower = project
+        .workspace_root
+        .as_ref()
+        .map(|root| input(&root.path, ConfigLayer::Workspace))
+        .transpose()?
+        .flatten();
+    Ok(lower
+        .filter(|lower| {
+            higher
+                .as_ref()
+                .is_none_or(|higher| higher.path != lower.path)
+        })
+        .into_iter()
+        .chain(higher)
+        .collect())
+}
+
+pub(super) fn approved_files<'a>(
+    body: &'a StoreBody,
+    approved: &GateSnapshot,
+    module: &str,
+) -> BTreeMap<PathBuf, &'a ConfigLayerSnapshot> {
+    body.generations.values().filter_map(|entry| {
+        entry.delivery.as_ref()?.project_views.get(module)
+    }).flat_map(|projects| projects.values()).flat_map(|view| &view.layers)
+        .filter(|layer| layer.layer != ConfigLayer::User)
+        .filter_map(|layer| {
+            let path = PathBuf::from(layer.path.as_ref()?);
+            let input = approved.inputs.get(&file_key(module, &path))?;
+            matches!(&input.state, InputState::Present { digest } if Some(digest) == layer.digest.as_ref())
+                .then_some((path, layer))
+        }).collect()
 }
 
 fn held_notice(module: &str, path: &Path) -> ConfigPlanRefusal {
@@ -533,7 +563,7 @@ pub(crate) struct CaptureReview {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_review(
+pub(super) fn build_review(
     module: &str,
     project: &str,
     captured: &CapturedModule,
@@ -627,6 +657,7 @@ pub(super) struct ProjectCapture {
     pub authority: BTreeMap<String, CaptureAuthority>,
     pub held_user: BTreeSet<String>,
     pub witnesses: GateSnapshot,
+    pub edit_observations: GateSnapshot,
 }
 
 #[derive(Default)]

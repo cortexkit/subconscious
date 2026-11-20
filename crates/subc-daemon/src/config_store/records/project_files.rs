@@ -107,11 +107,26 @@ pub enum ExpectedProjectFile {
     },
 }
 
+/// Observed state of one module's physical repository file. The two flags
+/// are independent: a pending write can coexist with an external proposal.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProjectWriteBackStatus {
+    /// A committed edit still has an intent. No matching file was confirmed
+    /// by the writer or by a fresh authorized read.
+    pub write_back_behind: bool,
+    /// The observed digest or presence differs from the approved snapshot.
+    /// Only capture approval or reconciliation of matching bytes clears this.
+    pub pending_proposal: bool,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ProjectWriteBackIntent {
     pub target: ProjectFileTarget,
     pub expected: ExpectedProjectFile,
     pub generation: u64,
+    // A deleted approved file is dirty, not an authorized first publish.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub missing_approved: bool,
     #[serde(with = "encoded_bytes")]
     pub bytes: Vec<u8>,
 }
@@ -135,6 +150,7 @@ pub enum ProjectFileApproval {
         target: ProjectFileTarget,
         expected: ExpectedProjectFile,
         bytes: Vec<u8>,
+        missing_approved: bool,
     },
     Adopt {
         target: ProjectFileTarget,
@@ -155,9 +171,11 @@ impl ProjectFileApproval {
                 target,
                 expected,
                 bytes,
+                missing_approved,
             } => serde_json::json!({
                 "operation": "write", "target": target, "expected": expected,
                 "candidate_digest": subc_config::raw_digest(bytes),
+                "missing_approved": missing_approved,
             }),
             Self::Adopt {
                 target,
@@ -168,20 +186,19 @@ impl ProjectFileApproval {
         }
     }
 
-    pub(in crate::config_store) fn into_intent(
-        self,
-        generation: u64,
-    ) -> Option<ProjectWriteBackIntent> {
+    pub(crate) fn into_intent(self, generation: u64) -> Option<ProjectWriteBackIntent> {
         match self {
             Self::Write {
                 target,
                 expected,
                 bytes,
+                missing_approved,
             } => Some(ProjectWriteBackIntent {
                 target,
                 expected,
                 generation,
                 bytes,
+                missing_approved,
             }),
             Self::Adopt { .. } => None,
         }
@@ -189,6 +206,48 @@ impl ProjectFileApproval {
 }
 
 impl StoreBody {
+    /// Read the write-back/proposal inputs for a settings row without opening
+    /// any roots. A cleared intent with matching observations is in sync; the
+    /// store does not retain a separate record of which writes were adopted.
+    pub fn project_write_back_status(
+        &self,
+        module: &str,
+        path: &Path,
+    ) -> Result<ProjectWriteBackStatus, GateError> {
+        use crate::config_gate::{CapturedInput, InputKey};
+        use crate::config_store::Snapshot;
+        use subc_config::{InputState, RecordedValue};
+        let invalid = || GateError::new("config_unavailable", "invalid project file observation");
+        let key = serde_json::to_string(&InputKey::ProjectFile {
+            module: module.into(),
+            path: path.to_string_lossy().into_owned(),
+        })
+        .map_err(|_| invalid())?;
+        let state = |snapshot: &Snapshot| -> Result<InputState, GateError> {
+            match snapshot.get(&key) {
+                None => Ok(InputState::Absent),
+                Some(RecordedValue::Value { value }) => {
+                    serde_json::from_value::<CapturedInput>(value.clone())
+                        .map(|input| input.state)
+                        .map_err(|_| invalid())
+                }
+                _ => Err(invalid()),
+            }
+        };
+        let pending_proposal = if let Some(observed) = &self.observed {
+            state(observed)? != state(&self.approved)?
+        } else {
+            false
+        };
+        Ok(ProjectWriteBackStatus {
+            write_back_behind: self
+                .project_write_back
+                .get(path)
+                .is_some_and(|intent| intent.target.module == module),
+            pending_proposal,
+        })
+    }
+
     pub(in crate::config_store) fn apply_project_file_approvals(
         &mut self,
         files: Vec<ProjectFileApproval>,

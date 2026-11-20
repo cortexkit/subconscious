@@ -176,6 +176,10 @@ async fn config_settings_handler_refusals_and_capability_gate() {
             json!({"op":"config.watch","modules":"sample-reader"}),
             "invalid_control_body",
         ),
+        (
+            json!({"op":"config.plan","base_generations":{"sample-reader":0},"edits":[{"module_id":"sample-reader","layer":"project","project_id":5,"path":"/limit","set":6}]}),
+            "invalid_control_body",
+        ),
     ] {
         let reply = handler
             .handle_control_frame(&ctx, request(body))

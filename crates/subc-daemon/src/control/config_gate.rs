@@ -732,12 +732,7 @@ impl ControlHandler {
             }
             ConfigControlRequest::Apply { digest } => {
                 let apply_digest = digest.clone();
-                if let Some(generation) =
-                    config_work(runtime.clone(), ConfigWake::Delivery, move |owner| {
-                        owner.apply_unstamped_edits(&apply_digest)
-                    })
-                    .await?
-                {
+                if let Some(generation) = runtime.apply_control_edits(apply_digest).await? {
                     return Ok(ConfigControlResponse::Applied {
                         generation,
                         restart_required: false,
@@ -808,12 +803,15 @@ impl ControlHandler {
                 attempt_guard.commit_window = window.clone();
                 let checked_phone = self.config_phone_surface().await;
                 let locks = async {
+                    // A registry root can keep its worker busy until the I/O
+                    // returns. Do not hold supervisor or module gates while
+                    // waiting for that registry check.
+                    let project_apply = runtime.recheck_capture_apply(attempt).await?;
                     let operation = self.supervisor.operation_lock().lock_owned().await;
                     let module_gates = runtime.approval_commit_gates(attempt).await?;
                     let current_phone = self.config_phone_surface_snapshot().await;
                     let phone = checked_phone.filter(|phone| Some(phone) == current_phone.as_ref());
                     let facts = self.config_approval_facts_with_phone(ctx, phone).await;
-                    let project_apply = runtime.recheck_capture_apply(attempt).await?;
                     Ok::<_, GateError>((operation, module_gates, facts, project_apply))
                 };
                 let (operation, module_gates, facts, project_apply) = if let Some(window) = &window
@@ -830,7 +828,8 @@ impl ControlHandler {
                 let exit_runtime = runtime.clone();
                 let work = config_work(runtime, ConfigWake::Delivery, move |owner| {
                     let _owned_gates = (operation, module_gates);
-                    owner.finish_approval_with_commit_window(
+                    let write_authority = project_apply.clone();
+                    let generation = owner.finish_approval_with_commit_window(
                         attempt,
                         &facts,
                         reply,
@@ -838,7 +837,17 @@ impl ControlHandler {
                         publish_window,
                         publication_request,
                         project_apply,
-                    )
+                    )?;
+                    if let Some(authority) = write_authority {
+                        // The publication job can finish after the control
+                        // request disconnects. It still owns this write-back.
+                        tokio::spawn(async move {
+                            owner
+                                .write_approved_project_files(generation, authority)
+                                .await
+                        });
+                    }
+                    Ok(generation)
                 });
                 tokio::pin!(work);
                 let generation = if let Some(window) = window {
@@ -914,12 +923,7 @@ impl ControlHandler {
                     }
                 };
                 let mut prepared = match edits {
-                    Some((base, edits)) => {
-                        config_work(runtime.clone(), ConfigWake::Delivery, move |owner| {
-                            owner.prepare_edits(base, edits)
-                        })
-                        .await?
-                    }
+                    Some((base, edits)) => runtime.prepare_control_edits(base, edits).await?,
                     None => {
                         let prepared = runtime.prepare_capture(kind).await?;
                         // Preparing a plan can record observations that delivery reads.
@@ -1018,16 +1022,31 @@ impl ControlHandler {
                             &review.approval.view,
                         )
                         .await?;
-                    let reply = serde_json::from_slice(&bytes).map_err(|_| {
-                        GateError::new(
-                            "module_review_invalid",
-                            format!("{}: malformed project config.review reply", tuple.module),
-                        )
-                    })?;
+                    let reply: subc_protocol::config::ConfigReviewReply =
+                        serde_json::from_slice(&bytes).map_err(|_| {
+                            GateError::new(
+                                "module_review_invalid",
+                                format!("{}: malformed project config.review reply", tuple.module),
+                            )
+                        })?;
                     project_replies.push((tuple.clone(), reply));
                 }
                 for (tuple, reply) in project_replies {
-                    fields.extend(prepared.accept_project_review(&tuple, reply)?);
+                    if prepared.is_edit_plan() && !reply.refusals.is_empty() {
+                        prepared.refuse_project_review(&tuple, &reply);
+                    } else {
+                        fields.extend(prepared.accept_project_review(&tuple, reply)?);
+                    }
+                }
+                if prepared.capture_refused() {
+                    let view = runtime
+                        .on_blocking(move |owner| {
+                            owner.capture_refusal(&prepared)?.ok_or_else(|| {
+                                GateError::new("module_review_invalid", "project refusal is absent")
+                            })
+                        })
+                        .await?;
+                    return Ok(ConfigControlResponse::Plan { view });
                 }
                 prepared.add_edit_refusals(edit_refusals);
                 let view = config_work(runtime, ConfigWake::Delivery, move |owner| {

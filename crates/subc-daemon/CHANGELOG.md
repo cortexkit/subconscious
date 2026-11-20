@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.50.25
+
+- Prepare workspace and project edits behind the project settings guard. Review
+  settings for every project that reads an edited file. Write each file through the
+  project directory handle held from the approval's final check, without overwriting
+  unapproved changes or a competing first file.
+- Require subc-os 0.1.48 (checked replace).
+
 ## 0.50.24
 
 - Review a changed entry in a settings map whose keys are matched by `patternProperties`

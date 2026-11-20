@@ -75,7 +75,7 @@ pub(super) fn open_root(
     Ok(OpenedRoot { id, handle, layer })
 }
 
-fn read_layer(root: &File, leaf: &OsStr) -> Result<LayerLocation> {
+pub(super) fn read_layer(root: &File, leaf: &OsStr) -> Result<LayerLocation> {
     let directory =
         subc_os::open_directory_nofollow_at(root, OsStr::new(".cortexkit")).map_err(open_error)?;
     let Some(directory) = directory else {

@@ -34,6 +34,10 @@ impl Registry {
 }
 
 impl ProjectRegistry for Registry {
+    fn root_io(&self) -> Option<&RootIoPool> {
+        Some(&self.pool)
+    }
+
     fn snapshot_scoped<'a>(
         &'a self,
         module: &'a str,
@@ -124,6 +128,14 @@ impl CaptureRig {
     }
 
     fn with_capture_enabled(enabled: bool) -> Self {
+        Self::with_pool(enabled, RootIoPool::new().unwrap())
+    }
+
+    fn with_pool(enabled: bool, pool: RootIoPool) -> Self {
+        Self::with_state(enabled, pool, true)
+    }
+
+    fn with_state(enabled: bool, pool: RootIoPool, stamped: bool) -> Self {
         let mut rig = Rig::new();
         rig.declaration.schema["x-ck-layers"] = json!(["user", "workspace", "project"]);
         rig.declaration.schema["properties"]
@@ -133,7 +145,7 @@ impl CaptureRig {
         rig.declaration.schema["properties"]["limit"]["x-ck-bound"] = json!("raise_only");
         let registry = Arc::new(Registry {
             reply: Mutex::new(None),
-            pool: RootIoPool::new().unwrap(),
+            pool,
             enumerations: AtomicUsize::new(0),
         });
         let mut owner = rig.owner("capture-test");
@@ -143,13 +155,18 @@ impl CaptureRig {
         }
         let owner = Arc::new(owner);
         rig.declare(&owner, 10);
-        let stamp = rig.stamp(&owner);
-        owner
-            .lock()
-            .unwrap()
-            .store
-            .record_delivery(&tuple(None), stamp, true)
-            .unwrap();
+        let stamp = if stamped {
+            let stamp = rig.stamp(&owner);
+            owner
+                .lock()
+                .unwrap()
+                .store
+                .record_delivery(&tuple(None), stamp, true)
+                .unwrap();
+            stamp
+        } else {
+            0
+        };
         // Use owned scratch directories so the registry's scan can open
         // each ancestor without depending on the Windows checkout's ACLs.
         let project_scratch = cortexkit_test_support::ScratchDir::new("capture-project-roots");
@@ -213,6 +230,9 @@ impl CaptureRig {
             .unwrap();
     }
 }
+
+#[path = "project_edit_tests.rs"]
+mod project_edit_tests;
 
 fn reply(review: &crate::config_gate::capture_plan::CaptureReview) -> ConfigReviewReply {
     ConfigReviewReply::new(

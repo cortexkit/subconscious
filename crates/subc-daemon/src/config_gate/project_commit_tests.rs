@@ -442,6 +442,7 @@ fn project_commit_targets_project_file_intents_supersede_and_adopt_by_physical_p
             ProjectReviews {
                 tuples: BTreeMap::from([(key.clone(), review("a", "A", x))]),
                 files: vec![ProjectFileApproval::Write {
+                    missing_approved: false,
                     target: target.clone(),
                     expected: expected.clone(),
                     bytes: bytes.clone(),

@@ -14,6 +14,7 @@ pub(crate) struct EditPlan {
     pub unstamped: bool,
     pub refusals: Vec<ConfigPlanRefusal>,
     pub files: Vec<WriteBack>,
+    pub user_modules: BTreeSet<String>,
 }
 
 #[derive(Clone)]
@@ -52,10 +53,10 @@ impl WriteBack {
     }
 }
 
-fn invalid(message: &str) -> GateError {
+pub(super) fn invalid(message: &str) -> GateError {
     GateError::new("invalid_params", message)
 }
-fn refused(edit: &ConfigEdit, code: &str, message: &str) -> ConfigPlanRefusal {
+pub(super) fn refused(edit: &ConfigEdit, code: &str, message: &str) -> ConfigPlanRefusal {
     ConfigPlanRefusal {
         module_id: edit.module_id.clone(),
         path: edit.path.clone(),
@@ -125,10 +126,11 @@ fn patch(document: &mut Value, keys: &[String], action: &ConfigEditAction) -> Re
     Ok(())
 }
 
-fn schema_path<'a>(
+pub(super) fn schema_path<'a>(
     mut schema: &'a Value,
     mut effective: Option<&Value>,
     keys: &[String],
+    user_only: bool,
 ) -> Result<&'a Value> {
     for key in keys {
         if schema.get("type").and_then(Value::as_str) == Some("array") {
@@ -168,10 +170,11 @@ fn schema_path<'a>(
                 )
             })?;
         effective = effective.and_then(|value| value.get(key));
-        if schema
-            .get("x-ck-layers")
-            .and_then(Value::as_array)
-            .is_some_and(|layers| !layers.iter().any(|layer| layer == "user"))
+        if user_only
+            && schema
+                .get("x-ck-layers")
+                .and_then(Value::as_array)
+                .is_some_and(|layers| !layers.iter().any(|layer| layer == "user"))
         {
             return Err(GateError::new(
                 "layer_forbidden",
@@ -307,10 +310,20 @@ impl RuntimeOwner {
         if edits.is_empty() {
             return Err(invalid("edits must not be empty"));
         }
+        let touched = edits.iter().map(|edit| edit.module_id.clone()).collect();
+        self.prepare_edit_base(base_generations, edits, touched)
+    }
+
+    pub(super) fn prepare_edit_base(
+        &self,
+        base_generations: BTreeMap<String, u64>,
+        edits: Vec<ConfigEdit>,
+        touched: BTreeSet<String>,
+    ) -> Result<PreparedPlan> {
         let mut state = self.lock()?;
         Self::check_authority(&mut state, false)?;
         let unstamped = state.store.status().state == StoreState::Unstamped;
-        let touched: BTreeSet<_> = edits.iter().map(|edit| edit.module_id.clone()).collect();
+        let user_modules: BTreeSet<_> = edits.iter().map(|edit| edit.module_id.clone()).collect();
         let approved = self.edit_baseline(&mut state, unstamped.then_some(&touched))?;
         for module in &touched {
             let wanted = base_generations
@@ -337,7 +350,7 @@ impl RuntimeOwner {
         let mut candidate = if unstamped {
             approved
         } else {
-            self.edit_baseline(&mut state, Some(&touched))?
+            self.edit_baseline(&mut state, Some(&user_modules))?
         };
         let baseline = candidate.diagnostic.clone();
         let mut refusals = Vec::new();
@@ -371,6 +384,7 @@ impl RuntimeOwner {
                     captured.schema.normalized(),
                     Some(&captured.view.effective),
                     &keys,
+                    true,
                 )?;
                 let mut document = captured.file.parse()?;
                 patch(&mut document, &keys, &edit.action)?;
@@ -472,11 +486,15 @@ impl RuntimeOwner {
             })
             .cloned()
             .collect();
-        let review_modules = touched
-            .iter()
-            .filter(|module| candidate.modules.contains_key(*module))
-            .cloned()
-            .collect();
+        let review_modules = if unstamped && self.project_capture_enabled {
+            BTreeSet::new()
+        } else {
+            user_modules
+                .iter()
+                .filter(|module| candidate.modules.contains_key(*module))
+                .cloned()
+                .collect()
+        };
         Ok(PreparedPlan {
             projects: None,
             project_capture: None,
@@ -497,12 +515,13 @@ impl RuntimeOwner {
                 unstamped,
                 refusals,
                 files,
+                user_modules,
             }),
         })
     }
 }
 
-fn edit_text(bytes: Option<&[u8]>, edits: &[ConfigEdit]) -> Result<Vec<u8>> {
+pub(super) fn edit_text(bytes: Option<&[u8]>, edits: &[ConfigEdit]) -> Result<Vec<u8>> {
     let mut text = match bytes {
         Some(bytes) => std::str::from_utf8(bytes)
             .map_err(|_| invalid("invalid UTF-8"))?
@@ -536,8 +555,6 @@ impl WriteBack {
 
     /// Use the daemon's normal atomic replacement for user-layer files. It
     /// keeps the file's mode, but not explicit ACLs or extended attributes.
-    /// Repository layers need retained ancestor handles and an ACL-preserving
-    /// replacement before their write-back can be supported.
     pub(super) fn write_back(&self) -> Result<()> {
         use std::io::Write;
         self.unchanged()?;
@@ -651,6 +668,12 @@ impl RuntimeOwner {
         let Some(edit) = plan.edits.as_ref().filter(|edit| edit.unstamped).cloned() else {
             return Ok(None);
         };
+        if !plan.project_files.is_empty() {
+            return Err(GateError::new(
+                "config_unavailable",
+                "project edit requires registry recheck",
+            ));
+        }
         let base_revision = plan.view.base_revision;
         Self::check_authority(&mut state, false)?;
         let status = state.store.status();

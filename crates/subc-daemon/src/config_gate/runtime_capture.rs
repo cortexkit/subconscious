@@ -11,9 +11,11 @@ use crate::config_store::Tuple;
 use super::*;
 
 /// Checked registry evidence for exactly one pending capture plan.
+#[derive(Clone)]
 pub(crate) struct CaptureApply {
     pub(super) digest: Digest,
     pub(super) enumeration: Option<cortexkit_project_identity::EnumerateReply>,
+    pub(super) revisions: BTreeMap<String, super::super::project_registry::RegistryRevision>,
 }
 
 impl RuntimeOwner {
@@ -81,6 +83,7 @@ impl RuntimeOwner {
         Ok(Some(CaptureApply {
             digest,
             enumeration,
+            revisions: current,
         }))
     }
 
@@ -111,16 +114,47 @@ impl RuntimeOwner {
             return Ok(None);
         };
         let state = self.lock()?;
-        Ok(Some(projects.refused_view(
+        let mut view = projects.refused_view(
             &state.gate.incarnation,
             prepared.base_revision,
             state.store.loaded_admission_state().1.last_generation,
             prepared.read_set.clone(),
-        )?))
+        )?;
+        if let Some(edit) = &prepared.edits {
+            view.refusals.extend(edit.refusals.clone());
+        }
+        Ok(Some(view))
     }
 }
 
 impl PreparedPlan {
+    pub(crate) fn refuse_project_review(&mut self, tuple: &Tuple, reply: &ConfigReviewReply) {
+        if let Some(plan) = &mut self.project_capture {
+            let paths: BTreeSet<_> = reply
+                .refusals
+                .iter()
+                .flat_map(|refusal| &refusal.paths)
+                .filter(|path| path.starts_with('/') && path.len() <= 1024)
+                .cloned()
+                .collect();
+            let paths = if paths.is_empty() {
+                BTreeSet::from([String::new()])
+            } else {
+                paths
+            };
+            for path in paths {
+                plan.refusals.push(subc_control::config::ConfigPlanRefusal {
+                    module_id: tuple.module.clone(),
+                    project_id: tuple.project.clone(),
+                    workspace_id: None,
+                    path,
+                    code: "module_review_refused".into(),
+                    message: "the module refused the project edits".into(),
+                });
+            }
+        }
+    }
+
     pub(crate) fn capture_refused(&self) -> bool {
         self.project_capture
             .as_ref()

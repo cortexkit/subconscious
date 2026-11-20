@@ -1307,6 +1307,51 @@ impl ConfigStore {
         Ok(true)
     }
 
+    /// Reconciliation does not approve anything. Clear only the still-current
+    /// intents whose candidate bytes the root worker has observed on disk.
+    pub(crate) fn adopt_project_write_backs(
+        &mut self,
+        matches: &std::collections::BTreeMap<std::path::PathBuf, u64>,
+    ) -> Result<bool, crate::config_gate::GateError> {
+        use crate::config_gate::{GateSnapshot, InputKey};
+        if self.state != StoreState::Stamped || matches.is_empty() {
+            return Ok(false);
+        }
+        self.delivery_ready()?;
+        let mut body = self.envelope.body.clone();
+        let approved = GateSnapshot::from_store(&body.approved)?;
+        let mut observed =
+            GateSnapshot::from_store(body.observed.as_ref().unwrap_or(&body.approved))?;
+        let mut adopted = false;
+        for (path, generation) in matches {
+            let Some(intent) = body
+                .project_write_back
+                .get(path)
+                .filter(|intent| intent.generation == *generation)
+            else {
+                continue;
+            };
+            let key = InputKey::ProjectFile {
+                module: intent.target.module.clone(),
+                path: path.to_string_lossy().into_owned(),
+            };
+            if let Some(input) = approved.inputs.get(&key) {
+                observed.inputs.insert(key, input.clone());
+            }
+            body.project_write_back.remove(path);
+            adopted = true;
+        }
+        if adopted {
+            body.observed = Some(observed.to_store()?);
+            let changed = body.rebase_proposal()?;
+            self.publish(body, false, wall_time_ms())?;
+            if changed {
+                self.proposal_activity();
+            }
+        }
+        Ok(adopted)
+    }
+
     /// ACK/NACK for a superseded generation changes nothing. A failure restores
     /// the active pointer immediately, even if its durable mark must wait for an
     /// anchor retry. ACKs never change memory while an anchor is pending.

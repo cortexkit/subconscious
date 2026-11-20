@@ -24,6 +24,11 @@ use crate::{
 
 #[path = "edits.rs"]
 pub(super) mod edits;
+#[path = "runtime_project_edits.rs"]
+pub(super) mod project_edits;
+
+#[cfg(test)]
+pub(super) type ProjectWriteHook = std::sync::Arc<dyn Fn(bool) -> Result<()> + Send + Sync>;
 
 #[cfg(test)]
 type UserFileTestIdle =
@@ -81,6 +86,8 @@ pub struct RuntimeOwner {
     // Enable with the public project-settings capability. Until then an
     // unscoped config.plan must not return project targets or diagnostics.
     project_capture_enabled: bool,
+    #[cfg(test)]
+    project_write_hook: std::sync::Mutex<Option<ProjectWriteHook>>,
     startup_overrides: Vec<String>,
     module_gates: Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
     delivery_changed: std::sync::Arc<tokio::sync::Notify>,
@@ -1053,6 +1060,8 @@ impl RuntimeOwner {
             }),
             capturer,
             project_capture_enabled: false,
+            #[cfg(test)]
+            project_write_hook: std::sync::Mutex::new(None),
             startup_overrides: status_inputs::present_overrides(|name| {
                 std::env::var_os(name).is_some()
             }),
@@ -1922,8 +1931,15 @@ impl RuntimeOwner {
         } else {
             BTreeMap::new()
         };
-        let mut current = if prepared.edits.is_some() {
-            self.edit_baseline(&mut state, Some(&prepared.touched_modules))
+        let mut current = if let Some(edit) = &prepared.edits {
+            self.edit_baseline(
+                &mut state,
+                Some(if edit.unstamped {
+                    &prepared.touched_modules
+                } else {
+                    &edit.user_modules
+                }),
+            )
         } else if let Some(projects) = &project_plan {
             self.capture_with_project_context(
                 &mut state,
@@ -1937,7 +1953,7 @@ impl RuntimeOwner {
         current
             .capture_programs(&prepared.program_keys)
             .map_err(|_| GateError::stale())?;
-        if (prepared.edits.is_none()
+        if ((prepared.edits.is_none() || project_plan.is_some())
             && state.store.status().base_revision != prepared.base_revision)
             || active_generations != prepared.active_generations
             || !prepared
@@ -1982,6 +1998,7 @@ impl RuntimeOwner {
         }
         let mut project_context = None;
         let mut project_skips = Vec::new();
+        let mut edit_registry = BTreeMap::new();
         if let Some(projects) = project_plan {
             let CapturePlan {
                 mut context,
@@ -1990,6 +2007,11 @@ impl RuntimeOwner {
                 files,
                 ..
             } = projects;
+            if prepared.edits.is_some() {
+                for (module, authority) in &context.authority {
+                    edit_registry.insert(module.clone(), authority.revision_digest()?);
+                }
+            }
             for (key, input) in &witnesses.inputs {
                 if matches!(key, super::InputKey::ProjectTuple { .. }) {
                     context.witnesses.inputs.insert(key.clone(), input.clone());
@@ -2113,6 +2135,9 @@ impl RuntimeOwner {
                         serde_json::json!({"review": changeset.apply_plan})
                     };
                 }
+                if !edit_registry.is_empty() {
+                    changeset.apply_plan["edit_registry"] = serde_json::json!(edit_registry);
+                }
                 changeset.apply_plan["module_transitions"] =
                     activation.apply_plan["module_transitions"].clone();
                 Ok(changeset)
@@ -2177,13 +2202,12 @@ impl RuntimeOwner {
         let modules = state.gate.plan_modules(digest)?;
         let program_keys = state.gate.plan_program_keys(digest)?;
         let projects = state.gate.plans[digest].project_capture.clone();
-        let mut current = if state
-            .gate
-            .plans
-            .get(digest)
-            .is_some_and(|plan| plan.edits.is_some())
-        {
-            self.edit_baseline(&mut state, Some(&modules))
+        let user_edits = state.gate.plans[digest]
+            .edits
+            .as_ref()
+            .map(|edit| edit.user_modules.clone());
+        let mut current = if let Some(user_edits) = &user_edits {
+            self.edit_baseline(&mut state, Some(user_edits))
         } else if let Some(capture) = &projects {
             self.capture_with_project_context(&mut state, &modules, capture)
         } else {
@@ -2301,8 +2325,8 @@ impl RuntimeOwner {
             .get(&digest)
             .and_then(|plan| plan.edits.clone());
         let current = match Self::check_authority(&mut state, true).and_then(|_| {
-            let mut current = if edit_plan.is_some() {
-                self.edit_baseline(&mut state, Some(&modules))
+            let mut current = if let Some(edit) = &edit_plan {
+                self.edit_baseline(&mut state, Some(&edit.user_modules))
             } else if let Some(capture) = &project_capture {
                 self.capture_with_project_context(&mut state, &modules, capture)
             } else {

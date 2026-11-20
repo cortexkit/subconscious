@@ -3,9 +3,9 @@
 mod edit;
 
 pub use edit::{
-    insert_member, insert_member_with, insert_object_member, insert_object_member_with,
-    push_element, read_document, remove_element, remove_member, set_element, set_member,
-    to_string_pretty_sorted,
+    apply_edits, insert_member, insert_member_with, insert_object_member,
+    insert_object_member_with, push_element, read_document, remove_element, remove_member,
+    set_element, set_member, to_string_pretty_sorted, Edit,
 };
 
 /// Normalize a JSONC document into strict JSON by stripping comments and
@@ -351,6 +351,7 @@ struct ParsedObject {
 struct ParsedMember {
     key: String,
     key_start: usize,
+    key_end: usize,
     value_start: usize,
     value_end: usize,
     comma_before: Option<usize>,
@@ -437,12 +438,12 @@ impl<'a> Parser<'a> {
             });
         }
         loop {
-            let (key, key_start) = match self.next() {
+            let (key, key_start, key_end) = match self.next() {
                 Some(Token {
                     kind: TokenKind::String(key),
                     start,
-                    ..
-                }) => (key.clone(), *start),
+                    end,
+                }) => (key.clone(), *start, *end),
                 Some(token) => {
                     return Err(format!("expected an object key at byte {}", token.start))
                 }
@@ -458,6 +459,7 @@ impl<'a> Parser<'a> {
             members.push(ParsedMember {
                 key,
                 key_start,
+                key_end,
                 value_start: value.start,
                 value_end: value.end,
                 comma_before: previous_comma,

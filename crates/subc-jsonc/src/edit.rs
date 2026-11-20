@@ -18,6 +18,59 @@ use super::{
     ParsedObject, Parser,
 };
 
+/// One step of a comment-preserving document edit. Paths name object keys.
+#[derive(Debug)]
+pub enum Edit<'a> {
+    /// Replace the spelling of a key without touching its value or comments.
+    RenameMember { path: &'a [&'a str], key: &'a str },
+    /// Set one member's value, with the same semantics as [`set_member`].
+    SetMember {
+        path: &'a [&'a str],
+        value: &'a Value,
+    },
+    /// Move the existing root object under a key of a new outer object.
+    WrapRoot { key: &'a str },
+}
+
+/// Apply edits in order, leaving the original document untouched on failure.
+pub fn apply_edits(document: &mut String, edits: &[Edit<'_>]) -> Result<(), String> {
+    let mut edited = document.clone();
+    for edit in edits {
+        match edit {
+            Edit::RenameMember { path, key } => {
+                let root = parse_root(&edited)?;
+                let Lookup::Found { member, parent } = lookup(&root, path)? else {
+                    return Err(format!("{} is absent", path.join(".")));
+                };
+                if parent.members.iter().any(|other| {
+                    other.key_start != member.key_start
+                        && (other.key == *key || other.key == member.key)
+                }) {
+                    return Err(format!("{} has a conflicting key", path.join(".")));
+                }
+                edited.replace_range(
+                    member.key_start..member.key_end,
+                    &serde_json::to_string(key).expect("object keys always serialize"),
+                );
+            }
+            Edit::SetMember { path, value } => set_member(&mut edited, path, value)?,
+            Edit::WrapRoot { key } => {
+                let tokens = tokenize(&edited)?;
+                let mut parser = Parser::new(&tokens);
+                let root = parser.parse_value()?;
+                if root.object.is_none() || parser.next().is_some() {
+                    return Err("the document does not contain a single root object".to_string());
+                }
+                let key = serde_json::to_string(key).expect("object keys always serialize");
+                edited.insert(root.end, '}');
+                edited.insert_str(root.start, &format!("{{{key}: "));
+            }
+        }
+    }
+    *document = edited;
+    Ok(())
+}
+
 /// Reads and parses an existing JSONC file. A missing file is an error here:
 /// callers edit a configuration the operator already has.
 pub fn read_document(path: &Path) -> Result<(String, Value), String> {
@@ -550,6 +603,59 @@ mod tests {
         edit(&mut document);
         parsed(&document);
         document
+    }
+
+    #[test]
+    fn apply_edits_keeps_comments_before_inside_and_after_a_renamed_member() {
+        let original = concat!(
+            "/* file header { */\r\n{\r\n",
+            "  // before\r\n  \"old\" /* beside key */: { /* inside */ \"n\": 1, }, // after\r\n",
+            "}\r\n// footer }\r\n"
+        );
+        let document = edited(original, |document| {
+            apply_edits(
+                document,
+                &[
+                    Edit::WrapRoot { key: "outer" },
+                    Edit::RenameMember {
+                        path: &["outer", "old"],
+                        key: "new",
+                    },
+                    Edit::SetMember {
+                        path: &["outer", "new", "n"],
+                        value: &json!(2),
+                    },
+                ],
+            )
+            .unwrap();
+        });
+        assert_eq!(
+            document,
+            concat!(
+                "/* file header { */\r\n{\"outer\": {\r\n",
+                "  // before\r\n  \"new\" /* beside key */: { /* inside */ \"n\": 2, }, // after\r\n",
+                "}}\r\n// footer }\r\n"
+            )
+        );
+        assert_eq!(parsed(&document), json!({"outer": {"new": {"n": 2}}}));
+    }
+
+    #[test]
+    fn apply_edits_does_not_modify_the_document_if_a_rename_conflicts() {
+        let original = r#"{"old": 1, "new": 2}"#;
+        let mut document = original.to_string();
+        assert!(apply_edits(
+            &mut document,
+            &[
+                Edit::WrapRoot { key: "outer" },
+                Edit::RenameMember {
+                    path: &["outer", "old"],
+                    key: "new",
+                }
+            ],
+        )
+        .is_err());
+        assert_eq!(document, original);
     }
 
     #[test]

@@ -52,8 +52,17 @@ pub trait ArtifactSource {
         verify_acceptance(destination, acceptance)
     }
 
-    fn rollback_install(&mut self, destination: &Path) -> Result<(), String> {
-        remove_placed_binary(destination).map_err(|error| error.to_string())
+    /// Place using the component's open install transaction. The release
+    /// source records the before and after digests before publishing bytes.
+    fn install_recorded(
+        &mut self,
+        component: Component,
+        binary: &str,
+        destination: &Path,
+        inventory: &mut Inventory,
+    ) -> Result<PlacementDigests, String> {
+        let _ = inventory;
+        self.install(component, binary, destination)
     }
 
     /// A binary already at `destination` that no inventory row owns: are its
@@ -76,7 +85,6 @@ pub trait ArtifactSource {
 /// the digest source.
 pub struct ReleaseArtifactSource {
     pub(super) runner: Box<dyn super::runtime::CommandRunner>,
-    pub(super) daemon_replacement: Option<super::daemon_bundle::Replacement>,
     target: AlphaTarget,
     index_url: String,
     index: Option<Result<ReleaseIndex, IndexRefusal>>,
@@ -94,7 +102,6 @@ impl ReleaseArtifactSource {
     pub fn current() -> Self {
         Self {
             runner: Box::new(super::runtime::SystemCommandRunner),
-            daemon_replacement: None,
             target: host_alpha_target(),
             index_url: release_index::index_url(),
             index: None,
@@ -107,7 +114,6 @@ impl ReleaseArtifactSource {
     pub fn from_index(index: ReleaseIndex, target: AlphaTarget) -> Self {
         Self {
             runner: Box::new(super::runtime::SystemCommandRunner),
-            daemon_replacement: None,
             target,
             index_url: String::new(),
             index: Some(Ok(index)),
@@ -365,18 +371,11 @@ impl ArtifactSource for ReleaseArtifactSource {
         destination: &Path,
     ) -> Result<PlacementDigests, String> {
         let binary_name = platform_binary(binary);
+        if self.target == AlphaTarget::DarwinArm64 && binary == "ck-subc" {
+            return Err("internal: the macOS daemon bundle is placed with install_recorded".into());
+        }
         let fetched = self.fetch_candidate(component, binary)?;
         let candidate = fetched.candidate.clone();
-        if self.target == AlphaTarget::DarwinArm64 && binary == "ck-subc" {
-            let home = super::daemon_bundle::binary_home(destination)?;
-            let replacement =
-                super::daemon_bundle::Replacement::place(&candidate, &home, &mut self.runner)?;
-            self.daemon_replacement = Some(replacement);
-            return Ok(PlacementDigests {
-                binary_sha256: digest_file(destination)?,
-                archive_sha256: fetched.archive_sha256.clone(),
-            });
-        }
         let parent = destination.parent().ok_or_else(|| {
             format!(
                 "managed binary destination {} has no parent",
@@ -442,13 +441,39 @@ impl ArtifactSource for ReleaseArtifactSource {
         verify_acceptance(destination, acceptance)
     }
 
-    fn rollback_install(&mut self, destination: &Path) -> Result<(), String> {
-        if super::daemon_bundle::containing_bundle(destination).is_some() {
-            if let Some(mut replacement) = self.daemon_replacement.take() {
-                return replacement.rollback();
+    fn install_recorded(
+        &mut self,
+        component: Component,
+        binary: &str,
+        destination: &Path,
+        inventory: &mut Inventory,
+    ) -> Result<PlacementDigests, String> {
+        if let Some(transaction) = inventory.transaction() {
+            let fetched = self.fetch_candidate(component, binary)?;
+            #[cfg(unix)]
+            if self.target == AlphaTarget::DarwinArm64 && binary == "ck-subc" {
+                let staged = super::daemon_bundle::containing_bundle(&fetched.candidate)
+                    .ok_or("download did not contain the daemon app")?;
+                let bundle = super::daemon_bundle::containing_bundle(destination)
+                    .ok_or("managed daemon path is not in its app")?;
+                super::install_journal::bundle::place(
+                    transaction.journal(),
+                    bundle,
+                    staged,
+                    &mut self.runner,
+                )?;
+                return Ok(PlacementDigests {
+                    binary_sha256: digest_file(destination)?,
+                    archive_sha256: fetched.archive_sha256.clone(),
+                });
             }
+            transaction.replace(destination, &fetched.candidate)?;
+            return Ok(PlacementDigests {
+                binary_sha256: digest_file(destination)?,
+                archive_sha256: fetched.archive_sha256.clone(),
+            });
         }
-        remove_placed_binary(destination).map_err(|error| error.to_string())
+        Err("release placement requires an install transaction".into())
     }
 }
 
@@ -835,39 +860,24 @@ pub fn install_component<S: ArtifactSource>(
                 }
             }
         }
-        let digests = source.install(component, binary, &destination)?;
-        // Acceptance runs between placement and the inventory record. If it
-        // refuses, the placed file must not survive: it is owned by nobody, so
-        // the next `ck setup` would refuse it as a foreign binary at the
-        // managed destination, and the operator could never re-run setup
-        // without hand-deleting what setup itself left behind.
+        let digests = source.install_recorded(component, binary, &destination, inventory)?;
+        // Acceptance precedes the ownership record. A failed check leaves the
+        // journal to restore the component rather than adopting the candidate.
         let accepted = source
             .acceptance(component, binary)
             .and_then(|acceptance| source.verify(&destination, &acceptance));
-        if let Err(error) = accepted {
-            match source.rollback_install(&destination) {
-                Ok(()) => return Err(error),
-                Err(cleanup) => {
-                    return Err(format!(
-                    "{error}; additionally could not remove the unaccepted binary at {}: {cleanup}",
-                    destination.display()
-                ))
-                }
+        #[cfg(test)]
+        if let Err(error) = &accepted {
+            if !inventory.transaction_is_open() {
+                // Direct fixture sources place plain files, not app bundles.
+                std::fs::remove_file(&destination).map_err(|cleanup| format!("{error}; additionally could not remove the unaccepted fixture binary at {}: {cleanup}", destination.display()))?;
             }
         }
+        accepted?;
         record_placement(component, &destination, digests, inventory)?;
         println!("  placed {}", display_home_path(&destination));
     }
     Ok(())
-}
-
-pub(super) fn remove_placed_binary(destination: &Path) -> std::io::Result<()> {
-    if cfg!(target_os = "macos") {
-        if let Some(bundle) = super::daemon_bundle::containing_bundle(destination) {
-            return fs::remove_dir_all(bundle);
-        }
-    }
-    fs::remove_file(destination)
 }
 
 fn record_placement(
@@ -893,19 +903,11 @@ fn record_placement(
         fields.insert("version".to_string(), Value::String(version));
     }
     inventory.record("managed-binary", destination, fields);
-    // The ownership record must be durable the moment the binary it
-    // describes is. Deferring the save to the end of the whole plan meant
-    // a refusal anywhere later left every already-accepted binary on disk
-    // with its record lost — and the next `ck setup` refused them as
-    // foreign files at managed destinations. A binary placed, accepted,
-    // and recorded is a completed mutation regardless of what the plan
-    // does next.
-    inventory.save().map_err(|error| {
-        format!(
-            "placed and accepted {} but could not record ownership: {error}",
-            destination.display()
-        )
-    })
+    #[cfg(test)]
+    if !inventory.transaction_is_open() {
+        inventory.save()?;
+    }
+    Ok(())
 }
 
 pub fn configure_component(
@@ -925,7 +927,7 @@ pub fn configure_component(
                 )
             })?;
     if let Some(change) = &change {
-        config::apply(change)?;
+        config::apply_recorded(change, inventory)?;
         let configured = component.module_id().unwrap_or(component.label());
         println!(
             "  configured {configured} in {}",

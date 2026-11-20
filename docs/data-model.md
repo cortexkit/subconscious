@@ -86,6 +86,16 @@ stale one.
   account's real daemon through it. Tests:
   `set_and_wrong_environment_path_fails_without_fallback` (`crates/subc-transport/src/connection_file.rs`) and
   `discovery_without_overrides_keeps_three_rung_order_and_deduplicates` (`crates/subc-transport/src/connection_file.rs`).
+- `ck` chooses among the default files (`discover_reachable` in
+  `crates/subc-transport/src/connection_file.rs`): a readable file whose
+  endpoint refuses connections, with another readable file after it, is left
+  by a daemon that is gone, so `ck` skips it with a warning naming it. A
+  daemon that answers but fails the identity check stops the command with an
+  error naming the other files; `ck` never tries a different daemon after
+  that. A named file (`--subc` or `SUBC_CONNECTION_FILE`) is never skipped.
+  Tests: `implicit_discovery_skips_a_default_file_nothing_listens_at` (`crates/subc-transport/src/connection_file.rs`),
+  `implicit_discovery_keeps_a_listening_file_and_names_the_rest` (`crates/subc-transport/src/connection_file.rs`) and
+  `named_files_stay_exclusive_under_reachable_discovery` (`crates/subc-transport/src/connection_file.rs`).
 - A new daemon writes a new key. A client holding the old one fails the
   handshake and must re-read the file. Test:
   `key_rotation_rejects_old_connection_file_then_accepts_reread_file` (`crates/subc-transport/tests/handshake.rs`).
@@ -156,9 +166,10 @@ because two messages carry the same id. Tests:
 
 ## 7. Installer inventory
 
-`installer-manifest.json` records every change the installer, `ck setup`,
-`ck upgrade` and self-update made: placed binaries, PATH edits and service
-registration. `ck setup --uninstall` removes only what this inventory names,
+`installer-manifest.json` records the ownership of installed binaries, PATH
+edits and service registrations at commit. `installer.journal` records the
+steps of an interrupted installation, upgrade or uninstall for recovery under
+the install lock. `ck setup --uninstall` removes only what the inventory names,
 and leaves configuration and module stores in place
 (`crates/subc-core/src/setup/inventory.rs`, `crates/subc-core/src/setup/uninstall.rs`;
 test `uninstall_removes_only_inventory_paths_and_retains_configuration_and_stores` (`crates/subc-core/src/setup/uninstall.rs`)).

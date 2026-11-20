@@ -154,7 +154,7 @@ pub(super) fn daemon_processes<R: CommandRunner + ?Sized>(
         .collect())
 }
 
-pub(super) fn connected_daemon<R: CommandRunner>(
+pub(in crate::setup) fn connected_daemon<R: CommandRunner>(
     runner: &mut R,
     daemon: &Path,
     connection: Option<&Path>,

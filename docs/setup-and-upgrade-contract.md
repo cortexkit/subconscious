@@ -235,14 +235,13 @@ Fresh installer destinations separate the operator command from managed daemon a
 
 Existing installations are not moved by `ck setup` or `ck upgrade`; their owners move their PATH entry by hand if they want only `ck` on PATH. No automatic migration is attempted.
 
-No installation path or PATH operation requires elevation. The installer checks whether an existing destination binary matches its archive sidecar digest. On a match it reports the existing binary and skips placement; PATH and ownership-record steps remain idempotent.
+No installation path or PATH operation requires elevation. The bootstrap script verifies the archive digest and asks the extracted `ck` to journal placement. The installed `ck setup` then records ownership and reconciles PATH.
 
-`installer-manifest.json` in the platform data directory is the ownership
-inventory. It records every mutation managed by installation, setup, uninstall,
-or self-update, including binary placements, PATH changes, and runtime
-registration. Setup, uninstall, and self-update may mutate or remove only
-items established in this inventory; retained user configuration and component
-stores are never treated as managed binaries.
+`installer-manifest.json` in the platform data directory is the installed
+ownership inventory. `installer.journal` holds write-ahead evidence for an
+in-progress transaction; the inventory changes only at commit. Setup, uninstall,
+and self-update check ownership before replacing or removing installed files.
+User configuration and component stores are never treated as managed binaries.
 
 ## Setup command model
 
@@ -507,11 +506,13 @@ release data, and produces an ordered plan. Magic Context (`ck-mc`) is an
 upgrade target on the targets that have its archive; its releases are build
 trains, so its version is compared as a train id rather than a number.
 
-For every selected non-self target, the executor derives the matching archive
-and sidecar, verifies SHA-256, creates a rollback copy, places the candidate,
-warm-executes the destination inode, and post-verifies PID, destination inode,
-health, and version. Failed post-verification offers rollback; accepting it
-restores the prior inode. The command prints evidence for each completed stage.
+For every selected non-self target, the executor verifies the archive SHA-256,
+journals the previous and candidate files, places and warm-executes the
+candidate, and verifies the resulting process identity, destination, health,
+and version. Failed activation leaves the journal available for recovery;
+accepting rollback restores the previous files and verifies the previous live
+build before closing the transaction. The command prints evidence for each
+completed stage.
 
 The ladder runs the daemon first, then the modules, then `ck`. A module built
 against a newer wire crate can send a HELLO that an older daemon refuses (the
@@ -565,11 +566,13 @@ Restart semantics are target-specific:
   target, after the daemon and all modules have completed, so its failure
   cannot undo or strand their completed sequence.
 
-On Unix, self-update verifies a temporary replacement and atomically renames it
-over the current executable. The running process retains the prior inode, and
-a subsequent invocation must execute the new destination inode. On Windows,
-`ck.exe` is renamed to `ck.exe.old`, the verified replacement is placed as
-`ck.exe` without elevation, and the next successful invocation deletes `.old`.
+On Unix, self-update atomically publishes the replacement while the running
+process retains its previous inode. On Windows it moves the mapped `ck.exe`
+into private journal staging before publishing the replacement. Both moves are
+durable and do not overwrite their destination. If Windows setup or upgrade is
+interrupted between those moves and `ck` is missing, the verified installer
+helper can recover it. A committed backup still in use is cleaned up on a
+later applying run.
 
 ## Release lanes
 
@@ -592,9 +595,9 @@ development identities never enter the release path.
 ## Verification requirements
 
 Tests must prove observable effects and preserved state, not only success
-messages. At minimum they cover the fixed target tuples; unsupported and
-release-incomplete refusals; direct archive and sidecar naming; installer
-idempotence and its prohibition on executing setup; dry-run read-only behavior
+messages. At minimum they cover the fixed target tuples; refusals when a target
+is unsupported or its release archive is missing; installer handover to setup
+and idempotence; dry-run read-only behavior
 and plan equivalence; all per-user runtime registrations with immediate
 liveness; manifest-limited uninstall and self-update ownership; explicit AFT
 conversion; Magic Context precedence, two tiers, foreign and torn state, `SQLITE_BUSY`,

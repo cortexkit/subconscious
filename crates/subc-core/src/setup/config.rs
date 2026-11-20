@@ -5,9 +5,9 @@ use std::{
 };
 
 use serde_json::{Map, Value};
-use subc_jsonc::{
-    insert_member_with, jsonc_member_span, jsonc_to_json, read_document, to_string_pretty_sorted,
-};
+#[cfg(test)]
+use subc_jsonc::jsonc_member_span;
+use subc_jsonc::{insert_member_with, jsonc_to_json, read_document, to_string_pretty_sorted};
 
 use super::{file_modes, model::Component};
 
@@ -311,10 +311,37 @@ pub fn apply(change: &ConfigChange) -> Result<(), String> {
     )
 }
 
+pub(super) fn apply_recorded(
+    change: &ConfigChange,
+    inventory: &mut super::inventory::Inventory,
+) -> Result<(), String> {
+    if let Some(transaction) = inventory.transaction() {
+        let current = match fs::read_to_string(&change.path) {
+            Ok(current) => current,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+            Err(error) => {
+                return Err(format!(
+                    "could not reread {}: {error}",
+                    change.path.display()
+                ))
+            }
+        };
+        if current != change.before {
+            return Err(format!(
+                "refusal: configuration {} changed while planning",
+                change.path.display()
+            ));
+        }
+        return transaction.write(&change.path, change.after.as_bytes(), 0o600);
+    }
+    apply(change)
+}
+
 /// Removes only a component's values when setup must unwind a later failure.
 /// Matching the generated values prevents rollback from deleting a user edit
 /// that occurred after setup wrote the original component entry.
-pub fn rollback_change(change: &ConfigChange) -> Result<bool, String> {
+#[cfg(test)]
+pub(super) fn rollback_change(change: &ConfigChange) -> Result<bool, String> {
     let current = match fs::read_to_string(&change.path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -406,6 +433,7 @@ pub fn rollback_change(change: &ConfigChange) -> Result<bool, String> {
     Ok(removed)
 }
 
+#[cfg(test)]
 fn inserted_values(before: &Value, after: &Value) -> Vec<(String, Value)> {
     fn collect(
         before: Option<&Value>,

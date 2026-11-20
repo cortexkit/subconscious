@@ -13,10 +13,6 @@ use super::{
 pub struct UninstallReport {
     pub removed: Vec<PathBuf>,
     pub retained: Vec<String>,
-    /// Removals that complete only after this process exits, each stated
-    /// with the mechanism, so the operator is not left to wonder about a
-    /// file that is still there when the command returns.
-    pub deferred: Vec<String>,
 }
 
 /// Remove only paths named by the ownership inventory. Configuration and stores
@@ -32,7 +28,29 @@ pub fn uninstall<R: CommandRunner>(
 ) -> Result<UninstallReport, String> {
     let mut report = UninstallReport::default();
     if inventory.owns_path("runtime-registration", &runtime_paths.definition) {
-        runtime::deregister(platform, runtime_paths, daemon_pid, runner)?;
+        if let Some(transaction) = inventory.transaction() {
+            let mut service = super::install_journal::registration::Service {
+                platform,
+                paths: runtime_paths,
+                runner,
+            };
+            let path = &runtime_paths.definition;
+            let registered = runtime::observe(platform, service.runner)?.registered;
+            let before = service.record(
+                path,
+                registered,
+                super::install_journal::files::digest(path)?,
+            );
+            let after = service.record(path, false, None);
+            if before.registered {
+                let journal = transaction.journal();
+                let index = service.prepare(journal, before, after)?;
+                service.replay(journal.step(index))?;
+                journal.done(index)?;
+            }
+        } else {
+            runtime::deregister(platform, runtime_paths, daemon_pid, runner)?;
+        }
         inventory.remove_owned_path("runtime-registration", &runtime_paths.definition);
     }
     remove_owned_path(
@@ -44,6 +62,34 @@ pub fn uninstall<R: CommandRunner>(
 
     for kind in ["managed-link", "managed-binary", "binary-placement"] {
         for path in inventory.paths_for_kind(kind) {
+            #[cfg(unix)]
+            if platform == RuntimePlatform::Macos {
+                if let Some(bundle) = super::daemon_bundle::containing_bundle(&path) {
+                    if inventory.transaction_is_open() && path.is_file() {
+                        if let Some(expected) = inventory
+                            .entry_for_path(kind, &path)
+                            .and_then(|row| row.get("sha256"))
+                            .and_then(serde_json::Value::as_str)
+                        {
+                            if digest_file(&path)? != expected {
+                                report.retained.push(format!(
+                                    "modified managed destination retained: {}",
+                                    bundle.display()
+                                ));
+                                continue;
+                            }
+                        }
+                        super::install_journal::bundle::remove(
+                            inventory.transaction().unwrap().journal(),
+                            bundle,
+                            runner,
+                        )?;
+                        inventory.remove_owned_path(kind, &path);
+                        report.removed.push(bundle.to_owned());
+                        continue;
+                    }
+                }
+            }
             remove_owned_path(kind, &path, inventory, &mut report)?;
         }
     }
@@ -94,17 +140,13 @@ fn remove_owned_path(
                 path.display()
             ));
         }
-        if cfg!(windows) && is_this_process_image(path) {
-            let parked = retire_running_image(path)?;
-            report.deferred.push(format!(
-                "{}: Windows cannot delete a running executable; renamed to {} and deleted after this process exits",
-                plain_path(path),
-                plain_path(&parked)
-            ));
+        if let Some(transaction) = inventory.transaction() {
+            transaction.remove(path)?;
+            report.removed.push(path.to_owned());
             inventory.remove_owned_path(kind, path);
             return Ok(());
         }
-        remove_file_when_released(path).map_err(|error| {
+        fs::remove_file(path).map_err(|error| {
             format!(
                 "could not remove inventory-owned {}: {error}",
                 path.display()
@@ -151,6 +193,13 @@ fn remove_owned_symlink(
                 ));
                 return Ok(());
             }
+            #[cfg(unix)]
+            if let Some(transaction) = inventory.transaction() {
+                super::install_journal::symlink::place(transaction.journal(), path, None)?;
+                report.removed.push(path.to_owned());
+                inventory.remove_owned_path(kind, path);
+                return Ok(());
+            }
             fs::remove_file(path).map_err(|error| {
                 format!(
                     "could not remove inventory-owned {}: {error}",
@@ -162,85 +211,6 @@ fn remove_owned_symlink(
     }
     inventory.remove_owned_path(kind, path);
     Ok(())
-}
-
-/// Whether `path` is the executable this process is running from. The
-/// uninstall removes the managed `ck.exe`, and on Windows that is the very
-/// image executing the removal.
-fn is_this_process_image(path: &Path) -> bool {
-    let Ok(this) = std::env::current_exe().and_then(fs::canonicalize) else {
-        return false;
-    };
-    fs::canonicalize(path).map(|p| p == this).unwrap_or(false)
-}
-
-/// Removes the running executable the only way Windows allows: rename it out
-/// from under its name now (permitted while it runs), and hand the delete to
-/// a detached `cmd` that waits for this process to exit. The bin directory
-/// stops resolving `ck` the moment the rename lands; the parked file carries
-/// a name that explains itself if the deferred delete never runs.
-fn retire_running_image(path: &Path) -> Result<PathBuf, String> {
-    let parked = path.with_extension(format!("exe.uninstalled-{}", std::process::id()));
-    fs::rename(path, &parked).map_err(|error| {
-        format!(
-            "could not rename the running executable {} aside for removal: {error}",
-            path.display()
-        )
-    })?;
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // cmd.exe rejects the `\\?\` extended-length form ("The specified
-        // path is invalid"), so the deleter gets the plain drive path.
-        let plain = plain_path(&parked);
-        // The command line reaches cmd.exe verbatim (`raw_arg`): the default
-        // argument quoting would wrap the whole script in quotes and escape
-        // the path's, which cmd reads as a bad filename. DETACHED_PROCESS |
-        // CREATE_NO_WINDOW: the deleter must outlive us and must not flash a
-        // console.
-        let script = format!("/C ping 127.0.0.1 -n 4 > nul & del /F /Q \"{plain}\"");
-        let _ = std::process::Command::new("cmd.exe")
-            .raw_arg(&script)
-            .creation_flags(0x0000_0008 | 0x0800_0000)
-            .spawn()
-            .map_err(|error| {
-                format!(
-                    "could not schedule deletion of {}: {error}",
-                    parked.display()
-                )
-            })?;
-    }
-    Ok(parked)
-}
-
-/// A path as an operator or cmd.exe reads it: inventory rows carry canonical
-/// Windows paths with the `\\?\` extended-length prefix, which cmd.exe
-/// refuses and no operator types.
-fn plain_path(path: &Path) -> String {
-    let text = path.to_string_lossy();
-    text.strip_prefix(r"\\?\").unwrap_or(&text).to_string()
-}
-
-/// Removes a file, waiting out a process that is still releasing it. On
-/// Windows an executable stays undeletable ("Access is denied") until the
-/// process running it has fully exited, and the daemon was asked to stop
-/// only moments earlier by `deregister`; the wait is bounded so a daemon
-/// that never exits still produces the refusal, with the OS's words.
-fn remove_file_when_released(path: &Path) -> std::io::Result<()> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        match fs::remove_file(path) {
-            Ok(()) => return Ok(()),
-            Err(error)
-                if cfg!(windows)
-                    && error.kind() == std::io::ErrorKind::PermissionDenied
-                    && std::time::Instant::now() < deadline =>
-            {
-                std::thread::sleep(std::time::Duration::from_millis(200));
-            }
-            Err(error) => return Err(error),
-        }
-    }
 }
 
 #[cfg(test)]

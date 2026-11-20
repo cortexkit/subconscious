@@ -111,7 +111,15 @@ fn nats_setup_disabled_entry_is_rewritten_without_health_wait() {
         .unwrap();
     assert_eq!(nats_entry(&backend)["protocol"], "subc");
     assert_eq!(nats_entry(&backend)["enabled"], false);
-    backend.finish_daemon_migration(Ok(())).unwrap();
+    backend
+        .component_steps
+        .get_mut(&Component::Core)
+        .unwrap()
+        .nats_migration
+        .as_mut()
+        .unwrap()
+        .complete(&mut backend.inventory)
+        .unwrap();
     assert!(!root
         .join(format!(
             "bin/nats-server{}",
@@ -125,6 +133,7 @@ fn nats_setup_verification_failure_restores_entry_and_stock_binary() {
     let root = ScratchDir::new("nats-setup-rollback");
     let (mut backend, _) = nats_setup_fixture(&root, true);
     let original = nats_entry(&backend);
+    backend.inventory.start_transaction().unwrap();
     backend
         .apply(&SetupOperation::ConfigureComponent {
             component: Component::Core,
@@ -132,12 +141,16 @@ fn nats_setup_verification_failure_restores_entry_and_stock_binary() {
         .unwrap();
     backend.apply(&SetupOperation::ConfigureMessageHub).unwrap();
     assert_eq!(nats_entry(&backend)["protocol"], "subc");
-    assert!(backend
-        .finish_daemon_migration(Err("pair health failed".into()))
-        .unwrap_err()
-        .contains("pair health failed"));
+    backend
+        .inventory
+        .undo_transaction(&mut crate::setup::install_journal::bootstrap::FileRecovery)
+        .unwrap();
     assert_eq!(nats_entry(&backend), original);
-    assert!(subc_jsonc::read_document(&backend.paths.config_path).unwrap().1["modules"].get("nats-hub").is_none());
+    assert!(subc_jsonc::read_document(&backend.paths.config_path)
+        .unwrap()
+        .1["modules"]
+        .get("nats-hub")
+        .is_none());
     assert_eq!(
         fs::read(root.join(format!(
             "bin/nats-server{}",
@@ -156,19 +169,35 @@ fn message_plane_setup_hub_repeat_and_rollback_keep_existing_entries() {
         let path = backend.paths.config_path.clone();
         if existing {
             let (mut text, _) = subc_jsonc::read_document(&path).unwrap();
-            subc_jsonc::set_member(&mut text, &["modules", "nats-hub"], &serde_json::json!({"enabled":false,"program":"operator-hub"})).unwrap();
+            subc_jsonc::set_member(
+                &mut text,
+                &["modules", "nats-hub"],
+                &serde_json::json!({"enabled":false,"program":"operator-hub"}),
+            )
+            .unwrap();
             fs::write(&path, text).unwrap();
         }
         let before = fs::read(&path).unwrap();
+        backend.inventory.start_transaction().unwrap();
         backend.apply(&SetupOperation::ConfigureMessageHub).unwrap();
         let after = fs::read(&path).unwrap();
         if !existing {
             let doc = subc_jsonc::read_document(&path).unwrap().1;
-            assert_eq!(doc["modules"]["nats-hub"]["args"][1], root.join("data").join("nats-hub").join("server.conf").to_string_lossy().as_ref());
+            assert_eq!(
+                doc["modules"]["nats-hub"]["args"][1],
+                root.join("data")
+                    .join("nats-hub")
+                    .join("server.conf")
+                    .to_string_lossy()
+                    .as_ref()
+            );
         }
         backend.apply(&SetupOperation::ConfigureMessageHub).unwrap();
         assert_eq!(fs::read(&path).unwrap(), after);
-        backend.rollback_component(Component::Core).unwrap();
+        backend
+            .inventory
+            .undo_transaction(&mut crate::setup::install_journal::bootstrap::FileRecovery)
+            .unwrap();
         assert_eq!(fs::read(&path).unwrap(), before);
     }
 }
@@ -180,7 +209,11 @@ fn message_plane_setup_uses_the_installed_vault_cli_after_it_is_live() {
         calls: std::sync::Arc<std::sync::Mutex<usize>>,
     }
     impl CommandRunner for VaultRunner {
-        fn run(&mut self, program: &str, args: &[String]) -> Result<runtime::CommandResult, String> {
+        fn run(
+            &mut self,
+            program: &str,
+            args: &[String],
+        ) -> Result<runtime::CommandResult, String> {
             let mut count = self.calls.lock().unwrap();
             let stdout = if *count == 0 {
                 assert_eq!(args, ["--json", "module", "status", "claustrum"]);
@@ -192,14 +225,22 @@ fn message_plane_setup_uses_the_installed_vault_cli_after_it_is_live() {
                 "already granted (no change)".into()
             };
             *count += 1;
-            Ok(runtime::CommandResult { success: true, stdout, stderr: String::new() })
+            Ok(runtime::CommandResult {
+                success: true,
+                stdout,
+                stderr: String::new(),
+            })
         }
     }
     let root = ScratchDir::new("message-setup-vault-cli");
     let mut backend = backend_without_user_manager(&root);
     let calls = std::sync::Arc::new(std::sync::Mutex::new(0));
     backend.runner = Box::new(VaultRunner {
-        auth: root.join("bin").join(if cfg!(windows) {"ck-auth.exe"} else {"ck-auth"}),
+        auth: root.join("bin").join(if cfg!(windows) {
+            "ck-auth.exe"
+        } else {
+            "ck-auth"
+        }),
         calls: calls.clone(),
     });
     backend.apply(&SetupOperation::GrantMessageKeys).unwrap();

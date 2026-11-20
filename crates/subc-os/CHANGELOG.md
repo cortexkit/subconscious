@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.49
+
+- Create owner-only directories exclusively without changing existing paths. On
+  Windows, move running executables to unused names with write-through semantics
+  and read or replace the current user's PATH registry value without expanding
+  it or losing its type.
+
 ## 0.1.48
 
 - Allow a caller to check the target's contents after flushing the staging file

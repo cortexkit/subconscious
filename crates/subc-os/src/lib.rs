@@ -91,6 +91,8 @@ mod durable_replace;
 mod retained_file;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 mod retained_replace;
+#[cfg(windows)]
+pub use durable_replace::durable_move_to_new_name;
 #[cfg(feature = "test-support")]
 pub use durable_replace::durable_replace_with_rename_hook;
 pub use durable_replace::{durable_replace, DurableReplaceError};
@@ -113,12 +115,16 @@ pub mod launch_nonce;
 pub mod local_peer;
 pub mod named_pipe;
 pub mod privacy_identity;
+mod private_directory;
 #[cfg(unix)]
 pub mod process_group;
 pub mod process_identity;
+pub use private_directory::create_private_directory_exclusive;
 pub mod registration_channel;
 pub mod script_pipe;
 pub mod socket_peer;
+#[cfg(windows)]
+pub mod user_path;
 #[cfg_attr(not(windows), path = "windows_acl_noop.rs")]
 pub mod windows_acl;
 #[cfg(unix)]

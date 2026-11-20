@@ -82,18 +82,47 @@ impl SetupUpgradeService {
         if let Some(refusal) = super::text::upgrade_ownership_refusal(&ownership) {
             return Ok((refused(refusal), None));
         }
-        let cache = super::UpdateCache::from_environment();
-        let source = super::IndexReleaseSource::from_environment(super::TARGET_CHECK_BUDGET);
         let roster: Vec<UpgradeTarget> = discovered.iter().map(|item| item.target).collect();
-        let metadata = match super::check_update_metadata(&cache, &source, &roster).await {
-            Ok(metadata) => metadata,
-            Err(super::UpdateCheckError::IndexUnreachable { .. }) => {
-                return Err(super::not_checked_from_cache(&cache).render())
-            }
-            Err(error) => return Err(error.to_string()),
-        };
+        self.plan_at(
+            &super::upgrade::current_manifest()?,
+            discovered,
+            async move {
+                let cache = super::UpdateCache::from_environment();
+                let source =
+                    super::IndexReleaseSource::from_environment(super::TARGET_CHECK_BUDGET);
+                let metadata = match super::check_update_metadata(&cache, &source, &roster).await {
+                    Ok(metadata) => metadata,
+                    Err(super::UpdateCheckError::IndexUnreachable { .. }) => {
+                        return Err(super::not_checked_from_cache(&cache).render())
+                    }
+                    Err(error) => return Err(error.to_string()),
+                };
+                let index = source.cloned_index().map_err(|error| error.to_string())?;
+                Ok((metadata, index))
+            },
+        )
+        .await
+    }
+
+    async fn plan_at(
+        &self,
+        manifest: &std::path::Path,
+        discovered: Vec<ManagedUpgradeTarget>,
+        updates: impl Future<
+            Output = Result<
+                (
+                    super::update_cache::UpdateMetadata,
+                    super::release_index::ReleaseIndex,
+                ),
+                String,
+            >,
+        >,
+    ) -> Result<(UpgradeCheck, Option<Ready>), String> {
+        if let Some(refusal) = super::upgrade::unresumed_activation_refusal(manifest)? {
+            return Ok((refused(refusal), None));
+        }
+        let (metadata, index) = updates.await?;
         let modules = self.daemon.supervised_modules().await;
-        let index = source.cloned_index().map_err(|error| error.to_string())?;
         let observed =
             super::observed_upgrade_targets(&metadata, &discovered, modules, Some(&index));
         let plan = super::plan_upgrade(&observed);
@@ -132,10 +161,37 @@ impl UpgradeService for SetupUpgradeService {
         report: &mut dyn FnMut(UpgradeEvent),
         ask: &mut dyn FnMut(RollbackQuestion) -> Option<RollbackChoice>,
     ) -> UpgradeOutcome {
+        keep_installer_messages(|| self.run_installer(report, ask))
+    }
+}
+
+fn keep_installer_messages(run: impl FnOnce() -> UpgradeOutcome) -> UpgradeOutcome {
+    let (mut outcome, messages) = super::messages::keep(run);
+    outcome.warnings.splice(..0, messages);
+    outcome
+}
+
+impl SetupUpgradeService {
+    fn run_installer(
+        &self,
+        report: &mut dyn FnMut(UpgradeEvent),
+        ask: &mut dyn FnMut(RollbackQuestion) -> Option<RollbackChoice>,
+    ) -> UpgradeOutcome {
         let stopped = |error: String| UpgradeOutcome {
             error: Some(error),
             ..UpgradeOutcome::default()
         };
+        // Apply plans under the install lock; the rollback prompt releases it.
+        let hold = match super::upgrade::take_install_hold("ck upgrade (app)") {
+            Ok(hold) => hold,
+            Err(error) => return stopped(error),
+        };
+        if let Err(error) = super::upgrade::recover_upgrade(
+            &self.executable,
+            self.daemon.connection_path().as_deref(),
+        ) {
+            return stopped(error);
+        }
         let (check, ready) = match self.runtime.block_on(self.plan()) {
             Ok(planned) => planned,
             Err(error) => return stopped(error),
@@ -159,6 +215,7 @@ impl UpgradeService for SetupUpgradeService {
             Ok(backend) => backend,
             Err(error) => return stopped(error),
         };
+        backend.retain_app_hold(hold);
         backend.set_supervised_modules(ready.observed.supervised_modules.clone());
         let mut versions = BTreeMap::new();
         let mut previous = BTreeMap::new();
@@ -365,6 +422,16 @@ impl<B> Reporting<'_, B> {
 }
 
 impl<B: UpgradeExecutionBackend> UpgradeExecutionBackend for Reporting<'_, B> {
+    fn abort_before_activation(&mut self) -> Result<bool, String> {
+        self.inner.abort_before_activation()
+    }
+    fn leave_unconfirmed(&mut self, target: UpgradeTarget) -> Result<(), String> {
+        self.inner.leave_unconfirmed(target)
+    }
+
+    fn finish_verified(&mut self, target: UpgradeTarget) -> Result<(), String> {
+        self.inner.finish_verified(target)
+    }
     fn configure_message_hub(&mut self, target: UpgradeTarget) -> Result<(bool, String), String> {
         let mut changed = false;
         let detail = self.stage(Some(target), "message-hub-entry", |b| {
@@ -469,9 +536,6 @@ impl<B: UpgradeExecutionBackend> UpgradeExecutionBackend for Reporting<'_, B> {
     }
 
     fn rollback_decision(&mut self, target: UpgradeTarget) -> RollbackDecision {
-        if self.inner.failure_rollback_target().is_some() {
-            return self.inner.rollback_decision(target);
-        }
         let label = target.label();
         let question = RollbackQuestion {
             component: label.to_string(),
@@ -487,6 +551,14 @@ impl<B: UpgradeExecutionBackend> UpgradeExecutionBackend for Reporting<'_, B> {
         }
     }
 
+    fn pause_rollback_prompt(&mut self) -> Result<(), String> {
+        self.inner.pause_rollback_prompt()
+    }
+
+    fn resume_rollback_prompt(&mut self, decision: RollbackDecision) -> Result<(), String> {
+        self.inner.resume_rollback_prompt(decision)
+    }
+
     fn rollback(&mut self, target: UpgradeTarget) -> Result<String, String> {
         self.stage(Some(target), "rollback", |b| b.rollback(target))
     }
@@ -495,6 +567,70 @@ impl<B: UpgradeExecutionBackend> UpgradeExecutionBackend for Reporting<'_, B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_upgrade_keeps_retired_journal_messages_with_its_warnings() {
+        let outcome = keep_installer_messages(|| {
+            super::super::install_journal::retired::report_busy(std::path::Path::new(
+                "staged/previous",
+            ));
+            UpgradeOutcome {
+                warnings: vec!["backend warning".into()],
+                ..UpgradeOutcome::default()
+            }
+        });
+        assert_eq!(outcome.warnings.len(), 2, "{:?}", outcome.warnings);
+        assert!(outcome.warnings[0].contains("staged/previous is still in use"));
+        assert_eq!(outcome.warnings[1], "backend warning");
+    }
+
+    #[tokio::test]
+    async fn wizard_plan_does_not_refuse_an_install_with_only_a_retired_journal() {
+        struct NoModules;
+        impl UpgradeDaemon for NoModules {
+            fn connection_path(&self) -> Option<PathBuf> {
+                None
+            }
+            fn supervised_modules(
+                &self,
+            ) -> Pin<Box<dyn Future<Output = Result<BTreeSet<String>, String>> + Send + '_>>
+            {
+                Box::pin(async { Ok(BTreeSet::new()) })
+            }
+        }
+
+        let fixture = cortexkit_test_support::ScratchDir::new("wizard-retired-journal");
+        let manifest = fixture.join("installer-manifest.json");
+        let retired = fixture.join("installer.retired");
+        subc_os::create_private_directory_exclusive(&retired).unwrap();
+        let journal = retired.join("1-1.journal");
+        std::fs::write(&journal, "retained journal").unwrap();
+        let wizard = SetupUpgradeService::new(
+            fixture.join("ck"),
+            Box::new(NoModules),
+            tokio::runtime::Handle::current(),
+        );
+        let (check, _) = wizard
+            .plan_at(&manifest, Vec::new(), async {
+                Ok((
+                    super::super::update_cache::UpdateMetadata {
+                        format_version: super::super::update_cache::UPDATE_CACHE_FORMAT_VERSION,
+                        checked_at_unix_secs: 0,
+                        targets: BTreeMap::new(),
+                    },
+                    super::super::release_index::ReleaseIndex {
+                        schema: 1,
+                        channel: "alpha".into(),
+                        generated_at_ms: 0,
+                        components: BTreeMap::new(),
+                    },
+                ))
+            })
+            .await
+            .unwrap();
+        assert!(check.refusal.is_none(), "{:?}", check.refusal);
+        assert!(journal.exists(), "planning must not sweep retired journals");
+    }
     use crate::setup::components::upgrade_roster;
     use crate::setup::model::Component;
     use crate::setup::planner::plan_upgrade;
@@ -801,9 +937,11 @@ mod tests {
             failure: None,
             installed: Vec::new(),
         };
+        reporting.create_rollback_copy(target).unwrap();
         let detail = reporting
             .replace_destination(target)
             .expect("ck is replaced");
+        reporting.finish_verified(target).unwrap();
 
         assert_eq!(fs::read(&ck).unwrap(), b"new ck");
         assert_eq!(fs::read(&ckni).unwrap(), b"new ck", "{detail}");
@@ -812,14 +950,12 @@ mod tests {
             .entry_for_path(CKNI_KIND, &ckni)
             .expect("ckni stays on record");
         if cfg!(windows) {
-            assert!(detail.contains("copied ck to"), "{detail}");
             assert_eq!(row["mechanism"], "copy");
             assert_eq!(
                 row["sha256"],
                 crate::setup::components::digest_file(&ck).unwrap().as_str()
             );
         } else {
-            assert!(detail.contains("linked"), "{detail}");
             assert!(fs::symlink_metadata(&ckni)
                 .unwrap()
                 .file_type()

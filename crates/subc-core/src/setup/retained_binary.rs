@@ -34,28 +34,16 @@ impl RetainedBinary {
         }
     }
 
-    pub(super) fn restore(&self, inventory: &mut Inventory) {
-        for kind in OWNED_BINARY_KINDS {
-            inventory.remove_owned_path(kind, &self.new);
-        }
-        self.restore_legacy_rows(inventory);
-    }
-
-    pub(super) fn restore_legacy_rows(&self, inventory: &mut Inventory) {
-        for kind in OWNED_BINARY_KINDS {
-            inventory.remove_owned_path(kind, &self.old);
-        }
-        for (kind, row) in &self.rows {
-            inventory.record(kind, &self.old, row.clone());
-        }
-    }
-
     pub(super) fn complete(&self, inventory: &mut Inventory) -> Result<(), String> {
         if self.old != self.new {
             if !self.rows.is_empty() && self.old.is_file() {
-                fs::remove_file(&self.old).map_err(|e| {
-                    format!("could not remove legacy binary {}: {e}", self.old.display())
-                })?;
+                if let Some(transaction) = inventory.transaction() {
+                    transaction.remove(&self.old)?;
+                } else {
+                    fs::remove_file(&self.old).map_err(|e| {
+                        format!("could not remove legacy binary {}: {e}", self.old.display())
+                    })?;
+                }
             }
             for kind in OWNED_BINARY_KINDS {
                 inventory.remove_owned_path(kind, &self.old);

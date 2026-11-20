@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.18.1
+
+- Add `connection_file::discover_reachable` and `ReachableDiscovery` so implicit
+  discovery can skip stale endpoints and report the skipped files and remaining
+  candidates. An explicit path or `SUBC_CONNECTION_FILE` is still exclusive,
+  and `discover` is unchanged. Non-blocking opens refuse non-regular connection
+  files without hanging. Requires subc-os 0.1.49 on Windows and rustix's `fs`
+  feature on Unix.
+
 ## 0.18.0
 
 - Adopt protocol 0.37 types in public frame I/O and raise the OS helper floor

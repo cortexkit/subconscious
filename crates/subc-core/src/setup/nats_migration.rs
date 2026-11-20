@@ -116,6 +116,23 @@ impl Migration {
     }
 
     pub(super) fn apply(&mut self) -> Result<(), String> {
+        self.apply_with(|path, bytes| {
+            file_modes::write_atomic(path, bytes, 0o600, 0o600, "nats.tmp")
+        })
+    }
+
+    pub(super) fn apply_recorded(&mut self, inventory: &mut Inventory) -> Result<(), String> {
+        if let Some(transaction) = inventory.transaction() {
+            self.apply_with(|path, bytes| transaction.write(path, bytes, 0o600))
+        } else {
+            self.apply()
+        }
+    }
+
+    fn apply_with(
+        &mut self,
+        write: impl FnOnce(&Path, &[u8]) -> Result<(), String>,
+    ) -> Result<(), String> {
         if self.text.is_some() {
             return Ok(());
         }
@@ -143,40 +160,17 @@ impl Migration {
             return Ok(());
         }
         set_member(&mut after, ENTRY, &self.after)?;
-        file_modes::write_atomic(&self.config, after.as_bytes(), 0o600, 0o600, "nats.tmp")?;
+        write(&self.config, after.as_bytes())?;
         self.text = Some((before, after));
         Ok(())
     }
 
-    pub(super) fn rollback(&mut self, inventory: &mut Inventory) -> Result<(), String> {
-        if let Some((before, after)) = &self.text {
-            let (current, document) = read_document(&self.config)?;
-            if document["modules"]["nats-server"] != self.after {
-                return Err("refusal: modules.nats-server changed after migration; cannot overwrite it during rollback".into());
-            }
-            let restored = if &current == after {
-                before.clone()
-            } else {
-                let mut restored = current;
-                set_member(&mut restored, ENTRY, &self.before)?;
-                restored
-            };
-            file_modes::write_atomic(
-                &self.config,
-                restored.as_bytes(),
-                0o600,
-                0o600,
-                "nats.rollback.tmp",
-            )?;
-        }
-        self.legacy.restore_legacy_rows(inventory);
-        self.text = None;
-        inventory.save()
-    }
-
     pub(super) fn complete(&mut self, inventory: &mut Inventory) -> Result<(), String> {
         self.legacy.complete(inventory)?;
-        inventory.save()?;
+        #[cfg(test)]
+        if !inventory.transaction_is_open() {
+            inventory.save()?;
+        }
         self.text = None;
         Ok(())
     }

@@ -535,15 +535,18 @@ fn create_missing_parent_directories(path: &Path) -> Result<(), String> {
 
 #[cfg(unix)]
 fn create_directory_exact(path: &Path, mode: u32) -> Result<(), String> {
-    fs::DirBuilder::new()
-        .mode(mode)
-        .create(path)
-        .map_err(|error| {
-            format!(
+    match fs::DirBuilder::new().mode(mode).create(path) {
+        Ok(()) => {}
+        // Another installer command created it first; the mode check below
+        // still refuses anything but a directory.
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(format!(
                 "could not create managed directory {}: {error}",
                 path.display()
-            )
-        })?;
+            ))
+        }
+    }
     set_directory_mode(path, mode)
 }
 

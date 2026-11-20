@@ -6,13 +6,17 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde_json::{Map, Value};
+#[cfg(test)]
+use serde_json::Map;
+use serde_json::Value;
 
 mod lifecycle;
+pub(super) use lifecycle::connected_daemon;
 pub(crate) use lifecycle::wait_for_service_ready;
-use lifecycle::{connected_daemon, daemon_processes, wait_for_exit};
+use lifecycle::{daemon_processes, wait_for_exit};
 
 #[cfg(unix)]
+#[cfg(test)]
 use super::file_modes;
 use super::{
     definition::{canonical, windows_task_difference},
@@ -238,6 +242,21 @@ pub fn runtime_paths(
     }
 }
 
+/// [`runtime_paths`] for this process's session: on Linux the unit goes
+/// where the systemd user manager searches, which honours an absolute
+/// `XDG_CONFIG_HOME`.
+pub fn session_runtime_paths(
+    platform: RuntimePlatform,
+    binary_home: &Path,
+    user_home: &Path,
+) -> RuntimePaths {
+    let mut paths = runtime_paths(platform, binary_home, user_home);
+    if platform == RuntimePlatform::Linux {
+        paths.definition = super::systemd_unit::session_unit_path(user_home);
+    }
+    paths
+}
+
 /// How long the service manager lets the daemon run after asking it to stop,
 /// before it SIGKILLs it: launchd `ExitTimeOut` (default 20 s) and systemd
 /// `TimeoutStopSec` (default 90 s), set to the same value on both.
@@ -265,7 +284,7 @@ fn desired_definition(platform: RuntimePlatform, paths: &RuntimePaths) -> String
 
 // Setup resolves the Windows account first so a missing account is a setup
 // error with a message rather than a panic.
-fn desired_definition_checked(
+pub(super) fn desired_definition_checked(
     platform: RuntimePlatform,
     paths: &RuntimePaths,
 ) -> Result<String, String> {
@@ -514,6 +533,27 @@ pub fn definition_state<R: CommandRunner>(
     let metadata = match fs::symlink_metadata(&paths.definition) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Setup's unit recorded at the other configuration root: `ensure`
+            // moves it here, so this is a definition to rewrite, not a
+            // stranger's registered service.
+            if platform == RuntimePlatform::Linux {
+                if let Some(old) =
+                    super::systemd_unit::recorded_elsewhere(&paths.definition, inventory)
+                {
+                    let row = inventory
+                        .entry_for_path("runtime-definition", &old)
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    let is_file =
+                        fs::symlink_metadata(&old).is_ok_and(|metadata| metadata.is_file());
+                    if is_file
+                        && fs::read_to_string(&old)
+                            .is_ok_and(|text| definition_trusted(platform, paths, &row, &text))
+                    {
+                        return Ok(RuntimeState::Outdated { restart: false });
+                    }
+                }
+            }
             return Ok(if status.registered {
                 refusal("registered service has no owned definition file")
             } else {
@@ -538,13 +578,7 @@ pub fn definition_state<R: CommandRunner>(
         return Ok(refusal("unrecognized or user-edited contents"));
     };
     let desired = desired_definition_checked(platform, paths)?;
-    let trusted = match entry.get("definition_semantics").and_then(Value::as_str) {
-        Some(recorded) => recorded == parsed,
-        None => legacy_definitions(platform, paths, &desired)
-            .iter()
-            .any(|old| canonical(platform, old).ok().as_ref() == Some(&parsed)),
-    };
-    if !trusted {
+    if !definition_trusted(platform, paths, entry, &current) {
         return Ok(refusal(
             "user-edited contents differ from setup's recorded definition",
         ));
@@ -553,6 +587,47 @@ pub fn definition_state<R: CommandRunner>(
     let query_task = std::env::var_os("CK_TEST_SETUP_CONTROL_OK").is_none();
     #[cfg(not(feature = "test-support"))]
     let query_task = true;
+    // The unit is used by name: make sure the name means this file, or
+    // setup's own unit at the other root while a move from there is under
+    // way. Asked whether or not the unit is enabled: a loaded foreign unit
+    // must not be started either.
+    let elsewhere = if platform == RuntimePlatform::Linux {
+        super::systemd_unit::recorded_elsewhere(&paths.definition, inventory)
+    } else {
+        None
+    };
+    if platform == RuntimePlatform::Linux && query_task {
+        // The old file counts as setup's only while its contents are.
+        let trusted_elsewhere: Vec<PathBuf> = elsewhere
+            .iter()
+            .filter(|old| {
+                let row = inventory
+                    .entry_for_path("runtime-definition", old)
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                super::systemd_unit::regular_contents(old)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|bytes| {
+                        definition_trusted(platform, paths, &row, &String::from_utf8_lossy(&bytes))
+                    })
+            })
+            .cloned()
+            .collect();
+        if let Err(error) = super::systemd_unit::refuse_foreign_fragment(
+            &paths.definition,
+            &trusted_elsewhere,
+            runner,
+        ) {
+            return Ok(RuntimeState::Unowned {
+                reason: error.trim_start_matches("refusal: ").to_string(),
+            });
+        }
+    }
+    if elsewhere.is_some() {
+        // A move from the other root has not finished: `ensure` finishes it.
+        return Ok(RuntimeState::Outdated { restart: false });
+    }
     if platform == RuntimePlatform::Windows && status.registered && query_task {
         let result = export_windows_task("\\CortexKit\\", "subc-daemon", runner)?;
         if !result.success {
@@ -580,6 +655,28 @@ pub fn definition_state<R: CommandRunner>(
         Ok(RuntimeState::Missing)
     } else {
         Ok(RuntimeState::Correct)
+    }
+}
+
+/// Whether `text` is a definition setup wrote, for the inventory `row` that
+/// records it: its parsed values equal the row's recorded semantics, or for
+/// a row from before those were recorded, one of setup's earlier templates.
+pub(super) fn definition_trusted(
+    platform: RuntimePlatform,
+    paths: &RuntimePaths,
+    row: &Value,
+    text: &str,
+) -> bool {
+    let Ok(parsed) = canonical(platform, text) else {
+        return false;
+    };
+    match row.get("definition_semantics").and_then(Value::as_str) {
+        Some(recorded) => recorded == parsed,
+        None => desired_definition_checked(platform, paths).is_ok_and(|desired| {
+            legacy_definitions(platform, paths, &desired)
+                .iter()
+                .any(|old| canonical(platform, old).ok().as_ref() == Some(&parsed))
+        }),
     }
 }
 
@@ -678,6 +775,7 @@ fn without_config_store_argument(platform: RuntimePlatform, text: &str) -> Strin
     legacy
 }
 
+#[cfg(test)]
 pub fn ensure<R: CommandRunner>(
     platform: RuntimePlatform,
     paths: &RuntimePaths,
@@ -749,6 +847,7 @@ pub fn ensure<R: CommandRunner>(
     Ok(())
 }
 
+#[cfg(test)]
 fn write_definition(
     platform: RuntimePlatform,
     paths: &RuntimePaths,
@@ -770,6 +869,7 @@ fn write_definition(
             store_parent.display()
         )
     })?;
+    let semantics = canonical(platform, desired)?;
     if needs_definition {
         let parent = paths.definition.parent().ok_or_else(|| {
             format!(
@@ -815,11 +915,12 @@ fn write_definition(
         "runtime-definition",
         &paths.definition,
         "definition_semantics",
-        canonical(platform, desired)?,
+        semantics,
     )?;
     inventory.save()
 }
 
+#[cfg(test)]
 fn first_definition_difference<'a>(
     current: &'a str,
     desired: &'a str,
@@ -873,6 +974,11 @@ pub fn deregister<R: CommandRunner>(
                 &["/PID".to_string(), pid.to_string(), "/F".to_string()],
             );
         }
+    }
+    if platform == RuntimePlatform::Linux {
+        // `disable --now` acts on the unit by name: never on a unit the
+        // manager loads from someone else's file.
+        super::systemd_unit::refuse_foreign_fragment(&paths.definition, &[], runner)?;
     }
     let args = match platform {
         RuntimePlatform::Macos => vec![
@@ -947,7 +1053,7 @@ fn export_windows_task<R: CommandRunner>(
     )
 }
 
-fn update_windows_task<R: CommandRunner>(
+pub(super) fn update_windows_task<R: CommandRunner>(
     paths: &RuntimePaths,
     runner: &mut R,
 ) -> Result<(), String> {
@@ -996,195 +1102,6 @@ Set-ScheduledTask -TaskPath '{task_path}' -TaskName '{task_name}' -Action $a -Tr
     Ok(())
 }
 
-/// Refresh only owned definitions inside the restart upgrade already authorized.
-/// Ownership is checked before stopping anything and again before writing.
-pub fn restart_with_definition<R: CommandRunner>(
-    platform: RuntimePlatform,
-    paths: &RuntimePaths,
-    runner: &mut R,
-    inventory: &mut Inventory,
-) -> Result<String, String> {
-    restart_with_definition_at(platform, paths, runner, inventory, None)
-}
-
-pub(crate) fn restart_with_definition_at<R: CommandRunner>(
-    platform: RuntimePlatform,
-    paths: &RuntimePaths,
-    runner: &mut R,
-    inventory: &mut Inventory,
-    connection: Option<&Path>,
-) -> Result<String, String> {
-    restart_with_definition_from_at(
-        platform,
-        paths,
-        &paths.daemon,
-        runner,
-        inventory,
-        connection,
-    )
-}
-
-pub(super) fn restart_with_definition_from_at<R: CommandRunner>(
-    platform: RuntimePlatform,
-    paths: &RuntimePaths,
-    previous_daemon: &Path,
-    runner: &mut R,
-    inventory: &mut Inventory,
-    connection: Option<&Path>,
-) -> Result<String, String> {
-    let desired = desired_definition_checked(platform, paths)?;
-    restart_with_definition_text_at(
-        platform,
-        paths,
-        previous_daemon,
-        runner,
-        inventory,
-        connection,
-        &desired,
-    )
-}
-
-pub(super) struct DefinitionSnapshot {
-    platform: RuntimePlatform,
-    paths: RuntimePaths,
-    text: String,
-}
-
-impl DefinitionSnapshot {
-    pub(super) fn paths(&self) -> &RuntimePaths {
-        &self.paths
-    }
-    pub(super) fn capture(platform: RuntimePlatform, paths: &RuntimePaths) -> Result<Self, String> {
-        let text = match fs::read_to_string(&paths.definition) {
-            Ok(text) => text,
-            // An upgrade can repair a missing service definition. If its binary
-            // rolls back, the restored daemon still needs an argument-free one.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                without_config_store_argument(
-                    platform,
-                    &desired_definition_checked(platform, paths)?,
-                )
-            }
-            Err(error) => {
-                return Err(format!(
-                    "could not save daemon definition {}: {error}",
-                    paths.definition.display()
-                ));
-            }
-        };
-        Ok(Self {
-            platform,
-            paths: paths.clone(),
-            text,
-        })
-    }
-
-    pub(super) fn restore<R: CommandRunner>(
-        &self,
-        runner: &mut R,
-        inventory: &mut Inventory,
-        connection: Option<&Path>,
-    ) -> Result<String, String> {
-        self.restore_from(runner, inventory, connection, &self.paths.daemon)
-    }
-
-    pub(super) fn restore_from<R: CommandRunner>(
-        &self,
-        runner: &mut R,
-        inventory: &mut Inventory,
-        connection: Option<&Path>,
-        previous_daemon: &Path,
-    ) -> Result<String, String> {
-        restart_with_definition_text_at(
-            self.platform,
-            &self.paths,
-            previous_daemon,
-            runner,
-            inventory,
-            connection,
-            &self.text,
-        )
-    }
-}
-
-fn restart_with_definition_text_at<R: CommandRunner>(
-    platform: RuntimePlatform,
-    paths: &RuntimePaths,
-    previous_daemon: &Path,
-    runner: &mut R,
-    inventory: &mut Inventory,
-    connection: Option<&Path>,
-    desired: &str,
-) -> Result<String, String> {
-    let status = observe(platform, runner)?;
-    if let RuntimeState::Unowned { reason } =
-        definition_state(platform, paths, status, runner, inventory)?
-    {
-        return Err(format!("refusal: {reason}"));
-    }
-    let old = if platform != RuntimePlatform::Linux {
-        connected_daemon(runner, previous_daemon, connection)?
-    } else {
-        None
-    };
-    let mut details = Vec::new();
-    let commands = restart_commands(platform, &paths.definition);
-    for (index, (program, args)) in commands.into_iter().enumerate() {
-        // macOS/Windows have separate stop/start verbs. Linux reloads the unit
-        // before its single restart; daemon-reload itself never stops a process.
-        if (platform == RuntimePlatform::Linux && index == 0) || index == 1 {
-            let stopped = RuntimeStatus {
-                registered: platform != RuntimePlatform::Macos && status.registered,
-                live: false,
-            };
-            if let RuntimeState::Unowned { reason } =
-                definition_state(platform, paths, stopped, runner, inventory)?
-            {
-                return Err(format!("refusal: {reason}"));
-            }
-            let changed = fs::read_to_string(&paths.definition)
-                .ok()
-                .and_then(|text| canonical(platform, &text).ok())
-                != Some(canonical(platform, desired)?);
-            write_definition(platform, paths, desired, changed, inventory)?;
-            if changed && platform == RuntimePlatform::Windows {
-                update_windows_task(paths, runner)?;
-            }
-            if changed && platform == RuntimePlatform::Linux {
-                let reload = runner.run("systemctl", &["--user".into(), "daemon-reload".into()])?;
-                if !reload.success {
-                    return Err(format!("could not reload unit: {}", reload.explanation()));
-                }
-            }
-        }
-        if index == 0 {
-            // Older daemons refuse the additive request; a restart must still run.
-            let _ = runner.announce_restart(connection);
-        }
-        let result = runner.run(&program, &args)?;
-        if !result.success {
-            let is_stop = index == 0 && platform != RuntimePlatform::Linux;
-            if !is_stop || observe(platform, runner)?.live {
-                return Err(format!(
-                    "{program} {} failed: {}",
-                    args.join(" "),
-                    result.explanation()
-                ));
-            }
-        } else {
-            details.push(format!("{program} {} completed", args.join(" ")));
-        }
-        if index == 0 && platform != RuntimePlatform::Linux {
-            wait_for_exit(
-                runner,
-                old.as_ref(),
-                Duration::from_secs(DAEMON_STOP_TIMEOUT_SECS + 5),
-            )?;
-        }
-    }
-    Ok(details.join("; "))
-}
-
 fn windows_create_arguments(paths: &RuntimePaths, task_name: &str) -> Vec<String> {
     vec![
         "/Create".into(),
@@ -1196,7 +1113,7 @@ fn windows_create_arguments(paths: &RuntimePaths, task_name: &str) -> Vec<String
     ]
 }
 
-fn register<R: CommandRunner>(
+pub(super) fn register<R: CommandRunner>(
     platform: RuntimePlatform,
     paths: &RuntimePaths,
     runner: &mut R,
@@ -1241,6 +1158,7 @@ fn register<R: CommandRunner>(
         ));
     }
     if platform == RuntimePlatform::Linux {
+        super::systemd_unit::verify_fragment(&paths.definition, runner)?;
         let result = runner.run(
             "systemctl",
             &[
@@ -1346,6 +1264,9 @@ pub fn start_installed<R: CommandRunner>(
     if !observe(platform, runner)?.registered {
         return Err("the daemon service isn't loaded; run ck setup".to_string());
     }
+    if platform == RuntimePlatform::Linux {
+        super::systemd_unit::verify_fragment(&paths.definition, runner)?;
+    }
     start(platform, paths, runner)
 }
 
@@ -1416,23 +1337,15 @@ fn platform_binary(name: &str) -> String {
 /// `paths` identifies the installed daemon image and service definition. The
 /// image check prevents a stale connection file from making restart wait for
 /// an unrelated process that reused the old PID.
-pub fn restart_via_service_manager(paths: &RuntimePaths) -> Result<String, String> {
-    let platform = RuntimePlatform::current();
-    let mut runner = SystemCommandRunner;
-    let old = if platform != RuntimePlatform::Linux {
-        connected_daemon(&mut runner, &paths.daemon, None)?
-    } else {
-        None
-    };
-    restart_via_service_manager_on(platform, &paths.definition, &mut runner, old.as_ref())
-}
-
-fn restart_via_service_manager_on<R: CommandRunner>(
+pub(super) fn restart_via_service_manager_on<R: CommandRunner>(
     platform: RuntimePlatform,
     definition: &Path,
     runner: &mut R,
     old: Option<&DaemonProcess>,
 ) -> Result<String, String> {
+    if platform == RuntimePlatform::Linux {
+        super::systemd_unit::verify_fragment(definition, runner)?;
+    }
     let mut details = Vec::new();
     for (index, (program, args)) in restart_commands(platform, definition)
         .into_iter()
@@ -1528,12 +1441,12 @@ fn restart_commands(platform: RuntimePlatform, definition: &Path) -> Vec<(String
 /// bootstrapped every macOS user's agent into root's domain
 /// (`Bootstrap failed: 125: Domain does not support specified action`).
 #[cfg(unix)]
-fn current_uid() -> u32 {
+pub(super) fn current_uid() -> u32 {
     rustix::process::getuid().as_raw()
 }
 
 #[cfg(not(unix))]
-fn current_uid() -> u32 {
+pub(super) fn current_uid() -> u32 {
     0
 }
 
@@ -1549,6 +1462,8 @@ mod tests {
         calls: Vec<(String, Vec<String>)>,
         results: VecDeque<bool>,
         task_xml: Option<String>,
+        /// The unit file systemd reports loading, for `show -p FragmentPath`.
+        fragment: String,
     }
 
     impl CommandRunner for RecordingRunner {
@@ -1556,7 +1471,9 @@ mod tests {
             self.calls.push((program.to_string(), args.to_vec()));
             Ok(CommandResult {
                 success: self.results.pop_front().unwrap_or(true),
-                stdout: if program == "powershell.exe"
+                stdout: if args.join(" ").contains("show -p FragmentPath") {
+                    format!("FragmentPath={}", self.fragment)
+                } else if program == "powershell.exe"
                     && args
                         .last()
                         .is_some_and(|s| s.contains("Export-ScheduledTask"))
@@ -1641,6 +1558,128 @@ mod tests {
         ));
     }
 
+    /// The CLI's XDG_CONFIG_HOME now names a root without the unit, while the
+    /// manager still has setup's unit enabled from the root setup recorded.
+    /// Observation must plan the move, not call the registered unit unowned.
+    #[test]
+    fn a_unit_recorded_at_the_other_root_is_planned_for_its_move_not_refused() {
+        let root = fixture_dir("unit-recorded-elsewhere");
+        let platform = RuntimePlatform::Linux;
+        let mut paths = runtime_paths(platform, &root.join("bin"), root.path());
+        let old = paths.definition.clone();
+        paths.definition = root.join("xdg/systemd/user/cortexkit-subc.service");
+        let desired = desired_definition_checked(platform, &paths).unwrap();
+        fs::create_dir_all(old.parent().unwrap()).unwrap();
+        fs::write(&old, &desired).unwrap();
+        let mut inventory =
+            Inventory::load(root.join("installer-manifest.json"), "linux-x64").unwrap();
+        let mut fields = Map::new();
+        fields.insert(
+            "definition_semantics".into(),
+            Value::String(canonical(platform, &desired).unwrap()),
+        );
+        inventory.record("runtime-definition", &old, fields);
+        let registered = RuntimeStatus {
+            registered: true,
+            live: true,
+        };
+
+        let state = definition_state(
+            platform,
+            &paths,
+            registered,
+            &mut RecordingRunner::default(),
+            &inventory,
+        )
+        .unwrap();
+
+        assert!(
+            matches!(state, RuntimeState::Outdated { restart: false }),
+            "{state:?}"
+        );
+        // A user-edited file at the recorded root is still nobody's to move.
+        fs::write(&old, "[Service]\nExecStart=/somewhere/else\n").unwrap();
+        let state = definition_state(
+            platform,
+            &paths,
+            registered,
+            &mut RecordingRunner::default(),
+            &inventory,
+        )
+        .unwrap();
+        assert!(matches!(state, RuntimeState::Unowned { .. }), "{state:?}");
+    }
+
+    /// A user manager for the unit-move tests: it loads the unit from the
+    /// old root until a reload, and afterwards from the new root only when
+    #[test]
+    fn uninstall_never_disables_a_unit_loaded_from_another_file() {
+        let root = fixture_dir("deregister-foreign");
+        let platform = RuntimePlatform::Linux;
+        let paths = runtime_paths(platform, &root.join("bin"), root.path());
+        let mut runner = RecordingRunner {
+            fragment: "/home/ada/.config/systemd/user/cortexkit-subc.service".into(),
+            ..RecordingRunner::default()
+        };
+
+        let error = deregister(platform, &paths, None, &mut runner).unwrap_err();
+
+        assert!(error.contains("not setup's"), "{error}");
+        assert!(!runner
+            .calls
+            .iter()
+            .any(|(_, args)| args.contains(&"disable".to_string())));
+    }
+
+    /// With setup's correct file on disk but a different file loaded under
+    /// the same unit name, nothing setup does by name may touch that unit.
+    #[test]
+    fn a_unit_loaded_from_another_file_is_never_accepted_started_or_restarted() {
+        let root = fixture_dir("unit-loaded-elsewhere");
+        let platform = RuntimePlatform::Linux;
+        let paths = runtime_paths(platform, &root.join("bin"), root.path());
+        let desired = desired_definition_checked(platform, &paths).unwrap();
+        fs::create_dir_all(paths.definition.parent().unwrap()).unwrap();
+        fs::write(&paths.definition, &desired).unwrap();
+        let mut inventory =
+            Inventory::load(root.join("installer-manifest.json"), "linux-x64").unwrap();
+        inventory.record("runtime-definition", &paths.definition, Map::new());
+        let foreign = || RecordingRunner {
+            fragment: "/home/ada/.config/systemd/user/cortexkit-subc.service".into(),
+            ..RecordingRunner::default()
+        };
+
+        let state = definition_state(
+            platform,
+            &paths,
+            RuntimeStatus {
+                registered: true,
+                live: true,
+            },
+            &mut foreign(),
+            &inventory,
+        )
+        .unwrap();
+        assert!(matches!(state, RuntimeState::Unowned { .. }), "{state:?}");
+
+        let mut runner = foreign();
+        let error = start_installed(platform, &paths, &mut runner).unwrap_err();
+        assert!(error.contains("loads it from"), "{error}");
+        assert!(!runner
+            .calls
+            .iter()
+            .any(|(_, args)| args.contains(&"start".to_string())));
+
+        let mut runner = foreign();
+        let error = restart_via_service_manager_on(platform, &paths.definition, &mut runner, None)
+            .unwrap_err();
+        assert!(error.contains("loads it from"), "{error}");
+        assert!(!runner
+            .calls
+            .iter()
+            .any(|(_, args)| args.contains(&"restart".to_string())));
+    }
+
     #[test]
     fn start_installed_starts_a_loaded_service_and_refuses_otherwise() {
         let root = fixture_dir("start-installed");
@@ -1655,7 +1694,11 @@ mod tests {
             desired_definition_for_user(platform, &paths, "user"),
         )
         .unwrap();
-        let mut runner = RecordingRunner::default();
+        // The manager loads setup's file: starting by name is allowed.
+        let mut runner = RecordingRunner {
+            fragment: paths.definition.display().to_string(),
+            ..RecordingRunner::default()
+        };
         start_installed(platform, &paths, &mut runner).unwrap();
         let last = runner.calls.last().unwrap();
         assert_eq!(last.0, "systemctl");
@@ -1994,6 +2037,8 @@ mod tests {
         calls: Vec<(String, Vec<String>)>,
         registered: bool,
         started: bool,
+        /// The unit file systemd reports loading, for `show -p FragmentPath`.
+        fragment: String,
     }
 
     impl CommandRunner for ServiceManagerModel {
@@ -2030,7 +2075,9 @@ mod tests {
             };
             Ok(CommandResult {
                 success,
-                stdout: if live {
+                stdout: if joined.contains("show -p FragmentPath") {
+                    format!("FragmentPath={}", self.fragment)
+                } else if live {
                     "state = running\nStatus: Running".to_string()
                 } else {
                     "state = waiting\nStatus: Ready".to_string()
@@ -2051,7 +2098,10 @@ mod tests {
             let paths = runtime_paths(platform, &root.join("bin"), &root);
             let manifest = root.join("installer-manifest.json");
             let mut inventory = Inventory::load(&manifest, "test").expect("inventory");
-            let mut runner = ServiceManagerModel::default();
+            let mut runner = ServiceManagerModel {
+                fragment: paths.definition.display().to_string(),
+                ..Default::default()
+            };
             ensure(
                 platform,
                 &paths,
@@ -2143,6 +2193,7 @@ mod tests {
             inventory.record("runtime-definition", &paths.definition, Map::new());
             let mut runner = RecordingRunner {
                 task_xml: Some(old),
+                fragment: paths.definition.display().to_string(),
                 ..Default::default()
             };
             ensure(
@@ -2189,10 +2240,13 @@ mod tests {
                 &mut inventory,
             )
             .unwrap();
+            // Only read-only queries: the exported task, or which file the
+            // user manager loads the unit from.
             assert!(
                 runner.calls.iter().all(|(_, args)| args
                     .last()
-                    .is_some_and(|s| s.contains("Export-ScheduledTask"))),
+                    .is_some_and(|s| s.contains("Export-ScheduledTask"))
+                    || args.join(" ").contains("show -p FragmentPath")),
                 "{platform:?}: {:?}",
                 runner.calls
             );
@@ -2532,6 +2586,8 @@ mod reconciliation_tests {
             }
             let stdout = if command.contains("Export-ScheduledTask") {
                 self.task_xml.clone()
+            } else if command.contains("show -p FragmentPath") {
+                format!("FragmentPath={}", self.paths.definition.display())
             } else {
                 "state = running\nStatus: Running".to_string()
             };
@@ -2594,55 +2650,6 @@ mod reconciliation_tests {
         live: true,
     };
 
-    fn assert_config_store_install_and_rollback(platform: RuntimePlatform) {
-        let (root, mut paths, mut inventory, mut manager) = fixture(platform, false, true);
-        assert_eq!(paths.config_store_root, root.join("config-store"));
-        paths.config_store_root = root.join("new data/config-store");
-        let desired = desired_definition_checked(platform, &paths).unwrap();
-        let legacy = without_config_store_argument(platform, &desired);
-        assert!(!legacy.contains("--config-store-root"));
-        fs::write(&paths.definition, &legacy).unwrap();
-        manager.task_xml = legacy.clone();
-        assert!(matches!(
-            definition_state(platform, &paths, LIVE, &mut manager, &inventory).unwrap(),
-            RuntimeState::Outdated { .. }
-        ));
-        let snapshot = DefinitionSnapshot::capture(platform, &paths).unwrap();
-        assert!(!paths.config_store_root.parent().unwrap().exists());
-        restart_with_definition_at(platform, &paths, &mut manager, &mut inventory, None).unwrap();
-        assert_eq!(fs::read_to_string(&paths.definition).unwrap(), desired);
-        assert!(
-            !paths.config_store_root.exists(),
-            "only the daemon creates the store"
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                fs::metadata(paths.config_store_root.parent().unwrap())
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o700
-            );
-        }
-        snapshot
-            .restore(&mut manager, &mut inventory, None)
-            .unwrap();
-        assert_eq!(fs::read_to_string(&paths.definition).unwrap(), legacy);
-        if platform == RuntimePlatform::Windows {
-            assert_eq!(
-                manager.task_xml, legacy,
-                "restore the registered action too"
-            );
-        }
-        assert!(matches!(
-            definition_state(platform, &paths, LIVE, &mut manager, &inventory).unwrap(),
-            RuntimeState::Outdated { .. }
-        ));
-    }
-
     #[test]
     fn macos_definition_pins_absolute_config_store_root() {
         for data in [
@@ -2681,7 +2688,6 @@ mod reconciliation_tests {
                 ]
             );
         }
-        assert_config_store_install_and_rollback(RuntimePlatform::Macos);
     }
 
     #[test]
@@ -2718,7 +2724,6 @@ mod reconciliation_tests {
             "--config-store-root {}\n",
             systemd_argument(&absolute.to_string_lossy())
         )));
-        assert_config_store_install_and_rollback(RuntimePlatform::Linux);
     }
 
     #[test]
@@ -2745,39 +2750,7 @@ mod reconciliation_tests {
                 format!(r#"--config-store-root "{data}\config-store""#)
             );
         }
-        assert_config_store_install_and_rollback(RuntimePlatform::Windows);
     }
-
-    #[test]
-    fn missing_definition_repair_rolls_back_without_config_store_argument() {
-        for platform in [
-            RuntimePlatform::Macos,
-            RuntimePlatform::Linux,
-            RuntimePlatform::Windows,
-        ] {
-            let (_root, paths, mut inventory, mut manager) = fixture(platform, false, true);
-            fs::remove_file(&paths.definition).unwrap();
-            let snapshot = DefinitionSnapshot::capture(platform, &paths).unwrap();
-            ensure(
-                platform,
-                &paths,
-                RuntimeStatus::default(),
-                &mut manager,
-                &mut inventory,
-            )
-            .unwrap();
-            assert!(fs::read_to_string(&paths.definition)
-                .unwrap()
-                .contains("--config-store-root"));
-            snapshot
-                .restore(&mut manager, &mut inventory, None)
-                .unwrap();
-            assert!(!fs::read_to_string(&paths.definition)
-                .unwrap()
-                .contains("--config-store-root"));
-        }
-    }
-
     #[test]
     fn upgrade_and_setup_restart_even_when_restart_announcement_is_refused() {
         for platform in [
@@ -2786,23 +2759,8 @@ mod reconciliation_tests {
             RuntimePlatform::Windows,
         ] {
             for error in ["unknown_control_op", "connection refused"] {
-                let (root, paths, mut inventory, mut manager) = fixture(platform, true, true);
+                let (_root, paths, _inventory, mut manager) = fixture(platform, false, true);
                 manager.announcement_error = Some(error);
-                let connection = root.join("missing-connection.json");
-                restart_with_definition_at(
-                    platform,
-                    &paths,
-                    &mut manager,
-                    &mut inventory,
-                    Some(&connection),
-                )
-                .unwrap();
-                assert_announcement_immediately_precedes_stop(&manager.calls);
-                assert!(manager
-                    .calls
-                    .iter()
-                    .any(|call| call == &format!("announce restart {}", connection.display())));
-                manager.calls.clear();
                 restart_via_service_manager_on(platform, &paths.definition, &mut manager, None)
                     .unwrap();
                 assert_announcement_immediately_precedes_stop(&manager.calls);
@@ -3018,7 +2976,7 @@ mod reconciliation_tests {
     #[test]
     fn upgrade_definition_restart_waits_for_the_connected_daemon() {
         for platform in [RuntimePlatform::Windows, RuntimePlatform::Macos] {
-            let (root, paths, mut inventory, mut manager) = fixture(platform, true, true);
+            let (root, paths, _inventory, mut manager) = fixture(platform, false, true);
             let connection = root.join("connection.json");
             subc_transport::write_atomic(
                 &connection,
@@ -3040,70 +2998,10 @@ mod reconciliation_tests {
                 pid: 123,
                 start_time: 1,
             });
-            restart_with_definition_at(
-                platform,
-                &paths,
-                &mut manager,
-                &mut inventory,
-                Some(&connection),
-            )
-            .unwrap();
+            let old = connected_daemon(&mut manager, &paths.daemon, Some(&connection)).unwrap();
+            restart_via_service_manager_on(platform, &paths.definition, &mut manager, old.as_ref())
+                .unwrap();
             assert_eq!(manager.exit_polls, 3);
-        }
-    }
-
-    #[test]
-    fn upgrade_regenerates_definition_between_existing_stop_and_start() {
-        for platform in [
-            RuntimePlatform::Macos,
-            RuntimePlatform::Windows,
-            RuntimePlatform::Linux,
-        ] {
-            let (_root, paths, mut inventory, mut manager) = fixture(platform, true, true);
-            restart_with_definition(platform, &paths, &mut manager, &mut inventory).unwrap();
-            let calls = &manager.calls;
-            let stops = calls
-                .iter()
-                .filter(|s| {
-                    s.contains(" bootout ") || s.contains(" /End ") || s.contains("--user restart ")
-                })
-                .count();
-            let starts = calls
-                .iter()
-                .filter(|s| {
-                    s.contains(" bootstrap ")
-                        || s.contains(" /Run ")
-                        || s.contains("--user restart ")
-                })
-                .count();
-            assert_eq!((stops, starts), (1, 1), "{calls:?}");
-            if platform != RuntimePlatform::Linux {
-                let stop = calls
-                    .iter()
-                    .position(|s| s.contains(" bootout ") || s.contains(" /End "))
-                    .unwrap();
-                let start = calls
-                    .iter()
-                    .position(|s| s.contains(" bootstrap ") || s.contains(" /Run "))
-                    .unwrap();
-                assert!(stop < start, "{calls:?}");
-            }
-            assert_eq!(
-                fs::read_to_string(&paths.definition).unwrap(),
-                desired_definition_checked(platform, &paths).unwrap()
-            );
-            if platform == RuntimePlatform::Linux {
-                assert!(
-                    calls
-                        .iter()
-                        .position(|s| s.contains("daemon-reload"))
-                        .unwrap()
-                        < calls
-                            .iter()
-                            .position(|s| s.contains("--user restart"))
-                            .unwrap()
-                );
-            }
         }
     }
 

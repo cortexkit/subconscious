@@ -19,30 +19,6 @@ use std::{
     process::{Command, Stdio},
 };
 
-/// Copy `src` to `dst` and mark the copy executable, for a test that will
-/// execute `dst`.
-///
-/// Do not replace this with `fs::copy`: the copy's writable descriptor would
-/// live in the multithreaded test process, where a child forked by another
-/// test thread can inherit it and make this test's later exec of `dst` fail
-/// with `ETXTBSY`. `cp` holds that descriptor in its own process instead, and
-/// the permission change does not open the file at all.
-pub(crate) fn copy_executable(src: &Path, dst: &Path) {
-    let status = Command::new("cp")
-        .arg(src)
-        .arg(dst)
-        .stdin(Stdio::null())
-        .status()
-        .expect("start cp for an executable fixture");
-    assert!(
-        status.success(),
-        "cp {} {} failed: {status}",
-        src.display(),
-        dst.display()
-    );
-    mark_executable(dst);
-}
-
 /// Write `contents` to `path` and mark it executable, for a test that will
 /// execute `path`.
 ///

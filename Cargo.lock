@@ -3200,7 +3200,7 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.21.32"
+version = "0.21.33"
 dependencies = [
  "async-trait",
  "base64",
@@ -3329,7 +3329,7 @@ dependencies = [
 
 [[package]]
 name = "subc-os"
-version = "0.1.48"
+version = "0.1.49"
 dependencies = [
  "cortexkit-test-support",
  "libc",
@@ -3389,7 +3389,7 @@ dependencies = [
 
 [[package]]
 name = "subc-transport"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "cortexkit-test-support",
  "getrandom 0.2.17",

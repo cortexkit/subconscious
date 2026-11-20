@@ -148,7 +148,8 @@ pub(super) fn plan_hub(
     )
 }
 
-pub(super) fn rollback_hub(change: &config::ConfigChange) -> Result<bool, String> {
+#[cfg(test)]
+fn rollback_hub(change: &config::ConfigChange) -> Result<bool, String> {
     if std::fs::metadata(&change.path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
         return Ok(false);
     }

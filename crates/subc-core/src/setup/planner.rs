@@ -529,10 +529,20 @@ pub struct SetupExecutionReport {
 /// Executes only the mutation-bearing operations in an already planned,
 /// authorized setup. A rejected plan and a dry run both leave the executor
 /// untouched; validation and confirmation remain observations, not mutations.
+#[cfg(test)]
 pub fn execute_setup<E: SetupExecutor>(
     plan: &SetupPlan,
     mode: ExecutionMode,
     executor: &mut E,
+) -> Result<SetupExecutionReport, E::Error> {
+    execute_setup_with_prepare(plan, mode, executor, true)
+}
+
+pub(super) fn execute_setup_with_prepare<E: SetupExecutor>(
+    plan: &SetupPlan,
+    mode: ExecutionMode,
+    executor: &mut E,
+    prepare: bool,
 ) -> Result<SetupExecutionReport, E::Error> {
     let mut report = SetupExecutionReport {
         planned: plan.operations.clone(),
@@ -542,7 +552,9 @@ pub fn execute_setup<E: SetupExecutor>(
         return Ok(report);
     }
 
-    executor.prepare_apply(plan)?;
+    if prepare {
+        executor.prepare_apply(plan)?;
+    }
 
     let mut pending_restart: Option<Vec<String>> = None;
     let mut restart_applied = false;

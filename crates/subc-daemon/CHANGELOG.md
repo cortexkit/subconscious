@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.50.24
+
+- Review a changed entry in a settings map whose keys are matched by `patternProperties`
+  (for example `/servers/<id>/command`) with the apply kind its schema declares, instead
+  of refusing it as `module_review_invalid`.
+
 ## 0.50.23
 
 - Prepare stamped project delivery behind the project settings guard. Project

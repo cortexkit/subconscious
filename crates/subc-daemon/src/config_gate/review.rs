@@ -246,13 +246,13 @@ fn visit_leaves<'a>(
         let vault = object.len() == 1 && object.contains_key("vault_ref");
         if !object.is_empty()
             && (!vault
-                || field_schema(schema, branch, "vault_ref", true).is_some_and(|child| {
+                || field_schema(schema, branch, "vault_ref").is_some_and(|child| {
                     child.get("x-ck-kind").and_then(Value::as_str) == Some("json")
                 }))
         {
             for (key, value) in object {
                 visit_leaves(
-                    field_schema(schema, branch, key, true).unwrap_or(&Value::Null),
+                    field_schema(schema, branch, key).unwrap_or(&Value::Null),
                     value,
                     &format!("{path}/{}", key.replace('~', "~0").replace('/', "~1")),
                     leaves,
@@ -274,14 +274,17 @@ fn visit_leaves<'a>(
 }
 
 fn apply_for(schema: &Value, value: &Value, path: &str) -> Result<ApplyKind> {
-    apply_for_path(schema, value, path, false)
+    apply_for_path(schema, value, path)
 }
 
 pub(super) fn apply_for_project(schema: &Value, value: &Value, path: &str) -> Result<ApplyKind> {
-    apply_for_path(schema, value, path, true)
+    apply_for_path(schema, value, path)
 }
 
-fn apply_for_path(schema: &Value, value: &Value, path: &str, patterns: bool) -> Result<ApplyKind> {
+/// The apply kind for the field at `path`, walking declared properties and the
+/// structural maps' `patternProperties` the same way validation does, so a
+/// map's pattern-keyed entries are reviewable like named fields.
+fn apply_for_path(schema: &Value, value: &Value, path: &str) -> Result<ApplyKind> {
     let mut schema = schema;
     let mut value = Some(value);
     let mut apply = schema.get("x-ck-apply");
@@ -289,7 +292,7 @@ fn apply_for_path(schema: &Value, value: &Value, path: &str, patterns: bool) -> 
         let key = part.replace("~1", "/").replace("~0", "~");
         let branch = select_branch(schema, value);
         apply = branch.get("x-ck-apply").or(apply);
-        schema = field_schema(schema, branch, &key, patterns).ok_or_else(|| {
+        schema = field_schema(schema, branch, &key).ok_or_else(|| {
             GateError::new("module_review_invalid", "field has no declared schema")
         })?;
         value = value.and_then(|value| value.get(&key));
@@ -323,29 +326,20 @@ fn select_branch<'a>(schema: &'a Value, value: Option<&Value>) -> &'a Value {
         .unwrap_or(schema)
 }
 
-fn field_schema<'a>(
-    schema: &'a Value,
-    branch: &'a Value,
-    key: &str,
-    patterns: bool,
-) -> Option<&'a Value> {
+fn field_schema<'a>(schema: &'a Value, branch: &'a Value, key: &str) -> Option<&'a Value> {
     branch
         .get("properties")
         .and_then(|p| p.get(key))
         .or_else(|| schema.get("properties").and_then(|p| p.get(key)))
         .or_else(|| {
-            if patterns {
-                branch
-                    .get("patternProperties")
-                    .and_then(Value::as_object)?
-                    .iter()
-                    .find(|(pattern, _)| {
-                        regex::Regex::new(pattern).is_ok_and(|regex| regex.is_match(key))
-                    })
-                    .map(|(_, schema)| schema)
-            } else {
-                None
-            }
+            branch
+                .get("patternProperties")
+                .and_then(Value::as_object)?
+                .iter()
+                .find(|(pattern, _)| {
+                    regex::Regex::new(pattern).is_ok_and(|regex| regex.is_match(key))
+                })
+                .map(|(_, schema)| schema)
         })
         .or_else(|| schema.get("additionalProperties").filter(|v| v.is_object()))
         .or_else(|| schema.get("items"))
@@ -532,6 +526,72 @@ mod tests {
             ConfigReviewReply::new(vec![], vec![])
         )
         .is_err());
+    }
+
+    #[test]
+    fn config_review_resolves_user_pattern_fields_in_module_and_project_views() {
+        let schema = Schema::new(json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object", "unevaluatedProperties": false,
+            "properties": {"servers": {
+                "type": "object", "unevaluatedProperties": false, "x-ck-layers": ["user"],
+                "patternProperties": {"^[a-z]+$": {
+                    "type": "object", "unevaluatedProperties": false,
+                    "properties": {"command": {
+                        "type": "string", "description": "Program to launch",
+                        "x-ck-required": true, "x-ck-apply": "module_restart"
+                    }}
+                }}
+            }}
+        }))
+        .unwrap();
+        let view = |generation, command, project_id: Option<&str>| {
+            let project_id = project_id.map(str::to_owned);
+            let tuple = schema
+                .review_tuple(
+                    &[subc_config::LayerValue::new(
+                        Layer::User,
+                        json!({"servers":{"fixture":{"command":command}}}),
+                    )],
+                    &subc_config::ValidationContext::new("worker", project_id.clone()),
+                )
+                .unwrap();
+            let mut view = ConfigView::new(
+                generation,
+                tuple.effective,
+                tuple.sources,
+                vec![],
+                ConfigStatus::Active,
+            );
+            view.project_id = project_id;
+            view
+        };
+        for project_id in [Some("project"), None] {
+            let before = view(1, "old", project_id);
+            let after = view(2, "new", project_id);
+            let mut field = FieldChange::new(
+                "worker",
+                "/servers/fixture/command",
+                RecordedValue::new(json!("old")),
+                RecordedValue::new(json!("new")),
+                ApplyKind::ModuleRestart,
+            );
+            field.project_id = after.project_id.clone();
+            field.old_source = Layer::User;
+            field.new_source = Layer::User;
+            assert_eq!(
+                checked_fields(
+                    "worker",
+                    &schema,
+                    Some(&before),
+                    Some(&schema),
+                    &after,
+                    ConfigReviewReply::new(vec![field.clone()], vec![]),
+                )
+                .unwrap(),
+                vec![field]
+            );
+        }
     }
 
     #[test]

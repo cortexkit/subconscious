@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.11
+
+- Limit MCP gateway timing environment overrides to debug builds. Move file-backed settings into a dedicated module without changing the legacy paths or allowing projects to expand tool access.
+
 ## 0.2.10
 
 - Require subc-client-rs 0.41.2, subc-control 0.42.0 and subc-daemon 0.50.0 for the settings release.

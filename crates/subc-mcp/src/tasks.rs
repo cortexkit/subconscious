@@ -40,7 +40,7 @@ use rmcp::task_manager::current_timestamp;
 /// task. A module question turns the call into a task at once, whatever the
 /// time. Both need a free task slot; without one the call stays inline.
 const TASK_PROMOTION_DELAY: Duration = Duration::from_secs(5);
-/// Overrides `TASK_PROMOTION_DELAY`, in milliseconds. The tests set it so a
+/// Overrides `TASK_PROMOTION_DELAY` in debug builds. The tests set it so a
 /// call becomes a task without waiting five seconds.
 const TASK_PROMOTION_DELAY_MS_ENV: &str = "SUBC_MCP_TASK_PROMOTION_DELAY_MS";
 /// The polling interval suggested to the host in every task it is shown
@@ -57,7 +57,7 @@ const TASK_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// uses) covers a host that stops polling for a while without keeping
 /// results that nobody will read.
 const TASK_RESULT_TTL: Duration = Duration::from_secs(5 * 60);
-/// Overrides `TASK_RESULT_TTL`, in milliseconds. The tests set it to check
+/// Overrides `TASK_RESULT_TTL` in debug builds. The tests set it to check
 /// that an expired task is reported as expired.
 const TASK_RESULT_TTL_MS_ENV: &str = "SUBC_MCP_TASK_RESULT_TTL_MS";
 /// Most tasks one MCP session keeps at once, running and finished. A
@@ -91,8 +91,7 @@ struct TaskSettings {
 impl TaskSettings {
     fn from_env() -> Self {
         let millis = |key: &str| {
-            env::var(key)
-                .ok()
+            debug_tuning_env(key)
                 .and_then(|raw| raw.trim().parse::<u64>().ok())
                 .map(Duration::from_millis)
         };
@@ -537,6 +536,26 @@ fn error_object(error: &ErrorData) -> JsonObject {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_tuning_overrides_are_debug_only() {
+        crate::tests::with_tuning_env(
+            "tasks::tests::task_tuning_overrides_are_debug_only",
+            &[
+                (TASK_PROMOTION_DELAY_MS_ENV, "25"),
+                (TASK_RESULT_TTL_MS_ENV, "50"),
+            ],
+            || {
+                let expected = if cfg!(debug_assertions) {
+                    (Duration::from_millis(25), Duration::from_millis(50))
+                } else {
+                    (Duration::from_secs(5), Duration::from_secs(300))
+                };
+                let settings = TaskSettings::from_env();
+                assert_eq!((settings.promotion_delay, settings.result_ttl), expected);
+            },
+        );
+    }
 
     fn is_expired(error: &ErrorData) -> bool {
         error

@@ -5,7 +5,7 @@
 mod fixture;
 
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
@@ -20,7 +20,8 @@ use async_nats::{
 use async_trait::async_trait;
 use cortexkit_bus_naming::{
     federation::{
-        fedout_stream, hub_inbox_stream, inbox_stream_name, leaf_user_grant, FEDOUT_STREAM,
+        fedout_stream, hub_inbox_stream, hub_inbox_stream_name, inbox_stream_name, leaf_user_grant,
+        FEDOUT_STREAM,
     },
     shipped_streams, AccountNames,
 };
@@ -41,6 +42,7 @@ use crate::{
         mover::{Inputs, Mover},
         out_durable,
         production::{ensure_inbox, mover_grant},
+        purge::Generation,
         tests::{hpke_open, rig_seal, rig_stamp, A, B},
         Health, OpenError, Opener, Peer, PeerKeys, Peers,
     },
@@ -55,6 +57,8 @@ const UNKNOWN: &str = "dddddddddddddddddddddddddddddddd";
 const FRAME_ID: &str = "delivery-a-1";
 const BODY: &str = "handoff payload";
 const DEADLINE: Duration = Duration::from_secs(15);
+const PEER_TAIL: &str = "peer.agent_x.handoff";
+const WAKE_TAIL: &str = "wake.agent_x.handoff";
 
 struct Vault {
     signing: HarnessSigner,
@@ -118,7 +122,7 @@ impl Peers for Roster {
 struct BoxServer {
     id: BoxId,
     names: AccountNames,
-    _server: Server,
+    server: Server,
     admin: jetstream::Context,
     fed_admin: jetstream::Context,
     ckbus: jetstream::Context,
@@ -133,6 +137,7 @@ impl BoxServer {
         hub_port: u16,
         hub_account: &Account,
         id: BoxId,
+        allow_hub_purge: bool,
     ) -> Self {
         let names = AccountNames::derive(&format!("box_{id}")).unwrap();
         let operator = Operator::new(&format!("operator-{id}"));
@@ -203,7 +208,7 @@ impl BoxServer {
         })
         .await;
         let mover = scoped_client(&server, &fed, "mover", |user| {
-            mover_grant(&id, user).jwt_permissions()
+            mover_grant(&id, user, allow_hub_purge).jwt_permissions()
         })
         .await;
         let mover = jetstream::new(mover);
@@ -211,7 +216,7 @@ impl BoxServer {
         Self {
             id,
             names,
-            _server: server,
+            server,
             admin,
             fed_admin,
             ckbus: jetstream::new(ckbus),
@@ -226,6 +231,7 @@ impl BoxServer {
         peers: &[(BoxId, PeerKeys)],
         health: &Arc<Health>,
         journal: &Path,
+        purge_generation: Option<Generation>,
     ) -> JoinHandle<()> {
         let mover = Mover::new(
             Inputs {
@@ -237,12 +243,35 @@ impl BoxServer {
                 signing: vault.clone(),
                 opener: vault.clone(),
                 health: health.clone(),
+                purge_generation,
             },
             journal,
         )
         .unwrap()
         .with_test_rate_limit_delay(Duration::from_secs(2));
         tokio::spawn(async move { mover.run().await })
+    }
+
+    async fn switch_hub(&mut self, old_port: u16, new_port: u16) {
+        let conf_path = &self.server.conf;
+        let conf = std::fs::read_to_string(conf_path).unwrap();
+        let old_url = format!("nats-leaf://127.0.0.1:{old_port}");
+        assert!(conf.contains(&old_url));
+        let client_addr = self
+            .server
+            .url()
+            .strip_prefix("nats://")
+            .unwrap()
+            .to_owned();
+        let conf = conf
+            .replace(&old_url, &format!("nats-leaf://127.0.0.1:{new_port}"))
+            .replace(
+                "listen: \"127.0.0.1:-1\"",
+                &format!("listen: {client_addr:?}"),
+            );
+        self.server.stop().await;
+        std::fs::write(&self.server.conf, conf).unwrap();
+        self.server.start().await;
     }
 }
 
@@ -327,8 +356,24 @@ async fn handoff_rig() {
         config.duplicate_window = Duration::from_millis(100);
         hub_js.create_stream(config).await.unwrap();
     }
-    let a = BoxServer::start(&bin, root.path(), hub_port, &hub_account, a_id.clone()).await;
-    let b = BoxServer::start(&bin, root.path(), hub_port, &hub_account, b_id.clone()).await;
+    let a = BoxServer::start(
+        &bin,
+        root.path(),
+        hub_port,
+        &hub_account,
+        a_id.clone(),
+        false,
+    )
+    .await;
+    let b = BoxServer::start(
+        &bin,
+        root.path(),
+        hub_port,
+        &hub_account,
+        b_id.clone(),
+        false,
+    )
+    .await;
     hub.wait_leaf_names(&["box-a", "box-b"], DEADLINE).await;
     let (a_kem, a_pub) = Kem::derive_keypair(&[2; 32]);
     let (b_kem, b_pub) = Kem::derive_keypair(&[3; 32]);
@@ -349,8 +394,8 @@ async fn handoff_rig() {
     let c_id = BoxId::parse(C).unwrap();
     let a_peers = [(b_id.clone(), b_keys), (c_id.clone(), b_keys)];
     let b_peers = [(a_id.clone(), a_keys)];
-    let a_task = a.move_frames(&a_vault, &a_peers, &a_health, &a_path);
-    let b_task = b.move_frames(&b_vault, &b_peers, &b_health, &b_path);
+    let a_task = a.move_frames(&a_vault, &a_peers, &a_health, &a_path, None);
+    let b_task = b.move_frames(&b_vault, &b_peers, &b_health, &b_path, None);
 
     let original = format!("ck.box_{A}.fedsend.{B}.peer.agent_x.handoff");
     let on_hub = format!("ck.{B}.peer.agent_x.handoff");
@@ -427,7 +472,7 @@ async fn handoff_rig() {
     })
     .await;
     stop(b_task).await;
-    let b_task = b.move_frames(&b_vault, &b_peers, &b_health, &b_path);
+    let b_task = b.move_frames(&b_vault, &b_peers, &b_health, &b_path, None);
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert!(
         !publish(&hub_js, &on_hub, FRAME_ID, sealed.payload.to_vec())
@@ -526,7 +571,7 @@ async fn handoff_rig() {
     stop(a_task).await;
     outbox_config.max_messages = outbox_limit;
     a.fed_admin.update_stream(&outbox_config).await.unwrap();
-    let a_task = a.move_frames(&a_vault, &a_peers, &a_health, &a_path);
+    let a_task = a.move_frames(&a_vault, &a_peers, &a_health, &a_path, None);
     wait_metric(&a_health, "fed.hub_full").await;
     assert_eq!(a_vault.signatures.load(Ordering::Relaxed), 3);
     let before_retry = outbox.get_raw_message(3).await.unwrap();
@@ -699,6 +744,343 @@ async fn handoff_rig() {
 async fn stop(task: JoinHandle<()>) {
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
+}
+
+struct PurgeRig {
+    bin: PathBuf,
+    root: tempfile::TempDir,
+    hub_account: Account,
+    leaf: BoxServer,
+    a_id: BoxId,
+    signer: HarnessSigner,
+    seal: [u8; 32],
+    vault: Arc<Vault>,
+    health: Arc<Health>,
+}
+
+impl PurgeRig {
+    async fn start(first_sequence: u64, deny_purge: bool) -> Option<(Self, PurgeHub)> {
+        let (bin, _) = match nats_server_bin() {
+            Ok(binary) => binary,
+            Err(RigError::MissingBinary { .. })
+                if std::env::var_os("CK_BUS_TESTKIT_REQUIRE").is_none() =>
+            {
+                eprintln!("handoff purge rig skipped: nats-server is missing");
+                return None;
+            }
+            Err(error) => panic!("real nats-server: {error}"),
+        };
+        let root = tempfile::tempdir().unwrap();
+        let b_id = BoxId::parse(B).unwrap();
+        let hub_account = Account::new("hub-account", true);
+        let hub = PurgeHub::start(
+            &bin,
+            root.path(),
+            "hub-old",
+            &hub_account,
+            &b_id,
+            first_sequence,
+            deny_purge,
+        )
+        .await;
+        let leaf = BoxServer::start(&bin, root.path(), hub.port, &hub_account, b_id, true).await;
+        hub.server.wait_leaf_names(&["box-b"], DEADLINE).await;
+        let (secret, public) = Kem::derive_keypair(&[3; 32]);
+        Some((
+            Self {
+                bin,
+                root,
+                hub_account,
+                leaf,
+                a_id: BoxId::parse(A).unwrap(),
+                signer: HarnessSigner::fixed(SIGNING_ID, [4; 32]),
+                seal: public.to_bytes().into(),
+                vault: Arc::new(Vault::new(
+                    HarnessSigner::fixed(SIGNING_ID, [5; 32]),
+                    secret,
+                )),
+                health: Arc::new(Health::default()),
+            },
+            hub,
+        ))
+    }
+
+    fn move_frames(&self, pin: [u8; 32], floor: u64) -> JoinHandle<()> {
+        self.leaf.move_frames(
+            &self.vault,
+            &[(
+                self.a_id.clone(),
+                PeerKeys {
+                    seal: self.seal,
+                    sign: self.signer.root(SIGNING_ID).public,
+                },
+            )],
+            &self.health,
+            &self.root.path().join("purge.sqlite3"),
+            Some(Generation { pin, floor }),
+        )
+    }
+
+    async fn publish(&self, hub: &PurgeHub, tail: &str, sequence: u64) {
+        let id = format!("delivery-{sequence}");
+        let blob = rig_seal(
+            &self.a_id,
+            &self.leaf.id,
+            &self.seal,
+            &self.signer.root(SIGNING_ID).pair,
+            tail,
+            &id,
+            (1, sequence),
+        );
+        publish(&hub.js, &format!("ck.{B}.{tail}"), &id, blob).await;
+    }
+
+    async fn inbox(&self) -> jetstream::stream::Stream {
+        self.leaf
+            .fed_admin
+            .get_stream(inbox_stream_name(&self.leaf.id))
+            .await
+            .unwrap()
+    }
+
+    async fn wait_ack(&self, family: &str, local_sequence: u64) {
+        let inbox = self.inbox().await;
+        fixture::wait_for("inbox frame acknowledged", DEADLINE, || async {
+            let consumer: Result<jetstream::consumer::PullConsumer, _> =
+                inbox.get_consumer(&in_durable(family)).await;
+            consumer.is_ok_and(|consumer| {
+                consumer.cached_info().ack_floor.stream_sequence >= local_sequence
+            })
+        })
+        .await;
+    }
+
+    async fn block_wake(&self) -> jetstream::stream::Config {
+        let mut config = self
+            .leaf
+            .admin
+            .get_stream(&self.leaf.names.streams().wake)
+            .await
+            .unwrap()
+            .cached_info()
+            .config
+            .clone();
+        let original = config.clone();
+        config.max_messages = 1;
+        self.leaf.admin.update_stream(&config).await.unwrap();
+        publish(
+            &self.leaf.admin,
+            &format!("ck.box_{B}.wake.agent_x.fire"),
+            "prefill",
+            b"full",
+        )
+        .await;
+        original
+    }
+}
+
+struct PurgeHub {
+    server: Server,
+    port: u16,
+    js: jetstream::Context,
+    inbox: jetstream::stream::Stream,
+}
+
+impl PurgeHub {
+    async fn start(
+        bin: &Path,
+        root: &Path,
+        name: &str,
+        account: &Account,
+        box_id: &BoxId,
+        first_sequence: u64,
+        deny_purge: bool,
+    ) -> Self {
+        let operator = Operator::new(name);
+        let mut server = Server::configure(
+            bin,
+            root,
+            name,
+            "hub",
+            &operator,
+            &[account],
+            Resolver::Memory,
+            "leafnodes { listen: \"127.0.0.1:-1\", no_advertise: true }",
+        );
+        server.start().await;
+        let port =
+            serde_json::from_str::<Value>(&http_get(server.http_port, "/varz").await.unwrap())
+                .unwrap()["leaf"]["port"]
+                .as_u64()
+                .unwrap() as u16;
+        let js = jetstream::new(connect(&server.url(), &account.user("hub-client")).await);
+        let mut config = stream_config(&hub_inbox_stream(box_id).stream);
+        config.first_sequence = Some(first_sequence);
+        config.deny_purge = deny_purge;
+        let inbox = js.create_stream(config).await.unwrap();
+        assert_eq!(
+            inbox.cached_info().config.name,
+            hub_inbox_stream_name(box_id)
+        );
+        Self {
+            server,
+            port,
+            js,
+            inbox,
+        }
+    }
+
+    async fn message_count(&self) -> u64 {
+        self.inbox.clone().info().await.unwrap().state.messages
+    }
+
+    async fn wait_empty(&self) {
+        fixture::wait_for("confirmed frames purged at the hub", DEADLINE, || async {
+            self.message_count().await == 0
+        })
+        .await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn handoff_purge_advances_after_acks_but_not_past_an_unfinished_frame() {
+    let Some((rig, hub)) = PurgeRig::start(1, false).await else {
+        return;
+    };
+    let wake = rig.block_wake().await;
+    let mover = rig.move_frames([1; 32], 0);
+    rig.publish(&hub, PEER_TAIL, 1).await;
+    rig.wait_ack("peer", 1).await;
+    hub.wait_empty().await;
+
+    rig.publish(&hub, WAKE_TAIL, 2).await;
+    rig.publish(&hub, PEER_TAIL, 3).await;
+    rig.wait_ack("peer", 3).await;
+    fixture::wait_for("earlier WAKE is still waiting", DEADLINE, || async {
+        rig.health
+            .metrics()
+            .contains_key("fed.receive_waiting.wake")
+    })
+    .await;
+    // There has been time for a purge triggered by the later ACK to run.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let state = hub.inbox.clone().info().await.unwrap().state.clone();
+    assert_eq!((state.first_sequence, state.messages), (2, 2));
+
+    rig.leaf.admin.update_stream(&wake).await.unwrap();
+    rig.wait_ack("wake", 2).await;
+    hub.wait_empty().await;
+    stop(mover).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn handoff_purge_ignores_old_hub_frames_acked_after_the_switch() {
+    let Some((mut rig, old)) = PurgeRig::start(100, false).await else {
+        return;
+    };
+    let new = PurgeHub::start(
+        &rig.bin,
+        rig.root.path(),
+        "hub-new",
+        &rig.hub_account,
+        &rig.leaf.id,
+        1,
+        false,
+    )
+    .await;
+    rig.publish(&old, PEER_TAIL, 1).await;
+    fixture::wait_for("old-hub frame sourced before switch", DEADLINE, || async {
+        rig.inbox().await.cached_info().state.last_sequence == 1
+    })
+    .await;
+    let source_config = rig.inbox().await.cached_info().config.clone();
+    let mut detached = source_config.clone();
+    detached.sources = Some(vec![]);
+    rig.leaf.fed_admin.update_stream(&detached).await.unwrap();
+    let floor = rig.inbox().await.cached_info().state.last_sequence;
+    assert_eq!(floor, 1);
+
+    let wake = rig.block_wake().await;
+    rig.publish(&new, WAKE_TAIL, 2).await;
+    rig.leaf.switch_hub(old.port, new.port).await;
+    new.server.wait_leaf_names(&["box-b"], DEADLINE).await;
+    old.server.wait_leaf_names(&[], DEADLINE).await;
+    let mover = rig.move_frames([2; 32], floor);
+    rig.leaf
+        .fed_admin
+        .update_stream(&source_config)
+        .await
+        .unwrap();
+    rig.wait_ack("peer", 1).await;
+    fixture::wait_for("new-hub WAKE is still waiting", DEADLINE, || async {
+        rig.health
+            .metrics()
+            .contains_key("fed.receive_waiting.wake")
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(new.message_count().await, 1);
+    assert_eq!(old.message_count().await, 1);
+
+    rig.leaf.admin.update_stream(&wake).await.unwrap();
+    rig.wait_ack("wake", 2).await;
+    new.wait_empty().await;
+
+    // The old hand-off can source again on this hub; its sender identity is unchanged.
+    rig.publish(&new, PEER_TAIL, 1).await;
+    rig.wait_ack("peer", 3).await;
+    new.wait_empty().await;
+    assert_eq!(rig.health.metrics()["fed.inbound_duplicate"], 1);
+    let peer = rig
+        .leaf
+        .admin
+        .get_stream(&rig.leaf.names.streams().peer)
+        .await
+        .unwrap();
+    assert_eq!(peer.cached_info().state.messages, 1);
+    assert_eq!(old.message_count().await, 1);
+    stop(mover).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn handoff_purge_refusal_preserves_delivery_without_retrying_the_same_cut() {
+    let Some((rig, hub)) = PurgeRig::start(1, true).await else {
+        return;
+    };
+    let mover = rig.move_frames([1; 32], 0);
+    let failures = || {
+        rig.health.metrics()["fed.hub_purge_failures"]
+            .as_u64()
+            .unwrap()
+    };
+    rig.publish(&hub, PEER_TAIL, 1).await;
+    rig.wait_ack("peer", 1).await;
+    fixture::wait_for("hub purge refused", DEADLINE, || async {
+        let metrics = rig.health.metrics();
+        metrics["fed.hub_purge_failures"] == 1
+            && metrics["fed.hub_purge_waiting"]
+                .as_str()
+                .is_some_and(|error| error.contains("stream purge not permitted"))
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(failures(), 1);
+
+    rig.publish(&hub, PEER_TAIL, 2).await;
+    rig.wait_ack("peer", 2).await;
+    fixture::wait_for("later confirmed cut attempted", DEADLINE, || async {
+        failures() == 2
+    })
+    .await;
+    let peer = rig
+        .leaf
+        .admin
+        .get_stream(&rig.leaf.names.streams().peer)
+        .await
+        .unwrap();
+    assert_eq!(peer.cached_info().state.messages, 2);
+    assert_eq!(hub.message_count().await, 2);
+    stop(mover).await;
 }
 
 fn recorded_seal(path: &Path, source: u64) -> Option<Vec<u8>> {

@@ -2,6 +2,7 @@
 
 pub(crate) mod mover;
 pub mod production;
+pub(crate) mod purge;
 mod store;
 mod wire;
 
@@ -42,6 +43,7 @@ pub(crate) struct Health {
     hub_full: AtomicU64,
     inbound_waits: AtomicU64,
     ambiguous_peers: AtomicU64,
+    hub_purge_failures: AtomicU64,
 }
 
 impl Health {
@@ -79,6 +81,10 @@ impl Health {
             (
                 "fed.ambiguous_peers".into(),
                 json!(self.ambiguous_peers.load(Ordering::Relaxed)),
+            ),
+            (
+                "fed.hub_purge_failures".into(),
+                json!(self.hub_purge_failures.load(Ordering::Relaxed)),
             ),
         ]);
         metrics

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.11.1
+
+- Add and exercise a hub inbox purge fence based on confirmed acknowledgements and the current hub generation. Keep purging disabled in production until it can be coordinated with leaf remote changes; seven-day retention is unchanged there.
+
 ## 0.11.0
 
 - Require subc-daemon 0.50.25 for tests.

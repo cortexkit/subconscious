@@ -5,6 +5,7 @@ use hpke::{
 use rand_core::{CryptoRng, RngCore};
 
 use super::{
+    purge::Generation,
     store::{unix_secs, Source, Store},
     wire::{self, Envelope, Frame, Refusal, SizeLimit, Stamp},
     Address, BoxId,
@@ -12,6 +13,60 @@ use super::{
 
 pub(crate) const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 pub(crate) const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+#[test]
+fn handoff_purge_journal_preserves_the_gap_and_restarts_the_cut_on_a_new_pin() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("handoff.sqlite3");
+    let old = Generation {
+        pin: [1; 32],
+        floor: 15,
+    };
+    {
+        let mut store = Store::open(&path).unwrap();
+        assert_eq!(store.set_purge_generation(old).unwrap(), 0);
+        assert_eq!(
+            store.confirm_purge_receipt(old, 16, 100, true).unwrap(),
+            Some(101)
+        );
+        assert_eq!(
+            store.confirm_purge_receipt(old, 18, 102, true).unwrap(),
+            None
+        );
+    }
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(store.set_purge_generation(old).unwrap(), 101);
+    assert_eq!(
+        store.confirm_purge_receipt(old, 19, 103, true).unwrap(),
+        None
+    );
+    assert_eq!(
+        store.confirm_purge_receipt(old, 17, 101, false).unwrap(),
+        Some(104)
+    );
+
+    let new = Generation {
+        pin: [2; 32],
+        floor: 20,
+    };
+    assert_eq!(store.set_purge_generation(new).unwrap(), 0);
+    assert_eq!(
+        store.confirm_purge_receipt(new, 20, 104, true).unwrap(),
+        None
+    );
+    assert_eq!(
+        store.confirm_purge_receipt(old, 21, 105, true).unwrap(),
+        None
+    );
+    assert_eq!(
+        store.confirm_purge_receipt(new, 21, 1, false).unwrap(),
+        None
+    );
+    assert_eq!(
+        store.confirm_purge_receipt(new, 22, 2, true).unwrap(),
+        Some(3)
+    );
+}
 
 #[test]
 fn handoff_journal_keeps_epoch_retry_bytes_and_late_receipts_across_restart() {

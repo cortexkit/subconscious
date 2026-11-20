@@ -767,6 +767,18 @@ Federation state is reported separately under `detail` keys prefixed `fed.`.
   hand-off ack is the last thing prefrontal can observe, so a full hub stream is otherwise invisible to
   it. Dedupe and gap-skipping (`outbox.skip` for a write past its deadline) are prefrontal's, above
   the bus.
+- **Hub inbox retention.** In production, `HUB_INBOX_{box}` retains messages for up to seven
+  days, even after delivery. ck-bus tests purging hub messages after delivery with real hub and
+  leaf servers, but the purge is disabled in production until ck-bus can coordinate it with the
+  server's applied hub switch. The intended switch detaches the old source, records the last
+  local inbox sequence with the new hub's key pin, and then attaches the new source. Sequences at or
+  below that boundary can still be delivered, but cannot advance the new hub's purge point.
+  The purge deletes hub messages strictly before the resulting sequence boundary. That boundary
+  can only advance through a contiguous run of confirmed acknowledgements and is only set by a
+  verified frame. A deferred frame that expires or an acknowledgement that was not recorded
+  leaves a gap; ck-bus does not purge past it. The purge uses the exact
+  `$JS.hub.API.STREAM.PURGE.HUB_INBOX_{box}` grant. A refused or failed purge does not interrupt
+  delivery, is counted in `fed.hub_purge_failures`, and leaves the max-age bound in place.
 - Leaf configuration. ck-bus reads `callosum.hub_read` every 60 s and on every
   reconnect. Exactly one hub is accepted; two are refused. The SPKI SHA-256 pin from the
   roster column is the authority and candidate addresses are advisory: a dial whose

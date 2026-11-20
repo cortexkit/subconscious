@@ -24,6 +24,7 @@ use tokio::sync::{Mutex, Notify};
 
 use super::{
     in_durable, out_durable,
+    purge::{Generation, Purger},
     store::{unix_secs, Source, Store},
     wire::{self, Envelope, Frame, Refusal, Stamp},
     Address, Health, OpenError, Opener, Peer, Peers, RECEIVE_FAMILIES, SEND_DURABLE,
@@ -51,6 +52,7 @@ pub(crate) struct Mover {
     journal: Mutex<Store>,
     recipient_changed: Notify,
     receiving: PendingReceipts,
+    purger: Option<Purger>,
     open_rate_limit_delay: Duration,
 }
 
@@ -65,10 +67,16 @@ pub(crate) struct Inputs {
     pub(crate) signing: Arc<dyn VaultSigning>,
     pub(crate) opener: Arc<dyn Opener>,
     pub(crate) health: Arc<Health>,
+    pub(crate) purge_generation: Option<Generation>,
 }
 
 impl Mover {
     pub(crate) fn new(input: Inputs, path: &std::path::Path) -> rusqlite::Result<Self> {
+        let mut journal = Store::open(path)?;
+        let purger = input
+            .purge_generation
+            .map(|generation| Purger::new(generation, &input.machine, &mut journal))
+            .transpose()?;
         Ok(Self {
             machine: input.machine,
             names: input.names,
@@ -78,9 +86,10 @@ impl Mover {
             signing: input.signing,
             opener: input.opener,
             health: input.health,
-            journal: Mutex::new(Store::open(path)?),
+            journal: Mutex::new(journal),
             recipient_changed: Notify::new(),
             receiving: std::sync::Mutex::new(HashSet::new()),
+            purger,
             open_rate_limit_delay: Duration::from_secs(60),
         })
     }
@@ -97,6 +106,11 @@ impl Mover {
             self.run_forwarders(),
             join_all(RECEIVE_FAMILIES.map(|family| self.run_lane(Lane::Receive(family)))),
             self.run_pruner(),
+            async {
+                if let Some(purger) = &self.purger {
+                    purger.run(&self.fed_js, &self.health).await;
+                }
+            },
         );
     }
 
@@ -248,22 +262,20 @@ impl Mover {
         let mut backoff = FIRST_BACKOFF;
         // Once the next hop has stored this message, retry only the ack, not the
         // publish. After a crash the journal and the next hop's dedupe take over.
-        let mut settling = false;
+        let mut settling = None;
         loop {
-            let result = if settling {
-                Ok(())
+            let result = if let Some(verified) = settling {
+                Ok(verified)
             } else {
                 match lane {
-                    Lane::Send => self.send(message, &source).await,
-                    Lane::Forward(peer) => self.forward(message, peer).await,
+                    Lane::Send => self.send(message, &source).await.map(|()| false),
+                    Lane::Forward(peer) => self.forward(message, peer).await.map(|()| false),
                     Lane::Receive(_) => self.receive(message, &source).await,
                 }
             };
             let delay = match result {
-                Ok(()) => {
-                    settling = true;
-                    // Leave hub records to expire. Purging by sequence needs a hub epoch,
-                    // since a replacement hub can reuse the previous hub's sequence numbers.
+                Ok(verified) => {
+                    settling = Some(verified);
                     match message.double_ack().await {
                         Ok(()) => {
                             if matches!(lane, Lane::Send) {
@@ -271,6 +283,10 @@ impl Mover {
                                     self.health.state(&health, Some(&error.to_string()));
                                     return;
                                 }
+                            }
+                            if matches!(lane, Lane::Receive(_)) {
+                                self.confirm_inbox_ack(message, source.sequence, verified)
+                                    .await;
                             }
                             self.health.state(&health, None);
                             return;
@@ -309,6 +325,17 @@ impl Mover {
                 return;
             }
             backoff = (backoff * 2).min(MAX_BACKOFF);
+        }
+    }
+
+    async fn confirm_inbox_ack(&self, message: &Message, sequence: u64, verified: bool) {
+        if let Some(purger) = &self.purger {
+            let result = purger
+                .confirmed(&self.journal, message, sequence, verified)
+                .await;
+            let error = result.err().map(|error| error.to_string());
+            self.health
+                .state("fed.hub_purge_journal_waiting", error.as_deref());
         }
     }
 
@@ -439,9 +466,10 @@ impl Mover {
         result
     }
 
-    async fn receive(&self, message: &Message, source: &Source) -> Result<(), Retry> {
+    // Only an opened and verified frame may set the hub cut, including a duplicate.
+    async fn receive(&self, message: &Message, source: &Source) -> Result<bool, Retry> {
         if self.journal.lock().await.quarantined(source)? {
-            return Ok(());
+            return Ok(false);
         }
         match self.open_frame(message).await? {
             Ok(opened) => {
@@ -455,7 +483,7 @@ impl Mover {
                     .seen(&opened.sender, epoch, sequence)?
                 {
                     self.health.duplicate.fetch_add(1, Ordering::Relaxed);
-                    return Ok(());
+                    return Ok(true);
                 }
                 publish(
                     &self.fed_js,
@@ -480,7 +508,7 @@ impl Mover {
                         }),
                     );
                 }
-                Ok(())
+                Ok(true)
             }
             Err(reason) => {
                 let origin = Envelope::claimed_sender(&message.payload);
@@ -497,7 +525,7 @@ impl Mover {
                         json!({"reason": reason, "source_sequence": source.sequence}),
                     );
                 }
-                Ok(())
+                Ok(false)
             }
         }
     }

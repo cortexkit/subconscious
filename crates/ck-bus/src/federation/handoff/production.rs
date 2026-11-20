@@ -22,6 +22,7 @@ use tokio::sync::{broadcast, watch};
 use super::{
     in_durable,
     mover::{Inputs, Mover},
+    purge::ENABLE_PRODUCTION_PURGE,
     Health, OpenError, Opener, Peer, PeerKeys, Peers, RECEIVE_FAMILIES,
 };
 use crate::{
@@ -82,6 +83,9 @@ pub(crate) fn start(
                             signing: credentials.vault.clone(),
                             opener: opener.clone(),
                             health: report.clone(),
+                            // Do not restore a disk generation without proving the
+                            // applied leaf route still points at its pinned hub.
+                            purge_generation: None,
                         },
                         &state_path,
                     );
@@ -150,7 +154,7 @@ async fn connect(
         .unwrap_or_default()
         .as_secs() as i64;
     let user = credentials.custody.generate_user();
-    let grant = mover_grant(&machine, &user);
+    let grant = mover_grant(&machine, &user, ENABLE_PRODUCTION_PURGE);
     let result = async {
         let signed = sign_user_jwt(
             credentials.vault.as_ref(),
@@ -200,13 +204,19 @@ async fn connect(
     result
 }
 
-pub(crate) fn mover_grant(machine: &BoxId, user: &str) -> Grant {
+pub(crate) fn mover_grant(machine: &BoxId, user: &str, allow_hub_purge: bool) -> Grant {
     let inbox = inbox_stream_name(machine);
     let mut publish = vec![
         format!("$JS.API.STREAM.INFO.{inbox}"),
         format!("$JS.API.STREAM.CREATE.{inbox}"),
         "fedout.>".into(),
     ];
+    if allow_hub_purge {
+        publish.push(format!(
+            "{HUB_API_PREFIX}.STREAM.PURGE.{}",
+            hub_inbox_stream_name(machine)
+        ));
+    }
     // A recipient is learned after the mover connects. Limit the wildcard to the
     // consumer token on FEDOUT; each receive consumer has an exact grant.
     let receive = RECEIVE_FAMILIES.map(in_durable);

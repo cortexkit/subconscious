@@ -71,8 +71,12 @@ impl ControlHandler {
         let owner = self.config_runtime.as_ref()?;
         let changed = owner.delivery_notifications();
         let handler = Arc::downgrade(self);
+        let projects = owner.project_settings_enabled();
         Some(tokio::spawn(async move {
             let mut tasks = JoinSet::new();
+            if projects {
+                tasks.spawn(poll_project_membership(handler.clone()));
+            }
             let mut wakes = HashMap::<ConnectionId, Arc<Notify>>::new();
             let recording = Arc::new(std::sync::Mutex::new(HashSet::<String>::new()));
             let mut restarting = HashSet::<(String, u64)>::new();
@@ -421,6 +425,23 @@ async fn config_recovery_exit_retry_backoff_caps_and_does_not_postpone_on_owner_
     assert_eq!(retry.next, Some(start + Duration::from_secs(185)));
 }
 
+async fn poll_project_membership(handler: std::sync::Weak<ControlHandler>) {
+    use crate::config_gate::runtime::unstamped::USER_FILE_POLL_INTERVAL;
+
+    let mut poll = tokio::time::interval(USER_FILE_POLL_INTERVAL);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        poll.tick().await;
+        let Some(control) = handler.upgrade() else {
+            break;
+        };
+        let Some(owner) = &control.config_runtime else {
+            break;
+        };
+        let _ = owner.refresh_project_membership().await;
+    }
+}
+
 async fn module_worker(
     handler: std::sync::Weak<ControlHandler>,
     registration: ConfigReviewRegistration,
@@ -692,6 +713,84 @@ async fn module_worker(
                     }
                 }
             }
+            let mut project_deadline = None;
+            if owner.project_settings_enabled() && !unstamped {
+                let pass = module_work(owner, module, move |owner, module| {
+                    owner.project_delivery_pass(connection, &module)
+                })
+                .await
+                .unwrap_or_default();
+                for (project, window) in pass.windows {
+                    if let Some(deadline) = window.deadline {
+                        if Instant::now() >= deadline {
+                            let _ = module_work(owner, module, move |owner, module| {
+                                owner.delivery_timeout_for(
+                                    connection,
+                                    &module,
+                                    Some(project),
+                                    window.generation,
+                                    window.attempt,
+                                )
+                            })
+                            .await;
+                        } else {
+                            project_deadline =
+                                project_deadline.into_iter().chain(Some(deadline)).min();
+                        }
+                    }
+                }
+                for hint in pass.hints {
+                    let generation = hint.generation;
+                    let project = hint
+                        .project_id
+                        .as_ref()
+                        .expect("project hint carries an id")
+                        .clone();
+                    if !module_work(owner, module, move |owner, module| {
+                        owner.project_hint_current(connection, &module, &project, generation)
+                    })
+                    .await
+                    .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    let Some(frame) = serde_json::to_vec(&hint).ok().and_then(|body| {
+                        Frame::build_with_version(
+                            registration.negotiated_ver,
+                            FrameType::Push,
+                            control_flags(),
+                            0,
+                            0,
+                            0,
+                            body,
+                        )
+                        .ok()
+                    }) else {
+                        continue;
+                    };
+                    // Project pushes are discovery notifications; only a
+                    // flushed response to config.get starts the ACK window.
+                    drop(_guard);
+                    let sent = timeout_at(
+                        Instant::now() + CONFIG_LIVE_ACK_TIMEOUT,
+                        sink.send_flushed(frame),
+                    )
+                    .await;
+                    _guard = gate.lock().await;
+                    if !matches!(sent, Ok(Ok(())))
+                        || !control
+                            .config_delivery_target_current(module, connection, true, 0)
+                            .unwrap_or(false)
+                    {
+                        break;
+                    }
+                    let project = hint.project_id.expect("project hint carries an id");
+                    let _ = module_work(owner, module, move |owner, module| {
+                        owner.project_hint_sent(connection, &module, project, generation)
+                    })
+                    .await;
+                }
+            }
             let window = owner
                 .on_blocking(move |owner| owner.delivery_window(connection))
                 .await
@@ -711,7 +810,11 @@ async fn module_worker(
                     owner.notify_delivery_changed();
                     (None, false)
                 }
-                Some(window) => (window.deadline, false),
+                Some(window) => (
+                    window.deadline.into_iter().chain(project_deadline).min(),
+                    false,
+                ),
+                None if project_deadline.is_some() => (project_deadline, false),
                 None => (next_poll, true),
             }
         };

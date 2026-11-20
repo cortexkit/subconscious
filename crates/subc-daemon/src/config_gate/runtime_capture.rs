@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use subc_control::config::ConfigPlanView;
-use subc_protocol::config::{ConfigGetReply, ConfigGetRequest, ConfigReviewReply};
+use subc_protocol::config::ConfigReviewReply;
 
 use crate::config_gate::{
     capture_plan::CaptureReview, project_registry::RegistryScope, review::checked_fields,
@@ -117,125 +117,6 @@ impl RuntimeOwner {
             state.store.loaded_admission_state().1.last_generation,
             prepared.read_set.clone(),
         )?))
-    }
-
-    pub(super) fn stamped_project_get(
-        &self,
-        state: &mut OwnerState,
-        module: &str,
-        project: &str,
-        declaration: &ConfigDeclareRequest,
-        request: &ConfigGetRequest,
-        check_store: bool,
-    ) -> Result<ConfigGetReply> {
-        if check_store {
-            state.store.delivery_ready()?;
-        }
-        let body = if check_store {
-            state.store.body()?
-        } else {
-            state.store.loaded_admission_state().1
-        };
-        let tuple = Tuple {
-            module: module.into(),
-            project: Some(project.into()),
-        };
-        let versions = body
-            .versions
-            .iter()
-            .find(|(key, _)| key == &tuple)
-            .map(|(_, versions)| versions);
-        match &body.registry_membership {
-            Some(membership) if !membership.projects.contains_key(project) => {
-                return Err(GateError::new(
-                    "unknown_project",
-                    "project is not registered",
-                ))
-            }
-            None if versions.is_none() => {
-                return Err(GateError::new(
-                    "project_registry_unavailable",
-                    "no confirmed project list is available",
-                ))
-            }
-            _ => {}
-        }
-        let user = body
-            .versions
-            .iter()
-            .find(|(key, _)| key.module == module && key.project.is_none())
-            .map(|(_, versions)| versions);
-        let own = versions.and_then(|versions| versions.active);
-        let generation = own
-            .or_else(|| user.and_then(|versions| versions.active))
-            .ok_or_else(|| {
-                GateError::new(
-                    "config_gated",
-                    "module has no approved active configuration",
-                )
-            })?;
-        if request.attempt.is_some()
-            || request
-                .generation
-                .is_some_and(|requested| requested != generation)
-        {
-            return Err(GateError::new(
-                "config_gated",
-                "requested project configuration is not active",
-            ));
-        }
-        let delivery = body
-            .generations
-            .get(&generation)
-            .and_then(|entry| entry.delivery.as_ref())
-            .ok_or_else(|| GateError::new("config_gated", "approved project delivery is absent"))?;
-        let mut view = if own.is_some() {
-            delivery
-                .project_views
-                .get(module)
-                .and_then(|views| views.get(project))
-        } else {
-            delivery.modules.get(module)
-        }
-        .cloned()
-        .ok_or_else(|| GateError::new("config_gated", "approved project view is absent"))?;
-        view.generation = generation;
-        view.project_id = Some(project.into());
-        view.status = ConfigStatus::Active;
-        view.attempt = None;
-        let mut reply = ConfigGetReply::new(Some(view), None);
-        let declaration_versions = versions.or(user);
-        let approved = declaration_versions
-            .into_iter()
-            .flat_map(|versions| [versions.active, versions.pending])
-            .flatten()
-            .any(|id| {
-                body.generations
-                    .get(&id)
-                    .and_then(|entry| entry.delivery.as_ref())
-                    .and_then(|delivery| delivery.declarations.get(module))
-                    == Some(declaration)
-            });
-        if !approved {
-            let mut pending = subc_protocol::config::ConfigDeclarationPending::default();
-            pending.plan_digest = state
-                .gate
-                .plans
-                .values()
-                .filter(|plan| {
-                    let reviewed = plan.delivery.as_ref();
-                    reviewed.and_then(|delivery| delivery.declarations.get(module))
-                        == Some(declaration)
-                        && (own.is_none()
-                            || reviewed
-                                .and_then(|delivery| delivery.project_views.get(module))
-                                .is_some_and(|views| views.contains_key(project)))
-                })
-                .max_by_key(|plan| plan.creation_sequence)
-                .map(|plan| plan.view.digest.clone());
-            reply.declaration_pending = Some(pending);
-        }
-        Ok(reply)
     }
 }
 

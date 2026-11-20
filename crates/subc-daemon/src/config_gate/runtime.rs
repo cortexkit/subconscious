@@ -1346,12 +1346,12 @@ impl RuntimeOwner {
                     "config.declare must precede get or applied on this connection",
                 )
             })?;
-        if let Some(project) = &request.project_id {
+        if request.project_id.is_some() {
             if state.store.loaded_admission_state().0 == StoreState::Stamped {
                 return self.stamped_project_get(
                     state,
+                    connection,
                     module,
-                    project,
                     &declaration,
                     &request,
                     check_store,

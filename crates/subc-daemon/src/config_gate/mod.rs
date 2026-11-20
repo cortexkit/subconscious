@@ -21,6 +21,7 @@ mod snapshot;
 mod strict_json;
 pub(crate) mod targets;
 
+pub(crate) use apply::Transition;
 pub use approval::*;
 pub use snapshot::{CapturedInput, GateSnapshot, InputKey};
 

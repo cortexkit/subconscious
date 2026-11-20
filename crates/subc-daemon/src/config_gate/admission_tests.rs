@@ -909,12 +909,27 @@ async fn gated_channel_agent_commands_commit_through_the_channel_spawn() {
         .owner
         .set_agent_validation_window_for_test(AGENT_COMMAND_CONTRACT_TEST_WINDOW);
     assert!(fixture.handle.spawn_launch_nonce_for("a").is_none());
-    let reply = fixture
-        .primary
-        .call(request(json!({
-            "op":"supervisor.agent_commands","started":[],"finished":[],
-        })))
-        .await;
+    // `busy` is the documented retryable answer while the module's launch
+    // snapshot is being written; under a loaded test run one call can meet it.
+    // Retry it, as a module does, and require a Response within a bounded time.
+    let mut reply = None;
+    for _ in 0..50 {
+        let answer = fixture
+            .primary
+            .call(request(json!({
+                "op":"supervisor.agent_commands","started":[],"finished":[],
+            })))
+            .await;
+        let busy = answer.header.ty == subc_protocol::FrameType::Error
+            && serde_json::from_slice::<serde_json::Value>(&answer.body)
+                .is_ok_and(|body| body["code"] == "busy");
+        reply = Some(answer);
+        if !busy {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let reply = reply.expect("at least one call was made");
     assert_eq!(
         reply.header.ty,
         subc_protocol::FrameType::Response,

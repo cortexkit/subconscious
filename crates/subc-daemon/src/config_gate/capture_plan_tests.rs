@@ -9,6 +9,7 @@ use crate::config_store::Tuple;
 use cortexkit_project_identity::EnumerateReply;
 use std::{
     path::{Path, PathBuf},
+    sync::atomic::{AtomicUsize, Ordering},
     sync::Arc,
 };
 use subc_protocol::config::{ConfigLayer, ConfigReviewReply, ConfigReviewRequest};
@@ -16,11 +17,14 @@ use subc_protocol::config::{ConfigLayer, ConfigReviewReply, ConfigReviewRequest}
 struct Registry {
     reply: Mutex<Option<EnumerateReply>>,
     pool: RootIoPool,
+    enumerations: AtomicUsize,
 }
 
 impl Registry {
     fn reply(&self) -> Result<EnumerateReply> {
-        self.reply.lock().unwrap().clone().ok_or_else(|| {
+        let reply = self.reply.lock().unwrap();
+        self.enumerations.fetch_add(1, Ordering::Relaxed);
+        reply.clone().ok_or_else(|| {
             GateError::new(
                 "project_registry_unavailable",
                 "fixture registry disconnected",
@@ -130,6 +134,7 @@ impl CaptureRig {
         let registry = Arc::new(Registry {
             reply: Mutex::new(None),
             pool: RootIoPool::new().unwrap(),
+            enumerations: AtomicUsize::new(0),
         });
         let mut owner = rig.owner("capture-test");
         owner.capturer.projects = registry.clone();
@@ -310,7 +315,13 @@ async fn capture_plan_first_review_identifies_each_tuple_and_persists_cutoffs() 
     }
     for id in ["A", "C"] {
         let get = rig.get(id, 10);
-        assert!(get.pending.is_none());
+        if id == "A" {
+            let pending = get.pending.unwrap();
+            assert_eq!(pending.generation, generation);
+            assert!(pending.attempt.is_some());
+        } else {
+            assert!(get.pending.is_none());
+        }
         let view = get.active.unwrap();
         assert_eq!(view.generation, rig.stamp);
         assert_eq!(view.project_id.as_deref(), Some(id));
@@ -319,6 +330,9 @@ async fn capture_plan_first_review_identifies_each_tuple_and_persists_cutoffs() 
     rig.ack("A", generation);
     assert_eq!(rig.get("A", 10).active.unwrap().effective["limit"], 9);
 }
+
+#[path = "stamped_delivery_tests.rs"]
+mod stamped_delivery_tests;
 
 #[tokio::test]
 async fn capture_plan_held_paths_keep_approved_bytes_and_observed_proposals() {

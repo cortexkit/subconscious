@@ -747,7 +747,8 @@ pub trait ProjectRegistry: Send + Sync {
     ) -> RegistryFuture<'a>;
 
     /// Capture several modules against one complete enumeration when the
-    /// registry supplies it. Root I/O is independent of the runtime owner.
+    /// registry supplies it. Empty scopes request membership alone, without
+    /// opening any roots. Root I/O is independent of the runtime owner.
     #[doc(hidden)]
     fn capture_batch<'a>(
         &'a self,

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.21.29
+
+- Requires subc-daemon 0.50.23 (stamped delivery of project settings tuples).
+
 ## 0.21.28
 
 - Requires subc-daemon 0.50.22 (the router audit fixes).

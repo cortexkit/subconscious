@@ -1096,6 +1096,7 @@ impl ConfigStore {
                 )
             })?;
         entry.generation.id = id;
+        entry.bind_project_bases(&self.envelope.body);
         entry.initialize_project_outcomes();
         let mut body = self.envelope.body.clone();
         body.apply_project_file_approvals(files, id)?;
@@ -1163,6 +1164,7 @@ impl ConfigStore {
             }
         }
         body.generations.insert(id, entry);
+        body.fail_projects_on_rejected_bases();
         body.observed = if kind == CommitKind::Unstamp {
             None
         } else {
@@ -1350,6 +1352,9 @@ impl ConfigStore {
             .get_mut(&generation)
             .ok_or_else(|| StoreError::new(StoreErrorCode::GenerationMissing, generation))?;
         entry.record_tuple_delivery(tuple, ack, false);
+        if tuple.project.is_none() && !ack {
+            body.fail_projects_on_rejected_bases();
+        }
         if self.pending_anchor.is_some() {
             self.deferred_failure = Some(body);
             if !self.warnings.iter().any(|w| w.contains("redeliver")) {
@@ -1461,6 +1466,7 @@ impl ConfigStore {
                 if let Some(entry) = body.generations.get_mut(&intent.generation) {
                     mark_daemon_failed(entry);
                 }
+                body.fail_projects_on_rejected_bases();
                 self.warnings.push(format!(
                     "Daemon restart into generation {} never became ready; it is marked failed",
                     intent.generation

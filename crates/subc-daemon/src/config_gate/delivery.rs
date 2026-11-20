@@ -10,6 +10,8 @@ use crate::config_store::Tuple;
 #[path = "rpc_delivery.rs"]
 mod rpc_delivery;
 use rpc_delivery::record_served_view;
+#[path = "project_delivery.rs"]
+mod projects;
 
 pub(crate) const CONFIG_LIVE_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const CONFIG_WARMUP_SLACK: Duration = Duration::from_secs(10);
@@ -80,6 +82,37 @@ struct Attempt {
     declaration_fallback: bool,
 }
 
+impl Attempt {
+    fn window(&self) -> DeliveryWindow {
+        DeliveryWindow {
+            generation: self.generation,
+            attempt: self.id,
+            delivered: self.delivered,
+            deadline: self.deadline,
+        }
+    }
+
+    fn written(&mut self, written_at: tokio::time::Instant) -> Result<bool> {
+        if self
+            .write_deadline
+            .is_some_and(|deadline| written_at >= deadline)
+            || self.deadline.is_some_and(|deadline| written_at >= deadline)
+        {
+            return Err(GateError::new(
+                "delivery_expired",
+                "configuration delivery timed out",
+            ));
+        }
+        let mut changed = !self.delivered;
+        self.delivered = true;
+        if !self.transition.requires_spawn() && self.deadline.is_none() {
+            self.deadline = Some(written_at + CONFIG_LIVE_ACK_TIMEOUT);
+            changed = true;
+        }
+        Ok(changed)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DeliverySpawn {
     id: u64,
@@ -138,6 +171,7 @@ pub(super) struct DeliveryState {
     next_attempt: u64,
     policy_epochs: HashMap<String, u64>,
     attempts: HashMap<ConnectionId, Attempt>,
+    projects: HashMap<ConnectionId, BTreeMap<String, projects::ProjectSlot>>,
     served: HashMap<ConnectionId, (Option<u64>, Option<u64>)>,
     pub(super) unstamped_views: HashMap<ConnectionId, std::sync::Arc<ConfigView>>,
     stamp_running: HashSet<ConnectionId>,
@@ -340,6 +374,7 @@ impl DeliveryState {
     /// Forget `connection`'s delivery state. Returns whether it had any.
     pub(super) fn disconnected(&mut self, connection: ConnectionId) -> bool {
         let mut held = self.attempts.remove(&connection).is_some();
+        held |= self.projects.remove(&connection).is_some();
         held |= self.fallback_applied.remove(&connection).is_some();
         held |= self.served.remove(&connection).is_some();
         held |= self.unstamped_views.remove(&connection).is_some();
@@ -1212,17 +1247,19 @@ impl RuntimeOwner {
         &self,
         connection: ConnectionId,
     ) -> Result<Option<DeliveryWindow>> {
+        self.delivery_window_for(connection, None)
+    }
+
+    pub(crate) fn delivery_window_for(
+        &self,
+        connection: ConnectionId,
+        project: Option<&str>,
+    ) -> Result<Option<DeliveryWindow>> {
         Ok(self
             .lock()?
             .delivery
-            .attempts
-            .get(&connection)
-            .map(|bound| DeliveryWindow {
-                generation: bound.generation,
-                attempt: bound.id,
-                delivered: bound.delivered,
-                deadline: bound.deadline,
-            }))
+            .attempt_for(connection, project)
+            .map(Attempt::window))
     }
 
     pub(crate) fn delivery_write_started(
@@ -1232,11 +1269,21 @@ impl RuntimeOwner {
         attempt: u64,
         now: tokio::time::Instant,
     ) -> Result<()> {
+        self.delivery_write_started_for(connection, None, generation, attempt, now)
+    }
+
+    pub(crate) fn delivery_write_started_for(
+        &self,
+        connection: ConnectionId,
+        project: Option<&str>,
+        generation: u64,
+        attempt: u64,
+        now: tokio::time::Instant,
+    ) -> Result<()> {
         if let Some(bound) = self
             .lock()?
             .delivery
-            .attempts
-            .get_mut(&connection)
+            .attempt_for_mut(connection, project)
             .filter(|bound| {
                 bound.generation == generation && bound.id == attempt && !bound.delivered
             })
@@ -1255,17 +1302,25 @@ impl RuntimeOwner {
         generation: u64,
         attempt: u64,
     ) -> Result<AppliedDisposition> {
-        self.module_outcome(
-            connection,
-            module,
-            ConfigAppliedRequest::new(
-                generation,
-                attempt,
-                subc_protocol::config::ConfigApplyResult::Nack,
-                vec![],
-            ),
-            true,
-        )
+        self.delivery_timeout_for(connection, module, None, generation, attempt)
+    }
+
+    pub(crate) fn delivery_timeout_for(
+        &self,
+        connection: ConnectionId,
+        module: &str,
+        project: Option<String>,
+        generation: u64,
+        attempt: u64,
+    ) -> Result<AppliedDisposition> {
+        let mut request = ConfigAppliedRequest::new(
+            generation,
+            attempt,
+            subc_protocol::config::ConfigApplyResult::Nack,
+            vec![],
+        );
+        request.project_id = project;
+        self.module_outcome(connection, module, request, true)
     }
 
     /// Capture the common spawn instant, not the later HELLO instant, so a slow
@@ -1341,6 +1396,20 @@ impl RuntimeOwner {
                 self.notify_delivery_changed();
             }
             checked?;
+            if let Some(project) = reply
+                .pending
+                .as_ref()
+                .or(reply.active.as_ref())
+                .and_then(|view| view.project_id.as_deref())
+            {
+                let wrote = Self::project_view_delivered(
+                    &mut state, connection, module, project, reply, written_at, active,
+                )?;
+                if wrote {
+                    self.notify_delivery_changed();
+                }
+                return Ok(());
+            }
             let (_, body) = state.store.loaded_admission_state();
             if body.stamped {
                 let versions = body
@@ -1637,25 +1706,7 @@ impl RuntimeOwner {
                     "writer receipt no longer names the current delivery attempt",
                 )
             })?;
-        if bound
-            .write_deadline
-            .is_some_and(|deadline| written_at >= deadline)
-            || bound
-                .deadline
-                .is_some_and(|deadline| written_at >= deadline)
-        {
-            return Err(GateError::new(
-                "delivery_expired",
-                "configuration delivery timed out",
-            ));
-        }
-        let mut changed = !bound.delivered;
-        bound.delivered = true;
-        if !bound.transition.requires_spawn() && bound.deadline.is_none() {
-            bound.deadline = Some(written_at + CONFIG_LIVE_ACK_TIMEOUT);
-            changed = true;
-        }
-        Ok(changed)
+        bound.written(written_at)
     }
 
     pub(crate) fn module_applied(
@@ -1685,11 +1736,9 @@ impl RuntimeOwner {
                 "config.declare must precede get or applied on this connection",
             ));
         }
-        if request.project_id.is_some() {
-            return Err(GateError::new(
-                "config_gated",
-                "project-tuple delivery is not supported yet",
-            ));
+        if let Some(project) = &request.project_id {
+            return self
+                .project_outcome(&mut state, connection, module, project, &request, timed_out);
         }
         if state.active_declarations.get(module) != Some(&connection) {
             return Err(GateError::new(
@@ -1826,6 +1875,9 @@ impl RuntimeOwner {
             state.restore_route_policy(module, bound.generation);
         }
         let result = state.store.record_delivery(&tuple, bound.generation, ack);
+        if self.project_capture_enabled {
+            self.notify_delivery_changed();
+        }
         if result.is_ok() && ack {
             state.commit_route_policy(module, bound.generation);
         }

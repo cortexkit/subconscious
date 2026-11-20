@@ -119,20 +119,18 @@ fn config_store_projects_outcomes_and_suppression_are_isolated_after_restart() {
 fn config_store_projects_anchor_retry_keeps_project_ack_and_user_failure() {
     let rig = Rig::new();
     let mut store = rig.open(true);
-    commit(&mut store, CommitKind::Stamp);
+    let stamp = commit(&mut store, CommitKind::Stamp);
+    store.record_delivery(&tuple(), stamp, true).unwrap();
     let key = project("A");
-    let mut approved = project_entry(&["A"], 1);
-    approved.tuples.insert(tuple());
-    let id = store
-        .commit_generation(approved, snapshot(1, 1), snapshot(1, 1), 1)
-        .unwrap();
+    let id = generation(&mut store, &["A"], 1);
+    let user = commit(&mut store, CommitKind::Approved);
     rig.key.lock().unwrap().set_anchor_failure(true);
     error_code(
         store.record_delivery(&key, id, true),
         StoreErrorCode::AnchorPending,
     );
     error_code(
-        store.record_delivery(&tuple(), id, false),
+        store.record_delivery(&tuple(), user, false),
         StoreErrorCode::AnchorPending,
     );
     rig.key.lock().unwrap().set_anchor_failure(false);
@@ -140,12 +138,13 @@ fn config_store_projects_anchor_retry_keeps_project_ack_and_user_failure() {
     let mut restarted = rig.open(true);
     let body = restarted.body().unwrap();
     let approved = &body.generations[&id];
-    assert_eq!(approved.outcome, "failed");
+    let failed = &body.generations[&user];
+    assert_eq!(failed.outcome, "failed");
     assert_eq!(
-        approved.generation.module_states["sample"],
+        failed.generation.module_states["sample"],
         subc_config::GenerationState::Failed
     );
-    assert!(approved.redelivery_suppressed(&tuple()));
+    assert!(failed.redelivery_suppressed(&tuple()));
     assert!(!approved.redelivery_suppressed(&key));
     assert_eq!(
         approved.project_outcomes["sample"]["A"].state,

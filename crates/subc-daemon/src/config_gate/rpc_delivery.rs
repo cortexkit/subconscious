@@ -8,12 +8,12 @@ impl RuntimeOwner {
         request: ConfigGetRequest,
     ) -> Result<ConfigGetReply> {
         let mut state = self.lock()?;
+        let project = request.project_id.clone();
         let witness = |state: &OwnerState| {
             (
                 state
                     .delivery
-                    .attempts
-                    .get(&connection)
+                    .attempt_for(connection, project.as_deref())
                     .map(|bound| bound.id),
                 state.delivery.last_target_attempt.get(module).copied(),
                 store_witness(&state.store),

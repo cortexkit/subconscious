@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.50.23
+
+- Prepare stamped project delivery behind the project settings guard. Project
+  notifications and acknowledgements are tracked separately from user settings,
+  and a project update waits for the user generation it was reviewed against.
+
 ## 0.50.22
 
 Fixes from a review of the router and forwarding code:

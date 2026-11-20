@@ -59,6 +59,8 @@ pub struct DeliverySnapshot {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProjectCutoffs {
+    /// The user view the project view was reviewed against; its generation
+    /// names that user approval.
     pub user: ConfigView,
     pub workspace: ConfigView,
 }
@@ -96,6 +98,50 @@ pub struct HistoryEntry {
 }
 
 impl HistoryEntry {
+    pub(crate) fn project_basis(&self, tuple: &Tuple) -> Option<u64> {
+        let project = tuple.project.as_ref()?;
+        let generation = self
+            .delivery
+            .as_ref()?
+            .project_cutoffs
+            .get(&tuple.module)?
+            .get(project)?
+            .user
+            .generation;
+        (generation != 0).then_some(generation)
+    }
+
+    pub(super) fn bind_project_bases(&mut self, body: &StoreBody) {
+        let Some(delivery) = &mut self.delivery else {
+            return;
+        };
+        for tuple in &self.tuples {
+            let Some(cutoffs) = tuple.project.as_ref().and_then(|project| {
+                delivery
+                    .project_cutoffs
+                    .get_mut(&tuple.module)?
+                    .get_mut(project)
+            }) else {
+                continue;
+            };
+            let user = Tuple {
+                module: tuple.module.clone(),
+                project: None,
+            };
+            // A project-only review uses the last approved user input, even
+            // if the module has not activated that approval yet.
+            cutoffs.user.generation = if self.tuples.contains(&user) {
+                self.generation.id
+            } else {
+                body.generations
+                    .iter()
+                    .rev()
+                    .find_map(|(&id, entry)| entry.tuples.contains(&user).then_some(id))
+                    .unwrap_or(0)
+            };
+        }
+    }
+
     pub(super) fn initialize_project_outcomes(&mut self) {
         for tuple in &self.tuples {
             if let Some(project) = &tuple.project {
@@ -326,6 +372,57 @@ fn bootable(entry: &HistoryEntry) -> bool {
 }
 
 impl StoreBody {
+    pub(crate) fn user_versions(&self, module: &str) -> Option<&Versions> {
+        self.versions.iter().find_map(|(key, versions)| {
+            (key.module == module && key.project.is_none()).then_some(versions)
+        })
+    }
+
+    pub(crate) fn project_versions(&self, tuple: &Tuple) -> Option<&Versions> {
+        self.versions
+            .iter()
+            .find_map(|(key, versions)| (key == tuple).then_some(versions))
+    }
+
+    pub(crate) fn project_sendable(&self, tuple: &Tuple, generation: u64) -> bool {
+        let Some(entry) = self.generations.get(&generation) else {
+            return false;
+        };
+        !entry.redelivery_suppressed(tuple)
+            && entry.project_basis(tuple).is_some_and(|basis| {
+                self.user_versions(&tuple.module)
+                    .is_some_and(|user| user.active == Some(basis) && user.pending.is_none())
+            })
+    }
+
+    pub(super) fn fail_projects_on_rejected_bases(&mut self) {
+        for (tuple, versions) in &mut self.versions {
+            let (Some(_), Some(pending)) = (&tuple.project, versions.pending) else {
+                continue;
+            };
+            let Some(entry) = self.generations.get(&pending) else {
+                continue;
+            };
+            let rejected = entry
+                .project_basis(tuple)
+                .and_then(|basis| self.generations.get(&basis))
+                .is_some_and(|basis| {
+                    use crate::config_gate::Transition;
+                    let suppressed = &basis.generation.never_redeliver;
+                    suppressed.contains(&tuple.module)
+                        || (suppressed.iter().any(|module| module == DAEMON_MODULE)
+                            && Transition::for_module(&basis.generation.changeset, &tuple.module)
+                                .is_ok_and(|transition| transition == Transition::DaemonRestart))
+                });
+            if rejected {
+                versions.pending = None;
+                if let Some(entry) = self.generations.get_mut(&pending) {
+                    entry.record_tuple_delivery(tuple, false, false);
+                }
+            }
+        }
+    }
+
     /// Called before a configuration generation is inserted: whether it is the
     /// first one since the daemon's activation point to wait for a restart.
     pub(super) fn awaits_restart(&self, entry: &HistoryEntry) -> bool {

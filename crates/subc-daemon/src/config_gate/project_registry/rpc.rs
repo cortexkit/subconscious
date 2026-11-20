@@ -139,6 +139,9 @@ impl ProjectRegistry for EntorhinalProjectRegistry {
     ) -> RegistryBatchFuture<'a> {
         Box::pin(async move {
             let reply = self.enumerate().await?;
+            if scopes.is_empty() {
+                return Ok((Some(reply), BTreeMap::new()));
+            }
             let pool = self
                 .root_io
                 .as_ref()

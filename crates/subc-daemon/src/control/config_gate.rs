@@ -268,6 +268,11 @@ impl ControlHandler {
                     control_response_body_frame(&frame, &response, "module config response")?;
                 if let Some(view) = delivered_view {
                     use crate::config_gate::runtime::delivery::CONFIG_LIVE_ACK_TIMEOUT;
+                    let project = view
+                        .pending
+                        .as_ref()
+                        .or(view.active.as_ref())
+                        .and_then(|view| view.project_id.clone());
                     let selected = view
                         .pending
                         .as_ref()
@@ -276,19 +281,21 @@ impl ControlHandler {
                             .as_ref()
                             .filter(|_| view.declaration_pending.is_some()))
                         .and_then(|view| view.attempt.map(|attempt| (view.generation, attempt)));
+                    let writing_project = project.clone();
                     let window = runtime
                         .on_blocking(move |owner| {
                             if active {
                                 if let Some((generation, attempt)) = selected {
-                                    owner.delivery_write_started(
+                                    owner.delivery_write_started_for(
                                         connection,
+                                        writing_project.as_deref(),
                                         generation,
                                         attempt,
                                         tokio::time::Instant::now(),
                                     )?;
                                 }
                             }
-                            owner.delivery_window(connection)
+                            owner.delivery_window_for(connection, writing_project.as_deref())
                         })
                         .await
                         .map_err(|error| {
@@ -309,8 +316,11 @@ impl ControlHandler {
                             .await;
                     let flushed_at = tokio::time::Instant::now();
                     let _gate = gate.lock().await;
+                    let current_project = project.clone();
                     let current_window = runtime
-                        .on_blocking(move |owner| owner.delivery_window(connection))
+                        .on_blocking(move |owner| {
+                            owner.delivery_window_for(connection, current_project.as_deref())
+                        })
                         .await
                         .ok()
                         .flatten();
@@ -337,8 +347,8 @@ impl ControlHandler {
                                         runtime.clone(),
                                         ConfigWake::Delivery,
                                         move |owner| {
-                                            owner.delivery_timeout(
-                                                connection, &module, generation, attempt,
+                                            owner.delivery_timeout_for(
+                                                connection, &module, project, generation, attempt,
                                             )
                                         },
                                     )
@@ -371,8 +381,8 @@ impl ControlHandler {
                                         runtime.clone(),
                                         ConfigWake::Delivery,
                                         move |owner| {
-                                            owner.delivery_timeout(
-                                                connection, &module, generation, attempt,
+                                            owner.delivery_timeout_for(
+                                                connection, &module, project, generation, attempt,
                                             )
                                         },
                                     )

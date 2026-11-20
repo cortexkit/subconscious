@@ -160,6 +160,19 @@ impl ClaustrumRoute {
             .await
             .map_err(classify_call_error)
     }
+
+    pub(crate) async fn open_bus_seal(
+        &self,
+        enc: &[u8],
+        ciphertext: &[u8],
+        info: &[u8],
+    ) -> Result<Vec<u8>, VaultError> {
+        let reply = self
+            .call(wire::open_bus_seal_request(enc, ciphertext, info))
+            .await?;
+        wire::parse_open_reply(&reply)
+            .map_err(|error| VaultError::from_reply(wire::BUS_SEAL_ID, error))
+    }
 }
 
 /// `target_unavailable` and `module_warming` clear on their own and are retried on the

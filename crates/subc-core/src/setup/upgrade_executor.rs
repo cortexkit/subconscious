@@ -337,7 +337,7 @@ mod tests {
             Ok((self.maintenance_changes, "message hub entry checked".into()))
         }
         fn grant_message_keys(&mut self, _target: UpgradeTarget) -> Result<(bool, String), String> {
-            Ok((self.maintenance_changes, "all nine grants checked".into()))
+            Ok((self.maintenance_changes, "all grants checked".into()))
         }
         fn download_and_verify(&mut self, _target: UpgradeTarget) -> Result<String, String> {
             self.calls.push("download");

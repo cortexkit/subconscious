@@ -159,6 +159,7 @@ pub fn hub_account_claims(
         signing_keys: vec![account_signing_key.to_string()],
         revocations: revocations.clone(),
         issued_at,
+        handoff: None,
     }
     .claims(issuer)
 }

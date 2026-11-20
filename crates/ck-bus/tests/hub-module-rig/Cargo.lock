@@ -149,9 +149,9 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "cortexkit-bus-naming"
-version = "0.5.4"
+version = "0.5.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0fa062a586449c8841f851bf042483b9a3347d8222c38c06f807f5eb243e9ce0"
+checksum = "d97b2e70eb1bf24836617fec2efb4ae141af78734dbeb38fa77838503f045308"
 
 [[package]]
 name = "cpufeatures"

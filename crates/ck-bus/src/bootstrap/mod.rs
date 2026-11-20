@@ -442,6 +442,9 @@ pub async fn boot(
         signing_keys: vec![encode_public(NkeyRole::Account, &box_root.public)],
         revocations: revoked,
         issued_at: now.max(previous_iat + 1),
+        handoff: Some(account_jwt::HandoffService::Export {
+            box_name: account.acct.clone(),
+        }),
     };
     let account_jwt = sign_account_jwt(vault, &deps.credentials.key_ids, &signer_id, &claims)
         .await

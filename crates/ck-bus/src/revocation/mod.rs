@@ -598,6 +598,19 @@ impl Revoker {
             })?;
         let name = claims["name"].as_str().unwrap_or_default().to_string();
         let previous_iat = claims["iat"].as_i64().unwrap_or_default();
+        use crate::bootstrap::account_jwt::HandoffService;
+        let handoff = if hub && claims["nats"].get("imports").is_some() {
+            Some(HandoffService::Import {
+                box_name: plane.names.account().to_owned(),
+                box_account: plane.account_public.clone(),
+            })
+        } else if !hub && claims["nats"].get("exports").is_some() {
+            Some(HandoffService::Export {
+                box_name: plane.names.account().to_owned(),
+            })
+        } else {
+            None
+        };
         // The update below is rebuilt from ck-bus's own claim layout (`AccountClaims`), not
         // edited in place, so it drops any claim ck-bus does not write itself. That is safe
         // only while ck-bus is the account's single writer. So the looked-up claims must be
@@ -610,6 +623,7 @@ impl Revoker {
             signing_keys: signing_keys.clone(),
             revocations: revoked.clone(),
             issued_at: previous_iat,
+            handoff: handoff.clone(),
         }
         .claims(claims["iss"].as_str().unwrap_or_default());
         if let Some(claim) = foreign_claim(&claims, &as_written, "") {
@@ -637,6 +651,7 @@ impl Revoker {
             signing_keys,
             revocations: revoked,
             issued_at: now.max(previous_iat + 1),
+            handoff,
         };
         let signer_id = RootCredential::OperatorSigner
             .credential_id()

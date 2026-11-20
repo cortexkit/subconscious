@@ -405,6 +405,16 @@
     },
     {
       "ack_wait_secs": 30,
+      "durable": "m_entorhinal",
+      "filter_subjects": [
+        "ck.box_upgradegolden.event.callosum.device_removed.v1"
+      ],
+      "max_ack_pending": 1000,
+      "max_deliver": -1,
+      "stream": "CK_BOX_UPGRADEGOLDEN_EVENT"
+    },
+    {
+      "ack_wait_secs": 30,
       "durable": "m_prefrontal",
       "filter_subjects": [
         "ck.box_upgradegolden.room.*.post"

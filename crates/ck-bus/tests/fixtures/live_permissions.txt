@@ -125,34 +125,15 @@ allow colliculus subscribe ck.box_goldenfixture.live.magic-context.memory_change
 allow colliculus subscribe ck.box_goldenfixture.live.prefrontal-core.board_changed.v1
 allow colliculus subscribe ck.box_goldenfixture.live.prefrontal.board_changed.v1
 allow colliculus subscribe ck.box_goldenfixture.live.thalamus-harness.turn_ended.v1
-allow entorhinal publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EFFECT.*.>
-allow entorhinal publish $JS.ACK.CK_BOX_GOLDENFIXTURE_PEER.*.>
-allow entorhinal publish $JS.ACK.CK_BOX_GOLDENFIXTURE_WAKE.*.>
-allow entorhinal publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS
-allow entorhinal publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow entorhinal publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_ENTORHINAL_CHANGES
 allow entorhinal publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_PREFRONTAL_CORE_SESSION_LIVENESS
 allow entorhinal publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_PREFRONTAL_SESSION_LIVENESS
-allow entorhinal publish $JS.API.CONSUMER.DELETE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow entorhinal publish $JS.API.CONSUMER.DURABLE.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow entorhinal publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EFFECT.*
-allow entorhinal publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_PEER.*
-allow entorhinal publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_WAKE.*
-allow entorhinal publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EFFECT.*
-allow entorhinal publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_PEER.*
-allow entorhinal publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_WAKE.*
-allow entorhinal publish $JS.API.DIRECT.GET.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow entorhinal publish $JS.API.DIRECT.GET.KV_CK_BOX_GOLDENFIXTURE_ENTORHINAL_CHANGES.>
 allow entorhinal publish $JS.API.DIRECT.GET.KV_CK_BOX_GOLDENFIXTURE_PREFRONTAL_CORE_SESSION_LIVENESS.>
 allow entorhinal publish $JS.API.DIRECT.GET.KV_CK_BOX_GOLDENFIXTURE_PREFRONTAL_SESSION_LIVENESS.>
-allow entorhinal publish $JS.API.STREAM.INFO.CK_BOX_GOLDENFIXTURE_EFFECT
-allow entorhinal publish $JS.API.STREAM.INFO.CK_BOX_GOLDENFIXTURE_PEER
-allow entorhinal publish $JS.API.STREAM.INFO.CK_BOX_GOLDENFIXTURE_WAKE
-allow entorhinal publish $JS.API.STREAM.INFO.KV_CK_BOX_GOLDENFIXTURE_CENSUS
 allow entorhinal publish $JS.API.STREAM.INFO.KV_CK_BOX_GOLDENFIXTURE_ENTORHINAL_CHANGES
 allow entorhinal publish $JS.API.STREAM.INFO.KV_CK_BOX_GOLDENFIXTURE_PREFRONTAL_CORE_SESSION_LIVENESS
 allow entorhinal publish $JS.API.STREAM.INFO.KV_CK_BOX_GOLDENFIXTURE_PREFRONTAL_SESSION_LIVENESS
-allow entorhinal publish $JS.API.STREAM.MSG.GET.KV_CK_BOX_GOLDENFIXTURE_CENSUS
 allow entorhinal publish $JS.API.STREAM.MSG.GET.KV_CK_BOX_GOLDENFIXTURE_ENTORHINAL_CHANGES
 allow entorhinal publish $JS.API.STREAM.MSG.GET.KV_CK_BOX_GOLDENFIXTURE_PREFRONTAL_CORE_SESSION_LIVENESS
 allow entorhinal publish $JS.API.STREAM.MSG.GET.KV_CK_BOX_GOLDENFIXTURE_PREFRONTAL_SESSION_LIVENESS
@@ -160,11 +141,8 @@ allow entorhinal publish $JS.FC.KV_CK_BOX_GOLDENFIXTURE_ENTORHINAL_CHANGES.>
 allow entorhinal publish $JS.FC.KV_CK_BOX_GOLDENFIXTURE_PREFRONTAL_CORE_SESSION_LIVENESS.>
 allow entorhinal publish $JS.FC.KV_CK_BOX_GOLDENFIXTURE_PREFRONTAL_SESSION_LIVENESS.>
 allow entorhinal publish $KV.CK_BOX_GOLDENFIXTURE_ENTORHINAL_CHANGES.>
-allow entorhinal publish ck.box_goldenfixture.effect.dead
-allow entorhinal publish ck.box_goldenfixture.event.entorhinal.>
 allow entorhinal publish ck.box_goldenfixture.live.entorhinal.>
-allow entorhinal subscribe $KV.CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow entorhinal subscribe _INBOX.entorhinal.>
+allow entorhinal subscribe ck.box_goldenfixture.live.callosum.device_removed.v1
 allow magic-context publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_ENTORHINAL_CHANGES
 allow magic-context publish $JS.API.DIRECT.GET.KV_CK_BOX_GOLDENFIXTURE_ENTORHINAL_CHANGES.>
 allow magic-context publish $JS.API.STREAM.INFO.KV_CK_BOX_GOLDENFIXTURE_ENTORHINAL_CHANGES
@@ -250,6 +228,8 @@ expect-refused cerebellum publish ck.box_goldenfixture.live.broca.run.v1 foreign
 expect-refused cerebellum publish ck.box_goldenfixture.live.insula.quota_sampled.v1 foreign-module-live
 expect-refused colliculus publish ck.box_goldenfixture.live.broca.run.v1 foreign-module-live
 expect-refused colliculus publish ck.box_goldenfixture.live.insula.quota_sampled.v1 foreign-module-live
+expect-refused entorhinal publish ck.box_goldenfixture.live.broca.run.v1 foreign-module-live
+expect-refused entorhinal publish ck.box_goldenfixture.live.insula.quota_sampled.v1 foreign-module-live
 expect-refused magic-context publish ck.box_goldenfixture.live.broca.run.v1 foreign-module-live
 expect-refused magic-context publish ck.box_goldenfixture.live.insula.quota_sampled.v1 foreign-module-live
 expect-refused occipital publish ck.box_goldenfixture.live.broca.run.v1 foreign-module-live

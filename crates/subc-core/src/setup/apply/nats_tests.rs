@@ -204,8 +204,10 @@ fn message_plane_setup_uses_the_installed_vault_cli_after_it_is_live() {
     });
     backend.apply(&SetupOperation::GrantMessageKeys).unwrap();
     // One vault status read, then one grant per line: five signing keys, each
-    // for read and sign, and the hub token audience.
-    assert_eq!(*calls.lock().unwrap(), 12);
+    // for read and sign; the hub token audience; ck-bus's open on the bus seal
+    // key and sign on the message-signing key; and Callosum's read on the three
+    // public keys it announces to paired computers.
+    assert_eq!(*calls.lock().unwrap(), 17);
     assert!(!backend.component_steps[&Component::Claustrum].message_grants_changed);
 }
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.11.0
+
+- Require subc-daemon 0.50.25 for tests.
+- Require cortexkit-bus-naming 0.5.6 for the box mover's durable pull and acknowledgement permissions.
+- Move hand-offs through FEDSEND, FEDOUT and the hub inbox. Sign with the vault and seal locally to the paired recipient; keep sequence numbers and retry bytes across restarts.
+- Verify and deduplicate inbound frames by sender, epoch and sequence before delivering them through a box service import. Wait on transient vault and roster failures; quarantine malformed frames without retaining their ciphertext.
+- Keep hub progress separate by recipient and inbound delivery separate by family. Report gaps, quarantine, dead letters and hub backpressure in health.
+
 ## 0.10.1
 
 - Hold federation watches until a decision so ck-bus restarts leave the hub and its leaf links running.

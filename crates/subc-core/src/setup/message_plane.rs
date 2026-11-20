@@ -7,7 +7,7 @@ use super::{config, runtime::CommandRunner};
 pub(super) const GRANT_STEP: &str = "Let the message module use this computer's message-plane keys";
 pub(super) const HUB_STEP: &str = "Install an idle message hub entry";
 
-/// Individual signing keys require the operator's grants, not a module's
+/// Individual signing and opening keys require the operator's grants, not a module's
 /// declaration. The vault CLI owns idempotence, including on older vaults.
 pub(super) fn grant_keys(
     auth: &Path,
@@ -25,17 +25,39 @@ pub(super) fn grant_keys(
         "signing:bus-hub-tls:1",
     ] {
         for operation in ["read", "sign"] {
-            selectors.push(("exact", key, operation));
+            selectors.push(("reserved:ckbus", "exact", key, operation));
         }
     }
-    selectors.push(("audience", "cortexkit-hub", "account_token"));
+    selectors.extend([
+        ("reserved:ckbus", "exact", "kem:bus-seal:1", "open"),
+        ("reserved:ckbus", "exact", "signing:msgsig", "sign"),
+        ("reserved:callosum", "exact", "kem:bus-seal:1", "read"),
+        (
+            "reserved:callosum",
+            "exact",
+            "kem:fleet-epoch-wrap:1",
+            "read",
+        ),
+        (
+            "reserved:callosum",
+            "exact",
+            "signing:fleet-record:1",
+            "read",
+        ),
+        (
+            "reserved:ckbus",
+            "audience",
+            "cortexkit-hub",
+            "account_token",
+        ),
+    ]);
     let mut changed = false;
     let mut lines = Vec::new();
-    for (kind, selector, operation) in selectors {
+    for (principal, kind, selector, operation) in selectors {
         let args = [
             "grant",
             "--principal",
-            "reserved:ckbus",
+            principal,
             "--selector-kind",
             kind,
             "--selector",
@@ -61,7 +83,7 @@ pub(super) fn grant_keys(
     let detail = if changed {
         format!("{}\nMessage-plane grants applied", lines.join("\n"))
     } else {
-        "Message-plane grants: nothing changed (all nine already granted)".into()
+        "Message-plane grants: nothing changed (all already granted)".into()
     };
     Ok((changed, detail))
 }
@@ -238,6 +260,11 @@ mod tests {
             "grant --principal reserved:ckbus --selector-kind exact --selector signing:bus-federation-account:1 --operation sign",
             "grant --principal reserved:ckbus --selector-kind exact --selector signing:bus-hub-tls:1 --operation read",
             "grant --principal reserved:ckbus --selector-kind exact --selector signing:bus-hub-tls:1 --operation sign",
+            "grant --principal reserved:ckbus --selector-kind exact --selector kem:bus-seal:1 --operation open",
+            "grant --principal reserved:ckbus --selector-kind exact --selector signing:msgsig --operation sign",
+            "grant --principal reserved:callosum --selector-kind exact --selector kem:bus-seal:1 --operation read",
+            "grant --principal reserved:callosum --selector-kind exact --selector kem:fleet-epoch-wrap:1 --operation read",
+            "grant --principal reserved:callosum --selector-kind exact --selector signing:fleet-record:1 --operation read",
             "grant --principal reserved:ckbus --selector-kind audience --selector cortexkit-hub --operation account_token",
         ];
         let calls = fs::read_to_string(root.join("calls")).unwrap();

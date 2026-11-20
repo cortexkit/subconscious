@@ -947,6 +947,9 @@ async fn revocation_prunes_expired_user_cutoffs_but_keeps_live_cutoffs() {
             .collect(),
         revocations: [(expired.clone(), now - 901), (recent.clone(), now)].into(),
         issued_at: now.max(current["iat"].as_i64().unwrap() + 1),
+        handoff: Some(bootstrap::account_jwt::HandoffService::Export {
+            box_name: plane.names.account().to_owned(),
+        }),
     };
     let signer = InProcessSigner(run.trust.signer.clone());
     let jwt = bootstrap::account_jwt::sign_account_jwt(
@@ -2248,6 +2251,7 @@ async fn boot_grant_sweep_batches_changes_and_preserves_unchanged_users_and_data
         signing_keys: vec![],
         revocations: BTreeMap::new(),
         issued_at: unix_now(),
+        handoff: None,
     };
     let signer = credentials::roots::RootCredential::OperatorSigner
         .credential_id()
@@ -2317,6 +2321,7 @@ async fn boot_grant_sweep_refuses_census_transport_failures_before_pushing() {
             signing_keys: vec![],
             revocations: BTreeMap::new(),
             issued_at: unix_now(),
+            handoff: None,
         };
         let error = bootstrap::grant_changes::revoke_changed(
             &credentials,
@@ -2444,6 +2449,7 @@ async fn a_claim_ck_bus_did_not_write_refuses_the_push_and_is_named() {
         signing_keys: vec![trust.box_root_public()],
         revocations: Default::default(),
         issued_at: unix_now() - 60,
+        handoff: None,
     };
     let own_jwt = sign_account_jwt(
         credentials.vault.as_ref(),
@@ -2595,6 +2601,7 @@ async fn the_operator_signer_grant_authorizes_the_revocation_signature() {
             .into_iter()
             .collect(),
         issued_at: unix_now(),
+        handoff: None,
     };
 
     // Reserved: ck-bus's exact grants on the operator signer sign the revocation list,

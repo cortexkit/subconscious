@@ -22,8 +22,8 @@ use serde_json::Value;
 
 use crate::{
     bootstrap::{
-        account_jwt::AccountClaims,
         account_jwt::{decode_claims, prune_revocations, revocations, sign_account_jwt},
+        account_jwt::{AccountClaims, HandoffService},
         plane::{apply_account_jwt, Broker, SystemPlane},
         store::{AccountFile, AccountRecord, Store},
     },
@@ -140,6 +140,15 @@ pub(crate) async fn ensure_account(
         }
     }
     let acct = federation_account_name(machine_id);
+    let handoff = match store.read_account() {
+        AccountFile::Present(box_account) if box_account.machine_id == machine_id => {
+            Some(HandoffService::Import {
+                box_name: box_account.acct,
+                box_account: box_account.account_public,
+            })
+        }
+        _ => None,
+    };
     let (record, existing) = match store.read_federation_account() {
         AccountFile::Damaged { path, reason } => {
             return Err(format!(
@@ -176,10 +185,11 @@ pub(crate) async fn ensure_account(
         }
     }
     if let Some(key) = &signing_key {
-        if existing
-            .as_ref()
-            .is_some_and(|claims| claims["nats"]["signing_keys"] == serde_json::json!([key]))
-        {
+        let imports = handoff.as_ref().map(|service| service.claims().1);
+        if existing.as_ref().is_some_and(|claims| {
+            claims["nats"]["signing_keys"] == serde_json::json!([key])
+                && claims["nats"].get("imports") == imports.as_ref()
+        }) {
             return Ok(record.account_public);
         }
     }
@@ -211,6 +221,7 @@ pub(crate) async fn ensure_account(
         }),
         revocations: revoked,
         issued_at: now.max(previous_iat + 1),
+        handoff,
     };
     let jwt = sign_account_jwt(
         credentials.vault.as_ref(),

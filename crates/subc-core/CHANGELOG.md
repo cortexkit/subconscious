@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.21.30
+
+- Require subc-daemon 0.50.25 and subc-os 0.1.48.
+- During setup and upgrade, grant ck-bus exact `open` on `kem:bus-seal:1` and exact `sign` on `signing:msgsig`, and grant Callosum exact `read` on `kem:bus-seal:1`, `kem:fleet-epoch-wrap:1` and `signing:fleet-record:1`.
+
 ## 0.21.29
 
 - Requires subc-daemon 0.50.23 (stamped delivery of project settings tuples).

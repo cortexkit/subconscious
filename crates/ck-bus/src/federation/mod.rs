@@ -12,6 +12,7 @@
 #[cfg(test)]
 #[path = "account/tests.rs"]
 mod account_tests;
+pub mod handoff;
 pub mod hub;
 pub mod leaf;
 #[cfg(test)]

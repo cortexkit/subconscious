@@ -33,6 +33,10 @@ mod activity_mirror;
 // the hub computer, the self-hosted hub's setup and its four ops.
 #[allow(dead_code)]
 mod federation;
+
+#[cfg(test)]
+#[path = "../tests/support/handoff_rig.rs"]
+mod handoff_rig;
 // The spawn-stream consumer: revokes the credential of every process that exits, and
 // reconciles the census against the supervisor's spawn snapshot.
 #[allow(dead_code)]
@@ -172,10 +176,21 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         bootstrap.ready(),
         std::time::Duration::from_millis(sentinel_period_ms),
     );
+    let connection_file = credentials::vault::subc_arg(env::args_os())
+        .ok_or("ck-bus needs --subc <connection file> to follow the hub")?;
     let callosum = Arc::new(federation::leaf::production::SubcFederation::new(
-        credentials::vault::subc_arg(env::args_os())
-            .ok_or("ck-bus needs --subc <connection file> to follow the hub")?,
+        connection_file.clone(),
     ));
+    let handoff = federation::handoff::production::start(
+        callosum.clone(),
+        Arc::new(credentials::vault::ClaustrumRoute::new(
+            connection_file,
+            None,
+        )),
+        credentials.clone(),
+        store_root.clone(),
+        bootstrap.ready(),
+    );
     let hub = federation::hub::production::start(
         callosum.clone(),
         credentials.clone(),
@@ -205,7 +220,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let handler = federation::leaf::handler::LeafHandler::new(
         federation::hub::handler::HubHandler::new(wired.handler, hub),
         leaf,
-    );
+    )
+    .with_handoff_health(handoff);
     dead_letter::consumer::wire(
         bootstrap.ready(),
         std::time::Duration::from_millis(sentinel_period_ms),

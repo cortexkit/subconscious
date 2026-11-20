@@ -1470,8 +1470,8 @@ fn fixture_hub_entry(bin: &Path, data: &Path) -> Value {
     })
 }
 
-const SETUP_MAINTENANCE_NO_CHANGE: &str = "Install an idle message hub entry\n  Message hub entry: nothing changed (existing entry kept)\nLet the message module use this computer's message-plane keys\n  Message-plane grants: nothing changed (all nine already granted)\nNothing changed.\n";
-const UPGRADE_MAINTENANCE_NO_CHANGE: &str = "Message hub entry: nothing changed (existing entry kept)\nLet the message module use this computer's message-plane keys\nMessage-plane grants: nothing changed (all nine already granted)\nNothing changed.\n";
+const SETUP_MAINTENANCE_NO_CHANGE: &str = "Install an idle message hub entry\n  Message hub entry: nothing changed (existing entry kept)\nLet the message module use this computer's message-plane keys\n  Message-plane grants: nothing changed (all already granted)\nNothing changed.\n";
+const UPGRADE_MAINTENANCE_NO_CHANGE: &str = "Message hub entry: nothing changed (existing entry kept)\nLet the message module use this computer's message-plane keys\nMessage-plane grants: nothing changed (all already granted)\nNothing changed.\n";
 
 /// Default setup leaves key-store selection to the vault on every platform.
 fn installed_claustrum_entry(bin: &Path) -> Value {
@@ -2688,7 +2688,7 @@ fn setup_mc_apply_reports_each_completed_change_without_a_plan() {
     assert_eq!(
         text(&output.stdout),
         format!(
-            "Installing magic-context (ck-mc-alpha.22464bf2, {})\n  downloaded and verified ck-mc (12.1 MiB)\n  placed ~/.local/share/cortexkit/bin/{}\n  configured magic-context in ~/.config/cortexkit/subc.jsonc\nInstall an idle message hub entry\n  Message hub entry: nothing changed (existing entry kept)\nLet the message module use this computer's message-plane keys\n  Message-plane grants: nothing changed (all nine already granted)\n  registered with the daemon; magic-context ok\nDone.\n",
+            "Installing magic-context (ck-mc-alpha.22464bf2, {})\n  downloaded and verified ck-mc (12.1 MiB)\n  placed ~/.local/share/cortexkit/bin/{}\n  configured magic-context in ~/.config/cortexkit/subc.jsonc\nInstall an idle message hub entry\n  Message hub entry: nothing changed (existing entry kept)\nLet the message module use this computer's message-plane keys\n  Message-plane grants: nothing changed (all already granted)\n  registered with the daemon; magic-context ok\nDone.\n",
             host_target(),
             platform_binary("ck-mc")
         )

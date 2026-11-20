@@ -65,6 +65,7 @@ pub fn advertise(mut manifest: ModuleManifest) -> ModuleManifest {
 pub struct LeafHandler<H> {
     inner: H,
     area: Arc<LeafArea>,
+    handoff: Option<Arc<crate::federation::handoff::Health>>,
     principals: Mutex<HashMap<RouteKey, Option<Principal>>>,
 }
 
@@ -73,8 +74,17 @@ impl<H> LeafHandler<H> {
         Self {
             inner,
             area,
+            handoff: None,
             principals: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub(crate) fn with_handoff_health(
+        mut self,
+        health: Arc<crate::federation::handoff::Health>,
+    ) -> Self {
+        self.handoff = Some(health);
+        self
     }
 
     fn principals(&self) -> std::sync::MutexGuard<'_, HashMap<RouteKey, Option<Principal>>> {
@@ -200,7 +210,10 @@ impl<H: ModuleHandler> ModuleHandler for LeafHandler<H> {
     /// and every existing metric are passed through unchanged.
     async fn health(&self) -> HealthReport {
         let mut report = self.inner.health().await;
-        let fed = self.area.health_metrics();
+        let mut fed = self.area.health_metrics();
+        if let Some(handoff) = &self.handoff {
+            fed.extend(handoff.metrics());
+        }
         match report.metrics.as_mut() {
             Some(Value::Object(metrics)) => metrics.extend(fed),
             Some(_) => {}

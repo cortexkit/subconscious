@@ -88,6 +88,66 @@ pub fn public_key_request(credential_id: &str) -> Vec<u8> {
     }))
 }
 
+pub(super) const BUS_SEAL_ID: &str = "kem:bus-seal:1";
+
+pub(super) fn open_bus_seal_request(enc: &[u8], ciphertext: &[u8], info: &[u8]) -> Vec<u8> {
+    encode(json!({
+        "method": "credential.open",
+        "params": {
+            "credential_id": BUS_SEAL_ID,
+            "enc_b64": STANDARD.encode(enc),
+            "ciphertext_b64": STANDARD.encode(ciphertext),
+            "info_b64": STANDARD.encode(info),
+            "aad_b64": "",
+        },
+    }))
+}
+
+pub(super) fn parse_open_reply(body: &[u8]) -> Result<Vec<u8>, ReplyError> {
+    let result = result_object(body)?;
+    let _ = string_field(&result, "key_id")?;
+    STANDARD
+        .decode(string_field(&result, "plaintext_b64")?)
+        .map_err(|error| {
+            ReplyError::Malformed(format!(
+                "plaintext_b64 is not standard padded base64: {error}"
+            ))
+        })
+}
+
+#[cfg(test)]
+#[test]
+fn handoff_vault_open_uses_exact_params_and_strict_base64() {
+    let shape: Value = serde_json::from_slice(&open_bus_seal_request(
+        &[0xff],
+        &[0x00, 0xff],
+        b"ck-bus-seal/v1/ckbus/a|b",
+    ))
+    .unwrap();
+    assert_eq!(
+        shape,
+        json!({
+            "method": "credential.open",
+            "params": {
+                "credential_id": "kem:bus-seal:1",
+                "enc_b64": "/w==",
+                "ciphertext_b64": "AP8=",
+                "info_b64": "Y2stYnVzLXNlYWwvdjEvY2tidXMvYXxi",
+                "aad_b64": "",
+            },
+        })
+    );
+    assert_eq!(
+        parse_open_reply(br#"{"result":{"plaintext_b64":"AP8=","key_id":"fixture"}}"#).unwrap(),
+        [0x00, 0xff],
+    );
+    assert!(parse_open_reply(br#"{"result":{"plaintext_b64":"AP8","key_id":"fixture"}}"#).is_err());
+    assert!(matches!(
+        parse_open_reply(br#"{"result":{"error":{"code":"open_failed","class":"permanent"}}}"#),
+        Err(ReplyError::Refused { code, .. }) if code == "open_failed",
+    ));
+}
+
 fn encode(value: Value) -> Vec<u8> {
     serde_json::to_vec(&value).expect("a JSON value always encodes")
 }

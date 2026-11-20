@@ -196,9 +196,18 @@ impl Account {
         publish: Value,
         subscribe: Value,
     ) -> User {
+        self.user_with_claims_for_key(name, |_| json!({"pub": publish, "sub": subscribe}))
+    }
+
+    pub(super) fn user_with_claims_for_key(
+        &self,
+        name: &str,
+        permissions: impl FnOnce(&str) -> Value,
+    ) -> User {
         let kp = KeyPair::new_user();
+        let permissions = permissions(&kp.public_key());
         let nats = json!({
-            "type": "user", "version": 2, "pub": publish, "sub": subscribe,
+            "type": "user", "version": 2, "pub": permissions["pub"], "sub": permissions["sub"],
             "subs": -1, "data": -1, "payload": -1,
         });
         let jwt = encode_jwt(&self.kp, &kp.public_key(), name, unix_now() - 60, nats);

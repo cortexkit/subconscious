@@ -362,7 +362,7 @@ Credentials (design D; foundation amendment `48c83a68e`, `0eb12229f`, `b9e827c69
   | operator root | `signing:ck-bus-operator-root:1` | the operator JWT (self-signed) and the system account JWT, once, by ceremony at install |
   | operator signer | `signing:ck-bus-operator-signer:1` | the box account JWT, at first boot and in every revocation claims update |
   | federation account signing key | `signing:ck-bus-fedaccount:1` | ck-bus's federation-account user JWT |
-  | message-signing key | `signing:msgsig:<host>:1` | per-message sender signatures; `<host>` is the machine ID |
+  | message-signing key | `signing:msgsig` | per-message sender signatures |
 
   ck-bus never calls the vault for the operator root; `RootCredential::OperatorRoot` refuses a credential ID. The operator signer needs exact `sign` and `read` grants to `reserved:ckbus`; the message-signing key needs `sign` for `reserved:ckbus` and `read` for `reserved:callosum`, which publishes its public half.
   Resolve credential IDs through `cortexkit-bus-naming::root_credential_id`. For installation key roles, JWT issuers and first-boot behavior, the requirements in `docs/nats-install-trust-chain.md`, §§1–5 and §7, take precedence over conflicting statements here.
@@ -795,7 +795,7 @@ Federation state is reported separately under `detail` keys prefixed `fed.`.
   shape it built. The connect error must name the signer, so "vault unavailable" and
   "hub refused" read differently.
 - Keys. Each machine holds two operational keys in its vault: a seal key (X25519, for
-  HPKE) and a message-signing key (Ed25519, `signing:msgsig:<machine id>:1`, used
+  HPKE) and a message-signing key (Ed25519, `signing:msgsig`, used
   through `credential.sign`, which works today).
   - The seal key is a new vault kind, a KEM key, minted with
     `ck auth mint-kem-key --id kem:<name>`. `<name>` is unagreed; by analogy this spec

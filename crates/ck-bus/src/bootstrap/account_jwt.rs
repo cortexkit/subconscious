@@ -35,6 +35,46 @@ pub struct AccountClaims {
     /// revoked.
     pub revocations: BTreeMap<String, i64>,
     pub issued_at: i64,
+    pub handoff: Option<HandoffService>,
+}
+
+/// The box is the service exporter; the federation account imports under a subject
+/// that never crosses the leaf. The import's replies carry the box's PubAck.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandoffService {
+    Export {
+        box_name: String,
+    },
+    Import {
+        box_name: String,
+        box_account: String,
+    },
+}
+
+pub(crate) const HANDOFF_FAMILIES: [&str; 3] = ["room", "wake", "peer"];
+
+impl HandoffService {
+    pub(crate) fn claims(&self) -> (&'static str, Value) {
+        match self {
+            Self::Export { box_name } => (
+                "exports",
+                json!(HANDOFF_FAMILIES.map(|family| json!({
+                    "type": "service", "subject": format!("ck.{box_name}.{family}.fed.>"),
+                    "response_type": "Singleton",
+                }))),
+            ),
+            Self::Import {
+                box_name,
+                box_account,
+            } => (
+                "imports",
+                json!(HANDOFF_FAMILIES.map(|family| json!({
+                    "type": "service", "subject": format!("ck.{box_name}.{family}.fed.>"),
+                    "local_subject": format!("fedlocal.{family}.fed.>"), "account": box_account,
+                }))),
+            ),
+        }
+    }
 }
 
 impl AccountClaims {
@@ -53,6 +93,10 @@ impl AccountClaims {
         });
         if !self.revocations.is_empty() {
             nats["revocations"] = json!(self.revocations);
+        }
+        if let Some(handoff) = &self.handoff {
+            let (field, entries) = handoff.claims();
+            nats[field] = entries;
         }
         let mut claims = json!({
             "jti": "",

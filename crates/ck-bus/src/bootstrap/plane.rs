@@ -265,6 +265,9 @@ pub struct LeafLink {
 
 #[async_trait]
 pub trait BoxPlane: Send + Sync {
+    fn handoff_jetstream(&self) -> Option<jetstream::Context> {
+        None
+    }
     /// Creates the census bucket's backing stream if absent, and brings an existing one
     /// to the configuration below (its messages are kept).
     async fn ensure_census(&self, account: &AccountNames) -> Result<(), PlaneError>;
@@ -805,6 +808,9 @@ pub struct NatsBox {
 
 #[async_trait]
 impl BoxPlane for NatsBox {
+    fn handoff_jetstream(&self) -> Option<jetstream::Context> {
+        Some(self.jetstream.clone())
+    }
     async fn ensure_module_bucket(
         &self,
         account: &AccountNames,

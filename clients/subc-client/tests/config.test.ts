@@ -16,6 +16,7 @@ function rig(options: Partial<ModuleConfigOptions> = {}) {
   let capabilities = ["config.gate"];
   let response: { active: ConfigView | null; pending?: ConfigView; declaration_pending?: { plan_digest?: string } } = { active: null, pending: sampleView(1) };
   let fail: { op: string; code: string } | undefined;
+  let beforeGet: (() => Promise<void>) | undefined;
   const calls: Array<Record<string, unknown>> = [], applied: ConfigView[] = [], errors: unknown[] = [], states: ModuleConfigState[] = [];
   let filesRead = 0;
   const config = new ModuleConfig({
@@ -24,7 +25,9 @@ function rig(options: Partial<ModuleConfigOptions> = {}) {
       const request = body as Record<string, unknown>;
       calls.push(request);
       if (fail && fail.op === request.op) throw refusal(fail.code);
-      return request.op === "config.get" ? { op: "config.get", ...response } : { op: request.op };
+      if (request.op !== "config.get") return { op: request.op };
+      await beforeGet?.();
+      return { op: "config.get", ...response };
     },
   }, {
     declaration: { schema: {}, user_file: "/isolated/config.json", project_dirs: [] },
@@ -36,6 +39,7 @@ function rig(options: Partial<ModuleConfigOptions> = {}) {
   });
   sessions.push(config);
   return { config, calls, applied, errors, states, filesRead: () => filesRead,
+    beforeGet: (hook: () => Promise<void>) => { beforeGet = hook; },
     reply: (active: ConfigView | null, pending?: ConfigView, declaration_pending?: { plan_digest?: string }) => { response = { active, pending, declaration_pending }; },
     fail: (op: string, code: string) => { fail = { op, code }; }, recover: () => { fail = undefined; },
     reconnect: () => { epoch++; }, legacy: () => { capabilities = []; } };
@@ -135,6 +139,106 @@ test("a pending view without an assigned attempt cannot be applied", async () =>
   await r.config.refresh();
   expect(r.applied).toEqual([]);
   expect(r.errors).toHaveLength(1);
+});
+
+test("a bare config.get rejects a project delivery before apply or ACK", async () => {
+  const r = rig();
+  r.reply(null, { ...sampleView(1), project_id: "A" });
+  await r.config.refresh();
+  expect(r.applied).toEqual([]);
+  expect(r.calls.some((call) => call.op === "config.applied")).toBe(false);
+  expect(r.config.state).toBeUndefined();
+  expect(r.errors).toEqual([new Error("config.get returned another project")]);
+});
+
+test("a named config.get rejects a mismatched active or pending view before recovery", async () => {
+  for (const [activeId, pendingId] of [["B", "A"], ["A", "B"], ["A", undefined]]) {
+    const r = rig();
+    r.reply({ ...sampleView(1, "active"), project_id: activeId }, { ...sampleView(2), project_id: pendingId });
+    await r.config.refresh("A");
+    expect(r.calls.at(-1)).toEqual({ op: "config.get", project_id: "A" });
+    expect(r.applied).toEqual([]);
+    expect(r.config.getState("A")).toBeUndefined();
+    expect(r.errors).toEqual([new Error("config.get returned another project")]);
+  }
+});
+
+test("interleaved user, A and B deliveries replay only their own reports and B's NACK keeps B's last view", async () => {
+  const published: { projectId?: string; state: ModuleConfigState }[] = [];
+  const r = rig({
+    apply: (view) => ({ result: view.project_id === "B" && view.generation === 3 ? "nack" : "ack",
+      reasons: view.project_id === "B" && view.generation === 3 ? ["B not ready"] : [] }),
+    onState: (state, projectId) => published.push({ state, projectId }),
+  });
+  r.fail("config.applied", "not_delivery_target");
+  await r.config.refresh();
+  const userRefusal = r.config.state;
+  const bLast = { ...sampleView(1, "active"), attempt: undefined, project_id: "B" };
+  r.reply(bLast);
+  await r.config.refresh("B");
+  const aPending = { ...sampleView(3), project_id: "A" };
+  r.reply(null, aPending);
+  await r.config.refresh("A");
+  const aRefusal = r.config.getState("A");
+  r.reply(bLast, { ...sampleView(3), project_id: "B" });
+  await r.config.refresh("B");
+  expect(published.find(({ state }) => state.state === "failed")).toEqual({
+    projectId: "B", state: { state: "failed", view: bLast, reasons: ["B not ready"] },
+  });
+  expect(r.config.getState("B")).toMatchObject({ state: "not_delivery_target", view: bLast });
+  expect(r.config.getState("A")).toBe(aRefusal);
+  expect(r.config.state).toBe(userRefusal);
+
+  r.recover();
+  r.reply(bLast);
+  await r.config.refresh("B");
+  r.reply(null, aPending);
+  await r.config.refresh("A");
+  r.reply(null, sampleView(1));
+  await r.config.refresh();
+  const userAck = { op: "config.applied", generation: 1, attempt: 11, result: "ack", reasons: [] };
+  const aAck = { op: "config.applied", generation: 3, attempt: 13, project_id: "A", result: "ack", reasons: [] };
+  const bNack = { op: "config.applied", generation: 3, attempt: 13, project_id: "B", result: "nack", reasons: ["B not ready"] };
+  expect(r.calls.filter((call) => call.op === "config.applied")).toEqual([userAck, aAck, bNack, bNack, aAck, userAck]);
+  expect(r.calls.filter((call) => call.op === "config.get").map((call) => call.project_id)).toEqual([undefined, "B", "A", "B", "B", "A", undefined]);
+  expect(r.calls.filter((call) => call.op === "config.declare")).toHaveLength(1);
+  expect(r.config.getState("A")).toEqual({ state: "active", view: aPending });
+  expect(r.config.state).toEqual({ state: "active", view: sampleView(1) });
+});
+
+test("named refreshes coalesce while queued and allow one follow-up during get", async () => {
+  const r = rig();
+  r.reply({ ...sampleView(1, "active"), attempt: undefined, project_id: "A" });
+  let started!: () => void;
+  let finish!: () => void;
+  const getStarted = new Promise<void>((resolve) => { started = resolve; });
+  const getBlocked = new Promise<void>((resolve) => { finish = resolve; });
+  r.beforeGet(() => { started(); return getBlocked; });
+  const first = r.config.refresh("A");
+  expect(r.config.refresh("A")).toBe(first);
+  await getStarted;
+  const followup = r.config.refresh("A");
+  expect(followup).not.toBe(first);
+  expect(r.config.refresh("A")).toBe(followup);
+  finish();
+  await Promise.all([first, followup]);
+  expect(r.calls.filter((call) => call.op === "config.get")).toEqual([
+    { op: "config.get", project_id: "A" }, { op: "config.get", project_id: "A" },
+  ]);
+  expect(r.applied).toHaveLength(1);
+});
+
+test("a daemon with config.gate can refuse a project without changing user state", async () => {
+  const r = rig();
+  await r.config.refresh();
+  const userState = r.config.state;
+  r.fail("config.get", "unsupported_control_op");
+  await r.config.refresh("A");
+  expect(r.calls.at(-1)).toEqual({ op: "config.get", project_id: "A" });
+  expect(r.config.getState("A")).toEqual({ state: "unknown", rawState: "unsupported_control_op", view: undefined });
+  expect(r.errors).toEqual([refusal("unsupported_control_op")]);
+  expect(r.config.state).toBe(userState);
+  expect(r.filesRead()).toBe(0);
 });
 
 test("review refuses unknown layers rather than passing them to a merger", async () => {

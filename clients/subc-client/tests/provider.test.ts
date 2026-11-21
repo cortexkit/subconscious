@@ -1222,8 +1222,8 @@ describe("SubcProvider config negotiation", () => {
     onError: (error) => { throw error; },
     ...extra,
   });
-  async function connectConfig(daemon: ScriptedProviderDaemon, config: ModuleConfigOptions) {
-    daemon.capabilities = ["config.gate"];
+  async function connectConfig(daemon: ScriptedProviderDaemon, config: ModuleConfigOptions, capabilities = ["config.gate"]) {
+    daemon.capabilities = capabilities;
     return SubcProvider.connect({
       connectionFile: writeConnectionFile(trackedTempDir("subc-config-wire-"), daemon.port),
       manifest: managementSurfaceManifest({ moduleId: "sample", operations: ["echo"] }),
@@ -1245,7 +1245,7 @@ describe("SubcProvider config negotiation", () => {
       await waitForCondition(() => daemon.responses.length === 1, "review response");
       expect(daemon.responses[0]).toEqual(golden("config_review_reply"));
       get = golden("config_get_reply_pending");
-      await daemon.sendLatest(FrameType.Push, golden("config_changed"));
+      await daemon.sendLatest(FrameType.Push, { ...golden("config_changed"), project_id: undefined });
       await waitForCondition(() => daemon.requests.some((r) => r.op === "config.applied"), "ACK after changed");
       expect(daemon.requests.at(-1)).toEqual(golden("config_applied_request_ack"));
       expect(applied.map((v) => v.generation)).toEqual([3, 4]);
@@ -1257,11 +1257,13 @@ describe("SubcProvider config negotiation", () => {
     const daemon = await ScriptedProviderDaemon.start();
     const get = golden("config_get_reply_first_delivery");
     get.pending.project_id = "project-a";
-    daemon.control = (body) => body.op === "config.get" ? get : { op: body.op };
+    daemon.control = (body) => body.op === "config.get"
+      ? body.project_id === "project-a" ? get : golden("config_get_reply_active") : { op: body.op };
     const provider = await connectConfig(daemon, options({ apply: () => ({ result: "nack", reasons: ["Cannot activate this generation"] }) }));
     try {
+      await provider.config!.refresh("project-a");
       expect(daemon.requests.at(-1)).toEqual(golden("config_applied_request_nack"));
-      expect(provider.config?.state?.state).toBe("failed");
+      expect(provider.config?.getState("project-a")?.state).toBe("failed");
       expect(await settlesWithin(provider.closed, 10)).toBe(false);
     } finally { await provider.close(); }
   });
@@ -1297,7 +1299,7 @@ describe("SubcProvider config negotiation", () => {
         expect(provider.config?.state?.state).toBe(code);
         expect(await settlesWithin(provider.closed, 10)).toBe(false);
         blocked = false;
-        await daemon.sendLatest(FrameType.Push, golden("config_changed"));
+        await daemon.sendLatest(FrameType.Push, { ...golden("config_changed"), project_id: undefined });
         await waitForCondition(() => provider.config?.state?.state === "active", "outcome retry after hint");
         const reports = daemon.requests.filter((r) => r.op === "config.applied");
         expect(reports).toHaveLength(2);
@@ -1316,6 +1318,42 @@ describe("SubcProvider config negotiation", () => {
     try {
       expect(provider.config?.state).toEqual({ state: "unknown", rawState: "future_status", view: undefined });
       expect(applies).toBe(0);
+    } finally { await provider.close(); }
+  });
+
+  test("project wire vectors: a hint fetches and ACKs only its project, no-attempt views send no ACK", async () => {
+    const projectVector = (name: string) => JSON.parse(readFileSync(join(import.meta.dir,
+      "../../../vectors/config-settings-v1", `project-${name}.json`), "utf8"));
+    const pending = projectVector("get-pending");
+    const applied = projectVector("applied");
+    const fallback = projectVector("get-fallback");
+    const unstamped = projectVector("get-unstamped");
+    const daemon = await ScriptedProviderDaemon.start();
+    let projectA = pending;
+    daemon.control = (body) => {
+      if (body.op === "config.get") {
+        if (body.project_id === "A") return projectA.reply;
+        if (body.project_id === "C") return fallback.reply;
+        return golden("config_get_reply_active");
+      }
+      return body.op === "config.applied" ? applied.reply : { op: body.op };
+    };
+    const views: ConfigView[] = [];
+    const provider = await connectConfig(daemon, options({ apply: (view) => { views.push(view); return { result: "ack" }; } }));
+    try {
+      const config = provider.config!;
+      const userState = config.state;
+      await daemon.sendLatest(FrameType.Push, projectVector("changed"));
+      await waitForCondition(() => config.getState("A")?.state === "active" &&
+        daemon.requests.some((req) => req.op === "config.applied"), "project A ACK");
+      await config.refresh("C");
+      projectA = unstamped;
+      await config.refresh("A");
+      expect(daemon.requests.slice(2)).toEqual([pending.request, applied.request, fallback.request, unstamped.request]);
+      expect(views.slice(1)).toEqual([pending.reply.active, pending.reply.pending, fallback.reply.active, unstamped.reply.active]);
+      expect(config.getState("A")?.state).toBe("unstamped");
+      expect(config.getState("C")?.state).toBe("active");
+      expect(config.state).toBe(userState);
     } finally { await provider.close(); }
   });
 
@@ -1355,6 +1393,30 @@ describe("SubcProvider config negotiation", () => {
       expect(reads).toBe(1);
       expect(daemon.hellos[0]?.control_ops).toContain("config.review");
       expect(provider.config?.state?.state).toBe("unstamped");
+    } finally { await provider.close(); }
+  });
+
+  test("a named refresh without config.gate sends no config frame", async () => {
+    const daemon = await ScriptedProviderDaemon.start();
+    daemon.control = () => ({ error: { code: "unsupported_control_op", message: "config.get is unsupported" } });
+    const errors: unknown[] = [];
+    const stateProjects: (string | undefined)[] = [];
+    let reads = 0;
+    const provider = await connectConfig(daemon, options({
+      readFiles: () => { reads++; return { generation: 0, status: "unstamped", layers: [], sources: {}, effective: {} }; },
+      onState: (_, projectId) => stateProjects.push(projectId),
+      onError: (error) => errors.push(error),
+    }), []);
+    try {
+      const config = provider.config!;
+      const userState = config.state;
+      await config.refresh("A");
+      expect(daemon.requests).toEqual([]);
+      expect(config.getState("A")).toBeUndefined();
+      expect(config.state).toBe(userState);
+      expect(stateProjects).toEqual([undefined]);
+      expect(errors).toEqual([]);
+      expect(reads).toBe(1);
     } finally { await provider.close(); }
   });
 });

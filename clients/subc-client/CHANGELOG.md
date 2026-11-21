@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.26.7
+
+- Add project refreshes to `ModuleConfig`, with per-project state and delivery report retries.
+
 ## 0.26.6
 
 - Accept federated `app` peers and optional origin principals, stable peer machine

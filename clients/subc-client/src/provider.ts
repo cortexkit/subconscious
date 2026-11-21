@@ -985,11 +985,14 @@ export class SubcProvider {
   }
 
   private handleControlPush(frame: Frame, control: ControlPushState): void {
-    let body: { op?: unknown; reason?: unknown; deadline_ms?: unknown };
+    let body: { op?: unknown; reason?: unknown; deadline_ms?: unknown; project_id?: unknown };
     try {
       body = JSON.parse(Buffer.from(frame.body).toString("utf8"));
       if (body?.op === "config.changed" && this.config) {
-        void this.config.refresh();
+        if (body.project_id !== undefined && typeof body.project_id !== "string") {
+          throw new Error("invalid config.changed project_id");
+        }
+        void this.config.refresh(body.project_id);
         return;
       }
       if (body === null || body.op !== "module.draining" || typeof body.reason !== "string" ||

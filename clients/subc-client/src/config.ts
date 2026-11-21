@@ -104,7 +104,8 @@ export interface ModuleConfigOptions {
     | Promise<{ result: "ack" | "nack"; reasons?: string[] }>;
   /** Called ONLY when HELLO_ACK lacks config.gate; never after a gate refusal. */
   readFiles(): ConfigView | Promise<ConfigView>;
-  onState?(state: ModuleConfigState): void;
+  /** The second argument names the project; undefined is the user view. */
+  onState?(state: ModuleConfigState, projectId?: string): void;
   onError?(error: unknown): void;
   /** Retry after anchor_pending at most once per interval (1..30000 ms, default 1000). */
   anchorRetryMs?: number;
@@ -180,14 +181,21 @@ function unknownView(value: ConfigView): string | undefined {
     ?? Object.values(value.sources).find((source) => !layers.has(source));
 }
 
+interface ConfigTuple {
+  projectId?: string;
+  state?: ModuleConfigState;
+  lastView?: ConfigView;
+  report?: { epoch: number; request: ConfigAppliedRequest };
+  timer?: ReturnType<typeof setTimeout>;
+}
+
 /** Provider-owned config lifecycle. Refreshes serialize so hints cannot race an apply/ACK. */
 export class ModuleConfig {
   state: ModuleConfigState | undefined;
-  private lastView: ConfigView | undefined;
+  private readonly tuples = new Map<string | undefined, ConfigTuple>();
+  private readonly queued = new Map<string, { epoch: number; done: Promise<void> }>();
   private declaredEpoch = 0;
   private tail: Promise<void> = Promise.resolve();
-  private report: ConfigAppliedRequest | undefined;
-  private timer: ReturnType<typeof setTimeout> | undefined;
   private stopped = false;
   private readonly retryMs: number;
 
@@ -196,15 +204,38 @@ export class ModuleConfig {
     if (!Number.isInteger(this.retryMs) || this.retryMs < 1 || this.retryMs > 30000) throw new Error("anchorRetryMs must be 1..30000");
   }
 
-  refresh(): Promise<void> {
+  getState(projectId?: string): ModuleConfigState | undefined {
+    return projectId === undefined ? this.state : this.tuples.get(projectId)?.state;
+  }
+
+  /** Queue a refresh; the returned promise does not confirm activation. */
+  refresh(projectId?: string): Promise<void> {
+    if (projectId !== undefined && !this.transport.capabilities().includes("config.gate")) return Promise.resolve();
     const epoch = this.transport.epoch();
-    this.tail = this.tail.then(() => this.synchronize(epoch)).catch((error) => this.error(error));
-    return this.tail;
+    const queued = projectId === undefined ? undefined : this.queued.get(projectId);
+    if (queued?.epoch === epoch) return queued.done;
+    const done = this.tail.then(() => {
+      // Once a refresh starts, hints can queue one follow-up for this project.
+      if (projectId !== undefined && this.queued.get(projectId)?.done === done) this.queued.delete(projectId);
+      return this.synchronize(epoch, projectId);
+    }).catch((error) => this.error(error));
+    this.tail = done;
+    if (projectId !== undefined) this.queued.set(projectId, { epoch, done });
+    return done;
   }
 
   close(): void {
     this.stopped = true;
-    clearTimeout(this.timer);
+    for (const tuple of this.tuples.values()) clearTimeout(tuple.timer);
+  }
+
+  private tuple(projectId?: string): ConfigTuple {
+    let tuple = this.tuples.get(projectId);
+    if (!tuple) {
+      tuple = { projectId };
+      this.tuples.set(projectId, tuple);
+    }
+    return tuple;
   }
 
   async review(body: unknown): Promise<ConfigReviewReply> {
@@ -215,7 +246,11 @@ export class ModuleConfig {
     const base = request.base === null ? undefined : view(request.base);
     const unknown = inputs.find((layer) => !layers.has(layer.layer))?.layer ?? (base && unknownView(base));
     if (unknown !== undefined) {
-      this.publish({ state: "unknown", rawState: unknown, view: this.lastView });
+      const projects = new Set([base?.project_id, ...inputs.map((layer) => layer.project_id)].filter((id) => id !== undefined));
+      if (projects.size <= 1) {
+        const tuple = this.tuple(projects.values().next().value);
+        this.publish(tuple, { state: "unknown", rawState: unknown, view: tuple.lastView });
+      }
       throw new Error("unknown config review input");
     }
     return this.options.review(immutable(request as unknown as ConfigReviewRequest));
@@ -223,31 +258,34 @@ export class ModuleConfig {
 
   private live(epoch: number): boolean { return !this.stopped && epoch === this.transport.epoch(); }
 
-  private async synchronize(epoch: number): Promise<void> {
+  private async synchronize(epoch: number, projectId?: string): Promise<void> {
     if (!this.live(epoch)) return;
-    clearTimeout(this.timer);
-    if (this.declaredEpoch !== epoch) this.report = undefined;
+    const tuple = this.tuple(projectId);
+    clearTimeout(tuple.timer);
+    if (tuple.report?.epoch !== epoch) tuple.report = undefined;
     try {
-      if (!this.transport.capabilities().includes("config.gate")) {
+      const gated = this.transport.capabilities().includes("config.gate");
+      if (!gated && projectId === undefined) {
         const files = view(await this.options.readFiles());
         if (!this.live(epoch)) return;
         const result = await this.options.apply(files);
         if (!this.live(epoch)) return;
-        if (result.result === "ack") { this.lastView = files; this.publish({ state: "unstamped", view: files }); }
-        else this.publish({ state: "failed", view: this.lastView, reasons: result.reasons ?? [] });
+        if (result.result === "ack") { tuple.lastView = files; this.publish(tuple, { state: "unstamped", view: files }); }
+        else this.publish(tuple, { state: "failed", view: tuple.lastView, reasons: result.reasons ?? [] });
         return;
       }
-      if (this.declaredEpoch !== epoch) {
+      if (gated && this.declaredEpoch !== epoch) {
         // The daemon permits only one declaration per connection, including a refused one.
         this.declaredEpoch = epoch;
         await this.transport.request({ ...this.options.declaration, op: "config.declare" });
         if (!this.live(epoch)) return;
       }
-      if (this.report) {
-        await this.sendReport(epoch);
+      if (tuple.report) {
+        await this.sendReport(epoch, tuple, tuple.report.request);
         if (!this.live(epoch)) return;
       }
-      const reply = record(await this.transport.request({ op: "config.get" }));
+      const reply = record(await this.transport.request(projectId === undefined
+        ? { op: "config.get" } : { op: "config.get", project_id: projectId }));
       if (!this.live(epoch)) return;
       if (reply.op !== "config.get") throw new Error("invalid config.get reply");
       let marker: ConfigDeclarationPending | undefined;
@@ -258,90 +296,95 @@ export class ModuleConfig {
       }
       const active = reply.active === null ? undefined : immutable({ ...view(reply.active), declaration_pending: marker });
       const pending = reply.pending === undefined ? undefined : immutable(view(reply.pending));
+      if ((active && active.project_id !== projectId) || (pending && pending.project_id !== projectId)) {
+        throw new Error("config.get returned another project");
+      }
       // A fresh process needs a recovery view before trying a delivery that can
       // be rejected. Never ACK that already-active view as the pending attempt.
-      if (!this.lastView && pending && active) {
+      if (!tuple.lastView && pending && active) {
         if (active.status !== "active" || unknownView(active) !== undefined) throw new Error("invalid recovery view");
         const recovered = await this.options.apply(active);
         if (!this.live(epoch)) return;
         if (recovered.result !== "ack") {
-          this.publish({ state: "failed", view: this.lastView, reasons: recovered.reasons ?? [] });
+          this.publish(tuple, { state: "failed", view: tuple.lastView, reasons: recovered.reasons ?? [] });
           return;
         }
-        this.lastView = active;
-        this.publish({ state: "active", view: active });
+        tuple.lastView = active;
+        this.publish(tuple, { state: "active", view: active });
       }
       const target = pending ?? active;
       if (!target) throw new Error("config.get returned no view");
       const unknown = unknownView(target);
       if (unknown !== undefined || target.status === "gated") {
-        this.publish({ state: "unknown", rawState: unknown ?? target.status, view: this.lastView });
+        this.publish(tuple, { state: "unknown", rawState: unknown ?? target.status, view: tuple.lastView });
         return;
       }
-      if (target.status === "failed") { this.publish({ state: "failed", view: this.lastView, reasons: [] }); return; }
+      if (target.status === "failed") { this.publish(tuple, { state: "failed", view: tuple.lastView, reasons: [] }); return; }
       if (target.status === "pending" && target.attempt === undefined) throw new Error("config delivery has no attempt");
-      if (JSON.stringify(target) === JSON.stringify(this.lastView)) {
-        if (this.state?.state === "config_gated" || this.state?.state === "unknown") {
-          this.publish({ state: target.status as "unstamped" | "pending" | "active", view: target });
+      if (JSON.stringify(target) === JSON.stringify(tuple.lastView)) {
+        const state = this.getState(projectId)?.state;
+        if (state === "config_gated" || state === "unknown") {
+          this.publish(tuple, { state: target.status as "unstamped" | "pending" | "active", view: target });
         }
         return;
       }
       const result = await this.options.apply(target);
       if (!this.live(epoch)) return;
-      if (result.result === "ack") this.lastView = target;
+      if (result.result === "ack") tuple.lastView = target;
       if (target.status === "unstamped") {
-        this.publish(result.result === "ack" ? { state: "unstamped", view: target }
-          : { state: "failed", view: this.lastView, reasons: result.reasons ?? [] });
+        this.publish(tuple, result.result === "ack" ? { state: "unstamped", view: target }
+          : { state: "failed", view: tuple.lastView, reasons: result.reasons ?? [] });
         return;
       }
       // An already-active view has no delivery attempt to acknowledge on reconnect.
       if (target.status === "active" && target.attempt === undefined) {
-        this.publish(result.result === "ack" ? { state: "active", view: target }
-          : { state: "failed", view: this.lastView, reasons: result.reasons ?? [] });
+        this.publish(tuple, result.result === "ack" ? { state: "active", view: target }
+          : { state: "failed", view: tuple.lastView, reasons: result.reasons ?? [] });
         return;
       }
       if (target.attempt === undefined) throw new Error("config delivery has no attempt");
-      this.report = { op: "config.applied", generation: target.generation, attempt: target.attempt,
+      const request: ConfigAppliedRequest = { op: "config.applied", generation: target.generation, attempt: target.attempt,
         project_id: target.project_id, result: result.result, reasons: result.reasons ?? [] };
-      this.publish(result.result === "ack" ? { state: target.status === "active" ? "active" : "pending", view: target }
-        : { state: "failed", view: this.lastView, reasons: result.reasons ?? [] });
-      await this.sendReport(epoch);
+      tuple.report = { epoch, request };
+      this.publish(tuple, result.result === "ack" ? { state: target.status === "active" ? "active" : "pending", view: target }
+        : { state: "failed", view: tuple.lastView, reasons: result.reasons ?? [] });
+      await this.sendReport(epoch, tuple, request);
     } catch (error) {
-      if (this.live(epoch) && !this.refused(error)) this.error(error);
+      if (this.live(epoch) && !this.refused(error, tuple, epoch)) this.error(error);
     }
   }
 
-  private async sendReport(epoch: number): Promise<void> {
-    const report = this.report!;
+  private async sendReport(epoch: number, tuple: ConfigTuple, report: ConfigAppliedRequest): Promise<void> {
     await this.transport.request(report);
     if (!this.live(epoch)) return;
-    this.report = undefined;
-    if (report.result === "ack" && this.lastView) this.publish({ state: "active", view: this.lastView });
+    tuple.report = undefined;
+    if (report.result === "ack" && tuple.lastView) this.publish(tuple, { state: "active", view: tuple.lastView });
   }
 
-  private refused(error: unknown): boolean {
+  private refused(error: unknown, tuple: ConfigTuple, epoch: number): boolean {
     if (!error || typeof error !== "object" || !("code" in error)) return false;
     const code = String(error.code);
     const refusal: ConfigRefusal = { code, message: error instanceof Error ? error.message : code, cause: error };
     if (code === "config_gated") {
-      this.publish(this.lastView ? { state: code, refusal, availability: "last_view", view: this.lastView }
+      this.publish(tuple, tuple.lastView ? { state: code, refusal, availability: "last_view", view: tuple.lastView }
         : { state: code, refusal, availability: "no_approved_config" });
     } else if (code === "not_delivery_target" || code === "anchor_pending") {
-      this.publish({ state: code, refusal, view: this.lastView });
-      if (code === "anchor_pending" && this.report) {
-        this.timer = setTimeout(() => { void this.refresh(); }, this.retryMs);
-        this.timer.unref?.();
+      this.publish(tuple, { state: code, refusal, view: tuple.lastView });
+      if (code === "anchor_pending" && tuple.report && this.live(epoch)) {
+        tuple.timer = setTimeout(() => { if (this.live(epoch)) void this.refresh(tuple.projectId); }, this.retryMs);
+        tuple.timer.unref?.();
       }
     } else {
-      this.publish({ state: "unknown", rawState: code, view: this.lastView });
+      this.publish(tuple, { state: "unknown", rawState: code, view: tuple.lastView });
       this.error(error);
     }
     return true;
   }
 
-  private publish(state: ModuleConfigState): void {
-    this.state = state;
-    try { this.options.onState?.(state); } catch (error) { this.error(error); }
+  private publish(tuple: ConfigTuple, state: ModuleConfigState): void {
+    if (tuple.projectId === undefined) this.state = state;
+    else tuple.state = state;
+    try { this.options.onState?.(state, tuple.projectId); } catch (error) { this.error(error); }
   }
 
   private error(error: unknown): void {

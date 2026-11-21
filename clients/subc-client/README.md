@@ -251,10 +251,24 @@ For view statuses other than `active`, `pending` or `unstamped`, `failed` publis
 Refusal states include the original error in `refusal.cause`. None ends serving
 or exits the process. `onError` reports unexpected transport/protocol/callback
 failures without falling back to files. `config.changed` resynchronizes without
-blocking the frame reader; `provider.config.refresh()` allows an explicit refresh.
+blocking the frame reader. A hint with `project_id` queues that project's refresh.
+Use `provider.config.refresh(projectId)` to queue one explicitly; queued refreshes
+for the same project coalesce, and a refresh requested during an in-flight get
+queues one more get. The promise does not confirm activation: use
+`provider.config.getState(projectId)` or `onState(state, projectId)` to observe it.
+`provider.config.refresh()` and `.state` still refer to the user view; its
+`onState` project ID is `undefined`.
+
+Project refreshes are ignored if the daemon lacks `config.gate` and never fall
+back to local files. They use the same refusal
+routing as user refreshes: `config_gated`, `not_delivery_target` and
+`anchor_pending` publish their named states; other refusal codes publish
+`unknown` and call `onError`. A get reply naming a different project is a
+protocol error reported through `onError`, with no view applied from that reply.
+
 Anchor retry intervals default to 1000 ms and must be 1..30000 ms. Closing the
-provider cancels retries. Plain unstamped file edits currently require explicit
-refresh; changed-hint handling is covered separately by wire tests.
+provider cancels retries. When the daemon lacks `config.gate`, call `refresh()`
+to reread the user file after an edit.
 
 See the paired [legacy sample](tests/fixtures/config-sample-legacy.ts) and
 [adopting sample](tests/fixtures/config-sample.ts), whose line diff is checked to

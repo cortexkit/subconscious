@@ -47,6 +47,13 @@ pub fn durable_replace(from: &Path, to: &Path) -> Result<(), DurableReplaceError
     durable_replace_impl(from, to, || Ok(()))
 }
 
+/// Move a Windows executable from its installed path without reopening the
+/// image for writing. The destination must be absent and on the same volume.
+#[cfg(windows)]
+pub fn durable_move_to_new_name(from: &Path, to: &Path) -> io::Result<()> {
+    windows_move_file_ex(from, to, false)
+}
+
 /// Inject a failure after a real rename. Unix runs the hook before syncing the
 /// directory; Windows flushes the publication, then uses the held source file's
 /// identity to distinguish a failed rename from a visible replacement whose
@@ -279,8 +286,13 @@ fn windows_posix_move(from: &Path, to: &Path) -> io::Result<bool> {
 }
 
 #[cfg(windows)]
-#[allow(unsafe_code)]
 fn windows_legacy_move(from: &Path, to: &Path) -> io::Result<()> {
+    windows_move_file_ex(from, to, true)
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn windows_move_file_ex(from: &Path, to: &Path, replace: bool) -> io::Result<()> {
     use windows_sys::Win32::Storage::FileSystem::{
         MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     };
@@ -290,14 +302,13 @@ fn windows_legacy_move(from: &Path, to: &Path) -> io::Result<()> {
     // are no borrowed handles. WRITE_THROUGH returns only once the move is
     // flushed; Windows has no directory fsync. Failure is never retried using
     // a weaker rename that could report an approval before publication flush.
-    if unsafe {
-        MoveFileExW(
-            from.as_ptr(),
-            to.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    } == 0
-    {
+    let flags = MOVEFILE_WRITE_THROUGH
+        | if replace {
+            MOVEFILE_REPLACE_EXISTING
+        } else {
+            0
+        };
+    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), flags) } == 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())

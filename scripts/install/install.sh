@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
-# Bootstrap only ck from the CortexKit release index. Setup owns all runtime
-# and configuration work, so this script must never invoke `ck setup`. The
-# index signature is not checked here: bootstrap trust is TLS to the index
-# host, and the placed `ck` verifies the signed index on its first setup.
+# Download and verify the CLI archive, then hand installation to ck. Bootstrap
+# trusts TLS to the release host; setup verifies its signed release index.
 #
 # This is a bash script and the documented invocation pipes it into bash.
 # Piped into `sh` on Debian and Ubuntu it runs under dash, where the very
@@ -50,12 +48,6 @@ sha256_for() {
   printf '%s\n' "$digest"
 }
 
-json_escape() {
-  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
-}
-
-# Create missing parents with an explicit mode; the caller's umask cannot
-# widen a new directory beyond the mode requested here.
 ensure_created_directory_tree() {
   local directory="$1"
   local mode="$2"
@@ -89,32 +81,6 @@ is_private_staging_directory() {
   [[ "$mode" == "700" && "$owner" == "$expected_owner" ]]
 }
 
-is_owned_nonwritable_directory() {
-  local directory="$1"
-  local mode
-  local owner
-  local expected_owner
-  local permission_bits
-  local group_mode
-  local other_mode
-
-  [[ -d "$directory" && ! -L "$directory" ]] || return 1
-  mode=$(stat -f '%Lp' "$directory" 2>/dev/null) || mode=$(stat -c '%a' "$directory" 2>/dev/null) || return 1
-  owner=$(stat -f '%u' "$directory" 2>/dev/null) || owner=$(stat -c '%u' "$directory" 2>/dev/null) || return 1
-  expected_owner=$(id -u) || return 1
-  [[ "$owner" == "$expected_owner" ]] || return 1
-  case "$mode" in
-    ''|*[!0-7]*) return 1 ;;
-  esac
-  permission_bits="${mode: -3}"
-  group_mode="${permission_bits:1:1}"
-  other_mode="${permission_bits:2:1}"
-  case "$group_mode$other_mode" in
-    *[2367]*) return 1 ;;
-  esac
-  return 0
-}
-
 select_profile() {
   if [[ -n "${CK_PROFILE_PATH:-}" ]]; then
     profile_path="$CK_PROFILE_PATH"
@@ -139,270 +105,35 @@ select_profile() {
   esac
 }
 
-ensure_profile_path() {
+check_profile() {
   local profile="$1"
-  local profile_block="$2"
-  local profile_directory
-  local without_block
-  local updated_profile
-  local link_target
-  local links_followed=0
-
-  # Replace the dotfiles target, never the link the shell reads. readlink
-  # without -f works on BSD as well as GNU hosts and retains relative targets.
-  while [[ -L "$profile" ]]; do
-    links_followed=$((links_followed + 1))
-    if [[ "$links_followed" -gt 40 ]] || ! link_target=$(readlink "$profile"); then
-      refuse "path-update-failed" "could not resolve shell profile symlink $profile"
-    fi
-    case "$link_target" in
-      /*) profile="$link_target" ;;
-      *) profile="$(dirname "$profile")/$link_target" ;;
-    esac
-  done
-
-  profile_directory=$(dirname "$profile")
-  ensure_created_directory_tree "$profile_directory" 700 path-update-failed
-  if [[ ! -e "$profile" ]]; then
-    if ! : >"$profile"; then
-      refuse "path-update-failed" "could not create shell profile $profile"
-    fi
-  fi
-  if [[ ! -f "$profile" ]]; then
+  if [[ ( -e "$profile" || -L "$profile" ) && ! -f "$profile" ]]; then
     refuse "path-update-failed" "$profile is not a regular file"
   fi
-
-  if ! without_block=$(mktemp "${profile}.without-cortexkit.XXXXXX"); then
-    refuse "path-update-failed" "could not prepare update for $profile"
-  fi
-  if ! updated_profile=$(mktemp "${profile}.with-cortexkit.XXXXXX"); then
-    rm -f "$without_block"
-    refuse "path-update-failed" "could not prepare update for $profile"
-  fi
-  # Keep the replacement owner-only while constructing it; copying metadata
-  # from a previously writable profile would expose the temporary contents.
-  if ! : >"$updated_profile"; then
-    rm -f "$without_block" "$updated_profile"
-    refuse "path-update-failed" "could not preserve shell profile metadata for $profile"
-  fi
-
-  if ! awk -v begin="$PATH_BLOCK_BEGIN" -v end="$PATH_BLOCK_END" '
-    $0 == begin {
-      if (inside) {
-        invalid = 1
-        exit 1
-      }
-      inside = 1
-      begins++
-      next
-    }
-    $0 == end {
-      if (!inside) {
-        invalid = 1
-        exit 1
-      }
-      inside = 0
-      ends++
-      next
-    }
-    !inside { print }
-    END {
-      if (invalid || inside || begins != ends || begins > 1) {
-        exit 1
-      }
-    }
-  ' "$profile" >"$without_block"; then
-    rm -f "$without_block" "$updated_profile"
+  if [[ -f "$profile" ]] && ! awk -v begin="$PATH_BLOCK_BEGIN" -v end="$PATH_BLOCK_END" '
+    $0 == begin { if (inside || seen) { invalid = 1; exit 1 } inside=1; seen=1; next }
+    $0 == end { if (!inside) { invalid=1; exit 1 } inside=0 }
+    END { if (inside || invalid) exit 1 }
+  ' "$profile"; then
     refuse "path-update-failed" "$profile has malformed CortexKit PATH markers"
   fi
-
-  if [[ -s "$without_block" ]]; then
-    if ! cat "$without_block" >"$updated_profile"; then
-      rm -f "$without_block" "$updated_profile"
-      refuse "path-update-failed" "could not update shell profile $profile"
-    fi
-    if ! printf '\n' >>"$updated_profile"; then
-      rm -f "$without_block" "$updated_profile"
-      refuse "path-update-failed" "could not update shell profile $profile"
-    fi
-  fi
-  if ! printf '%s\n' "$profile_block" >>"$updated_profile"; then
-    rm -f "$without_block" "$updated_profile"
-    refuse "path-update-failed" "could not update shell profile $profile"
-  fi
-  rm -f "$without_block"
-
-  if cmp -s "$profile" "$updated_profile"; then
-    rm -f "$updated_profile"
-    return
-  fi
-  if ! mv "$updated_profile" "$profile"; then
-    rm -f "$updated_profile"
-    refuse "path-update-failed" "could not replace shell profile $profile"
-  fi
 }
-
-# Two digests, two meanings: `sha256` is the placed binary's bytes (the
-# ownership proof uninstall compares before deleting), `archive_sha256` is
-# the release archive the binary came from (the digest the index carries,
-# which currency checks compare against). Recording only the first made
-# every release-placed binary read as an available update forever.
-#
-# On a machine that already has a manifest, `ck setup` has extended it with
-# rows for the daemon, the modules, and the runtime definition, and this
-# script has no JSON parser to merge into that and must never run the ck
-# it just placed. Rewriting the file dropped every one of those rows, after
-# which `ck upgrade` reported the daemon as not installed. So an existing
-# manifest is left untouched and the rows go to a sidecar beside it, which
-# the next ck to load the inventory folds in and removes.
-retire_cli() {
-  local old="$1" backup digest
-  [[ "$old" == "$data_dir/bin/ck" && ! -L "$old" && ! -L "$data_dir/bin" ]] || return 0
-  [[ "$old" != "$destination" && -f "$old" ]] || return 0
-  [[ ! "$old" -ef "$destination" ]] || return 0
-  digest=$(sha256_for "$old")
-  backup="$old.retired-$(date -u +%Y%m%dT%H%M%SZ)-$$"
-  if [[ -e "$backup" || -L "$backup" ]] || ! mv "$old" "$backup"; then
-    refuse "cli-shadowed" "could not retire $old to $backup"
-  fi
-  record_retirement "$old" "$backup" "$digest"
-  printf 'Retired legacy ck at %s to %s.\n' "$old" "$backup"
-}
-
-record_retirement() {
-  local old="$1" backup="$2" digest="$3" recorded
-  for recorded in "${retirement_backups[@]}"; do
-    [[ "$recorded" != "$backup" ]] || return 0
-  done
-  retirement_backups+=("$backup")
-  retirement_rows="$retirement_rows, {\"kind\":\"legacy-cli-retirement\",\"path\":\"$(json_escape "$backup")\",\"original_path\":\"$(json_escape "$old")\",\"backup_path\":\"$(json_escape "$backup")\",\"sha256\":\"$digest\"}"
-}
-
-collect_retirement_history() {
-  local sidecar="$data_dir/installer-manifest.bootstrap.json" history
-  # Reinstalling before setup adopts the sidecar must not lose the audit trail.
-  [[ -f "$sidecar" ]] || return 0
-  if ! history=$(awk '
-    { document = document $0 "\n" }
-    END {
-      if (!match(document, /"mutations"[[:space:]]*:[[:space:]]*\[/)) exit 1
-      document = substr(document, RSTART + RLENGTH)
-      depth = 0; quoted = 0; escaped = 0
-      for (i = 1; i <= length(document); i++) {
-        c = substr(document, i, 1)
-        if (quoted) {
-          if (escaped) escaped = 0
-          else if (c == "\\") escaped = 1
-          else if (c == "\"") quoted = 0
-        } else if (c == "\"") quoted = 1
-        else if (c == "{") { if (depth++ == 0) start = i }
-        else if (c == "}") {
-          if (--depth == 0) {
-            row = substr(document, start, i - start + 1)
-            if (row ~ /"kind"[[:space:]]*:[[:space:]]*"legacy-cli-retirement"/) print "," row
-          }
-        } else if (c == "]" && depth == 0) exit 0
-      }
-      exit 1
-    }
-  ' "$sidecar"); then
-    refuse "inventory-record-failed" "could not preserve retirement history in $sidecar"
-  fi
-  retirement_rows="$history$retirement_rows"
-}
-
-retire_legacy_clis() {
-  retire_cli "$data_dir/bin/ck"
-}
-
 verify_cli_resolution() {
   local winner
   # The quoted programs expand their arguments in the new shell, not here.
   # shellcheck disable=SC2016
   if [[ "$profile_kind" == fish ]]; then
-    winner=$("$SHELL" --no-config --interactive -c 'source "$argv[1]" >&2; command --search ck' "$profile_path") || winner='<not found>'
+    winner=$("$SHELL" --no-config --interactive -c 'source "$argv[1]" >&2; command --search ck' "$profile_path" 9>&-) || winner='<not found>'
   elif [[ "${SHELL##*/}" == zsh ]]; then
-    winner=$("$SHELL" -f -i -c '. "$1" >&2; whence -p ck' _ "$profile_path") || winner='<not found>'
+    winner=$("$SHELL" -f -i -c '. "$1" >&2; whence -p ck' _ "$profile_path" 9>&-) || winner='<not found>'
   else
-    winner=$(bash --noprofile --norc -i -c '. "$1" >&2; type -P ck' _ "$profile_path") || winner='<not found>'
+    winner=$(bash --noprofile --norc -i -c '. "$1" >&2; type -P ck' _ "$profile_path" 9>&-) || winner='<not found>'
   fi
   [[ "$winner" -ef "$destination" ]] || refuse "cli-shadowed" "ck resolves to $winner (PATH entry ${winner%/*}) instead of $destination"
 }
 
-write_manifest() {
-  local manifest="$1"
-  local binary="$2"
-  local binary_digest="$3"
-  local profile="$4"
-  local archive_digest="$5"
-  local target="$manifest"
-  local manifest_tmp
-  local escaped_manifest
-  local escaped_binary
-  local escaped_digest
-  local escaped_archive_digest
-  local escaped_profile
-
-  if [[ -f "$manifest" ]]; then
-    target="${manifest%/*}/installer-manifest.bootstrap.json"
-  fi
-  if ! manifest_tmp=$(mktemp "${target}.XXXXXX"); then
-    refuse "inventory-record-failed" "could not prepare $target"
-  fi
-
-  escaped_manifest=$(json_escape "$manifest")
-  escaped_binary=$(json_escape "$binary")
-  escaped_digest=$(json_escape "$binary_digest")
-  escaped_archive_digest=$(json_escape "$archive_digest")
-  escaped_profile=$(json_escape "$profile")
-  if ! cat >"$manifest_tmp" <<EOF
-{
-  "schema_version": 1,
-  "installer": "ck",
-  "platform": "${os}-${arch}",
-  "mutations": [
-    {
-      "kind": "binary-placement",
-      "path": "$escaped_binary",
-      "sha256": "$escaped_digest",
-      "archive_sha256": "$escaped_archive_digest"
-    },
-    {
-      "kind": "shell-profile-path",
-      "path": "$escaped_profile",
-      "begin_marker": "$PATH_BLOCK_BEGIN",
-      "end_marker": "$PATH_BLOCK_END"
-    },
-    {
-      "kind": "ownership-record",
-      "path": "$escaped_manifest"
-    }$retirement_rows
-  ]
-}
-EOF
-  then
-    rm -f "$manifest_tmp"
-    refuse "inventory-record-failed" "could not write $target"
-  fi
-
-  if [[ -f "$target" ]] && cmp -s "$target" "$manifest_tmp"; then
-    rm -f "$manifest_tmp"
-    return
-  fi
-  if ! mv "$manifest_tmp" "$target"; then
-    rm -f "$manifest_tmp"
-    refuse "inventory-record-failed" "could not replace $target"
-  fi
-}
-
 cleanup_staging() {
-  if [[ -n "${retirement_rows:-}" && "${retirement_manifest_written:-0}" != 1 ]]; then
-    write_manifest "$manifest" "$destination" "$candidate_digest" "$profile_path" "$expected_digest"
-  fi
   rm -rf "$temp_dir"
-  if [[ -n "${placement_stage:-}" ]]; then
-    rm -rf "$placement_stage"
-  fi
 }
 
 if ! raw_os=$(uname -s); then
@@ -455,7 +186,6 @@ archive_name="ck-${os}-${arch}.zip"
 data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/cortexkit"
 cmd_dir="$data_dir/cmd"
 destination="$cmd_dir/ck"
-manifest="$data_dir/installer-manifest.json"
 
 if ! temp_dir=$(mktemp -d); then
   refuse "download-failed" "could not create a temporary download directory"
@@ -515,14 +245,17 @@ ck_fields=$(awk -v target="${os}-${arch}" '
     ck = extract_object(host, "ck")
     url = json_string(ck, "url")
     sha = json_string(ck, "sha256")
-    if (url == "" || sha == "") exit 1
+    version = json_string(core, "version")
+    if (url == "" || sha == "" || version == "") exit 1
     print url
     print sha
+    print version
   }
 ' "$index_path") || refuse "release-incomplete" "ck asset for ${os}-${arch} is missing from $index_url"
 
 archive_url=$(printf '%s\n' "$ck_fields" | sed -n '1p')
 expected_digest=$(printf '%s\n' "$ck_fields" | sed -n '2p' | tr 'A-F' 'a-f')
+release_version=$(printf '%s\n' "$ck_fields" | sed -n '3p')
 if [[ ${#expected_digest} -ne 64 || "$expected_digest" == *[!0-9a-f]* ]]; then
   refuse "release-incomplete" "ck sha256 for ${os}-${arch} is missing from $index_url"
 fi
@@ -550,83 +283,13 @@ fi
 if ! chmod 755 "$candidate"; then
   refuse "extraction-failed" "could not set executable mode on extracted ck"
 fi
-candidate_digest=$(sha256_for "$candidate")
-
-ensure_created_directory_tree "$data_dir" 700
-ensure_created_directory_tree "$cmd_dir" 755
-if ! is_owned_nonwritable_directory "$data_dir" || ! is_owned_nonwritable_directory "$cmd_dir"; then
-  refuse "placement-failed" "data and command directories must be owned by this user and not writable by others; run ck setup to repair existing paths"
-fi
-
-if [[ -f "$destination" ]] && cmp -s "$candidate" "$destination"; then
-  printf 'ck already matches verified download at %s; skipping placement.\n' "$destination"
-else
-  # This private sibling keeps the mode change off the destination path and
-  # makes the final move a same-filesystem atomic rename.
-  if ! placement_stage=$(mktemp -d "$cmd_dir/.ck-stage.XXXXXX"); then
-    refuse "placement-failed" "could not prepare destination staging directory"
-  fi
-  if ! is_private_staging_directory "$placement_stage"; then
-    refuse "placement-failed" "destination staging directory is not owner-only or is not owned by this user"
-  fi
-  placement_tmp="$placement_stage/ck"
-  if ! cp "$candidate" "$placement_tmp"; then
-    rm -f "$placement_tmp"
-    refuse "placement-failed" "could not copy ck to $destination"
-  fi
-  if ! chmod 755 "$placement_tmp"; then
-    rm -f "$placement_tmp"
-    refuse "placement-failed" "could not make $destination executable"
-  fi
-  if ! mv "$placement_tmp" "$destination"; then
-    refuse "placement-failed" "could not place ck at $destination"
-  fi
-  if ! rmdir "$placement_stage"; then
-    refuse "placement-failed" "could not remove destination staging directory"
-  fi
-  placement_stage=""
-  printf 'Installed ck at %s.\n' "$destination"
-fi
-
 select_profile
-retirement_rows=""
-retirement_backups=()
-retire_legacy_clis
-collect_retirement_history
-# Quote the resolved installation path, rather than assuming the default data
-# home. Shell metacharacters in a user-selected directory must remain literal.
-profile_cmd_dir=${cmd_dir//\\/\\\\}
-profile_cmd_dir=${profile_cmd_dir//\"/\\\"}
-profile_cmd_dir=${profile_cmd_dir//\$/\\\$}
-if [[ "$profile_kind" == "fish" ]]; then
-  path_block="$PATH_BLOCK_BEGIN
-set -gx PATH \"$profile_cmd_dir\" \$PATH
-$PATH_BLOCK_END"
-else
-  profile_cmd_dir=${profile_cmd_dir//\`/\\\`}
-  path_block="$PATH_BLOCK_BEGIN
-export PATH=\"$profile_cmd_dir:\$PATH\"
-$PATH_BLOCK_END"
+check_profile "$profile_path"
+if ! "$candidate" __install-bootstrap "$expected_digest" "$release_version"; then
+  refuse "placement-failed" "verified ck could not complete journaled placement"
 fi
-ensure_profile_path "$profile_path" "$path_block"
-write_manifest "$manifest" "$destination" "$candidate_digest" "$profile_path" "$expected_digest"
-retirement_manifest_written=1
+if ! CK_BOOTSTRAP_PROFILE="$profile_path" CK_BOOTSTRAP_PROFILE_KIND="$profile_kind" "$destination" setup; then
+  refuse "setup-failed" "ck setup did not complete; run $destination setup to retry"
+fi
 verify_cli_resolution
-
-# The profile change reaches new shells only. This script runs in a child of
-# the user's shell (curl | bash), so it cannot change that shell's PATH; say
-# how to load it here, unless the command directory is already on the PATH
-# this script inherited (a re-run, or a terminal opened after the first one).
-cmd_dir_on_path=0
-IFS=':' read -r -a inherited_path_entries <<<"${PATH:-}"
-for entry in "${inherited_path_entries[@]}"; do
-  if [[ -n "$entry" && "$entry" -ef "$cmd_dir" ]]; then
-    cmd_dir_on_path=1
-    break
-  fi
-done
-if [[ "$cmd_dir_on_path" -eq 0 ]]; then
-  printf 'Added ck to PATH in %s. New terminals find it.\n' "$profile_path"
-  printf 'To use ck in this terminal, run:\n  source %q\n' "$profile_path"
-fi
-printf 'Next: ck setup\n'
+printf 'New terminals find ck on PATH. To load it in this terminal, run:\n  source %q\n' "$profile_path"

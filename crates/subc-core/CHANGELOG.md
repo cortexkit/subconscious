@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.21.34
+
+- Setup, upgrade, uninstall and both install scripts use one locked write-ahead
+  journal. A retry finishes a transaction only when the journal records its
+  complete plan and recovery verifies the changes. Otherwise it restores the
+  prior installation without starting a daemon that was previously stopped. On
+  Windows, mapped executables move aside before replacement, and closed journals
+  with in-use files wait for cleanup without blocking subsequent installs. The
+  lock is released while awaiting confirmation. Setup honors an absolute
+  `XDG_CONFIG_HOME` for the systemd user unit and checks the loaded path. Shell
+  profile updates preserve mode and symlinks, but not hard-link identity, ACLs,
+  extended attributes or group ownership. CLI discovery skips unreachable
+  implicit connection files but stops on authentication failure. Log tailing
+  bounds the sort and follows from the initial read, buffering partial lines.
+  Requires subc-os 0.1.50 and subc-transport 0.18.2.
+- An app upgrade that does not need to recover an activation no longer loads
+  daemon connection details before checking installation ownership.
+
 ## 0.21.32
 
 - Add `ck policy-root show`, `set` and `recover` for the daemon's agent policy

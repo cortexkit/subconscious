@@ -5,18 +5,12 @@ use std::{
 
 use serde_json::{json, Map, Value};
 
-use super::{components::OWNED_BINARY_KINDS, file_modes};
+#[cfg(test)]
+use super::file_modes;
+use super::install_journal::{transaction::Transaction, Recovery};
+use super::{components::OWNED_BINARY_KINDS, install_lock::InstallLock};
 
 const SCHEMA_VERSION: u64 = 1;
-
-/// Written by the bootstrap installer beside the manifest when a manifest
-/// already exists. The installer is a shell script with no JSON parser and
-/// must never run the ck it just placed, so it cannot merge its rows into a
-/// manifest that setup has extended; rewriting the whole file dropped every
-/// daemon and module row and made `ck upgrade` report them as not installed.
-/// The installer writes its rows here instead and the next ck that loads the
-/// inventory adopts them, replacing rows of the same kind and path.
-pub const BOOTSTRAP_SIDECAR: &str = "installer-manifest.bootstrap.json";
 
 /// The installer manifest is the sole authority for removal. Its entries retain
 /// installer-written fields verbatim while setup appends only its own mutations.
@@ -26,11 +20,81 @@ pub struct Inventory {
     document: Value,
     changed: bool,
     windows_separators: bool,
+    /// Held from before the load until this inventory is dropped, when it
+    /// was loaded by a command that changes the install.
+    _lock: Option<InstallLock>,
+    /// Loaded without the install lock to look, never to save: a save from
+    /// such a copy could write back rows another, locked, command has since
+    /// replaced.
+    snapshot: bool,
+    active: Option<(Transaction, Value)>,
+    #[cfg(test)]
+    opened_transaction: bool,
+}
+
+#[cfg(test)]
+#[test]
+fn an_unconfirmed_or_failed_undo_cannot_leak_inventory_rows() {
+    use super::install_journal::bootstrap::FileRecovery;
+    for unconfirmed in [false, true] {
+        let root = cortexkit_test_support::ScratchDir::new("journal-inventory-state");
+        let manifest = root.join("installer-manifest.json");
+        let target = root.join("managed");
+        let mut inventory = Inventory::read(manifest.clone(), "test").unwrap();
+        inventory.start_transaction().unwrap();
+        inventory
+            .transaction()
+            .unwrap()
+            .write(&target, b"new", 0o600)
+            .unwrap();
+        inventory.record("managed-binary", &target, Map::new());
+        if unconfirmed {
+            inventory.leave_transaction_unconfirmed().unwrap();
+        } else {
+            fs::write(&target, "unexpected bytes").unwrap();
+            assert!(inventory.undo_transaction(&mut FileRecovery).is_err());
+        }
+        assert!(!inventory.owns_path("managed-binary", &target));
+        assert!(!inventory.has_changes());
+        assert!(inventory.save().unwrap_err().contains("journal commit"));
+        assert!(!manifest.exists());
+    }
 }
 
 impl Inventory {
-    pub fn load(path: impl Into<PathBuf>, platform: &str) -> Result<Self, String> {
+    /// Loads the inventory for a command that changes the install: first
+    /// waits up to `wait` for any other installer command on this install
+    /// root to finish (see [`InstallLock`]), then reads the manifest it left,
+    /// and keeps the lock until this inventory is dropped.
+    pub fn load_locked(
+        path: impl Into<PathBuf>,
+        platform: &str,
+        command: &str,
+        wait: std::time::Duration,
+    ) -> Result<Self, String> {
         let path = path.into();
+        let lock = InstallLock::acquire_within(&path, command, wait)?;
+        let mut inventory = Self::read(path, platform)?;
+        inventory._lock = Some(lock);
+        super::install_journal::bootstrap::refuse_legacy(&inventory.path, &inventory)?;
+        Ok(inventory)
+    }
+
+    /// A read-only snapshot for discovery, previews and the dashboard.
+    pub fn load_snapshot(path: impl Into<PathBuf>, platform: &str) -> Result<Self, String> {
+        let mut inventory = Self::read(path.into(), platform)?;
+        inventory.snapshot = true;
+        Ok(inventory)
+    }
+
+    /// A writable load without the lock, for tests that stand in for one
+    /// installer command; production writers use [`load_locked`](Self::load_locked).
+    #[cfg(test)]
+    pub fn load(path: impl Into<PathBuf>, platform: &str) -> Result<Self, String> {
+        Self::read(path.into(), platform)
+    }
+
+    pub(super) fn read(path: PathBuf, platform: &str) -> Result<Self, String> {
         let document = match fs::read_to_string(&path) {
             Ok(contents) => serde_json::from_str(&contents).map_err(|error| {
                 format!("inventory {} is invalid JSON: {error}", path.display())
@@ -59,77 +123,18 @@ impl Inventory {
                 path.display()
             ));
         }
-        let mut inventory = Self {
+        let inventory = Self {
             path,
             document,
             changed: false,
             windows_separators: matches!(platform, "windows-x64" | "windows-arm64"),
+            _lock: None,
+            snapshot: false,
+            active: None,
+            #[cfg(test)]
+            opened_transaction: false,
         };
-        inventory.adopt_bootstrap_sidecar()?;
         Ok(inventory)
-    }
-
-    /// Folds a bootstrap sidecar into the manifest and removes it. Adoption
-    /// is persisted here rather than left to the caller's `save`, because a
-    /// read-only caller (uninstall deciding what it owns) must see the
-    /// adopted rows on disk too, and a sidecar that survived a load would be
-    /// adopted again over any later change.
-    fn adopt_bootstrap_sidecar(&mut self) -> Result<(), String> {
-        let sidecar = match self.path.parent() {
-            Some(parent) => parent.join(BOOTSTRAP_SIDECAR),
-            None => return Ok(()),
-        };
-        let contents = match fs::read_to_string(&sidecar) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => {
-                return Err(format!(
-                    "could not read bootstrap sidecar {}: {error}",
-                    sidecar.display()
-                ))
-            }
-        };
-        let document: Value = serde_json::from_str(&contents).map_err(|error| {
-            format!(
-                "bootstrap sidecar {} is invalid JSON: {error}",
-                sidecar.display()
-            )
-        })?;
-        let rows = document
-            .get("mutations")
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
-                format!(
-                    "bootstrap sidecar {} has no mutations array",
-                    sidecar.display()
-                )
-            })?;
-        for row in rows {
-            let (Some(kind), Some(path)) = (
-                row.get("kind").and_then(Value::as_str),
-                row.get("path").and_then(Value::as_str),
-            ) else {
-                return Err(format!(
-                    "bootstrap sidecar {} has a row without kind and path: {row}",
-                    sidecar.display()
-                ));
-            };
-            let (kind, path) = (kind.to_string(), PathBuf::from(path));
-            self.remove_owned_path(&kind, &path);
-            // The bootstrap installer just replaced the bytes at this path, so
-            // a row another binary-ownership kind wrote for it describes a
-            // file that no longer exists.
-            self.transfer_binary_ownership(&kind, &path);
-            self.mutations_mut().push(row.clone());
-            self.changed = true;
-        }
-        self.save()?;
-        fs::remove_file(&sidecar).map_err(|error| {
-            format!(
-                "adopted bootstrap sidecar {} but could not remove it: {error}",
-                sidecar.display()
-            )
-        })
     }
 
     pub fn owns_path(&self, kind: &str, path: &Path) -> bool {
@@ -262,9 +267,22 @@ impl Inventory {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn save(&mut self) -> Result<(), String> {
+        if self.opened_transaction {
+            return Err(format!(
+                "refusal: {} must be saved at journal commit after opening an install transaction",
+                self.path.display()
+            ));
+        }
         if !self.changed {
             return Ok(());
+        }
+        if self.snapshot {
+            return Err(format!(
+                "refusal: inventory {} was read without the install lock and cannot be saved",
+                self.path.display()
+            ));
         }
         let parent = self
             .path
@@ -273,15 +291,87 @@ impl Inventory {
         file_modes::ensure_owned_directory(parent, 0o700)?;
         // Sorted keys, so the file's bytes don't depend on whether the build
         // turned on serde_json's `preserve_order`.
-        let serialized = subc_jsonc::to_string_pretty_sorted(&self.document);
-        file_modes::write_atomic(
-            &self.path,
-            format!("{serialized}\n").as_bytes(),
-            0o644,
-            0o644,
-            "json.tmp",
-        )?;
+        let serialized = self.serialized();
+        file_modes::write_atomic(&self.path, serialized.as_bytes(), 0o644, 0o644, "json.tmp")?;
         self.changed = false;
+        Ok(())
+    }
+
+    pub(super) fn serialized(&self) -> String {
+        format!("{}\n", subc_jsonc::to_string_pretty_sorted(&self.document))
+    }
+
+    pub(super) fn has_changes(&self) -> bool {
+        self.changed
+    }
+
+    pub(super) fn manifest(&self) -> &Path {
+        &self.path
+    }
+
+    pub(super) fn start_transaction(&mut self) -> Result<(), String> {
+        if self.snapshot || self.active.is_some() {
+            return Err(format!(
+                "refusal: cannot start a new install transaction for {}",
+                self.path.display()
+            ));
+        }
+        self.active = Some((Transaction::begin(&self.path)?, self.document.clone()));
+        #[cfg(test)]
+        {
+            self.opened_transaction = true;
+        }
+        Ok(())
+    }
+
+    pub(super) fn transaction(&mut self) -> Option<&mut Transaction> {
+        self.active.as_mut().map(|(transaction, _)| transaction)
+    }
+
+    pub(super) fn transaction_is_open(&self) -> bool {
+        self.active.is_some()
+    }
+
+    pub(super) fn release_lock(&mut self) {
+        self._lock.take();
+    }
+
+    pub(super) fn suspend_transaction(&mut self) -> Option<Value> {
+        self.active.take().map(|(_, prior)| prior)
+    }
+
+    pub(super) fn resume_transaction(&mut self, prior: Value) -> Result<(), String> {
+        self.active = Some((Transaction::resume(&self.path)?, prior));
+        Ok(())
+    }
+
+    pub(super) fn commit_transaction(
+        &mut self,
+        recovery: &mut impl Recovery,
+    ) -> Result<(), String> {
+        if let Some((transaction, _)) = self.active.take() {
+            transaction.commit(self, recovery)?;
+            self.changed = false;
+        }
+        Ok(())
+    }
+
+    pub(super) fn undo_transaction(&mut self, recovery: &mut impl Recovery) -> Result<(), String> {
+        if let Some((transaction, prior)) = self.active.take() {
+            self.document = prior;
+            self.changed = false;
+            transaction.undo(recovery)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn leave_transaction_unconfirmed(&mut self) -> Result<(), String> {
+        if let Some((transaction, prior)) = self.active.take() {
+            let result = transaction.leave_unconfirmed(self);
+            self.document = prior;
+            self.changed = false;
+            result?;
+        }
         Ok(())
     }
 
@@ -442,54 +532,6 @@ mod tests {
         );
     }
 
-    // A machine where `ck setup` once recorded ck as `managed-binary` and a
-    // later bootstrap re-run wrote a `binary-placement` row for the same
-    // path. Adoption must leave ONE row for the path, the sidecar's, or the
-    // stale managed-binary digest is what `ck upgrade` reads first and ck
-    // re-places itself on every run.
-    #[test]
-    fn a_bootstrap_sidecar_replaces_a_row_of_another_kind_at_the_same_path() {
-        let root = fixture_path("bootstrap-sidecar-mixed-kind");
-        let manifest = root.join("installer-manifest.json");
-        fs::write(
-            &manifest,
-            r#"{"schema_version":1,"platform":"linux-x64","mutations":[
-              {"kind":"managed-binary","path":"/managed/ck","version":"0.17.33","sha256":"old-ck","archive_sha256":"old-archive"},
-              {"kind":"managed-binary","path":"/managed/ck-subc","sha256":"daemon","archive_sha256":"daemon-archive"}
-            ]}"#,
-        )
-        .expect("installed manifest");
-        fs::write(
-            root.join(BOOTSTRAP_SIDECAR),
-            r#"{"schema_version":1,"installer":"ck","platform":"linux-x64","mutations":[
-              {"kind":"binary-placement","path":"/managed/ck","sha256":"new-ck","archive_sha256":"new-archive"}
-            ]}"#,
-        )
-        .expect("bootstrap sidecar");
-
-        let inventory = Inventory::load(&manifest, "linux-x64").expect("load adopts");
-        let rows_for_ck = inventory
-            .mutations()
-            .filter(|entry| entry.get("path").and_then(Value::as_str) == Some("/managed/ck"))
-            .count();
-        assert_eq!(rows_for_ck, 1, "one owner row per path");
-        assert!(
-            !inventory.owns_path("managed-binary", Path::new("/managed/ck")),
-            "the stale managed-binary row is gone"
-        );
-        assert_eq!(
-            inventory
-                .entry_for_path("binary-placement", Path::new("/managed/ck"))
-                .and_then(|entry| entry.get("archive_sha256"))
-                .and_then(Value::as_str),
-            Some("new-archive")
-        );
-        assert!(
-            inventory.owns_path("managed-binary", Path::new("/managed/ck-subc")),
-            "other paths' rows are untouched"
-        );
-    }
-
     // Same rule for a live writer: setup recording a path the bootstrap
     // installer owns takes the row over instead of adding a second one.
     #[test]
@@ -527,82 +569,6 @@ mod tests {
         assert!(inventory.owns_path("runtime-registration", unit));
     }
 
-    // A bootstrap re-run onto an installed machine: the manifest carries the
-    // daemon row setup wrote, the sidecar carries the new ck digests. Loading
-    // must keep the daemon row, replace the ck row, persist the result for
-    // read-only callers, and consume the sidecar so a later load does not
-    // adopt it again over newer state.
-    #[test]
-    fn a_bootstrap_sidecar_replaces_its_own_rows_and_keeps_the_rest() {
-        let root = fixture_path("bootstrap-sidecar");
-        let manifest = root.join("installer-manifest.json");
-        fs::write(
-            &manifest,
-            r#"{"schema_version":1,"platform":"linux-x64","mutations":[
-              {"kind":"binary-placement","path":"/managed/ck","sha256":"old-ck","archive_sha256":"old-archive"},
-              {"kind":"binary-placement","path":"/managed/ck-subc","sha256":"daemon","archive_sha256":"daemon-archive"},
-              {"kind":"runtime-definition","path":"/units/cortexkit-subc.service"}
-            ]}"#,
-        )
-        .expect("installed manifest");
-        let sidecar = root.join(BOOTSTRAP_SIDECAR);
-        fs::write(
-            &sidecar,
-            r#"{"schema_version":1,"installer":"ck","platform":"linux-x64","mutations":[
-              {"kind":"binary-placement","path":"/managed/ck","sha256":"new-ck","archive_sha256":"new-archive"},
-              {"kind":"shell-profile-path","path":"/home/u/.bashrc","begin_marker":"b","end_marker":"e"},
-              {"kind":"ownership-record","path":"/managed/installer-manifest.json"}
-            ]}"#,
-        )
-        .expect("bootstrap sidecar");
-
-        let inventory = Inventory::load(&manifest, "linux-x64").expect("load adopts");
-        let ck = |inventory: &Inventory, field: &str| {
-            inventory
-                .entry_for_path("binary-placement", Path::new("/managed/ck"))
-                .and_then(|entry| entry.get(field))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        };
-        assert_eq!(ck(&inventory, "sha256").as_deref(), Some("new-ck"));
-        assert_eq!(
-            ck(&inventory, "archive_sha256").as_deref(),
-            Some("new-archive")
-        );
-        assert!(
-            inventory.owns_path("binary-placement", Path::new("/managed/ck-subc")),
-            "the daemon row setup wrote must survive a bootstrap re-run"
-        );
-        assert!(inventory.owns_path(
-            "runtime-definition",
-            Path::new("/units/cortexkit-subc.service")
-        ));
-        assert!(inventory.owns_path("shell-profile-path", Path::new("/home/u/.bashrc")));
-        assert_eq!(
-            inventory.paths_for_kind("binary-placement").len(),
-            2,
-            "one ck row, not old and new side by side"
-        );
-        assert!(!sidecar.exists(), "the sidecar is consumed on adoption");
-
-        // Persisted, not just in memory: a fresh load without the sidecar
-        // reads the adopted digests from the manifest itself.
-        let reloaded = Inventory::load(&manifest, "linux-x64").expect("reload");
-        assert_eq!(ck(&reloaded, "sha256").as_deref(), Some("new-ck"));
-        assert!(reloaded.owns_path("binary-placement", Path::new("/managed/ck-subc")));
-    }
-
-    #[test]
-    fn a_malformed_bootstrap_sidecar_refuses_the_load_rather_than_ignoring_it() {
-        let root = fixture_path("bootstrap-sidecar-malformed");
-        let manifest = root.join("installer-manifest.json");
-        fs::write(&manifest, r#"{"schema_version":1,"mutations":[]}"#).unwrap();
-        fs::write(root.join(BOOTSTRAP_SIDECAR), "{not json").unwrap();
-        let error = Inventory::load(&manifest, "linux-x64").expect_err("refuses");
-        assert!(error.contains("bootstrap sidecar"), "{error}");
-        assert!(error.contains("invalid JSON"), "{error}");
-    }
-
     #[test]
     fn setup_entries_extend_installer_inventory_without_losing_installer_ownership() {
         let root = fixture_path("inventory");
@@ -621,5 +587,51 @@ mod tests {
         let inventory = Inventory::load(&manifest, "linux-x64").expect("reload inventory");
         assert!(inventory.owns_path("binary-placement", Path::new("/managed/ck")));
         assert!(inventory.owns_path("runtime-definition", &runtime));
+    }
+
+    /// A snapshot writes nothing and cannot save over a later locked writer.
+    #[test]
+    fn a_snapshot_read_writes_nothing_and_cannot_overwrite_a_locked_writer() {
+        let root = fixture_path("snapshot-read");
+        let manifest = root.join("installer-manifest.json");
+        let mut seeded = Inventory::load(&manifest, "linux-x64").unwrap();
+        seeded.record("managed-binary", Path::new("/managed/ck-subc"), Map::new());
+        seeded.save().unwrap();
+        let before = fs::read(&manifest).unwrap();
+
+        let mut snapshot = Inventory::load_snapshot(&manifest, "linux-x64").unwrap();
+
+        assert_eq!(
+            fs::read(&manifest).unwrap(),
+            before,
+            "a snapshot wrote the manifest"
+        );
+
+        let mut locked = Inventory::load_locked(
+            &manifest,
+            "linux-x64",
+            "ck setup",
+            std::time::Duration::ZERO,
+        )
+        .unwrap();
+        locked.record(
+            "managed-binary",
+            Path::new("/managed/ck-subc-mcp"),
+            Map::new(),
+        );
+        locked.save().unwrap();
+        drop(locked);
+
+        snapshot.record("managed-binary", Path::new("/managed/stale"), Map::new());
+        let error = snapshot.save().expect_err("a snapshot cannot save");
+        assert!(error.contains("without the install lock"), "{error}");
+        let reloaded = Inventory::load(&manifest, "linux-x64").unwrap();
+        for path in ["/managed/ck-subc", "/managed/ck-subc-mcp"] {
+            assert!(
+                reloaded.owns_path("managed-binary", Path::new(path)),
+                "missing {path}"
+            );
+        }
+        assert!(!reloaded.owns_path("managed-binary", Path::new("/managed/stale")));
     }
 }

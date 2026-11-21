@@ -280,7 +280,7 @@ test_check() {
     alpha-setup) step 'Alpha setup selection (nonzero tests)' alpha_logged 'test result: ok\. [1-9][0-9]* passed;' cargo test -p subc-core --lib --locked setup:: ;;
     alpha-cli) step 'Alpha CLI update-check contract' cargo test -p subc-core --test ck_cli --locked -v ;;
     alpha-inode)
-      step 'Unix self-update inode contract (exactly one test)' alpha_logged 'test result: ok\. 1 passed;' cargo test -p subc-core --lib --locked setup::self_update_unix::tests::unix_self_update_keeps_running_process_on_original_inode -- --exact ;;
+      step 'Unix journaled self-update contract (exactly one test)' alpha_logged 'test result: ok\. 1 passed;' cargo test -p subc-core --lib --locked setup::install_journal::tests::crash::replacing_and_restoring_a_running_unix_ck_keeps_both_processes_alive -- --exact ;;
     *) invalid_check ;;
   esac
 }

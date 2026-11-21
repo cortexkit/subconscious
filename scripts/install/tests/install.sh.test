@@ -159,7 +159,19 @@ if [[ "${CK_TEST_ASSERT_TEMP_MODES:-0}" == "1" ]]; then
 fi
 cat >"$destination/ck" <<'CK'
 #!/usr/bin/env bash
-printf 'setup process started\n' >"$CK_TEST_SETUP_MARKER"
+set -euo pipefail
+root="${XDG_DATA_HOME:-$HOME/.local/share}/cortexkit"
+if [[ "${1:-}" == __install-bootstrap ]]; then
+  [[ $# -eq 3 && "$2" =~ ^[0-9a-f]{64}$ && "$3" == '0.16.0' ]]
+  printf 'handover %s %s\n' "$2" "$3" >>"$CK_TEST_SETUP_MARKER"
+  if [[ "${CK_TEST_HELPER_REFUSE:-0}" == 1 ]]; then exit 1; fi
+  mkdir -p "$root/cmd"
+  cp "$0" "$root/cmd/ck"
+else
+  [[ "$0" -ef "$root/cmd/ck" && $# -eq 1 && "$1" == setup ]]
+  printf 'setup %s %s\n' "$CK_BOOTSTRAP_PROFILE" "$CK_BOOTSTRAP_PROFILE_KIND" >>"$CK_TEST_SETUP_MARKER"
+  printf 'export PATH="%s/cmd:$PATH"\n' "$root" >>"$CK_BOOTSTRAP_PROFILE"
+fi
 CK
 EOF
 cat >"$stub_dir/systemctl" <<'EOF'
@@ -220,184 +232,43 @@ run_installer() {
   fi
 }
 
-legacy_home="$test_root/legacy-layout"
-mkdir -p "$legacy_home/.local/share/cortexkit/bin" "$legacy_home/earlier"
-/bin/chmod 700 "$legacy_home/.local/share/cortexkit"
-legacy_bin="$legacy_home/.local/share/cortexkit/bin"
-legacy_cmd="$legacy_home/.local/share/cortexkit/cmd"
-printf 'old CLI\n' >"$legacy_bin/ck"
-printf 'other old CLI\n' >"$legacy_home/earlier/ck"
-printf 'module\n' >"$legacy_bin/ck-subc"
-/bin/chmod +x "$legacy_bin/ck" "$legacy_home/earlier/ck"
-run_installer "$legacy_home" "$legacy_home/output" PATH="$stub_dir:$legacy_home/earlier:$legacy_bin:$legacy_cmd:$PATH"
-[[ -f "$legacy_home/earlier/ck" && "$(<"$legacy_home/earlier/ck")" == 'other old CLI' ]] || fail 'foreign_cli_untouched: a foreign CLI was moved or changed'
-printf 'ok: foreign_cli_untouched\n'
-[[ ! -e "$legacy_bin/ck" ]] || fail 'legacy_cli_retirement: old CLI still present'
-[[ -f "$legacy_bin/ck-subc" ]] || fail 'legacy_cli_retirement: module removed'
-python3 - "$legacy_home" <<'PY'
-import hashlib, json, pathlib, sys
-home = pathlib.Path(sys.argv[1])
-rows = json.loads((home / '.local/share/cortexkit/installer-manifest.json').read_text())['mutations']
-retired = [row for row in rows if row['kind'] == 'legacy-cli-retirement']
-assert len(retired) == 1, 'legacy_cli_retirement: missing manifest row'
-for row in retired:
-    backup = pathlib.Path(row['backup_path'])
-    assert backup.is_file() and '.retired-' in backup.name
-    assert backup.read_text() == 'old CLI\n'
-    assert row['original_path'] == str(home / '.local/share/cortexkit/bin/ck'), 'legacy_cli_retirement: original path missing'
-    assert row['path'] == str(backup) and row['sha256'] == hashlib.sha256(backup.read_bytes()).hexdigest(), 'legacy_cli_retirement: backup path or digest differs'
-PY
-resolved=$(HOME="$legacy_home" PATH="$stub_dir:$legacy_bin:$legacy_cmd:$PATH" bash -c '. "$HOME/.bashrc"; type -P ck')
-[[ "$resolved" == "$legacy_cmd/ck" ]] || fail "legacy_cli_retirement: shadowed by $resolved"
-printf 'ok: legacy_cli_retirement\n'
-
-foreign_home="$test_root/foreign-without-cmd"
-mkdir -p "$foreign_home/outside"
-printf 'operator CLI\n' >"$foreign_home/outside/ck"
-/bin/chmod +x "$foreign_home/outside/ck"
-run_installer "$foreign_home" "$foreign_home/output" PATH="$stub_dir:$foreign_home/outside:$PATH"
-[[ -f "$foreign_home/outside/ck" && "$(<"$foreign_home/outside/ck")" == 'operator CLI' ]] || fail 'no_cmd_foreign_untouched: renamed an external CLI before cmd was on PATH'
-printf 'ok: no_cmd_foreign_untouched\n'
-
-guard_home="$test_root/interactive-profile"
-mkdir -p "$guard_home"
-printf 'case $- in *i*) ;; *) return ;; esac\n' >"$guard_home/.bashrc"
-run_installer "$guard_home" "$guard_home/output" || fail 'bash_profile_interactive_guard: skipped the persisted PATH block'
-printf 'ok: bash_profile_interactive_guard\n'
-
-awk '/^if ! raw_os=/{exit} {print}' "$installer" >"$test_root/functions.sh"
-selected=$(CK_PROFILE_PATH='' ZDOTDIR="$test_root/zsh-config" SHELL=/bin/zsh bash -c '. "$1"; select_profile; printf "%s" "$profile_path"' _ "$test_root/functions.sh")
-[[ "$selected" == "$test_root/zsh-config/.zshrc" ]] || fail 'zsh_profile_location: ignored the directory a new zsh will read'
-printf 'ok: zsh_profile_location\n'
-shadow_home="$test_root/shadow"
-mkdir -p "$shadow_home/old" "$shadow_home/cmd"
-printf 'shadow\n' >"$shadow_home/old/ck"
-/bin/chmod +x "$shadow_home/old/ck"
-# Keep PATH literal until the fresh shell reads this profile.
-# shellcheck disable=SC2016
-printf 'readonly PATH="%s:$PATH"\n' "$shadow_home/old" >"$shadow_home/.bashrc"
-if run_installer "$shadow_home" "$shadow_home/output"; then
-  fail 'unix_cli_shadow_refusal: accepted an unresolved placement'
-fi
-grep -F "cli-shadowed: ck resolves to $shadow_home/old/ck" "$shadow_home/output" >/dev/null || fail 'unix_cli_shadow_refusal: shadowing path not named'
-grep -F "PATH entry $shadow_home/old" "$shadow_home/output" >/dev/null || fail 'unix_cli_shadow_refusal: PATH entry not named'
-[[ "$(<"$shadow_home/old/ck")" == shadow ]] || fail 'unix_cli_shadow_refusal: foreign CLI changed'
-printf 'ok: unix_cli_shadow_refusal\n'
-
-printf 'restored old CLI\n' >"$legacy_bin/ck"
-/bin/chmod +x "$legacy_bin/ck"
-run_installer "$legacy_home" "$legacy_home/output" PATH="$stub_dir:$legacy_bin:$legacy_cmd:$PATH"
-run_installer "$legacy_home" "$legacy_home/output" PATH="$stub_dir:$legacy_cmd:$PATH"
-python3 - "$legacy_home" <<'PY'
-import json, pathlib, sys
-root = pathlib.Path(sys.argv[1]) / '.local/share/cortexkit'
-rows = []
-for name in ('installer-manifest.json', 'installer-manifest.bootstrap.json'):
-    rows.extend(json.loads((root / name).read_text())['mutations'])
-retired = [row for row in rows if row['kind'] == 'legacy-cli-retirement']
-assert len(retired) == 2, 'retirement_history: pending history lost after PATH changed'
-assert len({row['path'] for row in retired}) == 2, 'retirement_history: repeated source shares inventory key'
-PY
-printf 'ok: retirement_history\n'
-
-alias_home="$test_root/alias-layout"
-mkdir -p "$alias_home/.local/share/cortexkit/cmd"
-/bin/chmod 700 "$alias_home/.local/share/cortexkit" "$alias_home/.local/share/cortexkit/cmd"
-ln -s cmd "$alias_home/.local/share/cortexkit/bin"
-run_installer "$alias_home" "$alias_home/output" PATH="$stub_dir:$alias_home/.local/share/cortexkit/bin:$PATH" || fail 'cli_directory_alias: installation failed through a directory alias'
-[[ -f "$alias_home/.local/share/cortexkit/cmd/ck" ]] || fail 'cli_directory_alias: retired the new destination through bin'
-printf 'ok: cli_directory_alias\n'
-
 linux_home="$test_root/linux-home"
 mkdir -p "$linux_home"
-linux_output="$test_root/linux-output"
-run_installer "$linux_home" "$linux_output" \
-  CK_TEST_OS=Linux CK_TEST_ARCH=x86_64 CK_TEST_KERNEL=generic
-
-grep -Fq 'index.json' "$linux_home/requests.log" || fail 'Linux installer did not fetch the release index'
-grep -Fq 'ck-linux-x64.zip' "$linux_home/requests.log" || fail 'Linux archive name was not requested'
-grep -Fq 'Next: ck setup' "$linux_output" || fail 'installer did not print the setup command'
-# The installer's own PATH lacks cmd, as in a terminal that ran curl | bash:
-# it must say how to load the new PATH here, or `ck setup` fails as typed.
-grep -Fxq "  source $linux_home/.bashrc" "$linux_output" || fail 'installer did not say how to load PATH in this terminal'
-[[ ! -e "$linux_home/setup-called" ]] || fail 'installer started the extracted ck process'
-[[ -x "$linux_home/.local/share/cortexkit/cmd/ck" ]] || fail 'installer did not place ck in cmd'
-assert_mode "$linux_home/.local/share/cortexkit" 700
-assert_mode "$linux_home/.local/share/cortexkit/cmd" 755
-assert_mode "$linux_home/.local/share/cortexkit/cmd/ck" 755
-assert_mode "$linux_home/.local/share/cortexkit/installer-manifest.json" 600
-assert_mode "$linux_home/.bashrc" 600
-[[ "$(grep -Fc '# cortexkit-managed PATH begin' "$linux_home/.bashrc")" == "1" ]] || fail 'PATH block was not recorded exactly once'
-grep -Fq "$linux_home/.local/share/cortexkit/cmd" "$linux_home/.bashrc" || fail 'PATH block did not use cmd'
-! grep -Fq "$linux_home/.local/share/cortexkit/bin" "$linux_home/.bashrc" || fail 'PATH block still includes bin'
-grep -Fq 'installer-manifest.json' "$linux_home/.local/share/cortexkit/installer-manifest.json" || fail 'installer manifest did not record itself'
-# The two digests must be the two different files: the archive digest the
-# index carried (currency) and the extracted binary's own bytes (ownership).
-# Asserting both by value, not just presence, is what catches a copy of one
-# into the other.
+run_installer "$linux_home" "$linux_home/output" || fail 'journal handover failed'
+[[ -x "$linux_home/.local/share/cortexkit/cmd/ck" ]] || fail 'helper did not publish ck'
 archive_digest=$(printf 'fixture archive\n' | shasum -a 256 | awk '{print $1}')
-binary_digest=$(shasum -a 256 "$linux_home/.local/share/cortexkit/cmd/ck" | awk '{print $1}')
-[[ "$archive_digest" != "$binary_digest" ]] || fail 'fixture cannot discriminate: archive and binary digests coincide'
-grep -Fq "\"archive_sha256\": \"$archive_digest\"" "$linux_home/.local/share/cortexkit/installer-manifest.json" || fail 'manifest did not record the archive digest the index carried'
-grep -Fq "\"sha256\": \"$binary_digest\"" "$linux_home/.local/share/cortexkit/installer-manifest.json" || fail 'manifest did not record the placed binary digest'
+grep -Fxq "handover $archive_digest 0.16.0" "$linux_home/setup-called" || fail 'helper did not receive verified index fields'
+grep -Fxq "setup $linux_home/.bashrc posix" "$linux_home/setup-called" || fail 'installed ck did not receive profile selection'
+[[ ! -e "$linux_home/.local/share/cortexkit/installer-manifest.bootstrap.json" ]] || fail 'script wrote a bootstrap sidecar'
+grep -Fxq 'https://release.fixture.example/ck-linux-x64.zip' "$linux_home/requests.log" || fail 'wrong Linux archive'
 
-# A re-run onto an installed machine. Stand in for `ck setup` by extending
-# the manifest with a daemon row the way setup does (serde's own layout, so
-# the file is nothing this script wrote). The re-run must not touch that
-# file: the daemon row would be lost and `ck upgrade` would report the daemon
-# as not installed. Its rows go to the sidecar the next ck load adopts.
-linux_manifest="$linux_home/.local/share/cortexkit/installer-manifest.json"
-linux_sidecar="$linux_home/.local/share/cortexkit/installer-manifest.bootstrap.json"
-cat >"$linux_manifest" <<EOF
-{
-  "mutations": [
-    {
-      "archive_sha256": "stale-archive",
-      "kind": "binary-placement",
-      "path": "$linux_home/.local/share/cortexkit/cmd/ck",
-      "sha256": "stale-binary"
-    },
-    {
-      "archive_sha256": "daemon-archive",
-      "kind": "binary-placement",
-      "path": "$linux_home/.local/share/cortexkit/bin/ck-subc",
-      "sha256": "daemon-binary"
-    }
-  ],
-  "platform": "linux-x64",
-  "schema_version": 1
-}
-EOF
-manifest_before=$(shasum -a 256 "$linux_manifest" | awk '{print $1}')
-rerun_output="$test_root/linux-rerun-output"
-run_installer "$linux_home" "$rerun_output" \
-  CK_TEST_OS=Linux CK_TEST_ARCH=x86_64 CK_TEST_KERNEL=generic
-grep -Fq 'already matches verified download' "$rerun_output" || fail 'identical destination was not reported as a no-op'
-grep -Fq 'Next: ck setup' "$rerun_output" || fail 'no-op installer did not print the setup command'
-onpath_output="$test_root/linux-onpath-output"
-run_installer "$linux_home" "$onpath_output" \
-  CK_TEST_OS=Linux CK_TEST_ARCH=x86_64 CK_TEST_KERNEL=generic \
-  PATH="$stub_dir:$linux_home/.local/share/cortexkit/cmd:$PATH"
-grep -Fq 'Next: ck setup' "$onpath_output" || fail 'on-PATH installer did not print the setup command'
-! grep -Fq 'source ' "$onpath_output" || fail 'installer asked to load PATH although cmd was already on it'
-[[ ! -e "$linux_home/setup-called" ]] || fail 'no-op installer started the extracted ck process'
-[[ "$(grep -Fc '# cortexkit-managed PATH begin' "$linux_home/.bashrc")" == "1" ]] || fail 'no-op installer duplicated the PATH block'
-[[ "$(shasum -a 256 "$linux_manifest" | awk '{print $1}')" == "$manifest_before" ]] || fail 're-run rewrote an existing manifest (setup rows would be lost)'
-[[ -f "$linux_sidecar" ]] || fail 're-run did not write the bootstrap sidecar'
-assert_mode "$linux_sidecar" 600
-grep -Fq "\"archive_sha256\": \"$archive_digest\"" "$linux_sidecar" || fail 'sidecar did not record the archive digest'
-grep -Fq "\"sha256\": \"$binary_digest\"" "$linux_sidecar" || fail 'sidecar did not record the placed binary digest'
-grep -Fq 'ck-subc' "$linux_manifest" || fail 'daemon row vanished from the manifest'
-! grep -Fq 'ck-subc' "$linux_sidecar" || fail 'sidecar carries rows that are not the bootstrap installer'"'"'s'
+xdg_home="$test_root/xdg-home"
+xdg_data="$test_root/custom data"
+mkdir -p "$xdg_home"
+run_installer "$xdg_home" "$xdg_home/output" XDG_DATA_HOME="$xdg_data" || fail 'custom XDG data install failed'
+run_installer "$xdg_home" "$xdg_home/reinstall" XDG_DATA_HOME="$xdg_data" || fail 'custom XDG data reinstall failed'
+[[ -x "$xdg_data/cortexkit/cmd/ck" ]] || fail 'helper did not install under XDG_DATA_HOME'
+[[ ! -e "$xdg_data/cortexkit/installer-manifest.bootstrap.json" ]] || fail 'reinstall wrote a bootstrap sidecar'
+[[ ! -e "$xdg_home/.local/share/cortexkit" ]] || fail 'custom XDG_DATA_HOME leaked into the default root'
+
+malformed_home="$test_root/bad-profile"
+mkdir -p "$malformed_home"
+printf '# cortexkit-managed PATH begin\n' >"$malformed_home/.bashrc"
+if run_installer "$malformed_home" "$malformed_home/output"; then fail 'malformed profile was accepted'; fi
+grep -Fq 'malformed CortexKit PATH markers' "$malformed_home/output" || fail 'malformed profile was not named'
+[[ ! -e "$malformed_home/setup-called" ]] || fail 'profile check ran after the helper'
+
+refused_home="$test_root/refused-placement"
+mkdir -p "$refused_home"
+if run_installer "$refused_home" "$refused_home/output" CK_TEST_HELPER_REFUSE=1; then fail 'helper refusal was ignored'; fi
+grep -Fq 'placement-failed' "$refused_home/output" || fail 'helper refusal was not named'
+[[ ! -e "$refused_home/.bashrc" && ! -e "$refused_home/.local/share/cortexkit/cmd/ck" ]] || fail 'refused placement acted anyway'
 
 darwin_home="$test_root/darwin-home"
 mkdir -p "$darwin_home"
-darwin_output="$test_root/darwin-output"
-run_installer "$darwin_home" "$darwin_output" \
-  CK_TEST_OS=Darwin CK_TEST_ARCH=arm64 CK_TEST_KERNEL=generic
-grep -Fq 'ck-darwin-arm64.zip' "$darwin_home/requests.log" || fail 'Darwin archive name was not requested'
-[[ ! -e "$darwin_home/setup-called" ]] || fail 'Darwin installer started the extracted ck process'
-
+run_installer "$darwin_home" "$darwin_home/output" CK_TEST_OS=Darwin CK_TEST_ARCH=arm64 || fail 'Darwin journal handover failed'
+grep -Fxq 'https://release.fixture.example/ck-darwin-arm64.zip' "$darwin_home/requests.log" || fail 'wrong Darwin archive'
+grep -Fxq "setup $darwin_home/.bashrc posix" "$darwin_home/setup-called" || fail 'Darwin setup did not run'
 # The documented invocation pipes into bash. On Debian and Ubuntu /bin/sh is
 # dash, where `set -o pipefail` is fatal before any line of the script runs;
 # the guard ahead of it must refuse by name under a POSIX shell. Run the arm

@@ -26,10 +26,14 @@ macro_rules! println {
 mod activity;
 mod ckni;
 mod config_cli;
+mod connection_choice;
+use connection_choice::discover_connection_file;
 mod inline_actions;
 mod inline_views;
+mod log_tail;
 mod policy_root_cli;
 use ckni::JsonOutput;
+use log_tail::{follow_module_logs, LogFollower};
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -476,11 +480,18 @@ fn record_test_probe(path: &Path) {
 #[tokio::main]
 async fn main() {
     let argv = env::args_os().collect::<Vec<_>>();
+    if let Some(result) = setup::bootstrap_entry(&argv) {
+        process::exit(
+            result
+                .map_err(|error| eprintln!("{error}"))
+                .map_or(1, |()| 0),
+        );
+    }
     let ckni = argv
         .first()
         .is_some_and(|name| invoked_as_ckni(Path::new(name)));
     match run(argv).await {
-        Ok(()) => process::exit(successful_command_exit(cleanup_replaced_windows_ck())),
+        Ok(()) => process::exit(0),
         Err(err) if ckni => {
             if let Some(text) = ckni::error_text(&err) {
                 eprintln!("{text}");
@@ -497,34 +508,6 @@ async fn main() {
             process::exit(err.exit_code());
         }
     }
-}
-
-fn successful_command_exit(cleanup: Result<(), CkError>) -> i32 {
-    // Another invocation may still be running the previous Windows image.
-    // Cleanup retains its inventory row on failure so a later command can try
-    // again; housekeeping must not change the result of the user's command.
-    if let Err(error) = cleanup {
-        eprintln!("warning: self-update cleanup deferred: {error}");
-    }
-    0
-}
-
-/// A Windows self-update leaves `ck.exe.old` until a later, successful process
-/// proves that the replacement starts normally. Unix replacement has no old-name
-/// artifact because rename keeps the running process on its original inode.
-#[cfg(windows)]
-fn cleanup_replaced_windows_ck() -> Result<(), CkError> {
-    let executable = env::current_exe().map_err(|error| {
-        CkError::Message(format!(
-            "could not locate ck for self-update cleanup: {error}"
-        ))
-    })?;
-    setup::cleanup_replaced_windows_ck(&executable).map_err(CkError::Message)
-}
-
-#[cfg(not(windows))]
-fn cleanup_replaced_windows_ck() -> Result<(), CkError> {
-    Ok(())
 }
 
 async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
@@ -1669,6 +1652,8 @@ enum ModuleCommand {
 struct ResolvedConnection {
     path: PathBuf,
     info: ConnectionInfo,
+    /// Connection files discovery found after this one and did not try.
+    others: Vec<PathBuf>,
 }
 
 #[derive(Clone, Copy)]
@@ -1721,7 +1706,7 @@ impl CkClient {
             .await
             .map_err(|source| CkError::Connection {
                 path: resolved.path.clone(),
-                source: format!("authenticate: {source}"),
+                source: connection_choice::tcp_authentication_failure(source, &resolved.others),
             })?;
 
         Ok(Self {
@@ -2096,38 +2081,28 @@ async fn module_logs(
     }
 
     let sources = discover_log_sources(module_id, true)?;
-    let (mut entries, counts) = collect_log_entries(module_id, &sources, options)?;
-    sort_log_entries(&mut entries);
+    let (dirs, _) = LogDirs::for_module(module_id);
+    let (entries, counts, follower) =
+        log_tail::tail_and_follower(module_id, dirs, &sources, options)?;
     if entries.is_empty() && counts.total == 0 && !json_output.is_versioned() {
         println!("no log yet for {module_id}");
-        return Ok(());
+        // `-f` waits for the first line rather than giving up.
+        if !options.follow {
+            return Ok(());
+        }
+    } else {
+        print_log_entries(&entries, json_output)?;
+        print_log_filter_summary(entries.len(), &counts);
     }
 
-    let start = entries.len().saturating_sub(options.lines);
-    let shown = &entries[start..];
-    print_log_entries(shown, json_output)?;
-    print_log_filter_summary(shown.len(), &counts);
-
     if options.follow {
-        follow_module_logs(module_id, options, sources, json_output).await?;
+        follow_module_logs(module_id, options, follower, json_output).await?;
     }
     Ok(())
 }
 
-/// Undated lines (including captures from files with no daemon stamps) sort
-/// AFTER every dated line: `Option`'s natural order puts `None` first, which
-/// would render a module's crash stderr above older daemon lines. Within the
-/// undated tail, source order holds. Capture lines from stamped files inherit
-/// an anchor time before reaching this sort.
 fn sort_log_entries(entries: &mut [LogEntry]) {
-    entries.sort_by(|left, right| {
-        left.timestamp
-            .is_none()
-            .cmp(&right.timestamp.is_none())
-            .then_with(|| left.timestamp.cmp(&right.timestamp))
-            .then_with(|| left.lane.cmp(&right.lane))
-            .then_with(|| left.source_order.cmp(&right.source_order))
-    });
+    entries.sort_by(log_tail::compare_log_entries);
 }
 
 fn module_log_census(modules: &[Value], json_output: JsonOutput) -> Result<(), CkError> {
@@ -2346,141 +2321,25 @@ fn rotation_generation(path: &Path) -> u32 {
         .unwrap_or(0)
 }
 
-fn collect_log_entries(
-    module_id: &str,
-    sources: &[LogSource],
-    options: &ModuleLogsOptions,
-) -> Result<(Vec<LogEntry>, LogFilterCounts), CkError> {
-    let mut counts = LogFilterCounts::default();
-    let mut output = Vec::new();
-    let mut source_order = 0;
-    for source in sources {
-        let contents = fs::read_to_string(&source.path)
-            .map_err(|error| CkError::Message(format!("{}: {error}", source.path.display())))?;
-        collect_log_text(
-            module_id,
-            source,
-            &contents,
-            options,
-            &mut counts,
-            &mut output,
-            &mut source_order,
-        );
-    }
-    Ok((output, counts))
-}
-
+/// Reads one source's text into `output`, line by line, as
+/// [`log_tail::SourceLines`] filters and dates it.
 fn collect_log_text(
     module_id: &str,
     source: &LogSource,
     contents: &str,
     options: &ModuleLogsOptions,
     counts: &mut LogFilterCounts,
-    output: &mut Vec<LogEntry>,
+    output: &mut impl log_tail::LogSink,
     source_order: &mut usize,
 ) {
-    let since = options
-        .since
-        .and_then(|duration| SystemTime::now().checked_sub(duration));
     let first_capture_stamp = if source.capture {
         contents.lines().find_map(capture_stamp_time)
     } else {
         None
     };
-    let mut preceding_capture_stamp = None;
+    let mut lines = log_tail::SourceLines::new(module_id, source, options, first_capture_stamp);
     for line in contents.lines() {
-        counts.total += 1;
-        let (mut timestamp, parsed, capture_stamp) = if source.capture {
-            capture_line_facts(line)
-        } else {
-            let parsed = line_facts(line);
-            (parsed.as_ref().map(|parsed| parsed.timestamp), parsed, None)
-        };
-        if let Some(stamp) = capture_stamp {
-            preceding_capture_stamp = Some(stamp);
-        }
-        let time_inherited = if source.capture && timestamp.is_none() {
-            // Capture files are append-only, so file position orders an
-            // unstamped line against the capture's stamped lines. The nearest
-            // preceding stamp (or first following stamp for a legacy head) is
-            // a safe ordering anchor, not a measured time; JSON marks it as
-            // inherited so consumers do not mistake the anchor for the line's
-            // own timestamp.
-            if let Some(stamp) = preceding_capture_stamp.or(first_capture_stamp) {
-                timestamp = Some(stamp);
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        if source.daemon
-            && parsed
-                .as_ref()
-                .is_some_and(|parsed| !body_has_module_id(parsed.body, module_id))
-        {
-            counts.daemon_hidden += 1;
-            continue;
-        }
-        if options
-            .lane
-            .as_ref()
-            .is_some_and(|lane| !lane_matches(lane, &source.lane))
-        {
-            counts.wrong_lane += 1;
-            continue;
-        }
-        if let Some(parsed) = &parsed {
-            if options
-                .level
-                .is_some_and(|minimum| log_level_rank(parsed.level) < log_level_rank(minimum))
-            {
-                counts.below_level += 1;
-                continue;
-            }
-            // `--tag` predates the logger hierarchy and is kept as the operator
-            // surface: under r2 it names a COMPONENT, i.e. the logger with the
-            // module root stripped (`synapse.perf` -> `perf`), matched as a
-            // dotted prefix so `--tag gc` also shows `gc.walk`.
-            if options
-                .tag
-                .as_deref()
-                .is_some_and(|tag| !component_matches(parsed.component, tag))
-            {
-                counts.wrong_tag += 1;
-                continue;
-            }
-        }
-        // `--since` compares each line's own time. A stamped capture line
-        // already carries the daemon's capture time above, whatever the
-        // module wrote after it. A stamped line otherwise keeps its own time
-        // even when the strict fleet grammar rejects it for something
-        // unrelated to the time itself: an unpadded level, a trailing context
-        // bracket, or another shape the module's own writer emits. Without a
-        // fallback the module's own dated segments are immune to `--since`,
-        // and their old lines fill the `-n` tail because undated lines sort
-        // after dated ones. Lines with no stamp at all stay undated: capture
-        // lines inherit a neighbour's stamp above, and the rest are shown and
-        // counted below, exactly as before.
-        let since_time = timestamp.or_else(|| since_stamp(line));
-        if since.is_some_and(|since| since_time.is_some_and(|time| time < since)) {
-            counts.before_since += 1;
-            continue;
-        }
-        if parsed.is_none() {
-            counts.unparsed += 1;
-        }
-        output.push(LogEntry {
-            lane: source.lane.clone(),
-            line: line.to_string(),
-            timestamp,
-            time_inherited,
-            level: parsed.as_ref().map(|parsed| parsed.level),
-            tag: parsed.and_then(|parsed| parsed.component.map(str::to_string)),
-            source_order: *source_order,
-        });
-        *source_order += 1;
+        lines.push(line, counts, output, source_order);
     }
 }
 
@@ -2743,175 +2602,6 @@ fn print_log_filter_summary(shown: usize, counts: &LogFilterCounts) {
     }
 }
 
-async fn follow_module_logs(
-    module_id: &str,
-    options: &ModuleLogsOptions,
-    initial_sources: Vec<LogSource>,
-    json_output: JsonOutput,
-) -> Result<(), CkError> {
-    let (dirs, _) = LogDirs::for_module(module_id);
-    let mut follower = LogFollower::start(module_id, dirs, &initial_sources)?;
-    loop {
-        time::sleep(Duration::from_millis(250)).await;
-        for (source, text) in follower.poll()? {
-            print_follow_text(module_id, options, &source, &text, json_output)?;
-        }
-        use std::io::Write as _;
-        stdout_result(io::stdout().flush()).map_err(|error| CkError::Message(error.to_string()))?;
-    }
-}
-
-/// Follows a module's active log files from where they end, the way `ck
-/// module logs -f` does: each poll reads what was appended since the last,
-/// plus each file's first few bytes to notice a rotation, and when a file
-/// was rotated (it shrank, was recreated, or its first
-/// bytes changed) drains the rotated file's unseen tail before starting the
-/// new one from its beginning. The app's log view follows with this too.
-struct LogFollower {
-    module_id: String,
-    dirs: LogDirs,
-    cursors: HashMap<PathBuf, LogCursor>,
-    /// How many times a whole file was read, for the test that keeps
-    /// following incremental.
-    #[cfg(test)]
-    whole_reads: usize,
-}
-
-/// Where following one file has got to: the length read so far, the file's
-/// creation time, and its first bytes, which together tell a rotation from
-/// an append.
-struct LogCursor {
-    offset: u64,
-    created: Option<SystemTime>,
-    prefix: Vec<u8>,
-}
-
-impl LogFollower {
-    /// Starts following at the current end of each active (unrotated) file
-    /// among `initial_sources`.
-    fn start(
-        module_id: &str,
-        dirs: LogDirs,
-        initial_sources: &[LogSource],
-    ) -> Result<LogFollower, CkError> {
-        let mut cursors = HashMap::new();
-        for source in initial_sources
-            .iter()
-            .filter(|source| rotation_generation(&source.path) == 0)
-        {
-            if let Ok(metadata) = fs::metadata(&source.path) {
-                cursors.insert(
-                    source.path.clone(),
-                    LogCursor {
-                        offset: metadata.len(),
-                        created: metadata.created().ok(),
-                        prefix: read_log_prefix(&source.path, metadata.len().min(64) as usize)?,
-                    },
-                );
-            }
-        }
-        Ok(LogFollower {
-            module_id: module_id.to_string(),
-            dirs,
-            cursors,
-            #[cfg(test)]
-            whole_reads: 0,
-        })
-    }
-
-    /// The text appended to each active file since the last poll, with the
-    /// file it came from.
-    fn poll(&mut self) -> Result<Vec<(LogSource, String)>, CkError> {
-        let mut out = Vec::new();
-        for source in discover_log_sources_in(&self.dirs, &self.module_id, false)? {
-            let metadata =
-                fs::metadata(&source.path).map_err(|error| CkError::Message(error.to_string()))?;
-            let length = metadata.len();
-            let cursor = self
-                .cursors
-                .entry(source.path.clone())
-                .or_insert(LogCursor {
-                    offset: 0,
-                    created: metadata.created().ok(),
-                    prefix: Vec::new(),
-                });
-            let current_prefix = read_log_prefix(&source.path, cursor.prefix.len())?;
-            let rotated = length < cursor.offset
-                || metadata.created().ok() != cursor.created
-                || current_prefix != cursor.prefix;
-            if rotated {
-                // A rotation may move bytes appended after the previous poll into
-                // `.1`. Drain that old inode's unseen tail before switching the
-                // cursor to the replacement active file.
-                let mut rotated_name = source.path.as_os_str().to_os_string();
-                rotated_name.push(".1");
-                let rotated_path = PathBuf::from(rotated_name);
-                if let Ok(rotated_length) = fs::metadata(&rotated_path).map(|meta| meta.len()) {
-                    if rotated_length > cursor.offset {
-                        let text = read_log_range(&rotated_path, cursor.offset)?;
-                        out.push((source.clone(), text));
-                    }
-                }
-                cursor.offset = 0;
-                cursor.created = metadata.created().ok();
-                cursor.prefix = read_log_prefix(&source.path, length.min(64) as usize)?;
-            } else if cursor.prefix.is_empty() && length != 0 {
-                cursor.prefix = read_log_prefix(&source.path, length.min(64) as usize)?;
-            }
-            if length == cursor.offset {
-                continue;
-            }
-            #[cfg(test)]
-            if cursor.offset == 0 {
-                self.whole_reads += 1;
-            }
-            let text = read_log_range(&source.path, cursor.offset)?;
-            cursor.offset = length;
-            out.push((source, text));
-        }
-        Ok(out)
-    }
-
-    /// The newest lines of the active files up to where following starts,
-    /// at most `max` of them, merged and ordered as `ck module logs` orders
-    /// them. Reads only the end of each file (about `max` lines' worth),
-    /// never the whole set.
-    fn tail(&self, max: usize) -> Result<Vec<LogEntry>, CkError> {
-        const BYTES_PER_LINE: u64 = 400;
-        let options = app_log_options(max);
-        let mut counts = LogFilterCounts::default();
-        let mut entries = Vec::new();
-        let mut order = 0;
-        for source in discover_log_sources_in(&self.dirs, &self.module_id, false)? {
-            let Some(cursor) = self.cursors.get(&source.path) else {
-                continue;
-            };
-            let start = cursor
-                .offset
-                .saturating_sub(BYTES_PER_LINE.saturating_mul(max as u64));
-            let mut text = read_log_slice(&source.path, start, cursor.offset)?;
-            // A read that starts mid-file drops its first, partial line.
-            if start > 0 {
-                text = text
-                    .split_once('\n')
-                    .map_or(String::new(), |(_, rest)| rest.to_string());
-            }
-            collect_log_text(
-                &self.module_id,
-                &source,
-                &text,
-                &options,
-                &mut counts,
-                &mut entries,
-                &mut order,
-            );
-        }
-        sort_log_entries(&mut entries);
-        let from = entries.len().saturating_sub(max);
-        Ok(entries.split_off(from))
-    }
-}
-
 /// The options the app's log view reads with: every lane, level and tag.
 fn app_log_options(max: usize) -> ModuleLogsOptions {
     ModuleLogsOptions {
@@ -2923,64 +2613,6 @@ fn app_log_options(max: usize) -> ModuleLogsOptions {
         lane: None,
     }
 }
-
-/// The bytes of `path` from `start` up to `end`, as text.
-fn read_log_slice(path: &Path, start: u64, end: u64) -> Result<String, CkError> {
-    let mut file = fs::File::open(path).map_err(|error| CkError::Message(error.to_string()))?;
-    file.seek(SeekFrom::Start(start))
-        .map_err(|error| CkError::Message(error.to_string()))?;
-    let mut bytes = Vec::new();
-    file.take(end.saturating_sub(start))
-        .read_to_end(&mut bytes)
-        .map_err(|error| CkError::Message(error.to_string()))?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
-}
-
-/// Up to `length` bytes from the start of `path`. A file shorter than that
-/// gives what it has: a replacement written since the last poll can be
-/// shorter than the prefix kept for the file it replaced, and its differing
-/// prefix is how the rotation is noticed.
-fn read_log_prefix(path: &Path, length: usize) -> Result<Vec<u8>, CkError> {
-    let file = fs::File::open(path).map_err(|error| CkError::Message(error.to_string()))?;
-    let mut prefix = Vec::with_capacity(length);
-    file.take(length as u64)
-        .read_to_end(&mut prefix)
-        .map_err(|error| CkError::Message(error.to_string()))?;
-    Ok(prefix)
-}
-
-fn read_log_range(path: &Path, offset: u64) -> Result<String, CkError> {
-    let mut file = fs::File::open(path).map_err(|error| CkError::Message(error.to_string()))?;
-    file.seek(SeekFrom::Start(offset))
-        .map_err(|error| CkError::Message(error.to_string()))?;
-    let mut text = String::new();
-    file.read_to_string(&mut text)
-        .map_err(|error| CkError::Message(error.to_string()))?;
-    Ok(text)
-}
-
-fn print_follow_text(
-    module_id: &str,
-    options: &ModuleLogsOptions,
-    source: &LogSource,
-    text: &str,
-    json_output: JsonOutput,
-) -> Result<(), CkError> {
-    let mut entries = Vec::new();
-    let mut counts = LogFilterCounts::default();
-    let mut order = 0;
-    collect_log_text(
-        module_id,
-        source,
-        text,
-        options,
-        &mut counts,
-        &mut entries,
-        &mut order,
-    );
-    print_log_entries(&entries, json_output)
-}
-
 async fn module_status(
     client: &mut CkClient,
     module_id: &str,
@@ -7828,7 +7460,8 @@ async fn preview_rescan_restart_required_async() -> Result<Vec<String>, String> 
 
 fn setup_command(program: &Path, request: &setup::SetupRequest, ckni: bool) -> Result<(), CkError> {
     let mut backend =
-        setup::SetupBackend::current(program.to_path_buf()).map_err(CkError::Message)?;
+        setup::SetupBackend::current_with_preview(program.to_path_buf(), request.dry_run)
+            .map_err(CkError::Message)?;
     backend.set_rescan_preview(preview_rescan_restart_required);
     let observed = backend.observe(request).map_err(CkError::Message)?;
     let plan = setup::plan_setup(&observed, request);
@@ -7861,8 +7494,6 @@ fn setup_command(program: &Path, request: &setup::SetupRequest, ckni: bool) -> R
         print_verbose_setup_outcomes(&plan, request.verbose);
         return Ok(());
     }
-    // The offer is informational, not a mutation for the executor to apply.
-    // Print it once for both dry runs and ordinary setup, without prompting.
     if let Some(line) = plan.optional_components_line() {
         println!("{line}");
     }
@@ -7876,24 +7507,26 @@ fn setup_command(program: &Path, request: &setup::SetupRequest, ckni: bool) -> R
     }
     let (stdin_terminal, stdout_terminal) = (io::stdin().is_terminal(), io::stdout().is_terminal());
     ckni_refuses_to_ask(ckni, request, stdin_terminal, stdout_terminal)?;
+    let paused = setup_would_ask(request, stdin_terminal, stdout_terminal)
+        .then(|| backend.pause_confirmation(&plan, request))
+        .transpose()
+        .map_err(CkError::Message)?;
     if !confirm_setup_if_interactive(request, stdin_terminal, stdout_terminal, || {
-        backend.print_dry_run(&plan).map_err(CkError::Message)?;
-        backend
-            .print_proposed_diffs(&plan, request)
-            .map_err(CkError::Message)?;
         confirm_setup(&mut io::stdin().lock(), &mut io::stdout().lock())
             .map_err(|error| CkError::Message(format!("could not confirm setup: {error}")))
     })? {
         println!("Nothing was changed.");
         return Ok(());
     }
+    if let Some(paused) = paused {
+        backend
+            .resume_confirmation(paused, request, &observed, &plan)
+            .map_err(CkError::Message)?;
+    }
     backend
         .apply_plan(&plan, request)
         .map_err(CkError::Message)?;
-    print!(
-        "{}",
-        setup::text::print_verbose_outcomes(&plan.outcomes, request.verbose)
-    );
+    print_verbose_setup_outcomes(&plan, request.verbose);
     Ok(())
 }
 
@@ -7910,8 +7543,7 @@ fn confirm_setup_if_interactive(
     }
 }
 
-/// Setup asks before changing anything only when a person can answer: both
-/// ends are a terminal and `--yes` wasn't given.
+/// Setup asks only when both ends are terminals and `--yes` wasn't given.
 fn setup_would_ask(
     request: &setup::SetupRequest,
     stdin_terminal: bool,
@@ -7920,8 +7552,7 @@ fn setup_would_ask(
     !request.yes && stdin_terminal && stdout_terminal
 }
 
-/// ckni never waits for input, so where `ck setup` would ask, `ckni setup`
-/// stops with a usage error that names the flag to pass instead.
+/// The noninteractive `ckni` command directs the caller to pass `--yes`.
 fn ckni_refuses_to_ask(
     ckni: bool,
     request: &setup::SetupRequest,
@@ -8065,14 +7696,13 @@ async fn upgrade_command(
     verbose: bool,
     dry_run: bool,
 ) -> Result<(), CkError> {
-    // Keep the discovered path for post-restart verification. Installed core
-    // versions come from the managed binary, not the connection's library tag.
+    // Keep the discovered path for post-restart verification (core versions come from the binary).
     let connection = discover_connection_file(subc).ok();
     let connection_path = subc
         .map(Path::to_path_buf)
         .or_else(|| connection.as_ref().map(|found| found.path.clone()));
-    let discovered =
-        setup::discover_current_upgrade_targets(executable, None::<&setup::DaemonCatalogBuild>)
+    let (_install_hold, discovered) =
+        setup::lock_and_discover_upgrade_targets(executable, subc, check || dry_run)
             .map_err(CkError::rejected)?;
     let ownership_outcomes =
         setup::upgrade_ownership_outcomes(executable, &discovered).map_err(CkError::rejected)?;
@@ -8945,14 +8575,6 @@ fn take_value(args: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<O
         .ok_or_else(|| CkError::Usage(format!("{flag} requires a value; run bare ck for usage")))
 }
 
-fn discover_connection_file(override_path: Option<&Path>) -> Result<ResolvedConnection, CkError> {
-    let discovered = connection_file::discover(override_path).map_err(CkError::from)?;
-    Ok(ResolvedConnection {
-        path: discovered.path,
-        info: discovered.info,
-    })
-}
-
 fn decode_error_body(body: &[u8]) -> String {
     match serde_json::from_slice::<subc_protocol::ErrorBody>(body) {
         Ok(error) => {
@@ -9212,17 +8834,6 @@ fn malformed_unicode_reset_timestamps_are_refused_without_panicking() {
 fn reset_timestamp_display_labels_its_utc_timezone() {
     let formatted = format_reset_timestamp("2026-01-01T03:00:00+03:00").unwrap();
     assert!(formatted.ends_with("00:00 UTC"), "{formatted}");
-}
-
-#[cfg(test)]
-#[test]
-fn a_successful_command_stays_successful_when_old_image_cleanup_fails() {
-    assert_eq!(
-        successful_command_exit(Err(CkError::Message(
-            "could not delete prior Windows executable: sharing violation".into()
-        ))),
-        0
-    );
 }
 
 #[cfg(test)]
@@ -9666,6 +9277,7 @@ mod tests {
             let resolved = ResolvedConnection {
                 path: PathBuf::from("scripted-connection.json"),
                 info: info.clone(),
+                others: Vec::new(),
             };
             let server = tokio::spawn(async move {
                 let (mut stream, _) = listener.accept().await.unwrap();
@@ -10549,8 +10161,30 @@ mod tests {
 
         let started = Instant::now();
         let sources = discover_log_sources(&dirs, "broca");
-        let (all, _) = collect_log_entries("broca", &sources, &app_log_options(1000)).unwrap();
+        // What `ck module logs -n 20` did before it kept only the newest
+        // lines: collect every line of every source, then sort them all.
+        let mut all = Vec::new();
+        let (mut counts, mut order) = (LogFilterCounts::default(), 0);
+        for source in &sources {
+            let text = fs::read_to_string(&source.path).unwrap();
+            let options = app_log_options(20);
+            collect_log_text(
+                "broca",
+                source,
+                &text,
+                &options,
+                &mut counts,
+                &mut all,
+                &mut order,
+            );
+        }
+        sort_log_entries(&mut all);
         let whole = started.elapsed();
+        let started = Instant::now();
+        let (newest, _) =
+            log_tail::newest_log_entries("broca", &sources, &app_log_options(20)).unwrap();
+        let newest_time = started.elapsed();
+        assert_eq!(newest.len(), 20);
 
         let started = Instant::now();
         let mut follower = LogFollower::start("broca", dirs.clone(), &sources).unwrap();
@@ -10565,7 +10199,7 @@ mod tests {
         let quiet = follower.poll().unwrap();
         let idle = started.elapsed();
         eprintln!(
-            "module log {:.1} MB, {} lines: whole collection {whole:?}; open (tail of {}) {open:?}; tick with one new line {tick:?} ({} text); idle tick {idle:?} ({} texts)",
+            "module log {:.1} MB, {} lines: whole collection and sort {whole:?}; newest 20 {newest_time:?}; open (tail of {}) {open:?}; tick with one new line {tick:?} ({} text); idle tick {idle:?} ({} texts)",
             size as f64 / 1e6,
             all.len(),
             tail.len(),
@@ -13125,8 +12759,8 @@ mod tests {
             level: None,
             lane: None,
         };
-        let (mut entries, counts) = collect_log_entries("callosum", &sources, &options).unwrap();
-        sort_log_entries(&mut entries);
+        let (entries, counts) =
+            log_tail::newest_log_entries("callosum", &sources, &options).unwrap();
 
         assert_eq!(counts.total, 3);
         assert_eq!(counts.before_since, 1);

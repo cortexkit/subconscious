@@ -39,6 +39,8 @@ use common::{
 
 mod inline_actions;
 mod inline_views;
+#[path = "ck_cli/install_crashes.rs"]
+mod install_crashes;
 
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
 const SETUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1807,9 +1809,11 @@ fn service_manager_script() -> &'static str {
     {
         "#!/bin/sh\nif [ \"$1\" = print ] && [ ! -f \"$HOME/Library/LaunchAgents/cortexkit.subc.plist\" ]; then exit 1; fi\necho 'state = running'\nexit 0\n"
     }
+    // `systemctl --user show -p FragmentPath` names the unit file setup
+    // wrote, as a user manager searching the same root would.
     #[cfg(not(target_os = "macos"))]
     {
-        "#!/bin/sh\necho 'state = running'\nexit 0\n"
+        "#!/bin/sh\nif [ \"$2\" = show ]; then echo \"FragmentPath=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/cortexkit-subc.service\"; exit 0; fi\necho 'state = running'\nexit 0\n"
     }
 }
 
@@ -2689,7 +2693,7 @@ fn setup_mc_apply_reports_each_completed_change_without_a_plan() {
     assert_eq!(
         text(&output.stdout),
         format!(
-            "Installing magic-context (ck-mc-alpha.22464bf2, {})\n  downloaded and verified ck-mc (12.1 MiB)\n  placed ~/.local/share/cortexkit/bin/{}\n  configured magic-context in ~/.config/cortexkit/subc.jsonc\nInstall an idle message hub entry\n  Message hub entry: nothing changed (existing entry kept)\nLet the message module use this computer's message-plane keys\n  Message-plane grants: nothing changed (all already granted)\n  registered with the daemon; magic-context ok\nDone.\n",
+            "Install an idle message hub entry\n  Message hub entry: nothing changed (existing entry kept)\nInstalling magic-context (ck-mc-alpha.22464bf2, {})\n  downloaded and verified ck-mc (12.1 MiB)\n  placed ~/.local/share/cortexkit/bin/{}\n  configured magic-context in ~/.config/cortexkit/subc.jsonc\nLet the message module use this computer's message-plane keys\n  Message-plane grants: nothing changed (all already granted)\n  registered with the daemon; magic-context ok\nDone.\n",
             host_target(),
             platform_binary("ck-mc")
         )
@@ -2884,6 +2888,11 @@ fn setup_dry_run_shows_owned_service_definition_update_without_writing() {
 #[test]
 fn setup_mc_dry_run_has_future_steps_and_the_config_diff() {
     let fixture = SetupFixture::installed("ck-setup-mc-dry-run");
+    fs::set_permissions(
+        fixture.config_home.join("cortexkit"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
     let archive = fixture_archive(
         fixture._root.path(),
         "ck-mc",
@@ -4220,6 +4229,66 @@ fn upgrade_apply_reports_completed_targets_then_done() {
         text(&output.stdout),
         "upgraded ck-aft 0.55.1 → 0.55.2, restarted\nupgraded ck-claustrum 0.8.0 → 0.8.1, restarted\nupgraded ck 0.17.9 → 0.17.10\nDone.\n"
     );
+}
+
+/// `ck upgrade` takes the install lock before it reads anything it acts on.
+/// Started while another installer command holds the lock, it waits; that
+/// command takes ck-auth out of the inventory meanwhile; once the lock is
+/// free, `ck upgrade` refuses on the ownership it then finds, instead of
+/// acting on what it would have read before waiting.
+#[test]
+#[cfg(target_os = "linux")]
+fn upgrade_reads_the_install_only_after_it_holds_the_install_lock() {
+    let fixture = UpgradeFixture::new("upgrade-lock-first");
+    let cortexkit = fixture.home.join(".local/share/cortexkit");
+    let inventory = cortexkit.join("installer-manifest.json");
+    let other_installer = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(cortexkit.join("installer.lock"))
+        .unwrap();
+    other_installer.lock().unwrap();
+    let index = serve_signed_index(|base| {
+        upgrade_index(
+            base,
+            "0.55.2",
+            &"aa".repeat(32),
+            "0.17.10",
+            &"bb".repeat(32),
+            "0.8.1",
+            &"cc".repeat(32),
+        )
+    });
+    let mut upgrade = fixture
+        .command(&index, &["upgrade"])
+        .env("CK_TEST_UPGRADE_APPLY_OK", "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    assert!(
+        upgrade.try_wait().unwrap().is_none(),
+        "ck upgrade went ahead while another installer command held the lock"
+    );
+    let mut document: Value = serde_json::from_slice(&fs::read(&inventory).unwrap()).unwrap();
+    document["mutations"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|entry| !entry["path"].as_str().unwrap().ends_with("ck-auth"));
+    fs::write(&inventory, serde_json::to_vec(&document).unwrap()).unwrap();
+    other_installer.unlock().unwrap();
+    let output = upgrade.wait_with_output().unwrap();
+
+    assert_exit(&output, 1);
+    assert_eq!(
+        text(&output.stdout),
+        "ck upgrade manages only what ck setup installed. ck setup did not install these, so ck upgrade won't replace them:\n  ~/.local/share/cortexkit/bin/ck-auth\nMove them aside and run ck setup again. Nothing was changed.\n"
+    );
+    assert!(index.requests.lock().unwrap().is_empty());
 }
 
 #[cfg(unix)]

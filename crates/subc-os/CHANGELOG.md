@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.50
+
+- Create owner-only directories exclusively without changing existing paths. On
+  Windows, move running executables to unused names with write-through semantics
+  and read or replace the current user's PATH registry value without expanding
+  it or losing its type.
+- Add a bounded TCP loopback connect on Windows that disables SYN retries
+  when Winsock supports it, allowing prompt connection-refusal detection.
+
 ## 0.1.48
 
 - Allow a caller to check the target's contents after flushing the staging file

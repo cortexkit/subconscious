@@ -15,16 +15,13 @@
 use std::{
     fs, io,
     path::{Path, PathBuf},
-    process,
 };
 
 use serde_json::{Map, Value};
 
 use super::{
     components::{digest_file, OWNED_BINARY_KINDS},
-    file_modes,
     inventory::Inventory,
-    managed_replace,
 };
 
 /// The installer-manifest kind for `ckni`. Uninstall removes every path
@@ -201,6 +198,20 @@ pub fn install(
     );
     let detail = match mechanism {
         Mechanism::Symlink => {
+            #[cfg(unix)]
+            if let Some(transaction) = inventory.transaction() {
+                if link.is_file() && !link.is_symlink() {
+                    transaction.remove(&link)?;
+                }
+                super::install_journal::symlink::place(
+                    transaction.journal(),
+                    &link,
+                    Some(&symlink_target(ck)),
+                )?;
+            } else {
+                place_symlink(ck, &link)?;
+            }
+            #[cfg(not(unix))]
             place_symlink(ck, &link)?;
             format!(
                 "linked {} to ck",
@@ -208,7 +219,14 @@ pub fn install(
             )
         }
         Mechanism::Copy => {
-            place_copy(ck, &link, inventory)?;
+            if let Some(transaction) = inventory.transaction() {
+                transaction.replace(&link, ck)?;
+            } else {
+                #[cfg(test)]
+                place_copy(ck, &link, inventory)?;
+                #[cfg(not(test))]
+                return Err("ckni placement requires an install transaction".into());
+            }
             fields.insert("sha256".to_string(), Value::String(digest_file(&link)?));
             format!(
                 "copied ck to {}",
@@ -217,7 +235,10 @@ pub fn install(
         }
     };
     record(inventory, &link, fields)?;
-    inventory.save()?;
+    #[cfg(test)]
+    if !inventory.transaction_is_open() {
+        inventory.save()?;
+    }
     Ok(Some(detail))
 }
 
@@ -246,6 +267,7 @@ fn record(
 
 /// A fresh hidden name beside `link` for staging, so a leftover from an
 /// interrupted run never blocks the next one.
+#[cfg(any(unix, test))]
 fn staging_path(link: &Path) -> PathBuf {
     let name = link
         .file_name()
@@ -255,7 +277,7 @@ fn staging_path(link: &Path) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_nanos())
         .unwrap_or_default();
-    link.with_file_name(format!(".{name}.link-{}-{nonce}", process::id()))
+    link.with_file_name(format!(".{name}.link-{}-{nonce}", std::process::id()))
 }
 
 /// Creates the symlink under a staging name and renames it over `link`, so
@@ -279,29 +301,12 @@ fn place_symlink(_ck: &Path, link: &Path) -> Result<(), String> {
     ))
 }
 
-/// Copies `ck` under a staging name, then renames the copy over `link`
-/// through the same step that replaces managed binaries. On Windows a
-/// running `ckni.exe` can't be overwritten but can be renamed, so that step
-/// moves it aside first; the aside file is deleted here if Windows lets go
-/// of it, and otherwise by the sweep a later setup or upgrade runs.
-fn place_copy(ck: &Path, link: &Path, inventory: &mut Inventory) -> Result<(), String> {
+#[cfg(test)]
+fn place_copy(ck: &Path, link: &Path, _inventory: &mut Inventory) -> Result<(), String> {
     let staged = staging_path(link);
-    file_modes::copy_file_with_mode(ck, &staged, 0o755).map_err(|error| {
-        format!(
-            "could not copy ck to {} for ckni: {error}",
-            staged.display()
-        )
-    })?;
-    let aside =
-        managed_replace::place_staged_binary(&staged, link, inventory).inspect_err(|_| {
-            let _ = fs::remove_file(&staged);
-        })?;
-    if let Some(aside) = aside {
-        // A still-running ckni keeps its image; the row place_staged_binary
-        // wrote keeps it on record for the later sweep.
-        let _ = managed_replace::remove_replaced_image(inventory, &aside);
-    }
-    Ok(())
+    super::file_modes::copy_file_with_mode(ck, &staged, 0o755)
+        .map_err(|error| error.to_string())?;
+    subc_os::durable_replace(&staged, link).map_err(|error| error.to_string())
 }
 
 /// The engine's `ck` replacement step calls this after it puts new bytes at

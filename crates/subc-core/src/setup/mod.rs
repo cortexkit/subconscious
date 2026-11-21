@@ -8,21 +8,21 @@ mod daemon_bundle;
 mod definition;
 mod detection;
 mod file_modes;
+mod install_journal;
+mod install_lock;
+mod messages;
+pub use install_lock::InstallHold;
 mod inventory;
-mod managed_replace;
 mod mc_detection;
 mod message_plane;
 mod model;
 mod nats_migration;
 mod planner;
+mod prompt;
 mod release_index;
 mod retained_binary;
 mod runtime;
-mod self_update;
-#[cfg(unix)]
-mod self_update_unix;
-#[cfg(windows)]
-mod self_update_windows;
+mod systemd_unit;
 #[cfg(all(test, unix))]
 mod test_exec;
 pub mod text;
@@ -41,22 +41,23 @@ pub use apply::{
     default_claustrum_key_path, installed_service_facts, start_installed_service, SetupBackend,
 };
 pub use components::{component_binaries_for_target, module_program};
+#[doc(hidden)]
+pub use install_journal::bootstrap_entry;
 pub use model::{
     version_transition, AlphaTarget, Component, ComponentState, PlanOutcome, PlatformObservation,
     SetupObserved, SetupRequest, UpgradeOperation, UpgradeState, UpgradeTarget,
 };
 pub use planner::{plan_setup, plan_upgrade, SetupPlan, UpgradePlan};
-#[cfg(windows)]
-pub use self_update::cleanup_replaced_windows_ck;
 pub use update_cache::{cache_directory, UpdateCache};
 pub use update_check::{
     check_update_metadata, dashboard_update, not_checked_from_cache, IndexReleaseSource,
     UpdateCheckError, BARE_REFRESH_BUDGET, TARGET_CHECK_BUDGET,
 };
 pub use upgrade::{
-    dashboard_installed_binaries, discover_current_upgrade_targets, observed_upgrade_targets,
-    render_execution_report, upgrade_ownership_outcomes, DaemonCatalogBuild, ManagedUpgradeTarget,
-    SystemUpgradeBackend, UpgradeOutput,
+    dashboard_installed_binaries, discover_current_upgrade_targets,
+    lock_and_discover_upgrade_targets, observed_upgrade_targets, render_execution_report,
+    upgrade_ownership_outcomes, DaemonCatalogBuild, ManagedUpgradeTarget, SystemUpgradeBackend,
+    UpgradeOutput,
 };
 // Production announces completion from inside the executor after verification;
 // only the fixture CLI's simulated apply renders the completion line directly.

@@ -359,6 +359,18 @@ fn disk_attributes(handle: HANDLE) -> io::Result<u32> {
     Ok(info.dwFileAttributes)
 }
 
+pub(crate) fn create_private_directory_exclusive(path: &Path) -> io::Result<()> {
+    let name = wide(path)?;
+    with_security(true, |attributes| {
+        // SAFETY: name is terminated and the descriptor/ACL outlive this call.
+        if unsafe { CreateDirectoryW(name.as_ptr(), attributes) } != 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    })
+}
+
 fn create_all(path: &Path) -> io::Result<bool> {
     if path.as_os_str().is_empty() {
         return Ok(false);
@@ -371,20 +383,13 @@ fn create_all(path: &Path) -> io::Result<bool> {
     if let Some(parent) = path.parent() {
         create_all(parent)?;
     }
-    let name = wide(path)?;
-    with_security(true, |attributes| {
-        // SAFETY: name is terminated and the descriptor/ACL outlive this call.
-        // Every missing component receives private security at creation.
-        if unsafe { CreateDirectoryW(name.as_ptr(), attributes) } != 0 {
-            return Ok(true);
-        }
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(ERROR_ALREADY_EXISTS as i32) {
+    match create_private_directory_exclusive(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.raw_os_error() == Some(ERROR_ALREADY_EXISTS as i32) => {
             open_directory(path, READ_CONTROL).map(|_| false)
-        } else {
-            Err(error)
         }
-    })
+        Err(error) => Err(error),
+    }
 }
 
 /// Create missing directories with a protected owner-only DACL and tighten the

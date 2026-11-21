@@ -10,7 +10,6 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-#[cfg(not(windows))]
 use std::fs::OpenOptions;
 
 use serde::{Deserialize, Serialize};
@@ -525,11 +524,37 @@ pub fn read_for_client_with_local_endpoint(
 }
 
 fn read_owner_checked(path: &Path) -> Result<Vec<u8>, ConnectionFileError> {
-    let mut file = File::open(path).map_err(|source| ConnectionFileError::Io {
-        op: "open",
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A FIFO or device at a predictable path must not block the open;
+        // the regular-file check below then refuses it.
+        options.custom_flags(
+            (rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::NOCTTY).bits() as i32,
+        );
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|source| ConnectionFileError::Io {
+            op: "open",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let is_file = file
+        .metadata()
+        .map_err(|source| ConnectionFileError::Io {
+            op: "fstat",
+            path: path.to_path_buf(),
+            source,
+        })?
+        .is_file();
+    if !is_file {
+        return Err(ConnectionFileError::Invalid {
+            reason: format!("connection file {} is not a regular file", path.display()),
+        });
+    }
     // Verify the opened inode, not a separate path lookup: replacing the path
     // between stat and read must not let an unverified key through.
     verify_owner_only(path, &file)?;
@@ -648,6 +673,127 @@ fn discover_candidates(candidates: Vec<PathBuf>) -> Result<Discovered, Discovery
         }
     }
     Err(DiscoveryError { tried })
+}
+
+/// A connection file chosen by [`discover_reachable`], with what implicit
+/// discovery passed over to reach it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReachableDiscovery {
+    pub discovered: Discovered,
+    /// Readable default files skipped because nothing was listening at their
+    /// endpoint: left behind by a daemon that is gone.
+    pub stale: Vec<PathBuf>,
+    /// Readable default files after the chosen one, never tried. A client
+    /// that fails to authenticate to the chosen daemon names them rather
+    /// than trying them: a different daemon is not a fallback for a failed
+    /// identity check.
+    pub others: Vec<PathBuf>,
+}
+
+/// Like [`discover`], but implicit discovery passes over a readable default
+/// file whose endpoint has nothing listening (the connection is refused)
+/// when another readable default file follows it. An explicit path or
+/// `SUBC_CONNECTION_FILE` stays the only candidate. The last readable
+/// default file is chosen without a check, so when every file is stale the
+/// caller's own connection attempt reports the refusal.
+pub fn discover_reachable(explicit: Option<&Path>) -> Result<ReachableDiscovery, DiscoveryError> {
+    let env_named = non_empty_os_var("SUBC_CONNECTION_FILE");
+    let named = explicit.is_some() || env_named.is_some();
+    let candidates = discovery_candidates(explicit, env_named.as_deref());
+    if named {
+        return discover_candidates(candidates).map(|discovered| ReachableDiscovery {
+            discovered,
+            stale: Vec::new(),
+            others: Vec::new(),
+        });
+    }
+    discover_reachable_candidates(candidates, nothing_listening)
+}
+
+/// How long the listener check waits for a connection before treating the
+/// endpoint as live: only a refusal proves a file stale.
+const LISTENER_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Whether the first endpoint a client dials refuses connections. Anything
+/// short of a refusal (a timeout, an unparsable host) is not proof that the
+/// daemon is gone, so it counts as listening.
+fn nothing_listening(info: &ConnectionInfo) -> bool {
+    let Some(endpoint) = info.endpoints.first() else {
+        return false;
+    };
+    let Ok(ip) = endpoint.host.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    let address = std::net::SocketAddr::new(ip, endpoint.port);
+    listener_probe(address)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::ConnectionRefused)
+}
+
+fn listener_probe(address: std::net::SocketAddr) -> io::Result<std::net::TcpStream> {
+    #[cfg(windows)]
+    if address.ip().is_loopback() {
+        return subc_os::connect_loopback(address, LISTENER_CHECK_TIMEOUT);
+    }
+    std::net::TcpStream::connect_timeout(&address, LISTENER_CHECK_TIMEOUT)
+}
+
+/// Reads candidates in priority order and stops at the first one to use: a
+/// lower-priority file is never opened while a higher one serves. A readable
+/// file is checked for a listener only when a later candidate exists on disk
+/// (a `stat`, which cannot block on a special file); a refusal there makes
+/// it stale and the search goes on. When every readable file proved stale,
+/// the first is returned so the caller's own connection reports it.
+fn discover_reachable_candidates(
+    candidates: Vec<PathBuf>,
+    mut nothing_listening: impl FnMut(&ConnectionInfo) -> bool,
+) -> Result<ReachableDiscovery, DiscoveryError> {
+    let present = |paths: &[PathBuf]| -> Vec<PathBuf> {
+        paths
+            .iter()
+            .filter(|path| fs::symlink_metadata(path).is_ok())
+            .cloned()
+            .collect()
+    };
+    let mut tried = Vec::new();
+    let mut stale: Vec<Discovered> = Vec::new();
+    for (index, path) in candidates.iter().enumerate() {
+        match read_for_client(path) {
+            Ok(info) => {
+                let later = present(&candidates[index + 1..]);
+                if later.is_empty() || !nothing_listening(&info) {
+                    return Ok(ReachableDiscovery {
+                        discovered: Discovered {
+                            path: path.clone(),
+                            info,
+                        },
+                        stale: stale.into_iter().map(|file| file.path).collect(),
+                        others: later,
+                    });
+                }
+                stale.push(Discovered {
+                    path: path.clone(),
+                    info,
+                });
+            }
+            Err(source) => tried.push(TriedCandidate {
+                path: path.clone(),
+                reason: discovery_reason(&source),
+            }),
+        }
+    }
+    if stale.is_empty() {
+        return Err(DiscoveryError { tried });
+    }
+    let first = stale.remove(0);
+    let others = present(&candidates)
+        .into_iter()
+        .filter(|path| *path != first.path)
+        .collect();
+    Ok(ReachableDiscovery {
+        discovered: first,
+        stale: Vec::new(),
+        others,
+    })
 }
 
 fn push_unique(paths: &mut Vec<PathBuf>, path: PathBuf) {
@@ -1201,6 +1347,125 @@ mod tests {
             discovery_candidates(Some(&explicit), Some(env_named)),
             vec![explicit],
             "the caller's explicit override must exclude every fallback"
+        );
+    }
+
+    #[test]
+    fn implicit_discovery_skips_a_default_file_nothing_listens_at() {
+        let root = unique_temp_dir("reachable-stale");
+        let stale_path = root.join("runtime").join(CONNECTION_FILE_NAME);
+        let live_path = root.join("temp").join("subc-user.connection.json");
+        // A daemon that crashed left its file; the live one listens elsewhere.
+        let gone = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let gone_port = gone.local_addr().unwrap().port();
+        let live = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let live_port = live.local_addr().unwrap().port();
+        for (path, port) in [(&stale_path, gone_port), (&live_path, live_port)] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut info = sample_info();
+            info.endpoints[0].port = port;
+            write_atomic(path, &info).unwrap();
+        }
+        drop(gone);
+
+        let found = discover_reachable_candidates(
+            vec![stale_path.clone(), live_path.clone()],
+            nothing_listening,
+        )
+        .unwrap();
+
+        assert_eq!(found.discovered.path, live_path);
+        assert_eq!(found.discovered.info.endpoints[0].port, live_port);
+        assert_eq!(found.stale, vec![stale_path]);
+        assert!(found.others.is_empty());
+        drop(live);
+    }
+
+    #[test]
+    fn implicit_discovery_keeps_a_listening_file_and_names_the_rest() {
+        let root = unique_temp_dir("reachable-first");
+        let first = root.join("runtime").join(CONNECTION_FILE_NAME);
+        let second = root.join("temp").join("subc-user.connection.json");
+        for path in [&first, &second] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            write_atomic(path, &sample_info()).unwrap();
+        }
+        let mut checked = 0;
+        let found = discover_reachable_candidates(vec![first.clone(), second.clone()], |_| {
+            checked += 1;
+            false
+        })
+        .unwrap();
+        assert_eq!(found.discovered.path, first);
+        assert!(found.stale.is_empty());
+        assert_eq!(found.others, vec![second]);
+        assert_eq!(
+            checked, 1,
+            "only files with a later alternative are checked"
+        );
+
+        // With every earlier file stale, the last is chosen unchecked and the
+        // caller's own connection reports what it finds there.
+        let mut checked = 0;
+        let found =
+            discover_reachable_candidates(vec![first.clone(), root.join("absent.json")], |_| {
+                checked += 1;
+                true
+            })
+            .unwrap();
+        assert_eq!(found.discovered.path, first);
+        assert_eq!(checked, 0, "a lone readable file is never checked");
+    }
+
+    /// A FIFO at a lower-priority candidate path (the temporary directory
+    /// is shared) must neither be opened while a better candidate serves nor
+    /// block discovery when it is the one being read.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_candidate_never_blocks_discovery() {
+        let root = unique_temp_dir("reachable-fifo");
+        let first = root.join("runtime").join(CONNECTION_FILE_NAME);
+        fs::create_dir_all(first.parent().unwrap()).unwrap();
+        write_atomic(&first, &sample_info()).unwrap();
+        let fifo = root.join("subc-user.connection.json");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        let within = |candidates: Vec<PathBuf>| {
+            let (done, finished) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = done.send(discover_reachable_candidates(candidates, |_| false));
+            });
+            finished
+                .recv_timeout(Duration::from_secs(5))
+                .expect("discovery blocked on a FIFO")
+        };
+
+        let found = within(vec![first.clone(), fifo.clone()]).unwrap();
+        assert_eq!(found.discovered.path, first);
+
+        let error = within(vec![fifo.clone()]).expect_err("a FIFO is no connection file");
+        assert!(
+            error.tried[0].reason.contains("regular file"),
+            "{:?}",
+            error.tried
+        );
+    }
+
+    #[test]
+    fn named_files_stay_exclusive_under_reachable_discovery() {
+        let root = unique_temp_dir("reachable-named");
+        let named = root.join("missing-rig.json");
+        let error = discover_reachable(Some(&named)).expect_err("a missing named file fails");
+        assert_eq!(
+            error
+                .tried
+                .iter()
+                .map(|tried| &tried.path)
+                .collect::<Vec<_>>(),
+            vec![&named]
         );
     }
 

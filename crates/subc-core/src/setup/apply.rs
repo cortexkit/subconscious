@@ -16,18 +16,19 @@ use super::{
     conversion::selected_components,
     file_modes,
     inventory::Inventory,
-    managed_replace,
     model::{
         Component, ComponentState, ConfigurationState, PlatformObservation, ReleaseAvailability,
         SetupObserved, SetupOperation, SetupRequest,
     },
-    planner::{execute_setup, ExecutionMode, SetupExecutor, SetupPlan},
+    planner::{SetupExecutor, SetupPlan},
     runtime::{self, CommandRunner, RuntimePlatform, RuntimeStatus, SystemCommandRunner},
     uninstall,
     validation::{self, Validator},
 };
 
 type RescanPreview = fn() -> Result<Vec<String>, String>;
+
+mod journal;
 
 pub struct SetupBackend {
     executable: PathBuf,
@@ -48,15 +49,7 @@ pub struct SetupBackend {
 struct ComponentSteps {
     message_hub_change: Option<config::ConfigChange>,
     message_grants_changed: bool,
-    daemon_migration: Option<super::daemon_bundle::Migration>,
     nats_migration: Option<super::nats_migration::Migration>,
-    nats_definition: Option<runtime::DefinitionSnapshot>,
-    placed_binaries: Vec<PathBuf>,
-    /// Files that existed before this run and were adopted as the release's
-    /// bytes; rollback un-records them and never deletes them.
-    adopted_binaries: Vec<PathBuf>,
-    config_change: Option<config::ConfigChange>,
-    configuration_inventory_created: bool,
     failed_bootstrap_directory: Option<BootstrapDirectory>,
 }
 
@@ -112,16 +105,68 @@ struct SetupPaths {
 
 impl SetupBackend {
     pub fn current(executable: impl Into<PathBuf>) -> Result<Self, String> {
+        Self::current_with_preview(executable, false)
+    }
+
+    #[doc(hidden)]
+    pub fn current_with_preview(
+        executable: impl Into<PathBuf>,
+        preview: bool,
+    ) -> Result<Self, String> {
         let executable = executable.into();
         let platform = RuntimePlatform::current();
         let data_dir = data_directory()?;
         let binary_home = data_dir.join("bin");
         let runtime_home = user_home()?;
-        let runtime_paths = runtime::runtime_paths(platform, &binary_home, &runtime_home);
-        let inventory = Inventory::load(
-            data_dir.join("installer-manifest.json"),
-            PlatformObservation::current().to_string().as_str(),
-        )?;
+        let runtime_paths = runtime::session_runtime_paths(platform, &binary_home, &runtime_home);
+        // The lock comes first, before anything setup observes or plans, and
+        // as this process's hold: anything setup then loads under the lock
+        // shares it rather than waiting on it. The inventory keeps it held.
+        let manifest = data_dir.join("installer-manifest.json");
+        let platform_label = PlatformObservation::current().to_string();
+        let inventory = if preview {
+            match super::install_journal::Journal::status(&manifest)? {
+                Some(super::install_journal::Status::Open) => println!(
+                    "An unfinished install transaction is recorded at {}.",
+                    super::install_journal::Journal::path(&manifest).display()
+                ),
+                Some(super::install_journal::Status::NeedsCleanup) => println!(
+                    "A completed install transaction has leftovers listed in {}.",
+                    super::install_journal::Journal::path(&manifest).display()
+                ),
+                Some(super::install_journal::Status::Retired) => println!(
+                    "Completed install transactions still have leftovers listed in {}.",
+                    super::install_journal::retired::path(&manifest).display()
+                ),
+                None => {}
+            }
+            Inventory::load_snapshot(manifest, &platform_label)?
+        } else {
+            let _hold = super::install_lock::InstallHold::take(
+                &manifest,
+                "ck setup",
+                super::install_lock::WAIT,
+            )?;
+            super::install_journal::system::recover_locked(
+                &manifest,
+                &executable,
+                || None,
+                &runtime_paths,
+                &mut SystemCommandRunner,
+            )?;
+            let current = Inventory::read(manifest.clone(), &platform_label)?;
+            super::install_journal::bootstrap::refuse_legacy(&manifest, &current)?;
+            #[cfg(unix)]
+            super::install_journal::profile::from_bootstrap(&manifest, &executable)?;
+            #[cfg(windows)]
+            super::install_journal::user_path::from_bootstrap(&manifest, &executable)?;
+            Inventory::load_locked(
+                manifest,
+                &platform_label,
+                "ck setup",
+                super::install_lock::WAIT,
+            )?
+        };
         Ok(Self {
             executable,
             paths: SetupPaths {
@@ -519,10 +564,7 @@ impl SetupBackend {
         if let Some(key_path) = &request.claustrum_key_path {
             self.paths.claustrum_key_path = Some(key_path.clone());
         }
-        if let Err(error) = execute_setup(plan, ExecutionMode::Apply, self) {
-            return self.finish_daemon_migration(Err(error));
-        }
-        self.inventory.save()?;
+        self.execute_transactions(plan, request.uninstall)?;
         if request.uninstall {
             let report =
                 self.uninstall_report
@@ -533,26 +575,28 @@ impl SetupBackend {
                             format!("configuration: {}", self.paths.config_path.display()),
                             format!("store: {}", self.paths.data_dir.join("stores").display()),
                         ],
-                        deferred: Vec::new(),
                     });
             println!("retained after uninstall:");
             for retained in report.retained {
                 println!("  {retained}");
             }
-            if !report.deferred.is_empty() {
-                println!("completes after this process exits:");
-                for deferred in report.deferred {
-                    println!("  {deferred}");
+            #[cfg(windows)]
+            match super::install_journal::Journal::retained_removals(self.inventory.manifest()) {
+                Ok(images) => {
+                    for (image, stage) in images {
+                        println!("  image: {}", image.display());
+                        println!(
+                            "  staging directory: {} (cleaned on the next installer run)",
+                            stage.display()
+                        );
+                    }
+                }
+                Err(error) => {
+                    eprintln!("warning: could not list retained uninstall files: {error}")
                 }
             }
             return Ok(());
         }
-        let selected = selected_components(request).into_iter().collect::<Vec<_>>();
-        let mut validator = CkValidator {
-            executable: &self.executable,
-        };
-        let verified = validation::validate_selected(&mut validator, &selected);
-        self.finish_daemon_migration(verified)?;
         for operation in &plan.operations {
             if let SetupOperation::EnableComponent { component } = operation {
                 let module_id = component
@@ -593,60 +637,6 @@ impl SetupBackend {
         }) {
             println!("{}", validation::MCP_HARNESS_NEXT);
         }
-        Ok(())
-    }
-
-    fn finish_daemon_migration(&mut self, verified: Result<(), String>) -> Result<(), String> {
-        let migrating = self
-            .component_steps
-            .get(&Component::Core)
-            .is_some_and(|steps| {
-                steps.daemon_migration.is_some() || steps.nats_migration.is_some()
-            });
-        if !migrating {
-            return verified;
-        }
-        let verified = verified.and_then(|()| {
-            if let Some(migration) = self
-                .component_steps
-                .get(&Component::Core)
-                .and_then(|s| s.nats_migration.as_ref())
-            {
-                migration.verify(
-                    &self.executable,
-                    &mut self.runner,
-                    super::upgrade_executor::RESTART_COMPLETION_TIMEOUT,
-                )?;
-            }
-            Ok(())
-        });
-        if let Err(error) = verified {
-            self.rollback_component(Component::Core)
-                .map_err(|rollback| format!("{error}; daemon rollback failed: {rollback}"))?;
-            return Err(error);
-        }
-        if let Some(migration) = self
-            .component_steps
-            .get_mut(&Component::Core)
-            .and_then(|s| s.nats_migration.as_mut())
-        {
-            migration.complete(&mut self.inventory)?;
-        }
-        if let Some(migration) = self
-            .component_steps
-            .get_mut(&Component::Core)
-            .and_then(|steps| steps.daemon_migration.as_mut())
-        {
-            migration.complete(&mut self.inventory)?;
-        }
-        self.component_steps
-            .get_mut(&Component::Core)
-            .unwrap()
-            .daemon_migration = None;
-        self.component_steps
-            .get_mut(&Component::Core)
-            .unwrap()
-            .nats_migration = None;
         Ok(())
     }
 
@@ -786,7 +776,10 @@ impl SetupBackend {
             Value::String(super::upgrade::binary_version(path)?),
         );
         self.inventory.record("managed-binary", path, fields);
-        self.inventory.save()?;
+        #[cfg(test)]
+        if !self.inventory.transaction_is_open() {
+            self.inventory.save()?;
+        }
         println!(
             "  adopted {} from the bootstrap installer",
             components::display_home_path(path)
@@ -962,14 +955,6 @@ impl SetupBackend {
         }
         Ok(false)
     }
-
-    fn restart_runtime(&mut self, sections: &[String]) -> Result<(), String> {
-        runtime::restart_via_service_manager(&self.paths.runtime_paths)?;
-        let mut validator = CkValidator {
-            executable: &self.executable,
-        };
-        validation::wait_for_daemon(&mut validator, sections)
-    }
 }
 
 /// Runs `ck-auth bootstrap` through `run`, which executes the command and
@@ -1050,13 +1035,6 @@ impl SetupExecutor for SetupBackend {
     type Error = String;
 
     fn prepare_apply(&mut self, plan: &SetupPlan) -> Result<(), Self::Error> {
-        // An earlier upgrade on Windows may have left a previous binary image
-        // behind because its process was still running; it is free by now.
-        // Setup runs in a terminal of its own, so a held image's warning
-        // goes to stderr as it is found.
-        for warning in managed_replace::sweep_replaced_images(&mut self.inventory) {
-            eprintln!("{warning}");
-        }
         if plan
             .operations
             .iter()
@@ -1088,68 +1066,12 @@ impl SetupExecutor for SetupBackend {
                     release.release,
                     release.target
                 );
-                let paths =
-                    components::installation_binary_paths(*component, &self.paths.binary_home);
-                let mut migration =
-                    if self.platform == RuntimePlatform::Macos && *component == Component::Core {
-                        let old =
-                            components::component_binary_paths(*component, &self.paths.binary_home)
-                                .into_iter()
-                                .next()
-                                .expect("Core has a daemon");
-                        Some(super::daemon_bundle::Migration::capture(
-                            &self.paths.runtime_paths,
-                            &old,
-                            &self.inventory,
-                        )?)
-                    } else {
-                        None
-                    };
-                // Rollback may delete only files this run wrote. A file that
-                // already existed and was ADOPTED (byte-identical to the
-                // release) belongs to the operator's machine before setup ran;
-                // a refusal later in the plan must un-record it, never unlink
-                // it. So the tell is "existed on disk before install", not
-                // "was owned before install".
-                let existed_before = paths.iter().map(|path| path.is_file()).collect::<Vec<_>>();
-                let owned_before = paths
-                    .iter()
-                    .map(|path| self.inventory.owns_path("managed-binary", path))
-                    .collect::<Vec<_>>();
-                let installed = components::install_component(
+                components::install_component(
                     *component,
                     &self.paths.binary_home,
                     &mut self.inventory,
                     &mut self.artifacts,
-                );
-                if installed.is_err() && self.artifacts.daemon_replacement.is_none() {
-                    return installed;
-                }
-                let steps = self.component_steps.entry(*component).or_default();
-                if let Some(replacement) = self.artifacts.daemon_replacement.take() {
-                    migration
-                        .as_mut()
-                        .expect("bundle placement has a macOS migration")
-                        .attach(replacement);
-                    steps.daemon_migration = migration.take();
-                }
-                for ((path, owned_before), existed_before) in
-                    paths.into_iter().zip(owned_before).zip(existed_before)
-                {
-                    if owned_before || !self.inventory.owns_path("managed-binary", &path) {
-                        continue;
-                    }
-                    if existed_before {
-                        steps.adopted_binaries.push(path);
-                    } else {
-                        steps.placed_binaries.push(path);
-                    }
-                }
-                if let Err(error) = installed {
-                    self.rollback_component(*component)?;
-                    return Err(error);
-                }
-                Ok(())
+                )
             }
             SetupOperation::ConfigureComponent { component } => {
                 let mut nats = if *component == Component::Core {
@@ -1162,33 +1084,19 @@ impl SetupExecutor for SetupBackend {
                 } else {
                     None
                 };
-                let configuration_inventory_created = !self
-                    .inventory
-                    .owns_path("configuration", &self.paths.config_path);
-                if let Some(change) = components::configure_component(
+                components::configure_component(
                     *component,
                     &self.paths.config_path,
                     &self.paths.binary_home,
                     self.paths.claustrum_key_path.as_deref(),
                     &mut self.inventory,
-                )? {
-                    let steps = self.component_steps.entry(*component).or_default();
-                    steps.config_change = Some(change);
-                    steps.configuration_inventory_created = configuration_inventory_created;
-                }
+                )?;
                 if let Some(migration) = nats.as_mut() {
-                    let definition = if self.paths.runtime_paths.definition.is_file() {
-                        Some(runtime::DefinitionSnapshot::capture(
-                            self.platform,
-                            &self.paths.runtime_paths,
-                        )?)
-                    } else {
-                        None
-                    };
-                    migration.apply()?;
-                    let steps = self.component_steps.entry(*component).or_default();
-                    steps.nats_migration = nats;
-                    steps.nats_definition = definition;
+                    migration.apply_recorded(&mut self.inventory)?;
+                    self.component_steps
+                        .entry(*component)
+                        .or_default()
+                        .nats_migration = nats;
                 }
                 Ok(())
             }
@@ -1224,7 +1132,7 @@ impl SetupExecutor for SetupBackend {
                     &self.paths.data_dir,
                     &subc_daemon::bootstrap::connection_file_path(),
                 )? {
-                    config::apply(&change)?;
+                    config::apply_recorded(&change, &mut self.inventory)?;
                     self.component_steps
                         .entry(Component::Core)
                         .or_default()
@@ -1248,95 +1156,34 @@ impl SetupExecutor for SetupBackend {
                 Ok(())
             }
             SetupOperation::RescanComponent { .. } => self.run_ck(&["module", "rescan"]),
-            SetupOperation::EnableComponent { component } => self.run_ck(&[
-                "module",
-                "start",
-                component
-                    .module_id()
-                    .expect("only modules are enabled by setup"),
-            ]),
-            SetupOperation::RestartRuntime { sections } => {
-                if let Some(migration) = self
-                    .component_steps
-                    .get(&Component::Core)
-                    .and_then(|steps| steps.daemon_migration.as_ref())
-                {
-                    migration.activate(&mut self.runner, &mut self.inventory, None)?;
-                    return Ok(());
-                }
-                self.restart_runtime(sections)?;
+            SetupOperation::EnableComponent { component } => {
+                self.enable_transactional_module(*component)
+            }
+            SetupOperation::RestartRuntime { .. } => {
+                self.write_runtime_transaction(false)?;
                 println!("  restarted the daemon");
                 Ok(())
             }
             SetupOperation::RegisterRuntime => {
-                if let Some(migration) = self
-                    .component_steps
-                    .get(&Component::Core)
-                    .and_then(|steps| steps.daemon_migration.as_ref())
-                {
-                    migration.activate(&mut self.runner, &mut self.inventory, None)?;
-                    return Ok(());
-                }
-                runtime::ensure(
-                    self.platform,
-                    &self.paths.runtime_paths,
-                    self.runtime_status,
-                    &mut self.runner,
-                    &mut self.inventory,
-                )?;
+                self.write_runtime_transaction(true)?;
                 println!("  registered and started the daemon");
                 Ok(())
             }
             SetupOperation::UpdateRuntimeDefinition { restart } => {
-                if let Some(migration) = self
-                    .component_steps
-                    .get(&Component::Core)
-                    .and_then(|steps| steps.daemon_migration.as_ref())
+                if self.platform == RuntimePlatform::Macos
+                    && !restart
+                    && runtime::observe(self.platform, &mut self.runner)?.live
                 {
-                    migration.activate(&mut self.runner, &mut self.inventory, None)?;
-                    return Ok(());
+                    return Err("refusal: daemon became live after planning; re-run ck setup to confirm a LaunchAgent reload".into());
                 }
-                let status = runtime::observe(self.platform, &mut self.runner)?;
-                if self.platform == RuntimePlatform::Macos && status.registered && status.live {
-                    if !restart {
-                        return Err("refusal: daemon became live after planning; re-run ck setup to confirm a LaunchAgent reload".into());
-                    }
-                    runtime::restart_with_definition(
-                        self.platform,
-                        &self.paths.runtime_paths,
-                        &mut self.runner,
-                        &mut self.inventory,
-                    )?;
-                    let mut validator = CkValidator {
-                        executable: &self.executable,
-                    };
-                    validation::wait_for_daemon(&mut validator, &[])?;
-                } else {
-                    runtime::ensure(
-                        self.platform,
-                        &self.paths.runtime_paths,
-                        status,
-                        &mut self.runner,
-                        &mut self.inventory,
-                    )?;
-                }
+                self.write_runtime_transaction(true)?;
                 println!("  updated the daemon service definition");
                 Ok(())
             }
-            // Registration starts the daemon immediately on every platform. The
             // separate operation remains in the plan so its current-liveness
             // requirement is visible before execution.
             SetupOperation::StartRuntime => Ok(()),
-            SetupOperation::MonitorNatsServer { target } => {
-                for line in bus_monitoring::apply(
-                    &self.paths.config_path,
-                    target,
-                    &mut bus_monitoring::CkBusCommand,
-                )? {
-                    println!("  {line}");
-                }
-                Ok(())
-            }
+            SetupOperation::MonitorNatsServer { .. } => Ok(()),
             SetupOperation::DeregisterRuntime => Ok(()),
             SetupOperation::RemoveManagedComponent { .. } if self.uninstall_report.is_none() => {
                 // The daemon's own connection file names the pid to stop on a
@@ -1365,65 +1212,6 @@ impl SetupExecutor for SetupBackend {
             | SetupOperation::Validate { .. }
             | SetupOperation::RetainUserData => Ok(()),
         }
-    }
-
-    fn rollback_component(&mut self, component: Component) -> Result<(), Self::Error> {
-        let Some(mut steps) = self.component_steps.remove(&component) else {
-            return Ok(());
-        };
-        if let Some(change) = &steps.message_hub_change {
-            super::message_plane::rollback_hub(change)?;
-        }
-        if let Some(migration) = &mut steps.nats_migration {
-            migration.rollback(&mut self.inventory)?;
-        }
-        if let Some(migration) = &mut steps.daemon_migration {
-            migration.rollback(&mut self.runner, &mut self.inventory, None)?;
-        } else if let Some(definition) = &steps.nats_definition {
-            definition.restore(&mut self.runner, &mut self.inventory, None)?;
-        }
-        for path in steps.placed_binaries.into_iter().rev() {
-            if self.inventory.owns_path("managed-binary", &path) {
-                match components::remove_placed_binary(&path) {
-                    Ok(()) => println!("rolled back: {}", path.display()),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => {
-                        return Err(format!("could not roll back {}: {error}", path.display()))
-                    }
-                }
-                self.inventory.remove_owned_path("managed-binary", &path);
-            }
-        }
-        // Adopted files were on disk before this run; rolling back the run
-        // means forgetting the ownership record, not deleting the operator's
-        // binary (which may be the very image a supervised module is running).
-        for path in steps.adopted_binaries.into_iter().rev() {
-            if self.inventory.owns_path("managed-binary", &path) {
-                self.inventory.remove_owned_path("managed-binary", &path);
-                println!("rolled back ownership record: {}", path.display());
-            }
-        }
-        if let Some(change) = &steps.config_change {
-            if config::rollback_change(change)? {
-                println!("rolled back: {}", self.paths.config_path.display());
-            }
-        }
-        if steps.configuration_inventory_created
-            && !self
-                .component_steps
-                .values()
-                .any(|other| other.config_change.is_some())
-        {
-            self.inventory
-                .remove_owned_path("configuration", &self.paths.config_path);
-        }
-        // Save the ownership record first, so a vault folder that can't be
-        // removed never leaves the inventory listing binaries already removed.
-        self.inventory.save()?;
-        if let Some(directory) = steps.failed_bootstrap_directory {
-            println!("{}", directory.rollback()?);
-        }
-        Ok(())
     }
 
     fn runtime_was_live(&self) -> bool {
@@ -1516,7 +1304,8 @@ pub fn default_claustrum_key_path() -> Result<Option<PathBuf>, String> {
 /// app's daemon-down screen.
 pub fn installed_service_facts() -> Result<runtime::ServiceFacts, String> {
     let platform = RuntimePlatform::current();
-    let paths = runtime::runtime_paths(platform, &data_directory()?.join("bin"), &user_home()?);
+    let paths =
+        runtime::session_runtime_paths(platform, &data_directory()?.join("bin"), &user_home()?);
     Ok(runtime::service_facts(
         platform,
         &paths,
@@ -1528,7 +1317,8 @@ pub fn installed_service_facts() -> Result<runtime::ServiceFacts, String> {
 /// way setup starts it, without changing the installed definition.
 pub fn start_installed_service() -> Result<(), String> {
     let platform = RuntimePlatform::current();
-    let paths = runtime::runtime_paths(platform, &data_directory()?.join("bin"), &user_home()?);
+    let paths =
+        runtime::session_runtime_paths(platform, &data_directory()?.join("bin"), &user_home()?);
     runtime::start_installed(platform, &paths, &mut SystemCommandRunner)
 }
 
@@ -1554,62 +1344,27 @@ pub(super) fn user_home() -> Result<PathBuf, String> {
 
 #[cfg(test)]
 mod tests {
-    include!("apply/nats_tests.rs");
-    #[cfg(target_os = "macos")]
-    include!("apply/bundle_tests.rs");
     use super::*;
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_bundle_fresh_setup_rollback_removes_the_whole_app() {
-        let root = cortexkit_test_support::ScratchDir::new("bundle-setup-rollback");
-        let mut backend = backend_without_user_manager(&root);
-        backend.platform = RuntimePlatform::Macos;
-        let app = root.join("apps/Subconscious.app");
-        let daemon = app.join("Contents/MacOS/ck-subc");
-        fs::create_dir_all(daemon.parent().unwrap()).unwrap();
-        fs::write(&daemon, "new daemon").unwrap();
-        fs::write(app.join("Contents/Info.plist"), "new metadata").unwrap();
-        backend
-            .inventory
-            .record("managed-binary", &daemon, Map::new());
-        backend
-            .component_steps
-            .entry(Component::Core)
-            .or_default()
-            .placed_binaries
-            .push(daemon.clone());
-        backend.rollback_component(Component::Core).unwrap();
-        assert!(!app.exists());
-        assert!(!backend.inventory.owns_path("managed-binary", &daemon));
-    }
     use cortexkit_test_support::ScratchDir;
+    include!("apply/nats_tests.rs");
 
     struct UnavailableUserManager;
 
     impl CommandRunner for UnavailableUserManager {
         fn run(
             &mut self,
-            _program: &str,
+            program: &str,
             args: &[String],
         ) -> Result<runtime::CommandResult, String> {
-            if args.first().is_some_and(|arg| arg == "--user") {
-                return Ok(runtime::CommandResult {
-                    success: false,
-                    stdout: String::new(),
-                    stderr: "DBUS_SESSION_BUS_ADDRESS and XDG_RUNTIME_DIR not defined".to_string(),
-                });
-            }
             Ok(runtime::CommandResult {
-                success: true,
-                stdout: "system manager is running".to_string(),
-                stderr: String::new(),
+                success: program == "systemctl" && args == ["show-environment"],
+                stdout: String::new(),
+                stderr: format!("{program} {}: user manager unavailable", args.join(" ")),
             })
         }
     }
-
-    #[test]
     #[cfg(unix)]
+    #[test]
     fn failed_bootstrap_rolls_back_only_a_new_vault_directory() {
         use super::super::test_exec::write_executable;
         for existed_before in [false, true] {
@@ -1636,7 +1391,15 @@ mod tests {
                 .as_ref()
                 .unwrap();
             assert_eq!(snapshot.existed_before, existed_before);
-            backend.rollback_component(Component::Claustrum).unwrap();
+            backend
+                .component_steps
+                .get_mut(&Component::Claustrum)
+                .unwrap()
+                .failed_bootstrap_directory
+                .take()
+                .unwrap()
+                .rollback()
+                .unwrap();
             if existed_before {
                 assert_eq!(
                     fs::read(vault.join("store.db")).unwrap(),
@@ -1876,68 +1639,6 @@ mod adoption_tests {
     use cortexkit_test_support::ScratchDir;
 
     /// Rollback after a later refusal must delete only what this run wrote.
-    /// An adopted binary existed before the run (and may be the image a
-    /// supervised module is executing); rolling back forgets its ownership
-    /// record and leaves the file. The macOS drive lost a running claustrum's
-    /// binaries to the other behaviour.
-    #[test]
-    fn rollback_deletes_placed_binaries_but_only_unrecords_adopted_ones() {
-        let root = ScratchDir::new("setup-rollback-adopted");
-        let binary_home = root.join("bin");
-        fs::create_dir_all(&binary_home).unwrap();
-        let placed = binary_home.join("ck-claustrum");
-        let adopted = binary_home.join("ck-auth");
-        fs::write(&placed, b"written by this run").unwrap();
-        fs::write(&adopted, b"was already here").unwrap();
-        let platform = RuntimePlatform::current();
-        let mut inventory =
-            Inventory::load(root.join("installer-manifest.json"), "linux-x64").unwrap();
-        inventory.record("managed-binary", &placed, Map::new());
-        inventory.record("managed-binary", &adopted, Map::new());
-        let mut backend = SetupBackend {
-            executable: binary_home.join("ck"),
-            paths: SetupPaths {
-                data_dir: root.join("data"),
-                binary_home: binary_home.clone(),
-                config_path: root.join("subc.jsonc"),
-                claustrum_key_path: None,
-                runtime_paths: runtime::runtime_paths(platform, &binary_home, &root),
-            },
-            platform,
-            inventory,
-            runner: Box::new(SystemCommandRunner),
-            artifacts: ReleaseArtifactSource::from_index(
-                super::super::release_index::ReleaseIndex {
-                    schema: 1,
-                    channel: "alpha".to_string(),
-                    generated_at_ms: 0,
-                    components: BTreeMap::new(),
-                },
-                super::super::model::AlphaTarget::LinuxX64,
-            ),
-            runtime_status: RuntimeStatus::default(),
-            uninstall_report: None,
-            component_steps: BTreeMap::new(),
-            rescan_preview: None,
-        };
-        backend.component_steps.insert(
-            Component::Claustrum,
-            ComponentSteps {
-                placed_binaries: vec![placed.clone()],
-                adopted_binaries: vec![adopted.clone()],
-                ..ComponentSteps::default()
-            },
-        );
-
-        backend.rollback_component(Component::Claustrum).unwrap();
-
-        assert!(!placed.exists(), "a binary this run placed is removed");
-        assert!(adopted.exists(), "a binary that predated the run stays");
-        assert_eq!(fs::read(&adopted).unwrap(), b"was already here");
-        assert!(!backend.inventory.owns_path("managed-binary", &placed));
-        assert!(!backend.inventory.owns_path("managed-binary", &adopted));
-    }
-
     #[test]
     fn bootstrap_placed_ck_is_adopted_as_managed_binary() {
         let root = ScratchDir::new("setup-adopt-running-ck");
@@ -2001,123 +1702,6 @@ mod adoption_tests {
             "bootstrap row without archive_sha256 must not invent one"
         );
     }
-
-    #[test]
-    fn installer_placed_cmd_ck_is_adopted_and_self_updated_in_place() {
-        let root = ScratchDir::new("setup-adopt-cmd-ck");
-        let data_dir = root.join("cortexkit");
-        let binary_home = data_dir.join("bin");
-        let command_home = data_dir.join("cmd");
-        fs::create_dir_all(&binary_home).unwrap();
-        fs::create_dir_all(&command_home).unwrap();
-
-        let executable = command_home.join("ck");
-        write_executable(&executable, b"#!/bin/sh\necho 'ck 0.20.72'\n");
-        let daemon = binary_home.join("ck-subc");
-        let gateway = binary_home.join("ck-subc-mcp");
-        write_executable(&daemon, b"#!/bin/sh\necho 'ck-subc 0.17.10'\n");
-        write_executable(&gateway, b"#!/bin/sh\necho 'ck-subc-mcp 0.1.30'\n");
-
-        let installer_archive_digest = "cd".repeat(32);
-        let manifest = data_dir.join("installer-manifest.json");
-        fs::write(
-            &manifest,
-            serde_json::to_vec(&serde_json::json!({
-                "schema_version": 1,
-                "installer": "ck",
-                "platform": "linux-x64",
-                "mutations": [{
-                    "kind": "binary-placement",
-                    "path": executable.to_string_lossy(),
-                    "sha256": components::digest_file(&executable).unwrap(),
-                    "archive_sha256": installer_archive_digest.clone(),
-                }],
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let mut inventory = Inventory::load(&manifest, "linux-x64").unwrap();
-        // The other Core binaries are rows that `ck setup` installed under bin/.
-        inventory.record("managed-binary", &daemon, Map::new());
-        inventory.record("managed-binary", &gateway, Map::new());
-        let platform = RuntimePlatform::current();
-        let mut backend = SetupBackend {
-            executable: executable.clone(),
-            paths: SetupPaths {
-                data_dir: data_dir.clone(),
-                binary_home: binary_home.clone(),
-                config_path: root.join("subc.jsonc"),
-                claustrum_key_path: None,
-                runtime_paths: runtime::runtime_paths(platform, &binary_home, &root),
-            },
-            platform,
-            inventory,
-            runner: Box::new(SystemCommandRunner),
-            artifacts: ReleaseArtifactSource::from_index(
-                super::super::release_index::ReleaseIndex {
-                    schema: 1,
-                    channel: "alpha".to_string(),
-                    generated_at_ms: 0,
-                    components: BTreeMap::new(),
-                },
-                super::super::model::AlphaTarget::LinuxX64,
-            ),
-            runtime_status: RuntimeStatus::default(),
-            uninstall_report: None,
-            component_steps: BTreeMap::new(),
-            rescan_preview: None,
-        };
-
-        backend.adopt_running_ck(&executable).unwrap();
-        assert!(backend.inventory.owns_path("managed-binary", &executable));
-        assert!(!backend.inventory.owns_path("binary-placement", &executable));
-        assert_eq!(
-            backend
-                .inventory
-                .entry_for_path("managed-binary", &executable)
-                .and_then(|entry| entry.get("archive_sha256"))
-                .and_then(Value::as_str),
-            Some(installer_archive_digest.as_str())
-        );
-
-        let targets = super::super::upgrade::discover_managed_upgrade_targets(
-            &backend.inventory,
-            &executable,
-            None,
-        )
-        .unwrap();
-        let ck = targets
-            .iter()
-            .find(|target| target.target.label() == "ck")
-            .expect("the running ck is an upgrade target");
-        assert_eq!(ck.destination, executable);
-
-        let candidate = root.join("verified-ck");
-        write_executable(&candidate, b"#!/bin/sh\necho 'ck 0.20.73'\n");
-        super::super::self_update::replace_verified_candidate(
-            &ck.destination,
-            &candidate,
-            &"ab".repeat(32),
-            "0.20.73",
-            &mut backend.inventory,
-        )
-        .unwrap();
-
-        assert_eq!(
-            fs::read(&executable).unwrap(),
-            fs::read(&candidate).unwrap()
-        );
-        assert!(backend.inventory.owns_path("managed-binary", &executable));
-        assert_eq!(
-            backend
-                .inventory
-                .entry_for_path("managed-binary", &executable)
-                .and_then(|entry| entry.get("version"))
-                .and_then(Value::as_str),
-            Some("0.20.73")
-        );
-    }
-
     #[test]
     fn adoption_copies_bootstrap_archive_digest_when_present() {
         let root = ScratchDir::new("setup-adopt-archive-digest");

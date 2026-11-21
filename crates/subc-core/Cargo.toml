@@ -1,6 +1,6 @@
 [package]
 name = "subc-core"
-version = "0.21.32"
+version = "0.21.34"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -94,9 +94,9 @@ subc-control = { path = "../subc-control", version = "0.42.4" }
 subc-client-rs = { path = "../subc-client-rs", version = "0.41.7" }
 subc-jsonc = { path = "../subc-jsonc" }
 terminal_size = "0.4"
-subc-os = { path = "../subc-os", version = "0.1.48" }
+subc-os = { path = "../subc-os", version = "0.1.50" }
 subc-protocol = { path = "../subc-protocol", version = "0.37.6" }
-subc-transport = { path = "../subc-transport", version = "0.18.0" }
+subc-transport = { path = "../subc-transport", version = "0.18.2" }
 tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "io-util", "sync", "time", "process", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -119,7 +119,7 @@ portable-pty = "0.9"
 tokio = { version = "1", features = ["test-util"] }
 subc-daemon = { path = "../subc-daemon", version = "0.50.27", features = ["test-support"] }
 # Keep required-feature CLI fixture targets enabled for integration tests.
-subc-core = { path = ".", version = "0.21.28", features = ["test-support"] }
+subc-core = { path = ".", version = "0.21.34", features = ["test-support"] }
 vt100 = "0.15"
 
 [lints.rust]

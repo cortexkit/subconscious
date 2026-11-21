@@ -23,8 +23,9 @@ irm https://cortexkit.io/install/win | iex
 
 The script downloads the `ck` archive for your platform from the release index
 (`https://cortexkit.io/releases/v1/index.json`), checks its SHA-256 against the
-index, and places only `ck` (`scripts/install/install.sh`,
-`scripts/install/install.ps1`):
+index, and lets the verified copy of `ck` place itself. The script then runs
+the installed `ck setup`, which completes the handover and configures the
+installation (`scripts/install/install.sh`, `scripts/install/install.ps1`):
 
 | Platform | `ck` goes to | PATH change |
 | --- | --- | --- |
@@ -36,9 +37,8 @@ directory is added to PATH; the daemon and modules live in `<data home>/cortexki
 and are reached through `ck`. Existing `bin` PATH entries are left intact.
 The installer retires only the old layout's `<data home>/cortexkit/bin/ck`
 (`%LOCALAPPDATA%\cortexkit\bin\ck.exe` on Windows) by
-renaming it to `ck[.exe].retired-<UTC date>-<unique suffix>` beside the original,
-never deleting it, and records the original path, backup path and digest in
-`installer-manifest.json` (or its bootstrap sidecar on an existing installation).
+moving it to a unique `ck[.exe].retired-*` name beside the original. Setup
+records the original path, backup path and digest in `installer-manifest.json`.
 An operator's or package manager's `ck` anywhere else is left untouched.
 The installer puts `cmd` first in the user
 PATH on Windows and in the persisted shell-profile block on Unix, then checks
@@ -78,6 +78,24 @@ change first and refuses to overwrite a value you set yourself.
 | macOS | launchd agent `cortexkit.subc` at `~/Library/LaunchAgents/cortexkit.subc.plist` |
 | Linux | `systemd --user` unit `cortexkit-subc.service` (needs a reachable user session bus) |
 | Windows | Task Scheduler task `\CortexKit\subc-daemon`, started at logon |
+
+On Linux the unit file goes where the user manager looks for it:
+`$XDG_CONFIG_HOME/systemd/user/` when `XDG_CONFIG_HOME` is set to an absolute
+path, otherwise `~/.config/systemd/user/`. After reloading the manager, setup
+checks that `systemctl --user show -p FragmentPath cortexkit-subc.service`
+names that file, and refuses with both paths if the manager loads the unit from
+anywhere else (for example when the manager's `XDG_CONFIG_HOME` differs from
+your shell's). The same check runs before setup accepts the unit, before `ck`
+starts or restarts it by name (including after the reload a definition update
+makes), and before uninstall disables it, so a different unit file that systemd
+loads under the same name is never started, restarted or disabled; if systemd
+cannot be asked, ck refuses rather than guess. A unit setup recorded at the
+other location is copied, not moved: setup writes the new file, reloads, and
+only when systemd then loads the new file does it remove the old file, its
+enablement links and its records. If systemd still loads the old file, setup
+removes what it wrote, leaves the old unit running and enabled, and says why.
+Setup moves only its own unit (a regular file whose contents match what it
+recorded), and a move that stops part way is finished by the next `ck setup`.
 
 On Windows the setup-owned XML remains at `%USERPROFILE%\cortexkit-subc-daemon.xml`.
 Setup verifies that file against its inventory before comparing the registered
@@ -230,12 +248,55 @@ kept.
   through `supervisor.restart`; the upgrade waits up to 180 seconds for each to
   report healthy. If a module is not supervised on this host, upgrade says its
   restart was omitted rather than starting an independent process.
-- `ck` replaces itself last. On Windows the old binary is left as
-  `ck.exe.old` and removed by the next successful `ck` run.
+- Before each change, the installer syncs its expected old and new states to
+  `installer.journal` beside `installer-manifest.json`. A release becomes
+  current only after activation is verified and the inventory is published.
+  If the command stops, the next applying command verifies and finishes a
+  complete transaction or restores the previous state. It refuses to
+  overwrite an unexpected change and names the path.
+- macOS exchanges the daemon bundles atomically. On Windows a running
+  executable must move aside before the new one can take its name. If `ck`
+  is missing after an interrupted Windows upgrade, run `install.ps1` again;
+  it restores the previous version, after which you can rerun `ck upgrade`.
+  If a Windows process still holds a backup, the completed journal moves to
+  `installer.retired/` so it does not block the next operation. Applying
+  commands report the retained file and clean it up after the process exits.
+- The first applying command reconciles a verified `installer-manifest.bootstrap.json`
+  (the older install script's separate executable ownership record) and
+  recorded backup files left by released installers. It leaves a backup in
+  place if it is still in use or does not match the recorded ownership.
+  If a development build left an unfinished activation, bundle or unit move,
+  finish it with that build, which understands its recovery records, before
+  retrying. Do not delete recovery files.
 
 The daemon never checks for updates itself. Bare `ck` refreshes a 24-hour
 update cache in the background and never waits on the network for more than a
 moment.
+
+Only one of `ck setup`, `ck upgrade`, `ck setup --uninstall`, and bootstrap changes an
+installation at a time. Each uses the exclusive `installer.lock` beside the
+inventory. A second command waits up to 30 seconds, then refuses and names the
+holder's process ID and command when known. Applying commands recover before
+planning; previews report an unfinished journal or retained cleanup files
+without locking, starting services or writing anything.
+
+Setup confirmation and the app's upgrade rollback prompt release the install
+lock while waiting for your answer. If another installer changes the plan or
+recovers the journal in that time, the answer is discarded. It is safe to
+rerun the command to review the current state.
+
+The vault owns its signing-key grants and ck-bus owns its NATS listener file.
+Setup does not put either external operation in the installer journal. After
+committing installation, it checks and reapplies these idempotent operations
+when needed on each applying run. If setup stops before the external operation,
+run it again; it does not need to unwind the committed installation. Setup's
+own optional health entry is a separate journaled config change.
+Updating a shell profile preserves its permission bits and any symlink to it,
+but replaces the target file. Other hard links keep the old bytes; ACLs,
+extended attributes, and group ownership are not copied.
+Tightening access to installer-owned files and directories is also outside
+rollback. It checks ownership and only narrows access; retrying can finish the
+repair, and undo never restores a looser mode.
 
 Verify:
 

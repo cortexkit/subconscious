@@ -21,7 +21,13 @@ impl CkClient {
             .map_err(|error| failure(format!("local connect {endpoint:?}: {error}; check `ck daemon` and the daemon log, then retry")))?;
         authenticate_client(&mut stream, &read.info, AUTH_DEADLINE)
             .await
-            .map_err(|error| failure(format!("local authenticate: {error}")))?;
+            .map_err(|error| {
+                failure(super::connection_choice::authentication_failure(
+                    "local authenticate",
+                    error,
+                    &resolved.others,
+                ))
+            })?;
         Ok(Self {
             path: resolved.path,
             info: read.info,

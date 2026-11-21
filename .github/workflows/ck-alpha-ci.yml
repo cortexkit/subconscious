@@ -115,8 +115,6 @@ jobs:
           if ($result.FailedCount -ne 0) {
             throw "Pester reported $($result.FailedCount) failing installer tests."
           }
-          & ./scripts/install/tests/test-user-path.ps1
-          & ./scripts/install/tests/test-legacy-cli.ps1
 
   alpha-contract:
     name: Setup, runtime, MC, and upgrade (${{ matrix.platform }})
@@ -162,30 +160,30 @@ jobs:
         run: bash scripts/gate.sh test alpha-cli
 
   self-update-unix:
-    name: Unix self-update inode contract
+    name: Unix self-update and rollback preserve running processes
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Prove atomic inode replacement
+      - name: Prove both processes survive replacement and restore
         shell: bash
         run: bash scripts/gate.sh test alpha-inode
 
   self-update-windows:
-    name: Windows self-update cleanup contract
+    name: Windows journaled self-update contract
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Prove ck.exe.old replacement and cleanup lifecycle
+      - name: Prove replacement and restore while ck.exe is mapped
         shell: pwsh
         run: |
           $log = Join-Path $env:RUNNER_TEMP 'self-update-windows.log'
-          & cargo test -p subc-core --lib --locked setup::self_update_windows::tests::replacement_preserves_old_until_a_successful_next_invocation_cleans_it -- --exact 2>&1 | Tee-Object -FilePath $log
+          & cargo test -p subc-core --lib --locked setup::install_journal::tests::crash::replacing_and_restoring_a_mapped_windows_ck_keeps_its_public_name -- --exact 2>&1 | Tee-Object -FilePath $log
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }

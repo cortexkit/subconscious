@@ -14,11 +14,10 @@ use subc_transport::connection_file;
 use super::{
     components::{installed_components, upgrade_roster},
     file_modes,
+    install_lock::InstallHold,
     inventory::Inventory,
-    managed_replace,
     model::{AlphaTarget, Component, UpgradeObserved, UpgradeTarget},
     release_index::ReleaseIndex,
-    self_update,
     update_cache::UpdateMetadata,
     update_check::{observed_from_metadata, InstalledBinary},
     upgrade_assets::{
@@ -29,6 +28,8 @@ use super::{
         destination_inode, expected_post_activation, verify_post_activation, VerificationEvidence,
     },
 };
+
+mod journal;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DaemonCatalogBuild {
@@ -82,6 +83,91 @@ pub fn discover_current_upgrade_targets(
 ) -> Result<Vec<ManagedUpgradeTarget>, String> {
     let inventory = load_current_inventory()?;
     discover_managed_upgrade_targets(&inventory, executable, daemon_catalog)
+}
+
+/// Recover under the install lock before reading ownership or checking the
+/// core version that upgrades of dependent modules require.
+/// Previews report the journal without locking or changing it.
+pub fn lock_and_discover_upgrade_targets(
+    executable: &Path,
+    subc: Option<&Path>,
+    check_only: bool,
+) -> Result<(Option<InstallHold>, Vec<ManagedUpgradeTarget>), String> {
+    let hold = if check_only {
+        None
+    } else {
+        Some(take_install_hold("ck upgrade")?)
+    };
+    if !check_only {
+        recover_upgrade(executable, || subc.map(Path::to_owned))?;
+    } else {
+        use super::install_journal::{retired, Journal, Status};
+        let manifest = current_manifest()?;
+        match Journal::status(&manifest)? {
+            Some(Status::Retired) => println!(
+                "Completed install transactions still have leftovers listed in {}.",
+                retired::path(&manifest).display()
+            ),
+            Some(Status::Open | Status::NeedsCleanup) => {
+                println!("{}", unfinished_install(&manifest))
+            }
+            None => {}
+        }
+    }
+    let discovered = discover_current_upgrade_targets(executable, None)?;
+    Ok((hold, discovered))
+}
+
+/// Takes the install lock for the current install root, for an applying
+/// command that holds it from before its first read until it is done.
+pub(super) fn take_install_hold(command: &str) -> Result<InstallHold, String> {
+    InstallHold::take(
+        &load_current_inventory_root()?.join("installer-manifest.json"),
+        command,
+        super::install_lock::WAIT,
+    )
+}
+
+pub(super) fn recover_upgrade(
+    executable: &Path,
+    connection: impl FnOnce() -> Option<PathBuf>,
+) -> Result<(), String> {
+    let root = load_current_inventory_root()?;
+    let platform = super::runtime::RuntimePlatform::current();
+    let paths = super::runtime::session_runtime_paths(
+        platform,
+        &root.join("bin"),
+        &super::apply::user_home()?,
+    );
+    let manifest = root.join("installer-manifest.json");
+    super::install_journal::system::recover_locked(
+        &manifest,
+        executable,
+        connection,
+        &paths,
+        &mut super::runtime::SystemCommandRunner,
+    )?;
+    let inventory = Inventory::read(
+        manifest.clone(),
+        &super::model::PlatformObservation::current().to_string(),
+    )?;
+    super::install_journal::bootstrap::refuse_legacy(&manifest, &inventory)
+}
+
+pub(super) fn current_manifest() -> Result<PathBuf, String> {
+    Ok(load_current_inventory_root()?.join("installer-manifest.json"))
+}
+
+pub(super) fn unresumed_activation_refusal(path: &Path) -> Result<Option<String>, String> {
+    use super::install_journal::{Journal, Status};
+    Ok(match Journal::status(path)? {
+        Some(Status::Open | Status::NeedsCleanup) => Some(unfinished_install(path)),
+        Some(Status::Retired) | None => None,
+    })
+}
+
+fn unfinished_install(manifest: &Path) -> String {
+    format!("An install transaction needs recovery at {}; run ck setup or ck upgrade in a terminal first.", super::install_journal::Journal::path(manifest).display())
 }
 
 /// Refuse incomplete ownership before reporting currency or planning writes.
@@ -224,8 +310,9 @@ fn load_current_inventory_root() -> Result<PathBuf, String> {
         .join("cortexkit"))
 }
 
+/// A read-only view of the current inventory: see [`Inventory::load_snapshot`].
 fn load_current_inventory() -> Result<Inventory, String> {
-    Inventory::load(
+    Inventory::load_snapshot(
         load_current_inventory_root()?.join("installer-manifest.json"),
         super::model::PlatformObservation::current()
             .to_string()
@@ -414,8 +501,10 @@ pub fn observed_upgrade_targets(
 /// surface. Daemon activation deliberately uses the OS service manager rather
 /// than a supervisor restart request.
 pub struct SystemUpgradeBackend {
+    app_hold: Option<InstallHold>,
+    rollback_prompt: Option<journal::RollbackPrompt>,
     runner: Box<dyn super::runtime::CommandRunner>,
-    bundle_migration: Option<super::daemon_bundle::Migration>,
+    journal_activations: BTreeMap<String, usize>,
     core_cut: CoreCut,
     platform: AlphaTarget,
     targets: BTreeMap<String, ManagedUpgradeTarget>,
@@ -433,17 +522,8 @@ pub struct SystemUpgradeBackend {
     /// destination still holds the file this upgrade verified and placed, not a
     /// file something else put there in the meantime.
     activated_inodes: BTreeMap<String, String>,
-    rollback_paths: BTreeMap<String, PathBuf>,
-    rollback_archive_sha256: BTreeMap<String, Option<String>>,
     /// Missing later companions roll back to absence, not to a copied image.
     new_companions: BTreeSet<String>,
-    // A binary rollback must also restore its arguments: older daemons reject
-    // config-store-root, even if a newer daemon never became ready.
-    daemon_definition_snapshot: Option<super::runtime::DefinitionSnapshot>,
-    /// Per target, where Windows replacement moved the previous image while
-    /// its process kept running. The image is deleted once the upgrade of
-    /// that target is verified.
-    replaced_images: BTreeMap<String, PathBuf>,
     expected_versions: BTreeMap<String, String>,
     /// The planner's `from` per target, empty for a binary that prints its own
     /// crate version (see `version_transition`). The completion line renders
@@ -457,11 +537,9 @@ pub struct SystemUpgradeBackend {
 
 #[derive(Default)]
 struct CoreCut {
-    message_hub_change: Option<super::config::ConfigChange>,
     captured: bool,
     nats: Option<super::nats_migration::Migration>,
     deferred: BTreeSet<String>,
-    rolling_back: bool,
 }
 
 fn nats_companion(target: UpgradeTarget) -> bool {
@@ -513,17 +591,6 @@ impl Lines {
         }
     }
 
-    fn warn(&mut self, warning: String) {
-        match self.output {
-            UpgradeOutput::Terminal => {
-                eprintln!("{warning}");
-                #[cfg(test)]
-                self.printed.push(warning);
-            }
-            UpgradeOutput::Kept => self.kept.push(warning),
-        }
-    }
-
     fn completed(&mut self, line: String) {
         match self.output {
             UpgradeOutput::Terminal => {
@@ -537,6 +604,9 @@ impl Lines {
 }
 
 impl SystemUpgradeBackend {
+    pub(super) fn retain_app_hold(&mut self, hold: InstallHold) {
+        self.app_hold = Some(hold);
+    }
     fn capture_core_cut(&mut self, target: UpgradeTarget) -> Result<(), String> {
         if !target.is_daemon() && !nats_companion(target) {
             return Ok(());
@@ -564,6 +634,10 @@ impl SystemUpgradeBackend {
         Ok(())
     }
 
+    /// The backend that executes a plan. The caller must already hold the
+    /// install lock it took before discovering `targets` (see
+    /// [`lock_and_discover_upgrade_targets`]): the plan and everything this
+    /// backend does then come from one locked view of the install.
     pub fn new(
         executable: impl Into<PathBuf>,
         subc: Option<PathBuf>,
@@ -582,7 +656,21 @@ impl SystemUpgradeBackend {
             }
         };
         let data_dir = load_current_inventory_root()?;
-        let inventory = load_current_inventory()?;
+        let manifest = data_dir.join("installer-manifest.json");
+        if !super::install_lock::InstallHold::is_held(&manifest) {
+            return Err(
+                "internal: ck upgrade must take the install lock before it discovers what to upgrade"
+                    .into(),
+            );
+        }
+        let inventory = Inventory::load_locked(
+            manifest,
+            super::model::PlatformObservation::current()
+                .to_string()
+                .as_str(),
+            "ck upgrade",
+            super::install_lock::WAIT,
+        )?;
         tighten_upgrade_permissions(&data_dir, &inventory)?;
         let config_path = inventory
             .paths_for_kind("configuration")
@@ -612,13 +700,10 @@ impl SystemUpgradeBackend {
         config_path: impl Into<PathBuf>,
         targets: Vec<ManagedUpgradeTarget>,
         index: ReleaseIndex,
-        mut inventory: Inventory,
+        inventory: Inventory,
         output: UpgradeOutput,
     ) -> Self {
-        let mut lines = Lines::new(output);
-        for warning in managed_replace::sweep_replaced_images(&mut inventory) {
-            lines.warn(warning);
-        }
+        let lines = Lines::new(output);
         let expected_versions = targets
             .iter()
             .map(|item| {
@@ -642,8 +727,10 @@ impl SystemUpgradeBackend {
         Self {
             platform,
             runner: Box::new(crate::setup::runtime::SystemCommandRunner),
-            bundle_migration: None,
             core_cut: CoreCut::default(),
+            app_hold: None,
+            rollback_prompt: None,
+            journal_activations: BTreeMap::new(),
             targets: targets
                 .into_iter()
                 .map(|item| (item.target.label().to_string(), item))
@@ -655,11 +742,7 @@ impl SystemUpgradeBackend {
             inventory,
             prepared: BTreeMap::new(),
             activated_inodes: BTreeMap::new(),
-            rollback_paths: BTreeMap::new(),
-            rollback_archive_sha256: BTreeMap::new(),
             new_companions,
-            daemon_definition_snapshot: None,
-            replaced_images: BTreeMap::new(),
             expected_versions,
             planned_from: BTreeMap::new(),
             supervised_modules: BTreeSet::new(),
@@ -671,10 +754,6 @@ impl SystemUpgradeBackend {
     /// empty under [`UpgradeOutput::Terminal`], which printed them.
     pub fn take_warnings(&mut self) -> Vec<String> {
         std::mem::take(&mut self.lines.kept)
-    }
-
-    fn warn(&mut self, warning: String) {
-        self.lines.warn(warning);
     }
 
     pub fn set_supervised_modules(&mut self, modules: BTreeSet<String>) {
@@ -719,18 +798,6 @@ impl SystemUpgradeBackend {
         self.targets
             .get(target.label())
             .ok_or_else(|| format!("refusal: {target} is not a managed inventory target"))
-    }
-
-    fn target_mutable_paths(&self, target: UpgradeTarget) -> Result<(PathBuf, PathBuf), String> {
-        let destination = self.target(target)?.destination.clone();
-        let rollback = destination.with_extension(format!(
-            "{}.rollback",
-            destination
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .unwrap_or("ck-upgrade")
-        ));
-        Ok((destination, rollback))
     }
 
     fn ck_command(&self) -> Command {
@@ -922,7 +989,7 @@ impl SystemUpgradeBackend {
                 }
                 self.inventory
                     .record("binary-placement", destination, fields);
-                return self.inventory.save();
+                return Ok(());
             }
             return Err(format!(
                 "inventory no longer owns {target} destination {}; refusing to record replacement",
@@ -952,82 +1019,7 @@ impl SystemUpgradeBackend {
                 )?;
             }
         }
-        self.inventory.save()
-    }
-
-    fn place_candidate(
-        &mut self,
-        target: UpgradeTarget,
-        destination: &Path,
-        prepared: &PreparedUpgradeAsset,
-    ) -> Result<String, String> {
-        if target.is_self_replacing() {
-            let version = self.expected_version(target)?.to_string();
-            let evidence = self_update::replace_verified_candidate(
-                destination,
-                &prepared.candidate,
-                &prepared.archive_sha256,
-                &version,
-                &mut self.inventory,
-            )?;
-            self.activated_inodes
-                .insert(target.label().into(), destination_inode(destination)?);
-            return Ok(evidence.to_string());
-        }
-
-        let parent = destination.parent().ok_or_else(|| {
-            format!(
-                "managed destination {} has no parent",
-                destination.display()
-            )
-        })?;
-        file_modes::ensure_owned_directory(parent, 0o755)?;
-        let temporary = parent.join(format!(".{}.upgrade", target.label()));
-        file_modes::copy_file_with_mode(&prepared.candidate, &temporary, 0o755).map_err(
-            |error| {
-                format!(
-                    "could not place verified candidate at {}: {error}",
-                    temporary.display()
-                )
-            },
-        )?;
-        let aside = match managed_replace::place_staged_binary(
-            &temporary,
-            destination,
-            &mut self.inventory,
-        ) {
-            Ok(aside) => aside,
-            Err(error) => {
-                let _ = fs::remove_file(&temporary);
-                return Err(error);
-            }
-        };
-        let aside_note = aside
-            .as_ref()
-            .map(|aside| format!("; previous image moved aside to {}", aside.display()))
-            .unwrap_or_default();
-        if let Some(aside) = aside {
-            self.replaced_images.insert(target.label().into(), aside);
-        }
-        self.activated_inodes
-            .insert(target.label().into(), destination_inode(destination)?);
-        self.record_replacement_digest(target, destination, Some(&prepared.archive_sha256))?;
-        Ok(format!(
-            "destination replaced; inode={}{aside_note}",
-            destination_inode(destination)?
-        ))
-    }
-
-    fn discard_rollback_copy(&mut self, target: UpgradeTarget) {
-        if let Some(rollback) = self.rollback_paths.remove(target.label()) {
-            self.rollback_archive_sha256.remove(target.label());
-            if let Err(error) = fs::remove_file(&rollback) {
-                self.warn(format!(
-                    "warning: could not remove unused rollback copy {}: {error}",
-                    rollback.display()
-                ));
-            }
-        }
+        Ok(())
     }
 
     fn expected_version(&self, target: UpgradeTarget) -> Result<&str, String> {
@@ -1036,58 +1028,45 @@ impl SystemUpgradeBackend {
             .map(String::as_str)
             .ok_or_else(|| format!("no expected release version recorded for {target}"))
     }
-
-    fn place_daemon_bundle(
-        &mut self,
-        target: UpgradeTarget,
-        prepared: &PreparedUpgradeAsset,
-    ) -> Result<String, String> {
-        let old = self.target(target)?.destination.clone();
-        let home = super::daemon_bundle::binary_home(&old)?;
-        let mut paths = if let Some(snapshot) = &self.daemon_definition_snapshot {
-            snapshot.paths().clone()
-        } else {
-            super::runtime::runtime_paths(
-                super::runtime::RuntimePlatform::Macos,
-                &home,
-                &super::apply::user_home()?,
-            )
-        };
-        paths.daemon = super::daemon_bundle::executable(&home);
-        let mut migration =
-            super::daemon_bundle::Migration::capture(&paths, &old, &self.inventory)?;
-        let replacement =
-            super::daemon_bundle::Replacement::place(&prepared.candidate, &home, &mut self.runner)?;
-        migration.attach(replacement);
-        let destination = paths.daemon;
-        self.bundle_migration = Some(migration);
-        self.targets.get_mut(target.label()).unwrap().destination = destination.clone();
-        if old != destination {
-            for kind in super::components::OWNED_BINARY_KINDS {
-                if let Some(fields) = self
-                    .inventory
-                    .entry_for_path(kind, &old)
-                    .and_then(Value::as_object)
-                    .cloned()
-                {
-                    self.inventory.record(kind, &destination, fields);
-                }
-            }
-        }
-        let result = (|| {
-            self.activated_inodes
-                .insert(target.label().into(), destination_inode(&destination)?);
-            self.record_replacement_digest(target, &destination, Some(&prepared.archive_sha256))?;
-            Ok("verified daemon bundle replaced as a unit".into())
-        })();
-        if result.is_err() {
-            self.rollback(target)?;
-        }
-        result
-    }
 }
 
 impl UpgradeExecutionBackend for SystemUpgradeBackend {
+    fn pause_rollback_prompt(&mut self) -> Result<(), String> {
+        self.pause_app_rollback()
+    }
+
+    fn resume_rollback_prompt(&mut self, decision: RollbackDecision) -> Result<(), String> {
+        self.resume_app_rollback(decision)
+            .inspect_err(|error| self.lines.kept.push(error.clone()))
+    }
+    fn abort_before_activation(&mut self) -> Result<bool, String> {
+        if !super::install_lock::InstallHold::is_held(self.inventory.manifest()) {
+            return Ok(false);
+        }
+        if self.inventory.transaction_is_open() {
+            self.close_upgrade_journal(false)?;
+        }
+        Ok(true)
+    }
+    fn leave_unconfirmed(&mut self, _target: UpgradeTarget) -> Result<(), String> {
+        self.inventory.leave_transaction_unconfirmed()
+    }
+
+    fn finish_verified(&mut self, target: UpgradeTarget) -> Result<(), String> {
+        if self.inventory.transaction().is_none() || nats_companion(target) {
+            return Ok(());
+        }
+        self.verify_journal_activation(target)?;
+        if target.is_daemon() {
+            self.retire_flat_daemon()?;
+            if let Some(nats) = self.core_cut.nats.as_mut() {
+                nats.complete(&mut self.inventory)?;
+            }
+            self.core_cut.nats = None;
+        }
+        self.close_upgrade_journal(true)
+    }
+
     fn configure_message_hub(&mut self, target: UpgradeTarget) -> Result<(bool, String), String> {
         let home = super::daemon_bundle::binary_home(&self.target(target)?.destination)?;
         let data_dir = home
@@ -1100,8 +1079,15 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
         if let Some(change) =
             super::message_plane::plan_hub(&self.config_path, &home, data_dir, &connection)?
         {
-            super::config::apply(&change)?;
-            self.core_cut.message_hub_change = Some(change);
+            let independent = self.inventory.transaction().is_none()
+                && super::install_lock::InstallHold::is_held(self.inventory.manifest());
+            if independent {
+                self.inventory.start_transaction()?;
+            }
+            super::config::apply_recorded(&change, &mut self.inventory)?;
+            if independent {
+                self.close_upgrade_journal(true)?;
+            }
             let detail = "Installed idle nats-hub entry".to_string();
             self.lines.completed(detail.clone());
             Ok((true, detail))
@@ -1127,17 +1113,14 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
         Ok((changed, detail))
     }
     fn failure_rollback_target(&self) -> Option<UpgradeTarget> {
-        if !self.core_cut.captured || self.core_cut.rolling_back {
+        if !self.inventory.transaction_is_open() {
             return None;
         }
         self.targets
             .values()
+            .filter(|item| self.activated_inodes.contains_key(item.target.label()))
             .map(|item| item.target)
-            .filter(|t| {
-                (t.is_daemon() || nats_companion(*t))
-                    && self.activated_inodes.contains_key(t.label())
-            })
-            .min_by_key(|t| !t.is_daemon())
+            .min_by_key(|target| !target.is_daemon())
     }
     fn download_and_verify(&mut self, target: UpgradeTarget) -> Result<String, String> {
         let prepared = if self.platform == AlphaTarget::DarwinArm64 && target.is_daemon() {
@@ -1158,47 +1141,14 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
 
     fn create_rollback_copy(&mut self, target: UpgradeTarget) -> Result<String, String> {
         self.capture_core_cut(target)?;
-        if self.platform == AlphaTarget::DarwinArm64 && target.is_daemon() {
-            if !self.target(target)?.destination.is_file() {
-                return Err("installed daemon is missing".into());
-            }
-            return Ok(
-                "the verified replacement will retain the previous bundle or bare daemon".into(),
-            );
+        if self.inventory.transaction().is_none() {
+            self.inventory.start_transaction()?;
         }
-        let (destination, rollback) = self.target_mutable_paths(target)?;
-        if self.new_companions.contains(target.label()) {
-            match fs::symlink_metadata(&destination) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok("new companion; rollback restores absence".into());
-                }
-                _ => {
-                    return Err(format!(
-                        "refusal: new companion destination is occupied: {}",
-                        destination.display()
-                    ))
-                }
-            }
-        }
-        let prior_inode = destination_inode(&destination)?;
-        file_modes::copy_file_with_mode(&destination, &rollback, 0o755).map_err(|error| {
-            format!(
-                "could not create rollback copy {} from {}: {error}",
-                rollback.display(),
-                destination.display()
-            )
-        })?;
-        self.rollback_paths
-            .insert(target.label().to_string(), rollback);
-        self.rollback_archive_sha256.insert(
-            target.label().to_string(),
-            inventory_string(&self.inventory, &destination, "archive_sha256"),
-        );
-        Ok(format!("rollback copy created; prior inode={prior_inode}"))
+        Ok("previous image retained by the install journal at replacement".into())
     }
 
     fn replace_destination(&mut self, target: UpgradeTarget) -> Result<String, String> {
-        let (destination, _) = self.target_mutable_paths(target)?;
+        let destination = self.target(target)?.destination.clone();
         if self.new_companions.contains(target.label())
             && fs::symlink_metadata(&destination).is_ok()
         {
@@ -1211,43 +1161,8 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
             .prepared
             .remove(target.label())
             .ok_or_else(|| format!("no verified candidate was prepared for {target}"))?;
-        if self.platform == AlphaTarget::DarwinArm64 && target.is_daemon() {
-            let result = self.place_daemon_bundle(target, &prepared);
-            prepared.cleanup();
-            return result.and_then(|detail| {
-                if let Some(nats) = self.core_cut.nats.as_mut() {
-                    nats.apply()?;
-                }
-                Ok(detail)
-            });
-        }
-        let prior_identity = destination_inode(&destination).ok();
-        let result = self
-            .place_candidate(target, &destination, &prepared)
-            .and_then(|detail| {
-                if target.is_daemon() {
-                    if let Some(nats) = self.core_cut.nats.as_mut() {
-                        nats.apply()?;
-                    }
-                }
-                Ok(detail)
-            });
+        let result = self.journal_place(target, &destination, &prepared);
         prepared.cleanup();
-        if result.is_err()
-            && self.new_companions.contains(target.label())
-            && self.activated_inodes.contains_key(target.label())
-        {
-            self.rollback(target)?;
-        }
-        if result.is_err()
-            && prior_identity.is_some()
-            && destination_inode(&destination).ok() == prior_identity
-        {
-            // The destination still holds the binary it held before, so the
-            // rollback copy this run made of it is not needed. Removing it
-            // leaves the bin directory exactly as this run found it.
-            self.discard_rollback_copy(target);
-        }
         result
     }
 
@@ -1313,31 +1228,20 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
         &mut self,
         drain_timeout: Duration,
     ) -> Result<String, String> {
-        if let Some(migration) = &self.bundle_migration {
-            migration.activate(&mut self.runner, &mut self.inventory, self.subc.as_deref())?;
-            return Ok(format!(
-                "daemon bundle activated; drain budget={}s",
-                drain_timeout.as_secs()
-            ));
-        }
+        let paths = self.runtime_paths()?;
         let platform = super::runtime::RuntimePlatform::current();
-        let root = load_current_inventory_root()?;
-        let paths =
-            super::runtime::runtime_paths(platform, &root.join("bin"), &super::apply::user_home()?);
-        if self.daemon_definition_snapshot.is_none() {
-            self.daemon_definition_snapshot = Some(super::runtime::DefinitionSnapshot::capture(
-                platform, &paths,
-            )?);
-        }
-        let detail = super::runtime::restart_with_definition_at(
+        let mut recovery = super::install_journal::system::SystemRecovery {
+            executable: &self.executable,
+            connection: self.subc.as_deref(),
             platform,
-            &paths,
-            &mut self.runner,
-            &mut self.inventory,
-            self.subc.as_deref(),
-        )?;
+            paths: &paths,
+            runner: &mut self.runner,
+        };
+        recovery.service().install(&mut self.inventory)?;
+        let mut control = recovery.control(&paths.daemon, None);
+        super::install_journal::activation::Control::restart(&mut control, None)?;
         Ok(format!(
-            "{detail}; drain budget={}s",
+            "restarted daemon through the service manager; drain budget={}s",
             drain_timeout.as_secs()
         ))
     }
@@ -1349,8 +1253,11 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
         let started = Instant::now();
         let platform = super::runtime::RuntimePlatform::current();
         let root = load_current_inventory_root()?;
-        let paths =
-            super::runtime::runtime_paths(platform, &root.join("bin"), &super::apply::user_home()?);
+        let paths = super::runtime::session_runtime_paths(
+            platform,
+            &root.join("bin"),
+            &super::apply::user_home()?,
+        );
         super::runtime::wait_for_service_ready(
             platform,
             &paths,
@@ -1460,15 +1367,6 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
             return;
         }
         if target.is_daemon() {
-            self.core_cut.message_hub_change = None;
-            if let Some(nats) = self.core_cut.nats.as_mut() {
-                if let Err(error) = nats.complete(&mut self.inventory) {
-                    self.warn(format!(
-                        "warning: NATS verified but legacy cleanup failed: {error}"
-                    ));
-                    return;
-                }
-            }
             let cut = std::mem::take(&mut self.core_cut);
             for label in cut.deferred {
                 if let Some(item) = self.targets.get(&label) {
@@ -1476,53 +1374,11 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
                 }
             }
         }
-        if target.is_daemon() {
-            if let Some(mut migration) = self.bundle_migration.take() {
-                if let Err(error) = migration.complete(&mut self.inventory) {
-                    self.warn(format!(
-                        "warning: daemon verified but bundle cleanup failed: {error}"
-                    ));
-                    self.bundle_migration = Some(migration);
-                }
-            }
-        }
-        if target.is_daemon() {
-            self.daemon_definition_snapshot = None;
-        }
-        // Failed targets keep their recovery evidence; a verified completed
-        // replacement no longer needs a private copy of the previous image.
-        if let Some(path) = self.rollback_paths.get(target.label()).cloned() {
-            match fs::remove_file(&path) {
-                Ok(()) => {
-                    self.rollback_paths.remove(target.label());
-                    self.rollback_archive_sha256.remove(target.label());
-                }
-                Err(error) => self.warn(format!(
-                    "warning: upgrade completed but could not remove rollback copy {}: {error}",
-                    path.display()
-                )),
-            }
-        }
-        // By now the restarted process runs the new image, so the previous
-        // one is normally free to delete. If its process is still exiting,
-        // the inventory row stays and the next ck setup or ck upgrade
-        // deletes it.
-        if let Some(aside) = self.replaced_images.remove(target.label()) {
-            if let Err(error) = managed_replace::remove_replaced_image(&mut self.inventory, &aside)
-            {
-                self.warn(format!(
-                    "warning: upgrade completed but {error}; a later ck setup or ck upgrade removes it"
-                ));
-            }
-        }
         let line = self.completion_line(target);
         self.lines.completed(line);
     }
 
     fn rollback_decision(&mut self, _target: UpgradeTarget) -> RollbackDecision {
-        if self.failure_rollback_target().is_some() {
-            return RollbackDecision::Accepted;
-        }
         match env::var("CK_UPGRADE_ROLLBACK") {
             Ok(value) if matches!(value.as_str(), "accept" | "accepted" | "yes") => {
                 RollbackDecision::Accepted
@@ -1531,191 +1387,10 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
         }
     }
 
-    fn rollback(&mut self, target: UpgradeTarget) -> Result<String, String> {
-        if target.is_daemon() || nats_companion(target) {
-            if let Some(change) = self.core_cut.message_hub_change.take() {
-                super::message_plane::rollback_hub(&change)?;
-            }
-        }
-        if !self.core_cut.rolling_back
-            && self.core_cut.captured
-            && (target.is_daemon() || nats_companion(target))
-        {
-            if let Some(nats) = self.core_cut.nats.as_mut() {
-                nats.rollback(&mut self.inventory)?;
-            }
-            self.core_cut.rolling_back = true;
-            let mut targets = self
-                .targets
-                .values()
-                .map(|item| item.target)
-                .filter(|t| {
-                    (t.is_daemon() || nats_companion(*t))
-                        && self.activated_inodes.contains_key(t.label())
-                })
-                .collect::<Vec<_>>();
-            targets.sort_by_key(|t| !t.is_daemon());
-            let result = targets
-                .into_iter()
-                .try_for_each(|t| self.rollback(t).map(|_| ()));
-            self.core_cut.rolling_back = false;
-            result?;
-            self.core_cut = CoreCut::default();
-            return Ok(
-                "accepted; restored daemon, NATS entry and previous companion binaries".into(),
-            );
-        }
-        if target.is_daemon() {
-            if let Some(mut migration) = self.bundle_migration.take() {
-                let old = migration.old_destination().to_path_buf();
-                if let Err(error) =
-                    migration.rollback(&mut self.runner, &mut self.inventory, self.subc.as_deref())
-                {
-                    self.bundle_migration = Some(migration);
-                    return Err(error);
-                }
-                self.targets.get_mut(target.label()).unwrap().destination = old;
-                self.daemon_definition_snapshot = None;
-                self.activated_inodes.remove(target.label());
-                return Ok(
-                    "accepted; restored previous daemon installation and launch agent".into(),
-                );
-            }
-        }
-        let destination = self.target(target)?.destination.clone();
-        if self.new_companions.contains(target.label()) {
-            if self.activated_inodes.get(target.label()) != Some(&destination_inode(&destination)?)
-            {
-                return Err(format!(
-                    "refusal: new companion {target} changed before rollback"
-                ));
-            }
-            fs::remove_file(&destination)
-                .map_err(|error| format!("could not remove new companion {target}: {error}"))?;
-            self.inventory
-                .remove_owned_path("binary-placement", &destination);
-            self.inventory.save()?;
-            self.activated_inodes.remove(target.label());
-            return Ok("accepted; removed newly installed companion".into());
-        }
-        let rollback = self
-            .rollback_paths
-            .get(target.label())
-            .ok_or_else(|| format!("no rollback copy exists for {target}"))?
-            .clone();
-        #[cfg(unix)]
-        let moved_aside = if target.is_self_replacing() {
-            super::self_update_unix::replace_verified_candidate(&destination, &rollback)?;
-            file_modes::set_new_file_mode(&destination, 0o755)?;
-            None
-        } else {
-            restore_rollback_by_rename(&rollback, &destination, &mut self.inventory, false)?
-        };
-        // Windows refuses to rename over the image of a running process, and
-        // a rollback usually follows a new image that did start, so the new
-        // image is moved aside first. Its process keeps running from there;
-        // the next ck setup or ck upgrade deletes the file once it is free.
-        #[cfg(not(unix))]
-        let moved_aside = restore_rollback_by_rename(
-            &rollback,
-            &destination,
-            &mut self.inventory,
-            cfg!(windows),
-        )?;
-        let previous_archive = self
-            .rollback_archive_sha256
-            .remove(target.label())
-            .flatten();
-        self.record_replacement_digest(target, &destination, previous_archive.as_deref())?;
-        if target.is_daemon() {
-            if let Some(snapshot) = &self.daemon_definition_snapshot {
-                snapshot.restore(&mut self.runner, &mut self.inventory, self.subc.as_deref())?;
-                self.daemon_definition_snapshot = None;
-            }
-        }
-        // Restoring `ck` changes its bytes as much as replacing it did, so a
-        // Windows `ckni.exe` copy is rewritten to the restored `ck` too.
-        let ckni_note = if target.is_self_replacing() {
-            super::ckni::refresh_after_ck_replacement(
-                &destination,
-                &mut self.inventory,
-                super::ckni::Mechanism::CURRENT,
-            )?
-        } else {
-            String::new()
-        };
-        fs::remove_file(&rollback).map_err(|error| {
-            format!(
-                "restored {} but could not remove rollback copy {}: {error}",
-                destination.display(),
-                rollback.display()
-            )
-        })?;
-        self.rollback_paths.remove(target.label());
-        self.activated_inodes.remove(target.label());
-        let aside_note = moved_aside
-            .map(|aside| {
-                format!(
-                    "; the replaced image was moved aside to {} until its process exits",
-                    aside.display()
-                )
-            })
-            .unwrap_or_default();
-        Ok(format!(
-            "accepted; restored prior binary at inode={}{aside_note}{ckni_note}",
-            destination_inode(&destination)?
-        ))
+    fn rollback(&mut self, _target: UpgradeTarget) -> Result<String, String> {
+        self.close_upgrade_journal(false)?;
+        Ok("restored the previous installation from the install journal".into())
     }
-}
-
-/// Copies the rollback copy beside `destination` and renames it into place,
-/// through the same step as a forward replacement: with `move_previous_aside`
-/// (Windows) the image at the destination is first moved aside and recorded
-/// for a later sweep, and the aside path is returned. The rollback copy itself
-/// is left for the caller to remove.
-fn restore_rollback_by_rename(
-    rollback: &Path,
-    destination: &Path,
-    inventory: &mut Inventory,
-    move_previous_aside: bool,
-) -> Result<Option<PathBuf>, String> {
-    let parent = destination
-        .parent()
-        .ok_or_else(|| format!("{} has no parent", destination.display()))?;
-    let temporary = parent.join(format!(
-        ".{}.restore-{}-{}",
-        destination
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy(),
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|error| error.to_string())?
-            .as_nanos()
-    ));
-    let result = (|| {
-        #[cfg(unix)]
-        file_modes::copy_file_with_mode(rollback, &temporary, 0o755)
-            .map_err(|error| format!("could not stage rollback {}: {error}", rollback.display()))?;
-        #[cfg(not(unix))]
-        {
-            fs::copy(rollback, &temporary).map_err(|error| {
-                format!("could not stage rollback {}: {error}", rollback.display())
-            })?;
-            let permissions = fs::metadata(rollback)
-                .map_err(|error| format!("could not read rollback mode: {error}"))?
-                .permissions();
-            fs::set_permissions(&temporary, permissions)
-                .map_err(|error| format!("could not restore rollback mode: {error}"))?;
-        }
-        managed_replace::place_with(&temporary, destination, inventory, move_previous_aside)
-            .map_err(|error| format!("could not put the rollback copy in place: {error}"))
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
 }
 
 pub fn render_execution_report(report: &UpgradeExecutionReport) {
@@ -1783,20 +1458,18 @@ fn process_id() -> u32 {
 
 #[cfg(test)]
 pub(super) mod tests {
-    include!("upgrade/nats_tests.rs");
-    #[cfg(target_os = "macos")]
-    include!("upgrade/bundle_tests.rs");
     use serde_json::Map;
     #[cfg(unix)]
     use serde_json::Value;
 
     use super::*;
     #[cfg(unix)]
-    use crate::setup::test_exec::{copy_executable, write_executable};
+    use crate::setup::test_exec::write_executable;
     use crate::setup::{components::ReleaseArtifactSource, planner::plan_upgrade};
+    #[cfg(unix)]
     use cortexkit_test_support::ScratchDir;
 
-    fn upgrade_target(binary: &str) -> UpgradeTarget {
+    pub(super) fn upgrade_target(binary: &str) -> UpgradeTarget {
         upgrade_roster(Component::ALL)
             .into_iter()
             .find(|target| target.label() == binary)
@@ -1806,7 +1479,7 @@ pub(super) mod tests {
     // Used only by the unix-gated tests below; gate it with them so windows
     // clippy under -D warnings does not read it as dead code.
     #[cfg(unix)]
-    fn fixture_dir(name: &str) -> ScratchDir {
+    pub(super) fn fixture_dir(name: &str) -> ScratchDir {
         ScratchDir::new(name)
     }
 
@@ -1886,8 +1559,10 @@ pub(super) mod tests {
         SystemUpgradeBackend {
             platform: AlphaTarget::LinuxX64,
             runner: Box::new(crate::setup::runtime::SystemCommandRunner),
-            bundle_migration: None,
             core_cut: CoreCut::default(),
+            app_hold: None,
+            rollback_prompt: None,
+            journal_activations: BTreeMap::new(),
             targets: [(
                 target.label().to_string(),
                 ManagedUpgradeTarget {
@@ -1916,11 +1591,7 @@ pub(super) mod tests {
             )]
             .into_iter()
             .collect(),
-            rollback_paths: BTreeMap::new(),
-            rollback_archive_sha256: BTreeMap::new(),
             new_companions: BTreeSet::new(),
-            daemon_definition_snapshot: None,
-            replaced_images: BTreeMap::new(),
             expected_versions: [(target.label().to_string(), "0.1.0".into())]
                 .into_iter()
                 .collect(),
@@ -1931,7 +1602,11 @@ pub(super) mod tests {
     }
 
     #[cfg(unix)]
-    fn daemon_build_backend(root: &Path, disk: Value, running: Value) -> SystemUpgradeBackend {
+    pub(super) fn daemon_build_backend(
+        root: &Path,
+        disk: Value,
+        running: Value,
+    ) -> SystemUpgradeBackend {
         write_executable(&root.join("ck-subc"), format!(
             "#!/bin/sh\nif [ \"$1\" = --build-info ]; then\n  echo '{disk}'\nelse\n  echo 'ck-subc 0.20.83'\nfi\n"
         ).as_bytes());
@@ -1964,7 +1639,7 @@ pub(super) mod tests {
     }
 
     #[cfg(unix)]
-    fn core_build(sha: Option<&str>, lock: Option<&str>) -> Value {
+    pub(super) fn core_build(sha: Option<&str>, lock: Option<&str>) -> Value {
         serde_json::json!({"core_version": "0.20.83", "build_git_sha": sha, "build_lock_digest": lock})
     }
 
@@ -2084,21 +1759,6 @@ pub(super) mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn successful_upgrade_completion_removes_its_rollback_copy() {
-        let root = ScratchDir::new("upgrade-completed-rollback");
-        let target = upgrade_target("ck-mc");
-        version_binary(&root.join("ck-mc"), "0.1.0");
-        let mut backend = isolated_backend(&root, target);
-        backend.create_rollback_copy(target).unwrap();
-        let path = backend.rollback_paths.get(target.label()).unwrap().clone();
-        assert!(path.is_file());
-        backend.completed(target);
-        assert!(!path.exists(), "{}", path.display());
-        assert!(!backend.rollback_paths.contains_key(target.label()));
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn post_verification_rejects_a_destination_changed_after_replacement() {
         let root = ScratchDir::new("changed-post-inode");
         let target = upgrade_target("ck-mc");
@@ -2116,6 +1776,7 @@ pub(super) mod tests {
             target.label().into(),
             PreparedUpgradeAsset::test_candidate(candidate, target),
         );
+        backend.create_rollback_copy(target).unwrap();
         backend.replace_destination(target).unwrap();
         assert!(backend.post_verify(target).is_ok());
         let rogue = root.join("rogue");
@@ -2143,8 +1804,10 @@ pub(super) mod tests {
         SystemUpgradeBackend {
             platform: AlphaTarget::LinuxX64,
             runner: Box::new(crate::setup::runtime::SystemCommandRunner),
-            bundle_migration: None,
             core_cut: CoreCut::default(),
+            app_hold: None,
+            rollback_prompt: None,
+            journal_activations: BTreeMap::new(),
             targets: BTreeMap::from([(
                 target.label().to_string(),
                 ManagedUpgradeTarget {
@@ -2166,11 +1829,7 @@ pub(super) mod tests {
             inventory,
             prepared: BTreeMap::new(),
             activated_inodes: BTreeMap::new(),
-            rollback_paths: BTreeMap::new(),
-            rollback_archive_sha256: BTreeMap::new(),
             new_companions: BTreeSet::new(),
-            daemon_definition_snapshot: None,
-            replaced_images: BTreeMap::new(),
             expected_versions: BTreeMap::from([(target.label().to_string(), "0.2.0".into())]),
             planned_from: BTreeMap::new(),
             supervised_modules: BTreeSet::new(),
@@ -2196,297 +1855,6 @@ pub(super) mod tests {
         );
     }
 
-    fn directory_entries(directory: &Path) -> Vec<String> {
-        let mut names = fs::read_dir(directory)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        names.sort();
-        names
-    }
-
-    #[test]
-    fn upgrade_refuses_a_ckni_beside_ck_that_setup_did_not_install() {
-        use crate::setup::ckni::{link_path, CKNI_KIND};
-        let root = ScratchDir::new("upgrade-ckni-unowned");
-        let bin = root.join("bin");
-        let cmd = root.join("cmd");
-        fs::create_dir(&bin).unwrap();
-        fs::create_dir(&cmd).unwrap();
-        let ck = cmd.join(if cfg!(windows) { "ck.exe" } else { "ck" });
-        fs::write(&ck, "ck").unwrap();
-        let mut inventory =
-            Inventory::load(root.join("installer-manifest.json"), "linux-x64").unwrap();
-        inventory.record("managed-binary", &ck, Map::new());
-        let discovered = [ManagedUpgradeTarget {
-            target: upgrade_target("ck"),
-            destination: ck.clone(),
-            installed_version: "0.1.0".into(),
-            installed_archive_sha256: None,
-        }];
-        let outcomes =
-            |inventory: &Inventory| ownership_outcomes(&ck, &discovered, inventory, &bin);
-        assert!(outcomes(&inventory).is_empty());
-
-        let ckni = link_path(&ck);
-        fs::write(&ckni, "someone else's ckni").unwrap();
-        assert_eq!(
-            outcomes(&inventory),
-            [crate::setup::PlanOutcome::Refusal {
-                reason: crate::setup::text::upgrade_unowned_binaries_refusal(std::slice::from_ref(
-                    &ckni
-                )),
-            }]
-        );
-
-        inventory.record(CKNI_KIND, &ckni, Map::new());
-        assert!(outcomes(&inventory).is_empty());
-    }
-
-    #[test]
-    fn a_replacement_refused_before_the_destination_changed_leaves_the_bin_directory_as_found() {
-        let root = ScratchDir::new("upgrade-refused-replacement");
-        let bin = root.join("bin");
-        fs::create_dir(&bin).unwrap();
-        let target = upgrade_target("ck-aft");
-        let destination = bin.join("ckdev-aft.exe");
-        fs::write(&destination, "original image").unwrap();
-        let mut backend = managed_backend(&root, target, &destination);
-        stage_candidate(&mut backend, &root, target, b"verified candidate");
-        let found = directory_entries(&bin);
-
-        backend.create_rollback_copy(target).unwrap();
-        let rollback = backend.rollback_paths[target.label()].clone();
-        assert!(rollback.is_file(), "{}", rollback.display());
-        // The staged candidate is the file whose rename is refused, the way
-        // Windows refuses to replace the image of a running process.
-        let _refusal = managed_replace::test_seam::refuse_rename_from(&bin.join(".ck-aft.upgrade"));
-        let error = backend
-            .replace_destination(target)
-            .expect_err("the refused rename fails the replacement");
-
-        assert!(error.contains("rename refused by test"), "{error}");
-        assert_eq!(fs::read(&destination).unwrap(), b"original image");
-        assert_eq!(
-            directory_entries(&bin),
-            found,
-            "no staging file, rollback copy or moved-aside image may remain"
-        );
-        assert!(!backend.rollback_paths.contains_key(target.label()));
-        assert!(backend
-            .inventory
-            .paths_for_kind(managed_replace::REPLACED_IMAGE_KIND)
-            .is_empty());
-    }
-
-    /// Starts a copy of this test binary at `destination` that keeps running,
-    /// standing in for a daemon or module the upgrade has not restarted yet.
-    #[cfg(windows)]
-    fn start_running_image(destination: &Path) -> std::process::Child {
-        fs::copy(std::env::current_exe().unwrap(), destination).unwrap();
-        let mut child = cortexkit_test_support::dev_command(destination)
-            .args([
-                "--exact",
-                "setup::upgrade::tests::rollback_stand_in_holds_until_killed",
-                "--test-threads=1",
-            ])
-            .env(ROLLBACK_HOLD_ENV, "1")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
-        // A stand-in that exited at once would prove nothing about replacing a
-        // running image, so fail loudly instead.
-        std::thread::sleep(Duration::from_millis(500));
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "the stand-in for the running managed binary exited before the replacement"
-        );
-        child
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_replacement_moves_a_running_image_aside() {
-        let root = ScratchDir::new("upgrade-running-image");
-        let bin = root.join("bin");
-        fs::create_dir(&bin).unwrap();
-        let target = upgrade_target("ck-aft");
-        let destination = bin.join("ckdev-aft.exe");
-        let mut child = start_running_image(&destination);
-        let mut backend = managed_backend(&root, target, &destination);
-        stage_candidate(&mut backend, &root, target, b"verified candidate");
-        backend.create_rollback_copy(target).unwrap();
-
-        let result = backend.replace_destination(target);
-        let still_running = child.try_wait().unwrap().is_none();
-        let destination_bytes = fs::read(&destination);
-        let staging_left = bin.join(".ck-aft.upgrade").exists();
-        child.kill().unwrap();
-        child.wait().unwrap();
-
-        result.expect("replacing a running image succeeds");
-        assert!(
-            still_running,
-            "the old process keeps running from the aside file"
-        );
-        assert_eq!(destination_bytes.unwrap(), b"verified candidate");
-        assert!(
-            !staging_left,
-            "the staging file was renamed onto the destination"
-        );
-        let aside = backend.replaced_images[target.label()].clone();
-        assert!(aside.is_file(), "{}", aside.display());
-
-        // With the old process gone, completion deletes the aside image and
-        // the rollback copy. Windows can release an exited image a moment
-        // late; the sweep a later ck setup or ck upgrade runs covers that.
-        backend.completed(target);
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while aside.exists() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(100));
-            // A still-held image only warns; the loop retries it.
-            let _ = managed_replace::sweep_replaced_images(&mut backend.inventory);
-        }
-        assert_eq!(directory_entries(&bin), ["ckdev-aft.exe"]);
-        assert!(backend
-            .inventory
-            .paths_for_kind(managed_replace::REPLACED_IMAGE_KIND)
-            .is_empty());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_refused_replacement_moves_the_running_image_back() {
-        let root = ScratchDir::new("upgrade-running-image-restored");
-        let bin = root.join("bin");
-        fs::create_dir(&bin).unwrap();
-        let target = upgrade_target("ck-aft");
-        let destination = bin.join("ckdev-aft.exe");
-        let mut child = start_running_image(&destination);
-        let original = fs::read(&destination).unwrap();
-        let mut backend = managed_backend(&root, target, &destination);
-        stage_candidate(&mut backend, &root, target, b"verified candidate");
-        backend.create_rollback_copy(target).unwrap();
-
-        let _refusal = managed_replace::test_seam::refuse_rename_from(&bin.join(".ck-aft.upgrade"));
-        let result = backend.replace_destination(target);
-        let still_running = child.try_wait().unwrap().is_none();
-        let destination_bytes = fs::read(&destination);
-        let entries = directory_entries(&bin);
-        child.kill().unwrap();
-        child.wait().unwrap();
-
-        let error = result.expect_err("the refused rename fails the replacement");
-        assert!(error.contains("rename refused by test"), "{error}");
-        assert!(!error.contains("additionally"), "{error}");
-        assert!(still_running, "the running process is left alone");
-        assert_eq!(destination_bytes.unwrap(), original);
-        assert_eq!(
-            entries,
-            ["ckdev-aft.exe"],
-            "the image is back under its name and nothing else is left"
-        );
-        assert!(backend
-            .inventory
-            .paths_for_kind(managed_replace::REPLACED_IMAGE_KIND)
-            .is_empty());
-    }
-
-    /// The rollback goes through the same aside step as the forward
-    /// replacement. Forced on here so it runs on every platform; Windows takes
-    /// this path for real.
-    #[test]
-    fn rollback_restore_moves_the_replaced_image_aside_and_records_it() {
-        let root = ScratchDir::new("rollback-restore-aside");
-        let bin = root.join("bin");
-        fs::create_dir(&bin).unwrap();
-        let destination = bin.join("ckdev-aft.exe");
-        let rollback = bin.join("ckdev-aft.exe.rollback");
-        fs::write(&destination, "new image").unwrap();
-        fs::write(&rollback, "previous image").unwrap();
-        let mut inventory =
-            Inventory::load(root.join("installer-manifest.json"), "windows-x64").unwrap();
-
-        let aside = restore_rollback_by_rename(&rollback, &destination, &mut inventory, true)
-            .unwrap()
-            .expect("the replaced image is moved aside");
-
-        assert_eq!(fs::read(&destination).unwrap(), b"previous image");
-        assert_eq!(fs::read(&aside).unwrap(), b"new image");
-        assert!(inventory.owns_path(managed_replace::REPLACED_IMAGE_KIND, &aside));
-        let mut expected = vec![
-            aside.file_name().unwrap().to_string_lossy().into_owned(),
-            "ckdev-aft.exe".to_string(),
-            "ckdev-aft.exe.rollback".to_string(),
-        ];
-        expected.sort();
-        assert_eq!(
-            directory_entries(&bin),
-            expected,
-            "the staged copy was renamed into place; the rollback copy is the caller's to remove"
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_rollback_moves_the_running_new_image_aside() {
-        let root = ScratchDir::new("rollback-running-image");
-        let bin = root.join("bin");
-        fs::create_dir(&bin).unwrap();
-        let target = upgrade_target("ck-aft");
-        let destination = bin.join("ckdev-aft.exe");
-        // The new image is running: the restarted module started but failed
-        // verification, and the operator accepted the rollback.
-        let mut child = start_running_image(&destination);
-        let mut backend = managed_backend(&root, target, &destination);
-        let rollback = bin.join("ckdev-aft.exe.rollback");
-        fs::write(&rollback, "previous release").unwrap();
-        backend
-            .rollback_paths
-            .insert(target.label().into(), rollback.clone());
-
-        let result = backend.rollback(target);
-        let still_running = child.try_wait().unwrap().is_none();
-        let destination_bytes = fs::read(&destination);
-        let recorded = backend
-            .inventory
-            .paths_for_kind(managed_replace::REPLACED_IMAGE_KIND);
-        child.kill().unwrap();
-        child.wait().unwrap();
-
-        let detail = result.expect("rolling back over a running image succeeds");
-        assert!(detail.contains("moved aside"), "{detail}");
-        assert!(
-            still_running,
-            "the new process keeps running from the aside file"
-        );
-        assert_eq!(destination_bytes.unwrap(), b"previous release");
-        assert!(!rollback.exists(), "a completed rollback removes its copy");
-        let [aside] = recorded.as_slice() else {
-            panic!("exactly one moved-aside image is recorded: {recorded:?}");
-        };
-        assert!(aside.is_file(), "{}", aside.display());
-
-        // With its process gone, the sweep a later ck setup or ck upgrade
-        // runs deletes the moved-aside image. Windows can release an exited
-        // image a moment late, so the sweep is retried briefly.
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while aside.exists() && Instant::now() < deadline {
-            // A still-held image only warns; the loop retries it.
-            let _ = managed_replace::sweep_replaced_images(&mut backend.inventory);
-            if aside.exists() {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        }
-        assert!(!aside.exists(), "{}", aside.display());
-        assert_eq!(directory_entries(&bin), ["ckdev-aft.exe"]);
-        assert!(backend
-            .inventory
-            .paths_for_kind(managed_replace::REPLACED_IMAGE_KIND)
-            .is_empty());
-    }
-
     #[cfg(unix)]
     #[test]
     fn train_release_post_verifies_the_binarys_own_version() {
@@ -2501,113 +1869,6 @@ pub(super) mod tests {
         })).unwrap());
         backend.set_expected_version(target, "ck-mc-deadbeef".into());
         assert!(backend.post_verify(target).is_ok());
-    }
-
-    /// Environment variable that turns [`rollback_stand_in_holds_until_killed`]
-    /// from an instant pass into a process that stays alive.
-    const ROLLBACK_HOLD_ENV: &str = "CK_ROLLBACK_TEST_HOLD";
-
-    /// Run normally, this passes at once. Run from a copy of this test binary
-    /// with [`ROLLBACK_HOLD_ENV`] set, it keeps that copy running so the tests
-    /// that replace or roll back a managed binary have a live executable at
-    /// the destination.
-    #[test]
-    fn rollback_stand_in_holds_until_killed() {
-        if std::env::var_os(ROLLBACK_HOLD_ENV).is_some() {
-            std::thread::sleep(std::time::Duration::from_secs(60));
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn rollback_replaces_running_executable_by_rename() {
-        let root = fixture_dir("rollback-running-executable");
-        // The managed binary this test models runs as `ckdev-aft`, so the test
-        // process is never listed under a production `ck-` name.
-        let destination = root.join("ckdev-aft");
-        let rollback = root.join("ckdev-aft.rollback");
-        let candidate = root.join("candidate");
-        // The stand-in is a copy of this test binary, not of a system utility:
-        // macOS kills a copied Apple platform binary run from outside its system
-        // path, and a multicall coreutils refuses to run under another name, so
-        // either way the "running" executable would already be gone.
-        let test_binary = std::env::current_exe().expect("test executable");
-        copy_executable(&test_binary, &destination);
-        copy_executable(&test_binary, &rollback);
-        copy_executable(&test_binary, &candidate);
-        fs::rename(&candidate, &destination).unwrap();
-        let replaced_inode = destination_inode(&destination).unwrap();
-        let mut child = Command::new(&destination)
-            .args([
-                "--exact",
-                "setup::upgrade::tests::rollback_stand_in_holds_until_killed",
-                "--test-threads=1",
-            ])
-            .env(ROLLBACK_HOLD_ENV, "1")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
-        // A stand-in that exited at once would prove nothing about replacing a
-        // running executable, so fail loudly instead.
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "the stand-in for the running managed binary exited before the rollback"
-        );
-        let aft = upgrade_target("ck-aft");
-        let mut inventory =
-            Inventory::load(root.join("installer-manifest.json"), "linux-x64").unwrap();
-        inventory.record("managed-binary", &destination, Map::new());
-        let mut backend = SystemUpgradeBackend {
-            platform: AlphaTarget::LinuxX64,
-            runner: Box::new(crate::setup::runtime::SystemCommandRunner),
-            bundle_migration: None,
-            core_cut: CoreCut::default(),
-            targets: BTreeMap::from([(
-                aft.label().to_string(),
-                ManagedUpgradeTarget {
-                    target: aft,
-                    destination: destination.clone(),
-                    installed_version: "1.0.0".to_string(),
-                    installed_archive_sha256: None,
-                },
-            )]),
-            executable: destination.clone(),
-            subc: None,
-            config_path: root.join("subc.jsonc"),
-            assets: ReleaseUpgradeAssetFetcher::from_index(ReleaseIndex {
-                schema: 1,
-                channel: "alpha".to_string(),
-                generated_at_ms: 0,
-                components: BTreeMap::new(),
-            }),
-            inventory,
-            prepared: BTreeMap::new(),
-            activated_inodes: BTreeMap::new(),
-            rollback_paths: BTreeMap::from([(aft.label().to_string(), rollback)]),
-            rollback_archive_sha256: BTreeMap::new(),
-            new_companions: BTreeSet::new(),
-            daemon_definition_snapshot: None,
-            replaced_images: BTreeMap::new(),
-            expected_versions: BTreeMap::new(),
-            planned_from: BTreeMap::new(),
-            supervised_modules: BTreeSet::new(),
-            lines: Lines::new(UpgradeOutput::Terminal),
-        };
-        let result = backend.rollback(aft);
-        child.kill().unwrap();
-        child.wait().unwrap();
-        result.expect("rollback onto running executable");
-        assert!(
-            !root.join("ckdev-aft.rollback").exists(),
-            "successful rollback cleans its backup"
-        );
-        assert_ne!(
-            destination_inode(&destination).unwrap(),
-            replaced_inode,
-            "rollback must rename a new inode over the running executable"
-        );
     }
 
     #[cfg(unix)]
@@ -2941,8 +2202,10 @@ exit 1
         let mut backend = SystemUpgradeBackend {
             platform: AlphaTarget::LinuxX64,
             runner: Box::new(crate::setup::runtime::SystemCommandRunner),
-            bundle_migration: None,
             core_cut: CoreCut::default(),
+            app_hold: None,
+            rollback_prompt: None,
+            journal_activations: BTreeMap::new(),
             targets: [(
                 aft.label().to_string(),
                 ManagedUpgradeTarget {
@@ -2966,11 +2229,7 @@ exit 1
             inventory,
             prepared: BTreeMap::new(),
             activated_inodes: BTreeMap::new(),
-            rollback_paths: BTreeMap::new(),
-            rollback_archive_sha256: BTreeMap::new(),
             new_companions: BTreeSet::new(),
-            daemon_definition_snapshot: None,
-            replaced_images: BTreeMap::new(),
             expected_versions: [(aft.label().to_string(), "2.0.0".to_string())]
                 .into_iter()
                 .collect(),
@@ -2998,8 +2257,10 @@ exit 1
         let mut backend = SystemUpgradeBackend {
             platform: AlphaTarget::LinuxX64,
             runner: Box::new(crate::setup::runtime::SystemCommandRunner),
-            bundle_migration: None,
             core_cut: CoreCut::default(),
+            app_hold: None,
+            rollback_prompt: None,
+            journal_activations: BTreeMap::new(),
             targets: [(
                 mcp.label().to_string(),
                 ManagedUpgradeTarget {
@@ -3023,11 +2284,7 @@ exit 1
             inventory,
             prepared: BTreeMap::new(),
             activated_inodes: BTreeMap::new(),
-            rollback_paths: BTreeMap::new(),
-            rollback_archive_sha256: BTreeMap::new(),
             new_companions: BTreeSet::new(),
-            daemon_definition_snapshot: None,
-            replaced_images: BTreeMap::new(),
             expected_versions: [(mcp.label().to_string(), "0.17.36".to_string())]
                 .into_iter()
                 .collect(),
@@ -3046,92 +2303,5 @@ exit 1
             backend.completion_line(mcp),
             "upgraded ck-subc-mcp → release 0.17.36, restarted"
         );
-    }
-
-    /// What a backend built with `output` sends for its two cleanup
-    /// warnings and its completion line: a previous image the construction
-    /// sweep can't delete, then a rollback copy completion can't delete.
-    /// Both are directories, which file removal refuses on every platform.
-    /// Returns the kept warnings and the printed lines, with the scratch
-    /// folder written as `<root>` so both modes compare as text.
-    fn stuck_cleanup_lines(name: &str, output: UpgradeOutput) -> (Vec<String>, Vec<String>) {
-        let root = ScratchDir::new(name);
-        let target = upgrade_target("ck-aft");
-        let destination = root.join("ck-aft");
-        fs::write(&destination, "new image").unwrap();
-        let aside = root.join(".ck-aft.replaced-1-1");
-        fs::create_dir_all(aside.join("held")).unwrap();
-        let mut inventory =
-            Inventory::load(root.join("installer-manifest.json"), "linux-x64").unwrap();
-        let mut fields = Map::new();
-        fields.insert(
-            "replaces".to_string(),
-            serde_json::Value::String(destination.to_string_lossy().into_owned()),
-        );
-        inventory.record(managed_replace::REPLACED_IMAGE_KIND, &aside, fields);
-        let mut backend = SystemUpgradeBackend::with_inventory(
-            AlphaTarget::LinuxX64,
-            root.join("ck"),
-            root.join("subc.jsonc"),
-            vec![ManagedUpgradeTarget {
-                target,
-                destination,
-                installed_version: "0.1.0".to_string(),
-                installed_archive_sha256: None,
-            }],
-            ReleaseIndex {
-                schema: 1,
-                channel: "alpha".to_string(),
-                generated_at_ms: 0,
-                components: BTreeMap::new(),
-            },
-            inventory,
-            output,
-        );
-        backend.set_expected_version(target, "0.2.0".to_string());
-        let rollback = root.join(".ck-aft.rollback");
-        fs::create_dir_all(rollback.join("held")).unwrap();
-        backend
-            .rollback_paths
-            .insert(target.label().to_string(), rollback);
-        backend.completed(target);
-        let root_text = root.path().display().to_string();
-        let masked = |lines: Vec<String>| -> Vec<String> {
-            lines
-                .into_iter()
-                .map(|line| line.replace(&root_text, "<root>"))
-                .collect()
-        };
-        let printed = std::mem::take(&mut backend.lines.printed);
-        (masked(backend.take_warnings()), masked(printed))
-    }
-
-    #[test]
-    fn a_kept_backend_returns_the_sweep_and_rollback_warnings_in_order_and_prints_nothing() {
-        let (kept, printed) = stuck_cleanup_lines("kept-cleanup-lines", UpgradeOutput::Kept);
-        assert!(printed.is_empty(), "a kept backend printed {printed:?}");
-        assert_eq!(kept.len(), 2, "{kept:?}");
-        let sep = std::path::MAIN_SEPARATOR;
-        assert!(
-            kept[0].starts_with(&format!(
-                "warning: could not delete previous image <root>{sep}.ck-aft.replaced-1-1: "
-            )) && kept[0].ends_with("; it will be removed by a later ck setup or ck upgrade"),
-            "the construction sweep's warning comes first: {kept:?}"
-        );
-        assert!(
-            kept[1].starts_with(&format!(
-                "warning: upgrade completed but could not remove rollback copy <root>{sep}.ck-aft.rollback: "
-            )),
-            "the rollback copy's warning comes second: {kept:?}"
-        );
-
-        // A terminal backend prints the same warnings, in the same order,
-        // then the completion line, and keeps nothing.
-        let (terminal_kept, terminal_printed) =
-            stuck_cleanup_lines("terminal-cleanup-lines", UpgradeOutput::Terminal);
-        assert!(terminal_kept.is_empty(), "{terminal_kept:?}");
-        let mut expected = kept;
-        expected.push("upgraded ck-aft 0.1.0 → 0.2.0, restarted".to_string());
-        assert_eq!(terminal_printed, expected);
     }
 }

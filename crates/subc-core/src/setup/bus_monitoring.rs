@@ -374,13 +374,33 @@ pub fn observe(config_path: &Path, tool: &mut impl ConfTool) -> BusMonitoring {
 /// Adds the listener, then the health entry, and returns what was done as lines for
 /// the operator. Nothing is written to `subc.jsonc` unless ck-bus succeeded and
 /// reported a loopback listener.
-pub fn apply(
+#[cfg(test)]
+fn apply(
     config_path: &Path,
     target: &BusTarget,
     tool: &mut impl ConfTool,
 ) -> Result<Vec<String>, String> {
-    let conf = target.nats_dir.join(SERVER_CONF_FILE);
+    let report = apply_listener(target, tool)?;
+    apply_health(config_path, target, report, config::apply)
+}
+
+pub(super) fn apply_listener(
+    target: &BusTarget,
+    tool: &mut impl ConfTool,
+) -> Result<ConfReport, String> {
     let report = tool.conf_only(target, false)?;
+    listener_state(&report.status, false)?;
+    check_loopback_health_url(&report.health_url)?;
+    Ok(report)
+}
+
+pub(super) fn apply_health(
+    config_path: &Path,
+    target: &BusTarget,
+    report: ConfReport,
+    publish: impl FnOnce(&config::ConfigChange) -> Result<(), String>,
+) -> Result<Vec<String>, String> {
+    let conf = target.nats_dir.join(SERVER_CONF_FILE);
     let listener = listener_state(&report.status, false)?;
     check_loopback_health_url(&report.health_url)?;
 
@@ -412,7 +432,7 @@ pub fn apply(
             desired_health(&report.health_url),
         )? {
             Some(change) => {
-                config::apply(&change)?;
+                publish(&change)?;
                 lines.push(format!(
                     "added the nats-server health check ({}) to {}",
                     report.health_url,

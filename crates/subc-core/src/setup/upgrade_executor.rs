@@ -51,6 +51,15 @@ pub enum RollbackDecision {
 }
 
 pub trait UpgradeExecutionBackend {
+    fn abort_before_activation(&mut self) -> Result<bool, String> {
+        Ok(false)
+    }
+    fn leave_unconfirmed(&mut self, _target: UpgradeTarget) -> Result<(), String> {
+        Ok(())
+    }
+    fn finish_verified(&mut self, _target: UpgradeTarget) -> Result<(), String> {
+        Ok(())
+    }
     fn configure_message_hub(&mut self, _target: UpgradeTarget) -> Result<(bool, String), String> {
         Err("message hub configuration is not implemented by this backend".into())
     }
@@ -86,6 +95,12 @@ pub trait UpgradeExecutionBackend {
     }
 
     fn rollback_decision(&mut self, target: UpgradeTarget) -> RollbackDecision;
+    fn pause_rollback_prompt(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+    fn resume_rollback_prompt(&mut self, _decision: RollbackDecision) -> Result<(), String> {
+        Ok(())
+    }
     fn rollback(&mut self, target: UpgradeTarget) -> Result<String, String>;
 }
 
@@ -190,7 +205,9 @@ pub fn execute_upgrade<B: UpgradeExecutionBackend>(
                 backend.poll_daemon_service_ready(RESTART_COMPLETION_TIMEOUT),
             ),
             UpgradeOperation::PostVerify { target } => {
-                let result = backend.post_verify(*target);
+                let result = backend
+                    .post_verify(*target)
+                    .and_then(|detail| backend.finish_verified(*target).map(|()| detail));
                 if let Err(reason) = result {
                     report.evidence.push(UpgradeEvidence {
                         target: *target,
@@ -224,7 +241,25 @@ pub fn execute_upgrade<B: UpgradeExecutionBackend>(
                 });
             }
             Err(reason) => {
-                if replaced.contains(&target) || backend.failure_rollback_target().is_some() {
+                let (reason, aborted) = if matches!(
+                    stage,
+                    "download-and-verify"
+                        | "rollback-copy"
+                        | "destination-replacement"
+                        | "warm-execution"
+                ) {
+                    match backend.abort_before_activation() {
+                        Ok(aborted) => (reason, aborted),
+                        Err(error) => {
+                            (format!("{reason}; install recovery stopped: {error}"), true)
+                        }
+                    }
+                } else {
+                    (reason, false)
+                };
+                if !aborted
+                    && (replaced.contains(&target) || backend.failure_rollback_target().is_some())
+                {
                     let rollback = backend.failure_rollback_target().unwrap_or(target);
                     offer_rollback(backend, &mut report, rollback);
                 }
@@ -261,15 +296,46 @@ fn offer_rollback<B: UpgradeExecutionBackend>(
     report: &mut UpgradeExecutionReport,
     target: UpgradeTarget,
 ) {
-    match backend.rollback_decision(target) {
+    let decision = backend.pause_rollback_prompt().and_then(|()| {
+        let decision = backend.rollback_decision(target);
+        backend.resume_rollback_prompt(decision)?;
+        Ok(decision)
+    });
+    let decision = match decision {
+        Ok(decision) => decision,
+        Err(detail) => {
+            report.evidence.push(UpgradeEvidence {
+                target,
+                stage: "rollback-offer",
+                detail,
+            });
+            return;
+        }
+    };
+    match decision {
         RollbackDecision::Accepted => match backend.rollback(target) {
-            Ok(detail) => report.evidence.push(UpgradeEvidence { target, stage: "rollback", detail }),
-            Err(reason) => report.evidence.push(UpgradeEvidence { target, stage: "rollback", detail: format!("failed: {reason}") }),
+            Ok(detail) => report.evidence.push(UpgradeEvidence {
+                target,
+                stage: "rollback",
+                detail,
+            }),
+            Err(reason) => report.evidence.push(UpgradeEvidence {
+                target,
+                stage: "rollback",
+                detail: format!("failed: {reason}"),
+            }),
         },
-        RollbackDecision::Declined => report.evidence.push(UpgradeEvidence {
-            target, stage: "rollback-offer",
-            detail: "offered; declined; replacement remains in place (set CK_UPGRADE_ROLLBACK=accept to restore)".to_string(),
-        }),
+        RollbackDecision::Declined => {
+            let detail = match backend.leave_unconfirmed(target) {
+                Ok(()) => "offered; declined; replacement remains in place (set CK_UPGRADE_ROLLBACK=accept to restore)".into(),
+                Err(error) => format!("could not seal unconfirmed replacement: {error}"),
+            };
+            report.evidence.push(UpgradeEvidence {
+                target,
+                stage: "rollback-offer",
+                detail,
+            });
+        }
     }
 }
 

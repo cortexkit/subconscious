@@ -41,7 +41,7 @@ ck daemon triage      # reads only the run directory; never contacts the daemon
 ```sh
 ck module logs aft                 # merged module, plugin, stderr and daemon logs
 ck module logs aft -n 500 --since 30m --level warn
-ck module logs aft -f              # follow across rotation
+ck module logs aft -f              # follow across rotation; waits for a log that does not exist yet
 ck module stderr aft -n 50         # retained stderr lines
 ck module terminals aft            # retained process exits, across daemon restarts
 ```

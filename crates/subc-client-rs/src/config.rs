@@ -164,6 +164,44 @@ pub(crate) struct Session {
     pub(crate) stop: tokio_util::sync::CancellationToken,
 }
 
+impl Session {
+    fn enqueue_refresh(&self, project_id: Option<String>) {
+        self.projects
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(project_id);
+        self.changed.notify_one();
+    }
+}
+
+impl ModuleHandle {
+    /// Queue a configuration refresh for a named project on this connection.
+    ///
+    /// Returns `false` if the module has no config declaration, the connection
+    /// is closed, or the daemon did not advertise `config.gate`. `true` means
+    /// queued, not fetched or applied. Queued refreshes for the same project
+    /// coalesce, including those triggered by `config.changed`.
+    ///
+    /// Results arrive through the existing [`ModuleHandler`] config callbacks.
+    /// This does not check project support before sending `config.get`; use
+    /// [`Self::daemon_supports`] to check capabilities advertised in HELLO_ACK.
+    /// If an older daemon refuses a named get, the refusal reaches
+    /// [`ModuleHandler::on_config_error`] as [`ConfigError::Refused`], except
+    /// for `config_gated`, `not_delivery_target`, and `anchor_pending`, which
+    /// go to [`ModuleHandler::on_config_state`].
+    pub fn refresh_project_config(&self, project_id: impl Into<String>) -> bool {
+        let session = &self.shared.config;
+        if session.declaration.get().is_none()
+            || self.is_closed()
+            || !self.daemon_supports(CONFIG_GATE_CAPABILITY)
+        {
+            return false;
+        }
+        session.enqueue_refresh(Some(project_id.into()));
+        true
+    }
+}
+
 pub(crate) fn start<H: ModuleHandler>(
     handle: ModuleHandle,
     handler: Arc<H>,
@@ -226,16 +264,7 @@ pub(crate) fn changed(frame: &Frame, handle: &ModuleHandle) -> bool {
         && handle.daemon_supports(CONFIG_GATE_CAPABILITY)
     {
         match serde_json::from_slice::<ConfigChanged>(&frame.body) {
-            Ok(hint) => {
-                handle
-                    .shared
-                    .config
-                    .projects
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .insert(hint.project_id);
-                handle.shared.config.changed.notify_one();
-            }
+            Ok(hint) => handle.shared.config.enqueue_refresh(hint.project_id),
             Err(error) => tracing::warn!(%error, "ignoring malformed config.changed"),
         }
     }

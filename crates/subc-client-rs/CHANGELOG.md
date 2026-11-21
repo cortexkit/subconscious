@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.41.8
+
+- Add `ModuleHandle::refresh_project_config` to fetch a named project's settings.
+  The SDK sends no `config.applied` for views without a delivery attempt. Require
+  subc-control 0.42.4 for the project settings wire types.
+- Wait up to 15 s, not 3 s, for a control reply in the real-daemon tests.
+
 ## 0.41.7
 
 - Adopt subc-config 0.1.2 for tagged-union defaults and optional credential references.

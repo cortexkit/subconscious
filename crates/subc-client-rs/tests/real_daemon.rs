@@ -43,7 +43,10 @@ use tokio::{
 };
 
 const MODULE_ID: &str = "subc-client-rs-echo";
-const READ_TIMEOUT: Duration = Duration::from_secs(3);
+// Every read under this bound waits for a reply that always comes, so the bound
+// only decides how long a broken test takes to fail. A CI runner with many
+// daemons up at once took over 3 s to answer a control request.
+const READ_TIMEOUT: Duration = Duration::from_secs(15);
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 const EVENT_TIMEOUT: Duration = Duration::from_secs(5);
 const AUTH_DEADLINE: Duration = Duration::from_secs(2);

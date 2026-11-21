@@ -68,6 +68,7 @@ impl ModuleHandler for Sample {
     }
 }
 struct Rig {
+    handle: ModuleHandle,
     wire: DuplexStream,
     task: JoinHandle<Result<(), crate::SubcModuleError>>,
     stop: ModuleStopHandle,
@@ -102,9 +103,10 @@ impl Rig {
             .unwrap(),
         )
         .await;
-        let (_, serve) = register.await.unwrap().unwrap().unwrap();
+        let (handle, serve) = register.await.unwrap().unwrap().unwrap();
         (
             Self {
+                handle,
                 wire,
                 task: tokio::spawn(serve),
                 stop,
@@ -443,6 +445,7 @@ async fn config_sdk_missing_capability_only_calls_existing_file_reader() {
     let (handler, mut rx) = sample();
     let (mut rig, _) = Rig::new(handler, false).await;
     assert!(matches!(seen(&mut rx).await, Seen::Files));
+    assert!(!rig.handle.refresh_project_config("p"));
     rig.ping().await;
     rig.finish().await;
 }
@@ -465,6 +468,7 @@ async fn config_sdk_unopted_handler_keeps_original_hello_bytes_and_sends_no_conf
         launch_nonce: decoded.launch_nonce,
     };
     assert_eq!(hello.body, serde_json::to_vec(&original).unwrap());
+    assert!(!rig.handle.refresh_project_config("p"));
     rig.ping().await;
     rig.finish().await;
 }
@@ -725,5 +729,119 @@ async fn config_sdk_project_hint_fetches_and_reports_only_that_project() {
     assert_eq!(body(&ack)["project_id"], "p");
     rig.ok(ack, json!({"op":"config.applied"})).await;
     active(&mut rx, 2).await;
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn config_sdk_project_refresh_returns_false_after_connection_closes() {
+    let (handler, _rx) = sample();
+    let (mut rig, _) = Rig::new(handler, true).await;
+    let handle = rig.handle.clone();
+    rig.request(CONFIG_DECLARE_OP).await;
+    rig.finish().await;
+    assert!(handle.is_closed());
+    assert!(!handle.refresh_project_config("p"));
+}
+
+#[tokio::test]
+async fn config_sdk_project_refresh_coalesces_and_does_not_report_views_without_attempts() {
+    let (handler, mut rx) = sample();
+    let (mut rig, _) = Rig::new(handler, true).await;
+    declared(&mut rig).await;
+    let user_get = rig.request(CONFIG_GET_OP).await;
+    assert_eq!(body(&user_get), json!({"op":"config.get"}));
+    assert!(rig.handle.refresh_project_config("p"));
+    rig.ok(
+        user_get,
+        serde_json::to_value(ConfigGetReply::new(
+            Some(view(1, ConfigStatus::Active, 1)),
+            None,
+        ))
+        .unwrap(),
+    )
+    .await;
+    active(&mut rx, 1).await;
+
+    let first = rig.request(CONFIG_GET_OP).await;
+    assert_eq!(body(&first), json!({"op":"config.get","project_id":"p"}));
+    // Requests queued while a fetch is in flight collapse to one follow-up.
+    assert!(rig.handle.refresh_project_config("p"));
+    assert!(rig.handle.refresh_project_config("p"));
+    send(
+        &mut rig.wire,
+        FrameType::Push,
+        0,
+        json!({"op":"config.changed","generation":2,"project_id":"p","fields":[]}),
+    )
+    .await;
+    rig.ping().await;
+
+    let mut fallback = view(2, ConfigStatus::Active, 2);
+    fallback.project_id = Some("p".into());
+    fallback.attempt = None;
+    rig.ok(
+        first,
+        serde_json::to_value(ConfigGetReply::new(Some(fallback.clone()), None)).unwrap(),
+    )
+    .await;
+    assert!(matches!(seen(&mut rx).await, Seen::Applied(view) if view == fallback));
+    assert!(
+        matches!(seen(&mut rx).await, Seen::State(ConfigState::Active(view)) if view == fallback)
+    );
+
+    let follow_up = rig.request(CONFIG_GET_OP).await;
+    assert_eq!(
+        body(&follow_up),
+        json!({"op":"config.get","project_id":"p"})
+    );
+    assert!(rig.handle.refresh_project_config("q"));
+    let mut unstamped = view(0, ConfigStatus::Unstamped, 3);
+    unstamped.project_id = Some("p".into());
+    rig.ok(
+        follow_up,
+        serde_json::to_value(ConfigGetReply::new(Some(unstamped.clone()), None)).unwrap(),
+    )
+    .await;
+    assert!(matches!(seen(&mut rx).await, Seen::Applied(view) if view == unstamped));
+    assert!(
+        matches!(seen(&mut rx).await, Seen::State(ConfigState::Unstamped(view)) if view == unstamped)
+    );
+
+    // Another project must be next, with neither an ACK nor a duplicate get for p.
+    let next = rig.request(CONFIG_GET_OP).await;
+    assert_eq!(body(&next), json!({"op":"config.get","project_id":"q"}));
+    rig.refuse(next, "invalid_params").await;
+    assert!(
+        matches!(seen(&mut rx).await, Seen::Error(error) if error == "invalid_params: isolated refusal")
+    );
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn config_sdk_project_refresh_rejects_views_for_another_project() {
+    let (handler, mut rx) = sample();
+    let (mut rig, _) = Rig::new(handler, true).await;
+    declared(&mut rig).await;
+    get(&mut rig, Some(view(1, ConfigStatus::Active, 1)), None).await;
+    active(&mut rx, 1).await;
+
+    let mut wrong_active = view(2, ConfigStatus::Active, 2);
+    wrong_active.project_id = Some("q".into());
+    let mut matching_pending = view(3, ConfigStatus::Pending, 3);
+    matching_pending.project_id = Some("p".into());
+    for pending in [None, Some(matching_pending)] {
+        assert!(rig.handle.refresh_project_config("p"));
+        let request = rig.request(CONFIG_GET_OP).await;
+        assert_eq!(body(&request)["project_id"], "p");
+        rig.ok(
+            request,
+            serde_json::to_value(ConfigGetReply::new(Some(wrong_active.clone()), pending)).unwrap(),
+        )
+        .await;
+        assert!(
+            matches!(seen(&mut rx).await, Seen::Error(error) if error == "config.get returned another project")
+        );
+    }
+    rig.ping().await;
     rig.finish().await;
 }

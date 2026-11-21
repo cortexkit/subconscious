@@ -99,8 +99,9 @@ running before spawning new ones. The files that make this work are in
   on their 21-byte header alone; a field added to a route request is invisible
   to the daemon, a flag is not. Only channel-0 control bodies (`route.open`,
   `scope.sync`, `HELLO` and the rest of [`control-plane.md`](control-plane.md))
-  are parsed (`parse_client_control_request` and
-  `parse_module_control_request_from_module` in `crates/subc-daemon/src/control.rs`).
+  are parsed (`parse_client_control_request` in `crates/subc-daemon/src/control.rs`
+  and `parse_module_control_request_from_module` in
+  `crates/subc-daemon/src/control/module_operations.rs`).
 - **Only the principal is attested.** `BindIdentity` (`project_root`,
   `harness`, `session`, `project_id`) is whatever the caller sent. A module
   that authorizes on it has built a check the caller controls. Authorize on

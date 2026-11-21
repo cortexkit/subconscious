@@ -1,6 +1,8 @@
 //! Bounded, body-free attribution of channel-zero requests.
 
 use std::collections::BTreeMap;
+
+use super::{ConnectionId, ControlHandler};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -85,6 +87,31 @@ impl ControlUsage {
             "tracked_pairs": self.pairs.len(),
             "top": top,
         })
+    }
+}
+
+impl ControlHandler {
+    pub(super) fn record_control_usage(&self, connection: ConnectionId, op: &str) {
+        let module_id = self
+            .claims
+            .binding(connection)
+            .filter(|binding| {
+                binding.consumer_live(connection) && binding.registration.authority.alive()
+            })
+            .map(|binding| binding.registration.module_id.clone())
+            .or_else(|| {
+                self.registry
+                    .module_id_for_connection(connection)
+                    .ok()
+                    .flatten()
+            });
+        let principal = module_id
+            .map(|module_id| format!("reserved:{module_id}"))
+            .unwrap_or_else(|| "direct".to_owned());
+        self.control_usage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record(op, &principal);
     }
 }
 

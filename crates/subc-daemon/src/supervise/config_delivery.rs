@@ -392,6 +392,323 @@ fn launch_current_result(
     }
 }
 
+impl SupervisedModule {
+    pub(crate) fn check_approved_start_failure(
+        &self,
+        generation: &crate::config_gate::runtime::ApprovalIdentity,
+    ) -> Result<bool, SuperviseError> {
+        let state = lock_snapshot(&self.inner.snapshot)?;
+        if let Some((failed_generation, detail)) = &state.approved_start_failure {
+            if failed_generation == generation {
+                return Err(SuperviseError::ReloadFailed {
+                    module_id: self.inner.module_id.clone(),
+                    reason: detail.clone(),
+                });
+            }
+        }
+        Ok(state.approved_start_failure.is_some())
+    }
+
+    pub(crate) fn has_approved_start_failure(
+        &self,
+        identity: &crate::config_gate::runtime::ApprovalIdentity,
+    ) -> bool {
+        lock_snapshot(&self.inner.snapshot).is_ok_and(|state| {
+            state
+                .approved_start_failure
+                .as_ref()
+                .is_some_and(|(failed, _)| failed == identity)
+        })
+    }
+
+    pub(crate) fn needs_approved_gate_restart(
+        &self,
+        approval: &crate::config_gate::runtime::ApprovalIdentity,
+    ) -> bool {
+        lock_snapshot(&self.inner.snapshot)
+            .is_ok_and(|state| state.needs_approved_gate_restart(approval))
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn config_hold_origin_for_test(
+        &self,
+    ) -> (bool, Option<crate::config_gate::runtime::ApprovalIdentity>) {
+        let state = lock_snapshot(&self.inner.snapshot).unwrap();
+        (
+            state.config_hold_daemon_initiated,
+            state.config_hold_approval.clone(),
+        )
+    }
+
+    pub(crate) async fn config_policy_probe(
+        &self,
+        connection: crate::ConnectionId,
+        generation: u64,
+        attempt: u64,
+    ) -> Result<(), SuperviseError> {
+        self.inner
+            .commands
+            .send(SupervisorCommand::ConfigPolicyProbe {
+                connection,
+                generation,
+                attempt,
+            })
+            .await
+            .map_err(|_| SuperviseError::CommandClosed {
+                module_id: self.inner.module_id.clone(),
+            })
+    }
+    pub(crate) async fn config_exit_hold(&self) -> Result<(), SuperviseError> {
+        let (reply, result) = oneshot::channel();
+        self.inner
+            .commands
+            .send(SupervisorCommand::ConfigExitHold { reply })
+            .await
+            .map_err(|_| SuperviseError::CommandClosed {
+                module_id: self.module_id().to_string(),
+            })?;
+        result.await.map_err(|_| SuperviseError::CommandClosed {
+            module_id: self.module_id().to_string(),
+        })?
+    }
+    pub(crate) async fn config_delivery_failed(
+        &self,
+        connection: crate::ConnectionId,
+        hold: bool,
+    ) -> Result<(), SuperviseError> {
+        self.inner
+            .commands
+            .send(SupervisorCommand::ConfigDeliveryFailed { connection, hold })
+            .await
+            .map_err(|_| SuperviseError::CommandClosed {
+                module_id: self.module_id().to_string(),
+            })
+    }
+
+    pub(crate) async fn config_apply_restart(&self, generation: u64) -> Result<(), SuperviseError> {
+        self.inner
+            .commands
+            .send(SupervisorCommand::ConfigApplyRestart {
+                generation,
+                supersedes_swap: false,
+            })
+            .await
+            .map_err(|_| SuperviseError::CommandClosed {
+                module_id: self.inner.module_id.clone(),
+            })
+    }
+}
+
+impl SupervisedModule {
+    pub(crate) async fn reconcile_approved_configuration(
+        &self,
+        approved: crate::config_gate::runtime::ApprovedDaemonConfiguration,
+    ) -> Result<(), SuperviseError> {
+        let entry = approved
+            .module_entry(&self.inner.module_id)
+            .map_err(|error| SuperviseError::InvalidSpec {
+                reason: error.to_string(),
+            })?;
+        validate_spec(&entry.module_spec())?;
+        let (reply, received) = oneshot::channel();
+        self.inner
+            .commands
+            .send(SupervisorCommand::ApprovedConfiguration { approved, reply })
+            .await
+            .map_err(|_| SuperviseError::CommandClosed {
+                module_id: self.inner.module_id.clone(),
+            })?;
+        received.await.map_err(|_| SuperviseError::CommandClosed {
+            module_id: self.inner.module_id.clone(),
+        })??;
+        let mut configuration =
+            self.inner
+                .configuration
+                .lock()
+                .map_err(|_| SuperviseError::StatePoisoned {
+                    module_id: Some(self.inner.module_id.clone()),
+                })?;
+        configuration.spec = entry.module_spec();
+        configuration.enabled = entry.enabled;
+        configuration.health = entry.health;
+        configuration.register_timeout = entry.register_timeout;
+        configuration.restart_policy = entry.restart;
+        Ok(())
+    }
+}
+
+pub(super) fn cancel_deferred_reload(
+    runtime: &SupervisorRuntimeConfig,
+    module_id: &str,
+    reason: &str,
+) {
+    if let Some(reply) = runtime
+        .deferred_reload_reply
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take()
+    {
+        let _ = reply.send(Err(SuperviseError::ReloadFailed {
+            module_id: module_id.to_string(),
+            reason: reason.to_string(),
+        }));
+    }
+}
+
+fn park_config_spawn(
+    spec: &ModuleSpec,
+    runtime: &SupervisorRuntimeConfig,
+    snapshot: &SharedSnapshot,
+    failure: &FailureContext,
+    admission_refused: Option<String>,
+) -> Result<(), SuperviseError> {
+    *runtime
+        .scheduled_respawn
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    if let Some(reply) = runtime
+        .deferred_reload_reply
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+    {
+        let _ = reply.send(Err(SuperviseError::ConfigHeld {
+            module_id: spec.module_id.clone(),
+            code: "config_gated".into(),
+            detail: "module is held by configuration admission".into(),
+        }));
+    }
+    update_snapshot(snapshot, Some(&spec.module_id), |state| {
+        state.admission_refused = admission_refused;
+        state.config_hold_daemon_initiated = failure.daemon_initiated;
+        state.config_hold_approval = failure.approval.clone();
+        state.config_hold_parked = true;
+        state.state = ModuleState::Stopped;
+        state.respawn_pending = false;
+        state.failed_retry.pending = None;
+        // Parking ends this attempt and discards its failure timestamp. If a
+        // later release fails, its retry delay starts at that new failure.
+        state.failed_retry.failed_at = None;
+        clear_current_process_facts(state);
+    })
+}
+
+pub(super) fn try_park_config_attempt(
+    spec: &ModuleSpec,
+    runtime: &SupervisorRuntimeConfig,
+    snapshot: &SharedSnapshot,
+    failure: &FailureContext,
+    program_base: Option<&subc_config::Digest>,
+) -> Result<bool, SuperviseError> {
+    let result = (|| {
+        if !lock_snapshot(snapshot)?.enabled {
+            return Ok(false);
+        }
+        #[cfg(test)]
+        if let Some(delivery) = &runtime.config_delivery {
+            delivery.0.pause_before_config_park_for_test();
+        }
+        let Some(delivery) = &runtime.config_delivery else {
+            return Ok(false);
+        };
+        let parked = delivery
+            .0
+            .with_recorded_admission_hold(&spec.module_id, program_base, |refusal| {
+                park_config_spawn(spec, runtime, snapshot, failure, refusal)
+            })
+            .map_err(|error| config_delivery::gate_hold_error(spec, error, Some(delivery)))?;
+        if let Some(result) = parked {
+            result?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    })();
+    if let Err(error) = &result {
+        // A failed park still belongs to the attempt that tried to park. Mark it
+        // Failed here, before the monitor can use a daemon/operator origin saved
+        // for a different attempt to decide whether to schedule a slow retry.
+        fail_snapshot(snapshot, Some(&spec.module_id), None, failure);
+        record_approved_attempt_failure(spec, snapshot, failure, error);
+    }
+    result
+}
+
+pub(super) fn record_approved_attempt_failure(
+    spec: &ModuleSpec,
+    snapshot: &SharedSnapshot,
+    failure: &FailureContext,
+    error: &SuperviseError,
+) {
+    let Some(approval) = &failure.approval else {
+        return;
+    };
+    let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
+        if state.enabled
+            && state.state == ModuleState::Failed
+            && state
+                .approved_start_failure
+                .as_ref()
+                .is_none_or(|(identity, _)| identity != approval)
+        {
+            state.approved_start_failure = Some((approval.clone(), error.to_string()));
+        }
+    });
+}
+
+pub(super) fn hold_config_spawn(
+    spec: &ModuleSpec,
+    runtime: &SupervisorRuntimeConfig,
+    snapshot: &SharedSnapshot,
+    failure: &FailureContext,
+) -> Result<(), SuperviseError> {
+    hold_config_respawn(spec, runtime, snapshot, RespawnKind::Spawn, failure)
+}
+
+pub(super) fn hold_config_respawn(
+    spec: &ModuleSpec,
+    runtime: &SupervisorRuntimeConfig,
+    snapshot: &SharedSnapshot,
+    kind: RespawnKind,
+    failure: &FailureContext,
+) -> Result<(), SuperviseError> {
+    if !lock_snapshot(snapshot)?.enabled {
+        return Ok(());
+    }
+    if !try_park_config_attempt(spec, runtime, snapshot, failure, None)? {
+        // This caller consumed an actual start attempt. If its hold ended before
+        // parking, retain that attempt instead of waiting for a lost release.
+        defer_config_spawn(spec, runtime, snapshot, kind, failure)?;
+    }
+    Ok(())
+}
+
+pub(super) const CONFIG_ADMISSION_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+pub(super) fn defer_config_spawn(
+    spec: &ModuleSpec,
+    runtime: &SupervisorRuntimeConfig,
+    snapshot: &SharedSnapshot,
+    kind: RespawnKind,
+    failure: &FailureContext,
+) -> Result<(), SuperviseError> {
+    update_snapshot(snapshot, Some(&spec.module_id), |state| {
+        state.state = ModuleState::Restarting;
+        state.respawn_pending = true;
+        clear_current_process_facts(state);
+    })?;
+    *runtime
+        .scheduled_respawn
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some(PendingRespawn {
+        deadline: Instant::now() + CONFIG_ADMISSION_RETRY_DELAY,
+        kind,
+        daemon_initiated: failure.daemon_initiated,
+        approval: failure.approval.clone(),
+    });
+    Ok(())
+}
+
 #[cfg(test)]
 mod launch_current_tests {
     use super::*;

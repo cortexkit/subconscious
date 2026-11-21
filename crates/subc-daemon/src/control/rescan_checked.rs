@@ -22,10 +22,7 @@ use subc_control::{
     RESCAN_CANDIDATE_MAX_BYTES, RESCAN_CANDIDATE_PREVIEW_CAPABILITY, RESCAN_CANDIDATE_TOO_LARGE,
 };
 
-use super::{
-    config_gate, control_error_frame, launch_spec_agreement, ControlHandler,
-    SupervisorRescanContext,
-};
+use super::*;
 use crate::{
     daemon_config::{ActivityConfig, ConfiguredModule, DaemonConfig},
     router::{RouteCtx, RouterError},
@@ -846,4 +843,611 @@ async fn stalled_config_read_times_out_without_holding_operation_lock() {
             .load(Ordering::SeqCst),
         0
     );
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct SupervisorRescanContext {
+    pub(super) supervisor: Supervisor,
+    pub(super) config_path: PathBuf,
+    pub(super) configured_port: Option<u16>,
+    pub(super) storage_config: Option<crate::daemon_config::StorageConfig>,
+    pub(super) admission_facts_carrier_module_id: Option<String>,
+    pub(super) admission_facts_targets: Option<Vec<String>>,
+    pub(super) scope_authority_owners: Vec<String>,
+    federated_scope_owner: String,
+    pub(super) privileged_operator_prompt: PrivilegedOperatorPrompt,
+    /// Counts executed rescans that set out to change the supervised modules'
+    /// staged or applied configuration, counted before the first change so a
+    /// rescan that fails partway still counts. With the daemon incarnation it
+    /// names the state a `supervisor.rescan_checked` preview was computed
+    /// against.
+    generation: Arc<std::sync::atomic::AtomicU64>,
+    rescan_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(super) module_entries: Arc<Mutex<rescan_checked::ModuleEntries>>,
+}
+
+impl ControlHandler {
+    pub fn with_supervisor_rescan(
+        mut self,
+        supervisor: Supervisor,
+        config_path: impl Into<PathBuf>,
+        configured_port: Option<u16>,
+    ) -> Self {
+        self.rescan = Some(SupervisorRescanContext {
+            supervisor,
+            config_path: config_path.into(),
+            configured_port,
+            storage_config: self.storage_config.clone(),
+            admission_facts_carrier_module_id: self.admission_facts_carrier_module_id.clone(),
+            admission_facts_targets: self.admission_facts_targets.clone(),
+            scope_authority_owners: self.scope_authority_owners.clone(),
+            federated_scope_owner: self.federated_scope_owner.clone(),
+            privileged_operator_prompt: self.privileged_operator_prompt,
+            generation: Arc::default(),
+            rescan_lock: Arc::default(),
+            module_entries: Arc::default(),
+        });
+        self
+    }
+
+    pub(crate) fn with_supervisor_rescan_entries(
+        self,
+        modules: &[crate::daemon_config::ConfiguredModule],
+    ) -> Self {
+        if let Some(context) = &self.rescan {
+            let mut entries = context
+                .module_entries
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            entries.seed(modules);
+        }
+        self
+    }
+}
+
+impl ControlHandler {
+    /// `supervisor.rescan` and `supervisor.rescan_checked`. `mode` says where
+    /// the configuration comes from and whether to apply it; every mode then
+    /// runs the same comparison, so a preview describes the apply it previews.
+    pub(super) async fn handle_supervisor_rescan(
+        &self,
+        frame: Frame,
+        mode: RescanMode,
+        requester: Principal,
+    ) -> Result<Vec<Frame>, RouterError> {
+        let preview = mode.previews();
+        let Some(context) = self.rescan.clone() else {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "rescan_unavailable",
+                "the daemon was not started with a reloadable config path".to_string(),
+            )?]);
+        };
+
+        let _rescan_guard = context.rescan_lock.lock().await;
+        let rescan_checked::RescanInput {
+            config: loaded,
+            approved_preview,
+            guard: _operation_guard,
+        } = match self.rescan_input(&mode, &context).await {
+            Ok(input) => input,
+            Err(error) => return Ok(vec![error.into_frame(&frame)?]),
+        };
+        // `load` reports a missing file as Ok(None), which is correct at boot
+        // (no config, nothing to supervise) and catastrophic here: rescan treats
+        // "not in the config" as "remove it", so an absent file would read as an
+        // empty module list and retire the entire running fleet. An editor
+        // writing via write-new-then-rename, or a half-finished edit, is enough
+        // to open that window. Refuse instead: a config that cannot be read
+        // carries no instruction to remove anything.
+        let Some((config, activity_config)) = loaded else {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "invalid_daemon_config",
+                format!(
+                    "daemon config not found at {}; refusing to rescan (an absent config would \
+                     retire every supervised module)",
+                    context.config_path.display()
+                ),
+            )?]);
+        };
+        let (
+            configured_port,
+            storage_config,
+            admission_facts_carrier_module_id,
+            admission_facts_targets,
+            scope_authority_owners,
+            federated_scope_owner,
+            privileged_operator_prompt,
+            modules,
+            reserved_capabilities,
+        ) = (
+            config.port,
+            config.storage,
+            config.admission_facts_carrier_module_id,
+            config.admission_facts_targets,
+            config.scope_authority_owners,
+            config.federated_scope_owner,
+            config.privileged_operator_prompt,
+            config.modules,
+            config.reserved_capabilities,
+        );
+
+        // Collect the sections rescan cannot apply, so the REPLY carries them.
+        //
+        // The warning below has always been correct and has always gone only to
+        // the journal -- addressed to whoever reads logs, while the person who
+        // just edited the config is looking at the CLI. Naming each section
+        // individually rather than setting a flag: "something outside modules
+        // changed" sends the operator back to diffing their own file, which is
+        // the work this is meant to save.
+        let mut restart_required = Vec::new();
+        for section in RestartRequiredSection::ALL {
+            let changed = match section {
+                RestartRequiredSection::Port => configured_port != context.configured_port,
+                RestartRequiredSection::Storage => storage_config != context.storage_config,
+                RestartRequiredSection::AdmissionFactsCarrierModuleId => {
+                    admission_facts_carrier_module_id != context.admission_facts_carrier_module_id
+                }
+                RestartRequiredSection::AdmissionFactsTargets => {
+                    admission_facts_targets != context.admission_facts_targets
+                }
+                RestartRequiredSection::ScopeAuthorityOwners => {
+                    scope_authority_owners != context.scope_authority_owners
+                }
+                RestartRequiredSection::FederatedScopeOwner => {
+                    federated_scope_owner != context.federated_scope_owner
+                }
+                RestartRequiredSection::PrivilegedOperatorPrompt => {
+                    privileged_operator_prompt != context.privileged_operator_prompt
+                }
+            };
+            if changed {
+                restart_required.push(section.label().to_string());
+            }
+        }
+        if !restart_required.is_empty() {
+            warn!(
+                config_path = %context.config_path.display(),
+                sections = %restart_required.join(", "),
+                "daemon config changed outside the modules section; restart the daemon to apply those changes"
+            );
+        }
+
+        for configured in &modules {
+            if let Err(err) = validate_spec(&configured.module_spec()) {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    "invalid_daemon_config",
+                    format!("supervisor rescan rejected daemon config: {err}"),
+                )?]);
+            }
+        }
+
+        let configured_capabilities = modules
+            .iter()
+            .map(|module| (module.module_id.clone(), module.enabled))
+            .collect::<Vec<_>>();
+        let preview_capability_warnings = if preview {
+            let (_, registrations) = self.runtime_capability_snapshot()?;
+            let current_modules = self
+                .supervisor
+                .list()
+                .into_iter()
+                .map(|module| module.module_id().to_string())
+                .collect::<BTreeSet<_>>();
+            let resulting_modules = configured_capabilities.clone();
+            let removed = current_modules
+                .into_iter()
+                .filter(|module_id| {
+                    !resulting_modules
+                        .iter()
+                        .any(|(configured_id, _)| configured_id == module_id)
+                })
+                .collect::<Vec<_>>();
+            // A candidate preview also names providers the candidate disables.
+            // `supervisor.rescan`'s own preview keeps its removal-only warnings.
+            let disabled = match &mode {
+                RescanMode::Candidate(_) => resulting_modules
+                    .iter()
+                    .filter(|(_, enabled)| !enabled)
+                    .map(|(module_id, _)| module_id.clone())
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            };
+            self.capability_evaluator.preview_warnings(
+                resulting_modules,
+                &removed,
+                &disabled,
+                &registrations,
+            )
+        } else {
+            Vec::new()
+        };
+        let reconciled = match (&mode, approved_preview.as_ref()) {
+            (RescanMode::Preview, Some(approved)) => Ok((
+                config_gate::preview_approved_daemon(approved, &modules),
+                Vec::new(),
+            )),
+            (RescanMode::Candidate(candidate), _) => self
+                .preview_candidate(&context, modules, candidate)
+                .map(|result| (result, Vec::new())),
+            _ => {
+                self.reconcile_supervised_modules(
+                    &context.supervisor,
+                    modules,
+                    preview,
+                    requester.clone(),
+                )
+                .await
+            }
+        };
+        let (result, changed) = match reconciled {
+            Ok(result) => result,
+            Err(message) => {
+                return Ok(vec![control_error_frame(&frame, "rescan_failed", message)?])
+            }
+        };
+        if !preview {
+            self.rescan_policy_root(config.agent_policy_root).await;
+            if let Some(ledger) = &self.activity {
+                ledger.module_rescanned(&result.added, &result.removed, requester.clone());
+                ledger.config_changed(&result.added, &result.removed, &changed, requester);
+            }
+            if let Err(code) = self.configure_activity(activity_config).await {
+                warn!(
+                    code,
+                    "activity retention could not be applied during rescan"
+                );
+            }
+            self.capability_evaluator
+                .configure(configured_capabilities, reserved_capabilities);
+            self.capability_evaluator.wake_deadline_loop();
+            self.refresh_capability_requirements();
+        }
+        let mut result = result;
+        result.restart_required = restart_required;
+        result.capability_warnings = preview_capability_warnings;
+        let response = ClientControlResponse::SupervisorRescan { result };
+        Ok(vec![control_response_body_frame(
+            &frame,
+            &response,
+            "ClientControlResponse::SupervisorRescan",
+        )?])
+    }
+}
+
+impl ControlHandler {
+    /// Compare the configured module set with the supervised one, changing
+    /// nothing. The staged spec each supervised module holds is what the
+    /// configured entry is compared with.
+    fn plan_rescan(
+        &self,
+        configured_modules: Vec<crate::daemon_config::ConfiguredModule>,
+    ) -> Result<RescanPlan, String> {
+        let mut current = BTreeMap::new();
+        for module in self.supervisor.list() {
+            let (spec, health) = module.configuration().map_err(|err| {
+                format!(
+                    "failed to read configuration for module_id '{}': {err}",
+                    module.module_id()
+                )
+            })?;
+            let enabled = module
+                .status()
+                .map_err(|err| {
+                    format!(
+                        "failed to read status for module_id '{}': {err}",
+                        module.module_id()
+                    )
+                })?
+                .enabled;
+            current.insert(
+                module.module_id().to_string(),
+                (module, spec, health, enabled),
+            );
+        }
+        let configured = configured_modules
+            .into_iter()
+            .map(|module| (module.module_id.clone(), module))
+            .collect::<BTreeMap<_, _>>();
+
+        let added = configured
+            .keys()
+            .filter(|module_id| !current.contains_key(*module_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let removed = current
+            .keys()
+            .filter(|module_id| !configured.contains_key(*module_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut changed_pending_reload = Vec::new();
+        let mut changed_pending = Vec::new();
+        let mut configuration_changes = BTreeSet::new();
+        let mut enabled_changes = BTreeSet::new();
+        let mut unchanged = 0_u32;
+        let publication = self
+            .config_runtime
+            .as_ref()
+            .and_then(|owner| owner.polled_snapshot().ok());
+
+        for (module_id, configured_module) in &configured {
+            let Some((module, current_spec, current_health, current_enabled)) =
+                current.get(module_id)
+            else {
+                continue;
+            };
+            // Compare the whole launch spec so a future launch field cannot
+            // accidentally become a live-only policy change. Health is stored
+            // separately and applies live without replacing the process.
+            let launch_changed = *current_spec != configured_module.module_spec();
+            let configuration_changed =
+                launch_changed || *current_health != configured_module.health;
+            let pending = self.pending_module_fields(
+                module,
+                Some(configured_module),
+                configuration_changed,
+                Self::registration_channel_in_force(
+                    publication
+                        .as_ref()
+                        .and_then(|view| view.registration_declaration(module_id))
+                        .as_deref(),
+                    publication
+                        .as_ref()
+                        .and_then(|view| match &view.approved_daemon {
+                            crate::config_gate::runtime::ApprovedDaemonView::Approved {
+                                config,
+                                ..
+                            } => config
+                                .modules
+                                .iter()
+                                .find(|entry| entry.module_id == *module_id)
+                                .map(|entry| entry.registration_channel),
+                            _ => None,
+                        }),
+                ),
+                publication.as_deref(),
+            )?;
+            let has_pending = !pending.is_empty();
+            if has_pending {
+                changed_pending.push(subc_control::SupervisorPendingModule {
+                    module_id: module_id.clone(),
+                    fields: pending
+                        .into_iter()
+                        .map(|mut field| {
+                            field.value = None;
+                            field
+                        })
+                        .collect(),
+                });
+            }
+            // Applying a rescan also replaces the recorded config value, even
+            // when an operator already put the runtime in the requested state.
+            let enabled_changed = *current_enabled != configured_module.enabled
+                || self
+                    .capability_evaluator
+                    .configured_enabled(module_id)
+                    .is_some_and(|enabled| enabled != configured_module.enabled);
+            if configuration_changed {
+                configuration_changes.insert(module_id.clone());
+            }
+            if launch_changed {
+                changed_pending_reload.push(module_id.clone());
+            }
+            if enabled_changed {
+                enabled_changes.insert(module_id.clone());
+            }
+            if !configuration_changed && !enabled_changed && !has_pending {
+                unchanged = unchanged.saturating_add(1);
+            }
+        }
+        Ok(RescanPlan {
+            current,
+            configured,
+            added,
+            removed,
+            changed_pending_reload,
+            changed_pending,
+            configuration_changes,
+            enabled_changes,
+            unchanged,
+        })
+    }
+
+    /// Reconcile the running module set against the configured one.
+    ///
+    /// With `preview` set, the diff is computed and returned WITHOUT applying any
+    /// of it: nothing is retired, reconfigured, enabled or spawned. The preview
+    /// deliberately shares this function with the executing path rather than
+    /// computing the same diff somewhere else -- two implementations of one
+    /// decision agree until they do not, and the whole value of a preview is that
+    /// it describes the operation that will actually run.
+    pub(super) async fn reconcile_supervised_modules(
+        &self,
+        supervisor: &Supervisor,
+        configured_modules: Vec<crate::daemon_config::ConfiguredModule>,
+        preview: bool,
+        requester: Principal,
+    ) -> Result<(SupervisorRescanResult, Vec<String>), String> {
+        let plan = self.plan_rescan(configured_modules)?;
+
+        // Everything above this point is pure computation over two snapshots.
+        // Everything below MUTATES. The preview returns here so the boundary is a
+        // single early return rather than a condition repeated at each mutation
+        // site, where one missed guard would apply part of a change the caller was
+        // told would not happen.
+        if preview {
+            return Ok((plan.preview_result(), Vec::new()));
+        }
+        let changed = plan
+            .configuration_changes
+            .union(&plan.enabled_changes)
+            .cloned()
+            .collect::<Vec<_>>();
+        let RescanPlan {
+            current,
+            configured,
+            added,
+            removed,
+            changed_pending_reload,
+            changed_pending,
+            configuration_changes,
+            enabled_changes,
+            unchanged,
+        } = plan;
+        // The staged generation moves before the first change rather than
+        // after the last, so a rescan that fails partway still invalidates
+        // every earlier `supervisor.rescan_checked` preview: part of its diff
+        // may have run.
+        if !(added.is_empty()
+            && removed.is_empty()
+            && configuration_changes.is_empty()
+            && changed_pending.is_empty()
+            && enabled_changes.is_empty())
+        {
+            if let Some(context) = &self.rescan {
+                context
+                    .generation
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        for module_id in &removed {
+            let module = &current
+                .get(module_id)
+                .expect("removed module came from current supervisor state")
+                .0;
+            module
+                .retire_requested(Some(requester.clone()))
+                .await
+                .map_err(|err| {
+                    format!("failed to retire module_id '{module_id}' during rescan: {err}")
+                })?;
+            // TOMBSTONE BEFORE RETIRE, and the order is the whole fix.
+            //
+            // `handle_route_open` resolves an absent module in three steps:
+            // registry, then supervisor status, then tombstone. Retiring first
+            // opens a window where ALL THREE ARE ABSENT -- the registry entry
+            // went with the teardown above, the supervisor entry went with
+            // `retire`, and the tombstone does not exist yet -- so a route.open
+            // landing in it gets `unknown_module` (RETRYABLE, "never heard of
+            // it") for a module that was deliberately removed and whose caller
+            // should get `module_removed` (TERMINAL, carrying a removal age).
+            //
+            // Writing the tombstone first closes it: during the window the
+            // supervisor entry still answers, so the caller gets
+            // `target_unavailable` -- retryable, and TRUE, because the module
+            // is mid-teardown. After both statements it is `module_removed`.
+            // No instant remains where a removed module reads as one that
+            // never existed.
+            //
+            // NOT DETERMINISTICALLY TESTABLE FROM HERE, said plainly because
+            // the absence of a test beside a fix invites deletion: these are
+            // two sync statements with no await between them, so reaching the
+            // window needs a second worker thread to land exactly between them
+            // and there is no hook to force it. MEASURED: the 25 daemon_config
+            // tests pass identically with the old order and the new one, so
+            // the existing suite cannot see this and a green run is not
+            // evidence either way. What the suite does hold is the
+            // post-condition -- a removed module answers `module_removed` --
+            // which this preserves.
+            //
+            // Found by an Athena panel reading the shipped tree against a
+            // design note (2026-09-19), as the one concrete instance of that
+            // note's class that survived contact with source. Direction is
+            // benign: retryable where terminal was intended, never the reverse.
+            self.supervisor.record_rescan_removal(module_id);
+            self.supervisor.retire(module_id);
+            self.route_outages.forget(module_id);
+        }
+
+        for module_id in configured.keys() {
+            let Some((module, _, _, current_enabled)) = current.get(module_id) else {
+                continue;
+            };
+            let configured_module = configured
+                .get(module_id)
+                .expect("configured module id came from configured map");
+            if configuration_changes.contains(module_id) {
+                module
+                    .update_configuration(
+                        configured_module.module_spec(),
+                        configured_module.health.clone(),
+                        configured_module.drain_timeout_ms,
+                    )
+                    .await
+                    .map_err(|err| {
+                        format!(
+                            "failed to update module_id '{module_id}' configuration during rescan: {err}"
+                        )
+                    })?;
+            }
+            // Config-only drift is applied by the evaluator's config update;
+            // do not turn it into a runtime start or stop.
+            if *current_enabled != configured_module.enabled {
+                // A rescan that starts or stops a module applies an operator's
+                // edit to the config, so the resulting outage was asked for.
+                self.route_outages.mark_operator_action(module_id);
+                module
+                    .set_enabled_requested(configured_module.enabled, Some(requester.clone()))
+                    .await
+                    .map_err(|err| {
+                        self.route_outages.operator_action_ended_unrefused(module_id);
+                        format!(
+                            "failed to apply module_id '{module_id}' enabled={} during rescan: {err}",
+                            configured_module.enabled
+                        )
+                    })?;
+            }
+        }
+
+        for module_id in &added {
+            let configured_module = configured
+                .get(module_id)
+                .expect("added module id came from configured map");
+            supervisor
+                .supervise_configured_requested_async(
+                    configured_module.module_spec(),
+                    configured_module.enabled,
+                    configured_module.health.clone(),
+                    configured_module.drain_timeout_ms,
+                    configured_module.restart,
+                    configured_module.register_timeout,
+                    Some(requester.clone()),
+                )
+                .await
+                .map_err(|err| {
+                    format!("failed to add module_id '{module_id}' during rescan: {err}")
+                })?;
+        }
+
+        if let Some(context) = &self.rescan {
+            let mut entries = context
+                .module_entries
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            entries.record(&configured, &added, &removed);
+        }
+
+        Ok((
+            SupervisorRescanResult {
+                added,
+                removed,
+                changed_pending_reload,
+                changed_pending,
+                enabled_changes: enabled_changes.iter().cloned().collect(),
+                unchanged,
+                preview: false,
+                // Filled by the caller, which is the only layer that can see the
+                // previous config to diff against.
+                restart_required: Vec::new(),
+                capability_warnings: Vec::new(),
+                module_actions: Vec::new(),
+                earlier_pending: Vec::new(),
+                expect: None,
+            },
+            changed,
+        ))
+    }
 }

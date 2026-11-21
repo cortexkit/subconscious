@@ -154,15 +154,14 @@ mod tests {
             ("config_gate/program.rs", 1),
             ("config_gate/runtime.rs", 1),
             ("config_store/writer_lock.rs", 1),
-            // Inline test reads, including XDG_DATA_HOME for the fixture stop marker.
-            ("control.rs", 4),
             ("daemon_config.rs", 4),
             ("live_children.rs", 1),
             ("privileged_prompt.rs", 1),
             // Ignored benchmark inputs, not startup overrides.
             ("resource_totals/latency_bench.rs", 2),
             ("run_dir_lock.rs", 2),
-            ("supervise.rs", 11),
+            // Executable path resolution uses PATH and Windows SystemRoot.
+            ("supervise/spawn.rs", 4),
             ("systemd_kill_mode.rs", 1),
         ])
         .into_iter()

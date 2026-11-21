@@ -3463,8 +3463,8 @@ fn refusal_reason(body: &ErrorBody) -> Option<&str> {
 
 /// The daemon's reasons for refusing a route.open because too many binds are
 /// already in flight, on the consumer's connection or towards the target module
-/// (`crates/subc-daemon/src/control.rs`, `route_open_capacity_refusal` and
-/// `route_open_target_capacity_refusal`). Both are sent as `target_unavailable`.
+/// (`crates/subc-daemon/src/control/route_open.rs`, `route_open_capacity_refusal`
+/// and `route_open_target_capacity_refusal`). Both are sent as `target_unavailable`.
 const ADMISSION_PRESSURE_REASONS: [&str; 2] = ["open_admission_full", "target_binds_full"];
 /// Markers in the messages of those same admission-pressure refusals. The
 /// daemon currently logs the reason but leaves it out of the refusal's detail,

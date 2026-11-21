@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.50.32
+
+- Split `control.rs` and `supervise.rs` into modules by area. No behaviour change.
+
 ## 0.50.31
 
 - Log agent command roots that exit before admission at debug level rather than

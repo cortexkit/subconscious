@@ -162,7 +162,7 @@ mod tests {
             // Ignored benchmark inputs, not startup overrides.
             ("resource_totals/latency_bench.rs", 2),
             ("run_dir_lock.rs", 2),
-            ("supervise.rs", 12),
+            ("supervise.rs", 11),
             ("systemd_kill_mode.rs", 1),
         ])
         .into_iter()

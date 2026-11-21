@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.50.30
+
+- Test when a manual restart reuses a health-check replacement and when it
+  must start another process.
+- Move the restart-ordering tests out of the supervisor source into their own
+  test file.
+
 ## 0.50.29
 
 - Document project settings and pin the daemon's project replies and refusals in

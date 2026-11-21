@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.50.29
+
+- Document project settings and pin the daemon's project replies and refusals in
+  wire samples. Compare legacy watch bytes with and without project layers.
+
 ## 0.50.28
 
 - Advertise project settings. Show a project's effective settings and approval

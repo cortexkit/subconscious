@@ -44,6 +44,10 @@ impl ProjectRegistry for Registry {
         Some(&self.pool)
     }
 
+    fn root_io_health(&self) -> Option<subc_control::config::ConfigRootIo> {
+        self.pool.health()
+    }
+
     fn snapshot_scoped<'a>(
         &'a self,
         module: &'a str,

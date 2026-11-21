@@ -3,6 +3,11 @@ use crate::{router::RouteCtx, ControlHandler, FrameSink};
 use subc_control::config::{ConfigControlResponse, ConfigThrough};
 use subc_os::local_peer::{ObservedPeer, PeerObservation, PeerUser};
 use subc_protocol::{Frame, FrameType};
+use tokio::sync::mpsc::error::TryRecvError;
+
+#[cfg(target_os = "linux")]
+#[path = "project_vectors_tests.rs"]
+mod project_vectors;
 
 async fn show(
     rig: &CaptureRig,
@@ -131,6 +136,7 @@ async fn project_settings_unstamped_show_reads_cutoffs_fresh() {
 }
 
 fn owner_connection(handler: &ControlHandler, connection: ConnectionId) {
+    handler.record_local_connection(connection);
     #[cfg(unix)]
     let user = PeerUser::Uid(subc_os::effective_uid());
     #[cfg(windows)]
@@ -169,24 +175,34 @@ async fn request(
         .unwrap()
 }
 
-async fn event(
-    rx: &mut tokio::sync::mpsc::Receiver<crate::router::OutboundFrame>,
-) -> serde_json::Value {
+async fn event_frame(rx: &mut tokio::sync::mpsc::Receiver<crate::router::OutboundFrame>) -> Frame {
     let frame = tokio::time::timeout(Duration::from_secs(7), rx.recv())
         .await
         .unwrap()
         .unwrap()
         .frame;
     assert_eq!(frame.header.ty, FrameType::StreamData);
-    serde_json::from_slice(&frame.body).unwrap()
+    frame
+}
+
+async fn event(
+    rx: &mut tokio::sync::mpsc::Receiver<crate::router::OutboundFrame>,
+) -> serde_json::Value {
+    serde_json::from_slice(&event_frame(rx).await.body).unwrap()
 }
 
 #[tokio::test]
 async fn project_settings_watch_projects_isolate_validation_and_resync_on_drop() {
+    let samples = project_watch_samples().await;
+    #[cfg(target_os = "linux")]
+    project_vectors::assert_samples(samples);
+    #[cfg(not(target_os = "linux"))]
+    drop(samples);
+}
+
+async fn project_watch_samples() -> Vec<(&'static str, serde_json::Value)> {
     let rig = CaptureRig::with_state(true, RootIoPool::new().unwrap(), false);
     let private = root(&rig.project_scratch, "private");
-    let workspace = write_layer(&rig.workspace, 4);
-    write_layer(&private, 6);
     rig.set_projects(vec![
         member("B", Some("W"), &[&private]),
         member("C", None, &[]),
@@ -223,6 +239,17 @@ async fn project_settings_watch_projects_isolate_validation_and_resync_on_drop()
     };
     let (legacy, mut legacy_rx) = connect(76);
     let (opted, mut opted_rx) = connect(77);
+    let (baseline, mut baseline_rx) = connect(78);
+    let legacy_request = json!({"op":"config.watch"});
+    owner_connection(&handler, baseline.connection_id);
+    assert!(request(&handler, &baseline, 1, legacy_request.clone())
+        .await
+        .is_empty());
+    let baseline_resync = event_frame(&mut baseline_rx).await;
+    handler.cleanup_connection(baseline.connection_id).unwrap();
+    let workspace = write_layer(&rig.workspace, 4);
+    write_layer(&private, 6);
+
     owner_connection(&handler, legacy.connection_id);
     let refused = request(
         &handler,
@@ -243,18 +270,14 @@ async fn project_settings_watch_projects_isolate_validation_and_resync_on_drop()
         .unwrap()
         .contains(&json!("config.settings.projects/v1")));
 
-    assert!(request(&handler, &legacy, 4, json!({"op":"config.watch"}))
+    assert!(request(&handler, &legacy, 4, legacy_request)
         .await
         .is_empty());
-    let user_only = event(&mut legacy_rx).await;
-    assert!(request(
-        &handler,
-        &opted,
-        5,
-        json!({"op":"config.watch", "projects":true})
-    )
-    .await
-    .is_empty());
+    let legacy_resync = event_frame(&mut legacy_rx).await;
+    assert_eq!(legacy_resync.body, baseline_resync.body);
+    let user_only: serde_json::Value = serde_json::from_slice(&legacy_resync.body).unwrap();
+    let watch = json!({"op":"config.watch", "projects":true});
+    assert!(request(&handler, &opted, 5, watch.clone()).await.is_empty());
     let initial = event(&mut opted_rx).await;
     assert_eq!(initial["event"], "resync");
     let rows = initial["modules"].as_array().unwrap();
@@ -281,7 +304,7 @@ async fn project_settings_watch_projects_isolate_validation_and_resync_on_drop()
     assert_eq!(invalid_b["workspace_id"], "W");
     assert!(invalid_b["file_error"].is_object());
     assert_eq!(invalid_b["status"], rows[2]["status"]);
-    assert!(legacy_rx.try_recv().is_err());
+    assert!(matches!(legacy_rx.try_recv(), Err(TryRecvError::Empty)));
 
     std::fs::write(&workspace, b"not jsonc").unwrap();
     for project in ["A", "B"] {
@@ -290,17 +313,23 @@ async fn project_settings_watch_projects_isolate_validation_and_resync_on_drop()
         assert_eq!(invalid_file["project_id"], project);
         assert_eq!(invalid_file["file_error"]["code"], "value_invalid");
     }
-    assert!(legacy_rx.try_recv().is_err());
-    assert!(opted_rx.try_recv().is_err());
+    assert!(matches!(legacy_rx.try_recv(), Err(TryRecvError::Empty)));
+    assert!(matches!(opted_rx.try_recv(), Err(TryRecvError::Empty)));
 
     rig.set_projects(vec![member("A", Some("W"), &[]), member("C", None, &[])]);
     let dropped = event(&mut opted_rx).await;
     assert_eq!(dropped["event"], "resync");
     assert_eq!(dropped["modules"].as_array().unwrap().len(), 2);
     assert_eq!(dropped["modules"][1]["project_id"], "A");
-    assert!(legacy_rx.try_recv().is_err());
+    assert!(matches!(legacy_rx.try_recv(), Err(TryRecvError::Empty)));
     handler.cleanup_connection(opted.connection_id).unwrap();
     handler.cleanup_connection(legacy.connection_id).unwrap();
+    vec![
+        ("project-watch.request.json", watch),
+        ("project-watch.resync.json", initial),
+        ("project-watch.change.json", invalid_b),
+        ("project-watch.drop.resync.json", dropped),
+    ]
 }
 
 #[tokio::test]

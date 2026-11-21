@@ -59,6 +59,7 @@ Without `UPDATE_GOLDEN`, the same test compares every read sample and its checks
 row byte for byte, leaving the plan samples' rows intact. JSON keys are sorted before pretty-printing, with one trailing LF,
 independent of Cargo feature unification. The directory is marked `-text` so
 Git never rewrites those bytes on Windows.
+
 ## Edit plans and pending plan operations
 
 The `plan-*.json` and `apply-*.json` samples pair channel-0 request and response bodies from the
@@ -76,8 +77,6 @@ and immutable baseline. No module process is started.
 - `plan-discard.json`: dropping that pending plan without applying it.
 - `plan-base-changed.json`: `config_changed_since_review` because a touched
   module's base generation no longer matches.
-- `plan-layer-not-served.json`: a workspace-layer edit with a keyed
-  `layer_not_served` refusal; project-layer edits are likewise not served yet.
 - `apply-unstamped.json`: apply a reviewed digest immediately on an unstamped
   install, at generation zero, without an operator prompt.
 - `apply-changed.json`: `config_changed_since_review` because the user file
@@ -118,3 +117,55 @@ Without `UPDATE_GOLDEN`, the test compares every plan/apply sample and its rows 
 `SHA256SUMS` byte for byte, leaving other settings samples' checksum rows intact.
 To check the checksums separately, run `sha256sum --check SHA256SUMS` in this
 directory. Git preserves the sample bytes on every platform.
+
+## Workspace and project settings
+
+These samples use the daemon's `config.settings.projects/v1` capability, with
+invented projects `A`, `B`, and `C` and workspace `W`. Replies come from the
+channel-0 handlers and watch/delivery workers. Most samples pair `request` and
+`reply`; watch bodies and the `config.changed` push are standalone.
+
+| File | Body |
+| --- | --- |
+| `project-show.json` | Full approved tuple with user, workspace and project documents and the winning source. |
+| `project-show-default.json`, `project-show-user.json`, `project-show-workspace.json` | The same tuple at its three inclusive cutoffs. |
+| `project-watch.request.json`, `project-watch.resync.json` | Opt in with `projects: true`; the first resync has the user row followed by project rows. |
+| `project-watch.change.json` | A project's bound violation reports `file_error` on that tuple only. |
+| `project-watch.drop.resync.json` | A replacement snapshot after a project leaves the registry. |
+| `project-plan-edit.json`, `project-apply-unstamped.json` | Edit one workspace file and apply its reviewed digest at generation zero. |
+| `project-plan-capture.json` | Review the healthy project tuple; an unavailable root is a `skipped` notice, not a blocking `refusals` row. |
+| `project-plan-root-refusals.json` | Blocking `layer_symlink`, `layer_not_regular`, `layer_hardlinked`, `layer_too_large`, `layer_root_invalid` and `layer_root_ambiguous` rows. |
+| `project-plan-apply-kind.json`, `project-plan-credentials.json` | Blocking `project_apply_kind_unsupported` and `credential_layer_unsupported` field rows. |
+| `project-plan-unknown-workspace.json`, `project-plan-workspace-mismatch.json` | `ERROR` bodies for a missing workspace and conflicting IDs. |
+| `project-plan-edit-spans-files.json` | `edit_spans_files` when an unstamped plan would write two files. |
+| `project-plan-config-unavailable.json`, `project-plan-registry-unavailable.json` | `config_unavailable` for an unavailable edit root, and `project_registry_unavailable` for an enumeration outage. |
+| `project-show-unknown-project.json` | `unknown_project` for an ID that is neither stored nor registered. |
+| `project-changed.json`, `project-get-pending.json`, `project-applied.json` | Discovery, a pending delivery with a project-specific attempt, and its ACK. |
+| `project-get-fallback.json`, `project-get-unstamped.json` | Stamped layerless fallback and fresh unstamped delivery; neither has an attempt. |
+| `project-status-root-io.json` | `config.status` while one root job is past its deadline; idle status omits `root_io`. |
+
+The legacy watch test compares raw resync bodies before and after adding
+project layers. On the same layered state, legacy subscribers get no project
+events while opted-in subscribers see project changes and a resync on drop.
+The existing user-only wire samples and their checksum rows are unchanged.
+Valid workspace and project targets are served; this capability does not emit
+`layer_not_served`.
+
+For the project samples, paths under the fixture's scratch directories become
+`/home/example` and `/home/example/repos`. As with the user plan samples, the
+daemon incarnation and file identities are normalized. Registry and edit
+witness digests and project approval digests depend on those paths and
+identities; their hashes are normalized too. Layer content hashes and patch
+preconditions based on file bytes are preserved. The test then recomputes
+the normalized plan digest and uses it in the matching apply sample. The
+status sample clears `ungated_inputs` to exclude the build runner's environment.
+
+Regenerate on Linux from the repository root. Run the two writers serially
+because both update the checksum manifest:
+
+```sh
+UPDATE_GOLDEN=1 scripts/test-daemon-lib.sh -- \
+  project_settings_vectors_match_real_handler_bytes \
+  project_settings_watch_projects_isolate_validation_and_resync_on_drop \
+  --test-threads=1
+```

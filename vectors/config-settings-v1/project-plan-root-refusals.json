@@ -2,37 +2,72 @@
   "reply": {
     "op": "config.plan",
     "view": {
-      "base_revision": 0,
-      "digest": "sha256:c5183f9b8408593a5797587eadc9f9d42f850d45a1274a6192a9276f18d55b8d",
+      "base_revision": 1,
+      "digest": "sha256:708b7917c70dd8cc9719823c785691fe4a31f25e468a194ca757ef33c85a42f1",
       "plan": {
-        "active_generations": {},
-        "base_generation": 0,
-        "base_revision": 0,
+        "active_generations": {
+          "{\"module\":\"a\",\"project\":null}": 1
+        },
+        "base_generation": 1,
+        "base_revision": 1,
         "changeset": {
           "affected_projects": [],
           "apply_plan": {
             "edit_plan": {
-              "unstamped": true,
+              "unstamped": false,
               "write_back": []
             },
             "edit_refusals": [
               {
-                "code": "layer_not_served",
-                "message": "workspace and project settings are not served yet",
-                "module_id": "demo",
-                "path": "/limit"
+                "code": "layer_symlink",
+                "message": "symlink: root /home/example/repos/symlink: entry is a symlink or reparse point",
+                "module_id": "a",
+                "path": "/limit",
+                "project_id": "symlink",
+                "workspace_id": "W"
+              },
+              {
+                "code": "layer_not_regular",
+                "message": "directory: root /home/example/repos/directory: entry does not have the requested file type",
+                "module_id": "a",
+                "path": "/limit",
+                "project_id": "directory",
+                "workspace_id": "W"
+              },
+              {
+                "code": "layer_hardlinked",
+                "message": "hardlink: root /home/example/repos/hardlink: entry is not a singly linked file",
+                "module_id": "a",
+                "path": "/limit",
+                "project_id": "hardlink",
+                "workspace_id": "W"
+              },
+              {
+                "code": "layer_too_large",
+                "message": "large: root /home/example/repos/large: configuration document exceeds the 1 MiB JSONC limit",
+                "module_id": "a",
+                "path": "/limit",
+                "project_id": "large",
+                "workspace_id": "W"
+              },
+              {
+                "code": "layer_root_ambiguous",
+                "message": "the project layer cannot be assigned to a single root",
+                "module_id": "a",
+                "path": "/limit",
+                "project_id": "ambiguous",
+                "workspace_id": "W"
+              },
+              {
+                "code": "layer_root_invalid",
+                "message": "the project has no eligible root",
+                "module_id": "a",
+                "path": "/limit",
+                "project_id": "rootless",
+                "workspace_id": "W"
               }
             ],
-            "module_transitions": {
-              "demo": {
-                "deferred_live_fields": [],
-                "explanation": "The complete generation activates only after every required transition and readiness check finishes.",
-                "transition": "live",
-                "waits_for_daemon_restart": false,
-                "waits_for_next_start": false,
-                "whole_generation": true
-              }
-            },
+            "module_transitions": {},
             "operation": "change",
             "previous": {
               "\"Daemon\"": {
@@ -46,7 +81,7 @@
                     "kind": "value",
                     "value": {
                       "modules": {
-                        "demo": {
+                        "a": {
                           "program": "/home/example/program",
                           "registration_channel": true
                         }
@@ -56,7 +91,7 @@
                   }
                 }
               },
-              "{\"Declaration\":\"demo\"}": {
+              "{\"Declaration\":\"a\"}": {
                 "kind": "value",
                 "value": {
                   "state": {
@@ -74,22 +109,25 @@
                           "limit": {
                             "default": 1,
                             "description": "Limit",
-                            "type": "integer"
+                            "type": "integer",
+                            "x-ck-bound": "raise_only"
                           }
                         },
                         "type": "object",
                         "unevaluatedProperties": false,
                         "x-ck-apply": "live",
                         "x-ck-layers": [
-                          "user"
+                          "user",
+                          "workspace",
+                          "project"
                         ]
                       },
-                      "user_file": "/home/example/cortexkit/demo.jsonc"
+                      "user_file": "/home/example/cortexkit/a.jsonc"
                     }
                   }
                 }
               },
-              "{\"Entry\":\"demo\"}": {
+              "{\"Entry\":\"a\"}": {
                 "kind": "value",
                 "value": {
                   "state": {
@@ -105,22 +143,19 @@
                   }
                 }
               },
-              "{\"Layer\":{\"module\":\"demo\",\"path\":\"/home/example/cortexkit/demo.jsonc\"}}": {
+              "{\"Layer\":{\"module\":\"a\",\"path\":\"/home/example/cortexkit/a.jsonc\"}}": {
                 "kind": "value",
                 "value": {
                   "state": {
-                    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                    "state": "present"
+                    "state": "absent"
                   },
                   "value": {
                     "kind": "value",
-                    "value": {
-                      "limit": 1
-                    }
+                    "value": {}
                   }
                 }
               },
-              "{\"Program\":{\"module\":\"demo\",\"path\":\"/home/example/program\"}}": {
+              "{\"Program\":{\"module\":\"a\",\"path\":\"/home/example/program\"}}": {
                 "kind": "value",
                 "value": {
                   "state": {
@@ -135,9 +170,9 @@
                         "inode": "1",
                         "platform": "unix"
                       },
-                      "length": 15,
+                      "length": 25,
                       "path": "/home/example/program",
-                      "raw": "sha256:868d6bd28d3a6fa8e5ab189904db15df65f49ea4369735a771678aad32ab23b4"
+                      "raw": "sha256:744456cdcb787e63f8ca619ec6eaab592abad550190dfed1e22b2dc362cb2b57"
                     }
                   }
                 }
@@ -145,7 +180,7 @@
             },
             "review": null,
             "reviewed_programs": {
-              "demo": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+              "a": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             },
             "rollback_to": null,
             "snapshot": {
@@ -160,7 +195,7 @@
                     "kind": "value",
                     "value": {
                       "modules": {
-                        "demo": {
+                        "a": {
                           "program": "/home/example/program",
                           "registration_channel": true
                         }
@@ -170,7 +205,7 @@
                   }
                 }
               },
-              "{\"Declaration\":\"demo\"}": {
+              "{\"Declaration\":\"a\"}": {
                 "kind": "value",
                 "value": {
                   "state": {
@@ -188,22 +223,25 @@
                           "limit": {
                             "default": 1,
                             "description": "Limit",
-                            "type": "integer"
+                            "type": "integer",
+                            "x-ck-bound": "raise_only"
                           }
                         },
                         "type": "object",
                         "unevaluatedProperties": false,
                         "x-ck-apply": "live",
                         "x-ck-layers": [
-                          "user"
+                          "user",
+                          "workspace",
+                          "project"
                         ]
                       },
-                      "user_file": "/home/example/cortexkit/demo.jsonc"
+                      "user_file": "/home/example/cortexkit/a.jsonc"
                     }
                   }
                 }
               },
-              "{\"Entry\":\"demo\"}": {
+              "{\"Entry\":\"a\"}": {
                 "kind": "value",
                 "value": {
                   "state": {
@@ -219,22 +257,19 @@
                   }
                 }
               },
-              "{\"Layer\":{\"module\":\"demo\",\"path\":\"/home/example/cortexkit/demo.jsonc\"}}": {
+              "{\"Layer\":{\"module\":\"a\",\"path\":\"/home/example/cortexkit/a.jsonc\"}}": {
                 "kind": "value",
                 "value": {
                   "state": {
-                    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                    "state": "present"
+                    "state": "absent"
                   },
                   "value": {
                     "kind": "value",
-                    "value": {
-                      "limit": 1
-                    }
+                    "value": {}
                   }
                 }
               },
-              "{\"Program\":{\"module\":\"demo\",\"path\":\"/home/example/program\"}}": {
+              "{\"Program\":{\"module\":\"a\",\"path\":\"/home/example/program\"}}": {
                 "kind": "value",
                 "value": {
                   "state": {
@@ -249,9 +284,9 @@
                         "inode": "1",
                         "platform": "unix"
                       },
-                      "length": 15,
+                      "length": 25,
                       "path": "/home/example/program",
-                      "raw": "sha256:868d6bd28d3a6fa8e5ab189904db15df65f49ea4369735a771678aad32ab23b4"
+                      "raw": "sha256:744456cdcb787e63f8ca619ec6eaab592abad550190dfed1e22b2dc362cb2b57"
                     }
                   }
                 }
@@ -265,10 +300,6 @@
         "daemon_incarnation": "example-daemon",
         "input_vector": {
           "inputs": {
-            "module:\"demo\"": {
-              "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-              "state": "present"
-            },
             "subc.jsonc": {
               "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
               "state": "present"
@@ -278,25 +309,108 @@
       },
       "refusals": [
         {
-          "code": "layer_not_served",
-          "message": "workspace and project settings are not served yet",
-          "module_id": "demo",
-          "path": "/limit"
+          "code": "layer_symlink",
+          "message": "symlink: root /home/example/repos/symlink: entry is a symlink or reparse point",
+          "module_id": "a",
+          "path": "/limit",
+          "project_id": "symlink",
+          "workspace_id": "W"
+        },
+        {
+          "code": "layer_not_regular",
+          "message": "directory: root /home/example/repos/directory: entry does not have the requested file type",
+          "module_id": "a",
+          "path": "/limit",
+          "project_id": "directory",
+          "workspace_id": "W"
+        },
+        {
+          "code": "layer_hardlinked",
+          "message": "hardlink: root /home/example/repos/hardlink: entry is not a singly linked file",
+          "module_id": "a",
+          "path": "/limit",
+          "project_id": "hardlink",
+          "workspace_id": "W"
+        },
+        {
+          "code": "layer_too_large",
+          "message": "large: root /home/example/repos/large: configuration document exceeds the 1 MiB JSONC limit",
+          "module_id": "a",
+          "path": "/limit",
+          "project_id": "large",
+          "workspace_id": "W"
+        },
+        {
+          "code": "layer_root_ambiguous",
+          "message": "the project layer cannot be assigned to a single root",
+          "module_id": "a",
+          "path": "/limit",
+          "project_id": "ambiguous",
+          "workspace_id": "W"
+        },
+        {
+          "code": "layer_root_invalid",
+          "message": "the project has no eligible root",
+          "module_id": "a",
+          "path": "/limit",
+          "project_id": "rootless",
+          "workspace_id": "W"
         }
       ]
     }
   },
   "request": {
     "base_generations": {
-      "demo": 0
+      "a": 1
     },
     "edits": [
       {
-        "layer": "workspace",
-        "module_id": "demo",
+        "layer": "project",
+        "module_id": "a",
         "path": "/limit",
-        "set": 4,
-        "workspace_id": "example-workspace"
+        "project_id": "symlink",
+        "set": 8,
+        "workspace_id": "W"
+      },
+      {
+        "layer": "project",
+        "module_id": "a",
+        "path": "/limit",
+        "project_id": "directory",
+        "set": 8,
+        "workspace_id": "W"
+      },
+      {
+        "layer": "project",
+        "module_id": "a",
+        "path": "/limit",
+        "project_id": "hardlink",
+        "set": 8,
+        "workspace_id": "W"
+      },
+      {
+        "layer": "project",
+        "module_id": "a",
+        "path": "/limit",
+        "project_id": "large",
+        "set": 8,
+        "workspace_id": "W"
+      },
+      {
+        "layer": "project",
+        "module_id": "a",
+        "path": "/limit",
+        "project_id": "ambiguous",
+        "set": 8,
+        "workspace_id": "W"
+      },
+      {
+        "layer": "project",
+        "module_id": "a",
+        "path": "/limit",
+        "project_id": "rootless",
+        "set": 8,
+        "workspace_id": "W"
       }
     ],
     "op": "config.plan"

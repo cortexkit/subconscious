@@ -218,25 +218,6 @@ async fn config_plan_vectors_match_real_handler_bytes() {
         assert_eq!(error["code"], "invalid_params");
     }
 
-    handler.config_review_test_reply = Some(ConfigReviewReply::new(vec![], vec![]));
-    let request = json!({"op":"config.plan","base_generations":{"demo":0},"edits":[{"module_id":"demo","layer":"workspace","workspace_id":"example-workspace","path":"/limit","set":4}]});
-    let reply = call(&handler, &ctx, request.clone()).await;
-    assert_eq!(
-        reply["view"]["refusals"],
-        json!([{
-            "module_id":"demo", "path":"/limit", "code":"layer_not_served",
-            "message":"workspace and project settings are not served yet"
-        }])
-    );
-    let view = normalized_view(
-        serde_json::from_value(reply["view"].clone()).unwrap(),
-        root.to_str().unwrap(),
-    );
-    cases.insert(
-        "plan-layer-not-served.json",
-        json!({"request":request,"reply":{"op":"config.plan","view":view}}),
-    );
-
     let request = json!({"op":"config.plan","base_generations":{"demo":1},"edits":[{"module_id":"demo","layer":"user","path":"/limit","set":4}]});
     let reply = refused_call(
         &handler,

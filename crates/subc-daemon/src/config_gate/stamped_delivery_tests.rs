@@ -21,7 +21,7 @@ fn served(owner: &RuntimeOwner, connection: ConnectionId, project: Option<&str>)
     reply
 }
 
-fn report(view: &ConfigView, ack: bool) -> ConfigAppliedRequest {
+pub(super) fn report(view: &ConfigView, ack: bool) -> ConfigAppliedRequest {
     let mut report = ConfigAppliedRequest::new(
         view.generation,
         view.attempt.unwrap(),
@@ -257,14 +257,14 @@ async fn stamped_delivery_waits_for_user_basis_and_fails_only_dependents_on_user
     }
 }
 
-struct Peer {
-    handler: Arc<crate::ControlHandler>,
+pub(super) struct Peer {
+    pub(super) handler: Arc<crate::ControlHandler>,
     ctx: crate::router::RouteCtx,
     rx: tokio::sync::mpsc::Receiver<crate::router::OutboundFrame>,
 }
 
 impl Peer {
-    fn new(owner: Arc<RuntimeOwner>, connection_id: ConnectionId) -> Self {
+    pub(super) fn new(owner: Arc<RuntimeOwner>, connection_id: ConnectionId) -> Self {
         let registry = Arc::new(crate::Registry::default());
         let forwarding = Arc::new(crate::ForwardingTable::default());
         let (tx, rx) = tokio::sync::mpsc::channel(16);
@@ -311,12 +311,16 @@ impl Peer {
     }
 
     async fn next_hint(&mut self) -> ConfigChanged {
-        let frame = Self::next_frame(&mut self.rx).await;
-        assert_eq!(frame.header.ty, FrameType::Push);
-        serde_json::from_slice(&frame.body).unwrap()
+        serde_json::from_slice(&self.next_hint_frame().await.body).unwrap()
     }
 
-    async fn rpc(&mut self, request: &impl serde::Serialize, flushed: bool) -> Frame {
+    pub(super) async fn next_hint_frame(&mut self) -> Frame {
+        let frame = Self::next_frame(&mut self.rx).await;
+        assert_eq!(frame.header.ty, FrameType::Push);
+        frame
+    }
+
+    pub(super) async fn rpc(&mut self, request: &impl serde::Serialize, flushed: bool) -> Frame {
         let frame = Frame::build(
             FrameType::Request,
             Flags::new(false, Priority::Passive, false),
@@ -330,7 +334,12 @@ impl Peer {
         if flushed {
             let (reply, result) = tokio::join!(Self::next_frame(&mut self.rx), call);
             assert!(result.unwrap().is_empty());
-            assert_eq!(reply.header.ty, FrameType::Response);
+            assert_eq!(
+                reply.header.ty,
+                FrameType::Response,
+                "{}",
+                String::from_utf8_lossy(&reply.body)
+            );
             reply
         } else {
             let mut frames = call.await.unwrap();

@@ -102,7 +102,9 @@ The additive `config.settings/v1` capability serves `config.modules`,
 `config.schema`, `config.show` and `config.watch` to authorized local settings
 readers without prompting. `config.show` returns approved effective values and
 layer documents on a stamped install; unstamped reads identify live, unreviewed
-file settings as generation zero. Edits currently serve the user layer only.
+file settings as generation zero. The `config.settings.projects/v1` capability
+adds workspace and project settings. These operations remain on channel 0 with
+their existing admission checks; a `project_id` selects settings, not caller authority.
 
 On a stamped install (after a person approves a configuration stamp),
 `config.get` normally serves the approved active and
@@ -185,10 +187,20 @@ replaces the whole state when the module set or stamp changes. Reopening always
 starts with another complete resync. Each connection can have at most four open
 `config.watch` subscriptions. A fifth is refused with `too_many_watches`.
 
+Set `projects: true` to include rows for registered projects with a stored tuple,
+a proposal, or a present settings layer. Rows are sorted by `(module_id, project_id)`,
+with the user row first for each module. Project rows and their `change` events
+carry `project_id` and, if known, `workspace_id`. When a row disappears (for
+example, the registry drops a project), a `resync` replaces the old rows.
+Without `projects: true`, both the rows and events stay user-only, as does
+`config.modules`.
+
 Module rows, watch changes and successful `config.show` replies may carry
-`file_error: {code, message}`. It describes a user-file observation failure with
-code `value_invalid` or `input_unavailable`, independently of `status` and its
-existing precedence. Approved effective values, sources and layer documents are
+`file_error: {code, message}`. It describes a file observation failure, for
+example `value_invalid` or `input_unavailable`, independently of `status` and
+its existing precedence. A shared file that cannot be read or parsed affects
+each project that reads it. A tuple validation failure affects only that tuple.
+Approved effective values, sources and layer documents are
 not replaced by the broken file. One-shot `config.modules` and `config.show`
 reads report this diagnostic without a settling grace.
 
@@ -212,6 +224,23 @@ settings replies and events. Older readers may ignore the additive members.
 See the [settings wire samples](../vectors/config-settings-v1/README.md) for
 ordinary reads, file diagnostics and edit-plan requests.
 
+**Project views and cutoffs.** `config.show {module_id, project_id, through?}`
+returns the selected project's merged values and their sources. Precedence is
+defaults, user, workspace, then project. Workspace and project files live at
+`<registry root>/.cortexkit/<module_id>.jsonc`; module declarations cannot supply
+repository roots. If a project's root also serves as its workspace root, that
+file counts once, as the project's layer for that project. Other workspace
+members can still read it as their workspace layer. `layers` lists present files:
+user layers carry no IDs, workspace layers carry `workspace_id`, and project
+layers carry `project_id`.
+
+An optional `through` (`default`, `user`, or `workspace`) selects an inclusive
+cutoff. On stamped installs these views come from the project's own approval,
+not the module's current user generation. A dropped project still shows its
+stored tuple, even during a registry outage. Without a stored tuple, a known
+layerless project shows the user view. Without `project_id`, show keeps its
+user-only behavior, including for `through: "workspace"`.
+
 ### Configuration plans and approval
 
 The opt-in `config.gate` capability advertises standalone configuration bodies,
@@ -219,7 +248,7 @@ not new variants of the legacy exhaustive client control enums:
 
 | Op | Result |
 | --- | --- |
-| `config.status` | Stamp state, integrity mode, proposals, missing approval surfaces, platform warnings and approved-but-inactive differences. |
+| `config.status` | Stamp state, integrity mode, proposals, missing approval surfaces, platform warnings, approved-but-inactive differences and optional `root_io` health. |
 | `config.stamp`, `config.plan`, `config.unstamp`, `config.rollback` | A reviewable plan and digest; none commits configuration. |
 | `config.apply` | Requests approval of that digest, then reports `generation` and `restart_required` (always serialized; absent on older replies means false). |
 | `config.history` | Retained generations and summaries of pruned history. |
@@ -241,6 +270,59 @@ approval service answers the consent request with an error whose code is
 generation is created and the plan stays pending. Other phone error codes,
 declined approval and unanswered cards return `approval_declined`. Changed plan
 inputs return `plan_stale`, without supplying a new digest.
+
+**Project-tuple plans.** A capture plan (`config.plan` without `edits`) checks
+registered roots for external changes. An edit names `layer: "workspace"`
+and a `workspace_id` or member `project_id`, or names `layer: "project"` and
+`project_id`. A workspace edit covers every project that reads the file, even
+if some projects read the physical file as a project layer. Stamped edits start
+from approved bytes. They neither adopt nor overwrite a separate, unapproved
+disk change. The daemon computes each candidate `(module_id, project_id)` view
+from its ordered layers and checks the module's `config.review` reply against
+it. Project review snapshots carry `project_id`, including during the first
+review when `base` is `null`; the workspace snapshot also carries `workspace_id`.
+The plan binds exactly the changed tuples, including ones whose layer bytes or
+cutoffs change without an effective field delta.
+
+Before apply the daemon takes a fresh registry snapshot of affected readers and
+rechecks their membership, roots, and the reviewed files. Changes in that set
+refuse the apply with `config_changed_since_review`; unrelated registry changes
+do not. `config.show` returns the same module-wide `base_generation` token with
+or without `project_id`; approval of any tuple advances that token at commit,
+not at ACK. On stamped installs, approval commits to the store before file
+write-back. Dirty targets or timed-out writes can report `write_back_behind`.
+Reconciliation adopts a late write only if the current bytes match the newest
+intent. Unstamped edits apply directly and can touch only one physical file.
+
+**Root I/O and refusals.** Registry-root work uses four dedicated workers and
+a FIFO queue of 16 jobs. Each root has at most one outstanding job. A single
+10-second deadline covers queueing and execution; expired queued jobs never
+start, and a worker running past its deadline stays charged until it returns.
+`config.status` adds `root_io: {stuck_roots, charged_workers}` when a job is
+stuck, with canonical root paths sorted. Bare user reads and delivery of
+stored views do not wait on this pool.
+
+Capture root failures appear in `view.skipped`, not `view.refusals`. A changed
+file that a skipped project also reads is held for all readers until another
+capture; independent changes can proceed. `skipped` notices do not change the
+plan digest. In edit plans, path and root failures appear in the blocking
+`view.refusals` instead (with `project_id` and `workspace_id` where applicable).
+
+| Code | Meaning |
+| --- | --- |
+| `layer_symlink`, `layer_not_regular`, `layer_hardlinked` | A link, reparse point, non-regular file, or hard-linked file violates retained-root checks. |
+| `layer_too_large` | A layer file exceeds 1 MiB. |
+| `layer_root_invalid`, `layer_root_ambiguous` | The root is invalid, missing from the eligible set, or cannot be selected unambiguously. |
+| `project_apply_kind_unsupported` | A workspace- or project-sourced field requires a non-live apply action. |
+| `credential_layer_unsupported` | A workspace or project layer sets a section containing a credential reference field. Such sections are user-layer only. |
+| `unknown_project`, `unknown_workspace`, `workspace_mismatch` | The selection is unregistered, the workspace has no eligible root or member, or the IDs disagree. |
+| `edit_spans_files` | An unstamped edit plan touches more than one file. |
+| `project_registry_unavailable` | The registry could not be consulted; an outage is not an empty registry. |
+| `config_unavailable` | Required root I/O is unavailable (including a busy root, a full queue or a deadline), or the result of an unstamped write is unknown. |
+
+Selection and availability failures in edit requests are `ERROR` frames.
+Layer and field refusals are rows in the plan view. A malformed control body
+still yields `invalid_control_body`, and invalid parameters yield `invalid_params`.
 
 Approval of daemon entries is not live reconciliation. The intended activation
 boundary is the next deliberate daemon start; status compares approved entries
@@ -433,7 +515,8 @@ informational: restart and reload reasons still classify as `MayReopen`.
 | --- | --- | --- |
 | `route.bind` | Request | Bind a client route to a module channel. Carries `route_channel`, `epoch`, `target`, `identity`, the daemon-stamped `principal`, `consumer_capabilities`, `role_versions`, `admission_facts`, the scope stamp and the call mode. Success is an empty `route.bind` reply; a refusal is an `ERROR`, whose code and message reach the opener unchanged (test `route_open_module_rejection_uses_daemon_counter_key` (`crates/subc-daemon/src/control.rs`)). |
 | `health.check` | Request | Ask the module for its health. Reply: `status` (`ok`, `degraded`, `failing`), optional `detail` and `metrics`. Sent only to modules that declared the op in HELLO `control_ops`. |
-| `projects.enumerate` | Request | Read Entorhinal's authoritative project/workspace registry for configuration planning. Requires the nonce-verified reserved `entorhinal` principal, readiness and HELLO `control_ops` opt-in. |
+| `config.review` | Request | Review a candidate settings tuple against its approved view. The daemon checks the returned fields before including the tuple in a plan. |
+| `projects.enumerate` | Request | Read Entorhinal's authoritative project/workspace registry for configuration planning and membership refresh. Requires the nonce-verified reserved `entorhinal` principal, readiness and HELLO `control_ops` opt-in. |
 | `module.draining` | Command | Tell the module its routes are draining, with `reason` and an absolute wall-clock `deadline_ms`. Treat the deadline as "no later than". |
 
 What a module does with these is in [`module-surface.md`](module-surface.md).
@@ -448,8 +531,12 @@ workspaces with `root` and `fileId`). Refusals use an `ERROR` frame containing
 than a successful response with an error field. The daemon maps refusals to
 `project_registry_unavailable`, preserving the message. Queue admission and
 reply share one 10-second deadline; a timeout refuses planning with the same
-code. This reader is preparation for project-tuple planning and delivery, which
-are not supported yet. Runtime delivery never enumerates the registry.
+code. A stamped daemon persists the last successful membership snapshot. Capture
+and edit plans, apply, and the delivery worker's periodic refresh update it.
+Failed enumerations leave it unchanged. Stamped `config.get` uses that record
+and the approved store without enumerating or opening a repository root. A
+confirmed drop prevents further delivery, removes opted-in watch rows, and leaves
+stored approvals intact for `config.show`.
 
 `daemon.shutdown_intent` is a client-originated channel-0 request with
 `{"intent":"restart"}`. It uses the same client admission as `supervisor.restart`
@@ -481,7 +568,30 @@ to a module that lists it.
  | `policy_root.rotate` | Request | Propose a signed trust-root rotation from the launch-verified vault. |
 | `scope.sync`, `scope.apply`, `scope.describe` | Request | Register, change and read scopes. See [`scopes.md`](scopes.md). |
 | `scope.watch` | Subscription | Snapshot and follow the lifetime of selected scope epochs (below). |
+| `config.declare`, `config.get`, `config.applied` | Request | Declare a settings schema, fetch an approved or live view, and acknowledge a delivered attempt. |
 | `operator.confirm` | Request | Ask the person at the machine to confirm one in-flight write (section 5.1). |
+
+**Project settings delivery.** Modules may receive `config.changed {project_id}`
+after declaring on a delivery connection, even if they have not yet requested
+that project. The push is a hint: fetch the view with `config.get {project_id}`.
+For a deliverable view with an attempt, send `config.applied` with the same
+project ID and attempt. A pending project generation waits for its reviewed
+user generation to be active with no pending user generation. User ACK wakes
+waiting projects; a failed user basis fails its dependent pending project views.
+A project NACK (`config.applied` with `result: "nack"`, the module refusing the view) keeps that
+project's last active view and does not affect other tuples, route policy, or
+process recovery.
+
+A known project without its own tuple receives the active user view with the
+requested `project_id` and no attempt. On an unstamped install a project get
+reads the current registry entry and layer files, validates the tuple without
+`config.review`, and returns `generation: 0` and `status: "unstamped"`; fallback
+requires that the applicable workspace and project files are absent. An
+attempt-less view does not need an acknowledgement. Every two seconds the
+unstamped poller checks requested projects for file and registry changes. A
+valid change notifies that project's requesting connections; a failure leaves
+its last good view and can report `file_error` on its watch row. A bare
+`config.get` does no project root I/O.
 
 ### Scope lifecycle watches
 
@@ -611,6 +721,8 @@ in `server.describe.capabilities` (`subc_capabilities` in
 | `scope-bind-proof/v2` | Bind proofs are required only from non-attested openers; reserved modules are exempt. Advertised alongside v1. |
 | `scope-replace-if-idle/v1` | Scope records may request atomic idle-only epoch/proof replacement; scoped opens may hold connection presence across route closures. |
 | `activity-ledger/v1` | The `activity.*` ops exist. |
+| `config.settings/v1` | Channel-0 settings reads and watches are available to authorized readers. |
+| `config.settings.projects/v1` | Workspace and project edits, project show and delivery, opted-in project watch rows, and the project-specific refusal codes are supported. |
 
 A client checks for a capability before sending a field or op that depends on
 it. Absence of a capability means the daemon does not support it.

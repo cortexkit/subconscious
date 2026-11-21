@@ -334,6 +334,7 @@ mod tests {
             module_pid: pid,
             before_cpu: None,
             started: Vec::new(),
+            exited_before_admission: Vec::new(),
             pending: Vec::new(),
             finished: Vec::new(),
             known: Some(Vec::new()),

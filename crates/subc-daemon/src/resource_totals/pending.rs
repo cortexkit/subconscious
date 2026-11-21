@@ -154,35 +154,37 @@ impl Module {
                 continue;
             }
             pending.sequence = table.revision();
-            if table.process(root.pid).is_none() && table.identity_alive(root.pid, 0) == Some(false)
+            let result = if table.process(root.pid).is_none()
+                && table.identity_alive(root.pid, 0) == Some(false)
             {
-                tracing::debug!(
-                    module_id,
-                    pid = root.pid,
-                    "pending agent command exited before validation"
-                );
-                continue;
-            }
-            match validation::validate_root(pending.module_pid, target, root, table, None) {
+                validation::Validation::Exited
+            } else {
+                validation::validate_root(pending.module_pid, target, root, table, None)
+            };
+            let verified = match result {
+                validation::Validation::Exited => {
+                    tracing::debug!(
+                        module_id,
+                        pid = root.pid,
+                        "pending agent command exited before validation"
+                    );
+                    continue;
+                }
                 validation::Validation::Incomplete => {
                     self.pending.insert(root, pending);
+                    continue;
                 }
-                result => {
-                    let verified = match result {
-                        validation::Validation::Valid(verified) => Some(verified),
-                        validation::Validation::Invalid => None,
-                        validation::Validation::Incomplete => unreachable!(),
-                    };
-                    let acceptance = self.accept_checked(generation, root, verified, table, now);
-                    if acceptance.log_rejected {
-                        tracing::warn!(
-                            module_id,
-                            pid = root.pid,
-                            start_time_ms = root.start_time_ms,
-                            "agent command root was not admitted"
-                        );
-                    }
-                }
+                validation::Validation::Valid(verified) => Some(verified),
+                validation::Validation::Invalid => None,
+            };
+            let acceptance = self.accept_checked(generation, root, verified, table, now);
+            if acceptance.log_rejected {
+                tracing::warn!(
+                    module_id,
+                    pid = root.pid,
+                    start_time_ms = root.start_time_ms,
+                    "agent command root was not admitted"
+                );
             }
         }
     }

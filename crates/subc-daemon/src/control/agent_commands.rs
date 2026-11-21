@@ -260,8 +260,8 @@ impl ControlHandler {
                     validation.fence,
                 )
             });
-            let rejected = match committed {
-                Ok(rejected) => rejected,
+            let committed = match committed {
+                Ok(committed) => committed,
                 Err(crate::supervise::ResourceCommitError::Busy) => {
                     if attempt < 3 {
                         std::thread::yield_now();
@@ -277,26 +277,34 @@ impl ControlHandler {
                     )?]);
                 }
             };
-            if rejected.is_none() && attempt < 3 {
+            if committed.is_none() && attempt < 3 {
                 std::thread::yield_now();
                 continue;
             }
-            let Some(rejected) = rejected else {
+            let Some(committed) = committed else {
                 break;
             };
-            let roots_full = rejected.roots_full;
+            let roots_full = committed.roots_full;
             tracing::debug!(
                 module_id = id,
                 attempts = attempt + 1,
                 latency_ms = validation.arrival.elapsed().as_millis() as u64,
                 "agent command declaration validated"
             );
-            for root in rejected.rejected {
+            for root in committed.rejected {
                 tracing::warn!(
                     module_id = id,
                     pid = root.pid,
                     start_time_ms = root.start_time_ms,
                     "agent command root was not admitted"
+                );
+            }
+            for root in committed.exited_before_admission {
+                tracing::debug!(
+                    module_id = id,
+                    pid = root.pid,
+                    start_time_ms = root.start_time_ms,
+                    "agent command root exited before admission"
                 );
             }
             if roots_full {

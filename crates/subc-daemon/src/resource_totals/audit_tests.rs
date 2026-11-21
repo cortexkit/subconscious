@@ -46,6 +46,7 @@ fn omitted_identity_proofs_have_the_same_hard_bound_as_loss_identities() {
         module_pid: 1,
         before_cpu: None,
         started: Vec::new(),
+        exited_before_admission: Vec::new(),
         pending: Vec::new(),
         finished: Vec::new(),
         known: Some(Vec::new()),
@@ -66,6 +67,7 @@ fn omitted_identity_proofs_have_the_same_hard_bound_as_loss_identities() {
                 expected_revision: 0,
                 module,
                 rejected: Vec::new(),
+                exited_before_admission: Vec::new(),
                 recovered: Vec::new(),
                 complete_recovery: None,
                 lost: Vec::new(),
@@ -373,6 +375,7 @@ fn overlapping_started_and_known_roots_are_refused_in_both_orders() {
             }
             let batch = Prepared {
                 pending: Vec::new(),
+                exited_before_admission: Vec::new(),
                 scope_target: crate::subtree_resources::Target::Unavailable("no_container"),
                 #[cfg(unix)]
                 scope: None,

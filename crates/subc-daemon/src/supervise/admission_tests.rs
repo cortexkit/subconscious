@@ -826,6 +826,12 @@ async fn stalled_placement_times_out_with_known_pid_without_go_and_releases_perm
         || subc_os::child_exit::observe(pid).ok().flatten().is_some(),
     )
     .await;
+    // Only the first placement is meant to stall. The 250 ms deadline above
+    // would also bound the next module's ordinary admission, which a loaded
+    // runner can exceed, so give it the production deadline.
+    supervisor
+        .child_roster
+        .set_admission_timeout_for_test(ADMISSION_TIMEOUT);
     let spawning = Arc::clone(&supervisor);
     let next_spec = spec(&dir, "placement-next");
     let next = tokio::task::spawn_blocking(move || spawning.spawn(next_spec));

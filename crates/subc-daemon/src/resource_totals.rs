@@ -240,6 +240,7 @@ pub(crate) struct PreparedCommit {
     expected_revision: u64,
     module: Module,
     rejected: Vec<AgentCommandRoot>,
+    exited_before_admission: Vec<AgentCommandRoot>,
     recovered: Vec<AgentCommandRoot>,
     complete_recovery: Option<u64>,
     lost: Vec<AgentCommandRoot>,
@@ -249,6 +250,7 @@ pub(crate) struct PreparedCommit {
 
 pub(crate) struct Committed {
     pub rejected: Vec<AgentCommandRoot>,
+    pub exited_before_admission: Vec<AgentCommandRoot>,
     pub roots_full: bool,
     _retired: Option<Module>,
 }
@@ -256,6 +258,7 @@ pub(crate) struct Committed {
 #[derive(Default)]
 struct Application {
     rejected: Vec<AgentCommandRoot>,
+    exited_before_admission: Vec<AgentCommandRoot>,
     lost: Vec<AgentCommandRoot>,
     roots_full: bool,
     full_resync: bool,
@@ -327,6 +330,7 @@ impl Tracker {
         self.wake.notify_one();
         Some(Committed {
             rejected,
+            exited_before_admission: Vec::new(),
             roots_full: !lost.is_empty(),
             _retired: None,
         })
@@ -623,6 +627,7 @@ impl Tracker {
             expected_revision,
             module,
             rejected: applied.rejected,
+            exited_before_admission: applied.exited_before_admission,
             recovered,
             complete_recovery: applied.full_resync.then_some(epoch),
             lost: applied.lost,
@@ -653,6 +658,7 @@ impl Tracker {
                 expected_revision,
                 module,
                 rejected: applied.rejected,
+                exited_before_admission: applied.exited_before_admission,
                 recovered: Vec::new(),
                 complete_recovery: None,
                 lost: applied.lost,
@@ -708,6 +714,7 @@ impl Tracker {
         // launch replacement and nonce rotation have been released.
         Some(Committed {
             rejected: prepared.rejected,
+            exited_before_admission: prepared.exited_before_admission,
             roots_full: prepared.roots_full,
             _retired: old,
         })
@@ -747,7 +754,15 @@ impl Tracker {
         module.observe_reaped(&prepared.table, now);
         module.prune(now);
         module.observation_before = prepared.before_cpu.map_or(0, |(_, cpu)| cpu);
-        let mut applied = Application::default();
+        let mut applied = Application {
+            exited_before_admission: prepared.exited_before_admission,
+            ..Application::default()
+        };
+        for root in &applied.exited_before_admission {
+            if let Some(key) = module.pending_key(*root) {
+                module.pending.remove(&key);
+            }
+        }
         for (root, verified) in prepared.started {
             if let Some(key) = module.pending_key(root) {
                 module.pending.remove(&key);
@@ -902,6 +917,17 @@ impl Tracker {
             // roots first would conceal an overlapping ancestor in the resync.
             for (root, verified) in known {
                 if module.pending_key(root).is_some() {
+                    continue;
+                }
+                // A start can also appear in the same batch's known list.
+                // Keep it unverified for resync without rejecting it again.
+                if verified.is_none()
+                    && applied.exited_before_admission.iter().any(|exited| {
+                        exited.pid == root.pid
+                            && exited.start_time_ms.abs_diff(root.start_time_ms)
+                                < subc_os::process_start_time_precision_ms()
+                    })
+                {
                     continue;
                 }
                 let result =

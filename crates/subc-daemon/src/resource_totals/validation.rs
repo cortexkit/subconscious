@@ -13,6 +13,7 @@ pub(crate) struct VerifiedRoot {
 pub(super) enum Validation {
     Valid(VerifiedRoot),
     Invalid,
+    Exited,
     Incomplete,
 }
 
@@ -21,6 +22,7 @@ pub(crate) struct Prepared {
     pub module_pid: u32,
     pub before_cpu: Option<(u128, u64)>,
     pub started: Vec<(AgentCommandRoot, Option<VerifiedRoot>)>,
+    pub exited_before_admission: Vec<AgentCommandRoot>,
     pub pending: Vec<AgentCommandRoot>,
     pub finished: Vec<AgentCommandFinished>,
     pub known: Option<Vec<(AgentCommandRoot, Option<VerifiedRoot>)>>,
@@ -109,12 +111,17 @@ pub(super) fn prepare_snapshot(
         }
     };
     let mut pending = Vec::new();
+    let mut exited_before_admission = Vec::new();
     let started: Vec<_> = batch
         .started
         .into_iter()
         .filter_map(|root| match validate(root, false) {
             Validation::Valid(verified) => Some((root, Some(verified))),
             Validation::Invalid => Some((root, None)),
+            Validation::Exited => {
+                exited_before_admission.push(root);
+                None
+            }
             Validation::Incomplete => {
                 pending.push(root);
                 None
@@ -140,7 +147,9 @@ pub(super) fn prepare_snapshot(
                         } else {
                             match validate(root, true) {
                                 Validation::Valid(verified) => Some(verified),
-                                Validation::Invalid | Validation::Incomplete => None,
+                                Validation::Invalid
+                                | Validation::Exited
+                                | Validation::Incomplete => None,
                             }
                         },
                     ))
@@ -154,6 +163,7 @@ pub(super) fn prepare_snapshot(
         module_pid,
         before_cpu,
         started,
+        exited_before_admission,
         pending,
         finished: batch.finished,
         known,
@@ -179,7 +189,9 @@ pub(super) fn validate_root(
     }
     let process = match subc_os::Process::open(root.pid) {
         Ok(Some(process)) => process,
-        Ok(None) => return Validation::Invalid,
+        // A missing process cannot establish ownership. Its CPU stays with
+        // the module; a later finish report cannot supply that proof.
+        Ok(None) => return Validation::Exited,
         Err(_) => return Validation::Incomplete,
     };
     let Some(observed) = process.observe() else {
@@ -258,6 +270,67 @@ mod tests {
             let _ = self.0.kill();
             let _ = self.0.wait();
         }
+    }
+
+    #[test]
+    fn root_gone_at_first_validation_is_not_rejected_or_credited() {
+        let mut child = Child(
+            std::process::Command::new("sh")
+                .args(["-c", "exec sleep 30"])
+                .spawn()
+                .unwrap(),
+        );
+        let root = AgentCommandRoot {
+            pid: child.0.id(),
+            start_time_ms: subc_os::process_start_time_ms(child.0.id()).unwrap(),
+        };
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        assert!(matches!(subc_os::Process::open(root.pid), Ok(None)));
+
+        let tracker = Tracker::default();
+        let target = crate::subtree_resources::Target::Unavailable("no_container");
+        let declare = |batch| {
+            let prepared = tracker
+                .prepare(
+                    "module",
+                    1,
+                    std::process::id(),
+                    target.clone(),
+                    batch,
+                    &mut Receipt::default(),
+                )
+                .unwrap();
+            tracker
+                .commit_fenced("module", 1, prepared, &CommitFence::default())
+                .unwrap()
+        };
+        let committed = declare(Declaration {
+            started: vec![root],
+            known: Some(vec![root]),
+            ..Declaration::default()
+        });
+        assert!(
+            committed.rejected.is_empty(),
+            "exited root was rejected: {:?}",
+            committed.rejected
+        );
+        assert_eq!(committed.exited_before_admission, vec![root]);
+
+        declare(Declaration {
+            finished: vec![AgentCommandFinished {
+                pid: root.pid,
+                start_time_ms: root.start_time_ms,
+                cpu_ms: Some(1_000),
+            }],
+            ..Declaration::default()
+        });
+        let state = tracker.state.lock().unwrap();
+        let module = &state.modules["module"];
+        assert!(module.roots.is_empty());
+        assert!(module.pending.is_empty());
+        assert!(module.finished.is_empty());
+        assert_eq!(module.cpu_model.rows().1, 0);
     }
 
     #[test]

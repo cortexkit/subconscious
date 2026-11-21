@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.50.31
+
+- Log agent command roots that exit before admission at debug level rather than
+  warning. If the daemon never verified ownership, their CPU remains in the
+  module total even when the module later reports the command finished. Refs #153.
+- Give the next module the production admission deadline in the stalled-placement
+  test, so a loaded runner can't time out its ordinary start.
+
 ## 0.50.30
 
 - Test when a manual restart reuses a health-check replacement and when it

@@ -1555,3 +1555,795 @@ mod tests {
         }
     }
 }
+
+pub(crate) const DEFAULT_REGISTER_TIMEOUT: Duration = Duration::from_secs(120);
+pub(super) const REGISTRY_RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
+pub(super) const REGISTRY_RELEASE_POLL: Duration = Duration::from_millis(10);
+
+impl SupervisedChild {
+    pub(super) fn retire_registration(&self) {
+        // All exit observers enter here before cleanup can await. The retired
+        // program-binding flag and the registration's Dead state make repeated
+        // observations harmless, even when another task observes the group
+        // leader retained unreaped to reserve its process-group id.
+        if let Some(spawn) = &self.registration_spawn {
+            spawn.retire();
+        } else if let Some(binding) = &self._program_binding {
+            binding.retire();
+        }
+        #[cfg(unix)]
+        if let Some(channel) = &self.registration_channel {
+            let _ = channel.shutdown(std::net::Shutdown::Both);
+        }
+        #[cfg(windows)]
+        if let Some(channel) = &self.registration_channel {
+            if let Ok(shutdown) = channel.shutdown_handle() {
+                shutdown.shutdown();
+            }
+        }
+    }
+    pub(super) fn registered_since_spawn(&self) -> bool {
+        self.registration_watch
+            .as_ref()
+            .is_some_and(|watch| *watch.changes.borrow() != watch.baseline)
+    }
+
+    pub(super) fn awaiting_registration(&self) -> bool {
+        // Admission failure retires the channel before its kill becomes
+        // waitable. That closure must not replace the admission failure with
+        // a registration failure and spend crash restart budget.
+        let admission_failed = self.admission_kill_sent && self.spawn_failure.is_some();
+        !admission_failed && !self.registered_since_spawn()
+    }
+}
+
+fn registration_release_events() -> &'static watch::Sender<u64> {
+    static EVENTS: OnceLock<watch::Sender<u64>> = OnceLock::new();
+    EVENTS.get_or_init(|| {
+        let (sender, _receiver) = watch::channel(0);
+        sender
+    })
+}
+
+pub(crate) fn notify_registration_release() {
+    let events = registration_release_events();
+    let next_generation = (*events.borrow()).wrapping_add(1);
+    events.send_replace(next_generation);
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(super) struct IdentitySamplePause {
+    pub(super) reached: std::sync::mpsc::Sender<()>,
+    pub(super) release: std::sync::mpsc::Receiver<()>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReservedHelloRejection {
+    Exact {
+        module_id: String,
+    },
+    Prefix {
+        prefix: String,
+        owner_module_id: String,
+    },
+}
+
+/// Identity facts established by the reserved-module policy for one HELLO.
+#[derive(Debug, Default)]
+pub(crate) struct ReservedHelloVerification {
+    pub(crate) nonce_verified: bool,
+    pub(crate) prefix_owner: Option<String>,
+}
+
+impl SupervisorHandle {
+    /// Record the launch nonce from a supervised spawn, replacing any prior nonce so
+    /// a respawn invalidates stale consumer identities.
+    pub fn set_spawn_nonce(&self, module_id: &str, nonce: String) {
+        self.spawn_nonces
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(module_id.to_string(), nonce);
+        self.refresh_program_binding_nonces(module_id);
+    }
+
+    /// Record the launch nonce expected from the next HELLO for a reserved module,
+    /// replacing any prior nonce (a respawn invalidates the previous one).
+    pub fn set_reserved_nonce(&self, module_id: &str, nonce: String) {
+        {
+            let mut reserved = self
+                .reserved_nonces
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            self.implicit_protocol_none
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(module_id);
+            reserved.insert(module_id.to_string(), Some(nonce));
+        }
+        self.refresh_program_binding_nonces(module_id);
+    }
+
+    /// Record namespace prefixes owned by a supervised module.
+    pub fn set_reserved_prefixes(&self, owner_module_id: &str, prefixes: &[String]) {
+        let mut owners = self
+            .reserved_prefix_owners
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        owners.retain(|_, owner| owner != owner_module_id);
+        for prefix in prefixes {
+            owners.insert(prefix.clone(), owner_module_id.to_string());
+        }
+    }
+
+    /// The launch nonce most recently minted for a module's spawn, if any.
+    pub(crate) fn spawn_nonce(&self, module_id: &str) -> Option<String> {
+        if self.module_is_gated(module_id) {
+            return None;
+        }
+        self.spawn_nonces
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(module_id)
+            .cloned()
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn legacy_nonce_present_for_test(&self, module: &str) -> bool {
+        self.spawn_nonces.lock().unwrap().contains_key(module)
+    }
+
+    pub(crate) fn apply_identity_configuration(&self, spec: &ModuleSpec) {
+        // Prefix ownership follows staged configuration, not the running
+        // child's launch settings. A respawn may still carry an older spec.
+        self.set_reserved_prefixes(&spec.module_id, &spec.reserved_prefixes);
+        let protocol = self
+            .get(&spec.module_id)
+            .and_then(|module| {
+                let snapshot = module.inner.snapshot.lock().ok()?;
+                snapshot
+                    .process_alive
+                    .then_some(snapshot.spawned_protocol.unwrap_or(spec.protocol))
+            })
+            .unwrap_or(spec.protocol);
+        self.apply_identity_policy(spec, protocol);
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn pause_plain_identity_policy_for_test(
+        &self,
+        module: &str,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached, waiting) = std::sync::mpsc::channel();
+        let (release, paused) = std::sync::mpsc::channel();
+        *self.plain_identity_policy_pause.lock().unwrap() = Some((
+            module.to_owned(),
+            IdentitySamplePause {
+                reached,
+                release: paused,
+            },
+        ));
+        (waiting, release)
+    }
+
+    pub(super) fn apply_identity_policy(&self, spec: &ModuleSpec, protocol: ModuleProtocol) {
+        let channel_only = self.module_is_gated(&spec.module_id);
+        let mut current_nonces = self
+            .spawn_nonces
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if protocol == ModuleProtocol::None || channel_only {
+            current_nonces.remove(&spec.module_id);
+        }
+        let spawn_nonce = current_nonces.get(&spec.module_id).cloned();
+        #[cfg(test)]
+        if let Some(pause) = self.identity_sample_pause.lock().unwrap().take() {
+            pause.reached.send(()).unwrap();
+            pause.release.recv().unwrap();
+        }
+        let mut reserved_nonces = self
+            .reserved_nonces
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut implicit = self
+            .implicit_protocol_none
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if spec.reserved {
+            implicit.remove(&spec.module_id);
+        } else if protocol == ModuleProtocol::None {
+            if !reserved_nonces.contains_key(&spec.module_id) {
+                implicit.insert(spec.module_id.clone());
+            }
+        } else if implicit.remove(&spec.module_id) {
+            reserved_nonces.remove(&spec.module_id);
+        }
+        if spec.reserved || protocol == ModuleProtocol::None {
+            // `None` (no spawn nonce minted) is INSERTED, not skipped: a
+            // reserved name whose module has never spawned has no legitimate
+            // holder, and the entry's absence is what used to leave the name
+            // open to the first claimant.
+            reserved_nonces.insert(spec.module_id.clone(), spawn_nonce);
+        }
+        drop(implicit);
+        drop(reserved_nonces);
+        drop(current_nonces);
+        self.refresh_program_binding_nonces(&spec.module_id);
+        // A later unreserved declaration must not silently unreserve an id that
+        // was retained after its reserved configuration was removed. The explicit
+        // release ceremony is the only operation that retires that gate.
+        self.removal_tombstones
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&spec.module_id);
+    }
+
+    /// Whether a HELLO claiming `module_id` is authorized. An exact reserved id is
+    /// authorized only by its expected nonce; otherwise a matching reserved prefix
+    /// is authorized by the owner module's current spawn nonce. Non-reserved ids
+    /// with no matching prefix are always authorized.
+    pub fn reserved_hello_authorized(&self, module_id: &str, presented: Option<&str>) -> bool {
+        self.reserved_hello_verification(module_id, presented)
+            .is_ok()
+    }
+
+    /// Whether HELLO passed a nonce check that was actually required by reserved
+    /// module policy, or the refusal explaining why a required check failed.
+    pub(crate) fn reserved_hello_verification(
+        &self,
+        module_id: &str,
+        presented: Option<&str>,
+    ) -> Result<ReservedHelloVerification, ReservedHelloRejection> {
+        if self.module_is_gated(module_id) {
+            return Err(ReservedHelloRejection::Exact {
+                module_id: module_id.into(),
+            });
+        }
+        self.hello_verification(module_id, presented, false)
+    }
+
+    pub(crate) fn channel_hello_verification(
+        &self,
+        module_id: &str,
+    ) -> Result<ReservedHelloVerification, ReservedHelloRejection> {
+        if self
+            .get(module_id)
+            .is_some_and(|module| module.declared_protocol().ok() == Some(ModuleProtocol::None))
+        {
+            return Err(ReservedHelloRejection::Exact {
+                module_id: module_id.into(),
+            });
+        }
+        let mut verification = self.hello_verification(module_id, None, true)?;
+        verification.nonce_verified = true;
+        Ok(verification)
+    }
+
+    pub(crate) fn prefix_claim_authorized(&self, owner: &str, module_id: &str) -> bool {
+        self.prefix_claim_publication(owner, module_id).is_some()
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn prefix_publication_locked_for_test(&self) -> bool {
+        matches!(
+            self.reserved_prefix_owners.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        )
+    }
+
+    // Keep this guard through registry/forwarding publication. Rescans replace
+    // prefix owners without stopping their launches, so the spawn guard alone
+    // cannot fence a reservation transfer.
+    pub(crate) fn prefix_claim_publication(
+        &self,
+        owner: &str,
+        module_id: &str,
+    ) -> Option<std::sync::MutexGuard<'_, HashMap<String, String>>> {
+        if subc_protocol::manifest::validate_module_id(module_id).is_err()
+            || self.module_is_gated(module_id)
+            || self
+                .reserved_nonces
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains_key(module_id)
+        {
+            return None;
+        }
+        let owners = self
+            .reserved_prefix_owners
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let authorized = owners
+            .iter()
+            .filter(|(prefix, _)| module_id.starts_with(prefix.as_str()))
+            .max_by_key(|(prefix, _)| prefix.len())
+            .is_some_and(|(prefix, holder)| holder == owner && module_id.len() > prefix.len());
+        authorized.then_some(owners)
+    }
+
+    fn hello_verification(
+        &self,
+        module_id: &str,
+        presented: Option<&str>,
+        channel: bool,
+    ) -> Result<ReservedHelloVerification, ReservedHelloRejection> {
+        let nonces = self
+            .reserved_nonces
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(expected) = nonces.get(module_id) {
+            // `None` = reserved with no legitimate holder: refuse every
+            // presentation, because no process can hold a nonce that was never
+            // minted. Only a real minted nonce admits, in constant time.
+            let authorized = channel
+                || match expected {
+                    Some(expected) => presented.is_some_and(|p| {
+                        !p.is_empty() && constant_time_eq(expected.as_bytes(), p.as_bytes())
+                    }),
+                    None => false,
+                };
+            if authorized {
+                return Ok(ReservedHelloVerification {
+                    nonce_verified: true,
+                    prefix_owner: None,
+                });
+            }
+            return Err(ReservedHelloRejection::Exact {
+                module_id: module_id.to_string(),
+            });
+        }
+        drop(nonces);
+
+        let matched_prefix = self
+            .reserved_prefix_owners
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|(prefix, _)| module_id.starts_with(prefix.as_str()))
+            .max_by_key(|(prefix, _)| prefix.len())
+            .map(|(prefix, owner)| (prefix.clone(), owner.clone()));
+        let Some((prefix, owner_module_id)) = matched_prefix else {
+            return Ok(ReservedHelloVerification::default());
+        };
+
+        if module_id.len() == prefix.len()
+            || (!channel
+                && (self.module_is_gated(&owner_module_id) || self.protocol_none(&owner_module_id)))
+        {
+            return Err(ReservedHelloRejection::Prefix {
+                prefix,
+                owner_module_id,
+            });
+        }
+
+        let authorized = if channel {
+            owner_module_id == module_id
+        } else {
+            presented.is_some_and(|presented| {
+                self.spawn_nonces
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&owner_module_id)
+                .is_some_and(|expected| !presented.is_empty() && constant_time_eq(expected.as_bytes(), presented.as_bytes()))
+                // While the owner is being swapped, children started by
+                // either of its two processes hold that process's nonce.
+                || self.swap_nonce_matches(&owner_module_id, presented)
+            })
+        };
+        if authorized {
+            Ok(ReservedHelloVerification {
+                nonce_verified: true,
+                prefix_owner: (owner_module_id != module_id).then_some(owner_module_id),
+            })
+        } else {
+            Err(ReservedHelloRejection::Prefix {
+                prefix,
+                owner_module_id,
+            })
+        }
+    }
+
+    /// Whether a consumer connection proved it came from a daemon-spawned module.
+    ///
+    /// Absence of an expected spawn nonce is a hard failure: consumer_identity is
+    /// accepted only for module ids the supervisor has spawned.
+    pub fn spawned_consumer_authorized(&self, module_id: &str, presented: &str) -> bool {
+        if self.module_is_gated(module_id) || self.protocol_none(module_id) {
+            return false;
+        }
+        let nonces = self
+            .spawn_nonces
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = nonces.get(module_id).is_some_and(|expected| {
+            !presented.is_empty() && constant_time_eq(expected.as_bytes(), presented.as_bytes())
+        });
+        drop(nonces);
+        // Before cutover both launches may attest. Promotion removes the
+        // incumbent's token even if its process still needs time to drain.
+        current || self.swap_nonce_matches(module_id, presented)
+    }
+}
+
+impl SupervisorHandle {
+    pub(super) fn protocol_none(&self, module: &str) -> bool {
+        self.get(module)
+            .is_some_and(|module| module.declared_protocol().ok() == Some(ModuleProtocol::None))
+    }
+}
+
+impl SupervisorHandle {
+    /// Test/support lookup for the current launch nonce of a supervised spawn.
+    pub fn spawn_launch_nonce_for(&self, module_id: &str) -> Option<String> {
+        self.spawn_nonce(module_id)
+    }
+
+    /// Test/support lookup for the HELLO-gating nonce of a reserved module.
+    pub fn reserved_launch_nonce_for(&self, module_id: &str) -> Option<String> {
+        if self.module_is_gated(module_id) {
+            return None;
+        }
+        self.reserved_nonces
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(module_id)
+            .cloned()
+            .flatten()
+    }
+}
+
+/// Constant-time byte comparison so a reserved-nonce mismatch leaks no timing
+/// signal about how many leading bytes matched.
+pub(super) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+pub(super) struct RegistrationWatch {
+    pub(super) changes: watch::Receiver<u64>,
+    pub(super) baseline: u64,
+}
+
+// Capture before spawning: a fast child's accepted HELLO can disappear from the
+// active registry before the monitor first runs. A pre-existing registration
+// must not satisfy a new process's deadline either.
+pub(super) fn watch_registration(
+    registry: &Registry,
+    spec: &ModuleSpec,
+) -> Option<RegistrationWatch> {
+    if spec.protocol != ModuleProtocol::Subc {
+        return None;
+    }
+    let changes = registry.subscribe_module_changes(&spec.module_id).ok()?;
+    let baseline = *changes.borrow();
+    Some(RegistrationWatch { changes, baseline })
+}
+
+pub(super) fn arm_registration_deadline(
+    child: &mut SupervisedChild,
+    budget: Duration,
+    registration_watch: Option<RegistrationWatch>,
+) {
+    child.registration_watch = registration_watch;
+    child.registration_deadline = (child.protocol == ModuleProtocol::Subc
+        && child.awaiting_registration())
+    .then_some(child.spawned_at + budget);
+}
+
+pub(super) enum RegistrationWaitOutcome {
+    Registered,
+    Exited(ExitReport),
+    TimedOut,
+}
+
+pub(super) struct ReloadRegistrationFailure {
+    pub(super) cleanup_detail: Option<String>,
+    pub(super) exit_report: ExitReport,
+    pub(super) reason: String,
+}
+
+/// Wait for the freshly spawned child to take the ACTIVE slot for `module_id`,
+/// the only slot a plain (non-swap) spawn can register into.
+pub(super) async fn wait_for_registration_after_reload(
+    registry: &Registry,
+    module_id: &str,
+    snapshot: &SharedSnapshot,
+    child: &mut SupervisedChild,
+    wait: Duration,
+) -> Result<RegistrationWaitOutcome, SuperviseError> {
+    wait_for_slot_registration(
+        registry,
+        crate::registry::RegistrationSlot::Active(module_id),
+        module_id,
+        snapshot,
+        child,
+        wait,
+    )
+    .await
+}
+
+/// Wait for `child` to register into `slot`, or to exit, or for `wait` to pass.
+///
+/// Keyed on the slot rather than the bare module id because during a swap the
+/// id's active slot is already held by the incumbent: an id-keyed wait would
+/// report the incumbent's registration as the candidate's and a candidate that
+/// never registers would look registered. A swap candidate waits on
+/// `crate::registry::RegistrationSlot::Candidate`.
+async fn wait_for_slot_registration(
+    registry: &Registry,
+    slot: crate::registry::RegistrationSlot<'_>,
+    module_id: &str,
+    snapshot: &SharedSnapshot,
+    child: &mut SupervisedChild,
+    wait: Duration,
+) -> Result<RegistrationWaitOutcome, SuperviseError> {
+    let deadline = Instant::now() + wait;
+    loop {
+        if registry
+            .registration(slot)
+            .map_err(SuperviseError::Registry)?
+            .is_some()
+        {
+            return Ok(RegistrationWaitOutcome::Registered);
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(RegistrationWaitOutcome::TimedOut);
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        let poll = remaining.min(REGISTRY_RELEASE_POLL);
+
+        tokio::select! {
+            wait_result = child.wait() => {
+                let status = wait_result.map_err(|source| SuperviseError::Wait {
+                    module_id: module_id.to_string(),
+                    source,
+                })?;
+                return Ok(RegistrationWaitOutcome::Exited(classify_reaped_child_exit(
+                    snapshot,
+                    child,
+                    &status,
+                )));
+            }
+            _ = sleep(poll) => {}
+        }
+    }
+}
+
+pub(super) fn registration_failure_exit_report(mut exit_report: ExitReport) -> ExitReport {
+    // A process stopped for missing its first HELLO did not provide service,
+    // even if its TERM handler exits zero. Reload also uses this classification
+    // when a replacement exits before registering.
+    if exit_report.kind != ExitKind::DeliberateSeverance {
+        exit_report.kind = ExitKind::Crash;
+    }
+    exit_report
+}
+
+pub(super) async fn handle_reload_child_registration_failure(
+    spec: &ModuleSpec,
+    runtime: &SupervisorRuntimeConfig,
+    registry: &Registry,
+    process_liveness: &SupervisorProcessLiveness,
+    snapshot: &SharedSnapshot,
+    _child: &mut Option<SupervisedChild>,
+    failure: ReloadRegistrationFailure,
+) -> Result<(), SuperviseError> {
+    let ReloadRegistrationFailure {
+        exit_report,
+        reason,
+        cleanup_detail,
+    } = failure;
+    match on_child_exit_with_detail(
+        spec,
+        runtime.restart_policy,
+        registry,
+        snapshot,
+        &runtime.terminal_ring,
+        &runtime.spawn_events,
+        &runtime.child_roster,
+        exit_report,
+        runtime.recovery_is_daemon,
+        cleanup_detail,
+    )
+    .await
+    {
+        NextAction::Stop {
+            registration_released,
+        } => {
+            if registration_released {
+                process_liveness.untrack_if_current(&spec.module_id, snapshot);
+            }
+        }
+        NextAction::Restart { schedule } => {
+            let delay = schedule.map_or(runtime.restart_policy.delay_for_restart(0), |schedule| {
+                schedule.delay
+            });
+            if let Some(schedule) = schedule {
+                log_crash_respawn(&spec.module_id, schedule);
+            }
+            schedule_respawn(
+                runtime,
+                snapshot,
+                &spec.module_id,
+                delay,
+                RespawnKind::after_exit(schedule),
+                true,
+            )?;
+        }
+    }
+    Err(SuperviseError::ReloadFailed {
+        module_id: spec.module_id.clone(),
+        reason,
+    })
+}
+
+pub(super) async fn handle_reload_spawn_failure(
+    spec: &ModuleSpec,
+    runtime: &SupervisorRuntimeConfig,
+    process_liveness: &SupervisorProcessLiveness,
+    snapshot: &SharedSnapshot,
+    _child: &mut Option<SupervisedChild>,
+    reason: String,
+) -> Result<(), SuperviseError> {
+    let now = Instant::now();
+    let mut schedule = None;
+    update_snapshot(snapshot, Some(&spec.module_id), |state| {
+        clear_current_process_facts(state);
+        if state.enabled {
+            schedule = state.next_crash_restart(&runtime.restart_policy, now);
+            state.state = if schedule.is_some() {
+                ModuleState::Restarting
+            } else {
+                if runtime
+                    .failure_context(runtime.recovery_is_daemon)
+                    .may_retry()
+                {
+                    state.failed_retry.schedule(&spec.module_id);
+                }
+                ModuleState::Failed
+            };
+        } else {
+            state.state = ModuleState::Disabled;
+        }
+    })?;
+    if let Some(schedule) = schedule {
+        schedule_respawn(
+            runtime,
+            snapshot,
+            &spec.module_id,
+            schedule.delay,
+            RespawnKind::CrashRestart,
+            true,
+        )?;
+    } else {
+        process_liveness.untrack_if_current(&spec.module_id, snapshot);
+    }
+    Err(SuperviseError::ReloadFailed {
+        module_id: spec.module_id.clone(),
+        reason,
+    })
+}
+
+/// Release a reaped child's registration before allowing another spawn.
+///
+/// EOF is not a process-lifetime signal: an inherited socket can stay open
+/// indefinitely, and serial frame dispatch can be waiting on egress instead of
+/// reading EOF. After the normal release grace, request connection close (which
+/// cancels both reads and dispatch), then allow one more release grace for the
+/// connection guard's forwarding cleanup. Never evict a different connection.
+pub(super) async fn release_dead_registration(
+    registry: &Registry,
+    forwarding: Option<&ForwardingTable>,
+    snapshot: &SharedSnapshot,
+    module_id: &str,
+    failure: &FailureContext,
+) -> Result<(), SuperviseError> {
+    let result = async {
+        let registration = registry
+            .get_module(module_id)
+            .map_err(SuperviseError::Registry)?;
+        match wait_for_registration_release(registry, module_id, REGISTRY_RELEASE_TIMEOUT).await {
+            Ok(()) => return Ok(()),
+            Err(SuperviseError::RegistrationStillActive { .. }) => {}
+            Err(err) => return Err(err),
+        }
+        let pid = lock_snapshot(snapshot)?.reaped_pid;
+        if let (Some(registration), Some(forwarding), Some(pid)) = (registration, forwarding, pid) {
+            warn!(
+                module_id,
+                pid,
+                connection_id = registration.connection_id.get(),
+                "reaped module registration outlived release grace; closing dead connection"
+            );
+            forwarding.request_connection_close(
+                registration.connection_id,
+                CloseReason::new(
+                    "supervised_process_reaped",
+                    format!("module '{module_id}' pid {pid} exited"),
+                ),
+            );
+            wait_for_slot_registration_release(
+                registry,
+                crate::registry::RegistrationSlot::Connection(registration.connection_id),
+                REGISTRY_RELEASE_TIMEOUT,
+            )
+            .await?;
+        }
+        wait_for_registration_release(registry, module_id, Duration::ZERO).await
+    }
+    .await;
+    if let Err(err) = &result {
+        fail_snapshot(snapshot, Some(module_id), None, failure);
+        error!(module_id, error = %err, "registration release failed after child exit; module is failed and start can retry");
+    }
+    result
+}
+
+/// Wait for the ACTIVE registration of `module_id` to go away, which is what a
+/// plain stop or restart waits for before it spawns a replacement.
+pub(super) async fn wait_for_registration_release(
+    registry: &Registry,
+    module_id: &str,
+    wait: Duration,
+) -> Result<(), SuperviseError> {
+    wait_for_slot_registration_release(
+        registry,
+        crate::registry::RegistrationSlot::Active(module_id),
+        wait,
+    )
+    .await
+}
+
+/// Wait for the registration in `slot` to go away.
+///
+/// Keyed on the slot rather than the bare module id because a successful swap
+/// never empties the id's active slot (the promoted candidate is in it), so an
+/// id-keyed wait for the incumbent's release would always time out. Draining a
+/// swap's incumbent waits on `crate::registry::RegistrationSlot::Connection` with the
+/// incumbent's connection instead.
+pub(super) async fn wait_for_slot_registration_release(
+    registry: &Registry,
+    slot: crate::registry::RegistrationSlot<'_>,
+    wait: Duration,
+) -> Result<(), SuperviseError> {
+    let deadline = Instant::now() + wait;
+    let mut release_events = registration_release_events().subscribe();
+    let still_active = |registration: &crate::registry::ModuleRegistration| {
+        SuperviseError::RegistrationStillActive {
+            module_id: registration.manifest.module_id.clone(),
+            waited: wait,
+        }
+    };
+    loop {
+        let _observed_generation = *release_events.borrow_and_update();
+        let Some(registration) = registry
+            .registration(slot)
+            .map_err(SuperviseError::Registry)?
+        else {
+            return Ok(());
+        };
+
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(still_active(&registration));
+        }
+
+        let remaining = deadline.saturating_duration_since(now);
+        match timeout(remaining, release_events.changed()).await {
+            Ok(Ok(())) | Ok(Err(_)) => {}
+            Err(_) => return Err(still_active(&registration)),
+        }
+    }
+}
+
+pub(super) fn registration_child_is_running(child: &mut SupervisedChild) -> bool {
+    child.try_wait().is_ok_and(|status| status.is_none())
+}

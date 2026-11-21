@@ -4,6 +4,7 @@
 
 - The installer's test crash point publishes its marker file with its contents in
   one step, so a test can't read an empty marker.
+- Require subc-daemon 0.50.32.
 
 ## 0.21.34
 

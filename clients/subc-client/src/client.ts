@@ -821,7 +821,7 @@ export class SubcClient {
   /**
    * Watch coalesced catalog generations on channel zero; unsubscribe sends CANCEL.
    * Uses activity.subscribe framing: STREAM_DATA events, STREAM_END or ERROR at
-   * termination (crates/subc-daemon/src/control.rs, handle_activity_read and
+   * termination (crates/subc-daemon/src/control/activity.rs, handle_activity_read and
    * cancel_activity_subscription). The Rust SDK's generic subscription reader
    * also accepts a terminal RESPONSE (crates/subc-client-rs/src/consumer.rs).
    */
@@ -2752,7 +2752,7 @@ function equalJitter(delayMs: number, random: () => number): number {
 
 // The daemon's reasons for refusing a route.open because too many binds are
 // already in flight: on the client's connection, or towards the target module
-// (crates/subc-daemon/src/control.rs, route_open_capacity_refusal and
+// (crates/subc-daemon/src/control/route_open.rs, route_open_capacity_refusal and
 // route_open_target_capacity_refusal). Both are sent as target_unavailable.
 const ROUTE_OPEN_ADMISSION_PRESSURE_REASONS = new Set(["open_admission_full", "target_binds_full"]);
 // Matches the messages of those same admission-pressure refusals. The daemon

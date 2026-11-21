@@ -268,6 +268,18 @@ fn module_files(path: &Path, ts: &[Token]) -> Vec<PathBuf> {
         };
         files.extend(candidates.into_iter().filter_map(|p| p.canonicalize().ok()));
     }
+    // A test-only file may pull in another file with include!, as the control
+    // tests do for the activity scope tests. That file is test code too.
+    for window in ts.windows(4) {
+        if window[0].text == "include" && window[1].text == "!" && window[2].text == "(" {
+            files.extend(
+                parent
+                    .join(window[3].text.trim_matches('"'))
+                    .canonicalize()
+                    .ok(),
+            );
+        }
+    }
     files
 }
 

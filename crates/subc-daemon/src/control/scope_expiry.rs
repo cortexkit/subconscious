@@ -175,3 +175,32 @@ impl ScopeExpiryContext {
         }
     }
 }
+
+impl ControlHandler {
+    /// The timer only prompts sweeps. Each sweep reads wall time again, so a
+    /// deadline passed during sleep is enforced on the first tick after wake.
+    /// While no live scope carries a deadline the loop waits for an accepted
+    /// scope change instead of ticking, so a daemon without deadlines never
+    /// wakes for expiry.
+    pub(crate) fn spawn_scope_expiry_loop(self: Arc<Self>) {
+        let context = scope_expiry::ScopeExpiryContext::new(&self);
+        let deadline_added = self.scope_deadline_added.clone();
+        tokio::spawn(async move {
+            loop {
+                if !context.has_deadlines() {
+                    deadline_added.notified().await;
+                    continue;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if let Err(error) = context.sweep() {
+                    warn!(%error, "scope expiry sweep failed");
+                }
+            }
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sweep_expired_scopes(&self) -> Result<(), RouterError> {
+        scope_expiry::ScopeExpiryContext::new(self).sweep()
+    }
+}

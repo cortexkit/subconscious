@@ -75,7 +75,7 @@ so over a second, client connection. Test:
 | `supervisor.stderr_tail` | Retained stderr for one module, bounded by `max_lines` and `max_bytes`. | |
 | `supervisor.terminals` | Retained process exits for one module. | Read off the supervisor command channel, so it answers even when supervision of that module has failed. |
 | `supervisor.spawn_snapshot` | The live supervised processes and the spawn-event cursor, read atomically. | |
-| `supervisor.spawn_subscribe` | Replay spawn events after `since`, then stream new ones. | Refusals: `spawn_cursor_incarnation_mismatch`, `spawn_cursor_too_old`, `spawn_subscriber_lagged`. Tests: `spawn_snapshot_then_subscribe_has_no_overlap_or_gap` (`crates/subc-core/tests/supervision.rs`), `spawn_subscribe_refuses_stale_and_foreign_cursors_with_typed_details` (`crates/subc-core/tests/supervision.rs`), `lagged_spawn_subscriber_receives_a_terminal_lagged_error_after_its_queued_frames` (`crates/subc-daemon/src/supervise.rs`). |
+| `supervisor.spawn_subscribe` | Replay spawn events after `since`, then stream new ones. | Refusals: `spawn_cursor_incarnation_mismatch`, `spawn_cursor_too_old`, `spawn_subscriber_lagged`. Tests: `spawn_snapshot_then_subscribe_has_no_overlap_or_gap` (`crates/subc-core/tests/supervision.rs`), `spawn_subscribe_refuses_stale_and_foreign_cursors_with_typed_details` (`crates/subc-core/tests/supervision.rs`), `lagged_spawn_subscriber_receives_a_terminal_lagged_error_after_its_queued_frames` (`crates/subc-daemon/src/supervise/spawn_subscriber_lag_tests.rs`). |
 | `supervisor.restart` | Drain and restart a module. Optional `drain_timeout_ms` overrides the drain budget for this restart; `0` tears down without waiting. | Privileged. |
 | `supervisor.swap` | Blue/green restart: start a replacement beside the running process and cut over when it reports ready. Optional `ready_timeout_ms` (default 100 s). | Privileged. Refused unless the module is configured `overlap: "safe"`. Test: `swap_of_an_exclusive_module_is_refused_and_spawns_nothing` (`crates/subc-core/tests/forwarding.rs`). |
 | `supervisor.reload` | Drain a running module's routes, stop its process and spawn it again; routes close with reason `reload`. | Privileged. Refused for a disabled module. |
@@ -447,7 +447,7 @@ bytes. HELLO_ACK `subc_capabilities` advertises `peer-build/v1`. See
 - `consumer_identity` is optional. When present, the daemon checks the nonce
   against the processes it spawned and refuses the open with
   `bad_consumer_identity` if it does not match (test
-  `route_open_refuses_consumer_identity_that_fails_spawn_attestation` (`crates/subc-daemon/src/control.rs`)). When absent, the opener is a direct
+  `route_open_refuses_consumer_identity_that_fails_spawn_attestation` (`crates/subc-daemon/src/control/control_tests.rs`)). When absent, the opener is a direct
   key-holder.
 - `consumer_capabilities` and `role_versions` are unverified declarations
   copied to the module. A malformed `role_versions` is refused as
@@ -513,7 +513,7 @@ informational: restart and reload reasons still classify as `MayReopen`.
 
 | Op | Kind | Purpose |
 | --- | --- | --- |
-| `route.bind` | Request | Bind a client route to a module channel. Carries `route_channel`, `epoch`, `target`, `identity`, the daemon-stamped `principal`, `consumer_capabilities`, `role_versions`, `admission_facts`, the scope stamp and the call mode. Success is an empty `route.bind` reply; a refusal is an `ERROR`, whose code and message reach the opener unchanged (test `route_open_module_rejection_uses_daemon_counter_key` (`crates/subc-daemon/src/control.rs`)). |
+| `route.bind` | Request | Bind a client route to a module channel. Carries `route_channel`, `epoch`, `target`, `identity`, the daemon-stamped `principal`, `consumer_capabilities`, `role_versions`, `admission_facts`, the scope stamp and the call mode. Success is an empty `route.bind` reply; a refusal is an `ERROR`, whose code and message reach the opener unchanged (test `route_open_module_rejection_uses_daemon_counter_key` (`crates/subc-daemon/src/control/control_tests.rs`)). |
 | `health.check` | Request | Ask the module for its health. Reply: `status` (`ok`, `degraded`, `failing`), optional `detail` and `metrics`. Sent only to modules that declared the op in HELLO `control_ops`. |
 | `config.review` | Request | Review a candidate settings tuple against its approved view. The daemon checks the returned fields before including the tuple in a plan. |
 | `projects.enumerate` | Request | Read Entorhinal's authoritative project/workspace registry for configuration planning and membership refresh. Requires the nonce-verified reserved `entorhinal` principal, readiness and HELLO `control_ops` opt-in. |
@@ -555,7 +555,7 @@ request from a connection that has not registered is refused `not_registered`.
 section 2. The module's own HELLO `control_ops` declares the optional control
 operations it serves: every registration is treated as granting `route.bind`
 and `route.status` (`MODULE_BASELINE_CONTROL_OPS` in
-`crates/subc-daemon/src/control.rs`), and the daemon sends `health.check` only
+`crates/subc-daemon/src/control/module_operations.rs`), and the daemon sends `health.check` only
 to a module that lists it.
 
 | Op | Kind | Purpose |

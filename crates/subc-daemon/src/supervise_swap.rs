@@ -2263,3 +2263,303 @@ mod tests {
         }
     }
 }
+
+/// How long a swap waits for its candidate to register and declare itself
+/// ready when the operator does not say. A module warming as a swap candidate
+/// may take up to 90 s (aft's ceiling, the largest in the fleet), so the
+/// daemon allows that plus time to start the process and send HELLO.
+pub const DEFAULT_SWAP_READY_TIMEOUT: Duration = Duration::from_secs(100);
+
+/// Told when a swap has promoted its candidate to be the module's active
+/// registration.
+///
+/// An ordinary HELLO runs the control plane's registration side effects (the
+/// capability cache, the deny census, the requirement recompute) as it
+/// registers. A swap candidate's HELLO does not, because it is not routable;
+/// promotion is when those must run instead, and promotion happens in the
+/// supervisor, which has no other way into the control handler.
+pub(crate) trait SwapPromotionObserver: Send + Sync {
+    fn swap_promoted(&self, registration: &crate::registry::ModuleRegistration);
+}
+
+/// The installed [`SwapPromotionObserver`], held weakly: the observer (the
+/// control handler) owns this handle, so a strong reference back would be a
+/// cycle that keeps both alive.
+#[derive(Clone, Default)]
+pub(super) struct PromotionObserverSlot(
+    pub(super) Arc<Mutex<Option<std::sync::Weak<dyn SwapPromotionObserver>>>>,
+);
+
+impl fmt::Debug for PromotionObserverSlot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PromotionObserverSlot")
+    }
+}
+
+/// The nonces of one open swap.
+#[derive(Debug, Clone)]
+pub(super) struct OpenSwap {
+    /// Legacy candidate token. A gated candidate has an empty lifecycle
+    /// placeholder instead; only its own channel admits its HELLO.
+    pub(super) candidate_nonce: String,
+    /// Incumbent token accepted before cutover, then cleared by promotion even
+    /// while the incumbent's process is still draining.
+    pub(super) incumbent_nonce: Option<String>,
+    /// Set once a HELLO has been admitted with the swap token, so the token
+    /// admits one registration and cannot be replayed after cutover empties
+    /// the candidate slot.
+    candidate_admitted: bool,
+}
+
+/// What the swap gate says about a HELLO. See
+/// [`SupervisorHandle::swap_hello_admission`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SwapHelloAdmission {
+    /// No swap is open for the id (or the HELLO carries the incumbent's own
+    /// nonce); the ordinary gates decide.
+    NotSwapping,
+    /// The HELLO carries the swap token: register it into the candidate slot.
+    Candidate,
+    /// A swap is open and the HELLO carries a nonce the supervisor did not
+    /// mint for this id, no nonce, or a token already used.
+    Refused,
+    /// The id belongs to a supervised `protocol: none` module. Such a module
+    /// never registers, so no HELLO may claim its id, with or without a nonce.
+    ProtocolNone,
+    /// The id is gated. Its supervised child registers only over the
+    /// registration channel it inherited at launch, never by HELLO alone.
+    ChannelRequired,
+}
+
+impl SupervisorHandle {
+    /// Whether `presented` is either nonce of an open swap for `module_id`.
+    pub(super) fn swap_nonce_matches(&self, module_id: &str, presented: &str) -> bool {
+        if self.module_is_gated(module_id) || self.protocol_none(module_id) || presented.is_empty()
+        {
+            return false;
+        }
+        let swaps = self
+            .swaps
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        swaps.get(module_id).is_some_and(|swap| {
+            constant_time_eq(swap.candidate_nonce.as_bytes(), presented.as_bytes())
+                || swap.incumbent_nonce.as_deref().is_some_and(|incumbent| {
+                    constant_time_eq(incumbent.as_bytes(), presented.as_bytes())
+                })
+        })
+    }
+
+    /// Open a swap for `module_id` with the candidate's freshly minted nonce.
+    /// Called before the candidate process exists.
+    pub(crate) fn open_swap(&self, module_id: &str, candidate_nonce: String) {
+        let incumbent_nonce = self
+            .spawn_nonces
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(module_id)
+            .cloned();
+        self.swaps
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                module_id.to_string(),
+                OpenSwap {
+                    candidate_nonce,
+                    incumbent_nonce,
+                    candidate_admitted: false,
+                },
+            );
+        self.refresh_program_binding_nonces(module_id);
+    }
+
+    /// Close the swap for `module_id`, releasing whichever nonce is no longer
+    /// the module's recorded one.
+    pub(crate) fn close_swap(&self, module_id: &str) {
+        self.swaps
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(module_id);
+        self.refresh_program_binding_nonces(module_id);
+    }
+
+    /// Install the observer told about swap promotions, replacing any earlier
+    /// one.
+    pub(crate) fn set_swap_promotion_observer(
+        &self,
+        observer: std::sync::Weak<dyn SwapPromotionObserver>,
+    ) {
+        *self
+            .promotion_observer
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(observer);
+    }
+
+    /// Tell the installed observer, if it is still alive, that a swap promoted
+    /// `registration`.
+    fn notify_swap_promoted(&self, registration: &crate::registry::ModuleRegistration) {
+        let observer = self
+            .promotion_observer
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade);
+        if let Some(observer) = observer {
+            observer.swap_promoted(registration);
+        }
+    }
+
+    /// Whether a swap is open for `module_id`.
+    pub(crate) fn swap_open(&self, module_id: &str) -> bool {
+        self.swaps
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(module_id)
+    }
+
+    /// Make the candidate's nonce the module's recorded spawn nonce, as a plain
+    /// respawn would, once cutover has made the candidate the module's process.
+    /// Promotion revokes the incumbent's tokens; the swap record stays open
+    /// only for lifecycle cleanup while the old process drains.
+    pub(super) fn promote_swap_nonce(&self, module_id: &str, reserved: bool) {
+        let candidate_nonce = self
+            .swaps
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_mut(module_id)
+            .map(|swap| {
+                swap.incumbent_nonce = None;
+                swap.candidate_nonce.clone()
+            });
+        self.spawn_nonces
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(module_id);
+        {
+            let mut nonces = self
+                .reserved_nonces
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if reserved || nonces.contains_key(module_id) {
+                nonces.insert(module_id.into(), None);
+            }
+        }
+        if self.module_is_gated(module_id) {
+            return;
+        }
+        let Some(nonce) = candidate_nonce.filter(|nonce| !nonce.is_empty()) else {
+            return;
+        };
+        self.set_spawn_nonce(module_id, nonce.clone());
+        if reserved {
+            self.set_reserved_nonce(module_id, nonce);
+        }
+    }
+
+    /// The swap gate for a HELLO claiming `module_id`.
+    ///
+    /// This runs BEFORE the reserved-module gate. A reserved module's candidate
+    /// presents the candidate nonce, which the reserved gate (holding the
+    /// incumbent's nonce) would refuse as `reserved_module` before swap
+    /// admission was ever reached. And it applies to unreserved ids too: for an
+    /// unreserved id the only thing that ever stopped a second process claiming
+    /// a live id was the `duplicate_module_id` refusal, which is exactly the
+    /// refusal a swap lifts for its candidate.
+    ///
+    /// The incumbent's own nonce falls through to the ordinary gates, which
+    /// treat it as they always have (a live incumbent is refused as a
+    /// duplicate). Anything else while a swap is open is refused, including an
+    /// absent nonce.
+    pub(crate) fn swap_hello_admission(
+        &self,
+        module_id: &str,
+        presented: Option<&str>,
+    ) -> SwapHelloAdmission {
+        if self.protocol_none(module_id) {
+            return SwapHelloAdmission::ProtocolNone;
+        }
+        if self.module_is_gated(module_id) {
+            return SwapHelloAdmission::ChannelRequired;
+        }
+        let swaps = self
+            .swaps
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(swap) = swaps.get(module_id) else {
+            return SwapHelloAdmission::NotSwapping;
+        };
+        let Some(presented) = presented.filter(|nonce| !nonce.is_empty()) else {
+            return SwapHelloAdmission::Refused;
+        };
+        if constant_time_eq(swap.candidate_nonce.as_bytes(), presented.as_bytes()) {
+            return if swap.candidate_admitted {
+                SwapHelloAdmission::Refused
+            } else {
+                SwapHelloAdmission::Candidate
+            };
+        }
+        if swap
+            .incumbent_nonce
+            .as_deref()
+            .is_some_and(|incumbent| constant_time_eq(incumbent.as_bytes(), presented.as_bytes()))
+        {
+            return SwapHelloAdmission::NotSwapping;
+        }
+        SwapHelloAdmission::Refused
+    }
+}
+
+impl SupervisorHandle {
+    /// Exclude swap closure through the short, synchronous candidate publication.
+    pub(crate) fn with_swap_candidate_admission<T>(
+        &self,
+        module_id: &str,
+        publish: impl FnOnce() -> (T, bool),
+    ) -> Option<T> {
+        let mut swaps = self.swaps.lock().unwrap_or_else(|p| p.into_inner());
+        let swap = swaps
+            .get_mut(module_id)
+            .filter(|swap| !swap.candidate_admitted)?;
+        let (result, admitted) = publish();
+        swap.candidate_admitted = admitted;
+        Some(result)
+    }
+}
+
+impl SupervisedModule {
+    /// Blue/green restart: see `SupervisorCommand::Swap` and the
+    /// `supervisor_swap` module. Returns once the swap has cut over (the old
+    /// process then drains in the background of the supervise loop), has been
+    /// superseded by an approved configuration restart, or has failed. Both
+    /// supersession and failure leave the old process serving until replacement.
+    pub async fn swap(
+        &self,
+        ready_timeout: Option<Duration>,
+    ) -> Result<SwapOutcome, SuperviseError> {
+        self.swap_requested(ready_timeout, None).await
+    }
+
+    pub(crate) async fn swap_requested(
+        &self,
+        ready_timeout: Option<Duration>,
+        requester: Option<Principal>,
+    ) -> Result<SwapOutcome, SuperviseError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.inner
+            .commands
+            .send(SupervisorCommand::Swap {
+                requester,
+                ready_timeout,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| SuperviseError::CommandClosed {
+                module_id: self.inner.module_id.clone(),
+            })?;
+        reply_rx.await.map_err(|_| SuperviseError::CommandClosed {
+            module_id: self.inner.module_id.clone(),
+        })?
+    }
+}

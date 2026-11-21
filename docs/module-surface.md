@@ -60,7 +60,7 @@ root, are in [`daemon-config.md`](daemon-config.md).
   `http_health_refuses_non_loopback_https_and_wire_modules` (`crates/subc-daemon/src/daemon_config.rs`)).
   A clean exit the daemon did not ask for counts as a crash. Tests: `route_open_to_a_protocol_none_module_is_refused_as_terminal_and_counted` (`crates/subc-core/tests/forwarding.rs`)
   and `a_protocol_none_module_is_never_probed_while_its_subc_twin_is_restarted` (`crates/subc-core/tests/forwarding.rs`);
-  `protocol_none_unrequested_clean_exit_restarts_as_a_crash` (`crates/subc-daemon/src/supervise.rs`).
+  `protocol_none_unrequested_clean_exit_restarts_as_a_crash` (`crates/subc-daemon/src/supervise/terminal_history_tests.rs`).
 - `overlap: "safe"` permits a blue/green swap (section 7). The default,
   `exclusive`, refuses it, because most modules are single writers to their
   store.
@@ -70,7 +70,7 @@ root, are in [`daemon-config.md`](daemon-config.md).
 The daemon starts a `protocol: "subc"` module as
 `<program> <args> --subc <connection-file>` with this environment
 (`apply_wire_spawn_args_for_role` and `apply_child_env` in
-`crates/subc-daemon/src/supervise.rs`):
+`crates/subc-daemon/src/supervise/spawn.rs`):
 
 | Variable | Value |
 | --- | --- |
@@ -94,7 +94,7 @@ module-control ops it serves (`control_ops`, for example `["health.check"]`),
 and its `launch_nonce`.
 
 The daemon refuses the `HELLO` with an `ERROR` when
-(`handle_hello` in `crates/subc-daemon/src/control.rs`):
+(`handle_hello` in `crates/subc-daemon/src/control/module_operations.rs`):
 
 | Code | Cause |
 | --- | --- |
@@ -103,7 +103,7 @@ The daemon refuses the `HELLO` with an `ERROR` when
 | `invalid_capability_grammar` | The capability declaration breaks [`capability-grammar.md`](capability-grammar.md). |
 | `invalid_event_declaration` | An event declaration is malformed. |
 | `version_unsupported` | `protocol_ver` is not `2`. |
-| `reserved_module` | The id is reserved (or under a reserved prefix) and the nonce does not match the one the daemon gave the process it spawned. Test: `reserved_module_hello_requires_matching_launch_nonce` (`crates/subc-daemon/src/control.rs`). |
+| `reserved_module` | The id is reserved (or under a reserved prefix) and the nonce does not match the one the daemon gave the process it spawned. Test: `reserved_module_hello_requires_matching_launch_nonce` (`crates/subc-daemon/src/control/control_tests.rs`). |
 | `swap_token_invalid` | A swap is open for this id and the nonce is not the candidate's. |
 | `reserved_capability` | The manifest claims a capability reserved to another module id. |
 | `duplicate_module_id` | Another registration already holds the id. |
@@ -167,7 +167,7 @@ reply, answering the opener `module_timeout` if none comes. After three
 consecutive full-budget timeouts, the daemon refuses new routes to that module
 with `module_timeout` for 20 seconds without relaying, then lets one probe through
 (`DEFAULT_ROUTE_BIND_BREAKER_THRESHOLD` and `DEFAULT_ROUTE_BIND_BREAKER_COOLDOWN`
-in `crates/subc-daemon/src/control.rs`).
+in `crates/subc-daemon/src/control/route_open.rs`).
 
 The bind carries:
 
@@ -237,7 +237,7 @@ reply's `status` is `ok`, `degraded` or `failing`; `on_degraded` and
 spends the crash budget like a crash. `metrics` larger than 16 KiB are
 replaced in the stored report by `{"truncated": true, "original_bytes": N}`;
 the status still applies (`MAX_HEALTH_METRICS_BYTES` in
-`crates/subc-daemon/src/supervise.rs`).
+`crates/subc-daemon/src/supervise/health_probe.rs`).
 
 The reply must come from in-memory state and must not wait on anything that a
 busy module also waits on. [`health-path-rule.md`](health-path-rule.md) states
@@ -250,7 +250,7 @@ A module that has never been probed reports no `last_probe_ms`; that means
 
 A module that exits unexpectedly is respawned after a backoff that starts at
 `backoff_ms` and grows tenfold with each recent crash, capped at
-`max_backoff_ms` (`delay_for_restart` in `crates/subc-daemon/src/supervise.rs`). At most `max_restarts`
+`max_backoff_ms` (`delay_for_restart` in `crates/subc-daemon/src/supervise/crash_budget.rs`). At most `max_restarts`
 crashes are restarted within `window_secs`; past that the module stays down
 and `route.closed` reports `terminal: true`. An operator restart, reload or
 re-enable clears the crash count. Tests: `route_closed_crash_at_max_minus_one_is_non_terminal` (`crates/subc-core/tests/forwarding.rs`)
@@ -297,7 +297,7 @@ and the shutdown drain, GOODBYE and EOF sequence is unchanged.
   that stop. A `protocol: "none"` module, or a module that has not registered,
   receives `SIGTERM` on macOS and Linux instead. On Windows nothing is sent.
   Whatever is still running when the drain budget ends is killed
-  (`request_graceful_stop` in `crates/subc-daemon/src/supervise.rs`). Test:
+  (`request_graceful_stop` in `crates/subc-daemon/src/supervise/drain.rs`). Test:
   `protocol_none_teardown_sigterms_first_and_only_kills_a_child_that_ignores_it` (`crates/subc-core/tests/forwarding.rs`).
 - **Swap.** `supervisor.swap` starts a second process with
   `SUBC_SPAWN_ROLE=swap_candidate` and its own nonce. The candidate registers

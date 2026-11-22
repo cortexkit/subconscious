@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.50.34
+
+- Wait within the root I/O deadline when an unstamped module fetches project
+  settings while the daemon is already reading that root.
+
 ## 0.50.33
 
 - Advertise the enabled settings capabilities to modules in `HELLO_ACK` as well

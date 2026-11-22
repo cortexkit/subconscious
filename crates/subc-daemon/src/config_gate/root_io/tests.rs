@@ -65,6 +65,50 @@ async fn root_io_queue_is_fifo_and_bounded() {
 }
 
 #[tokio::test]
+async fn root_io_busy_read_times_out_without_queuing_work() {
+    let pool = RootIoPool::new().unwrap();
+    let (holder, release) = park(&pool, "/busy").await;
+    let deadline = Instant::now() + Duration::from_millis(300);
+    let read = pool.start_read("/busy".into(), Some(deadline), || {
+        panic!("a second read started while its root was busy");
+    });
+    let mut read = std::pin::pin!(read);
+    std::future::poll_fn(|cx| {
+        assert!(read.as_mut().poll(cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+
+    assert_eq!(pool.shared.state.lock().unwrap().queue.len(), 0);
+    pool.submit("/healthy".into(), || ())
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    assert_eq!(read.await, Err(RootIoError::DeadlineElapsed));
+    assert!(pool.is_busy(Path::new("/busy")));
+    assert_eq!(pool.shared.state.lock().unwrap().queue.len(), 0);
+    release.send(()).unwrap();
+    holder.wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn root_io_busy_read_keeps_original_deadline_after_release() {
+    let pool = RootIoPool::new().unwrap();
+    let (holder, release) = park(&pool, "/busy").await;
+    let deadline = Instant::now() + TEST_LIMIT;
+    let shared = pool.shared.clone();
+    let read = pool.start_read("/busy".into(), Some(deadline), move || {
+        shared.state.lock().unwrap().running[Path::new("/busy")].deadline
+    });
+
+    // A release before the reader first polls must not be missed either.
+    release.send(()).unwrap();
+    holder.wait().await.unwrap();
+    assert_eq!(read.await, Ok(deadline));
+}
+
+#[tokio::test]
 async fn root_io_expired_queue_never_dispatches_and_charged_workers_refuse() {
     let pool = RootIoPool::with_timeout(Duration::from_millis(300)).unwrap();
     let mut held = Vec::new();

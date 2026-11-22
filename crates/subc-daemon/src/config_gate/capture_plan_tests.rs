@@ -18,6 +18,7 @@ struct Registry {
     reply: Mutex<Option<EnumerateReply>>,
     pool: RootIoPool,
     enumerations: AtomicUsize,
+    after_snapshot_poll: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 impl Registry {
@@ -54,7 +55,19 @@ impl ProjectRegistry for Registry {
         scope: &'a RegistryScope,
     ) -> RegistryFuture<'a> {
         Box::pin(async move {
-            RegistryRevision::from_scope(&self.pool, &self.reply()?, module, scope).await
+            let reply = self.reply()?;
+            let mut capture = std::pin::pin!(RegistryRevision::from_scope(
+                &self.pool, &reply, module, scope
+            ));
+            let mut signal = self.after_snapshot_poll.lock().unwrap().take();
+            std::future::poll_fn(|cx| {
+                let result = std::future::Future::poll(capture.as_mut(), cx);
+                if let Some(signal) = signal.take() {
+                    let _ = signal.send(());
+                }
+                result
+            })
+            .await
         })
     }
 
@@ -157,6 +170,7 @@ impl CaptureRig {
             reply: Mutex::new(None),
             pool,
             enumerations: AtomicUsize::new(0),
+            after_snapshot_poll: Mutex::default(),
         });
         let mut owner = rig.owner("capture-test");
         owner.capturer.projects = registry.clone();

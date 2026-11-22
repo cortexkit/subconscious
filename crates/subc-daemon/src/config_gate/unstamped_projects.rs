@@ -172,7 +172,8 @@ impl RuntimeOwner {
             BTreeSet::from([read.project.clone()]),
             BTreeSet::new(),
             BTreeSet::new(),
-        );
+        )
+        .waiting_for_root();
         let revision = self
             .capturer
             .projects

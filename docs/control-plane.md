@@ -328,7 +328,7 @@ absent list with this marker does not mean all settings files are valid.
 | `unknown_project`, `unknown_workspace`, `workspace_mismatch` | The selection is unregistered, the workspace has no eligible root or member, or the IDs disagree. |
 | `edit_spans_files` | An unstamped edit plan touches more than one file. |
 | `project_registry_unavailable` | The registry could not be consulted; an outage is not an empty registry. |
-| `config_unavailable` | Required root I/O is unavailable (including a busy root, a full queue or a deadline), or the result of an unstamped write is unknown. |
+| `config_unavailable` | Required root I/O is unavailable (for example, the queue is full or the deadline elapsed), or the result of an unstamped write is unknown. A module's unstamped project `config.get` waits for a busy root until its root I/O deadline; edits can refuse a busy root immediately. |
 
 Selection and availability failures in edit requests are `ERROR` frames.
 Layer and field refusals are rows in the plan view. A malformed control body

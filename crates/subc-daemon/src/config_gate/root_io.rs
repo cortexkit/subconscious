@@ -3,14 +3,15 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
+    future::Future,
     io,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex},
     time::{Duration, Instant},
 };
 
 use subc_control::config::ConfigRootIo;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 
 const ROOT_IO_WORKERS: usize = 4;
 const ROOT_IO_QUEUE_CAPACITY: usize = 16;
@@ -83,7 +84,7 @@ struct Shared {
 #[derive(Default)]
 struct State {
     queue: VecDeque<Queued>,
-    running: BTreeMap<PathBuf, Instant>,
+    running: BTreeMap<PathBuf, Reservation>,
     closed: bool,
 }
 
@@ -91,7 +92,7 @@ impl State {
     fn take_expired(&mut self, now: Instant) -> Vec<Queued> {
         let mut expired = Vec::new();
         for index in (0..self.queue.len()).rev() {
-            if self.queue[index].deadline <= now {
+            if self.queue[index].reservation.deadline <= now {
                 expired.extend(self.queue.remove(index));
             }
         }
@@ -101,15 +102,29 @@ impl State {
     fn charged(&self, now: Instant) -> impl Iterator<Item = &PathBuf> {
         self.running
             .iter()
-            .filter(move |(_, deadline)| **deadline <= now)
+            .filter(move |(_, reservation)| reservation.deadline <= now)
             .map(|(root, _)| root)
     }
 }
 
 struct Queued {
     root: PathBuf,
-    deadline: Instant,
+    reservation: Reservation,
     run: Box<dyn FnOnce(Running) + Send>,
+}
+
+struct Reservation {
+    deadline: Instant,
+    // Dropping the sender wakes only readers waiting on this reservation.
+    release: Option<watch::Sender<()>>,
+}
+
+impl Reservation {
+    fn released(&mut self) -> watch::Receiver<()> {
+        self.release
+            .get_or_insert_with(|| watch::Sender::new(()))
+            .subscribe()
+    }
 }
 
 struct Running {
@@ -119,7 +134,8 @@ struct Running {
 
 impl Drop for Running {
     fn drop(&mut self) {
-        self.shared.state.lock().unwrap().running.remove(&self.root);
+        let reservation = self.shared.state.lock().unwrap().running.remove(&self.root);
+        drop(reservation);
     }
 }
 
@@ -153,7 +169,66 @@ impl RootIoPool {
         root: PathBuf,
         work: impl FnOnce() -> T + Send + 'static,
     ) -> Result<RootIoJob<T>, RootIoError> {
-        let deadline = Instant::now() + self.timeout;
+        let (queued, job) = self.prepare(root, self.deadline(), work);
+        self.enqueue(queued).map_err(|(error, _)| error)?;
+        Ok(job)
+    }
+
+    pub(super) fn deadline(&self) -> Instant {
+        Instant::now() + self.timeout
+    }
+
+    /// Try to submit now so other roots in the same batch can run in parallel.
+    /// An interactive read can retry a busy root without occupying the queue or
+    /// a worker. All retries use the original deadline.
+    pub(super) fn start_read<T: Send + 'static>(
+        &self,
+        root: PathBuf,
+        wait_until: Option<Instant>,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> impl Future<Output = Result<T, RootIoError>> + Send + '_ {
+        let deadline = wait_until.unwrap_or_else(|| self.deadline());
+        let (queued, job) = self.prepare(root, deadline, work);
+        let mut admission = self.enqueue(queued);
+        async move {
+            loop {
+                match admission {
+                    Ok(()) => return job.wait().await,
+                    Err((RootIoError::RootBusy, queued)) if wait_until.is_some() => {
+                        self.wait_for_release(&queued.root, deadline).await;
+                        admission = self.enqueue(queued);
+                    }
+                    Err((error, _)) => return Err(error),
+                }
+            }
+        }
+    }
+
+    async fn wait_for_release(&self, root: &Path, deadline: Instant) {
+        let (mut released, until) = {
+            let mut state = self.shared.state.lock().unwrap();
+            if let Some(running) = state.running.get_mut(root) {
+                (running.released(), deadline)
+            } else if let Some(job) = state.queue.iter_mut().find(|job| job.root == root) {
+                // Expired queued work no longer reserves the root, even if no
+                // worker or caller has removed it from the queue yet.
+                (
+                    job.reservation.released(),
+                    deadline.min(job.reservation.deadline),
+                )
+            } else {
+                return;
+            }
+        };
+        let _ = tokio::time::timeout_at(until.into(), released.changed()).await;
+    }
+
+    fn prepare<T: Send + 'static>(
+        &self,
+        root: PathBuf,
+        deadline: Instant,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> (Queued, RootIoJob<T>) {
         let (send, result) = oneshot::channel();
         #[cfg(test)]
         let before = self
@@ -178,37 +253,49 @@ impl RootIoPool {
                 Err(RootIoError::DeadlineElapsed)
             });
         });
+        (
+            Queued {
+                root,
+                reservation: Reservation {
+                    deadline,
+                    release: None,
+                },
+                run,
+            },
+            RootIoJob {
+                shared: self.shared.clone(),
+                deadline,
+                result,
+            },
+        )
+    }
+
+    fn enqueue(&self, job: Queued) -> Result<(), (RootIoError, Queued)> {
         let expired;
         {
             let mut state = self.shared.state.lock().unwrap();
             let now = Instant::now();
             expired = state.take_expired(now);
-            if deadline <= now {
-                return Err(RootIoError::DeadlineElapsed);
+            if job.reservation.deadline <= now {
+                return Err((RootIoError::DeadlineElapsed, job));
             }
-            if state.running.contains_key(&root) || state.queue.iter().any(|job| job.root == root) {
-                return Err(RootIoError::RootBusy);
+            if state.running.contains_key(&job.root)
+                || state.queue.iter().any(|queued| queued.root == job.root)
+            {
+                return Err((RootIoError::RootBusy, job));
             }
             if state.charged(now).count() == ROOT_IO_WORKERS {
-                return Err(RootIoError::WorkersCharged);
+                return Err((RootIoError::WorkersCharged, job));
             }
             if state.queue.len() >= ROOT_IO_QUEUE_CAPACITY {
-                return Err(RootIoError::QueueFull);
+                return Err((RootIoError::QueueFull, job));
             }
-            state.queue.push_back(Queued {
-                root,
-                deadline,
-                run,
-            });
+            state.queue.push_back(job);
         }
         self.shared.ready.notify_one();
         // Drop closures and wake their waiters outside the lock.
         drop(expired);
-        Ok(RootIoJob {
-            shared: self.shared.clone(),
-            deadline,
-            result,
-        })
+        Ok(())
     }
 
     /// After a batch's waits have finished, some of its jobs may still hold
@@ -219,23 +306,23 @@ impl RootIoPool {
         (ROOT_IO_WORKERS - state.charged(Instant::now()).count()).max(1)
     }
 
-    pub(super) fn is_busy(&self, root: &std::path::Path) -> bool {
+    pub(super) fn is_busy(&self, root: &Path) -> bool {
         let state = self.shared.state.lock().unwrap();
         state.running.contains_key(root)
             || state
                 .queue
                 .iter()
-                .any(|job| job.root == root && job.deadline > Instant::now())
+                .any(|job| job.root == root && job.reservation.deadline > Instant::now())
     }
 
-    pub(super) fn is_charged(&self, root: &std::path::Path) -> bool {
+    pub(super) fn is_charged(&self, root: &Path) -> bool {
         self.shared
             .state
             .lock()
             .unwrap()
             .running
             .get(root)
-            .is_some_and(|deadline| *deadline <= Instant::now())
+            .is_some_and(|reservation| reservation.deadline <= Instant::now())
     }
 
     pub(super) fn health(&self) -> Option<ConfigRootIo> {
@@ -268,7 +355,7 @@ impl Drop for RootIoPool {
 
 fn worker(shared: Arc<Shared>) {
     loop {
-        let (job, running) = {
+        let (run, running) = {
             let mut state = shared.state.lock().unwrap();
             while state.queue.is_empty() && !state.closed {
                 state = shared.ready.wait(state).unwrap();
@@ -276,21 +363,21 @@ fn worker(shared: Arc<Shared>) {
             let Some(job) = state.queue.pop_front() else {
                 return;
             };
-            if Instant::now() >= job.deadline {
+            if Instant::now() >= job.reservation.deadline {
                 drop(state);
                 drop(job);
                 continue;
             }
-            state.running.insert(job.root.clone(), job.deadline);
+            state.running.insert(job.root.clone(), job.reservation);
             let running = Running {
                 shared: shared.clone(),
-                root: job.root.clone(),
+                root: job.root,
             };
-            (job, running)
+            (job.run, running)
         };
         // An unwinding operation releases its reservation but doesn't shrink
         // the dedicated pool. No thread is interrupted to enforce a deadline.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (job.run)(running)));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(running)));
     }
 }
 

@@ -181,6 +181,7 @@ pub struct RegistryScope {
     pub workspaces: BTreeSet<String>,
     all_registered: bool,
     capture: CaptureLayers,
+    wait_for_root: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -193,6 +194,11 @@ enum CaptureLayers {
 impl RegistryScope {
     pub(super) fn targets_only(mut self) -> Self {
         self.capture = CaptureLayers::Targets;
+        self
+    }
+
+    pub(super) fn waiting_for_root(mut self) -> Self {
+        self.wait_for_root = true;
         self
     }
 
@@ -436,6 +442,7 @@ impl RegistryRevision {
         let mut probes = paths.into_iter();
         let leaf = std::ffi::OsString::from(format!("{}.jsonc", self.module));
         let mut observed = BTreeMap::new();
+        let deadline = scope.wait_for_root.then(|| pool.deadline());
         loop {
             let jobs: Vec<_> = probes
                 .by_ref()
@@ -447,7 +454,7 @@ impl RegistryRevision {
                     .then(|| leaf.clone());
                     (
                         root,
-                        pool.submit(path.clone(), move || {
+                        pool.start_read(path.clone(), deadline, move || {
                             open_root(&path, leaf.as_deref(), &allowed)
                         }),
                     )
@@ -457,10 +464,7 @@ impl RegistryRevision {
                 break;
             }
             for (root, job) in jobs {
-                let result = match job {
-                    Ok(job) => job.wait().await,
-                    Err(error) => Err(error),
-                };
+                let result = job.await;
                 observed.insert(
                     root,
                     Arc::new(

@@ -249,6 +249,49 @@ impl Wire {
 }
 
 #[tokio::test]
+async fn unstamped_project_get_waits_for_delivery_poll_on_the_same_root() {
+    let rig = unstamped();
+    let project = root(&rig.project_scratch, "project");
+    rig.set_projects(vec![member("P", None, &[&project])]);
+    let mut wire = Wire::new(&rig);
+    let fallback = wire.get(Some("P")).await.active.unwrap();
+    assert_eq!(fallback.layers.len(), 1);
+
+    let (entered, polling_root) = oneshot::channel();
+    let (release, blocked) = std::sync::mpsc::channel();
+    let block = Mutex::new(Some((entered, blocked)));
+    *rig.registry.pool.before_work.lock().unwrap() = Some(Arc::new(move |_| {
+        if let Some((entered, blocked)) = block.lock().unwrap().take() {
+            let _ = entered.send(());
+            let _ = blocked.recv();
+        }
+    }));
+    let (hints, _recv_hints) = mpsc::unbounded_channel();
+    let poll = rig.owner.poll_unstamped_projects(hints);
+    let get_during_poll = async {
+        polling_root.await.unwrap();
+        write_layer(&project, 9);
+        let (signal, snapshot_polled) = oneshot::channel();
+        *rig.registry.after_snapshot_poll.lock().unwrap() = Some(signal);
+        let (reply, ()) = tokio::join!(wire.get(Some("P")), async {
+            // The get must attempt the capture while the poll holds the root.
+            snapshot_polled.await.unwrap();
+            release.send(()).unwrap();
+        });
+        let view = reply.active.unwrap();
+        assert_eq!(view.project_id.as_deref(), Some("P"));
+        assert_eq!(view.status, ConfigStatus::Unstamped);
+        assert_eq!(view.effective["limit"], 9);
+    };
+    timeout(std::time::Duration::from_secs(5), async {
+        let (result, ()) = tokio::join!(poll, get_during_poll);
+        result.unwrap();
+    })
+    .await
+    .expect("the get should return after the poll releases the root");
+}
+
+#[tokio::test]
 async fn unstamped_projects_stuck_root_does_not_delay_wire_push_or_bare_get() {
     use std::time::Duration;
     let rig = unstamped();

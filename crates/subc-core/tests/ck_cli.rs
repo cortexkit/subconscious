@@ -14,8 +14,8 @@ use ed25519_dalek::{Signer, SigningKey};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use subc_control::{
-    ClientControlRequest, ClientControlResponse, ModuleProtocol, SupervisorEntry,
-    SupervisorHealthStatus,
+    ClientControlRequest, ClientControlResponse, ModuleProtocol, RunningImageAgreement,
+    RunningImageUnavailableReason, SupervisorEntry, SupervisorHealthStatus,
 };
 use subc_daemon::{
     read_frame, write_frame, Frame, HealthConfig, ModuleSpec, RestartPolicy, SupervisedModule,
@@ -34,7 +34,7 @@ mod common;
 use common::{
     connect_authed_client,
     scripted_daemon::{ScriptedControlAction, ScriptedControlStep, ScriptedDaemon},
-    start_test_daemon_with_process_liveness_and_supervisor, TestDaemon,
+    start_test_daemon_with_image, TestDaemon, TestDaemonImage,
 };
 
 mod inline_actions;
@@ -193,12 +193,20 @@ impl TestServer {
     }
 
     async fn start_named(name: &str) -> Self {
+        // The in-process daemon's own executable is this integration test
+        // binary. Status needs the module's image, not a SHA-256 of the test
+        // binary on every new server's first provenance request.
+        Self::start_named_with_image(name, TestDaemonImage::Unavailable).await
+    }
+
+    async fn start_named_with_image(name: &str, image: TestDaemonImage) -> Self {
         let process_liveness = Arc::new(SupervisorProcessLiveness::new());
         let supervisor_handle = SupervisorHandle::new();
-        let daemon = start_test_daemon_with_process_liveness_and_supervisor(
+        let daemon = start_test_daemon_with_image(
             name,
             process_liveness.clone(),
             supervisor_handle.clone(),
+            image,
         )
         .await;
         Self {
@@ -207,6 +215,27 @@ impl TestServer {
             supervisor_handle,
         }
     }
+}
+
+#[tokio::test]
+async fn module_status_fixture_does_not_hash_the_daemon_test_executable() {
+    let server = TestServer::start().await;
+    let mut client = wait_for_client(&server.connection_file_path).await;
+    let response = control_rpc_value_on_stream_within(
+        &mut client,
+        93,
+        ClientControlRequest::SupervisorProvenance { module_id: None },
+        Duration::from_secs(120),
+    )
+    .await;
+    let observed = &response["daemon"]["daemon_observed"];
+    assert_eq!(observed["pid"], std::process::id());
+    assert_eq!(
+        serde_json::from_value::<RunningImageAgreement>(observed["running_image"].clone()).unwrap(),
+        RunningImageAgreement::Unavailable {
+            reason: RunningImageUnavailableReason::SpawnedPathUnreadable,
+        }
+    );
 }
 
 impl Deref for TestServer {
@@ -6246,7 +6275,7 @@ async fn module_status_renders_key_value_block_byte_for_byte() {
         "tree readings report memory without process-only swap: {subtree:?}"
     );
     assert_eq!(status_json["module"]["tree"]["source"], source);
-    let rest = format!("{policy}\n{rest}");
+    let rest = format!("{policy}\n{}", status_without_provenance_wait(rest));
     // The budget renders with the window it is counted over (`in 10m`), because
     // the count alone reads as a lifetime total and stopped being one.
     assert_eq!(
@@ -6259,6 +6288,30 @@ async fn module_status_renders_key_value_block_byte_for_byte() {
     );
 
     module.stop().await.unwrap();
+}
+
+fn status_without_provenance_wait(rest: &str) -> &str {
+    // Earlier requests can increment the live counter before status takes its
+    // snapshot. Check the diagnostic separately from the fixed status bytes.
+    let Some((status, diagnostic)) = rest.split_once("  reader waits and refusals:\n") else {
+        return rest;
+    };
+    let count = diagnostic
+        .strip_prefix("    direct: supervisor.provenance waited over 5 s ")
+        .and_then(|line| line.strip_suffix(" times\n"))
+        .and_then(|count| count.parse::<u64>().ok());
+    assert!(count.is_some_and(|count| count > 0), "{diagnostic:?}");
+    status
+}
+
+#[test]
+fn module_status_byte_fixture_checks_the_provenance_wait_separately() {
+    let fixed = "  launch spec: matches running process\n";
+    let slow = format!(
+        "{fixed}  reader waits and refusals:\n    direct: supervisor.provenance waited over 5 s 1 times\n"
+    );
+    assert_eq!(status_without_provenance_wait(&slow), fixed);
+    assert_eq!(status_without_provenance_wait(fixed), fixed);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6677,7 +6730,9 @@ fn provenance_requires_exactly_one_module_id_without_connecting() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn provenance_json_preserves_the_complete_daemon_response_without_a_footer() {
-    let server = TestServer::start().await;
+    let server =
+        TestServer::start_named_with_image("ck-cli-provenance", TestDaemonImage::CurrentExecutable)
+            .await;
     let supervisor = supervisor(&server);
     let module = spawn_stub_with_env(
         &server,
@@ -6692,9 +6747,9 @@ async fn provenance_json_preserves_the_complete_daemon_response_without_a_footer
     )
     .await;
 
-    // First provenance evaluation pays the linux double-hash of the stub
-    // binary; see control_rpc_value_on_stream_within for why 10s is not enough
-    // on a contended CI disk.
+    // This test compares the complete provenance response, including the
+    // daemon's own observed image. Allow the first, cold observation to finish
+    // before invoking the CLI with its ordinary frame timeout.
     let expected = control_rpc_value_on_stream_within(
         &mut wait_for_client(&server.connection_file_path).await,
         91,
@@ -7889,12 +7944,10 @@ where
     }
 }
 
-/// Control RPC helper with a caller-sized reply window. The provenance op is the
-/// motivating caller: on linux its first evaluation sha256-hashes the running
-/// module executable twice (via /proc and from disk), and a debug-profile stub
-/// on a cold, contended CI disk legitimately exceeds the default 10s — the
-/// ubuntu leg failed 2 of 3 runs on exactly that. The window is sized against
-/// the slowest acceptable progress of the operation, not the median.
+/// Control RPC helper with a caller-sized reply window for cold provenance.
+/// The Linux image probe caches digests by opened-file identity, so the running
+/// and on-disk handles usually share one hash. The in-process daemon's own image
+/// can be a large test binary, so tests that inspect it let the cold read finish.
 async fn control_rpc_value_on_stream_within<S>(
     stream: &mut S,
     corr: u64,

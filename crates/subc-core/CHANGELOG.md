@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.21.37
+
+- `ck module status` tests no longer hash the test executable as the daemon's
+  running image. The exact status fixture checks live reader-wait counts
+  separately from the stable output.
+
 ## 0.21.36
 
 - `ck config status` includes the daemon's settings file diagnostics in its JSON

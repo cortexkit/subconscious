@@ -125,21 +125,59 @@ impl Drop for TestDaemon {
 /// open a module's breaker, and how long it stays open before one probe.
 pub type BreakerPolicy = (u32, Duration);
 
+pub enum TestDaemonImage {
+    CurrentExecutable,
+    Unavailable,
+}
+
 pub async fn start_test_daemon(name: &str) -> TestDaemon {
-    start_test_daemon_inner(name, None, None, None, Vec::new(), None).await
+    start_test_daemon_inner(
+        name,
+        None,
+        None,
+        None,
+        Vec::new(),
+        None,
+        TestDaemonImage::CurrentExecutable,
+    )
+    .await
 }
 
 pub async fn start_test_daemon_with_process_liveness(
     name: &str,
     process_liveness: Arc<dyn ModuleProcessLiveness>,
 ) -> TestDaemon {
-    start_test_daemon_inner(name, Some(process_liveness), None, None, Vec::new(), None).await
+    start_test_daemon_inner(
+        name,
+        Some(process_liveness),
+        None,
+        None,
+        Vec::new(),
+        None,
+        TestDaemonImage::CurrentExecutable,
+    )
+    .await
 }
 
 pub async fn start_test_daemon_with_process_liveness_and_supervisor(
     name: &str,
     process_liveness: Arc<dyn ModuleProcessLiveness>,
     supervisor_handle: SupervisorHandle,
+) -> TestDaemon {
+    start_test_daemon_with_image(
+        name,
+        process_liveness,
+        supervisor_handle,
+        TestDaemonImage::CurrentExecutable,
+    )
+    .await
+}
+
+pub async fn start_test_daemon_with_image(
+    name: &str,
+    process_liveness: Arc<dyn ModuleProcessLiveness>,
+    supervisor_handle: SupervisorHandle,
+    daemon_image: TestDaemonImage,
 ) -> TestDaemon {
     start_test_daemon_inner(
         name,
@@ -148,6 +186,7 @@ pub async fn start_test_daemon_with_process_liveness_and_supervisor(
         None,
         Vec::new(),
         None,
+        daemon_image,
     )
     .await
 }
@@ -167,6 +206,7 @@ pub async fn start_test_daemon_with_bind_timeout(
         Some(bind_timeout),
         Vec::new(),
         None,
+        TestDaemonImage::CurrentExecutable,
     )
     .await
 }
@@ -191,6 +231,7 @@ pub async fn start_test_daemon_with_bind_timeout_and_breaker(
         Some(bind_timeout),
         Vec::new(),
         Some(breaker),
+        TestDaemonImage::CurrentExecutable,
     )
     .await
 }
@@ -213,6 +254,7 @@ pub async fn start_test_daemon_with_route_bind_relay_overrides(
         Some(daemon_wide),
         per_module,
         None,
+        TestDaemonImage::CurrentExecutable,
     )
     .await
 }
@@ -224,6 +266,7 @@ async fn start_test_daemon_inner(
     bind_timeout: Option<Duration>,
     per_module_bind_timeouts: Vec<(String, Duration)>,
     breaker: Option<BreakerPolicy>,
+    daemon_image: TestDaemonImage,
 ) -> TestDaemon {
     let temp_dir = unique_temp_dir(name);
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
@@ -256,7 +299,10 @@ async fn start_test_daemon_inner(
                 .as_millis()
                 .try_into()
                 .unwrap_or(u64::MAX),
-            std::env::current_exe().ok(),
+            match daemon_image {
+                TestDaemonImage::CurrentExecutable => std::env::current_exe().ok(),
+                TestDaemonImage::Unavailable => None,
+            },
             Some("test-daemon-build".to_string()),
             Some("test-daemon-lock".to_string()),
         );

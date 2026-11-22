@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.41.9
+
+- Add `SubcConsumer::config_watch_projects` to opt in to project settings rows.
+  Document settings capability discovery for modules on older daemons.
+- Require subc-control 0.42.5.
+
 ## 0.41.8
 
 - Add `ModuleHandle::refresh_project_config` to fetch a named project's settings.

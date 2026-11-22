@@ -300,12 +300,28 @@ impl SubcConsumer {
         &self,
         modules: Option<Vec<String>>,
     ) -> Result<ConfigSubscription, CallError> {
+        self.config_watch_with_projects(modules, None).await
+    }
+
+    /// Watch settings rows including projects, optionally filtered by module id.
+    /// The daemon must advertise `config.settings.projects/v1` to include project
+    /// rows. A resync replaces every row, including project rows; key the rows by
+    /// `(module_id, project_id)`. See [`Self::config_watch`] for stream semantics.
+    pub async fn config_watch_projects(
+        &self,
+        modules: Option<Vec<String>>,
+    ) -> Result<ConfigSubscription, CallError> {
+        self.config_watch_with_projects(modules, Some(true)).await
+    }
+
+    async fn config_watch_with_projects(
+        &self,
+        modules: Option<Vec<String>>,
+        projects: Option<bool>,
+    ) -> Result<ConfigSubscription, CallError> {
         let deadline = Instant::now() + self.shared.opts.call_timeout;
-        let body = serde_json::to_vec(&ConfigControlRequest::Watch {
-            modules,
-            projects: None,
-        })
-        .map_err(|err| CallError::not_sent(format!("failed to encode config.watch: {err}")))?;
+        let body = serde_json::to_vec(&ConfigControlRequest::Watch { modules, projects })
+            .map_err(|err| CallError::not_sent(format!("failed to encode config.watch: {err}")))?;
         loop {
             self.shared.ensure_connected_for_call(deadline).await?;
             // Keep a permit alive until this watch ends, as route subscriptions do.
@@ -455,6 +471,75 @@ mod tests {
             subc_config::Changeset::new(),
         ))
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn config_plan_replies_round_trip_every_plan_vector() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../vectors/config-settings-v1");
+        let paths: std::collections::BTreeSet<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                let name = path.file_name().unwrap().to_str().unwrap();
+                (name.starts_with("plan-") || name.starts_with("project-plan-"))
+                    && name.ends_with(".json")
+            })
+            .collect();
+        for name in ["plan-edit.json", "project-plan-root-refusals.json"] {
+            assert!(
+                paths.iter().any(|path| path.ends_with(name)),
+                "missing {name}"
+            );
+        }
+        for path in paths {
+            let sample: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let expected_request = &sample["request"];
+            let expected_reply = &sample["reply"];
+            let (consumer, mut rx) = consumer();
+            let shared = consumer.shared.clone();
+            let operation = serde_json::from_value(expected_request.clone()).unwrap();
+            let call = tokio::spawn(async move {
+                match operation {
+                    ConfigControlRequest::Plan {
+                        base_generations,
+                        edits,
+                    } => consumer
+                        .config_plan(base_generations, edits)
+                        .await
+                        .map(|view| ConfigControlResponse::Plan { view }),
+                    ConfigControlRequest::PlanGet { digest } => consumer
+                        .config_plan_get(digest)
+                        .await
+                        .map(|view| ConfigControlResponse::PlanGet { view }),
+                    ConfigControlRequest::PlanDiscard { digest } => consumer
+                        .config_plan_discard(digest)
+                        .await
+                        .map(|()| ConfigControlResponse::PlanDiscard {}),
+                    other => panic!("unexpected plan request: {other:?}"),
+                }
+            });
+            let req = request(&mut rx, expected_request.clone()).await;
+            let kind = if expected_reply.get("code").is_some() {
+                FrameType::Error
+            } else {
+                FrameType::Response
+            };
+            assert!(
+                dispatch_frame(
+                    &shared,
+                    1,
+                    frame(kind, req.header.corr, expected_reply.clone()),
+                )
+                .await
+            );
+            let reply = match call.await.unwrap() {
+                Ok(response) => serde_json::to_value(response),
+                Err(CallError::Module(error)) => serde_json::to_value(error),
+                Err(other) => panic!("{}: {other}", path.display()),
+            };
+            assert_eq!(&reply.unwrap(), expected_reply, "{}", path.display());
+        }
     }
 
     #[tokio::test]
@@ -705,6 +790,65 @@ mod tests {
         );
         assert_eq!(watch.next().await.unwrap(), None);
         assert_eq!(watch.ended().await, SubscriptionEnd::Error(error));
+    }
+
+    #[tokio::test]
+    async fn config_watch_projects_streams_project_vectors_and_replaces_rows() {
+        let (consumer, mut rx) = consumer();
+        let mut watch = consumer.config_watch_projects(None).await.unwrap();
+        let expected: Value = serde_json::from_str(include_str!(
+            "../../../../vectors/config-settings-v1/project-watch.request.json"
+        ))
+        .unwrap();
+        let req = request(&mut rx, expected).await;
+        let events = [
+            include_str!("../../../../vectors/config-settings-v1/project-watch.resync.json"),
+            include_str!("../../../../vectors/config-settings-v1/project-watch.change.json"),
+            include_str!("../../../../vectors/config-settings-v1/project-watch.drop.resync.json"),
+        ];
+        let mut rows = Vec::new();
+        for (index, event) in events.into_iter().enumerate() {
+            let body: Value = serde_json::from_str(event).unwrap();
+            assert!(
+                dispatch_frame(
+                    &consumer.shared,
+                    1,
+                    frame(FrameType::StreamData, req.header.corr, body.clone()),
+                )
+                .await
+            );
+            let event = watch.next().await.unwrap().unwrap();
+            assert_eq!(
+                serde_json::to_value(ConfigWatchResponse::new(event.clone())).unwrap(),
+                body
+            );
+            match event {
+                ConfigWatchEvent::Resync { modules, .. } => {
+                    rows = modules;
+                    if index == 0 {
+                        assert_eq!(rows.len(), 3);
+                        assert_eq!(rows[2].project_id.as_deref(), Some("B"));
+                        assert_eq!(rows[2].workspace_id.as_deref(), Some("W"));
+                    }
+                }
+                ConfigWatchEvent::Change {
+                    project_id,
+                    workspace_id,
+                    file_error,
+                    ..
+                } => {
+                    assert_eq!(project_id.as_deref(), Some("B"));
+                    assert_eq!(workspace_id.as_deref(), Some("W"));
+                    assert_eq!(file_error.unwrap().code, "bound_violated");
+                }
+                other => panic!("unexpected settings watch event: {other:?}"),
+            }
+        }
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].project_id, None);
+        assert_eq!(rows[1].project_id.as_deref(), Some("A"));
+        assert_eq!(rows[1].workspace_id.as_deref(), Some("W"));
+        assert_eq!(rows[1].file_error.as_ref().unwrap().code, "value_invalid");
     }
 
     #[tokio::test]

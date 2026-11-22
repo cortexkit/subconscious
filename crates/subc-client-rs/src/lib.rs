@@ -670,6 +670,10 @@ impl ModuleHandle {
     /// `daemon_supports(subc_protocol::manifest::CAP_SCOPE_BIND_PROOF_V1)`
     /// before setting `ScopeRecord.bind_proof_sha256` on records sent over
     /// this connection.
+    ///
+    /// Daemons before 0.50.33 list `config.settings/v1` and
+    /// `config.settings.projects/v1` only in `server.describe`. Modules that
+    /// support those versions must check `server.describe` as well.
     pub fn daemon_supports(&self, capability: &str) -> bool {
         self.shared
             .daemon_capabilities

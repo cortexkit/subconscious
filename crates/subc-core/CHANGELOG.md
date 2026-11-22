@@ -4,6 +4,7 @@
 
 - `ck config status` includes the daemon's settings file diagnostics in its JSON
   output. Require subc-daemon 0.50.33 and subc-control 0.42.5.
+- Require subc-client-rs 0.41.9.
 
 ## 0.21.35
 

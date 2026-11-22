@@ -7,6 +7,8 @@
 - Include user and project settings file errors in `config.status` without the
   watch's settling grace. Mark incomplete project observations even when a
   repository stalls or the project registry is unavailable. Require subc-control 0.42.5.
+- Test only: let the cold-discovery fixture finish reading the workspace
+  before removing it on Windows.
 
 ## 0.50.32
 

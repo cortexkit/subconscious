@@ -270,6 +270,15 @@ pub(in crate::config_gate::runtime) struct ProjectObservations {
     cached: Mutex<Option<ProjectObservationsSnapshot>>,
 }
 
+#[cfg(test)]
+impl ProjectObservations {
+    pub(in crate::config_gate::runtime) async fn pause_refresh(
+        &self,
+    ) -> tokio::sync::MutexGuard<'_, ()> {
+        self.refresh.lock().await
+    }
+}
+
 struct ProjectObservationsSnapshot {
     incarnation: Arc<()>,
     rows: Arc<BTreeMap<Tuple, ProjectFiles>>,

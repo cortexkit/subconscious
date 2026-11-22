@@ -351,6 +351,30 @@ impl Peer {
     }
 }
 
+#[cfg(windows)]
+fn hold_workspace_probe(
+    rig: &CaptureRig,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+) {
+    let (opened, root_opened) = tokio::sync::oneshot::channel();
+    let (release_root, wait) = std::sync::mpsc::channel();
+    let gate = Mutex::new(Some((opened, wait)));
+    let workspace = rig.workspace.clone();
+    *rig.registry.pool.before_work.lock().unwrap() = Some(Arc::new(move |path| {
+        if path == workspace {
+            if let Some((opened, wait)) = gate.lock().unwrap().take() {
+                // Hold the same no-delete-share directory handle as a live root probe.
+                let _root = subc_os::open_directory_nofollow_all(path).unwrap();
+                let _ = opened.send(());
+                let _ = wait.recv();
+            }
+        }
+    }));
+    (root_opened, release_root)
+}
+
 #[tokio::test]
 async fn stamped_delivery_cold_discovery_serves_saved_views_and_skips_confirmed_drops() {
     let rig = CaptureRig::new();
@@ -372,6 +396,8 @@ async fn stamped_delivery_cold_discovery_serves_saved_views_and_skips_confirmed_
     }
     let polling = Peer::new(rig.owner.clone(), INCUMBENT);
     let before_poll = rig.registry.enumerations.load(Ordering::Relaxed);
+    #[cfg(windows)]
+    let (root_opened, release_root) = hold_workspace_probe(&rig);
     let worker = polling.handler.spawn_config_delivery_worker().unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         while rig.registry.enumerations.load(Ordering::Relaxed) == before_poll {
@@ -380,6 +406,11 @@ async fn stamped_delivery_cold_discovery_serves_saved_views_and_skips_confirmed_
     })
     .await
     .unwrap();
+    #[cfg(windows)]
+    tokio::time::timeout(Duration::from_secs(5), root_opened)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(rig.get("dropped", 10).active.is_some());
     rig.set_projects(vec![
         member("A", Some("W"), &[]),
@@ -400,10 +431,26 @@ async fn stamped_delivery_cold_discovery_serves_saved_views_and_skips_confirmed_
     })
     .await
     .unwrap();
+    *rig.registry.reply.lock().unwrap() = None;
+    // Aborting the delivery task does not join an in-flight blocking root read.
+    // Let the settings refresh release its handles, then stop further refreshes.
+    let mut pause = std::pin::pin!(rig.owner.settings_projects.pause_refresh());
+    #[cfg(windows)]
+    {
+        let waiting = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(pause.as_mut(), cx).is_pending())
+        })
+        .await;
+        assert!(waiting, "the refresh must still own the held root probe");
+        release_root.send(()).unwrap();
+    }
+    let refresh_paused = tokio::time::timeout(Duration::from_secs(5), pause.as_mut())
+        .await
+        .expect("the settings refresh should release the workspace before teardown");
     worker.abort();
     let _ = worker.await;
-    *rig.registry.reply.lock().unwrap() = None;
     std::fs::remove_dir_all(&rig.workspace).unwrap();
+    drop(refresh_paused);
     let mut restarted = rig.rig.owner("cold-discovery");
     restarted.project_capture_enabled = true;
     restarted.capturer.projects = rig.registry.clone();

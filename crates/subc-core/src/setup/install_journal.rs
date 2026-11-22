@@ -964,7 +964,13 @@ pub(in crate::setup) fn crash_hook(point: &str) {
         return;
     }
     if let Some(marker) = std::env::var_os("CK_TEST_INSTALL_CRASH_MARKER") {
-        fs::write(marker, point).expect("write installer crash marker");
+        // Tests poll for the marker and read it as soon as it exists, then
+        // kill this process. Write it under another name and rename it into
+        // place, so the marker never exists without its contents.
+        let marker = std::path::PathBuf::from(marker);
+        let partial = marker.with_extension("partial");
+        fs::write(&partial, point).expect("write installer crash marker");
+        fs::rename(&partial, &marker).expect("publish installer crash marker");
         loop {
             std::thread::sleep(std::time::Duration::from_secs(1));
         }

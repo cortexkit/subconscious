@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.21.35
+
+- The installer's test crash point publishes its marker file with its contents in
+  one step, so a test can't read an empty marker.
+
 ## 0.21.34
 
 - Setup, upgrade, uninstall and both install scripts use one locked write-ahead

@@ -296,6 +296,8 @@ async fn config_approved_boot_replaces_eager_provisional_configuration() {
     assert!(info.endpoints.iter().all(|endpoint| endpoint.port != 12345));
 }
 
+// Approving the edit needs a desktop app this daemon can't verify.
+#[cfg(feature = "dev-desktop-approval")]
 #[tokio::test]
 async fn config_approved_disable_stops_module() {
     let _serial = DAEMONS.lock().await;
@@ -323,6 +325,8 @@ async fn config_approved_disable_stops_module() {
     assert_eq!(reply["restart_required"], false, "{reply}");
 }
 
+// Approving the edit needs a desktop app this daemon can't verify.
+#[cfg(feature = "dev-desktop-approval")]
 #[tokio::test]
 async fn config_approved_removal_retires_module() {
     let _serial = DAEMONS.lock().await;
@@ -361,6 +365,8 @@ async fn config_approved_removal_retires_module() {
         "rollback must add and start the approved removed entry, without importing the still-removed live file");
 }
 
+// Approving the edit needs a desktop app this daemon can't verify.
+#[cfg(feature = "dev-desktop-approval")]
 #[tokio::test]
 async fn config_approved_launch_change_applies_at_next_spawn() {
     let _serial = DAEMONS.lock().await;
@@ -482,6 +488,8 @@ async fn config_approved_launch_change_applies_at_next_spawn() {
     );
 }
 
+// Approving the edit needs a desktop app this daemon can't verify.
+#[cfg(feature = "dev-desktop-approval")]
 #[tokio::test]
 async fn config_approved_unrelated_approval_keeps_runtime_override() {
     let _serial = DAEMONS.lock().await;
@@ -552,6 +560,8 @@ async fn config_approved_unrelated_approval_keeps_runtime_override() {
     );
 }
 
+// Approving the edit needs a desktop app this daemon can't verify.
+#[cfg(feature = "dev-desktop-approval")]
 #[tokio::test]
 async fn config_approved_daemon_restart_setting_stays_inactive() {
     let _serial = DAEMONS.lock().await;

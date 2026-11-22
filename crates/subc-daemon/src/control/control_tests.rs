@@ -2496,7 +2496,11 @@ async fn catalog_update_refuses_reserved_capabilities_for_active_and_candidate()
 #[test]
 #[cfg(not(feature = "dev-desktop-approval"))]
 fn server_describe_default_build_advertises_no_config_capability() {
-    let assert_default = |handler: &ControlHandler| {
+    // `allowed` lists the config capabilities this handler may announce:
+    // without a runtime none, with an unactivated runtime only the settings
+    // surface, which works on unstamped installs. Neither may announce the
+    // gate's admission authority (`config.gate`).
+    let assert_default = |handler: &ControlHandler, allowed: &[&str]| {
         let request = Frame::build(
             FrameType::Request,
             control_flags(),
@@ -2517,14 +2521,17 @@ fn server_describe_default_build_advertises_no_config_capability() {
             !capabilities.is_empty(),
             "exercise an actual describe response, not an empty fixture"
         );
-        assert!(
-            capabilities
-                .iter()
-                .all(|capability| !capability.as_str().unwrap().starts_with("config.")),
+        let config = capabilities
+            .iter()
+            .map(|capability| capability.as_str().unwrap())
+            .filter(|capability| capability.starts_with("config."))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            config, allowed,
             "a default build must not announce configuration authority: {capabilities:?}"
         );
     };
-    assert_default(&ControlHandler::new(Arc::new(Registry::default())));
+    assert_default(&ControlHandler::new(Arc::new(Registry::default())), &[]);
     #[cfg(unix)]
     {
         // A local store does not prove that project-membership validation,
@@ -2532,7 +2539,10 @@ fn server_describe_default_build_advertises_no_config_capability() {
         // are connected. Defaults must not advertise that authority.
         let (_rig, _owner, _supervisor, handler, _spec) =
             crate::config_gate::runtime::RuntimeOwner::unactivated_supervisor_fixture_for_test();
-        assert_default(&handler);
+        assert_default(
+            &handler,
+            &[subc_control::config::CONFIG_SETTINGS_CAPABILITY],
+        );
     }
 }
 

@@ -274,6 +274,10 @@ test_check() {
       # feature on in the workspace run above would also change the daemon
       # that other crates' tests link, so the daemon's own targets run here.
       step 'Daemon tests (test-support, dev-desktop-approval)' cargo test -p subc-daemon --all-targets --locked --no-fail-fast --features test-support,dev-desktop-approval
+      # Tests marked cfg(not(feature = "dev-desktop-approval")) check release
+      # behaviour (an unverified desktop app is refused). The run above
+      # compiles them out, so run the daemon's unit tests once without it.
+      step 'Daemon unit tests (test-support, release features)' cargo test -p subc-daemon --lib --locked --no-fail-fast --features test-support
       # Reuse the compiled test target while also exercising its shell entry point.
       step 'Workspace scratch fence wrapper' bash scripts/checks/test-scratch-fence.sh ;;
     docs) step 'Workspace doctests' cargo test --workspace --doc --locked ;;

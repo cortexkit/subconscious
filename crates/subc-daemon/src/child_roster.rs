@@ -827,6 +827,20 @@ impl ChildRoster {
         self.live().len()
     }
 
+    #[cfg(all(test, unix))]
+    pub(crate) fn plain_group_for_test(
+        &self,
+        pid: u32,
+    ) -> Option<Arc<crate::supervise::plain_group::PlainGroup>> {
+        lock(&self.inner.live)
+            .values()
+            .find(|entry| entry.pid == pid)?
+            .recorded
+            .plain_group
+            .as_ref()?
+            .upgrade()
+    }
+
     #[cfg(unix)]
     fn live(&self) -> Vec<(u64, RosterEntry)> {
         lock(&self.inner.live)

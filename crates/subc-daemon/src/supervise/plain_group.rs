@@ -119,6 +119,17 @@ impl PlainGroup {
         self.settle_with(&Unix).await;
     }
 
+    #[cfg(test)]
+    pub(super) fn remaining_term_grace_for_test(&self) -> Option<Duration> {
+        let owned = self.ownership.lock().unwrap_or_else(|p| p.into_inner());
+        let sent = owned.term_sent?;
+        Some(if owned.killed || owned.closed {
+            Duration::ZERO
+        } else {
+            (sent + TERM_GRACE).saturating_duration_since(Instant::now())
+        })
+    }
+
     async fn settle_with(&self, ops: &impl GroupOperations) {
         let fallback = Instant::now();
         if let Err(error) = self.signal_with(Signal::TERM, ops) {

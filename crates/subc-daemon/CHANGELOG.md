@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.50.35
+
+- Test only: advance the paused clock through the process group's TERM grace
+  before checking how a registration timeout affects restart scheduling.
+
 ## 0.50.34
 
 - Wait within the root I/O deadline when an unstamped module fetches project

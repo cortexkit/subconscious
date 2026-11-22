@@ -1,5 +1,6 @@
 use super::*;
 use cortexkit_test_support::ScratchDir;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use subc_protocol::{manifest::Concurrency, session::ModuleControlResponse};
 
 struct Actor {
@@ -10,7 +11,39 @@ struct Actor {
     health: HealthConfig,
     rx: mpsc::Receiver<crate::router::OutboundFrame>,
     roster: ChildRoster,
-    _home: ScratchDir,
+    home: ScratchDir,
+}
+
+struct TermIgnoringHelper(std::process::Child);
+
+impl TermIgnoringHelper {
+    fn start(group: u32, ready: &std::path::Path) -> Self {
+        // Run in the leader's group but hold our own child handle for cleanup.
+        Self(
+            std::process::Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "trap '' TERM; : > \"$1\"; exec /bin/sleep 120",
+                    "helper",
+                ])
+                .arg(ready)
+                .process_group(i32::try_from(group).unwrap())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        )
+    }
+}
+
+impl Drop for TermIgnoringHelper {
+    fn drop(&mut self) {
+        // Do not signal a numeric group after the leader has been reaped.
+        if matches!(self.0.try_wait(), Ok(None)) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
 }
 
 async fn wait_for<T>(reason: &str, mut observe: impl FnMut() -> Option<T>) -> T {
@@ -104,7 +137,7 @@ impl Actor {
             health,
             rx,
             roster: supervisor.child_roster.clone(),
-            _home: home,
+            home,
         };
         actor
             .wait_for_select(|checkpoint| checkpoint.generation > 0)
@@ -113,16 +146,18 @@ impl Actor {
     }
 
     async fn expire_registration_wait(&self, remaining: Duration) {
+        let pid = self.module.status().unwrap().pid.unwrap();
+        let group = self.roster.plain_group_for_test(pid).unwrap();
         tokio::time::advance(remaining).await;
-        wait_for("registration timeout TERM grace", || {
-            lock_snapshot(&self.module.inner.snapshot)
-                .unwrap()
-                .actor_select
-                .is_none()
-                .then_some(())
+        let grace = wait_for("registration timeout group TERM", || {
+            group.remaining_term_grace_for_test()
         })
         .await;
-        tokio::time::advance(crate::child_roster::TERM_TO_KILL).await;
+        // A sample partway through the grace can still see a live member and
+        // arm another poll timer. Advance to the deadline before waiting for I/O.
+        if !grace.is_zero() {
+            tokio::time::advance(grace).await;
+        }
     }
 
     fn turns(&self) -> u64 {
@@ -310,6 +345,15 @@ async fn registration_timeouts_exhaust_budget_and_schedule_slow_retry() {
         .expire_registration_wait(Duration::from_secs(10))
         .await;
     actor.wait_for_select(|at| at.generation > generation).await;
+    // Keep the second group live across TERM and intermediate membership
+    // polls. A cooperative leader can disappear before even the first poll.
+    let ready = actor.home.join("helper.ready");
+    let mut helper = TermIgnoringHelper::start(actor.module.status().unwrap().pid.unwrap(), &ready);
+    wait_for("TERM-ignoring group member to be ready", || {
+        assert!(helper.0.try_wait().unwrap().is_none());
+        ready.exists().then_some(())
+    })
+    .await;
     actor
         .expire_registration_wait(Duration::from_secs(10))
         .await;
@@ -320,6 +364,11 @@ async fn registration_timeouts_exhaust_budget_and_schedule_slow_retry() {
             .flatten()
     })
     .await;
+    let helper_exit = wait_for("TERM-ignoring group member to exit", || {
+        helper.0.try_wait().unwrap()
+    })
+    .await;
+    assert_eq!(helper_exit.signal(), Some(9));
     assert_eq!(retry.delay, Duration::from_secs(600));
     assert_eq!(retry.attempt, 1);
     let entries = actor.module.terminal_history().entries;
@@ -369,20 +418,6 @@ async fn registration_timeout_honours_ten_second_override() {
 
 #[tokio::test]
 async fn registration_timeout_kills_term_ignoring_helper_before_reaping_leader() {
-    use std::os::unix::process::{CommandExt, ExitStatusExt};
-
-    struct Helper(std::process::Child);
-    impl Drop for Helper {
-        fn drop(&mut self) {
-            // This handle still owns the helper until wait returns. Never
-            // clean up its old process group after the leader is reaped.
-            if matches!(self.0.try_wait(), Ok(None)) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
-            }
-        }
-    }
-
     let home = ScratchDir::new("registration-timeout-helper");
     let supervisor = Supervisor::new_for_test(
         Arc::new(Registry::default()),
@@ -426,22 +461,7 @@ async fn registration_timeout_kills_term_ignoring_helper_before_reaping_leader()
     .expect("supervised group leader must be reported before the deadline");
     assert!(leader > 1);
     let ready = home.join("helper.ready");
-    // Own the helper separately so even a broken group kill can be cleaned
-    // up by its own unreaped child handle, without signalling a stale pgid.
-    let mut helper = Helper(
-        std::process::Command::new("/bin/sh")
-            .args([
-                "-c",
-                "trap '' TERM; : > \"$1\"; exec /bin/sleep 120",
-                "helper",
-            ])
-            .arg(&ready)
-            .process_group(i32::try_from(leader).unwrap())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
+    let mut helper = TermIgnoringHelper::start(leader, &ready);
     timeout(Duration::from_secs(5), async {
         while !ready.exists() {
             assert!(helper.0.try_wait().unwrap().is_none());

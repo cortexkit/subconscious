@@ -550,7 +550,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-client-rs",
- "subc-control 0.42.4",
+ "subc-control 0.42.5",
  "subc-daemon",
  "subc-jsonc",
  "subc-protocol 0.37.6",
@@ -574,7 +574,7 @@ dependencies = [
  "serde",
  "serde_json",
  "subc-client-rs",
- "subc-control 0.42.4",
+ "subc-control 0.42.5",
  "subc-os",
  "subc-protocol 0.37.6",
  "tempfile",
@@ -611,7 +611,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-client-rs",
- "subc-control 0.42.4",
+ "subc-control 0.42.5",
  "subc-jsonc",
  "subc-os",
  "subc-protocol 0.37.6",
@@ -776,7 +776,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-client-rs",
- "subc-control 0.42.4",
+ "subc-control 0.42.5",
  "subc-os",
  "subc-protocol 0.37.6",
  "subc-transport",
@@ -3156,7 +3156,7 @@ dependencies = [
  "sha2",
  "socket2",
  "subc-config",
- "subc-control 0.42.4",
+ "subc-control 0.42.5",
  "subc-os",
  "subc-protocol 0.37.6",
  "subc-transport",
@@ -3190,7 +3190,7 @@ dependencies = [
 
 [[package]]
 name = "subc-control"
-version = "0.42.4"
+version = "0.42.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -3200,7 +3200,7 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.21.35"
+version = "0.21.36"
 dependencies = [
  "async-trait",
  "base64",
@@ -3220,7 +3220,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-client-rs",
- "subc-control 0.42.4",
+ "subc-control 0.42.5",
  "subc-core",
  "subc-daemon",
  "subc-jsonc",
@@ -3261,7 +3261,7 @@ dependencies = [
  "subc-cgroup",
  "subc-config",
  "subc-control 0.35.0",
- "subc-control 0.42.4",
+ "subc-control 0.42.5",
  "subc-jobobject",
  "subc-jsonc",
  "subc-os",
@@ -3319,7 +3319,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-client-rs",
- "subc-control 0.42.4",
+ "subc-control 0.42.5",
  "subc-daemon",
  "subc-jsonc",
  "subc-os",

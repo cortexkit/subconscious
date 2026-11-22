@@ -171,7 +171,7 @@ pub enum ConfigThrough {
     Workspace,
 }
 
-/// A user-file observation failure, separate from the approved settings status.
+/// A settings-file observation failure, separate from the approved settings status.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ConfigFileError {
@@ -383,8 +383,51 @@ pub struct ConfigStatus {
     pub development_switches: Vec<String>,
     pub missing_approval_surfaces: Vec<String>,
     pub warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_errors: Vec<ConfigStatusFileError>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_errors_incomplete: Option<ConfigFileErrorsIncomplete>,
     #[serde(default, skip_serializing_if = "ConfigRootIo::absent_or_idle")]
     pub root_io: Option<ConfigRootIo>,
+}
+
+/// The file error for one user or project settings row.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ConfigStatusFileError {
+    pub module_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(flatten)]
+    pub error: ConfigFileError,
+}
+
+impl ConfigStatusFileError {
+    pub fn new(module_id: String, error: ConfigFileError) -> Self {
+        Self {
+            module_id,
+            project_id: None,
+            workspace_id: None,
+            error,
+        }
+    }
+}
+
+/// An open diagnostic reason for missing project file observations.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ConfigFileErrorsIncomplete {
+    pub reason: String,
+}
+
+impl ConfigFileErrorsIncomplete {
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
 }
 
 /// Root I/O still outstanding after its deadline.

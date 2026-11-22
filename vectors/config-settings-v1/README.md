@@ -143,6 +143,7 @@ channel-0 handlers and watch/delivery workers. Most samples pair `request` and
 | `project-changed.json`, `project-get-pending.json`, `project-applied.json` | Discovery, a pending delivery with a project-specific attempt, and its ACK. |
 | `project-get-fallback.json`, `project-get-unstamped.json` | Stamped layerless fallback and fresh unstamped delivery; neither has an attempt. |
 | `project-status-root-io.json` | `config.status` while one root job is past its deadline; idle status omits `root_io`. |
+| `project-status-file-errors.json` | `config.status` reports an unstamped project's refused settings file without the watch's settling grace. |
 
 The legacy watch test compares raw resync bodies before and after adding
 project layers. On the same layered state, legacy subscribers get no project

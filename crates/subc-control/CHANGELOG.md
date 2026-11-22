@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.42.5
+
+- Preserve optional settings file errors and incomplete observations in
+  `config.status` replies.
+
 ## 0.42.4
 
 - Add local operator control bodies for reading, setting and recovering the

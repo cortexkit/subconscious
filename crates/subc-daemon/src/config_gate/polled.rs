@@ -1,5 +1,8 @@
 //! Polling clones a verified memory projection; only owner work refreshes it.
 use super::*;
+use crate::config_gate::capture::SettingsCapture;
+use std::sync::Arc;
+use subc_control::config::{ConfigStatus, ConfigStatusFileError};
 
 #[derive(Clone, Default)]
 pub(super) struct Projection {
@@ -20,13 +23,37 @@ impl RuntimeOwner {
     #[cfg(test)]
     pub(crate) fn polled_status(&self) -> Result<subc_control::config::ConfigStatus> {
         let snapshot = self.polled_snapshot()?;
-        self.polled_status_from(snapshot.as_ref())
+        self.poll_status_settings(&snapshot)
+            .map(|(status, _)| status)
     }
 
-    pub(crate) fn polled_status_from(
+    pub(crate) async fn polled_status_from(
+        self: &Arc<Self>,
+        snapshot: Arc<Published>,
+    ) -> Result<ConfigStatus> {
+        let published = snapshot.clone();
+        let (mut status, captured) = self
+            .on_blocking(move |owner| owner.poll_status_settings(&published))
+            .await?;
+        if let Some(captured) = captured {
+            self.report_project_settings_file_errors(
+                &snapshot.projection.config_declarations,
+                captured,
+                &mut status,
+            )
+            .await;
+        }
+        status
+            .file_errors
+            .sort_by(|a, b| (&a.module_id, &a.project_id).cmp(&(&b.module_id, &b.project_id)));
+        status.root_io = self.capturer.projects.root_io_health();
+        Ok(status)
+    }
+
+    fn poll_status_settings(
         &self,
         snapshot: &Published,
-    ) -> Result<subc_control::config::ConfigStatus> {
+    ) -> Result<(ConfigStatus, Option<SettingsCapture>)> {
         if self.inner.is_poisoned() {
             return Err(GateError::new(
                 "config_unavailable",
@@ -35,6 +62,7 @@ impl RuntimeOwner {
         }
         let view = &snapshot.projection;
         let mut status = view.status.clone();
+        let mut settings = None;
         if matches!(status.state.as_str(), "stamped" | "unstamped") && !status.anchor_pending {
             let captured = self.capturer.capture_settings(&view.config_declarations)?;
             let candidate = captured.proposal_snapshot(&view.approved);
@@ -49,9 +77,15 @@ impl RuntimeOwner {
                 status_inputs::report_snapshot(&candidate, &mut status);
             }
             captured.report_errors(&mut status);
+            status.file_errors.extend(
+                captured.file_errors.iter().map(|(module, error)| {
+                    ConfigStatusFileError::new(module.clone(), error.clone())
+                }),
+            );
+            settings = Some(captured);
         }
         status.root_io = self.capturer.projects.root_io_health();
-        Ok(status)
+        Ok((status, settings))
     }
 
     pub(crate) fn registration_declaration(&self, module: &str) -> Option<String> {

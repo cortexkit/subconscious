@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.21.36
+
+- `ck config status` includes the daemon's settings file diagnostics in its JSON
+  output. Require subc-daemon 0.50.33 and subc-control 0.42.5.
+
 ## 0.21.35
 
 - The installer's test crash point publishes its marker file with its contents in

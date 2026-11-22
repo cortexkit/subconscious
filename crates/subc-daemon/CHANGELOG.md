@@ -4,6 +4,9 @@
 
 - Advertise the enabled settings capabilities to modules in `HELLO_ACK` as well
   as to clients in `server.describe`.
+- Include user and project settings file errors in `config.status` without the
+  watch's settling grace. Mark incomplete project observations even when a
+  repository stalls or the project registry is unavailable. Require subc-control 0.42.5.
 
 ## 0.50.32
 

@@ -191,6 +191,125 @@ async fn event(
     serde_json::from_slice(&event_frame(rx).await.body).unwrap()
 }
 
+fn status_handler(rig: &CaptureRig) -> ControlHandler {
+    ControlHandler::new(Arc::new(crate::Registry::default())).with_config_runtime(rig.owner.clone())
+}
+
+async fn config_status(handler: &ControlHandler) -> serde_json::Value {
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let ctx = RouteCtx {
+        connection_id: ConnectionId::new(70),
+        egress: FrameSink::new(tx),
+    };
+    owner_connection(handler, ctx.connection_id);
+    let reply = tokio::time::timeout(
+        Duration::from_secs(5),
+        request(handler, &ctx, 1, json!({"op":"config.status"})),
+    )
+    .await
+    .expect("status should not wait for the owner or a stalled root");
+    assert_eq!(reply[0].header.ty, FrameType::Response);
+    serde_json::from_slice(&reply[0].body).unwrap()
+}
+
+#[tokio::test]
+async fn project_settings_status_reports_fresh_file_errors_without_owner_lock() {
+    let rig = CaptureRig::with_state(true, RootIoPool::new().unwrap(), false);
+    let private = root(&rig.project_scratch, "private");
+    write_layer(&rig.workspace, 4);
+    let file = write_layer(&private, 3);
+    rig.set_projects(vec![member("A", Some("W"), &[&private])]);
+    let handler = status_handler(&rig);
+
+    let owner = rig.owner.clone();
+    let (entered, held) = tokio::sync::oneshot::channel();
+    let (release, wait) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let _guard = owner.lock().unwrap();
+        entered.send(()).unwrap();
+        let _ = wait.recv();
+    });
+    held.await.unwrap();
+    let invalid = config_status(&handler).await;
+    drop(release);
+    holder.join().unwrap();
+    assert_eq!(invalid["status"]["state"], "unstamped");
+    assert_eq!(
+        invalid["status"]["file_errors"],
+        json!([{
+            "module_id":"a", "project_id":"A", "workspace_id":"W",
+            "code":"bound_violated", "message":"a/A: /limit"
+        }])
+    );
+    assert!(invalid["status"].get("file_errors_incomplete").is_none());
+    #[cfg(target_os = "linux")]
+    project_vectors::assert_status_file_errors_sample(invalid, &rig);
+
+    std::fs::write(file, br#"{"limit":5}"#).unwrap();
+    let valid = config_status(&handler).await;
+    assert!(valid["status"].get("file_errors").is_none());
+    assert!(valid["status"].get("file_errors_incomplete").is_none());
+}
+
+#[tokio::test]
+async fn project_settings_status_reports_user_errors_when_registry_is_down() {
+    let rig = CaptureRig::with_state(true, RootIoPool::new().unwrap(), false);
+    std::fs::write(&rig.rig.declaration.user_file, b"not jsonc").unwrap();
+    let reply = config_status(&status_handler(&rig)).await;
+    let status = &reply["status"];
+    assert_eq!(
+        status["file_errors_incomplete"],
+        json!({"reason":"project_registry_unavailable"})
+    );
+    let errors = status["file_errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0]["module_id"], "a");
+    assert_eq!(errors[0]["code"], "value_invalid");
+    assert!(errors[0].get("project_id").is_none());
+    assert!(errors[0].get("workspace_id").is_none());
+}
+
+#[tokio::test]
+async fn project_settings_status_keeps_completed_rows_when_a_root_stalls() {
+    let rig = CaptureRig::with_state(true, RootIoPool::new().unwrap(), false);
+    let fast = root(&rig.project_scratch, "fast");
+    let slow = root(&rig.project_scratch, "slow");
+    write_layer(&rig.workspace, 4);
+    write_layer(&fast, 3);
+    write_layer(&slow, 3);
+    rig.set_projects(vec![
+        member("fast", Some("W"), &[&fast]),
+        member("slow", Some("W"), &[&slow]),
+    ]);
+    let (release, wait) = std::sync::mpsc::channel::<()>();
+    let wait = std::sync::Mutex::new(wait);
+    let (entered, held) = std::sync::mpsc::channel();
+    *rig.registry.pool.before_work.lock().unwrap() = Some(Arc::new(move |path| {
+        if path == slow {
+            entered.send(()).unwrap();
+            let _ = wait.lock().unwrap().recv();
+        }
+    }));
+    let reply = config_status(&status_handler(&rig)).await;
+    drop(release);
+    assert!(
+        held.try_recv().is_ok(),
+        "slow root must have reached the gate"
+    );
+    let status = &reply["status"];
+    assert_eq!(
+        status["file_errors_incomplete"],
+        json!({"reason":"config_unavailable"})
+    );
+    assert_eq!(
+        status["file_errors"],
+        json!([{
+            "module_id":"a", "project_id":"fast", "workspace_id":"W",
+            "code":"bound_violated", "message":"a/fast: /limit"
+        }])
+    );
+}
+
 #[tokio::test]
 async fn project_settings_watch_projects_isolate_validation_and_resync_on_drop() {
     let samples = project_watch_samples().await;

@@ -3,15 +3,20 @@
 
 use super::*;
 use crate::config_gate::{
-    capture::{parse_layer, CapturedModule},
+    capture::{parse_layer, CapturedModule, SettingsCapture},
     capture_plan::tuple_layers,
     project_layers::ProjectLayerSchema,
     project_registry::{layer_path, live::LiveProjectCapture, RegistryRevision, RegistryScope},
 };
 use crate::config_store::{ProjectDeliveryState, Tuple};
 use std::{path::PathBuf, sync::Arc};
-use subc_control::config::ConfigFileError;
+use subc_control::config::{
+    ConfigFileError, ConfigFileErrorsIncomplete, ConfigStatus, ConfigStatusFileError,
+};
 use subc_protocol::config::ConfigDeclarationPending;
+
+// Leave room within ck's 10-second wait to report a stalled project folder.
+const STATUS_PROJECT_SCAN_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn key(module: &str, project: &str) -> Tuple {
     Tuple {
@@ -270,6 +275,13 @@ struct ProjectObservationsSnapshot {
     rows: Arc<BTreeMap<Tuple, ProjectFiles>>,
 }
 
+#[derive(Default)]
+struct ProjectFileScan {
+    registered: BTreeSet<String>,
+    files: BTreeMap<Tuple, ProjectFiles>,
+    incomplete: bool,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ProjectFiles {
     workspace: Option<String>,
@@ -304,7 +316,7 @@ impl RuntimeOwner {
         let Ok(_refresh) = self.settings_projects.refresh.try_lock() else {
             return Ok(());
         };
-        let (incarnation, declarations, stamped, own) = self
+        let (incarnation, declarations, own) = self
             .on_blocking(move |owner| {
                 let state = owner.lock()?;
                 let (_, body) = state.store.loaded_admission_state();
@@ -318,23 +330,39 @@ impl RuntimeOwner {
                 } else {
                     BTreeMap::new()
                 };
-                Ok((
-                    state.authority_incarnation.clone(),
-                    declarations,
-                    body.stamped,
-                    own,
-                ))
+                Ok((state.authority_incarnation.clone(), declarations, own))
             })
             .await?;
         if declarations.is_empty() && !all {
             return Ok(());
         }
+        let declarations = Arc::new(declarations);
+        let settings = self
+            .on_blocking({
+                let declarations = Arc::clone(&declarations);
+                move |owner| owner.capturer.capture_settings(&declarations)
+            })
+            .await?;
+        let mut scan = ProjectFileScan::default();
+        self.scan_project_settings(&declarations, settings, (!all).then_some(&own), &mut scan)
+            .await?;
+        self.publish_project_settings(incarnation, declarations, scan.registered, scan.files)
+            .await
+    }
+
+    async fn scan_project_settings(
+        self: &Arc<Self>,
+        declarations: &BTreeMap<String, ConfigDeclareRequest>,
+        settings: SettingsCapture,
+        only: Option<&BTreeSet<Tuple>>,
+        scan: &mut ProjectFileScan,
+    ) -> Result<()> {
         let registry = &self.capturer.projects;
         let reply = registry.enumerate_live().await?;
         let pool = registry.root_io().ok_or_else(|| {
             GateError::new("config_unavailable", "registry capture worker stopped")
         })?;
-        let registered: BTreeSet<_> = reply
+        scan.registered = reply
             .projects
             .iter()
             .map(|project| project.project_id.clone())
@@ -342,37 +370,32 @@ impl RuntimeOwner {
         let requests = declarations
             .keys()
             .flat_map(|module| {
-                registered
+                scan.registered
                     .iter()
                     .map(move |project| (module.clone(), project.clone()))
             })
-            .filter(|(module, project)| all || (stamped && own.contains(&key(module, project))));
-        let mut capture = LiveProjectCapture::new(pool, &reply, requests);
-        let declarations = Arc::new(declarations);
-        let users = self
-            .on_blocking({
-                let declarations = Arc::clone(&declarations);
-                move |owner| {
-                    let capture = owner.capturer.capture_settings(&declarations)?;
-                    let users = capture
-                        .configuration
-                        .modules
-                        .into_iter()
-                        .map(|(module, user)| {
-                            let schema = ProjectLayerSchema::new(user.schema.clone());
-                            (module, (user, schema))
-                        })
-                        .collect::<BTreeMap<_, _>>();
-                    Ok((users, capture.file_errors))
-                }
+            .filter(|(module, project)| {
+                only.is_none_or(|tuples| tuples.contains(&key(module, project)))
             })
-            .await?;
-        let users = Arc::new(users);
-        let mut complete = BTreeMap::new();
+            .collect::<Vec<_>>();
+        let expected = requests.len();
+        let mut capture = LiveProjectCapture::new(pool, &reply, requests);
+        let users = Arc::new((
+            settings
+                .configuration
+                .modules
+                .into_iter()
+                .map(|(module, user)| {
+                    let schema = ProjectLayerSchema::new(user.schema.clone());
+                    (module, (user, schema))
+                })
+                .collect::<BTreeMap<_, _>>(),
+            settings.file_errors,
+        ));
         while let Some(((module, project), revision)) = capture.next().await {
             let users = Arc::clone(&users);
             let tuple = key(&module, &project);
-            let files = self
+            let observed = self
                 .on_blocking(move |_| {
                     Ok(observe_project_files(
                         &module,
@@ -383,8 +406,21 @@ impl RuntimeOwner {
                     ))
                 })
                 .await?;
-            complete.insert(tuple, files);
+            scan.incomplete |= observed.read_unavailable();
+            scan.files.insert(tuple, observed);
         }
+        // A busy root may be skipped rather than replacing a watch's last row.
+        scan.incomplete |= scan.files.len() != expected;
+        Ok(())
+    }
+
+    async fn publish_project_settings(
+        self: &Arc<Self>,
+        incarnation: Arc<()>,
+        declarations: Arc<BTreeMap<String, ConfigDeclareRequest>>,
+        registered: BTreeSet<String>,
+        files: BTreeMap<Tuple, ProjectFiles>,
+    ) -> Result<()> {
         self.on_blocking(move |owner| {
             let state = owner.lock()?;
             if !Arc::ptr_eq(&state.authority_incarnation, &incarnation) {
@@ -419,7 +455,7 @@ impl RuntimeOwner {
                 changed |= !keep;
                 keep
             });
-            for (tuple, mut files) in complete {
+            for (tuple, mut files) in files {
                 if current.get(&tuple.module) != declarations.get(&tuple.module) {
                     continue;
                 }
@@ -443,6 +479,40 @@ impl RuntimeOwner {
             Ok(())
         })
         .await
+    }
+
+    pub(in crate::config_gate) async fn report_project_settings_file_errors(
+        self: &Arc<Self>,
+        declarations: &BTreeMap<String, ConfigDeclareRequest>,
+        captured: SettingsCapture,
+        status: &mut ConfigStatus,
+    ) {
+        if !self.project_settings_enabled() || declarations.is_empty() {
+            return;
+        }
+        let mut scan = ProjectFileScan::default();
+        let result = tokio::time::timeout(
+            STATUS_PROJECT_SCAN_BUDGET,
+            self.scan_project_settings(declarations, captured, None, &mut scan),
+        )
+        .await;
+        status
+            .file_errors
+            .extend(scan.files.into_iter().filter_map(|(tuple, files)| {
+                if !(files.present || files.read_failed) || files.read_unavailable() {
+                    return None;
+                }
+                let mut row = ConfigStatusFileError::new(tuple.module, files.error?);
+                row.project_id = tuple.project;
+                row.workspace_id = files.workspace;
+                Some(row)
+            }));
+        let reason = match result {
+            Ok(Ok(())) if !scan.incomplete => return,
+            Ok(Err(error)) => error.code,
+            _ => "config_unavailable".into(),
+        };
+        status.file_errors_incomplete = Some(ConfigFileErrorsIncomplete::new(reason));
     }
 
     fn project_settings_observations(
@@ -471,6 +541,16 @@ impl RuntimeOwner {
             .project_settings_observations(state)?
             .get(tuple)
             .and_then(|files| files.error.clone()))
+    }
+}
+
+impl ProjectFiles {
+    fn read_unavailable(&self) -> bool {
+        self.read_failed
+            && self
+                .error
+                .as_ref()
+                .is_some_and(|error| error.code == "config_unavailable")
     }
 }
 

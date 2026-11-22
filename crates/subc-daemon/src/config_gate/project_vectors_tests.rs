@@ -450,6 +450,7 @@ async fn unstamped_delivery_sample() -> Sample {
 async fn root_io_health_sample() -> Sample {
     let pool = RootIoPool::with_timeout(Duration::from_millis(300)).unwrap();
     let rig = CaptureRig::with_pool(true, pool);
+    rig.set_projects(vec![]);
     let client = Client::new(&rig);
     let request = json!({"op":"config.status"});
     let idle = client.call(&request, FrameType::Response).await;
@@ -469,26 +470,38 @@ async fn root_io_health_sample() -> Sample {
         .unwrap()
         .unwrap();
     assert!(job.wait().await.is_err());
-    let mut busy = client.call(&request, FrameType::Response).await;
+    let busy = client.call(&request, FrameType::Response).await;
     assert_eq!(
         busy["status"]["root_io"],
         json!({"stuck_roots":[rig.workspace],"charged_workers":1})
     );
     release.send(()).unwrap();
+    ("project-status-root-io.json", normalize_status(busy, &rig))
+}
+
+pub(super) fn assert_status_file_errors_sample(reply: Value, rig: &CaptureRig) {
+    assert_samples([(
+        "project-status-file-errors.json",
+        normalize_status(reply, rig),
+    )]);
+}
+
+fn normalize_status(mut reply: Value, rig: &CaptureRig) -> Value {
     // The test runner can itself be launched with startup environment overrides.
-    busy["status"]["ungated_inputs"] = json!([]);
+    reply["status"]["ungated_inputs"] = json!([]);
     // A build with the `dev-desktop-approval` feature lists that switch and can
     // approve on the desktop. The sample shows a release daemon either way.
     if cfg!(feature = "dev-desktop-approval") {
-        busy["status"]["development_switches"] = json!([]);
-        busy["status"]["missing_approval_surfaces"]
+        reply["status"]["development_switches"] = json!([]);
+        reply["status"]["missing_approval_surfaces"]
             .as_array_mut()
             .unwrap()
             .insert(0, json!("desktop (required for stamp)"));
     }
-    (
-        "project-status-root-io.json",
-        normalize(json!({"request":request,"reply":busy}), &rig, false),
+    normalize(
+        json!({"request":{"op":"config.status"},"reply":reply}),
+        rig,
+        false,
     )
 }
 

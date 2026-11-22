@@ -1,0 +1,41 @@
+{
+  "reply": {
+    "op": "config.status",
+    "status": {
+      "anchor_pending": false,
+      "approval_channels": [],
+      "approved_but_inactive": [],
+      "base_revision": 0,
+      "development_switches": [],
+      "file_errors": [
+        {
+          "code": "bound_violated",
+          "message": "a/A: /limit",
+          "module_id": "a",
+          "project_id": "A",
+          "workspace_id": "W"
+        }
+      ],
+      "gated_modules": [],
+      "integrity": "digest_only",
+      "interpreter_only_covered": [],
+      "missing_approval_surfaces": [
+        "desktop (required for stamp)",
+        "phone",
+        "OS prompt (Linux requires the per-user polkit action file)"
+      ],
+      "pending_proposals": 0,
+      "revision": 0,
+      "state": "unstamped",
+      "ungated_inputs": [],
+      "ungated_modules": [],
+      "warnings": [
+        "Digest-only: while the daemon is stopped, rewriting the store into another well-formed store, replay, deletion and data-home relocation are not detected",
+        "Deleting the sealed key and rewriting the store as digest-only bypasses sealing; pre-gate binaries ignore the store"
+      ]
+    }
+  },
+  "request": {
+    "op": "config.status"
+  }
+}

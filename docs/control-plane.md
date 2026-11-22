@@ -248,7 +248,7 @@ not new variants of the legacy exhaustive client control enums:
 
 | Op | Result |
 | --- | --- |
-| `config.status` | Stamp state, integrity mode, proposals, missing approval surfaces, platform warnings, approved-but-inactive differences and optional `root_io` health. |
+| `config.status` | Stamp state, integrity mode, proposals, missing approval surfaces, platform warnings, approved-but-inactive differences, optional settings file diagnostics and optional `root_io` health. |
 | `config.stamp`, `config.plan`, `config.unstamp`, `config.rollback` | A reviewable plan and digest; none commits configuration. |
 | `config.apply` | Requests approval of that digest, then reports `generation` and `restart_required` (always serialized; absent on older replies means false). |
 | `config.history` | Retained generations and summaries of pruned history. |
@@ -307,6 +307,16 @@ file that a skipped project also reads is held for all readers until another
 capture; independent changes can proceed. `skipped` notices do not change the
 plan digest. In edit plans, path and root failures appear in the blocking
 `view.refusals` instead (with `project_id` and `workspace_id` where applicable).
+
+`config.status` reports refused settings files in `status.file_errors`, sorted
+by `(module_id, project_id)`. Each row has `module_id`, `code`, and `message`;
+project rows also have `project_id` and, when known, `workspace_id`. The list is
+omitted when empty. Like `config.show`, this one-shot read does not apply the
+watch's save-settling grace. If project observations are incomplete, the reply
+keeps any rows already read and adds `status.file_errors_incomplete` with a
+`reason` such as `project_registry_unavailable` or `config_unavailable`. An
+absent list with this marker does not mean all settings files are valid.
+`ck config status` prints these diagnostics in its JSON output.
 
 | Code | Meaning |
 | --- | --- |

@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 use subc_client_rs::{
@@ -259,7 +259,7 @@ impl Bounds {
 }
 
 struct Inspect {
-    roster: Arc<dyn Roster>,
+    roster: Arc<OnceLock<Arc<dyn Roster>>>,
     sampler: Arc<dyn Sampler>,
     bounds: Bounds,
 }
@@ -282,10 +282,16 @@ fn target(entries: &[LiveSpawn], id: &str) -> Result<(u32, u64), Refusal> {
 
 impl Inspect {
     async fn query(&self, body: &[u8]) -> Result<Value, Refusal> {
-        match parse_request(body)? {
+        let request = parse_request(body)?;
+        let roster = self.roster.get().ok_or(Refusal {
+            code: "roster_unavailable",
+            reason: "roster connection is still starting",
+            retry_after_ms: Some(500),
+        })?;
+        match request {
             Request::Resources => {
-                let entries = self.roster.list().await?;
-                let live = self.roster.snapshot().await?;
+                let entries = roster.list().await?;
+                let live = roster.snapshot().await?;
                 let modules = entries
                     .iter()
                     .map(|entry| {
@@ -307,11 +313,11 @@ impl Inspect {
                 Ok(json!({"modules": modules}))
             }
             Request::Profile { module_id, seconds } => {
-                let entries = self.roster.list().await?;
+                let entries = roster.list().await?;
                 if !entries.iter().any(|e| e.module_id == module_id) {
                     return Err(Refusal::new("unknown_module", "module is not supervised"));
                 }
-                let before = self.roster.snapshot().await?;
+                let before = roster.snapshot().await?;
                 let (pid, generation) = target(&before, &module_id)?;
                 if !self.sampler.supported() {
                     return Err(Refusal::new(
@@ -344,7 +350,7 @@ impl Inspect {
                         .await;
                 // Check identity even after a sampler failure: a process that exited
                 // during capture must never produce a result for its successor.
-                let after = self.roster.snapshot().await?;
+                let after = roster.snapshot().await?;
                 if target(&after, &module_id).ok() != Some((pid, generation)) {
                     return Err(Refusal::new(
                         "module_restarted",
@@ -419,14 +425,22 @@ pub fn manifest() -> ModuleManifest {
 /// Serve until the daemon closes its module connection. The consumer connection
 /// is private to inspection; callers can select queries, never control RPCs.
 pub async fn serve(connection_file: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let roster = SubcConsumer::connect(connection_file, ConsumerOptions::default()).await?;
+    let roster = Arc::new(OnceLock::new());
     let handler = Inspect {
-        roster: Arc::new(roster),
+        roster: Arc::clone(&roster),
         sampler: Arc::new(OsSampler),
         bounds: Bounds::new(),
     };
-    let (_, serving) =
+    let (handle, mut serving) =
         subc_client_rs::serve_with_handle(connection_file, manifest(), handler).await?;
+    // Poll serving first so it can receive the credential the roster consumer
+    // needs to authenticate as this module.
+    let consumer = tokio::select! {
+        biased;
+        result = &mut serving => return result.map_err(Into::into),
+        result = handle.consumer(connection_file, ConsumerOptions::default()) => result?,
+    };
+    roster.get_or_init(|| consumer);
     serving.await?;
     Ok(())
 }

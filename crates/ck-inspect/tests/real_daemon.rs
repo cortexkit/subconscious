@@ -8,7 +8,7 @@ use std::{
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
-use subc_client_rs::{CallOptions, ConsumerOptions, SubcConsumer};
+use subc_client_rs::{CallError, CallOptions, ConsumerOptions, SubcConsumer};
 use subc_protocol::{BindIdentity, RouteTarget};
 
 struct Daemon {
@@ -27,6 +27,37 @@ impl Drop for Daemon {
                     }
                 }
             }
+        }
+    }
+}
+
+async fn inspect_query(consumer: &SubcConsumer, identity: BindIdentity, query: Value) -> Vec<u8> {
+    let target = RouteTarget::ManagementSurface {
+        module_id: "inspect".into(),
+    };
+    let request = serde_json::to_vec(&query).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match consumer
+            .call(
+                target.clone(),
+                identity.clone(),
+                request.clone(),
+                CallOptions::default(),
+            )
+            .await
+        {
+            Ok(reply) => return reply,
+            Err(CallError::Module(error)) if error.code == "roster_unavailable" => {
+                let delay = error
+                    .detail
+                    .as_ref()
+                    .and_then(|detail| detail["retry_after_ms"].as_u64())
+                    .expect("only a starting roster can be retried");
+                assert!(Instant::now() < deadline, "roster never became ready");
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
+            Err(error) => panic!("{query} failed: {error}"),
         }
     }
 }
@@ -173,20 +204,12 @@ async fn stripped_helper_profile_uses_module_dsym_symbols() {
         inspect.pid.to_string(),
     )
     .unwrap();
-    let reply = consumer
-        .call(
-            RouteTarget::ManagementSurface {
-                module_id: "inspect".into(),
-            },
-            BindIdentity::new("inspect-test", "symbols"),
-            serde_json::to_vec(
-                &json!({"method":"module.profile", "params":{"module_id":"load", "seconds":1}}),
-            )
-            .unwrap(),
-            CallOptions::default(),
-        )
-        .await
-        .unwrap();
+    let reply = inspect_query(
+        &consumer,
+        BindIdentity::new("inspect-test", "symbols"),
+        json!({"method":"module.profile", "params":{"module_id":"load", "seconds":1}}),
+    )
+    .await;
     assert!(reply.len() <= 16 * 1024);
     let profile: Value = serde_json::from_slice(&reply).unwrap();
     let frames: Vec<_> = profile["result"]["threads"]
@@ -228,7 +251,8 @@ async fn routed_resources_and_profile_observe_supervised_process_and_exit_on_eof
     )
     .unwrap();
     let config = json!({"version":1, "modules":{
-        "inspect": {"program":env!("CARGO_BIN_EXE_ck-inspect"), "args":[], "env":{}},
+        "inspect": {"program":env!("CARGO_BIN_EXE_ck-inspect"), "args":[], "env":{},
+            "registration_channel":true},
         "load": {"protocol":"none", "program":env!("CARGO_BIN_EXE_inspect-load-fixture"), "args":[],
             "env":{"INSPECT_FIXTURE_PID_PATH":root.path().join("load.pid")}}
     }});
@@ -247,6 +271,7 @@ async fn routed_resources_and_profile_observe_supervised_process_and_exit_on_eof
         "build subc-core --bins before running the real daemon test: {}",
         daemon_bin.display()
     );
+    let ck_bin = daemon_bin.with_file_name("ck");
     let log = fs::File::create(root.path().join("daemon.log")).unwrap();
     let child = Command::new(daemon_bin)
         .env("XDG_CONFIG_HOME", root.path().join("config"))
@@ -292,9 +317,6 @@ async fn routed_resources_and_profile_observe_supervised_process_and_exit_on_eof
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let target = RouteTarget::ManagementSurface {
-        module_id: "inspect".into(),
-    };
     let snapshot = consumer.spawn_snapshot().await.unwrap();
     let inspect = snapshot
         .live
@@ -306,16 +328,30 @@ async fn routed_resources_and_profile_observe_supervised_process_and_exit_on_eof
         inspect.pid.to_string(),
     )
     .unwrap();
+    let provenance = Command::new(&ck_bin)
+        .args(["--json", "provenance", "inspect", "--subc"])
+        .arg(&connection)
+        .output()
+        .unwrap_or_else(|error| panic!("run {}: {error}", ck_bin.display()));
+    assert!(
+        provenance.status.success(),
+        "ck provenance failed: {}",
+        String::from_utf8_lossy(&provenance.stderr)
+    );
+    let provenance: Value = serde_json::from_slice(&provenance.stdout).unwrap();
+    assert_eq!(provenance["modules"][0]["module_id"], "inspect");
+    assert_eq!(
+        provenance["modules"][0]["registration"], "channel",
+        "{provenance}"
+    );
+
     let identity = BindIdentity::new("inspect-test", "profile");
-    let resources = consumer
-        .call(
-            target.clone(),
-            identity.clone(),
-            serde_json::to_vec(&json!({"method":"module.resources","params":{}})).unwrap(),
-            CallOptions::default(),
-        )
-        .await
-        .unwrap();
+    let resources = inspect_query(
+        &consumer,
+        identity.clone(),
+        json!({"method":"module.resources","params":{}}),
+    )
+    .await;
     let mut resources: Value = serde_json::from_slice(&resources).unwrap();
     let resources = resources["result"].take();
     assert!(resources.is_object());
@@ -327,18 +363,12 @@ async fn routed_resources_and_profile_observe_supervised_process_and_exit_on_eof
         .unwrap();
     assert!(load["pid"].as_u64().unwrap() > 0);
     assert!(load["resources"].is_object());
-    let result = consumer
-        .call(
-            target,
-            identity,
-            serde_json::to_vec(
-                &json!({"method":"module.profile","params":{"module_id":"load","seconds":1}}),
-            )
-            .unwrap(),
-            CallOptions::default(),
-        )
-        .await
-        .unwrap();
+    let result = inspect_query(
+        &consumer,
+        identity,
+        json!({"method":"module.profile","params":{"module_id":"load","seconds":1}}),
+    )
+    .await;
     assert!(result.len() <= 16 * 1024);
     let mut profile: Value = serde_json::from_slice(&result).unwrap();
     let profile = profile["result"].take();

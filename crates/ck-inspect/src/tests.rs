@@ -82,12 +82,13 @@ fn service(
         calls: AtomicUsize::new(0),
         load: Mutex::new(None),
     });
+    let roster: Arc<dyn Roster> = Arc::new(FixtureRoster {
+        entries,
+        snapshots: Mutex::new(snapshots.into()),
+    });
     (
         Inspect {
-            roster: Arc::new(FixtureRoster {
-                entries,
-                snapshots: Mutex::new(snapshots.into()),
-            }),
+            roster: Arc::new(OnceLock::from(roster)),
             sampler: sampler.clone(),
             bounds: Bounds::new(),
         },
@@ -292,7 +293,8 @@ async fn unavailable_daemon_refusal() {
         }
     }
     let (mut service, sampler) = service(vec![], vec![], true, false);
-    service.roster = Arc::new(MissingRoster);
+    let roster: Arc<dyn Roster> = Arc::new(MissingRoster);
+    service.roster = Arc::new(OnceLock::from(roster));
     assert_eq!(
         service
             .query(br#"{"method":"module.resources","params":{}}"#)
@@ -305,6 +307,34 @@ async fn unavailable_daemon_refusal() {
         service.query(&request(1)).await.unwrap_err().code,
         "roster_unavailable"
     );
+    assert_eq!(sampler.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn queries_before_roster_is_ready_get_a_retry_hint() {
+    let (mut service, sampler) = service(vec![], vec![], true, false);
+    service.roster = Arc::new(OnceLock::new());
+    let resources = br#"{"method":"module.resources","params":{}}"#;
+    for body in [resources.as_slice(), &request(1)] {
+        let refusal = tokio::time::timeout(Duration::from_secs(1), service.query(body))
+            .await
+            .expect("query must not wait for roster initialization")
+            .unwrap_err();
+        let HandlerOutcome::ErrorWithDetail {
+            code,
+            message,
+            detail,
+        } = refusal.outcome()
+        else {
+            panic!("missing refusal detail");
+        };
+        assert_eq!(code, "roster_unavailable");
+        assert_eq!(message, "roster connection is still starting");
+        assert_eq!(
+            detail,
+            json!({"class": "terminal", "reason": message, "retry_after_ms": 500})
+        );
+    }
     assert_eq!(sampler.calls.load(Ordering::SeqCst), 0);
 }
 #[tokio::test]

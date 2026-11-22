@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.7
+
+- Support supervised registration over the daemon's registration channel. Queries
+  received while the roster connection starts return `roster_unavailable` with a
+  retry hint.
+
 ## 0.5.6
 
 - Require subc-client-rs 0.41.2 and subc-control 0.42.0 for the settings release.

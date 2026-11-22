@@ -130,13 +130,14 @@ pub(super) async fn run(
     // Keep the complete daemon view visible, including new diagnostic fields.
     // A summary must not hide files included in the daemon's program-identity
     // check, or any protection gap, from the person reviewing the plan.
-    if json_output.enabled {
-        print_json(&reply)
-    } else {
-        let mut view = reply;
-        human_channels(&mut view);
-        print_json(&view)
+    print_json(&reply_view(reply, json_output))
+}
+
+fn reply_view(mut reply: Value, json_output: JsonOutput) -> Value {
+    if !json_output.enabled {
+        human_channels(&mut reply);
     }
+    reply
 }
 
 fn human_channels(value: &mut Value) {
@@ -235,5 +236,20 @@ mod tests {
             value["status"]["approval_channels"][0]["channel"],
             "development placement (no approval)"
         );
+    }
+
+    #[test]
+    fn config_cli_status_shows_project_file_layer_and_path_in_both_modes() {
+        let path = "/home/example/workspace/.cortexkit/demo.jsonc";
+        let reply = json!({"op":"config.status","status":{"file_errors":[
+            {"module_id":"demo","project_id":"p","code":"value_invalid",
+             "message":"invalid settings","layer":"workspace","path":path}
+        ]}});
+        for json_output in [false, true] {
+            let view = reply_view(reply.clone(), json_output.into());
+            let error = &view["status"]["file_errors"][0];
+            assert_eq!(error["layer"], "workspace");
+            assert_eq!(error["path"], path);
+        }
     }
 }

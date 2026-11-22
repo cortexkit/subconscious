@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.41.10
+
+- Expose the optional project settings file `layer` and `path` in watch rows.
+  Require subc-control 0.42.6.
+
 ## 0.41.9
 
 - Add `SubcConsumer::config_watch_projects` to opt in to project settings rows.

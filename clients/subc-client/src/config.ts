@@ -16,6 +16,30 @@ export interface ConfigDeclarationPending {
   plan_digest?: string;
 }
 
+/** A failure to read or validate a settings file. */
+export interface ConfigFileError {
+  code: string;
+  message: string;
+  layer?: "project" | "workspace";
+  /** Absolute file path resolved by the daemon, when known. */
+  path?: string;
+}
+
+/** File diagnostic fields on a config.watch change or resync module row. */
+export interface ConfigWatchFileErrorRow {
+  module_id: string;
+  project_id?: string;
+  workspace_id?: string;
+  file_error?: ConfigFileError;
+}
+
+/** One entry of config.status's status.file_errors array. */
+export interface ConfigStatusFileError extends ConfigFileError {
+  module_id: string;
+  project_id?: string;
+  workspace_id?: string;
+}
+
 export interface ConfigView {
   /** Set only by clients from config.get; delivery state, not approved content. */
   declaration_pending?: ConfigDeclarationPending;

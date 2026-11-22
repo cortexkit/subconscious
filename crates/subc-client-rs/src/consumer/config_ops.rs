@@ -11,8 +11,9 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use subc_control::config::{ConfigControlRequest, ConfigControlResponse, ConfigWatchResponse};
 pub use subc_control::config::{
-    ConfigEdit, ConfigEditAction, ConfigFileError, ConfigModule, ConfigPlanRefusal, ConfigPlanView,
-    ConfigSettingsLayer, ConfigThrough, ConfigWatchEvent, Digest,
+    ConfigEdit, ConfigEditAction, ConfigFileError, ConfigFileErrorLayer, ConfigModule,
+    ConfigPlanRefusal, ConfigPlanView, ConfigSettingsLayer, ConfigThrough, ConfigWatchEvent,
+    Digest,
 };
 use tokio::{sync::Semaphore, time::Instant};
 
@@ -849,6 +850,36 @@ mod tests {
         assert_eq!(rows[1].project_id.as_deref(), Some("A"));
         assert_eq!(rows[1].workspace_id.as_deref(), Some("W"));
         assert_eq!(rows[1].file_error.as_ref().unwrap().code, "value_invalid");
+    }
+
+    #[tokio::test]
+    async fn config_watch_projects_exposes_file_error_layer_and_path() {
+        let (consumer, mut rx) = consumer();
+        let mut watch = consumer.config_watch_projects(None).await.unwrap();
+        let req = request(&mut rx, json!({"op":"config.watch","projects":true})).await;
+        let path = "/home/example/workspace/project/.cortexkit/demo.jsonc";
+        dispatch_frame(
+            &consumer.shared,
+            1,
+            frame(
+                FrameType::StreamData,
+                req.header.corr,
+                json!({
+                    "op":"config.watch", "event":"resync", "stamped":false, "modules":[
+                        {"module_id":"demo","gated":true,"status":"unstamped","project_id":"p",
+                         "file_error":{"code":"value_invalid","message":"invalid settings",
+                                       "layer":"project","path":path,"future":true}}
+                    ]
+                }),
+            ),
+        )
+        .await;
+        let Some(ConfigWatchEvent::Resync { modules, .. }) = watch.next().await.unwrap() else {
+            panic!("expected project watch resync");
+        };
+        let error = modules[0].file_error.as_ref().unwrap();
+        assert_eq!(error.layer, Some(ConfigFileErrorLayer::Project));
+        assert_eq!(error.path.as_deref(), Some(path));
     }
 
     #[tokio::test]

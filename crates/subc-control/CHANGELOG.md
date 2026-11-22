@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.42.6
+
+- Decode optional `layer` and `path` on project settings file diagnostics.
+
 ## 0.42.5
 
 - Preserve optional settings file errors and incomplete observations in

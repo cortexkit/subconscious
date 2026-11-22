@@ -100,6 +100,7 @@ export {
   type ConfigLayerSnapshot, type ConfigView, type ConfigDeclaration,
   type ConfigReviewRequest, type ConfigReviewReply, type ConfigFieldChange, type ConfigRecordedValue,
   type ConfigGetReply, type ConfigDeclarationPending, type ConfigAppliedRequest, type ConfigRefusal,
+  type ConfigFileError, type ConfigWatchFileErrorRow, type ConfigStatusFileError,
   type ConfigAvailability, type ModuleConfigState, type ModuleConfigOptions,
 } from "./config.js";
 export type {

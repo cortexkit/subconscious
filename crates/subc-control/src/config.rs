@@ -171,12 +171,26 @@ pub enum ConfigThrough {
     Workspace,
 }
 
+/// Which settings layer a refused file belongs to: the project's own file or its workspace's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ConfigFileErrorLayer {
+    Project,
+    Workspace,
+}
+
 /// A settings-file observation failure, separate from the approved settings status.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ConfigFileError {
     pub code: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer: Option<ConfigFileErrorLayer>,
+    /// The absolute file path resolved by the daemon, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 impl ConfigFileError {
@@ -184,6 +198,8 @@ impl ConfigFileError {
         Self {
             code: code.into(),
             message: message.into(),
+            layer: None,
+            path: None,
         }
     }
 }
@@ -761,6 +777,34 @@ mod tests {
         assert!(
             matches!(serde_json::from_value::<ConfigControlResponse>(shown).unwrap(), ConfigControlResponse::Show {file_error:Some(found), ..} if found == error)
         );
+    }
+
+    #[test]
+    fn config_wire_project_file_errors_keep_layer_and_path() {
+        let mut status = serde_json::to_value(ConfigStatus::default()).unwrap();
+        let path = "/home/example/workspace/.cortexkit/demo.jsonc";
+        status["file_errors"] = json!([
+            {"module_id":"demo","code":"value_invalid","message":"legacy"},
+            {"module_id":"demo","project_id":"p","workspace_id":"w","code":"value_invalid",
+                "message":"new","layer":"workspace","path":path,"future":true}
+        ]);
+        let response: ConfigControlResponse =
+            serde_json::from_value(json!({"op":"config.status","status":status})).unwrap();
+        let ConfigControlResponse::Status { status } = &response else {
+            panic!("expected config.status");
+        };
+        assert_eq!(status.file_errors[0].error.layer, None);
+        assert_eq!(status.file_errors[0].error.path, None);
+        assert_eq!(
+            status.file_errors[1].error.layer,
+            Some(ConfigFileErrorLayer::Workspace)
+        );
+        assert_eq!(status.file_errors[1].error.path.as_deref(), Some(path));
+        let wire = serde_json::to_value(response).unwrap();
+        assert!(wire["status"]["file_errors"][0].get("layer").is_none());
+        assert!(wire["status"]["file_errors"][0].get("path").is_none());
+        assert_eq!(wire["status"]["file_errors"][1]["layer"], "workspace");
+        assert_eq!(wire["status"]["file_errors"][1]["path"], path);
     }
 
     #[test]

@@ -102,8 +102,8 @@ mod supervisor_ops;
 use catalog::decode_route_open_response;
 pub use catalog::CatalogSubscription;
 pub use config_ops::{
-    ConfigApplyResponse, ConfigEdit, ConfigEditAction, ConfigFileError, ConfigModule,
-    ConfigModulesResponse, ConfigPlanRefusal, ConfigPlanView, ConfigSchemaResponse,
+    ConfigApplyResponse, ConfigEdit, ConfigEditAction, ConfigFileError, ConfigFileErrorLayer,
+    ConfigModule, ConfigModulesResponse, ConfigPlanRefusal, ConfigPlanView, ConfigSchemaResponse,
     ConfigSettingsLayer, ConfigShowResponse, ConfigSubscription, ConfigThrough, ConfigWatchEvent,
     Digest,
 };

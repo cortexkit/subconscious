@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.21.38
+
+- Preserve the refused project settings file's layer and path in human and JSON
+  `ck config status` output. Require subc-control 0.42.6 and subc-client-rs 0.41.10.
+
 ## 0.21.37
 
 - `ck module status` tests no longer hash the test executable as the daemon's

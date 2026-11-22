@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.26.9
+
+- Export wire types for settings file errors in `config.watch` and
+  `config.status`, including optional project/workspace `layer` and `path`.
+
 ## 0.26.8
 
 - `BindIdentity.project_root` is optional. Omit it to open a route without a project root.

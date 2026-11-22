@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.50.33
+
+- Advertise the enabled settings capabilities to modules in `HELLO_ACK` as well
+  as to clients in `server.describe`.
+
 ## 0.50.32
 
 - Split `control.rs` and `supervise.rs` into modules by area. No behaviour change.

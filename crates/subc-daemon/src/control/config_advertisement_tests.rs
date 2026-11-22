@@ -27,13 +27,15 @@ fn config_admission_gate_capability_requires_explicit_store_activation() {
         .build_hello_ack(&frame, subc_protocol::PROTOCOL_VERSION, "probe")
         .unwrap();
     let embedded = plain.clone().with_config_runtime(owner.clone());
-    assert_eq!(
-        embedded
-            .build_hello_ack(&frame, subc_protocol::PROTOCOL_VERSION, "probe")
+    let embedded_ack = embedded
+        .build_hello_ack(&frame, subc_protocol::PROTOCOL_VERSION, "probe")
+        .unwrap();
+    assert!(
+        !serde_json::from_slice::<ModuleHelloAckBody>(&embedded_ack.body)
             .unwrap()
-            .body,
-        original.body,
-        "installing an embedded runtime alone must not advertise daemon gate activation"
+            .subc_capabilities
+            .iter()
+            .any(|capability| capability == "config.gate")
     );
     let gated = plain
         .clone()
@@ -54,8 +56,8 @@ fn config_admission_gate_capability_requires_explicit_store_activation() {
         .retain(|capability| capability != "config.gate");
     assert_eq!(
         serde_json::to_vec(&body).unwrap(),
-        original.body,
-        "activation must add only config.gate, preserving every legacy ACK byte otherwise"
+        embedded_ack.body,
+        "explicit store activation must add only config.gate"
     );
     assert_eq!(
         plain
@@ -73,6 +75,66 @@ fn config_admission_gate_capability_requires_explicit_store_activation() {
             .any(|capability| capability == "config.gate")
     );
     std::fs::remove_dir_all(path).unwrap();
+}
+
+#[tokio::test]
+async fn config_settings_capabilities_are_advertised_in_module_hello() {
+    let root = cortexkit_test_support::ScratchDir::new("hello-settings-capabilities");
+    let settings_owner = || {
+        crate::config_gate::runtime::RuntimeOwner::new(
+            "advertisement".into(),
+            crate::config_store::ConfigStore::open_digest_only_for_tests(
+                crate::config_store::StoreRoot::from_service_definition(root.to_path_buf())
+                    .unwrap(),
+            ),
+            crate::config_gate::capture::ConfigCapturer {
+                daemon_path: root.join("subc.jsonc"),
+                config_home: root.to_path_buf(),
+                projects: Arc::new(crate::config_gate::capture::OfflineProjectRegistry),
+            },
+        )
+    };
+    for (runtime, expected) in [
+        (None, &[][..]),
+        (
+            Some(settings_owner().enable_project_settings()),
+            &["config.settings/v1", "config.settings.projects/v1"][..],
+        ),
+        (Some(settings_owner()), &["config.settings/v1"][..]),
+    ] {
+        let mut handler = ControlHandler::new(Arc::new(Registry::default()));
+        if let Some(owner) = runtime {
+            handler = handler.with_config_runtime(Arc::new(owner));
+        }
+        let hello = subc_protocol::ModuleHelloBody {
+            manifest: ModuleManifest::builder("probe", "0.1.0").build(),
+            protocol_ver: subc_protocol::PROTOCOL_VERSION,
+            control_ops: None,
+            launch_nonce: None,
+        };
+        let frame = Frame::build(
+            FrameType::Hello,
+            control_flags(),
+            0,
+            0,
+            7,
+            serde_json::to_vec(&hello).unwrap(),
+        )
+        .unwrap();
+        let reply = handler
+            .handle_hello(ConnectionId::new(1), None, frame)
+            .unwrap();
+        assert_eq!(reply[0].header.ty, FrameType::HelloAck);
+        let ack: ModuleHelloAckBody = serde_json::from_slice(&reply[0].body).unwrap();
+        let settings = |capabilities: Vec<String>| {
+            capabilities
+                .into_iter()
+                .filter(|capability| capability.starts_with("config.settings"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(settings(ack.subc_capabilities), expected);
+        assert_eq!(settings(handler.describe_capabilities()), expected);
+    }
 }
 
 #[cfg(unix)]

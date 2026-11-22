@@ -1313,7 +1313,7 @@ impl ControlHandler {
         let ack = ModuleHelloAckBody {
             negotiated_ver,
             subc_ops: module_subc_ops(),
-            subc_capabilities: self.subc_capabilities.as_ref().to_vec(),
+            subc_capabilities: self.capabilities_with_settings(),
             storage: self
                 .storage_config
                 .as_ref()

@@ -706,9 +706,10 @@ the operating-system prompts are in `crates/subc-presence`.
 
 ## 6. Advertised capabilities
 
-The daemon lists the same capabilities in `HELLO_ACK.subc_capabilities` and
-in `server.describe.capabilities` (`subc_capabilities` in
-`crates/subc-daemon/src/control.rs`):
+The daemon advertises capabilities to modules in `HELLO_ACK.subc_capabilities`
+and to clients in `server.describe.capabilities`. Both advertise the settings
+capabilities under the same conditions. Daemons before 0.50.33 advertised them
+only in `server.describe`.
 
 | Capability | Meaning |
 | --- | --- |
@@ -721,8 +722,9 @@ in `server.describe.capabilities` (`subc_capabilities` in
 | `scope-bind-proof/v2` | Bind proofs are required only from non-attested openers; reserved modules are exempt. Advertised alongside v1. |
 | `scope-replace-if-idle/v1` | Scope records may request atomic idle-only epoch/proof replacement; scoped opens may hold connection presence across route closures. |
 | `activity-ledger/v1` | The `activity.*` ops exist. |
-| `config.settings/v1` | Channel-0 settings reads and watches are available to authorized readers. |
-| `config.settings.projects/v1` | Workspace and project edits, project show and delivery, opted-in project watch rows, and the project-specific refusal codes are supported. |
+| `config.settings/v1` | A config runtime is active and channel-0 settings reads and watches are available to authorized readers. |
+| `config.settings.projects/v1` | Project settings are enabled in that runtime. Workspace and project edits, project show and delivery, opted-in project watch rows, and the project-specific refusal codes are supported. |
 
 A client checks for a capability before sending a field or op that depends on
-it. Absence of a capability means the daemon does not support it.
+it. Modules supporting older daemons must check `server.describe` when
+`HELLO_ACK` omits a settings capability.

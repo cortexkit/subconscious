@@ -446,6 +446,20 @@ impl ControlHandler {
             }
         }
     }
+    pub(super) fn capabilities_with_settings(&self) -> Vec<String> {
+        let mut capabilities = self.subc_capabilities.to_vec();
+        if CONFIG_SETTINGS_SURFACE_ENABLED {
+            if let Some(owner) = &self.config_runtime {
+                capabilities.push(subc_control::config::CONFIG_SETTINGS_CAPABILITY.to_owned());
+                if owner.project_settings_enabled() {
+                    capabilities
+                        .push(subc_control::config::CONFIG_SETTINGS_PROJECTS_CAPABILITY.to_owned());
+                }
+            }
+        }
+        capabilities
+    }
+
     pub fn with_config_runtime(
         mut self,
         runtime: Arc<crate::config_gate::runtime::RuntimeOwner>,

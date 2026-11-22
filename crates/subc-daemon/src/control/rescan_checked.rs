@@ -370,16 +370,7 @@ impl ControlHandler {
     /// is announced only by a daemon that has a config file to rescan; any
     /// other daemon refuses the op as `rescan_unavailable`.
     pub(super) fn describe_capabilities(&self) -> Vec<String> {
-        let mut capabilities = self.subc_capabilities.as_ref().to_vec();
-        if super::config_gate::CONFIG_SETTINGS_SURFACE_ENABLED {
-            if let Some(owner) = &self.config_runtime {
-                capabilities.push(subc_control::config::CONFIG_SETTINGS_CAPABILITY.to_owned());
-                if owner.project_settings_enabled() {
-                    capabilities
-                        .push(subc_control::config::CONFIG_SETTINGS_PROJECTS_CAPABILITY.to_owned());
-                }
-            }
-        }
+        let mut capabilities = self.capabilities_with_settings();
         if self.rescan.is_some() {
             capabilities.push(RESCAN_CANDIDATE_PREVIEW_CAPABILITY.to_string());
         }

@@ -631,6 +631,51 @@ describe("reverse-request lane", () => {
 });
 
 describe("SubcClient managed call", () => {
+  test("route.open sends rootless identities without a project_root member", async () => {
+    const { connFile } = tempConnectionFile();
+    const stats = newStats();
+    const daemon = await startFakeDaemon({ stats });
+    writeConnectionFile(connFile, daemon.port);
+    const client = await SubcClient.connect({ connectionFile: connFile });
+    const target = { kind: "tool_provider", module_id: "managed-provider" } as const;
+    const rootless: BindIdentity = { harness: "bun", session: "managed" };
+    try {
+      const first = await client.routeOpen(target, rootless);
+      const second = await client.routeOpen(target, { ...rootless, project_root: undefined });
+      const third = await client.routeOpen(target, IDENTITY);
+      expect([first.channel, second.channel, third.channel]).toEqual([41, 42, 43]);
+      const bodies = stats.routeOpenBodies.map((body) => JSON.parse(body.toString("utf8")));
+      expect(bodies.map((body) => body.op)).toEqual(["route.open", "route.open", "route.open"]);
+      expect(bodies[0].identity).toEqual(rootless);
+      expect(Object.hasOwn(bodies[0].identity, "project_root")).toBe(false);
+      expect(bodies[1].identity).toEqual(rootless);
+      expect(Object.hasOwn(bodies[1].identity, "project_root")).toBe(false);
+      expect(bodies[2].identity).toEqual(IDENTITY);
+    } finally {
+      client.close();
+    }
+  });
+
+  test("managed route cache separates rootless and rooted identities", async () => {
+    const { connFile } = tempConnectionFile();
+    const stats = newStats();
+    const daemon = await startFakeDaemon({ stats });
+    writeConnectionFile(connFile, daemon.port);
+    const client = await SubcClient.connect({ connectionFile: connFile });
+    const rootless: BindIdentity = { harness: IDENTITY.harness, session: IDENTITY.session };
+    try {
+      expect(await client.call<unknown>("managed-provider", "echo", { n: 1 }, { identity: rootless })).toEqual({ method: "echo", params: { n: 1 } });
+      expect(await client.call<unknown>("managed-provider", "echo", { n: 2 }, { identity: IDENTITY })).toEqual({ method: "echo", params: { n: 2 } });
+      expect(await client.call<unknown>("managed-provider", "echo", { n: 3 }, { identity: { ...rootless, project_root: undefined } })).toEqual({ method: "echo", params: { n: 3 } });
+      expect(stats.routeOpens).toBe(2);
+      expect(stats.dataRequests).toBe(3);
+      expect(stats.requestFrames.filter((frame) => frame.channel !== 0).map((frame) => frame.channel)).toEqual([41, 42, 41]);
+      expect(stats.routeOpenBodies.map((body) => JSON.parse(body.toString("utf8")).identity)).toEqual([rootless, IDENTITY]);
+    } finally {
+      client.close();
+    }
+  });
+
   test("reuses one route.open for repeated calls to the same module", async () => {
     const { connFile } = tempConnectionFile();
     const stats = newStats();

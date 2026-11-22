@@ -116,7 +116,12 @@ export const SUBC_MODULE_ID_ENV = "SUBC_MODULE_ID";
 export { SUBC_LAUNCH_NONCE_ENV } from "./launch-nonce.js";
 
 export interface BindIdentity {
-  project_root: string;
+  /**
+   * The opener's project root, read by the daemon for targets that do not
+   * declare `bind-no-project/v1`. Omit for a rootless open. If present, it
+   * must be an absolute path; null and the empty string are refused.
+   */
+  project_root?: string;
   harness: string;
   session: string;
 }
@@ -2897,7 +2902,7 @@ function routeCacheKey(
     ? JSON.stringify([scope.owner.kind, scope.owner.kind === "reserved" ? scope.owner.module_id : null, scope.ref, scope.scopeEpoch,
       scope.bindProof === undefined ? null : createHash("sha256").update(scope.bindProof).digest("hex")])
     : "";
-  return `${target.kind}\0${target.module_id}\0${identity.project_root}\0${identity.harness}\0${identity.session}\0${consumerPart}\0${capabilitiesPart}\0${scopePart}`;
+  return `${target.kind}\0${target.module_id}\0${identity.project_root ?? ""}\0${identity.harness}\0${identity.session}\0${consumerPart}\0${capabilitiesPart}\0${scopePart}`;
 }
 
 /** Validate before any route-open I/O, and snapshot caller-owned mutable values for reopens. */

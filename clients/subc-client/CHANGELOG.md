@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.26.8
+
+- `BindIdentity.project_root` is optional. Omit it to open a route without a project root.
+
 ## 0.26.7
 
 - Add project refreshes to `ModuleConfig`, with per-project state and delivery report retries.

@@ -1,5 +1,8 @@
 use super::*;
-use std::{io::Write, os::unix::fs::MetadataExt};
+use std::{
+    io::{Read, Seek, SeekFrom, Write},
+    os::unix::fs::MetadataExt,
+};
 use subc_client_rs::{config::*, ModuleStopHandle, ServeOptions};
 use subc_transport::{authenticate_client_with_role, connection_file};
 use tokio::{
@@ -107,6 +110,7 @@ async fn config_sdk_real_daemon_project_delivery_restart_and_fallback() {
     let temp = create_short_socket_root();
     let root = temp.0.canonicalize().unwrap();
     let daemon = start_project_daemon(&root);
+    let _log_tails = ProjectLogsOnPanic(&root);
     wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
     wait_for_catalog_module(&daemon.connection_file, "entorhinal", START_TIMEOUT).await;
 
@@ -125,7 +129,7 @@ async fn config_sdk_real_daemon_project_delivery_restart_and_fallback() {
 
     let mut operator = connect_operator(&daemon.connection_file).await;
     let events = root.join("counter-events.jsonl");
-    wait_for_event(&events, READ_TIMEOUT, |e| {
+    let legacy = wait_for_event(&events, READ_TIMEOUT, |e| {
         e["project_id"].is_null() && e["status"] == "unstamped"
     })
     .await;
@@ -138,8 +142,12 @@ async fn config_sdk_real_daemon_project_delivery_restart_and_fallback() {
         "{status}"
     );
     let user_generation = approve(&mut operator, 1, "config.stamp", &root).await;
+    wait_for_stamp_cutover(&mut operator).await;
     let user = wait_for_event(&events, READ_TIMEOUT, |e| {
-        e["project_id"].is_null() && e["status"] == "active" && e["generation"] == user_generation
+        e["pid"] != legacy["pid"]
+            && e["project_id"].is_null()
+            && e["status"] == "active"
+            && e["generation"] == user_generation
     })
     .await;
     let initial_pid = &user["pid"];
@@ -263,6 +271,33 @@ async fn connect_operator(path: &Path) -> UnixStream {
     stream
 }
 
+async fn wait_for_stamp_cutover(stream: &mut UnixStream) {
+    // Approving the initial config.stamp makes the supervisor restart both
+    // fixtures so they register over their approved channels. The old counter
+    // can report Active before the replacements register.
+    timeout(START_TIMEOUT, async {
+        let mut corr = 1_000;
+        loop {
+            let provenance =
+                control_rpc_on_stream(stream, corr, json!({"op":"supervisor.provenance"})).await;
+            let live = |id| {
+                provenance["modules"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["module_id"] == id && row["registration"] == "channel")
+            };
+            if live("entorhinal") && live(COUNTER) {
+                return;
+            }
+            corr += 1;
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("registry and counter did not register through their post-stamp channels")
+}
+
 async fn approve(stream: &mut UnixStream, corr: u64, op: &str, root: &Path) -> u64 {
     let plan = control_rpc_on_stream(stream, corr, json!({"op":op})).await;
     assert!(plan["view"]["refusals"].is_null(), "{plan}");
@@ -290,6 +325,49 @@ async fn approve(stream: &mut UnixStream, corr: u64, op: &str, root: &Path) -> u
     result["generation"]
         .as_u64()
         .unwrap_or_else(|| panic!("{result}"))
+}
+
+struct ProjectLogsOnPanic<'a>(&'a Path);
+
+impl Drop for ProjectLogsOnPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("{}", project_log_tails(self.0));
+        }
+    }
+}
+
+fn project_log_tails(root: &Path) -> String {
+    let logs = root.join("data/cortexkit/run/logs");
+    let daemon_log = fs::read_dir(&logs)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("subc."))
+        .map(|entry| entry.path())
+        .max();
+    let daemon_tail = daemon_log
+        .as_deref()
+        .map_or_else(|| format!("no subc log in {}", logs.display()), log_tail);
+    let registry_tail = log_tail(&logs.join("entorhinal.stderr.log"));
+    let counter_tail = log_tail(&logs.join(format!("{COUNTER}.stderr.log")));
+    format!("daemon log tail:\n{daemon_tail}\nregistry fixture output tail:\n{registry_tail}\ncounter fixture output tail:\n{counter_tail}")
+}
+
+fn log_tail(path: &Path) -> String {
+    const TAIL_BYTES: u64 = 16 * 1024;
+    let read_tail = || -> io::Result<Vec<u8>> {
+        let mut file = fs::File::open(path)?;
+        let start = file.metadata()?.len().saturating_sub(TAIL_BYTES);
+        file.seek(SeekFrom::Start(start))?;
+        let mut bytes = Vec::new();
+        file.take(TAIL_BYTES).read_to_end(&mut bytes)?;
+        Ok(bytes)
+    };
+    match read_tail() {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(error) => format!("{}: {error}", path.display()),
+    }
 }
 
 struct CounterProcess(Child);

@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod held_call;
+mod managed_settings;
 mod outage_output;
 mod prompts;
 mod result_size;
@@ -10,10 +11,7 @@ mod tasks;
 
 use held_call::{next_held_event, HeldCall, HeldCallEvent, HeldCalls, InputWaiterGuard};
 use session_scope::{LocalSessionScope, ScopeOwner};
-use settings::{
-    config_files_changed, read_gateway_config, ConfigSnapshot, GatewayConfig, RefreshMode,
-    SurfaceMode, ToolMode,
-};
+use settings::{ConfigSnapshot, GatewayConfig, RefreshMode, SurfaceMode, ToolMode};
 use tasks::Tasks;
 
 use std::{
@@ -63,14 +61,10 @@ use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse, Co
 use subc_protocol::{
     manifest::{ConsumerRole, ExecutionMode, ModuleManifest, ProviderRole, Tool as ManifestTool},
     scope::ScopeSelector,
-    session::{
-        HealthReport, HealthStatus, ModuleControlRequest, ModuleControlResponse,
-        MODULE_CONTROL_OP_HEALTH_CHECK,
-    },
+    session::{HealthReport, HealthStatus},
     tool_call::ToolCallRequest,
-    BindIdentity, ErrorBody, Flags, Frame as SubcFrame, FrameType, ModuleHelloAckBody,
-    ModuleHelloBody, Priority, RouteTarget, MAX_FRAME_BODY_LEN, PROTOCOL_VERSION,
-    SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV,
+    BindIdentity, ErrorBody, Flags, Frame as SubcFrame, FrameType, Priority, RouteTarget,
+    MAX_FRAME_BODY_LEN, SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV,
 };
 use subc_transport::{
     authenticate_client, authenticate_server, connection_file, generate_daemon_id, generate_key,
@@ -121,7 +115,6 @@ const SUBC_RECONNECT_BACKOFF_INITIAL: Duration = Duration::from_millis(50);
 const SUBC_RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(2);
 const SUBC_EVENT_BUFFER: usize = 64;
 const CATALOG_POLL_INTERVAL: Duration = Duration::from_millis(500);
-const SUPERVISION_HELLO_CORR: u64 = 1;
 const REVERSE_RELAY_PENDING_PER_SESSION: usize = 8;
 const DEFAULT_REVERSE_RELAY_TTL: Duration = Duration::from_secs(10 * 60);
 const REVERSE_RELAY_TTL_MS_ENV: &str = "SUBC_MCP_REVERSE_RELAY_TTL_MS";
@@ -1477,6 +1470,8 @@ struct ModuleArgs {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ShimHello {
     schema: u32,
+    #[serde(default)]
+    operation: ShimOperation,
     project_root: PathBuf,
     harness: String,
     shim_session_id: String,
@@ -1492,9 +1487,27 @@ struct ShimHello {
     instance_token: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+enum ShimOperation {
+    #[default]
+    #[serde(rename = "settings.get")]
+    SettingsGet,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ShimSettingsStatus {
+    Ready,
+    Unavailable,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ShimHelloAck {
     schema: u32,
+    #[serde(default)]
+    settings_status: Option<ShimSettingsStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1739,6 +1752,8 @@ struct SubcClient {
     last_corr: Arc<AtomicU64>,
     catalog_poller_started: Arc<AtomicBool>,
     scope_owner: Arc<OnceLock<ScopeOwner>>,
+    settings_handle: Arc<OnceLock<subc_client_rs::ModuleHandle>>,
+    settings: Arc<managed_settings::GatewaySettings>,
 }
 
 impl SubcClient {
@@ -1783,6 +1798,8 @@ impl SubcClient {
             last_corr: Arc::new(AtomicU64::new(0)),
             catalog_poller_started: Arc::new(AtomicBool::new(false)),
             scope_owner: Arc::new(OnceLock::new()),
+            settings_handle: Arc::new(OnceLock::new()),
+            settings: Arc::default(),
         }
     }
 
@@ -2218,6 +2235,7 @@ async fn run_shim(args: ShimArgs) -> Result<()> {
 
     let hello = ShimHello {
         schema: SHIM_SCHEMA_VERSION,
+        operation: ShimOperation::SettingsGet,
         project_root,
         harness: args.harness,
         shim_session_id: generated_id("shim")?,
@@ -2232,6 +2250,12 @@ async fn run_shim(args: ShimArgs) -> Result<()> {
             ack.schema
         )));
     }
+    if ack.settings_status == Some(ShimSettingsStatus::Unavailable) {
+        return Err(other_error(
+            ack.message
+                .unwrap_or_else(|| "MCP settings unavailable".into()),
+        ));
+    }
 
     pipe_stdio(stream).await
 }
@@ -2239,8 +2263,7 @@ async fn run_shim(args: ShimArgs) -> Result<()> {
 async fn run_module(args: ModuleArgs) -> Result<()> {
     let subc = SubcClient::connect(&args.subc_connection_file).await?;
     let mut supervision_task =
-        start_supervision_connection_if_configured(&args.subc_connection_file, subc.clone())
-            .await?;
+        Some(start_supervision_connection(&args.subc_connection_file, subc.clone()).await?);
 
     let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
         .await
@@ -2328,240 +2351,25 @@ async fn supervision_ended(task: &mut Option<JoinHandle<()>>) {
     }
 }
 
-async fn start_supervision_connection_if_configured(
+async fn start_supervision_connection(
     connection_file_path: &Path,
     subc: SubcClient,
-) -> Result<Option<JoinHandle<()>>> {
-    let module_id = match env::var(SUBC_MODULE_ID_ENV) {
-        Ok(module_id) if !module_id.trim().is_empty() => module_id,
-        Ok(_) => {
-            return Err(other_error(format!(
-                "{SUBC_MODULE_ID_ENV} must not be empty when set"
-            )))
-        }
-        Err(env::VarError::NotPresent) => return Ok(None),
-        Err(env::VarError::NotUnicode(value)) => {
-            return Err(other_error(format!(
-                "{SUBC_MODULE_ID_ENV} must be valid UTF-8, got '{}'",
-                value.to_string_lossy()
-            )))
-        }
-    };
-
-    let mut stream = connect_authenticated(connection_file_path, ConnectionService::Daemon).await?;
-    let ack = send_supervision_hello(&mut stream, &module_id).await?;
-    let supported = ["scopes/v1", "scope-workdir/v1"].iter().all(|capability| {
-        ack.subc_capabilities
-            .iter()
-            .any(|value| value == capability)
-    }) && ack.subc_ops.iter().any(|op| op == "scope.apply");
-    let (owner, changes) = ScopeOwner::new(module_id.clone(), supported);
-    let _ = subc.scope_owner.set(owner);
-    let task = tokio::spawn(async move {
-        if let Err(error) = session_scope::supervision_loop(stream, subc, changes).await {
+) -> Result<JoinHandle<()>> {
+    let module_id = env::var(SUBC_MODULE_ID_ENV)?;
+    let handler = managed_settings::GatewayModule::new(subc.clone(), module_id.clone())?;
+    let (handle, serve) = subc_client_rs::serve_with_handle(
+        connection_file_path,
+        supervision_manifest(module_id.clone()),
+        handler,
+    )
+    .await?;
+    let _ = subc.settings_handle.set(handle.clone());
+    let _ = subc.scope_owner.set(ScopeOwner::new(module_id, handle));
+    Ok(tokio::spawn(async move {
+        if let Err(error) = serve.await {
             tracing::error!("supervision control loop failed: {error}");
         }
-    });
-    Ok(Some(task))
-}
-
-async fn send_supervision_hello(
-    stream: &mut TcpStream,
-    module_id: &str,
-) -> Result<ModuleHelloAckBody> {
-    let nonce = subc_os::launch_nonce()
-        .map_err(|error| other_error(format!("launch nonce unavailable: {error}")))?;
-    let mut manifest = supervision_manifest(module_id.to_owned());
-    // Unlike SDK-managed HELLOs, this message is built here, so report the source
-    // from the same launch_nonce() result whose value is sent to the daemon.
-    if let Some(provenance) = manifest.provenance.as_mut() {
-        provenance.launch_nonce_source = nonce.as_ref().map(|nonce| {
-            subc_protocol::manifest::LaunchNonceSource::from_wire_name(nonce.source().as_str())
-        });
-    }
-    let body = serde_json::to_vec(&ModuleHelloBody {
-        manifest,
-        protocol_ver: PROTOCOL_VERSION,
-        control_ops: Some(vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_owned()]),
-        // Echo the supervised launch nonce. It authorizes scope changes for the
-        // current launch independently of reserved-ID configuration.
-        launch_nonce: nonce.map(|nonce| nonce.value().to_owned()),
-    })
-    .map_err(|source| {
-        other_error(format!(
-            "failed to encode supervision HELLO for module_id={module_id}: {source}"
-        ))
-    })?;
-    let frame = build_frame(
-        FrameType::Hello,
-        control_flags(),
-        0,
-        0,
-        SUPERVISION_HELLO_CORR,
-        body,
-    )
-    .map_err(|source| {
-        other_error(format!(
-            "failed to build supervision HELLO for module_id={module_id}: {source}"
-        ))
-    })?;
-
-    write_frame(stream, &frame).await.map_err(|source| {
-        other_error(format!(
-            "failed to write supervision HELLO for module_id={module_id}: {source}"
-        ))
-    })?;
-    stream.flush().await.map_err(|source| {
-        other_error(format!(
-            "failed to flush supervision HELLO for module_id={module_id}: {source}"
-        ))
-    })?;
-
-    let Some(frame) = read_frame(stream).await.map_err(|source| {
-        other_error(format!(
-            "failed to read supervision HELLO_ACK for module_id={module_id}: {source}"
-        ))
-    })?
-    else {
-        return Err(other_error(format!(
-            "subc closed before supervision HELLO_ACK for module_id={module_id}"
-        )));
-    };
-
-    match frame.header.ty {
-        FrameType::HelloAck => {
-            let ack: ModuleHelloAckBody =
-                serde_json::from_slice(&frame.body).map_err(|source| {
-                    other_error(format!(
-                    "failed to decode supervision HELLO_ACK for module_id={module_id}: {source}"
-                ))
-                })?;
-            tracing::info!("registered for supervision module_id={module_id}");
-            Ok(ack)
-        }
-        FrameType::Error => {
-            let body: ErrorBody = serde_json::from_slice(&frame.body).map_err(|source| {
-                other_error(format!(
-                    "subc rejected supervision HELLO for module_id={module_id} with malformed ERROR body: {source}"
-                ))
-            })?;
-            Err(other_error(format!(
-                "subc rejected supervision HELLO for module_id={module_id}: {}: {}",
-                body.code, body.message
-            )))
-        }
-        ty => Err(other_error(format!(
-            "unexpected supervision HELLO_ACK frame type for module_id={module_id}: {ty:?}"
-        ))),
-    }
-}
-
-async fn handle_supervision_control_frame(
-    frame: &SubcFrame,
-    subc: &SubcClient,
-) -> Result<Option<SubcFrame>> {
-    if frame.header.ty == FrameType::Goodbye && frame.header.channel == 0 {
-        return Ok(None);
-    }
-
-    if frame.header.ty != FrameType::Request || frame.header.channel != 0 {
-        return supervision_error_frame(
-            frame,
-            "unsupported_control_frame",
-            format!(
-                "supervision connection only accepts channel-0 Request frames, got {:?} on channel {}",
-                frame.header.ty, frame.header.channel
-            ),
-        )
-        .map(Some);
-    }
-
-    let request = match serde_json::from_slice::<ModuleControlRequest>(&frame.body) {
-        Ok(request) => request,
-        Err(error) => {
-            let (code, message) = supervision_decode_error(&frame.body, error);
-            return supervision_error_frame(frame, code, message).map(Some);
-        }
-    };
-
-    match request {
-        ModuleControlRequest::HealthCheck {} => {
-            let report = subc.health_report().await;
-            let body =
-                serde_json::to_vec(&ModuleControlResponse::from(report)).map_err(|source| {
-                    other_error(format!("failed to encode health.check response: {source}"))
-                })?;
-            Ok(Some(supervision_response_frame(frame, body)?))
-        }
-        other => supervision_error_frame(
-            frame,
-            "unexpected_control_op",
-            format!("supervision connection does not handle {other:?}"),
-        )
-        .map(Some),
-    }
-}
-
-#[derive(Deserialize)]
-struct ModuleControlOpProbe {
-    op: Option<String>,
-}
-
-fn supervision_decode_error(body: &[u8], error: serde_json::Error) -> (&'static str, String) {
-    match serde_json::from_slice::<ModuleControlOpProbe>(body) {
-        Ok(ModuleControlOpProbe { op: Some(op) }) if op == MODULE_CONTROL_OP_HEALTH_CHECK => (
-            "invalid_control_body",
-            format!("malformed health.check request body: {error}"),
-        ),
-        Ok(ModuleControlOpProbe { op: Some(op) }) if op == "route.bind" => (
-            "unexpected_control_op",
-            format!("supervision connection does not handle route.bind: {error}"),
-        ),
-        Ok(ModuleControlOpProbe { op: Some(op) }) => (
-            "unknown_control_op",
-            format!("unsupported module-control op '{op}': {error}"),
-        ),
-        _ => (
-            "invalid_control_body",
-            format!("malformed module-control request body: {error}"),
-        ),
-    }
-}
-
-fn supervision_response_frame(request: &SubcFrame, body: Vec<u8>) -> Result<SubcFrame> {
-    SubcFrame::build_with_version(
-        request.header.ver,
-        FrameType::Response,
-        control_flags(),
-        0,
-        0,
-        request.header.corr,
-        body,
-    )
-    .map_err(|source| other_error(format!("failed to build health.check response: {source}")))
-}
-
-fn supervision_error_frame(
-    request: &SubcFrame,
-    code: &str,
-    message: impl Into<String>,
-) -> Result<SubcFrame> {
-    let body = serde_json::to_vec(&ErrorBody {
-        code: code.to_owned(),
-        message: message.into(),
-        detail: None,
-    })
-    .map_err(|source| other_error(format!("failed to encode supervision ERROR: {source}")))?;
-    SubcFrame::build_with_version(
-        request.header.ver,
-        FrameType::Error,
-        control_flags(),
-        0,
-        0,
-        request.header.corr,
-        body,
-    )
-    .map_err(|source| other_error(format!("failed to build supervision ERROR: {source}")))
+    }))
 }
 
 fn manifest_json(manifest: ModuleManifest) -> serde_json::Value {
@@ -2679,16 +2487,23 @@ async fn handle_shim_connection(
             hello.schema
         )));
     }
+    let config = managed_settings::session_config(&subc, &hello).await;
+    let (status, message) = match &config {
+        Ok(_) => (ShimSettingsStatus::Ready, None),
+        Err(error) => (ShimSettingsStatus::Unavailable, Some(error.to_string())),
+    };
     write_json_message(
         &mut stream,
         &ShimHelloAck {
             schema: SHIM_SCHEMA_VERSION,
+            settings_status: Some(status),
+            message,
         },
         MAX_SHIM_CONTROL_MESSAGE_LEN,
     )
     .await?;
 
-    let attached = attach_session(&subc, &hello).await?;
+    let attached = attach_session(&subc, &hello, config?).await?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let reconcile_gate = Arc::new(Mutex::new(()));
     let prompt_routes: Arc<dyn PromptRouteClient> = Arc::new(SubcPromptRouteClient::new(
@@ -2753,8 +2568,11 @@ async fn handle_shim_connection(
     }
 }
 
-async fn attach_session(subc: &SubcClient, hello: &ShimHello) -> Result<AttachedSession> {
-    let config = read_gateway_config(&hello.project_root, &hello.harness)?;
+async fn attach_session(
+    subc: &SubcClient,
+    hello: &ShimHello,
+    config: ConfigSnapshot,
+) -> Result<AttachedSession> {
     let catalog = catalog_list(subc).await?;
     let desired = desired_session_from_catalog(&config.effective, &catalog.modules)?;
     let identity = BindIdentity::new(hello.harness.clone(), bind_session_from_hello(hello)?);
@@ -3660,11 +3478,19 @@ async fn refresh_policy_if_changed(
 
     let _reconcile_guard = reconcile_gate.lock().await;
     let snapshot = state.config_snapshot();
-    if snapshot.effective.refresh != RefreshMode::Immediate || !config_files_changed(&snapshot)? {
+    if snapshot.effective.refresh != RefreshMode::Immediate {
         return Ok(None);
     }
 
-    let next_config = read_gateway_config(&snapshot.project_root, &state.identity.harness)?;
+    let Some(next_config) = subc
+        .settings
+        .snapshot(snapshot.project_id.as_deref(), &state.identity.harness)
+    else {
+        return Ok(None);
+    };
+    if snapshot.effective == next_config.effective {
+        return Ok(None);
+    }
     let prompts_changed =
         snapshot.effective.visible_prompt_names() != next_config.effective.visible_prompt_names();
     let catalog = catalog_list(subc).await?;
@@ -8984,6 +8810,7 @@ mod tests {
     fn shim_hello_with_token(instance_token: Option<&str>) -> ShimHello {
         ShimHello {
             schema: SHIM_SCHEMA_VERSION,
+            operation: ShimOperation::SettingsGet,
             project_root: PathBuf::from("/tmp/instance-token-test"),
             harness: "mcp:claude-code".to_owned(),
             shim_session_id: "shim-abc123".to_owned(),

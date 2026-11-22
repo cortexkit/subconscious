@@ -1,19 +1,12 @@
 //! Reads and combines gateway settings from the user and project files, including per-app overlays.
 
-use std::{
-    collections::HashMap,
-    fs, io,
-    path::{Path, PathBuf},
-    time::SystemTime,
-};
+use std::{collections::HashMap, path::Path};
 
 use serde::{de, Deserialize, Deserializer};
 use subc_jsonc::jsonc_to_json;
 
-use super::{non_empty_os_var, other_error, prompts, Result};
+use super::{other_error, prompts, Result};
 
-const MCP_CONFIG_RELATIVE_PATH: &str = "cortexkit/mcp.jsonc";
-const PROJECT_MCP_CONFIG_RELATIVE_PATH: &str = ".cortexkit/mcp.jsonc";
 const FACADE_DEFAULT_DISABLED: &[&str] = &["magic-context", "llm-runner"];
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -39,26 +32,47 @@ pub(super) enum RefreshMode {
     Immediate,
 }
 
-impl<'de> Deserialize<'de> for RefreshMode {
+#[derive(Debug, Clone, Copy)]
+enum RawRefreshMode {
+    OnAttach,
+    LegacyOnAttach,
+    Immediate,
+}
+
+impl RawRefreshMode {
+    fn effective(raw: MaybeSet<Self>) -> MaybeSet<RefreshMode> {
+        match raw {
+            MaybeSet::Missing => MaybeSet::Missing,
+            MaybeSet::Null => MaybeSet::Null,
+            MaybeSet::Value(Self::OnAttach | Self::LegacyOnAttach) => {
+                MaybeSet::Value(RefreshMode::OnAttach)
+            }
+            MaybeSet::Value(Self::Immediate) => MaybeSet::Value(RefreshMode::Immediate),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RawRefreshMode {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
         match String::deserialize(deserializer)?.as_str() {
-            "on-attach" => Ok(Self::OnAttach),
+            "on_attach" => Ok(Self::OnAttach),
+            "on-attach" => Ok(Self::LegacyOnAttach),
             "immediate" => Ok(Self::Immediate),
             "on-hard" | "on-soft" => Err(de::Error::custom(
                 "refresh value requires a bust-signal source; not available on the MCP path",
             )),
             other => Err(de::Error::unknown_variant(
                 other,
-                &["on-attach", "immediate"],
+                &["on_attach", "immediate"],
             )),
         }
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct GatewayConfig {
     pub(super) surface_mode: SurfaceMode,
     pub(super) refresh: RefreshMode,
@@ -66,7 +80,7 @@ pub(super) struct GatewayConfig {
     providers: HashMap<String, ProviderConfig>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ProviderConfig {
     enabled: Option<bool>,
     namespace: Option<String>,
@@ -98,24 +112,10 @@ struct PromptOverride {
     enabled: Option<bool>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ConfigFileState {
-    path: PathBuf,
-    modified: Option<SystemTime>,
-    len: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ConfigFileSnapshot {
-    user: ConfigFileState,
-    project: ConfigFileState,
-}
-
 #[derive(Debug, Clone)]
 pub(super) struct ConfigSnapshot {
-    pub(super) project_root: PathBuf,
+    pub(super) project_id: Option<String>,
     pub(super) effective: GatewayConfig,
-    files: ConfigFileSnapshot,
 }
 
 #[derive(Debug, Default)]
@@ -126,18 +126,18 @@ struct RawGatewayLayer {
     providers: HashMap<String, RawProviderConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawGatewayConfig {
-    version: u8,
+pub(super) struct RawGatewayConfig {
+    version: Option<u8>,
     #[serde(
         default,
-        rename = "surfaceMode",
+        alias = "surfaceMode",
         deserialize_with = "deserialize_maybe_set"
     )]
     surface_mode: MaybeSet<SurfaceMode>,
     #[serde(default, deserialize_with = "deserialize_maybe_set")]
-    refresh: MaybeSet<RefreshMode>,
+    refresh: MaybeSet<RawRefreshMode>,
     #[serde(default, deserialize_with = "deserialize_maybe_set")]
     prompts: MaybeSet<RawPromptConfig>,
     #[serde(default)]
@@ -146,24 +146,24 @@ struct RawGatewayConfig {
     harness: HashMap<String, RawGatewayOverlayConfig>,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct RawGatewayOverlayConfig {
     #[serde(
         default,
-        rename = "surfaceMode",
+        alias = "surfaceMode",
         deserialize_with = "deserialize_maybe_set"
     )]
     surface_mode: MaybeSet<SurfaceMode>,
     #[serde(default, deserialize_with = "deserialize_maybe_set")]
-    refresh: MaybeSet<RefreshMode>,
+    refresh: MaybeSet<RawRefreshMode>,
     #[serde(default, deserialize_with = "deserialize_maybe_set")]
     prompts: MaybeSet<RawPromptConfig>,
     #[serde(default)]
     providers: HashMap<String, RawProviderConfig>,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct RawProviderConfig {
     #[serde(default, deserialize_with = "deserialize_maybe_set")]
@@ -174,12 +174,12 @@ struct RawProviderConfig {
     tools: MaybeSet<RawToolConfig>,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct RawToolConfig {
     #[serde(
         default,
-        rename = "defaultEnabled",
+        alias = "defaultEnabled",
         deserialize_with = "deserialize_maybe_set"
     )]
     default_enabled: MaybeSet<bool>,
@@ -187,12 +187,12 @@ struct RawToolConfig {
     overrides: HashMap<String, RawToolOverrideValue>,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct RawPromptConfig {
     #[serde(
         default,
-        rename = "defaultEnabled",
+        alias = "defaultEnabled",
         deserialize_with = "deserialize_maybe_set"
     )]
     default_enabled: MaybeSet<bool>,
@@ -200,7 +200,7 @@ struct RawPromptConfig {
     overrides: HashMap<String, RawPromptOverrideValue>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum RawPromptOverrideValue {
     Object(RawPromptOverrideObject),
     Bool(bool),
@@ -226,14 +226,14 @@ impl<'de> Deserialize<'de> for RawPromptOverrideValue {
     }
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct RawPromptOverrideObject {
     #[serde(default, deserialize_with = "deserialize_maybe_set")]
     enabled: MaybeSet<bool>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum RawToolOverrideValue {
     Object(RawToolOverrideObject),
     Bool(bool),
@@ -259,7 +259,7 @@ impl<'de> Deserialize<'de> for RawToolOverrideValue {
     }
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct RawToolOverrideObject {
     #[serde(default, deserialize_with = "deserialize_maybe_set")]
@@ -376,27 +376,7 @@ impl GatewayConfig {
     }
 }
 
-pub(super) fn read_gateway_config(
-    project_root: &Path,
-    harness_name: &str,
-) -> Result<ConfigSnapshot> {
-    let user_path = user_mcp_config_path();
-    let project_path = project_root.join(PROJECT_MCP_CONFIG_RELATIVE_PATH);
-    let user = read_raw_gateway_config("user", &user_path)?;
-    let project = read_raw_gateway_config("project", &project_path)?;
-    let (effective, notes) = compose_gateway_config(user, project, harness_name);
-    for ProjectNote { field, reason } in notes {
-        tracing::warn!(target: "catalog", "dropping project MCP config field {field}: {reason}");
-    }
-
-    Ok(ConfigSnapshot {
-        project_root: project_root.to_path_buf(),
-        effective,
-        files: gateway_config_file_snapshot(user_path, project_path)?,
-    })
-}
-
-fn compose_gateway_config(
+pub(super) fn compose_gateway_config(
     user: Option<RawGatewayConfig>,
     project: Option<RawGatewayConfig>,
     harness_name: &str,
@@ -422,69 +402,7 @@ fn compose_gateway_config(
     (effective, notes)
 }
 
-fn read_raw_gateway_config(tier: &str, path: &Path) -> Result<Option<RawGatewayConfig>> {
-    let doc = match fs::read_to_string(path) {
-        Ok(doc) => doc,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => {
-            return Err(other_error(format!(
-                "failed to read {tier} MCP config {}: {err}",
-                path.display()
-            )))
-        }
-    };
-    parse_gateway_config_doc(&doc, path).map(Some)
-}
-
-fn gateway_config_file_snapshot(
-    user_path: PathBuf,
-    project_path: PathBuf,
-) -> Result<ConfigFileSnapshot> {
-    Ok(ConfigFileSnapshot {
-        user: config_file_state(user_path)?,
-        project: config_file_state(project_path)?,
-    })
-}
-
-fn config_file_state(path: PathBuf) -> Result<ConfigFileState> {
-    match fs::metadata(&path) {
-        Ok(metadata) => Ok(ConfigFileState {
-            path,
-            modified: metadata.modified().ok(),
-            len: Some(metadata.len()),
-        }),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(ConfigFileState {
-            path,
-            modified: None,
-            len: None,
-        }),
-        Err(err) => Err(other_error(format!(
-            "failed to stat MCP config {}: {err}",
-            path.display()
-        ))),
-    }
-}
-
-pub(super) fn config_files_changed(snapshot: &ConfigSnapshot) -> Result<bool> {
-    Ok(gateway_config_file_snapshot(
-        snapshot.files.user.path.clone(),
-        snapshot.files.project.path.clone(),
-    )? != snapshot.files)
-}
-
-fn user_mcp_config_path() -> PathBuf {
-    if let Some(config_home) = non_empty_os_var("XDG_CONFIG_HOME") {
-        return PathBuf::from(config_home).join(MCP_CONFIG_RELATIVE_PATH);
-    }
-    if let Some(home) = non_empty_os_var("HOME") {
-        return PathBuf::from(home)
-            .join(".config")
-            .join(MCP_CONFIG_RELATIVE_PATH);
-    }
-    PathBuf::from(".config").join(MCP_CONFIG_RELATIVE_PATH)
-}
-
-fn parse_gateway_config_doc(doc: &str, path: &Path) -> Result<RawGatewayConfig> {
+fn parse_gateway_jsonc(doc: &str, path: &Path, legacy: bool) -> Result<RawGatewayConfig> {
     let json = jsonc_to_json(doc).map_err(|message| {
         other_error(format!(
             "invalid JSONC in MCP config {}: {message}",
@@ -494,21 +412,42 @@ fn parse_gateway_config_doc(doc: &str, path: &Path) -> Result<RawGatewayConfig> 
     let raw: RawGatewayConfig = serde_json::from_str(&json).map_err(|source| {
         other_error(format!("invalid MCP config {}: {source}", path.display()))
     })?;
-    if raw.version != 1 {
-        return Err(other_error(format!(
-            "invalid MCP config {}: version {} is unsupported (expected 1)",
-            path.display(),
-            raw.version
-        )));
-    }
-    validate_raw_gateway_config(&raw, path)?;
+    validate_raw_gateway_config(&raw, path, legacy)?;
     Ok(raw)
 }
 
-fn validate_raw_gateway_config(raw: &RawGatewayConfig, path: &Path) -> Result<()> {
+pub(super) fn parse_gateway_config_doc(doc: &str, path: &Path) -> Result<RawGatewayConfig> {
+    let raw = parse_gateway_jsonc(doc, path, true)?;
+    if raw.version != Some(1) {
+        return Err(other_error(format!(
+            "invalid MCP config {}: expected legacy version 1",
+            path.display()
+        )));
+    }
+    Ok(raw)
+}
+
+pub(super) fn parse_managed_config(doc: &str, path: &Path) -> Result<RawGatewayConfig> {
+    let raw = parse_gateway_jsonc(doc, path, false)?;
+    if raw.version.is_some() {
+        return Err(other_error(
+            "managed MCP settings do not use a version field",
+        ));
+    }
+    Ok(raw)
+}
+
+fn validate_raw_gateway_config(raw: &RawGatewayConfig, path: &Path, legacy: bool) -> Result<()> {
+    validate_refresh(&raw.refresh, path, "refresh", legacy)?;
     validate_raw_prompts(&raw.prompts, path, "prompts")?;
     validate_raw_providers(&raw.providers, path, "providers")?;
     for (harness_name, harness) in &raw.harness {
+        validate_refresh(
+            &harness.refresh,
+            path,
+            &format!("harness.{harness_name}.refresh"),
+            legacy,
+        )?;
         validate_raw_prompts(
             &harness.prompts,
             path,
@@ -521,6 +460,23 @@ fn validate_raw_gateway_config(raw: &RawGatewayConfig, path: &Path) -> Result<()
         )?;
     }
     Ok(())
+}
+
+fn validate_refresh(
+    value: &MaybeSet<RawRefreshMode>,
+    path: &Path,
+    field: &str,
+    legacy: bool,
+) -> Result<()> {
+    let expected = match (value, legacy) {
+        (MaybeSet::Value(RawRefreshMode::OnAttach), true) => "on-attach",
+        (MaybeSet::Value(RawRefreshMode::LegacyOnAttach), false) => "on_attach",
+        _ => return Ok(()),
+    };
+    Err(other_error(format!(
+        "invalid MCP config {}: {field} must use {expected:?} for on-attach refresh",
+        path.display()
+    )))
 }
 
 fn validate_raw_prompts(
@@ -597,11 +553,15 @@ fn validate_raw_tool_config(tools: &RawToolConfig, path: &Path, prefix: &str) ->
 }
 
 impl RawGatewayConfig {
+    pub(super) fn harness_names(&self) -> impl Iterator<Item = &str> {
+        self.harness.keys().map(String::as_str)
+    }
+
     fn into_parts(self) -> (RawGatewayLayer, HashMap<String, RawGatewayOverlayConfig>) {
         (
             RawGatewayLayer {
                 surface_mode: self.surface_mode,
-                refresh: self.refresh,
+                refresh: RawRefreshMode::effective(self.refresh),
                 prompts: self.prompts,
                 providers: self.providers,
             },
@@ -614,7 +574,7 @@ impl From<RawGatewayOverlayConfig> for RawGatewayLayer {
     fn from(raw: RawGatewayOverlayConfig) -> Self {
         Self {
             surface_mode: raw.surface_mode,
-            refresh: raw.refresh,
+            refresh: RawRefreshMode::effective(raw.refresh),
             prompts: raw.prompts,
             providers: raw.providers,
         }
@@ -686,7 +646,7 @@ fn merge_project_gateway_config(
             if effective.surface_mode == SurfaceMode::Search {
                 note_project_drop(
                     notes,
-                    "surfaceMode",
+                    "surface_mode",
                     "project MCP config cannot widen a search surface back to full",
                 );
             }
@@ -802,7 +762,7 @@ fn merge_project_prompt_config(
             } else {
                 note_project_drop(
                     notes,
-                    "prompts.defaultEnabled",
+                    "prompts.default_enabled",
                     "project MCP config cannot enable prompts disabled by the user baseline",
                 );
             }
@@ -935,7 +895,7 @@ fn merge_project_tool_config(
             } else {
                 note_project_drop(
                     notes,
-                    &format!("providers.{module_id}.tools.defaultEnabled"),
+                    &format!("providers.{module_id}.tools.default_enabled"),
                     "project MCP config cannot enable tools disabled by the user baseline",
                 );
             }
@@ -946,7 +906,7 @@ fn merge_project_tool_config(
             } else {
                 note_project_drop(
                     notes,
-                    &format!("providers.{module_id}.tools.defaultEnabled"),
+                    &format!("providers.{module_id}.tools.default_enabled"),
                     "project MCP config cannot delete a default tool deny from the user baseline",
                 );
             }
@@ -1080,9 +1040,9 @@ fn merge_project_override_mode(
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct ProjectNote {
-    field: String,
-    reason: &'static str,
+pub(super) struct ProjectNote {
+    pub(super) field: String,
+    pub(super) reason: &'static str,
 }
 
 fn note_project_drop(notes: &mut Vec<ProjectNote>, field: &str, reason: &'static str) {
@@ -1107,20 +1067,8 @@ where
 impl ConfigSnapshot {
     pub(super) fn test_default() -> Self {
         Self {
-            project_root: PathBuf::from("/tmp/project"),
+            project_id: None,
             effective: GatewayConfig::default(),
-            files: ConfigFileSnapshot {
-                user: ConfigFileState {
-                    path: PathBuf::from("user-mcp.jsonc"),
-                    modified: None,
-                    len: None,
-                },
-                project: ConfigFileState {
-                    path: PathBuf::from("project-mcp.jsonc"),
-                    modified: None,
-                    len: None,
-                },
-            },
         }
     }
 }
@@ -1679,18 +1627,46 @@ mod tests {
     }
 
     #[test]
+    fn managed_refresh_requires_snake_case_at_top_level_and_in_harness() {
+        let path = Path::new("subc-mcp.jsonc");
+        let config = parse_managed_config(
+            r#"{"refresh":"immediate","harness":{"mcp:generic":{"refresh":"on_attach"}}}"#,
+            path,
+        )
+        .unwrap();
+        let resolved = compose_gateway_config(Some(config), None, DEFAULT_HARNESS).0;
+        assert_eq!(resolved.refresh, RefreshMode::OnAttach);
+
+        for (doc, field) in [
+            (r#"{"refresh":"on-attach"}"#, "refresh"),
+            (
+                r#"{"harness":{"mcp:generic":{"refresh":"on-attach"}}}"#,
+                "harness.mcp:generic.refresh",
+            ),
+        ] {
+            let error = parse_managed_config(doc, path).unwrap_err().to_string();
+            assert!(
+                error.contains(&format!("{field} must use \"on_attach\"")),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
     fn widening_project_values_are_ignored_and_recorded() {
         let user = parse_test_config(
             r#"{
             "version": 1,
             "surfaceMode": "search",
-            "providers": {"aft": {"tools": {"overrides": {"read": {"mode": "ack_only"}}}}}
+            "providers": {"aft": {"tools": {"defaultEnabled": false, "overrides": {"read": {"mode": "ack_only"}}}}}
         }"#,
         );
         let project = parse_test_config(
             r#"{
             "version": 1,
             "surfaceMode": "full",
+            "prompts": {"defaultEnabled": true},
+            "providers": {"aft": {"tools": {"defaultEnabled": true}}},
             "harness": {"mcp:generic": {"providers": {
                 "aft": {"tools": {"overrides": {"read": {"mode": "forward"}, "write": false}}}
             }}}
@@ -1704,8 +1680,17 @@ mod tests {
             notes,
             [
                 ProjectNote {
-                    field: "surfaceMode".to_owned(),
+                    field: "surface_mode".to_owned(),
                     reason: "project MCP config cannot widen a search surface back to full",
+                },
+                ProjectNote {
+                    field: "prompts.default_enabled".to_owned(),
+                    reason:
+                        "project MCP config cannot enable prompts disabled by the user baseline",
+                },
+                ProjectNote {
+                    field: "providers.aft.tools.default_enabled".to_owned(),
+                    reason: "project MCP config cannot enable tools disabled by the user baseline",
                 },
                 ProjectNote {
                     field: "providers.aft.tools.overrides.read.mode".to_owned(),

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.12
+
+- Use daemon-managed user and project settings. Project overlays cannot widen access; ignored overrides are listed under `settings.project_notes` in the gateway module's `ck health` metrics. `refresh: on_attach` pins settings for the session; `refresh: immediate` applies daemon-delivered changes to attached hosts.
+- Convert the legacy user file to `subc-mcp.jsonc` and keep a private backup. Existing project files are never rewritten. If legacy project settings need migration, user conversion fails, or the daemon lacks project settings support, refuse the shim connection rather than serve a potentially wider tool surface.
+
 ## 0.2.11
 
 - Limit MCP gateway timing environment overrides to debug builds. Move file-backed settings into a dedicated module without changing the legacy paths or allowing projects to expand tool access.

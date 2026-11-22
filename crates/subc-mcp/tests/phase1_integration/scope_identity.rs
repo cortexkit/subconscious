@@ -61,7 +61,7 @@ impl ClientHandler for RootsClient {
     }
 }
 
-struct IdentityProvider {
+pub(super) struct IdentityProvider {
     binds: mpsc::Receiver<(Value, Vec<u8>)>,
     requests: Arc<TokioMutex<Vec<Value>>>,
     task: JoinHandle<()>,
@@ -74,6 +74,10 @@ impl Drop for IdentityProvider {
 }
 
 impl IdentityProvider {
+    pub(super) async fn settings_registry(server: &TestServer) -> Self {
+        Self::start(server, "entorhinal", false, Some(Value::Null)).await
+    }
+
     async fn start(server: &TestServer, id: &str, scoped: bool, resolve: Option<Value>) -> Self {
         let mut stream = connect_control_client(&server.daemon.connection_file_path)
             .await
@@ -120,14 +124,21 @@ impl IdentityProvider {
         let requests = Arc::new(TokioMutex::new(Vec::new()));
         let seen = requests.clone();
         let task = tokio::spawn(async move {
+            let mut settings_lookup = resolve.is_some();
             while let Some(frame) = read_frame(&mut stream).await.unwrap() {
                 if frame.header.ty != FrameType::Request {
                     continue;
                 }
                 let request: Value = serde_json::from_slice(&frame.body).unwrap();
                 let body = if frame.header.channel == 0 {
-                    tx.send((request, frame.body.clone())).await.unwrap();
+                    if resolve.is_none() {
+                        tx.send((request, frame.body.clone())).await.unwrap();
+                    }
                     serde_json::to_value(ModuleControlResponse::RouteBindAck {}).unwrap()
+                } else if resolve == Some(Value::Null) {
+                    json!({"result":{"via":"root", "projectId":request["params"]["canonicalRoot"]}})
+                } else if std::mem::take(&mut settings_lookup) {
+                    json!({"result":{"via":"implicit"}})
                 } else {
                     seen.lock().await.push(request);
                     resolve.clone().unwrap_or(json!({"content":[]}))
@@ -204,7 +215,7 @@ impl IdentityHarness {
         mode: AttributionMode,
         modern: bool,
     ) -> Self {
-        let server = TestServer::start().await;
+        let server = TestServer::start_inner(true).await;
         let proxy = AttributionProxy::start(&server, mode).await;
         let provider = IdentityProvider::start(&server, "scope-probe", scoped, None).await;
         let entorhinal = IdentityProvider::start(&server, "entorhinal", false, Some(resolve)).await;
@@ -213,10 +224,12 @@ impl IdentityHarness {
         let connection = server.daemon.temp_dir.join("mcp.json");
         let mut spec = mcp_module_spec(TEST_MCP_MODULE_ID, &connection, &home);
         spec.reserved = reserved;
-        let module = supervisor(&server)
-            .with_connection_file_path(proxy.connection_file.clone())
-            .spawn(spec)
-            .unwrap();
+        let mut supervisor =
+            supervisor(&server).with_connection_file_path(proxy.connection_file.clone());
+        if mode == AttributionMode::HoldScopeApply {
+            supervisor = supervisor.with_drain_timeout(Duration::from_secs(5));
+        }
+        let module = supervisor.spawn(spec).unwrap();
         timeout(READ_TIMEOUT, async {
             while !connection.exists() {
                 tokio::task::yield_now().await;
@@ -647,6 +660,43 @@ async fn scope_fallback_refusal_keeps_tools_and_catalog_lifecycle() {
     .await
     .expect("scope failure must not stop the lifecycle or catalog poller");
     h.shutdown().await;
+}
+
+#[tokio::test]
+async fn scope_apply_without_a_reply_does_not_block_daemon_stop() {
+    let h = IdentityHarness::start_with_policy(
+        true,
+        RootsMode::Folder,
+        explicit(),
+        false,
+        true,
+        AttributionMode::HoldScopeApply,
+    )
+    .await;
+    wait_for_atomic_at_least(&h.proxy.scope_requests, 2, "unanswered scope.apply").await;
+    let mut client = connect_control_client(&h.server.daemon.connection_file_path)
+        .await
+        .unwrap();
+    let reply = control_rpc_on_stream(
+        &mut client,
+        350,
+        ClientControlRequest::SupervisorSetEnabled {
+            module_id: TEST_MCP_MODULE_ID.to_owned(),
+            enabled: false,
+        },
+    )
+    .await;
+    assert!(matches!(reply, ClientControlResponse::SupervisorAck { .. }));
+    let exit = h
+        .module
+        .status()
+        .unwrap()
+        .last_exit
+        .expect("daemon stop reaps the gateway");
+    assert_eq!(
+        exit.signal, None,
+        "daemon should not need to kill the gateway: {exit:?}"
+    );
 }
 
 #[tokio::test]

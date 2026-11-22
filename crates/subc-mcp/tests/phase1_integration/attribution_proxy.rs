@@ -5,6 +5,7 @@ pub(super) enum AttributionMode {
     Normal,
     NoWorkdir,
     RefuseScopeApply,
+    HoldScopeApply,
     StaleScopeNonce,
 }
 
@@ -81,6 +82,9 @@ impl AttributionProxy {
                                         }
                                         if matches!(op, Some("scope.sync" | "scope.apply")) {
                                             scope_count.fetch_add(1, Ordering::SeqCst);
+                                        }
+                                        if op == Some("scope.apply") && mode == AttributionMode::HoldScopeApply {
+                                            continue;
                                         }
                                         if op == Some("scope.apply") && mode == AttributionMode::RefuseScopeApply {
                                             let refusal = Frame::build(FrameType::Error, frame.header.flags, 0, 0, frame.header.corr,

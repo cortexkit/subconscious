@@ -6,6 +6,9 @@ mod scope_identity;
 #[path = "phase1_integration/mcp_2026.rs"]
 mod mcp_2026;
 
+#[path = "phase1_integration/settings_fixture.rs"]
+mod settings_fixture;
+
 use cortexkit_test_support::ScratchDir;
 #[cfg(target_os = "macos")]
 use std::sync::OnceLock;
@@ -113,11 +116,13 @@ struct TestDaemon {
     connection_file_path: PathBuf,
     temp_dir: ScratchDir,
     task: JoinHandle<Result<(), subc_daemon::ServerError>>,
+    settings_task: JoinHandle<Result<(), subc_daemon::ServerError>>,
 }
 
 impl Drop for TestDaemon {
     fn drop(&mut self) {
         self.task.abort();
+        self.settings_task.abort();
     }
 }
 
@@ -125,16 +130,25 @@ struct TestServer {
     daemon: TestDaemon,
     process_liveness: Arc<SupervisorProcessLiveness>,
     supervisor_handle: SupervisorHandle,
+    settings_registry: Option<scope_identity::IdentityProvider>,
 }
 
 impl TestServer {
     async fn start() -> Self {
+        let mut server = Self::start_inner(true).await;
+        server.settings_registry =
+            Some(scope_identity::IdentityProvider::settings_registry(&server).await);
+        server
+    }
+
+    async fn start_inner(settings: bool) -> Self {
         let process_liveness = Arc::new(SupervisorProcessLiveness::new());
         let supervisor_handle = SupervisorHandle::new();
         let daemon = start_test_daemon_with_process_liveness_and_supervisor(
             "subc-mcp-phase2b",
             Arc::clone(&process_liveness),
             supervisor_handle.clone(),
+            settings,
         )
         .await;
         // Authorize the attested module's route.opens: the daemon-injected nonce the
@@ -144,6 +158,7 @@ impl TestServer {
             daemon,
             process_liveness,
             supervisor_handle,
+            settings_registry: None,
         }
     }
 }
@@ -1970,17 +1985,14 @@ async fn mcp_prompts_are_hidden_by_default() {
 #[tokio::test]
 async fn mcp_prompt_policy_refresh_is_proactive_inert_and_tool_neutral() {
     let user_config = r#"{
-        "version": 1,
         "refresh": "immediate",
-        "prompts": { "defaultEnabled": true }
+        "prompts": { "default_enabled": true }
     }"#;
     let hidden_project_config = r#"{
-        "version": 1,
-        "prompts": { "defaultEnabled": false }
+        "prompts": { "default_enabled": false }
     }"#;
     let enabled_project_config = r#"{
-        "version": 1,
-        "prompts": { "defaultEnabled": true }
+        "prompts": { "default_enabled": true }
     }"#;
     let harness = McpHarness::start_configured(
         "mcp-prompts-refresh",
@@ -2083,7 +2095,7 @@ async fn mcp_prompts_get_validation_and_unavailable_backend_errors_are_clean() {
     let harness = McpHarness::start_configured(
         "mcp-prompts-get",
         vec![StubProvider::new("fake-aft", &[])],
-        Some(r#"{ "version": 1, "prompts": { "defaultEnabled": true } }"#),
+        Some(r#"{  "prompts": { "default_enabled": true } }"#),
         None,
     )
     .await;
@@ -2164,8 +2176,8 @@ async fn mcp_tools_list_returns_stub_manifest_tools() {
 async fn mcp_upfront_tools_are_listed_and_callable_in_full_and_search_modes() {
     for mode in ["full", "search"] {
         let user_config = json!({
-            "version": 1,
-            "surfaceMode": mode,
+
+            "surface_mode": mode,
             "providers": {
                 "magic-context": {"enabled": true, "namespace": "ctx"},
                 "aft": {"tools": {"overrides": {
@@ -2176,7 +2188,6 @@ async fn mcp_upfront_tools_are_listed_and_callable_in_full_and_search_modes() {
         })
         .to_string();
         let project_config = r#"{
-            "version": 1,
             "providers": {"aft": {"tools": {"overrides": {"read": {"upfront": true}}}}}
         }"#;
         let harness = McpHarness::start_configured(
@@ -2303,7 +2314,6 @@ async fn mcp_tools_call_returns_result_and_stub_receives_route_body() {
 async fn mcp_project_ack_only_tool_stays_visible_and_skips_provider_frames() {
     let user_config = r#"
     {
-      "version": 1,
       "providers": {
         "fake-aft": {
           "tools": { "overrides": { "fake_read": { "mode": "forward" } } }
@@ -2313,7 +2323,6 @@ async fn mcp_project_ack_only_tool_stays_visible_and_skips_provider_frames() {
     "#;
     let project_config = r#"
     {
-      "version": 1,
       "providers": {
         "fake-aft": {
           "tools": { "overrides": { "fake_read": { "mode": "ack_only" } } }
@@ -2360,7 +2369,6 @@ async fn mcp_project_ack_only_tool_stays_visible_and_skips_provider_frames() {
 async fn mcp_project_mode_cannot_widen_user_ack_only() {
     let user_config = r#"
     {
-      "version": 1,
       "providers": {
         "fake-aft": {
           "tools": { "overrides": { "fake_read": { "mode": "ack_only" } } }
@@ -2370,7 +2378,6 @@ async fn mcp_project_mode_cannot_widen_user_ack_only() {
     "#;
     let project_config = r#"
     {
-      "version": 1,
       "providers": {
         "fake-aft": {
           "tools": { "overrides": { "fake_read": { "mode": "forward" } } }
@@ -3157,10 +3164,9 @@ async fn mcp_project_config_disables_provider_and_tool() {
     let project_config = r#"
     {
       // project config owns the user-visible exposure plane
-      "version": 1,
       "providers": {
         "mc": { "enabled": false },
-        "aft": { "tools": { "overrides": { "bash": false } } }
+        "aft": { "tools": { "overrides": { "bash": { "enabled": false } } } }
       }
     }
     "#;
@@ -3186,12 +3192,11 @@ async fn mcp_project_config_disables_provider_and_tool() {
 async fn mcp_project_config_allowlist_mode_exposes_only_overrides() {
     let project_config = r#"
     {
-      "version": 1,
       "providers": {
         "aft": {
           "tools": {
-            "defaultEnabled": false,
-            "overrides": { "read": true }
+            "default_enabled": false,
+            "overrides": { "read": { "enabled": true } }
           }
         }
       }
@@ -3213,23 +3218,21 @@ async fn mcp_project_config_allowlist_mode_exposes_only_overrides() {
 }
 
 #[tokio::test]
-async fn mcp_project_tier_cannot_reenable_user_denied_tools_or_null_delete_denies() {
+async fn mcp_project_widening_is_ignored_for_user_denied_tools() {
     let user_config = r#"
     {
-      "version": 1,
       "providers": {
         "aft": {
-          "tools": { "overrides": { "read": false, "write": false } }
+          "tools": { "overrides": { "read": { "enabled": false }, "write": { "enabled": false } } }
         }
       }
     }
     "#;
     let project_config = r#"
     {
-      "version": 1,
       "providers": {
         "aft": {
-          "tools": { "overrides": { "read": true, "write": null } }
+          "tools": { "overrides": { "read": { "enabled": true }, "write": { "enabled": true } } }
         }
       }
     }
@@ -3246,32 +3249,39 @@ async fn mcp_project_tier_cannot_reenable_user_denied_tools_or_null_delete_denie
     .await;
 
     assert_eq!(list_tool_names(&harness).await, Vec::<String>::new());
+    let (_, _, metrics) = probe_mcp_module_health(&harness, 5_010).await;
+    let notes = metrics["settings"]["project_notes"][0]["ignored"]
+        .as_array()
+        .unwrap();
+    assert!(notes
+        .iter()
+        .any(|note| note.as_str().is_some_and(|text| text
+            .contains("providers.aft.tools.overrides.read.enabled")
+            && text.contains("disabled by the user baseline"))));
 
     harness.shutdown().await;
 }
 
 #[tokio::test]
-async fn mcp_project_provider_level_null_cannot_reset_user_denies() {
+async fn mcp_project_provider_override_cannot_reset_user_denies() {
     let user_config = r#"
     {
-      "version": 1,
       "providers": {
         "aft": {
           "enabled": false,
           "namespace": "renamed",
-          "tools": { "defaultEnabled": false }
+          "tools": { "default_enabled": false }
         }
       }
     }
     "#;
     let project_config = r#"
     {
-      "version": 1,
       "providers": {
         "aft": {
-          "enabled": null,
-          "namespace": null,
-          "tools": null
+          "enabled": true,
+          "namespace": "aft",
+          "tools": { "default_enabled": true }
         }
       }
     }
@@ -3300,7 +3310,6 @@ async fn mcp_project_provider_level_null_cannot_reset_user_denies() {
 async fn mcp_global_namespace_override_changes_exposed_prefix() {
     let user_config = r#"
     {
-      "version": 1,
       "providers": {
         "aft": { "namespace": "tools" }
       }
@@ -3335,7 +3344,6 @@ async fn mcp_global_namespace_override_changes_exposed_prefix() {
 async fn mcp_project_namespace_and_description_overrides_are_dropped() {
     let user_config = r#"
     {
-      "version": 1,
       "providers": {
         "aft": {
           "tools": {
@@ -3349,7 +3357,6 @@ async fn mcp_project_namespace_and_description_overrides_are_dropped() {
     "#;
     let project_config = r#"
     {
-      "version": 1,
       "providers": {
         "aft": {
           "namespace": "project",
@@ -3404,7 +3411,6 @@ async fn mcp_project_attempts_to_grant_are_dropped_with_warning() {
         &user_config_home,
         r#"
         {
-          "version": 1,
           "providers": { "aft": { "enabled": false } }
         }
         "#,
@@ -3426,7 +3432,6 @@ async fn mcp_project_attempts_to_grant_are_dropped_with_warning() {
         &project.path,
         r#"
         {
-          "version": 1,
           "providers": { "aft": { "enabled": true } }
         }
         "#,
@@ -3463,9 +3468,8 @@ async fn mcp_project_attempts_to_grant_are_dropped_with_warning() {
 async fn mcp_zero_tool_provider_gets_no_route() {
     let project_config = r#"
     {
-      "version": 1,
       "providers": {
-        "aft": { "tools": { "defaultEnabled": false } }
+        "aft": { "tools": { "default_enabled": false } }
       }
     }
     "#;
@@ -3510,7 +3514,6 @@ async fn mcp_facade_default_deny_requires_global_enable() {
 
     let global_config = r#"
     {
-      "version": 1,
       "providers": { "magic-context": { "enabled": true } }
     }
     "#;
@@ -3532,7 +3535,6 @@ async fn mcp_facade_default_deny_requires_global_enable() {
 
     let project_config = r#"
     {
-      "version": 1,
       "providers": { "magic-context": { "enabled": true } }
     }
     "#;
@@ -3580,7 +3582,6 @@ async fn mcp_facade_default_deny_requires_global_enable() {
 async fn mcp_meta_tool_name_collision_skips_the_entry_and_keeps_the_rest() {
     let user_config = r#"
     {
-      "version": 1,
       "providers": { "aft": { "namespace": "tools" } }
     }
     "#;
@@ -3624,7 +3625,6 @@ async fn mcp_meta_tool_name_collision_skips_the_entry_and_keeps_the_rest() {
 async fn mcp_invalid_namespace_skips_the_provider_and_keeps_the_rest() {
     let user_config = r#"
     {
-      "version": 1,
       "providers": {
         "aft": { "namespace": "bad namespace" }
       }
@@ -3721,7 +3721,6 @@ async fn mcp_invalid_tool_name_skips_the_tool_and_keeps_the_rest() {
 async fn mcp_namespace_collision_keeps_the_first_claimant() {
     let user_config = r#"
     {
-      "version": 1,
       "providers": {
         "aft": { "namespace": "dup" },
         "mc": { "namespace": "dup" }
@@ -3765,7 +3764,172 @@ async fn mcp_invalid_config_fails_attach_closed() {
         "mcp-invalid-config",
         vec![StubProvider::new("aft", &[("FAKE_AFT_TOOLS", "read")])],
         None,
-        Some(r#"{ "providers": { "aft": {} } }"#),
+        Some(r#"{ "providers": { "aft": { "enabled": null } } }"#),
+    )
+    .await;
+}
+
+async fn settings_hello(connection: &Path, project_root: &Path) -> (Value, TcpStream) {
+    let mut stream = connect_control_client(connection).await.unwrap();
+    write_len_prefixed_json(
+        &mut stream,
+        &json!({
+            "schema": TEST_SHIM_SCHEMA_VERSION,
+            "operation": "settings.get",
+            "project_root": project_root,
+            "harness": "mcp:generic",
+            "shim_session_id": "settings-test",
+        }),
+        TEST_MAX_SHIM_CONTROL_MESSAGE_LEN,
+    )
+    .await
+    .unwrap();
+    let ack = timeout(
+        READ_TIMEOUT,
+        read_len_prefixed_json(&mut stream, TEST_MAX_SHIM_CONTROL_MESSAGE_LEN),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .expect("gateway sends a settings reply");
+    (ack, stream)
+}
+
+async fn assert_settings_unavailable(connection: &Path, root: &Path, expected: &str) {
+    let (ack, mut stream) = settings_hello(connection, root).await;
+    assert_eq!(ack["settings_status"], "unavailable", "{ack}");
+    assert!(
+        ack["message"]
+            .as_str()
+            .is_some_and(|message| message.contains(expected)),
+        "{ack}"
+    );
+    let mut byte = [0];
+    assert_eq!(
+        timeout(NO_HANG_TIMEOUT, stream.read(&mut byte))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn mcp_converts_user_settings_once_with_comments_and_private_backup() {
+    let server = TestServer::start().await;
+    let home = server.daemon.temp_dir.join("convert-settings");
+    let dir = home.join("cortexkit");
+    let old = dir.join("mcp.jsonc");
+    let canonical = dir.join("subc-mcp.jsonc");
+    fs::create_dir_all(&dir).unwrap();
+    let source = r#"// file note
+{
+  "version": 1,
+  // surface note
+  "surfaceMode": "search",
+  "prompts": {"defaultEnabled": false},
+  "providers": {"example": false},
+  "refresh": "on-attach",
+  "harness": {
+    "mcp:generic": {"refresh": "on-attach"},
+    "other": {"refresh": /* keep this note */ null}
+  }
+}
+"#;
+    fs::write(&old, source).unwrap();
+    let connection = home.join("gateway-connection.json");
+    let mut module = spawn_module(&server.daemon.connection_file_path, &connection, &home);
+    wait_for_module_connection_file(&mut module, &connection, READ_TIMEOUT).await;
+    let bytes =
+        fs::read_to_string(&canonical).expect("startup must publish the converted user file");
+    assert!(!old.exists());
+    assert!(bytes.contains("// file note") && bytes.contains("// surface note"));
+    assert!(bytes.contains("/* keep this note */"));
+    let value: Value = serde_json::from_str(&subc_jsonc::jsonc_to_json(&bytes).unwrap()).unwrap();
+    assert_eq!(
+        value,
+        json!({
+            "surface_mode": "search",
+            "prompts": {"default_enabled": false},
+            "providers": {"example": {"enabled": false}},
+            "refresh": "on_attach",
+            "harness": {"mcp:generic": {"refresh": "on_attach"}, "other": {}}
+        })
+    );
+    let backups = fs::read_dir(dir.join("subc-mcp"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|suffix| suffix == "bak"))
+        .collect::<Vec<_>>();
+    assert_eq!(backups.len(), 1);
+    assert_eq!(fs::read(&backups[0]).unwrap(), source.as_bytes());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&backups[0]).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+}
+
+#[tokio::test]
+async fn mcp_failed_user_conversion_preserves_source_and_fails_closed() {
+    let server = TestServer::start().await;
+    let home = server.daemon.temp_dir.join("failed-settings-conversion");
+    let dir = home.join("cortexkit");
+    fs::create_dir_all(&dir).unwrap();
+    let legacy = dir.join("mcp.jsonc");
+    // Dropping this null would make the overlay inherit a setting it reset.
+    let source =
+        r#"{"version":1,"surfaceMode":"search","harness":{"mcp:generic":{"surfaceMode":null}}}"#;
+    fs::write(&legacy, source).unwrap();
+    let connection = home.join("gateway-connection.json");
+    let mut module = spawn_module(&server.daemon.connection_file_path, &connection, &home);
+    wait_for_module_connection_file(&mut module, &connection, READ_TIMEOUT).await;
+    let project = TestProject::new("failed-settings-conversion-project");
+    assert_settings_unavailable(&connection, &project.path, "cannot remove legacy nulls").await;
+    assert_eq!(fs::read(&legacy).unwrap(), source.as_bytes());
+    assert!(!dir.join("subc-mcp.jsonc").exists());
+}
+
+#[tokio::test]
+async fn mcp_legacy_project_file_is_not_read_or_ignored() {
+    let server = TestServer::start().await;
+    let home = server.daemon.temp_dir.join("legacy-project-settings");
+    fs::create_dir_all(&home).unwrap();
+    let connection = home.join("gateway-connection.json");
+    let mut module = spawn_module(&server.daemon.connection_file_path, &connection, &home);
+    wait_for_module_connection_file(&mut module, &connection, READ_TIMEOUT).await;
+    let project = TestProject::new("legacy-settings-project");
+    let dir = project.path.join(".cortexkit");
+    fs::create_dir_all(&dir).unwrap();
+    let legacy = dir.join("mcp.jsonc");
+    let source = b"not valid JSONC";
+    fs::write(&legacy, source).unwrap();
+    assert_settings_unavailable(
+        &connection,
+        &project.path,
+        "rename the file to subc-mcp.jsonc",
+    )
+    .await;
+    assert_eq!(fs::read(&legacy).unwrap(), source);
+    assert!(!dir.join("subc-mcp.jsonc").exists());
+}
+
+#[tokio::test]
+async fn mcp_daemon_without_project_settings_fails_closed() {
+    let server = TestServer::start_inner(false).await;
+    let home = server.daemon.temp_dir.join("no-project-settings");
+    fs::create_dir_all(&home).unwrap();
+    let connection = home.join("gateway-connection.json");
+    let mut module = spawn_module(&server.daemon.connection_file_path, &connection, &home);
+    wait_for_module_connection_file(&mut module, &connection, READ_TIMEOUT).await;
+    let project = TestProject::new("unsupported-settings-project");
+    assert_settings_unavailable(
+        &connection,
+        &project.path,
+        "need a daemon with project settings",
     )
     .await;
 }
@@ -4066,9 +4230,8 @@ async fn mcp_on_attach_refresh_keeps_mid_session_config_edits_sticky() {
         &harness._project.path,
         r#"
         {
-          "version": 1,
           "providers": {
-            "aft": { "tools": { "overrides": { "write": false } } }
+            "aft": { "tools": { "overrides": { "write": { "enabled": false } } } }
           }
         }
         "#,
@@ -4093,7 +4256,6 @@ async fn mcp_on_attach_refresh_keeps_mid_session_config_edits_sticky() {
 async fn mcp_immediate_policy_removal_does_not_retain_forward_binding() {
     let user_config = r#"
     {
-      "version": 1,
       "refresh": "immediate",
       "providers": {
         "aft": {
@@ -4126,15 +4288,21 @@ async fn mcp_immediate_policy_removal_does_not_retain_forward_binding() {
         &harness._project.path,
         r#"
         {
-          "version": 1,
           "providers": {
             "aft": {
-              "tools": { "overrides": { "read": false, "write": false } }
+              "tools": { "overrides": { "read": { "enabled": false }, "write": { "enabled": false } } }
             }
           }
         }
         "#,
     );
+
+    TestMcpClient::wait_for_counter(
+        &harness.client_handler.tool_list_changed_count,
+        notification_baseline,
+        "tools/list_changed after the daemon delivered the settings change",
+    )
+    .await;
 
     let ack_result = harness
         .client
@@ -4152,12 +4320,6 @@ async fn mcp_immediate_policy_removal_does_not_retain_forward_binding() {
         .await
         .unwrap_err();
     assert_unknown_tool_error(err, "aft_write");
-    TestMcpClient::wait_for_counter(
-        &harness.client_handler.tool_list_changed_count,
-        notification_baseline,
-        "tools/list_changed after immediate policy refresh",
-    )
-    .await;
     assert_eq!(list_tool_names(&harness).await, vec!["aft_keep"]);
     assert_no_new_stub_events_within(
         harness.provider_events_path("aft"),
@@ -4173,7 +4335,6 @@ async fn mcp_immediate_policy_removal_does_not_retain_forward_binding() {
 async fn mcp_immediate_policy_removal_keeps_ack_only_tombstone_for_stale_call() {
     let user_config = r#"
     {
-      "version": 1,
       "refresh": "immediate",
       "providers": {
         "aft": {
@@ -4198,18 +4359,27 @@ async fn mcp_immediate_policy_removal_keeps_ack_only_tombstone_for_stale_call() 
     );
 
     let provider_events_before = stub_events(harness.provider_events_path("aft")).unwrap();
+    let notification_baseline = harness
+        .client_handler
+        .tool_list_changed_count
+        .load(Ordering::SeqCst);
     write_project_mcp_config(
         &harness._project.path,
         r#"
         {
-          "version": 1,
           "providers": {
-            "aft": { "tools": { "overrides": { "read": false } } }
+            "aft": { "tools": { "overrides": { "read": { "enabled": false } } } }
           }
         }
         "#,
     );
 
+    TestMcpClient::wait_for_counter(
+        &harness.client_handler.tool_list_changed_count,
+        notification_baseline,
+        "tools/list_changed after the daemon delivered the settings change",
+    )
+    .await;
     let result = harness
         .client
         .peer()
@@ -4233,10 +4403,9 @@ async fn mcp_immediate_policy_removal_keeps_ack_only_tombstone_for_stale_call() 
 async fn mcp_search_mode_exposes_meta_surface_and_private_invocation() {
     let user_config = r#"
     {
-      "version": 1,
-      "surfaceMode": "search",
+      "surface_mode": "search",
       "providers": {
-        "aft": { "tools": { "overrides": { "bash": false } } }
+        "aft": { "tools": { "overrides": { "bash": { "enabled": false } } } }
       }
     }
     "#;
@@ -4374,8 +4543,7 @@ async fn mcp_search_mode_exposes_meta_surface_and_private_invocation() {
 async fn mcp_search_mode_invoke_honors_ack_only_policy() {
     let user_config = r#"
     {
-      "version": 1,
-      "surfaceMode": "search",
+      "surface_mode": "search",
       "providers": {
         "fake-aft": {
           "tools": { "overrides": { "fake_read": { "mode": "ack_only" } } }
@@ -5036,10 +5204,7 @@ async fn expect_shim_attach_failure(
 
     let mut shim = spawn_shim(&module_connection_file, &project.path, &user_config_home);
     // Fail-closed contract: when the module rejects the attach it drops the shim's
-    // transport socket, so the shim's socket->stdout copy hits EOF and the shim
-    // process must exit, closing its stdout. A real MCP host observes fail-closed
-    // through that child-process / stdio lifecycle, so assert the production signal
-    // directly: the shim EXITS, promptly and cleanly.
+    // attach before opening MCP, the shim must exit unsuccessfully and close its stdout.
     //
     // The earlier check instead waited for an in-process rmcp client's serve() to
     // resolve, which hung to the timeout under load: the shim saw the socket EOF in
@@ -5053,8 +5218,8 @@ async fn expect_shim_attach_failure(
         .expect("shim must exit promptly when attach fails (it did not within SETUP_TIMEOUT)")
         .expect("waiting for the shim child to exit failed");
     assert!(
-        exit.success(),
-        "shim should exit cleanly on fail-closed attach (socket EOF), got {exit:?}"
+        !exit.success(),
+        "shim should not succeed when MCP settings are unavailable, got {exit:?}"
     );
     wait_for_binding_count(&server.daemon.forwarding, 0, READ_TIMEOUT).await;
 
@@ -5071,6 +5236,7 @@ async fn start_test_daemon_with_process_liveness_and_supervisor(
     name: &str,
     process_liveness: Arc<SupervisorProcessLiveness>,
     supervisor_handle: SupervisorHandle,
+    settings: bool,
 ) -> TestDaemon {
     let temp_dir = unique_temp_dir(name);
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
@@ -5097,15 +5263,27 @@ async fn start_test_daemon_with_process_liveness_and_supervisor(
         .with_supervisor(supervisor_handle);
     let forwarding = control.forwarding();
     let router = Arc::new(Router::with_control_handler(Arc::new(control)));
-    let auth = ServerAuth::new(conn.key, conn.daemon_id, conn.daemon_ver);
+    let auth = ServerAuth::new(conn.key.clone(), conn.daemon_id, conn.daemon_ver.clone());
     let task = tokio::spawn(serve_listener(listener, router, auth));
+    let front = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let mut info = conn;
+    info.endpoints[0].port = front.local_addr().unwrap().port();
+    let public_path = temp_dir.join("settings-subc-conn.json");
+    write_atomic(&public_path, &info).unwrap();
+    let settings_task = tokio::spawn(settings_fixture::serve(
+        front,
+        connection_file_path,
+        info,
+        settings,
+    ));
 
     TestDaemon {
         registry,
         forwarding,
-        connection_file_path,
+        connection_file_path: public_path,
         temp_dir,
         task,
+        settings_task,
     }
 }
 
@@ -5399,13 +5577,13 @@ fn spawn_shim(
 fn write_project_mcp_config(project_root: &Path, doc: &str) {
     let dir = project_root.join(".cortexkit");
     fs::create_dir_all(&dir).unwrap();
-    fs::write(dir.join("mcp.jsonc"), doc).unwrap();
+    fs::write(dir.join("subc-mcp.jsonc"), doc).unwrap();
 }
 
 fn write_user_mcp_config(xdg_config_home: &Path, doc: &str) {
     let dir = xdg_config_home.join("cortexkit");
     fs::create_dir_all(&dir).unwrap();
-    fs::write(dir.join("mcp.jsonc"), doc).unwrap();
+    fs::write(dir.join("subc-mcp.jsonc"), doc).unwrap();
 }
 
 async fn wait_for_registration(server: &TestServer, module_id: &str) {

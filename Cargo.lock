@@ -3306,10 +3306,12 @@ dependencies = [
 
 [[package]]
 name = "subc-mcp"
-version = "0.2.11"
+version = "0.2.12"
 dependencies = [
+ "async-trait",
  "cortexkit-log",
  "cortexkit-paths",
+ "cortexkit-store-types",
  "cortexkit-test-support",
  "rmcp",
  "ryu-js",

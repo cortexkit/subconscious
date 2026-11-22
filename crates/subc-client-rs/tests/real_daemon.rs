@@ -6940,3 +6940,6 @@ mod binary_replies;
 mod config_gate;
 #[path = "real_daemon/managed_scopes.rs"]
 mod managed_scopes;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "real_daemon/project_config.rs"]
+mod project_config;

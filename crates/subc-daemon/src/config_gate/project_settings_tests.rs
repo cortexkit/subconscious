@@ -238,17 +238,72 @@ async fn project_settings_status_reports_fresh_file_errors_without_owner_lock() 
         invalid["status"]["file_errors"],
         json!([{
             "module_id":"a", "project_id":"A", "workspace_id":"W",
-            "code":"bound_violated", "message":"a/A: /limit"
+            "code":"bound_violated", "message":"a/A: /limit", "layer":"project", "path":file
         }])
     );
     assert!(invalid["status"].get("file_errors_incomplete").is_none());
     #[cfg(target_os = "linux")]
-    project_vectors::assert_status_file_errors_sample(invalid, &rig);
+    project_vectors::assert_status_file_errors_sample(
+        "project-status-file-errors.json",
+        invalid,
+        &rig,
+    );
 
     std::fs::write(file, br#"{"limit":5}"#).unwrap();
     let valid = config_status(&handler).await;
     assert!(valid["status"].get("file_errors").is_none());
     assert!(valid["status"].get("file_errors_incomplete").is_none());
+}
+
+#[tokio::test]
+async fn project_settings_status_attributes_forbidden_workspace_field() {
+    let rig = CaptureRig::with_state(true, RootIoPool::new().unwrap(), false);
+    let private = root(&rig.project_scratch, "private");
+    write_layer(&private, 9);
+    let workspace = write_layer(&rig.workspace, 4);
+    std::fs::write(&workspace, br#"{"limit":4,"consumers":2}"#).unwrap();
+    let mut declaration = rig.rig.declaration.clone();
+    declaration.schema["properties"]["consumers"] = json!({
+        "type":"integer", "description":"Consumer count", "default":1, "x-ck-layers":["user"]
+    });
+    rig.owner
+        .declare(ConnectionId::new(11), "a", declaration, true)
+        .unwrap();
+    rig.set_projects(vec![
+        member("A", Some("W"), &[&private]),
+        member("B", Some("W"), &[]),
+    ]);
+    let invalid = config_status(&status_handler(&rig)).await;
+    let expected = ["A", "B"].map(|project| {
+        json!({
+            "module_id":"a", "project_id":project, "workspace_id":"W",
+            "code":"layer_forbidden", "message":format!("a/{project}: /consumers"),
+            "layer":"workspace", "path":workspace
+        })
+    });
+    assert_eq!(invalid["status"]["file_errors"], json!(expected));
+    assert!(invalid["status"].get("file_errors_incomplete").is_none());
+    #[cfg(target_os = "linux")]
+    project_vectors::assert_status_file_errors_sample(
+        "project-status-workspace-file-error.json",
+        invalid,
+        &rig,
+    );
+}
+
+#[tokio::test]
+async fn project_settings_status_attributes_a_refused_file_open() {
+    let rig = CaptureRig::with_state(true, RootIoPool::new().unwrap(), false);
+    let private = root(&rig.project_scratch, "private");
+    let file = write_layer(&private, 4);
+    std::fs::remove_file(&file).unwrap();
+    std::fs::create_dir(&file).unwrap();
+    rig.set_projects(vec![member("A", None, &[&private])]);
+    let invalid = config_status(&status_handler(&rig)).await;
+    let error = &invalid["status"]["file_errors"][0];
+    assert_eq!(error["code"], "layer_not_regular");
+    assert_eq!(error["layer"], "project");
+    assert_eq!(error["path"], json!(file));
 }
 
 #[tokio::test]
@@ -267,6 +322,8 @@ async fn project_settings_status_reports_user_errors_when_registry_is_down() {
     assert_eq!(errors[0]["code"], "value_invalid");
     assert!(errors[0].get("project_id").is_none());
     assert!(errors[0].get("workspace_id").is_none());
+    assert!(errors[0].get("layer").is_none());
+    assert!(errors[0].get("path").is_none());
 }
 
 #[tokio::test]
@@ -275,7 +332,7 @@ async fn project_settings_status_keeps_completed_rows_when_a_root_stalls() {
     let fast = root(&rig.project_scratch, "fast");
     let slow = root(&rig.project_scratch, "slow");
     write_layer(&rig.workspace, 4);
-    write_layer(&fast, 3);
+    let fast_file = write_layer(&fast, 3);
     write_layer(&slow, 3);
     rig.set_projects(vec![
         member("fast", Some("W"), &[&fast]),
@@ -305,21 +362,14 @@ async fn project_settings_status_keeps_completed_rows_when_a_root_stalls() {
         status["file_errors"],
         json!([{
             "module_id":"a", "project_id":"fast", "workspace_id":"W",
-            "code":"bound_violated", "message":"a/fast: /limit"
+            "code":"bound_violated", "message":"a/fast: /limit",
+            "layer":"project", "path":fast_file
         }])
     );
 }
 
 #[tokio::test]
 async fn project_settings_watch_projects_isolate_validation_and_resync_on_drop() {
-    let samples = project_watch_samples().await;
-    #[cfg(target_os = "linux")]
-    project_vectors::assert_samples(samples);
-    #[cfg(not(target_os = "linux"))]
-    drop(samples);
-}
-
-async fn project_watch_samples() -> Vec<(&'static str, serde_json::Value)> {
     let rig = CaptureRig::with_state(true, RootIoPool::new().unwrap(), false);
     let private = root(&rig.project_scratch, "private");
     rig.set_projects(vec![
@@ -367,7 +417,7 @@ async fn project_watch_samples() -> Vec<(&'static str, serde_json::Value)> {
     let baseline_resync = event_frame(&mut baseline_rx).await;
     handler.cleanup_connection(baseline.connection_id).unwrap();
     let workspace = write_layer(&rig.workspace, 4);
-    write_layer(&private, 6);
+    let project_file = write_layer(&private, 6);
 
     owner_connection(&handler, legacy.connection_id);
     let refused = request(
@@ -422,6 +472,8 @@ async fn project_watch_samples() -> Vec<(&'static str, serde_json::Value)> {
     assert_eq!(invalid_b["project_id"], "B");
     assert_eq!(invalid_b["workspace_id"], "W");
     assert!(invalid_b["file_error"].is_object());
+    assert_eq!(invalid_b["file_error"]["layer"], "project");
+    assert_eq!(invalid_b["file_error"]["path"], json!(project_file));
     assert_eq!(invalid_b["status"], rows[2]["status"]);
     assert!(matches!(legacy_rx.try_recv(), Err(TryRecvError::Empty)));
 
@@ -431,6 +483,8 @@ async fn project_watch_samples() -> Vec<(&'static str, serde_json::Value)> {
         assert_eq!(invalid_file["event"], "change");
         assert_eq!(invalid_file["project_id"], project);
         assert_eq!(invalid_file["file_error"]["code"], "value_invalid");
+        assert_eq!(invalid_file["file_error"]["layer"], "workspace");
+        assert_eq!(invalid_file["file_error"]["path"], json!(workspace));
     }
     assert!(matches!(legacy_rx.try_recv(), Err(TryRecvError::Empty)));
     assert!(matches!(opted_rx.try_recv(), Err(TryRecvError::Empty)));
@@ -443,12 +497,16 @@ async fn project_watch_samples() -> Vec<(&'static str, serde_json::Value)> {
     assert!(matches!(legacy_rx.try_recv(), Err(TryRecvError::Empty)));
     handler.cleanup_connection(opted.connection_id).unwrap();
     handler.cleanup_connection(legacy.connection_id).unwrap();
-    vec![
-        ("project-watch.request.json", watch),
-        ("project-watch.resync.json", initial),
-        ("project-watch.change.json", invalid_b),
-        ("project-watch.drop.resync.json", dropped),
-    ]
+    #[cfg(target_os = "linux")]
+    project_vectors::assert_watch_samples(
+        [
+            ("project-watch.request.json", watch),
+            ("project-watch.resync.json", initial),
+            ("project-watch.change.json", invalid_b),
+            ("project-watch.drop.resync.json", dropped),
+        ],
+        &rig,
+    );
 }
 
 #[tokio::test]

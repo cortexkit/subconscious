@@ -435,7 +435,7 @@ fn plan_module<'a>(
                     ConfigStatus::Pending
                 };
         }
-        let layers = capture_plan::tuple_layers(module, project, |root, path| {
+        let layers = capture_plan::tuple_layers(module, project, |root, path, _layer| {
             let (_, location) = revision.layer_location(id, root)?;
             plan.context.edit_observations.inputs.insert(
                 capture_plan::file_key(module, path),

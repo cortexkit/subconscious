@@ -258,9 +258,8 @@ type Layers = Vec<ConfigLayerSnapshot>;
 
 fn read_layers(module: &str, id: &str, revision: &RegistryRevision) -> Result<Layers> {
     let project = revision.project(id)?;
-    tuple_layers(module, project, |root, _| {
-        let (_, location) = revision.layer_location(id, root)?;
-        Ok(location.file.as_ref().map(|file| file.bytes.clone()))
+    tuple_layers(module, project, |root, path, layer| {
+        revision.observed_layer_file(id, root, path, layer)
     })
 }
 
@@ -600,7 +599,7 @@ fn observe_project_files(
         Ok(())
     })();
     files.error = match result {
-        Err(error) => Some(ConfigFileError::new(error.code, error.detail)),
+        Err(error) => Some(error.into_settings_file_error()),
         Ok(()) => user_error.cloned(),
     };
     files.read_failed = files.layers.is_none();

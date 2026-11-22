@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.50.36
+
+- Name the refused workspace or project settings file in watch and status
+  diagnostics when the failure identifies a single file. Require subc-config
+  0.1.5 and subc-control 0.42.6.
+
 ## 0.50.35
 
 - Test only: advance the paused clock through the process group's TERM grace

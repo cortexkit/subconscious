@@ -272,12 +272,12 @@ impl RuntimeOwner {
             let revision = revision?;
             let project = revision.project(&read.project)?;
             observation.workspace_id.clone_from(&project.workspace_id);
-            let layers = capture_plan::tuple_layers(&read.module, project, |root, _| {
-                let (_, location) = revision.layer_location(&read.project, root)?;
-                if location.file.is_some() {
+            let layers = capture_plan::tuple_layers(&read.module, project, |root, path, layer| {
+                let file = revision.observed_layer_file(&read.project, root, path, layer)?;
+                if file.is_some() {
                     observation.present = Some(true);
                 }
-                Ok(location.file.as_ref().map(|file| file.bytes.clone()))
+                Ok(file)
             })?;
             observation.present = Some(!layers.is_empty());
             let captured = self.capturer.capture_modules(
@@ -357,9 +357,7 @@ impl RuntimeOwner {
                     present: observed.present.unwrap_or_else(|| {
                         slot.observation.as_ref().is_some_and(|row| row.present)
                     }),
-                    file_error: error.map(|error| {
-                        ConfigFileError::new(error.code.clone(), error.detail.clone())
-                    }),
+                    file_error: error.cloned().map(GateError::into_settings_file_error),
                 }
             });
         let new_fingerprint = observed.result.as_ref().ok().map(|(_, digest)| digest);
@@ -451,16 +449,34 @@ pub(super) fn live_view(
             } else {
                 Layer::Project
             };
-            schema.record_layer(
-                kind,
-                layer.bytes.as_deref().expect("only present project layers"),
-                module,
-                project,
-            )
+            schema
+                .record_layer(
+                    kind,
+                    layer.bytes.as_deref().expect("only present project layers"),
+                    module,
+                    project,
+                )
+                .map_err(|error| {
+                    error
+                        .at_settings_layer(kind)
+                        .with_settings_path(|_| layer.path.clone())
+                })
         })
         .collect::<Result<Vec<_>>>()?;
     let user = user.file.bytes.as_deref().map(parse_layer).transpose()?;
-    let mut reviewed = schema.review_tuple(module, project, user.clone(), &recorded, None)?;
+    let locate = |error: GateError| {
+        error.with_settings_path(|source| {
+            let layer = if source == Layer::Workspace {
+                ConfigLayer::Workspace
+            } else {
+                ConfigLayer::Project
+            };
+            layers.iter().find(|item| item.layer == layer)?.path.clone()
+        })
+    };
+    let mut reviewed = schema
+        .review_tuple(module, project, user.clone(), &recorded, None)
+        .map_err(locate)?;
     let mut keep = layers.len();
     match through {
         Some(ConfigThrough::Default | ConfigThrough::User) => return Ok(view),
@@ -470,7 +486,9 @@ pub(super) fn live_view(
                 return Ok(view);
             }
             if keep < layers.len() {
-                reviewed = schema.review_tuple(module, project, user, &recorded[..keep], None)?;
+                reviewed = schema
+                    .review_tuple(module, project, user, &recorded[..keep], None)
+                    .map_err(locate)?;
             }
         }
         None => {}

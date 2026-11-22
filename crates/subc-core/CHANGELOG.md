@@ -3,7 +3,8 @@
 ## 0.21.38
 
 - Preserve the refused project settings file's layer and path in human and JSON
-  `ck config status` output. Require subc-control 0.42.6 and subc-client-rs 0.41.10.
+  `ck config status` output. Require subc-control 0.42.6, subc-client-rs 0.41.10,
+  and subc-daemon 0.50.36.
 
 ## 0.21.37
 

@@ -130,8 +130,8 @@ channel-0 handlers and watch/delivery workers. Most samples pair `request` and
 | `project-show.json` | Full approved tuple with user, workspace and project documents and the winning source. |
 | `project-show-default.json`, `project-show-user.json`, `project-show-workspace.json` | The same tuple at its three inclusive cutoffs. |
 | `project-watch.request.json`, `project-watch.resync.json` | Opt in with `projects: true`; the first resync has the user row followed by project rows. |
-| `project-watch.change.json` | A project's bound violation reports `file_error` on that tuple only. |
-| `project-watch.drop.resync.json` | A replacement snapshot after a project leaves the registry. |
+| `project-watch.change.json` | A project's bound violation reports the project file and path on that tuple only. |
+| `project-watch.drop.resync.json` | A replacement snapshot after a project leaves the registry, retaining the remaining project's workspace-file error. |
 | `project-plan-edit.json`, `project-apply-unstamped.json` | Edit one workspace file and apply its reviewed digest at generation zero. |
 | `project-plan-capture.json` | Review the healthy project tuple; an unavailable root is a `skipped` notice, not a blocking `refusals` row. |
 | `project-plan-root-refusals.json` | Blocking `layer_symlink`, `layer_not_regular`, `layer_hardlinked`, `layer_too_large`, `layer_root_invalid` and `layer_root_ambiguous` rows. |
@@ -143,7 +143,8 @@ channel-0 handlers and watch/delivery workers. Most samples pair `request` and
 | `project-changed.json`, `project-get-pending.json`, `project-applied.json` | Discovery, a pending delivery with a project-specific attempt, and its ACK. |
 | `project-get-fallback.json`, `project-get-unstamped.json` | Stamped layerless fallback and fresh unstamped delivery; neither has an attempt. |
 | `project-status-root-io.json` | `config.status` while one root job is past its deadline; idle status omits `root_io`. |
-| `project-status-file-errors.json` | `config.status` reports an unstamped project's refused settings file without the watch's settling grace. |
+| `project-status-file-errors.json` | On an unstamped daemon (its settings store has no approval key yet, so settings apply without approval), `config.status` reports a refused project file immediately, without waiting for confirmation on a second poll. |
+| `project-status-workspace-file-error.json` | `config.status` reports the same workspace file path for two projects when the workspace sets a user-only field. |
 
 The legacy watch test compares raw resync bodies before and after adding
 project layers. On the same layered state, legacy subscribers get no project
@@ -161,12 +162,14 @@ preconditions based on file bytes are preserved. The test then recomputes
 the normalized plan digest and uses it in the matching apply sample. The
 status sample clears `ungated_inputs` to exclude the build runner's environment.
 
-Regenerate on Linux from the repository root. Run the two writers serially
-because both update the checksum manifest:
+Regenerate on Linux from the repository root. Run the writers serially because
+they update the same checksum manifest:
 
 ```sh
 UPDATE_GOLDEN=1 scripts/test-daemon-lib.sh -- \
   project_settings_vectors_match_real_handler_bytes \
   project_settings_watch_projects_isolate_validation_and_resync_on_drop \
+  project_settings_status_reports_fresh_file_errors_without_owner_lock \
+  project_settings_status_attributes_forbidden_workspace_field \
   --test-threads=1
 ```

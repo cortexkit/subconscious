@@ -101,20 +101,26 @@ impl ProjectLayerSchema {
             .map(|value| LayerValue::new(Layer::User, value))
             .collect();
         for layer in layers {
-            self.check_credentials(module, project, &layer.input.value)?;
+            self.check_credentials(module, project, &layer.input.value)
+                .map_err(|error| error.at_settings_layer(layer.input.layer))?;
             inputs.push(layer.input.clone());
         }
         let reviewed = self
             .schema
-            .review_tuple(
+            .review_tuple_attributed(
                 &inputs,
                 &ValidationContext::new(module, Some(project.into())),
             )
-            .map_err(|refusal| {
-                GateError::new(
+            .map_err(|attributed| {
+                let refusal = attributed.refusal;
+                let error = GateError::new(
                     capture::refusal_code(refusal.code),
                     format!("{module}/{project}: {}", refusal.path),
-                )
+                );
+                match attributed.layer {
+                    Some(layer) => error.at_settings_layer(layer),
+                    None => error,
+                }
             })?;
         refuse_project_apply_kinds(module, project, base, &self.schema, &reviewed)?;
         Ok(reviewed)
@@ -212,17 +218,19 @@ pub fn refuse_project_apply_kinds(
 ) -> Result<()> {
     let check = |schema: &Schema, effective: &Value, sources: &BTreeMap<String, Layer>| {
         for path in review::leaf_paths(schema, effective) {
+            let Some(layer @ (Layer::Workspace | Layer::Project)) = review::source(sources, &path)
+            else {
+                continue;
+            };
             if matches!(
-                review::source(sources, &path),
-                Some(Layer::Workspace | Layer::Project)
-            ) && matches!(
                 review::apply_for_project(schema.normalized(), effective, &path)?,
                 ApplyKind::NextSupervision | ApplyKind::RouteRebind
             ) {
                 return Err(GateError::new(
                     "project_apply_kind_unsupported",
                     format!("{module}/{project}: {path}"),
-                ));
+                )
+                .at_settings_layer(layer));
             }
         }
         Ok(())

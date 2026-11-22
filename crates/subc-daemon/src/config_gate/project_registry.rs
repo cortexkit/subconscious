@@ -15,7 +15,7 @@ use cortexkit_project_identity::{
     Approval, ApprovalState, EnumerateReply, Project, RootIdentity, RootIncarnation, RootRecord,
 };
 use serde::{Deserialize, Serialize};
-use subc_config::Digest;
+use subc_config::{Digest, Layer};
 
 mod layers;
 pub(super) mod live;
@@ -532,6 +532,39 @@ impl RegistryRevision {
 
     /// Borrow a retained root and its layer observation for a registered project.
     pub fn layer_location(&self, id: &str, root: &Path) -> Result<(&File, &LayerLocation)> {
+        let opened = self.layer_root(id, root)?;
+        Ok((&opened.handle, location(opened, id, root)?))
+    }
+
+    pub(super) fn observed_layer_file(
+        &self,
+        id: &str,
+        root: &Path,
+        path: &Path,
+        layer: &subc_protocol::config::ConfigLayer,
+    ) -> Result<Option<Vec<u8>>> {
+        use subc_protocol::config::ConfigLayer;
+        let opened = self.layer_root(id, root)?;
+        let location = location(opened, id, root).map_err(|error| {
+            // Root and registry failures have no resolved file. Attribute only
+            // an error from reading the settings location in the retained root.
+            if opened.layer.as_ref().is_some_and(|layer| layer.is_err()) {
+                let layer = if *layer == ConfigLayer::Workspace {
+                    Layer::Workspace
+                } else {
+                    Layer::Project
+                };
+                error
+                    .at_settings_layer(layer)
+                    .with_settings_path(|_| path.to_str().map(str::to_owned))
+            } else {
+                error
+            }
+        })?;
+        Ok(location.file.as_ref().map(|file| file.bytes.clone()))
+    }
+
+    fn layer_root(&self, id: &str, root: &Path) -> Result<&OpenedRoot> {
         let project = self.project(id)?;
         if let Some(error) = self.metadata_errors.get(id) {
             return Err(error.clone());
@@ -540,13 +573,12 @@ impl RegistryRevision {
         for record in project.roots().filter(|record| record.path == root) {
             opened = Some(self.opened_root(id, record, false)?);
         }
-        let opened = opened.ok_or_else(|| {
+        opened.ok_or_else(|| {
             GateError::new(
                 "layer_root_invalid",
                 "project does not authorize this layer root",
             )
-        })?;
-        Ok((&opened.handle, location(opened, id, root)?))
+        })
     }
 
     /// Resolve present tuple inputs or return this project's refusal alone.

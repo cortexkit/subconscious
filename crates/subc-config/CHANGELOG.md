@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.5
+
+- Add `Schema::review_tuple_attributed` to identify the layer refused during
+  review. Leave the existing `Schema::review_tuple` API and refusal format intact.
+
 ## 0.1.4
 
 - Refuse only the old value-reference shapes `{"env": "<string>"}` and `{"file": "<string>"}`.

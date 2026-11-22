@@ -479,11 +479,16 @@ async fn root_io_health_sample() -> Sample {
     ("project-status-root-io.json", normalize_status(busy, &rig))
 }
 
-pub(super) fn assert_status_file_errors_sample(reply: Value, rig: &CaptureRig) {
-    assert_samples([(
-        "project-status-file-errors.json",
-        normalize_status(reply, rig),
-    )]);
+pub(super) fn assert_status_file_errors_sample(name: &'static str, reply: Value, rig: &CaptureRig) {
+    assert_samples([(name, normalize_status(reply, rig))]);
+}
+
+pub(super) fn assert_watch_samples(samples: impl IntoIterator<Item = Sample>, rig: &CaptureRig) {
+    assert_samples(
+        samples
+            .into_iter()
+            .map(|(name, sample)| (name, normalize(sample, rig, false))),
+    );
 }
 
 fn normalize_status(mut reply: Value, rig: &CaptureRig) -> Value {

@@ -67,6 +67,15 @@ impl ReviewedTuple {
     }
 }
 
+/// A tuple review refusal with the input layer, if a single layer was refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AttributedRefusal {
+    pub refusal: Refusal,
+    /// Absent when validation of the merged tuple fails.
+    pub layer: Option<Layer>,
+}
+
 impl Schema {
     pub fn new(schema: Value) -> Result<Self, Refusal> {
         if schema.get("$schema").and_then(Value::as_str)
@@ -114,6 +123,16 @@ impl Schema {
         layers: &[LayerValue],
         context: &ValidationContext,
     ) -> Result<ReviewedTuple, Refusal> {
+        self.review_tuple_attributed(layers, context)
+            .map_err(|error| error.refusal)
+    }
+
+    /// Review a tuple, retaining the input layer on failures during its application.
+    pub fn review_tuple_attributed(
+        &self,
+        layers: &[LayerValue],
+        context: &ValidationContext,
+    ) -> Result<ReviewedTuple, AttributedRefusal> {
         let mut effective = self.defaults();
         let mut sources = BTreeMap::new();
         mark_sources(
@@ -126,10 +145,14 @@ impl Schema {
         let mut previous = Layer::Default;
         let mut user_credentials = BTreeSet::new();
         for proposal in layers {
+            let at_layer = |refusal| AttributedRefusal {
+                refusal,
+                layer: Some(proposal.layer),
+            };
             if proposal.layer <= previous
                 || (proposal.layer == Layer::Project && context.project_id.is_none())
             {
-                return Err(refusal(RefusalCode::LayerForbidden, "", context));
+                return Err(at_layer(refusal(RefusalCode::LayerForbidden, "", context)));
             }
             previous = proposal.layer;
             validate(
@@ -139,7 +162,8 @@ impl Schema {
                 Some(proposal.layer),
                 true,
                 context,
-            )?;
+            )
+            .map_err(at_layer)?;
             if proposal.layer == Layer::User {
                 collect_credentials(&self.normalized, &proposal.value, &mut user_credentials);
             }
@@ -150,7 +174,8 @@ impl Schema {
                     "",
                     &user_credentials,
                     context,
-                )?;
+                )
+                .map_err(at_layer)?;
                 for (credential_path, destinations) in &context.credential_destinations {
                     if effective
                         .pointer(credential_path)
@@ -161,11 +186,11 @@ impl Schema {
                             .iter()
                             .any(|p| proposal.value.pointer(p).is_some())
                     {
-                        return Err(refusal(
+                        return Err(at_layer(refusal(
                             RefusalCode::CredentialShared,
                             credential_path,
                             context,
-                        ));
+                        )));
                     }
                 }
             }
@@ -177,9 +202,15 @@ impl Schema {
                 proposal.layer,
                 &mut sources,
                 context,
-            )?;
+            )
+            .map_err(at_layer)?;
         }
-        validate(&self.normalized, &effective, "", None, false, context)?;
+        validate(&self.normalized, &effective, "", None, false, context).map_err(|refusal| {
+            AttributedRefusal {
+                refusal,
+                layer: None,
+            }
+        })?;
         Ok(ReviewedTuple::new(effective, sources))
     }
     /// The only schema-aware value projection intended for durable views and
@@ -1390,6 +1421,42 @@ mod tests {
     fn context() -> ValidationContext {
         ValidationContext::new("module", Some("project-one".into()))
     }
+
+    #[test]
+    fn attributed_tuple_review_distinguishes_input_and_merged_failures() {
+        let user_only = json!({"type":"integer","description":"Count","default":1,
+            "x-ck-apply":"live","x-ck-layers":["user"]});
+        let required = json!({"type":"integer","description":"Required value",
+            "x-ck-apply":"live","x-ck-layers":["user","workspace","project"],"x-ck-required":true});
+        let schema = schema(json!({"count":user_only,"needed":required}));
+        let context = context();
+        let layers = [
+            LayerValue::new(Layer::Workspace, json!({"count":2})),
+            LayerValue::new(Layer::Project, json!({"needed":3})),
+        ];
+        let input = schema
+            .review_tuple_attributed(&layers, &context)
+            .unwrap_err();
+        assert_eq!(input.layer, Some(Layer::Workspace));
+        assert_eq!(input.refusal.code, RefusalCode::LayerForbidden);
+        assert_eq!(input.refusal.path, "/count");
+        assert_eq!(
+            schema.review_tuple(&layers, &context).unwrap_err(),
+            input.refusal
+        );
+
+        let layers = [LayerValue::new(Layer::Project, json!({}))];
+        let merged = schema
+            .review_tuple_attributed(&layers, &context)
+            .unwrap_err();
+        assert_eq!(merged.layer, None);
+        assert_eq!(merged.refusal.path, "/needed");
+        assert_eq!(
+            schema.review_tuple(&layers, &context).unwrap_err(),
+            merged.refusal
+        );
+    }
+
     fn layers(user: Value, project: Value) -> Vec<LayerValue> {
         vec![
             LayerValue::new(Layer::User, user),

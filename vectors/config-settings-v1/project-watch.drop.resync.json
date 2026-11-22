@@ -14,7 +14,9 @@
       "approved_generation": 0,
       "file_error": {
         "code": "value_invalid",
-        "message": "configuration must be JSON with unique keys and lossless finite numbers"
+        "layer": "workspace",
+        "message": "configuration must be JSON with unique keys and lossless finite numbers",
+        "path": "/home/example/repos/workspace/.cortexkit/a.jsonc"
       },
       "gated": true,
       "module_id": "a",

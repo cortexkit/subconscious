@@ -468,7 +468,7 @@ impl ModuleRoots {
         project: &RegistryProject,
         approved: &BTreeMap<PathBuf, &ConfigLayerSnapshot>,
     ) -> Result<Vec<ConfigLayerSnapshot>> {
-        tuple_layers(&self.revision.module, project, |root, path| {
+        tuple_layers(&self.revision.module, project, |root, path, _layer| {
             if self.held.contains(path) {
                 Ok(approved.get(path).and_then(|layer| layer.bytes.clone()))
             } else {
@@ -482,11 +482,11 @@ impl ModuleRoots {
 pub(super) fn tuple_layers(
     module: &str,
     project: &RegistryProject,
-    mut bytes: impl FnMut(&Path, &Path) -> Result<Option<Vec<u8>>>,
+    mut bytes: impl FnMut(&Path, &Path, &ConfigLayer) -> Result<Option<Vec<u8>>>,
 ) -> Result<Vec<ConfigLayerSnapshot>> {
     let mut input = |root: &Path, layer| -> Result<Option<ConfigLayerSnapshot>> {
         let path = layer_path(root, module);
-        let bytes = bytes(root, &path)?;
+        let bytes = bytes(root, &path, &layer)?;
         Ok(bytes.map(|bytes| {
             let mut snapshot =
                 ConfigLayerSnapshot::file(module, layer, path.to_string_lossy(), Some(bytes));

@@ -3,6 +3,7 @@
 ## 0.42.6
 
 - Decode optional `layer` and `path` on project settings file diagnostics.
+  Require subc-config 0.1.5.
 
 ## 0.42.5
 

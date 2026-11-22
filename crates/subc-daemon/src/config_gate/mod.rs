@@ -39,8 +39,8 @@ pub(crate) fn module_base_generation(body: &crate::config_store::StoreBody, modu
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use subc_config::{Changeset, Digest, Generation, Plan};
-use subc_control::config::ConfigPlanView;
+use subc_config::{Changeset, Digest, Generation, Layer, Plan};
+use subc_control::config::{ConfigFileError, ConfigFileErrorLayer, ConfigPlanView};
 
 use crate::config_store::{CommitKind, ConfigStore, HistoryEntry, StoreError, StoreState, Tuple};
 
@@ -49,6 +49,7 @@ pub struct GateError {
     pub code: String,
     pub detail: String,
     capture_race: bool,
+    settings_file: Option<Box<(Layer, Option<String>)>>,
 }
 type Result<T> = std::result::Result<T, GateError>;
 
@@ -58,7 +59,36 @@ impl GateError {
             code: code.into(),
             detail: detail.to_string(),
             capture_race: false,
+            settings_file: None,
         }
+    }
+
+    fn at_settings_layer(mut self, layer: Layer) -> Self {
+        if matches!(layer, Layer::Project | Layer::Workspace) {
+            self.settings_file = Some(Box::new((layer, None)));
+        }
+        self
+    }
+
+    fn with_settings_path(mut self, path_for: impl FnOnce(Layer) -> Option<String>) -> Self {
+        if let Some(file) = self.settings_file.as_mut() {
+            file.1 = path_for(file.0).filter(|path| std::path::Path::new(path).is_absolute());
+        }
+        self
+    }
+
+    fn into_settings_file_error(self) -> ConfigFileError {
+        let mut error = ConfigFileError::new(self.code, self.detail);
+        if let Some(file) = self.settings_file {
+            let (layer, path) = *file;
+            error.layer = match layer {
+                Layer::Project => Some(ConfigFileErrorLayer::Project),
+                Layer::Workspace => Some(ConfigFileErrorLayer::Workspace),
+                _ => None,
+            };
+            error.path = path;
+        }
+        error
     }
     fn invalid(detail: impl ToString) -> Self {
         Self::new("value_invalid", detail)

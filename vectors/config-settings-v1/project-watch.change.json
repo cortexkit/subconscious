@@ -4,7 +4,9 @@
   "event": "change",
   "file_error": {
     "code": "bound_violated",
-    "message": "a/B: /limit"
+    "layer": "project",
+    "message": "a/B: /limit",
+    "path": "/home/example/repos/private/.cortexkit/a.jsonc"
   },
   "module_id": "a",
   "op": "config.watch",

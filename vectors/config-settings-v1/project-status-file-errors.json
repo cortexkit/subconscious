@@ -10,8 +10,10 @@
       "file_errors": [
         {
           "code": "bound_violated",
+          "layer": "project",
           "message": "a/A: /limit",
           "module_id": "a",
+          "path": "/home/example/repos/private/.cortexkit/a.jsonc",
           "project_id": "A",
           "workspace_id": "W"
         }

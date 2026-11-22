@@ -3,6 +3,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { buildFlags, buildFrame, encodeFrame, FrameType, Priority, SubcSocket } from "../src/index.js";
+import type { ConfigFileError, ConfigStatusFileError, ConfigWatchFileErrorRow } from "../src/index.js";
 
 const folder = join(import.meta.dir, "../../../vectors/config-settings-v1");
 const projectVectors = readdirSync(folder).filter((name) => name.startsWith("project-") && name.endsWith(".json")).sort();
@@ -29,7 +30,22 @@ for (const name of projectVectors) {
         const deadline = Date.now() + 1000;
         const frame = await socket.readFrame(deadline, deadline);
         expect(frame.header).toMatchObject({ ty, flags, channel: 0, epoch: 0, corr });
-        expect(JSON.parse(Buffer.from(frame.body).toString("utf8"))).toEqual(body);
+        const decoded = JSON.parse(Buffer.from(frame.body).toString("utf8"));
+        expect(decoded).toEqual(body);
+        if (name === "project-watch.change.json") {
+          const row: ConfigWatchFileErrorRow = decoded;
+          const error: ConfigFileError | undefined = row.file_error;
+          expect(error?.layer).toBe("project");
+          expect(error?.path).toBe("/home/example/repos/private/.cortexkit/a.jsonc");
+        }
+        if (name === "project-status-workspace-file-error.json" && ty === FrameType.Response) {
+          const errors: ConfigStatusFileError[] = decoded.status.file_errors;
+          expect(errors.map(({ project_id }) => project_id)).toEqual(["A", "B"]);
+          for (const { layer, path } of errors) {
+            expect(layer).toBe("workspace");
+            expect(path).toBe("/home/example/repos/workspace/.cortexkit/a.jsonc");
+          }
+        }
       }
     } finally { socket.close(); }
   });

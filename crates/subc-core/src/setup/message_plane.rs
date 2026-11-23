@@ -45,6 +45,18 @@ pub(super) fn grant_keys(
             "read",
         ),
         (
+            "reserved:entorhinal",
+            "exact",
+            "signing:fleet-record:1",
+            "read",
+        ),
+        (
+            "reserved:entorhinal",
+            "exact",
+            "signing:fleet-record:1",
+            "sign",
+        ),
+        (
             "reserved:ckbus",
             "audience",
             "cortexkit-hub",
@@ -266,6 +278,8 @@ mod tests {
             "grant --principal reserved:callosum --selector-kind exact --selector kem:bus-seal:1 --operation read",
             "grant --principal reserved:callosum --selector-kind exact --selector kem:fleet-epoch-wrap:1 --operation read",
             "grant --principal reserved:callosum --selector-kind exact --selector signing:fleet-record:1 --operation read",
+            "grant --principal reserved:entorhinal --selector-kind exact --selector signing:fleet-record:1 --operation read",
+            "grant --principal reserved:entorhinal --selector-kind exact --selector signing:fleet-record:1 --operation sign",
             "grant --principal reserved:ckbus --selector-kind audience --selector cortexkit-hub --operation account_token",
         ];
         let calls = fs::read_to_string(root.join("calls")).unwrap();

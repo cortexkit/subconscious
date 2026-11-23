@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.21.39
+
+- During setup and upgrade, grant Entorhinal exact `read` and `sign` on `signing:fleet-record:1`.
+
 ## 0.21.38
 
 - Preserve the refused project settings file's layer and path in human and JSON

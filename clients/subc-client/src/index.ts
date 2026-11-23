@@ -8,6 +8,7 @@ export {
   isEstablishedRouteDead,
   isRouteBusyRetryable,
   isRetryableRouteOpenCode,
+  isRetryableRouteOpenRefusal,
   DEFAULT_RECONNECT_BACKOFF,
   SUBC_MODULE_ID_ENV,
   SUBC_LAUNCH_NONCE_ENV,

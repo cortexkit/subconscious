@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.26.10
+
+- Stop retrying route opens when the daemon returns boolean `detail.expected_back: false`.
+  Export `isRetryableRouteOpenRefusal` for consumers with their own retry loop.
+
 ## 0.26.9
 
 - Export wire types for settings file errors in `config.watch` and

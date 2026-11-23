@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.37.7
+
+- Add a route-open refusal predicate that treats boolean `detail.expected_back: false`
+  as terminal, even for an otherwise retryable code.
+
 ## 0.37.6
 
 - Define the module wire bodies for reading the agent policy trust root and

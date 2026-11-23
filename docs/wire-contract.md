@@ -494,12 +494,19 @@ the daemon-owned codes defined in `subc_protocol::error_codes`.
 
 ### 5.1 Retryable and terminal `route.open` refusals
 
-`error_codes::is_retryable_route_open` is the single predicate both SDKs call.
+`error_codes::is_retryable_route_open_refusal` is the Rust predicate for the
+whole refusal; the TypeScript SDK mirrors it. Clients stop retrying and return
+the refusal as soon as `detail.expected_back` is the boolean `false`, even if
+the code would otherwise permit a retry. An absent, true, or non-boolean verdict
+does not change the code's retryability. A terminal code remains terminal.
+
+`error_codes::is_retryable_route_open` is the code-only predicate.
 The golden table `crates/subc-protocol/tests/golden/decision_tables.json`
 (`route_open_retryable`) records every code's verdict, and
 `route_open_retry_predicate_matches_the_decision_table` (`crates/subc-protocol/tests/golden_json.rs`) holds the predicate to it.
 
-Retryable within the caller's own deadline:
+Retryable within the caller's own deadline unless the refusal reports
+`detail.expected_back: false`:
 
 | Code | Meaning |
 | --- | --- |

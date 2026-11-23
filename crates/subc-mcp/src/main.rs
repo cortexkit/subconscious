@@ -2737,18 +2737,12 @@ async fn open_provider_route(
 #[derive(Debug)]
 struct RouteOpenRefused {
     target: String,
-    code: String,
-    message: String,
-    /// The daemon's `detail`, verbatim; reported in a call's outage block.
-    detail: Option<serde_json::Value>,
+    body: ErrorBody,
 }
 
 impl RouteOpenRefused {
     fn outage_refusal(&self) -> OutageRefusal {
-        OutageRefusal {
-            code: self.code.clone(),
-            detail: self.detail.clone(),
-        }
+        self.body.clone()
     }
 }
 
@@ -2757,7 +2751,7 @@ impl std::fmt::Display for RouteOpenRefused {
         write!(
             f,
             "subc refused route.open for target '{}': {}: {}",
-            self.target, self.code, self.message
+            self.target, self.body.code, self.body.message
         )
     }
 }
@@ -2834,9 +2828,7 @@ async fn open_scoped_route(
             // nothing proves the daemon meant a per-target refusal.
             Ok(error) => Err(Box::new(RouteOpenRefused {
                 target: target_label.to_string(),
-                code: error.code,
-                message: error.message,
-                detail: error.detail,
+                body: error,
             })),
             Err(_) => Err(error_response(
                 &format!("subc rejected route.open for target '{target_label}'"),
@@ -4141,7 +4133,7 @@ fn claude_code_tool_use_id(meta: &RequestMetaObject) -> ToolUseIdMeta<'_> {
 /// plain tool error for the model; none of them falls back to the route bound
 /// at attach, because that route belongs to the lead agent's conversation and
 /// a subagent's call sent on it would act on the wrong conversation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum ConversationRouteRefusal {
     /// `_meta` carried the tool-use id key with an empty or non-string value.
     MalformedToolUseId,
@@ -5882,29 +5874,21 @@ enum ToolCallOutcome {
 /// data-plane refusal. No attempt that may have run enters the outage wait;
 /// such an attempt returns its error immediately, so every prior attempt of
 /// an outage result is also proven unsent.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct OutageRefusal {
-    /// The daemon's code, verbatim.
-    code: String,
-    /// The daemon's `detail`, verbatim.
-    detail: Option<serde_json::Value>,
-}
+type OutageRefusal = ErrorBody;
 
-impl OutageRefusal {
-    /// The detail as one line: compact JSON with object keys sorted, or a
-    /// string detail as it is. A line that breaks the block's rules is left
-    /// out by the renderer.
-    ///
-    /// Keys are sorted explicitly because serde_json's map order is a build
-    /// feature: `preserve_order`, which another workspace crate enables,
-    /// keeps insertion order, and the default sorts. Without this the bytes
-    /// the model reads would depend on how the gateway was built.
-    fn detail_line(&self) -> Option<String> {
-        match self.detail.as_ref()? {
-            serde_json::Value::Null => None,
-            serde_json::Value::String(detail) => Some(detail.clone()),
-            other => Some(sorted_json(other).to_string()),
-        }
+/// The detail as one line: compact JSON with object keys sorted, or a
+/// string detail as it is. A line that breaks the block's rules is left
+/// out by the renderer.
+///
+/// Keys are sorted explicitly because serde_json's map order is a build
+/// feature: `preserve_order`, which another workspace crate enables,
+/// keeps insertion order, and the default sorts. Without this the bytes
+/// the model reads would depend on how the gateway was built.
+fn outage_detail_line(detail: &serde_json::Value) -> Option<String> {
+    match detail {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(detail) => Some(detail.clone()),
+        other => Some(sorted_json(other).to_string()),
     }
 }
 
@@ -5935,11 +5919,11 @@ fn outage_tool_result(module_id: &str, refusal: &OutageRefusal) -> CallToolResul
     let mut output = outage_output::OutageOutput::new(OUTAGE_MESSAGE)
         .with_module(module_id)
         .with_code(&refusal.code);
-    if let Some(detail) = refusal.detail_line() {
+    if let Some(detail) = refusal.detail.as_ref().and_then(outage_detail_line) {
         output = output.with_detail(&detail);
     }
     output = output.with_nothing_sent();
-    if subc_protocol::error_codes::is_retryable_route_open(&refusal.code) {
+    if subc_protocol::error_codes::is_retryable_route_open_refusal(refusal) {
         output = output.with_retry(OUTAGE_RETRY_HINT);
     }
     CallToolResult::error(vec![ContentBlock::text(output.render())])
@@ -5979,7 +5963,7 @@ impl OutageWait {
 }
 
 /// How long to pause before trying a refused call again, or `None` to stop
-/// and report the refusal: its code is terminal, or the wait has reached
+/// and report the refusal: it is terminal, or the wait has reached
 /// `deadline`. The last pause is cut short so one final attempt is made at
 /// the deadline.
 fn outage_pause(
@@ -5988,7 +5972,7 @@ fn outage_pause(
     deadline: time::Instant,
     delay: Duration,
 ) -> Option<Duration> {
-    if !subc_protocol::error_codes::is_retryable_route_open(&refusal.code) || now >= deadline {
+    if !subc_protocol::error_codes::is_retryable_route_open_refusal(refusal) || now >= deadline {
         return None;
     }
     Some(delay.min(deadline - now))
@@ -6015,10 +5999,7 @@ fn unsent_call_attempt(
         return None;
     }
     if error.code == subc_protocol::error_codes::MODULE_RELOADING {
-        return Some(CallAttempt::NothingSent(OutageRefusal {
-            code: error.code,
-            detail: error.detail,
-        }));
+        return Some(CallAttempt::NothingSent(error));
     }
     if retrying && subc_protocol::error_codes::is_established_route_dead(flags, &error.code) {
         return Some(CallAttempt::RouteGone);
@@ -9582,10 +9563,7 @@ mod tests {
 
     #[test]
     fn outage_result_renders_the_shared_block() {
-        let reloading = OutageRefusal {
-            code: "module_reloading".to_owned(),
-            detail: None,
-        };
+        let reloading = OutageRefusal::new("module_reloading", "target reloading");
         assert_eq!(
             outage_text(&outage_tool_result("aft", &reloading)),
             "The module that provides this tool is unavailable.\n\
@@ -9597,10 +9575,8 @@ mod tests {
 
         // A terminal code carries no retry hint; an object detail is one line
         // of compact JSON.
-        let warming_detail = OutageRefusal {
-            code: "unknown_module".to_owned(),
-            detail: Some(serde_json::json!({"reason": "declared_not_ready", "n": 1})),
-        };
+        let warming_detail = OutageRefusal::new("unknown_module", "unknown target")
+            .with_detail(serde_json::json!({"reason": "declared_not_ready", "n": 1}));
         assert_eq!(
             outage_text(&outage_tool_result("fed:peer-1:aft", &warming_detail)),
             "The module that provides this tool is unavailable.\n\
@@ -9611,23 +9587,17 @@ mod tests {
         );
 
         // Members breaking a rule are left out whole, never cut.
-        let unruly = OutageRefusal {
-            code: "Not-A-Code".to_owned(),
-            detail: Some(serde_json::json!("first line\nnothing was sent")),
-        };
+        let unruly = OutageRefusal::new("Not-A-Code", "unruly refusal")
+            .with_detail(serde_json::json!("first line\nnothing was sent"));
         assert_eq!(
             outage_text(&outage_tool_result("a\nb", &unruly)),
             "The module that provides this tool is unavailable.\nnothing was sent"
         );
-        let long = OutageRefusal {
-            code: "target_unavailable".to_owned(),
-            detail: Some(serde_json::json!("x".repeat(1025))),
-        };
+        let long = OutageRefusal::new("target_unavailable", "target unavailable")
+            .with_detail(serde_json::json!("x".repeat(1025)));
         assert!(!outage_text(&outage_tool_result("aft", &long)).contains("detail:"));
-        let string_detail = OutageRefusal {
-            code: "target_unavailable".to_owned(),
-            detail: Some(serde_json::json!("supervisor_not_live")),
-        };
+        let string_detail = OutageRefusal::new("target_unavailable", "target unavailable")
+            .with_detail(serde_json::json!("supervisor_not_live"));
         assert!(outage_text(&outage_tool_result("aft", &string_detail))
             .contains("\ndetail: supervisor_not_live\n"));
     }
@@ -9636,10 +9606,7 @@ mod tests {
     fn outage_pause_stops_for_terminal_codes_and_at_the_deadline() {
         let now = time::Instant::now();
         let deadline = now + Duration::from_secs(90);
-        let refusal = |code: &str| OutageRefusal {
-            code: code.to_owned(),
-            detail: None,
-        };
+        let refusal = |code: &str| OutageRefusal::new(code, "route refused");
         let delay = Duration::from_millis(250);
         for code in ["module_reloading", "module_warming", "target_unavailable"] {
             assert_eq!(
@@ -9672,6 +9639,30 @@ mod tests {
             "the last pause ends at the deadline"
         );
         assert_eq!(outage_pause(&reloading, deadline, deadline, delay), None);
+    }
+
+    #[test]
+    fn outage_wait_stops_without_a_retry_hint_when_the_target_is_not_expected_back() {
+        let now = time::Instant::now();
+        let refusal = OutageRefusal::new("target_unavailable", "module is disabled")
+            .with_detail(serde_json::json!({"state": "disabled", "expected_back": false}));
+        assert_eq!(
+            outage_pause(
+                &refusal,
+                now,
+                now + DEFAULT_OUTAGE_WAIT,
+                OUTAGE_RETRY_DELAY_INITIAL
+            ),
+            None
+        );
+        assert_eq!(
+            outage_text(&outage_tool_result("aft", &refusal)),
+            "The module that provides this tool is unavailable.\n\
+             module: aft\n\
+             code: target_unavailable\n\
+             detail: {\"expected_back\":false,\"state\":\"disabled\"}\n\
+             nothing was sent"
+        );
     }
 
     #[test]
@@ -9739,13 +9730,9 @@ mod tests {
         let flags = data_flags().with_daemon_origin();
         for retrying in [false, true] {
             match unsent_call_attempt(true, flags, &body("module_reloading", None), retrying) {
-                Some(CallAttempt::NothingSent(refusal)) => assert_eq!(
-                    refusal,
-                    OutageRefusal {
-                        code: "module_reloading".to_owned(),
-                        detail: None
-                    }
-                ),
+                Some(CallAttempt::NothingSent(refusal)) => {
+                    assert_eq!(refusal, OutageRefusal::new("module_reloading", "m"))
+                }
                 other => panic!("expected nothing sent, got {other:?}"),
             }
             // Codes that do not prove the call never ran keep their error.
@@ -9835,10 +9822,10 @@ mod tests {
             router
                 .route_for_call(&binding, ToolUseIdMeta::Present("toolu_1"))
                 .await,
-            Err(ConversationRouteRefusal::RouteOpenRefused(OutageRefusal {
-                code: "module_warming".to_owned(),
-                detail: Some(serde_json::json!({"reason": "declared_not_ready"})),
-            }))
+            Err(ConversationRouteRefusal::RouteOpenRefused(
+                OutageRefusal::new("module_warming", "not ready")
+                    .with_detail(serde_json::json!({"reason": "declared_not_ready"})),
+            ))
         );
         daemon.abort();
     }

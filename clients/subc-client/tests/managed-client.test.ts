@@ -97,7 +97,7 @@ interface FakeDaemonOptions {
   routeOpenDropModule?: { module_id: string; dropFromConnection?: number };
   // Reject the first N route.open requests with this code (a booting-target
   // simulation), then serve subsequent ones normally.
-  routeOpenFailFirst?: { count: number; code: string; message: string };
+  routeOpenFailFirst?: { count: number; code: string; message: string; detail?: unknown };
   // Take over every route.open answer. The hook is not awaited: it answers
   // through `answer` whenever it likes (no argument accepts the open, an error
   // body refuses it), so a test can hold opens outstanding or script refusals
@@ -1231,7 +1231,7 @@ describe("SubcClient managed call", () => {
     }
   });
 
-  test("retries a retryable route.open rejection in-place and recovers when the target becomes available", async () => {
+  test.each([undefined, true])("retries a route.open with expected_back %s and recovers in place", async (expectedBack) => {
     // A daemon-restart boot window: the target is supervised but not yet live, so
     // the first two route.open attempts are rejected target_unavailable, then it
     // comes up. The retry is IN-PLACE (same connection, no socket reconnect), so
@@ -1241,7 +1241,12 @@ describe("SubcClient managed call", () => {
     const sleeps: number[] = [];
     const daemon = await startFakeDaemon({
       stats,
-      routeOpenFailFirst: { count: 2, code: "target_unavailable", message: "supervised but not available" },
+      routeOpenFailFirst: {
+        count: 2,
+        code: "target_unavailable",
+        message: "supervised but not available",
+        detail: expectedBack === undefined ? undefined : { expected_back: expectedBack },
+      },
     });
     writeConnectionFile(connFile, daemon.port);
 
@@ -1261,6 +1266,32 @@ describe("SubcClient managed call", () => {
       // connection (no reconnect), proven by the two backoff sleeps between them.
       expect(stats.routeOpens).toBe(3);
       expect(sleeps.length).toBe(2);
+    } finally {
+      client.close();
+    }
+  });
+
+  test("stops after one route.open refusal when the module is not expected back", async () => {
+    const { connFile } = tempConnectionFile();
+    const stats = newStats();
+    const refusal = {
+      code: "target_unavailable",
+      message: "module is disabled",
+      detail: { state: "disabled", expected_back: false },
+    };
+    const daemon = await startFakeDaemon({ stats, routeOpenFailFirst: { count: 1, ...refusal } });
+    writeConnectionFile(connFile, daemon.port);
+
+    const client = await SubcClient.connect({
+      connectionFile: connFile,
+      identity: IDENTITY,
+      reconnectBackoff: BACKOFF,
+      sleep: async () => {},
+    });
+    try {
+      const result = await client.call("managed-provider", "echo", { n: 1 }).catch((error: unknown) => error);
+      expect(stats.routeOpens).toBe(1);
+      expect(result).toMatchObject({ kind: "terminal", code: refusal.code, detail: refusal.detail });
     } finally {
       client.close();
     }
@@ -2160,7 +2191,7 @@ async function handleFakeConnection(socket: Socket, options: FakeDaemonOptions):
           if (failFirst && options.stats.routeOpens <= failFirst.count) {
             await writeFrame(
               socket,
-              errorFrame(frame, { code: failFirst.code, message: failFirst.message }),
+              errorFrame(frame, { code: failFirst.code, message: failFirst.message, detail: failFirst.detail }),
               deadline,
             );
           } else if (options.routeOpenError) {

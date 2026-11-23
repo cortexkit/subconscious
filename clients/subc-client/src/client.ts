@@ -1903,7 +1903,7 @@ export class SubcClient {
         }
         continue;
       }
-      if (!this.closeStarted && error instanceof SubcError && isRetryableRouteOpenCode(error.code)) {
+      if (!this.closeStarted && error instanceof SubcError && isRetryableRouteOpenRefusal(error)) {
         // The deadline is the ONLY binder here. An attempt cap used to share
         // this condition, and because the capped backoff sums to ~3.1s it
         // strictly dominated the deadline — the advertised reload patience was
@@ -2705,8 +2705,9 @@ function isRouteOpenRefusal(err: unknown): err is SubcError & { code: string } {
  * momentarily unavailable but the request could succeed on retry" — the target
  * is booting, mid-reload, transiently absent, or the bind relay timed out. A
  * daemon-rejected route.open is provably pre-send (no data frame ever left the
- * client), so these classify as not_sent; the managed path retries them in-place
- * within ROUTE_OPEN_RETRY_DEADLINE_MS. Permanent rejections (module_removed,
+ * client), so the managed path may retry them in-place within
+ * ROUTE_OPEN_RETRY_DEADLINE_MS; use isRetryableRouteOpenRefusal when the body is
+ * available to honor the daemon's recovery verdict. Permanent rejections (module_removed,
  * bad_consumer_identity, config_divergence, unknown_target, ...) are excluded — they are pre-send but
  * would never succeed, so retrying them would only storm the daemon. In
  * particular, capability_forbidden is an explicit non-retryable policy refusal,
@@ -2744,6 +2745,12 @@ export function isRetryableRouteOpenCode(code: string | undefined): boolean {
     // or write still running on it) refuses the bind; nothing was sent on it.
     code === "bind_busy"
   );
+}
+
+/** Whether this refusal can be retried in place, honoring the daemon's recovery verdict. */
+export function isRetryableRouteOpenRefusal({ code, detail }: Pick<SubcError, "code" | "detail">): boolean {
+  return isRetryableRouteOpenCode(code) &&
+    !(typeof detail === "object" && detail !== null && "expected_back" in detail && detail.expected_back === false);
 }
 
 /**

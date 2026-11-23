@@ -483,9 +483,12 @@ supervisor's module-state string (for example `starting`, `stopped`, `failed` or
 is expected to serve again without operator action. For a lost process or
 connection, a true verdict means the module is enabled and restarting, has a
 respawn pending, or has restart budget left. It is not a promise that recovery
-will succeed. False means
-the daemon does not expect to bring the module back on its own; an absent verdict
-means unknown, including when the supervisor's recovery state cannot be read.
+will succeed. A boolean `false` means the daemon does not expect to bring the
+module back on its own: clients stop retrying `route.open` and return the refusal,
+even for an otherwise retryable code. An absent verdict means unknown, including
+when the supervisor's recovery state cannot be read.
+`ck module stop` disables the module until `ck module start`, so callers get the
+refusal at once rather than waiting through the stop.
 
 These details accompany supervised-but-unregistered `module_warming` and
 `target_unavailable` replies, including waiting for a previous process, and the

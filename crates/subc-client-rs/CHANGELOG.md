@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.41.11
+
+- Return the daemon's route-open refusal immediately when `detail.expected_back`
+  is boolean `false`. Require subc-protocol 0.37.7.
+
 ## 0.41.10
 
 - Expose the optional project settings file `layer` and `path` in watch rows.

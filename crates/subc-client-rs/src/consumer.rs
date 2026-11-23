@@ -4600,7 +4600,7 @@ impl Shared {
                     // few seconds failed every managed caller. A restart
                     // legitimately keeps routes refused for about a minute;
                     // capped per-attempt backoff bounds pressure.
-                    if !is_retryable_route_open_code(&body.code) {
+                    if !error_codes::is_retryable_route_open_refusal(&body) {
                         return Err(CallError::route_open_refused(key.target_label(), body));
                     }
                     refusals.record(body);
@@ -9749,6 +9749,58 @@ mod tests {
             assert_eq!(shared.ingress_handle(1, old.channel, old.epoch), None);
             assert!(shared.lock_inner().retired_routes.is_empty());
             drop(call);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn route_open_stops_after_one_refusal_when_the_module_is_not_expected_back() {
+        let (shared, consumer, mut receiver) = route_open_stand_in(seeded_random(1));
+        let refusal = ErrorBody::new(error_codes::TARGET_UNAVAILABLE, "module is disabled")
+            .with_detail(serde_json::json!({"state": "disabled", "expected_back": false}));
+        let mut task = tokio::spawn(async move {
+            consumer
+                .open_route(
+                    restart_target("disabled"),
+                    restart_identity(),
+                    CallOptions::default(),
+                )
+                .await
+        });
+        let mut opens = 0;
+        let result = answer_route_opens(&shared, &mut receiver, &mut task, |_| {
+            opens += 1;
+            (opens == 1).then(|| refusal.clone())
+        })
+        .await;
+
+        assert_eq!(opens, 1, "the daemon said the target would not recover");
+        assert_eq!(result.unwrap_err().route_open_refusal(), Some(&refusal));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn route_open_retries_when_expected_back_is_true_or_absent() {
+        for expected_back in [Some(true), None] {
+            let (shared, consumer, mut receiver) = route_open_stand_in(seeded_random(1));
+            let mut refusal = ErrorBody::new(error_codes::TARGET_UNAVAILABLE, "module is stopped");
+            refusal.detail = expected_back.map(|value| serde_json::json!({"expected_back": value}));
+            let mut task = tokio::spawn(async move {
+                consumer
+                    .open_route(
+                        restart_target("stopped"),
+                        restart_identity(),
+                        CallOptions::default(),
+                    )
+                    .await
+            });
+            let mut opens = 0;
+            let result = answer_route_opens(&shared, &mut receiver, &mut task, |_| {
+                opens += 1;
+                (opens == 1).then(|| refusal.clone())
+            })
+            .await;
+
+            assert!(result.is_ok(), "{expected_back:?}: {result:?}");
+            assert_eq!(opens, 2, "{expected_back:?}");
         }
     }
 

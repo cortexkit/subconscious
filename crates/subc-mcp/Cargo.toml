@@ -1,6 +1,6 @@
 [package]
 name = "subc-mcp"
-version = "0.2.12"
+version = "0.2.13"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -22,11 +22,11 @@ ryu-js = "1"
 rmcp = { version = "3.8", default-features = false, features = ["server", "transport-async-rw"] }
 cortexkit-paths = "0.1.1"
 cortexkit-store-types = "0.2.2"
-subc-client-rs = { path = "../subc-client-rs", version = "0.41.8" }
+subc-client-rs = { path = "../subc-client-rs", version = "0.41.11" }
 subc-control = { path = "../subc-control", version = "0.42.4" }
 subc-jsonc = { path = "../subc-jsonc", version = "0.1.5" }
 subc-os = { path = "../subc-os", version = "0.1.47" }
-subc-protocol = { path = "../subc-protocol", version = "0.37.6" }
+subc-protocol = { path = "../subc-protocol", version = "0.37.7" }
 subc-transport = { path = "../subc-transport", version = "0.18.0" }
 tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "io-util", "io-std", "sync", "time", "process"] }
 

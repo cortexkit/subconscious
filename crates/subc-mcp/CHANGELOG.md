@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.13
+
+- End the tool call's outage wait without a retry hint when the daemon reports
+  `detail.expected_back: false`. Require subc-protocol 0.37.7 and subc-client-rs 0.41.11.
+
 ## 0.2.12
 
 - Use daemon-managed user and project settings. Project overlays cannot widen access; ignored overrides are listed under `settings.project_notes` in the gateway module's `ck health` metrics. `refresh: on_attach` pins settings for the session; `refresh: immediate` applies daemon-delivered changes to attached hosts.

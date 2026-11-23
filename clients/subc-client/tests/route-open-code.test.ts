@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 
 import { isRetryableRouteOpenCode } from "../src/client";
+import { isRetryableRouteOpenRefusal } from "../src/index";
 
 test("scope bind proof refusals are terminal", () => {
   expect(isRetryableRouteOpenCode("scope_bind_proof_required")).toBe(false);
@@ -34,4 +35,13 @@ test("a scoped open refused before the owner re-synced or after the scope change
   expect(isRetryableRouteOpenCode("scope_not_synced")).toBe(true);
   expect(isRetryableRouteOpenCode("scope_changed")).toBe(true);
   expect(isRetryableRouteOpenCode("scope_sync_not_authority")).toBe(false);
+});
+
+test("only a boolean false recovery verdict overrides a retryable code", () => {
+  const code = "target_unavailable";
+  expect(isRetryableRouteOpenRefusal({ code, detail: { expected_back: false } })).toBe(false);
+  expect(isRetryableRouteOpenRefusal({ code, detail: { expected_back: true } })).toBe(true);
+  expect(isRetryableRouteOpenRefusal({ code, detail: {} })).toBe(true);
+  expect(isRetryableRouteOpenRefusal({ code, detail: { expected_back: "false" } })).toBe(true);
+  expect(isRetryableRouteOpenRefusal({ code: "unknown_module", detail: { expected_back: true } })).toBe(false);
 });

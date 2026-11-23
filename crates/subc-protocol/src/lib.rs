@@ -364,8 +364,9 @@ pub mod error_codes {
     /// an open route with a verified opener on that connection.
     pub const OPERATOR_REQUEST_NOT_PERMITTED: &str = "operator_request_not_permitted";
 
-    /// Whether a `route.open` refusal carrying `code` may be retried in place
-    /// within the caller's deadline, or is terminal for the target as named.
+    /// Whether a `route.open` refusal code permits retrying in place within the
+    /// caller's deadline. If the body is available, use
+    /// [`is_retryable_route_open_refusal`] to honor the daemon's recovery verdict.
     ///
     /// This lives beside the codes because every consumer with its own
     /// connection layer needs the same answer: a copied list breaks loudly on
@@ -408,6 +409,18 @@ pub mod error_codes {
                 | BIND_BUSY
                 | STALE_AUTHORITY_EPOCH
         )
+    }
+
+    /// Whether a `route.open` refusal can be retried in place. An explicit
+    /// `detail.expected_back: false` means waiting will not bring the target back.
+    pub fn is_retryable_route_open_refusal(error: &crate::ErrorBody) -> bool {
+        is_retryable_route_open(&error.code)
+            && error
+                .detail
+                .as_ref()
+                .and_then(|detail| detail.get("expected_back"))
+                .and_then(serde_json::Value::as_bool)
+                != Some(false)
     }
 
     /// The scope requires a federated stamp, but the target cannot read one.
@@ -1100,6 +1113,41 @@ pub fn decode_header(bytes: &[u8]) -> Result<EnvelopeHeader, DecodeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn route_open_refusal_retries_unless_recovery_is_explicitly_false() {
+        use error_codes::{is_retryable_route_open_refusal, TARGET_UNAVAILABLE, UNKNOWN_MODULE};
+        use serde_json::json;
+
+        for (code, detail, retryable) in [
+            (
+                TARGET_UNAVAILABLE,
+                Some(json!({"expected_back": false})),
+                false,
+            ),
+            (
+                TARGET_UNAVAILABLE,
+                Some(json!({"expected_back": true})),
+                true,
+            ),
+            (TARGET_UNAVAILABLE, None, true),
+            (TARGET_UNAVAILABLE, Some(json!({"state": "disabled"})), true),
+            (
+                TARGET_UNAVAILABLE,
+                Some(json!({"expected_back": "false"})),
+                true,
+            ),
+            (UNKNOWN_MODULE, Some(json!({"expected_back": true})), false),
+        ] {
+            let mut error = ErrorBody::new(code, "route refused");
+            error.detail = detail;
+            assert_eq!(
+                is_retryable_route_open_refusal(&error),
+                retryable,
+                "{error:?}"
+            );
+        }
+    }
 
     fn hdr(len: u32, ty: FrameType, flags: Flags, channel: u16, corr: u64) -> EnvelopeHeader {
         hdr_with_epoch(len, ty, flags, channel, u32::from(channel != 0), corr)

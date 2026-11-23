@@ -1,6 +1,35 @@
 use super::*;
 
 #[test]
+fn uncontended_snapshot_access_keeps_the_runtime_worker() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let threads = Arc::new(AtomicUsize::new(0));
+    let started = threads.clone();
+    let daemon = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .on_thread_start(move || {
+            started.fetch_add(1, Ordering::Relaxed);
+        })
+        .build()
+        .unwrap();
+    daemon.block_on(async {
+        // Run on the worker, not on the thread calling block_on: a blocking
+        // section on the worker would start a second thread to take over.
+        tokio::spawn(async {
+            let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+            drop(lock_snapshot(&snapshot).unwrap());
+            update_snapshot(&snapshot, None, |state| state.enabled = false).unwrap();
+            assert!(!lock_snapshot(&snapshot).unwrap().enabled);
+        })
+        .await
+        .unwrap();
+    });
+    drop(daemon);
+    assert_eq!(threads.load(Ordering::Relaxed), 1);
+}
+
+#[test]
 fn registration_retirement_self_prefixed_owner_is_not_a_prefix_submodule() {
     let handle = SupervisorHandle::new();
     handle.set_spawn_nonce("prefix:owner", "owner-nonce".into());

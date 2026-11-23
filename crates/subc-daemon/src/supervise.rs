@@ -222,7 +222,7 @@ use std::{
     fmt, io,
     path::PathBuf,
     process::{ExitStatus, Stdio},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock, TryLockError},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -2112,7 +2112,7 @@ fn update_snapshot(
     module_id: Option<&str>,
     update: impl FnOnce(&mut SupervisorSnapshot),
 ) -> Result<(), SuperviseError> {
-    let mut state = snapshot.lock().map_err(|_| SuperviseError::StatePoisoned {
+    let mut state = lock_snapshot(snapshot).map_err(|_| SuperviseError::StatePoisoned {
         module_id: module_id.map(ToOwned::to_owned),
     })?;
     update(&mut state);
@@ -2143,9 +2143,22 @@ fn lock_snapshot_for_control<'a>(
 fn lock_snapshot(
     snapshot: &SharedSnapshot,
 ) -> Result<std::sync::MutexGuard<'_, SupervisorSnapshot>, SuperviseError> {
-    snapshot
-        .lock()
-        .map_err(|_| SuperviseError::StatePoisoned { module_id: None })
+    let guard = match snapshot.try_lock() {
+        Ok(guard) => return Ok(guard),
+        Err(TryLockError::Poisoned(guard)) => Err(guard),
+        Err(TryLockError::WouldBlock) => {
+            // A held launch record must not pin a daemon worker: that worker
+            // may also have to route and deliver the busy reply to a module.
+            if tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+                handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+            }) {
+                tokio::task::block_in_place(|| snapshot.lock())
+            } else {
+                snapshot.lock()
+            }
+        }
+    };
+    guard.map_err(|_| SuperviseError::StatePoisoned { module_id: None })
 }
 
 #[cfg(all(test, unix))]

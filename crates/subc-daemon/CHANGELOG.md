@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.50.37
+
+- Keep daemon workers available to answer requests while the supervisor waits
+  for a contended launch record on a multi-threaded runtime.
+
 ## 0.50.36
 
 - Name the refused workspace or project settings file in watch and status

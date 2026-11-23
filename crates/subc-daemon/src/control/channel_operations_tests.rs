@@ -828,7 +828,9 @@ async fn channel_operations_prefix_registration_dies_with_its_owner() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// Give the supervised actor and server only one worker so the end-to-end
+// exchange cannot depend on a spare worker to answer while the record is held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn channel_operations_busy_launch_record_is_retryable_for_the_serving_spawn() {
     let rig = rig().await;
     let (mut net, _spawn, module, _) = network_primary(&rig, "roles-busy").await;
@@ -851,6 +853,51 @@ async fn channel_operations_busy_launch_record_is_retryable_for_the_serving_spaw
     holder.join().unwrap();
     ok(&ask(&mut net, sync_request(1)).await);
     ok(&ask(&mut net, &agents).await);
+}
+
+#[test]
+fn channel_operations_actor_wake_during_launch_record_contention_does_not_stall_refusal() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (parked, wait_parked) = std::sync::mpsc::channel();
+    let report_park = Arc::new(AtomicBool::new(false));
+    let report = report_park.clone();
+    let daemon = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .on_thread_park(move || {
+            if report.swap(false, Ordering::AcqRel) {
+                let _ = parked.send(());
+            }
+        })
+        .build()
+        .unwrap();
+    let mut rig = daemon.block_on(rig());
+    daemon.spawn(async move { report_park.store(true, Ordering::Release) });
+    wait_parked.recv_timeout(Duration::from_secs(5)).unwrap();
+    let module = rig.handler.supervisor.get("claims-module").unwrap();
+    let refusal = module.with_resource_snapshot_locked_for_test(|| {
+        // Wake the parked supervisor on a registry change before submitting the
+        // request. Both run on the daemon worker; the deadline runs outside it.
+        assert!(rig
+            .handler
+            .registry
+            .set_module_state_for_test("claims-module", crate::registry::ChannelState::Active)
+            .unwrap());
+        let (reply, wait_reply) = std::sync::mpsc::channel();
+        daemon.spawn(async move {
+            rig.router
+                .route_for_connection(&rig.primary.ctx, request(sync_request(1)))
+                .await
+                .unwrap();
+            let _ = reply.send(rig.primary.replies.recv().await.unwrap().frame);
+        });
+        wait_reply.recv_timeout(Duration::from_secs(5))
+    });
+    assert_eq!(
+        code(&refusal.expect("a contended supervisor must not stall the daemon worker")),
+        "busy"
+    );
 }
 
 #[tokio::test]

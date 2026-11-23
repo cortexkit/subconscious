@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.50.41
+
+- Keep registrations under another module's reserved prefix out of settings
+  views unless they have declared or approved local settings.
+
 ## 0.50.40
 
 - Reserve the exact module ID `subc` for the daemon. Daemon configuration

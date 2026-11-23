@@ -83,9 +83,14 @@ impl ControlHandler {
     pub(super) fn config_settings_known_modules(
         &self,
     ) -> std::result::Result<BTreeSet<String>, GateError> {
-        self.registry
+        let mut known = self
+            .registry
             .registered_module_ids()
-            .map_err(|_| GateError::new("config_unavailable", "module registry is unavailable"))
+            .map_err(|_| GateError::new("config_unavailable", "module registry is unavailable"))?;
+        // A prefix registration alone does not imply local settings. The settings
+        // runtime adds declared and approved settings independently of registration.
+        self.supervisor.remove_reserved_prefix_children(&mut known);
+        Ok(known)
     }
 
     pub(super) async fn handle_config_settings_watch(

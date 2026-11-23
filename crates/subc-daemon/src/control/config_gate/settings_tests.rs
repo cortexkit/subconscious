@@ -99,6 +99,84 @@ async fn config_bad_number_watch_keeps_healthy_modules() {
     bad_number_rows().await;
 }
 
+#[tokio::test]
+async fn config_modules_ignores_registration_only_prefix_children() {
+    let rig = SettingsRig::new();
+    let supervisor = SupervisorHandle::new();
+    supervisor.set_reserved_nonce("federation", "owner-nonce".into());
+    supervisor.set_spawn_nonce("federation", "owner-nonce".into());
+    supervisor.set_reserved_prefixes("federation", &["fed:".into()]);
+    let handler = handler(&rig).with_supervisor(supervisor);
+    let (ctx, _owner_rx) = context();
+    let (mut module_ctx, mut module_rx) = context();
+    for (connection, module_id) in [
+        (1, "federation"),
+        (2, "fed:abc:ckbus"),
+        (3, "fed:abc:settings"),
+    ] {
+        module_ctx.connection_id = ConnectionId::new(connection);
+        let hello = ModuleHelloBody {
+            manifest: ModuleManifest::builder(module_id, "1.0.0").build(),
+            protocol_ver: PROTOCOL_VERSION,
+            control_ops: None,
+            launch_nonce: Some("owner-nonce".into()),
+        };
+        let frame = Frame::build(
+            FrameType::Hello,
+            control_flags(),
+            0,
+            0,
+            1,
+            serde_json::to_vec(&hello).unwrap(),
+        )
+        .unwrap();
+        let reply = handler
+            .handle_control_frame(&module_ctx, frame)
+            .await
+            .unwrap();
+        assert!(reply.is_empty(), "{module_id}: {reply:?}");
+        assert_eq!(
+            module_rx.try_recv().unwrap().frame.header.ty,
+            FrameType::HelloAck
+        );
+    }
+
+    let declaration = json!({
+        "op":"config.declare",
+        "schema":{
+            "$schema":"https://json-schema.org/draft/2020-12/schema",
+            "type":"object", "unevaluatedProperties":false,
+            "x-ck-layers":["user"], "x-ck-apply":"live",
+            "properties":{"limit":{"type":"integer", "description":"Limit", "default":1}}
+        },
+        "user_file":rig.root.join("cortexkit/fed:abc:settings.jsonc"),
+        "project_dirs":[]
+    });
+    let reply = handler
+        .handle_control_frame(&module_ctx, request(declaration))
+        .await
+        .unwrap();
+    assert_eq!(reply[0].header.ty, FrameType::Response, "{reply:?}");
+
+    let reply = handler
+        .handle_control_frame(&ctx, request(json!({"op":"config.modules"})))
+        .await
+        .unwrap();
+    assert_eq!(reply[0].header.ty, FrameType::Response, "{reply:?}");
+    let body: Value = serde_json::from_slice(&reply[0].body).unwrap();
+    let rows = body["modules"].as_array().unwrap();
+    let row = |id| rows.iter().find(|row| row["module_id"] == id);
+    assert!(
+        row("federation").is_some(),
+        "the prefix owner must remain visible"
+    );
+    assert_eq!(row("fed:abc:settings").unwrap()["gated"], true);
+    assert!(
+        row("fed:abc:ckbus").is_none(),
+        "registration alone must not list a prefix child"
+    );
+}
+
 async fn bad_number_rows() -> (Value, Value) {
     let rig = SettingsRig::new();
     rig.inject_bad_number_declaration();

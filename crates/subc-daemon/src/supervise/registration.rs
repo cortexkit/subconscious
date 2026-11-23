@@ -12,6 +12,7 @@ mod retirement_tests;
 mod review_tests;
 
 use super::*;
+use std::collections::BTreeSet;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Weak,
@@ -1636,6 +1637,16 @@ pub(crate) struct ReservedHelloVerification {
     pub(crate) prefix_owner: Option<String>,
 }
 
+fn matching_reserved_prefix<'a>(
+    owners: &'a HashMap<String, String>,
+    module_id: &str,
+) -> Option<(&'a String, &'a String)> {
+    owners
+        .iter()
+        .filter(|(prefix, _)| module_id.starts_with(prefix.as_str()))
+        .max_by_key(|(prefix, _)| prefix.len())
+}
+
 impl SupervisorHandle {
     /// Record the launch nonce from a supervised spawn, replacing any prior nonce so
     /// a respawn invalidates stale consumer identities.
@@ -1674,6 +1685,16 @@ impl SupervisorHandle {
         for prefix in prefixes {
             owners.insert(prefix.clone(), owner_module_id.to_string());
         }
+    }
+
+    pub(crate) fn remove_reserved_prefix_children(&self, module_ids: &mut BTreeSet<String>) {
+        let owners = self
+            .reserved_prefix_owners
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        module_ids.retain(|id| {
+            matching_reserved_prefix(&owners, id).is_none_or(|(_, owner)| owner == id)
+        });
     }
 
     /// The launch nonce most recently minted for a module's spawn, if any.
@@ -1853,10 +1874,7 @@ impl SupervisorHandle {
             .reserved_prefix_owners
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        let authorized = owners
-            .iter()
-            .filter(|(prefix, _)| module_id.starts_with(prefix.as_str()))
-            .max_by_key(|(prefix, _)| prefix.len())
+        let authorized = matching_reserved_prefix(&owners, module_id)
             .is_some_and(|(prefix, holder)| holder == owner && module_id.len() > prefix.len());
         authorized.then_some(owners)
     }
@@ -1894,14 +1912,14 @@ impl SupervisorHandle {
         }
         drop(nonces);
 
-        let matched_prefix = self
-            .reserved_prefix_owners
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-            .filter(|(prefix, _)| module_id.starts_with(prefix.as_str()))
-            .max_by_key(|(prefix, _)| prefix.len())
-            .map(|(prefix, owner)| (prefix.clone(), owner.clone()));
+        let matched_prefix = {
+            let owners = self
+                .reserved_prefix_owners
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            matching_reserved_prefix(&owners, module_id)
+                .map(|(prefix, owner)| (prefix.clone(), owner.clone()))
+        };
         let Some((prefix, owner_module_id)) = matched_prefix else {
             return Ok(ReservedHelloVerification::default());
         };

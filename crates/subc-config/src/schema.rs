@@ -556,7 +556,9 @@ fn variant<'a>(s: &'a Value, value: &Value) -> Option<&'a Value> {
             .is_some_and(|v| b["properties"][&key]["const"] == *v)
     })
 }
-fn child_schema<'a>(s: &'a Value, key: &str) -> Option<&'a Value> {
+/// Returns the schema for an object key, looking first in `properties` and then
+/// using the first matching `patternProperties` pattern. Returns `None` if neither matches.
+pub fn child_schema<'a>(s: &'a Value, key: &str) -> Option<&'a Value> {
     s.get("properties").and_then(|p| p.get(key)).or_else(|| {
         s.get("patternProperties")?
             .as_object()?

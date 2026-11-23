@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.50.42
+
+- Allow config plan edits to target individual entries in declared maps and
+  fields inside those entries. Require subc-config 0.1.7.
+
 ## 0.50.41
 
 - Keep registrations under another module's reserved prefix out of settings

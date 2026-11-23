@@ -257,6 +257,9 @@ not new variants of the legacy exhaustive client control enums:
 | `config.apply` | Requests approval of that digest, then reports `generation` and `restart_required` (always serialized; absent on older replies means false). |
 | `config.history` | Retained generations and summaries of pruned history. |
 
+An edit path may name a declared map entry or a field within it, but not an
+array item; discriminated unions can be set or removed as whole values.
+
 `ck config plan` followed by `ck config apply <digest>` replaces edit-and-rescan
 on a stamped daemon. The terminal is not a trusted surface and a client's claim
 to have reviewed a diff grants no authority. Stamp approval is desktop-only.

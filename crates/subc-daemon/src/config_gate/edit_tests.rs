@@ -321,6 +321,117 @@ fn config_edit_creates_parents_decodes_pointers_and_removes_commas() {
     );
 }
 
+fn map_rig() -> Rig {
+    let mut rig = rig();
+    rig.declaration.schema["properties"]["queues"] = json!({
+        "type": "object",
+        "unevaluatedProperties": false,
+        "patternProperties": {
+            "^[a-z]+[.][a-z]+$": {
+                "type": "object",
+                "unevaluatedProperties": false,
+                "properties": {
+                    "weight": {"type": "integer", "description": "Weight", "default": 1},
+                    "enabled": {"type": "boolean", "description": "Enabled", "default": true}
+                }
+            }
+        }
+    });
+    std::fs::write(
+        file(&rig),
+        br#"{"queues":{"primary.queue":{"weight":2,"enabled":false},"backup.queue":{"weight":3}},"limit":2}"#,
+    )
+    .unwrap();
+    rig
+}
+
+fn user_document(rig: &Rig) -> serde_json::Value {
+    let text = std::fs::read_to_string(file(rig)).unwrap();
+    serde_json::from_str(&subc_jsonc::jsonc_to_json(&text).unwrap()).unwrap()
+}
+
+#[test]
+fn config_edit_map_set_creates_and_replaces_entries() {
+    let rig = map_rig();
+    let owner = rig.owner("edit-map-set");
+    rig.declare(&owner, 10);
+    let view = plan(
+        &owner,
+        0,
+        vec![
+            edit("/queues/new.queue", json!({"set":{"weight":4}})),
+            edit("/queues/primary.queue", json!({"set":{"weight":5}})),
+        ],
+    );
+    assert!(view.refusals.is_empty(), "{:?}", view.refusals);
+    owner.apply_unstamped_edits(&view.digest).unwrap();
+    assert_eq!(
+        user_document(&rig),
+        json!({"queues":{"primary.queue":{"weight":5},"backup.queue":{"weight":3},"new.queue":{"weight":4}},"limit":2})
+    );
+}
+
+#[test]
+fn config_edit_map_set_changes_only_the_named_entry_field() {
+    let rig = map_rig();
+    let owner = rig.owner("edit-map-field");
+    rig.declare(&owner, 10);
+    let view = plan(
+        &owner,
+        0,
+        vec![edit("/queues/primary.queue/weight", json!({"set":6}))],
+    );
+    assert!(view.refusals.is_empty(), "{:?}", view.refusals);
+    owner.apply_unstamped_edits(&view.digest).unwrap();
+    assert_eq!(
+        user_document(&rig),
+        json!({"queues":{"primary.queue":{"weight":6,"enabled":false},"backup.queue":{"weight":3}},"limit":2})
+    );
+}
+
+#[test]
+fn config_edit_map_remove_deletes_only_the_named_entry() {
+    let rig = map_rig();
+    let owner = rig.owner("edit-map-remove");
+    rig.declare(&owner, 10);
+    let view = plan(
+        &owner,
+        0,
+        vec![edit("/queues/primary.queue", json!({"remove":true}))],
+    );
+    assert!(view.refusals.is_empty(), "{:?}", view.refusals);
+    owner.apply_unstamped_edits(&view.digest).unwrap();
+    assert_eq!(
+        user_document(&rig),
+        json!({"queues":{"backup.queue":{"weight":3}},"limit":2})
+    );
+}
+
+#[test]
+fn config_edit_map_refuses_a_key_that_matches_no_pattern() {
+    let rig = map_rig();
+    let owner = rig.owner("edit-map-unknown");
+    rig.declare(&owner, 10);
+    let path = "/queues/unmatched";
+    let view = plan(
+        &owner,
+        0,
+        vec![
+            edit(path, json!({"set":{"weight":4}})),
+            edit(path, json!({"remove":true})),
+        ],
+    );
+    assert_eq!(view.refusals.len(), 2);
+    for refusal in &view.refusals {
+        assert_eq!(refusal.path, path);
+        assert_eq!(refusal.code, "value_invalid");
+        assert_eq!(
+            refusal.message,
+            "the path is not declared by the admitted schema"
+        );
+    }
+}
+
 #[test]
 fn config_edit_refuses_invalid_pointers_arrays_layers_and_unknown_modules() {
     let mut rig = rig();
@@ -365,6 +476,8 @@ fn config_edit_refuses_invalid_pointers_arrays_layers_and_unknown_modules() {
             "unknown_module"
         ]
     );
+    assert_eq!(view.refusals[2].path, "/items/0");
+    assert_eq!(view.refusals[2].message, "arrays must be set whole");
 }
 
 #[test]

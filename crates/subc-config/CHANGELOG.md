@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.7
+
+- Expose `child_schema` so callers can use the same property and pattern lookup as validation.
+
 ## 0.1.6
 
 - Apply `x-ck-bound` only to workspace and project writes, not to user settings.

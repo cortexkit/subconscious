@@ -3168,7 +3168,7 @@ dependencies = [
 
 [[package]]
 name = "subc-config"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "regex",
  "ryu",
@@ -3238,7 +3238,7 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.50.41"
+version = "0.50.42"
 dependencies = [
  "base64",
  "cortexkit-log",

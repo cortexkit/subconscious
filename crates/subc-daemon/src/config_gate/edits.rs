@@ -4,7 +4,9 @@ use super::super::{capture::CapturedFile, GateSnapshot, InputKey};
 use super::*;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
-use subc_config::{Digest, InputState, Layer, LayerValue, RecordedValue, ValidationContext};
+use subc_config::{
+    child_schema, Digest, InputState, Layer, LayerValue, RecordedValue, ValidationContext,
+};
 use subc_control::config::{ConfigEdit, ConfigEditAction, ConfigPlanRefusal, ConfigPlanView};
 use subc_protocol::config::{ConfigLayerSnapshot, ConfigStatus, ConfigView};
 
@@ -156,9 +158,7 @@ pub(super) fn schema_path<'a>(
                     GateError::new("value_invalid", "the path has no selected schema variant")
                 })?;
         }
-        schema = schema
-            .get("properties")
-            .and_then(|properties| properties.get(key))
+        schema = child_schema(schema, key)
             .or_else(|| {
                 schema
                     .get("additionalProperties")

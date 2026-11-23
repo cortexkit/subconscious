@@ -34,6 +34,8 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - name: Build target registration helper
+        env:
+          CARGO_NET_RETRY: "10"
         run: cargo build --locked --release -p subc-registration-native --target ${{ matrix.target }}
       - name: Stage embedded helper
         shell: bash
@@ -51,8 +53,10 @@ jobs:
         env:
           BUN_COMPILE_TARGET: ${{ matrix.bun-target }}
         run: bun run build
+      # Runs only after the runner compiled, so a failed earlier step (such as a
+      # crate download) is reported as itself, not as a missing-dependency test failure.
       - name: Test compiled host runner
-        if: ${{ !cancelled() && matrix.test }}
+        if: ${{ success() && matrix.test }}
         working-directory: clients/script-runner
         run: bun test tests/runner.test.ts
       - uses: actions/upload-artifact@v4

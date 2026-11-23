@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.50.38
+
+- Settings views on an unstamped install (one whose settings are not yet
+  approved through the config gate) read only settings files and no longer
+  capture the module's program. This covers a module's `config.get`, with or
+  without `project_id`, `config.show` and the two-second project poll. Capturing
+  a program hashes the whole binary, and the poll did it for every requested
+  project, which kept the daemon busy on about two cores.
+
 ## 0.50.37
 
 - Keep daemon workers available to answer requests while the supervisor waits

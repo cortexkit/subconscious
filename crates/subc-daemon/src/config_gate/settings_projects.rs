@@ -159,7 +159,7 @@ impl RuntimeOwner {
                     let (module, project) = (module.clone(), project.clone());
                     move |owner| {
                         let layers = read_layers(&module, &project, &revision)?;
-                        let captured = owner.capturer.capture_modules(
+                        let captured = owner.capturer.capture_module_settings(
                             &BTreeMap::from([(module.clone(), declaration.clone())]),
                             &BTreeSet::from([module.clone()]),
                         )?;

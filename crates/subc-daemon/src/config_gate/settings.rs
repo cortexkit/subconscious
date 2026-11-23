@@ -390,7 +390,7 @@ impl RuntimeOwner {
             (generation, view, declaration)
         } else {
             drop(state);
-            let captured = self.capturer.capture_modules(
+            let captured = self.capturer.capture_module_settings(
                 &BTreeMap::from([(module.into(), declaration.clone())]),
                 &BTreeSet::from([module.into()]),
             )?;

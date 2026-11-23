@@ -84,7 +84,7 @@ impl RuntimeOwner {
         let declarations = BTreeMap::from([(module.to_owned(), declaration.clone())]);
         let mut captured = self
             .capturer
-            .capture_modules(&declarations, &BTreeSet::from([module.to_owned()]))?;
+            .capture_module_settings(&declarations, &BTreeSet::from([module.to_owned()]))?;
         let view = captured
             .modules
             .remove(module)

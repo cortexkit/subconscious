@@ -123,6 +123,25 @@ async fn unstamped_projects_poll_first_file_user_change_drop_and_registration() 
 }
 
 #[tokio::test]
+async fn unstamped_project_views_never_read_the_module_program() {
+    // The poll re-reads every requested project every two seconds. A view
+    // needs only settings files, so it must not open the module's program:
+    // hashing the program on every poll kept the daemon at about two cores.
+    let rig = unstamped();
+    let project = root(&rig.project_scratch, "private");
+    rig.set_projects(vec![member("P", Some("W"), &[&project])]);
+    get(&rig, CONNECTION, "P").await.unwrap();
+    std::fs::remove_file(rig.rig.path.join("program")).unwrap();
+
+    write_layer(&project, 9);
+    assert_eq!(poll(&rig).await, ["P"]);
+    assert_eq!(
+        get(&rig, CONNECTION, "P").await.unwrap().effective["limit"],
+        9
+    );
+}
+
+#[tokio::test]
 async fn unstamped_projects_poll_isolates_shared_file_refusal_and_settings_wakes() {
     let rig = unstamped();
     let b = root(&rig.project_scratch, "b");

@@ -435,6 +435,27 @@ impl ConfigCapturer {
         self.capture_selected(declarations, Some(modules))
     }
 
+    /// Capture the selected modules' settings files without reading their
+    /// programs. A settings view never uses program identity, and capturing a
+    /// program hashes the whole binary. On an unstamped install (one with no
+    /// approved settings store), the project poll did that for every requested
+    /// project every two seconds, which kept the daemon at about two cores.
+    /// Plans and approvals still use [`Self::capture_modules`].
+    pub fn capture_module_settings(
+        &self,
+        declarations: &BTreeMap<String, ConfigDeclareRequest>,
+        modules: &BTreeSet<String>,
+    ) -> Result<CapturedConfiguration> {
+        let daemon = CapturedFile::open(&self.daemon_path)?;
+        self.capture_layers(
+            daemon,
+            declarations,
+            Some(modules),
+            false,
+            CapturedFile::open,
+        )
+    }
+
     fn capture_selected(
         &self,
         declarations: &BTreeMap<String, ConfigDeclareRequest>,

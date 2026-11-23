@@ -280,7 +280,7 @@ impl RuntimeOwner {
                 Ok(file)
             })?;
             observation.present = Some(!layers.is_empty());
-            let captured = self.capturer.capture_modules(
+            let captured = self.capturer.capture_module_settings(
                 &BTreeMap::from([(read.module.clone(), read.declaration.request.clone())]),
                 &BTreeSet::from([read.module.clone()]),
             )?;

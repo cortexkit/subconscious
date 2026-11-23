@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.8
+
+- Include the daemon's own process counters in `module.resources` as `subc`,
+  marked with `kind: "daemon"`. The row appears when the daemon reports its
+  first resource reading.
+- Accept `subc` in `module.profile` with the same limits as supervised modules.
+  Profiling requires the daemon to report its PID; the OS may refuse attachment
+  to a hardened daemon on macOS.
+
 ## 0.5.7
 
 - Support supervised registration over the daemon's registration channel. Queries

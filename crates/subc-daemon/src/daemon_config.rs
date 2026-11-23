@@ -954,6 +954,12 @@ fn parse_doc_with_activity(
         .modules
         .into_iter()
         .map(|(module_id, module)| {
+            if module_id == "subc" {
+                return Err(DaemonConfigError::InvalidValue {
+                    path: path.to_path_buf(),
+                    message: "module id 'subc' is reserved for the daemon".to_owned(),
+                });
+            }
             let (program, script) = match (module.program, module.script) {
                 (Some(program), None) => (program, None),
                 (None, Some(script)) if matches!(script.runtime.as_str(), "bun" | "python") => {
@@ -2190,6 +2196,26 @@ mod tests {
             text.contains("not usable as a path component"),
             "refusal must name the hazard: {text}"
         );
+    }
+
+    #[test]
+    fn daemon_module_id_is_reserved() {
+        let path = Path::new("/tmp/subc.jsonc");
+        let err = parse_doc(
+            r#"{ "version": 1, "modules": { "subc": { "program": "x" } } }"#,
+            path,
+        )
+        .expect_err("a configured module must not take the daemon's id");
+        assert!(
+            matches!(err, DaemonConfigError::InvalidValue { message, .. }
+            if message == "module id 'subc' is reserved for the daemon")
+        );
+
+        parse_doc(
+            r#"{ "version": 1, "modules": { "subc-helper": { "program": "x" } } }"#,
+            path,
+        )
+        .expect("only the exact daemon id is reserved");
     }
 
     #[test]

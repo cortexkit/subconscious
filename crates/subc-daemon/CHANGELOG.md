@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.50.40
+
+- Reserve the exact module ID `subc` for the daemon. Daemon configuration
+  refuses any module with that ID so it cannot be mistaken for the daemon.
+
 ## 0.50.39
 
 - Require subc-config 0.1.6 so settings bounds apply only to workspace and project writes.

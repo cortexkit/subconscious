@@ -564,7 +564,7 @@ dependencies = [
 
 [[package]]
 name = "ck-inspect"
-version = "0.5.7"
+version = "0.5.8"
 dependencies = [
  "async-trait",
  "ck-inspect",
@@ -3238,7 +3238,7 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.50.39"
+version = "0.50.40"
 dependencies = [
  "base64",
  "cortexkit-log",

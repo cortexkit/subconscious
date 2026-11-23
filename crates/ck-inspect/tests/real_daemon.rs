@@ -308,6 +308,12 @@ async fn routed_resources_and_profile_observe_supervised_process_and_exit_on_eof
             .iter()
             .any(|e| e.module_id == "inspect" && e.live)
             && list.modules.iter().any(|e| e.module_id == "load" && e.live)
+            && list.daemon.as_ref().is_some_and(|daemon| {
+                matches!(
+                    daemon.resources,
+                    Some(subc_control::ChildResourceUsage::Measured(_))
+                )
+            })
         {
             break;
         }
@@ -355,6 +361,24 @@ async fn routed_resources_and_profile_observe_supervised_process_and_exit_on_eof
     let mut resources: Value = serde_json::from_slice(&resources).unwrap();
     let resources = resources["result"].take();
     assert!(resources.is_object());
+    let mut daemon_rows = resources["modules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["module_id"] == "subc");
+    let daemon_row = daemon_rows.next().expect("missing daemon resources row");
+    assert!(daemon_rows.next().is_none(), "duplicate daemon row");
+    assert_eq!(daemon_row["kind"], "daemon");
+    assert_eq!(daemon_row["state"], "running");
+    assert_eq!(daemon_row["pid"], daemon.child.id());
+    assert_eq!(daemon_row["spawn_generation"], 0);
+    let counters = &daemon_row["resources"];
+    assert_eq!(counters["status"], "measured");
+    assert!(counters["cpu_user_ms"].is_u64());
+    assert!(counters["cpu_system_ms"].is_u64());
+    assert!(counters["memory_bytes"].as_u64().unwrap() > 0);
+    assert!(counters["memory_kind"].is_string());
+
     let load = resources["modules"]
         .as_array()
         .unwrap()

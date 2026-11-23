@@ -21,9 +21,11 @@ use std::{
 };
 use subc_client_rs::{
     BindDecision, ConsumerOptions, HandlerOutcome, ModuleHandler, RequestCtx, RouteBindRequest,
-    SubcConsumer,
+    SubcConsumer, SupervisorListResponse,
 };
-use subc_control::{LiveSpawn, SupervisorEntry};
+use subc_control::{
+    ChildResourceUnavailableReason, ChildResourceUsage, DaemonResources, LiveSpawn,
+};
 use subc_protocol::{
     manifest::{
         CapabilityDeclarations, Concurrency, ManagementOperation, ManagementOperationKind,
@@ -31,6 +33,8 @@ use subc_protocol::{
     },
     Principal,
 };
+
+const DAEMON_MODULE_ID: &str = "subc";
 
 #[derive(Debug, PartialEq)]
 struct Refusal {
@@ -141,22 +145,19 @@ fn whole_number(value: &Value) -> Option<u64> {
 
 #[async_trait]
 trait Roster: Send + Sync {
-    async fn list(&self) -> Result<Vec<SupervisorEntry>, Refusal>;
+    async fn list(&self) -> Result<SupervisorListResponse, Refusal>;
     async fn snapshot(&self) -> Result<Vec<LiveSpawn>, Refusal>;
 }
 
 #[async_trait]
 impl Roster for SubcConsumer {
-    async fn list(&self) -> Result<Vec<SupervisorEntry>, Refusal> {
-        self.supervisor_list()
-            .await
-            .map(|reply| reply.modules)
-            .map_err(|_| {
-                Refusal::new(
-                    "roster_unavailable",
-                    "daemon does not provide the supervised roster",
-                )
-            })
+    async fn list(&self) -> Result<SupervisorListResponse, Refusal> {
+        self.supervisor_list().await.map_err(|_| {
+            Refusal::new(
+                "roster_unavailable",
+                "daemon does not provide the supervised roster",
+            )
+        })
     }
     async fn snapshot(&self) -> Result<Vec<LiveSpawn>, Refusal> {
         self.spawn_snapshot()
@@ -280,6 +281,36 @@ fn target(entries: &[LiveSpawn], id: &str) -> Result<(u32, u64), Refusal> {
         .ok_or_else(|| Refusal::new("not_running", "module has no live supervised process"))
 }
 
+fn daemon_identity(daemon: &DaemonResources) -> Option<(u32, u64)> {
+    (daemon.pid > 0).then_some((daemon.pid, daemon.start_time_ms))
+}
+
+fn daemon_target(list: &SupervisorListResponse) -> Result<(u32, u64), Refusal> {
+    if let Some(identity) = list.daemon.as_ref().and_then(daemon_identity) {
+        return Ok(identity);
+    }
+    // The daemon added its own reading with module tree accounting. New daemons
+    // include a tree or its absence reason for each module, even on a cold cache.
+    if list.daemon.is_some()
+        || list.agent_commands.is_some()
+        || list
+            .modules
+            .iter()
+            .any(|entry| entry.tree.is_some() || entry.tree_unavailable.is_some())
+    {
+        Err(Refusal {
+            code: "daemon_not_measured",
+            reason: "daemon resource reading is not ready",
+            retry_after_ms: Some(500),
+        })
+    } else {
+        Err(Refusal::new(
+            "daemon_not_reported",
+            "daemon does not report its own process in the supervised roster",
+        ))
+    }
+}
+
 impl Inspect {
     async fn query(&self, body: &[u8]) -> Result<Value, Refusal> {
         let request = parse_request(body)?;
@@ -290,10 +321,13 @@ impl Inspect {
         })?;
         match request {
             Request::Resources => {
-                let entries = roster.list().await?;
+                let list = roster.list().await?;
                 let live = roster.snapshot().await?;
-                let modules = entries
+                let mut modules = list
+                    .modules
                     .iter()
+                    // Older daemons may still allow a configured module with this id.
+                    .filter(|entry| entry.module_id != DAEMON_MODULE_ID)
                     .map(|entry| {
                         let value = serde_json::to_value(entry).expect("supervisor entry is JSON");
                         let fields = ["module_id", "state", "spawn_generation", "resources"];
@@ -310,15 +344,31 @@ impl Inspect {
                         Value::Object(output)
                     })
                     .collect::<Vec<_>>();
+                if let Some(daemon) = list.daemon.filter(|daemon| daemon.pid > 0) {
+                    modules.push(json!({
+                        "module_id": DAEMON_MODULE_ID,
+                        "kind": "daemon",
+                        "state": "running",
+                        "pid": daemon.pid,
+                        "spawn_generation": 0,
+                        "resources": daemon.resources.unwrap_or(ChildResourceUsage::Unavailable {
+                            reason: ChildResourceUnavailableReason::Unreadable,
+                        }),
+                    }));
+                }
                 Ok(json!({"modules": modules}))
             }
             Request::Profile { module_id, seconds } => {
-                let entries = roster.list().await?;
-                if !entries.iter().any(|e| e.module_id == module_id) {
-                    return Err(Refusal::new("unknown_module", "module is not supervised"));
-                }
-                let before = roster.snapshot().await?;
-                let (pid, generation) = target(&before, &module_id)?;
+                let list = roster.list().await?;
+                let is_daemon = module_id == DAEMON_MODULE_ID;
+                let before = if is_daemon {
+                    daemon_target(&list)?
+                } else {
+                    if !list.modules.iter().any(|e| e.module_id == module_id) {
+                        return Err(Refusal::new("unknown_module", "module is not supervised"));
+                    }
+                    target(&roster.snapshot().await?, &module_id)?
+                };
                 if !self.sampler.supported() {
                     return Err(Refusal::new(
                         "unsupported_platform",
@@ -343,18 +393,31 @@ impl Inspect {
                 } else {
                     "proc_threads"
                 };
-                let profile = Profile::new(module_id.clone(), pid, seconds, method.into());
+                let profile = Profile::new(module_id.clone(), before.0, seconds, method.into());
                 let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds + 5);
                 let captured =
                     tokio::time::timeout_at(deadline, self.sampler.capture(profile, deadline))
                         .await;
                 // Check identity even after a sampler failure: a process that exited
                 // during capture must never produce a result for its successor.
-                let after = roster.snapshot().await?;
-                if target(&after, &module_id).ok() != Some((pid, generation)) {
+                let after = if is_daemon {
+                    roster
+                        .list()
+                        .await?
+                        .daemon
+                        .as_ref()
+                        .and_then(daemon_identity)
+                } else {
+                    target(&roster.snapshot().await?, &module_id).ok()
+                };
+                if after != Some(before) {
                     return Err(Refusal::new(
                         "module_restarted",
-                        "supervised process changed during profiling",
+                        if is_daemon {
+                            "daemon process changed during profiling"
+                        } else {
+                            "supervised process changed during profiling"
+                        },
                     ));
                 }
                 let mut profile = captured

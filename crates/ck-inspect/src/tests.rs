@@ -4,17 +4,23 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 use subc_client_rs::RouteHandle;
-use subc_control::SupervisorHealthStatus;
+use subc_control::{DaemonResources, SupervisorEntry, SupervisorHealthStatus};
 use subc_protocol::{scope::ScopeStamp, BindIdentity, RouteTarget};
 
 struct FixtureRoster {
     entries: Vec<SupervisorEntry>,
     snapshots: Mutex<VecDeque<Vec<LiveSpawn>>>,
+    daemon: Mutex<VecDeque<DaemonResources>>,
 }
 #[async_trait]
 impl Roster for FixtureRoster {
-    async fn list(&self) -> Result<Vec<SupervisorEntry>, Refusal> {
-        Ok(self.entries.clone())
+    async fn list(&self) -> Result<SupervisorListResponse, Refusal> {
+        Ok(SupervisorListResponse {
+            generation: 1,
+            modules: self.entries.clone(),
+            daemon: self.daemon.lock().unwrap().pop_front(),
+            agent_commands: None,
+        })
     }
     async fn snapshot(&self) -> Result<Vec<LiveSpawn>, Refusal> {
         Ok(self
@@ -76,6 +82,16 @@ fn service(
     supported: bool,
     failure: bool,
 ) -> (Inspect, Arc<FakeSampler>) {
+    service_with_daemon(entries, snapshots, vec![], supported, failure)
+}
+
+fn service_with_daemon(
+    entries: Vec<SupervisorEntry>,
+    snapshots: Vec<Vec<LiveSpawn>>,
+    daemon: Vec<DaemonResources>,
+    supported: bool,
+    failure: bool,
+) -> (Inspect, Arc<FakeSampler>) {
     let sampler = Arc::new(FakeSampler {
         supported,
         failure,
@@ -85,6 +101,7 @@ fn service(
     let roster: Arc<dyn Roster> = Arc::new(FixtureRoster {
         entries,
         snapshots: Mutex::new(snapshots.into()),
+        daemon: Mutex::new(daemon.into()),
     });
     (
         Inspect {
@@ -95,6 +112,89 @@ fn service(
         sampler,
     )
 }
+
+const DAEMON_PROFILE: &[u8] =
+    br#"{"method":"module.profile","params":{"module_id":"subc","seconds":1}}"#;
+
+#[tokio::test]
+async fn daemon_profile_uses_pid_from_roster() {
+    let daemon = DaemonResources::new(1234, 5678, "fixture");
+    let (inspect, sampler) = service_with_daemon(
+        vec![entry()],
+        vec![vec![spawn(72, 3)]],
+        vec![daemon.clone(), daemon],
+        true,
+        false,
+    );
+    let result = inspect.query(DAEMON_PROFILE).await.unwrap();
+    assert_eq!(result["module_id"], "subc");
+    assert_eq!(result["pid"], 1234);
+    assert_eq!(sampler.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn daemon_profile_distinguishes_pending_reading_from_older_roster() {
+    for (tree_unavailable, code, retry) in [
+        (Some("not_yet_measured"), "daemon_not_measured", Some(500)),
+        (None, "daemon_not_reported", None),
+    ] {
+        let mut module = entry();
+        module.tree_unavailable = tree_unavailable.map(str::to_owned);
+        let (inspect, sampler) = service(vec![module], vec![], true, false);
+        let error = inspect.query(DAEMON_PROFILE).await.unwrap_err();
+        assert_eq!((error.code, error.retry_after_ms), (code, retry));
+        assert_eq!(sampler.calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn daemon_profile_discards_results_if_pid_or_start_time_changes() {
+    let daemon = DaemonResources::new(1234, 5678, "fixture");
+    for after in [
+        Some(DaemonResources::new(1235, 5678, "fixture")),
+        Some(DaemonResources::new(1234, 5679, "fixture")),
+        None,
+    ] {
+        let reports = std::iter::once(daemon.clone()).chain(after).collect();
+        let (inspect, sampler) = service_with_daemon(vec![], vec![], reports, true, false);
+        let error = inspect.query(DAEMON_PROFILE).await.unwrap_err();
+        assert_eq!(error.code, "module_restarted");
+        assert_eq!(sampler.calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn daemon_profile_preserves_sampler_failure() {
+    let daemon = DaemonResources::new(1234, 5678, "fixture");
+    let (inspect, _) =
+        service_with_daemon(vec![], vec![], vec![daemon.clone(), daemon], true, true);
+    let error = inspect.query(DAEMON_PROFILE).await.unwrap_err();
+    assert_eq!(
+        error,
+        Refusal::new("sampler_failed", "fixture sampler failure")
+    );
+}
+
+#[tokio::test]
+async fn daemon_resources_do_not_hide_other_modules_while_waiting_for_a_reading() {
+    let mut legacy_collision = entry();
+    legacy_collision.module_id = "subc".into();
+    let (inspect, _) = service(
+        vec![legacy_collision, entry()],
+        vec![vec![spawn(72, 3)]],
+        true,
+        false,
+    );
+    let result = inspect
+        .query(br#"{"method":"module.resources"}"#)
+        .await
+        .unwrap();
+    assert_eq!(
+        result["modules"],
+        json!([{"module_id": "fixture", "state": "running", "spawn_generation": 3, "pid": 72}])
+    );
+}
+
 fn request(seconds: u64) -> Vec<u8> {
     serde_json::to_vec(
         &json!({"method":"module.profile", "params":{"module_id":"fixture", "seconds": seconds}}),
@@ -279,7 +379,7 @@ async fn unavailable_daemon_refusal() {
     struct MissingRoster;
     #[async_trait]
     impl Roster for MissingRoster {
-        async fn list(&self) -> Result<Vec<SupervisorEntry>, Refusal> {
+        async fn list(&self) -> Result<SupervisorListResponse, Refusal> {
             Err(Refusal::new(
                 "roster_unavailable",
                 "daemon does not provide the supervised roster",

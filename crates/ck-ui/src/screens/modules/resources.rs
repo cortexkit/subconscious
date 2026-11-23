@@ -263,7 +263,7 @@ fn total(snap: &Snapshot) -> (ResourceUsage, Option<HourFigure>) {
     )
 }
 
-pub(super) fn draw(c: &mut Canvas, v: &View) {
+pub(super) fn draw(c: &mut Canvas, v: &View, stopping: &impl Fn(&Module) -> bool) {
     let snap = v.snap;
     chrome(
         c,
@@ -300,12 +300,9 @@ pub(super) fn draw(c: &mut Canvas, v: &View) {
     }
     for i in r.first..r.first + r.count {
         if let Some(m) = snap.modules.data.get(i) {
-            let (g, gst) = status_glyph(m.status);
             let ok = m.status == Status::Ok;
-            let (g, gst, word) = m.action.as_ref().map_or_else(
-                || (g, gst, status_word(m.status).into()),
-                |a| ("◐", St::A, action_word(a)),
-            );
+            let is_stopping = stopping(m);
+            let (g, gst, word) = module_label(m, is_stopping);
             c.put(2, y, g, gst);
             let x = c.put(4, y, &trunc(&m.id, 18), if ok { St::NONE } else { St::B });
             if m.pending_restart.is_some() {
@@ -315,7 +312,11 @@ pub(super) fn draw(c: &mut Canvas, v: &View) {
                 24,
                 y,
                 &trunc(&word, HEALTH_W),
-                if ok && m.action.is_none() { St::D } else { gst },
+                if !is_stopping && ok && m.action.is_none() {
+                    St::D
+                } else {
+                    gst
+                },
             );
             figures(
                 c,
@@ -339,6 +340,9 @@ pub(super) fn draw(c: &mut Canvas, v: &View) {
                     &trunc(&m.summary, (lw - 83).max(0) as usize),
                     if ok { St::D } else { gst },
                 );
+            }
+            if !is_stopping && stop_unconfirmed(snap, m) {
+                unconfirmed_row(c, m, y, lw);
             }
         } else {
             let extra = &snap.resource_rows[i - snap.modules.data.len()];
@@ -385,8 +389,8 @@ pub(super) fn draw(c: &mut Canvas, v: &View) {
             x1: c.w,
             y1: l.last + 1,
         });
-        if sel < snap.modules.data.len() {
-            pane(c, v, sel, lw);
+        if let Some(m) = snap.modules.data.get(sel) {
+            pane(c, v, sel, lw, stopping(m));
         } else {
             extra_pane(c, &snap.resource_rows[sel - snap.modules.data.len()], lw);
         }
@@ -403,18 +407,10 @@ pub(super) fn draw(c: &mut Canvas, v: &View) {
     }
     let mut hints = vec![("↑↓", "select")];
     if let Some(m) = snap.modules.data.get(sel) {
-        hints.extend([
-            ("r", "restart"),
-            (
-                "s",
-                if m.status == Status::Stopped {
-                    "start"
-                } else {
-                    "stop"
-                },
-            ),
-            ("l", "logs"),
-        ]);
+        if !stopping(m) {
+            hints.extend(action_hints(Some(m)));
+        }
+        hints.push(("l", "logs"));
         if snap.serves.all_metrics {
             hints.push(("m", "all metrics"));
         }

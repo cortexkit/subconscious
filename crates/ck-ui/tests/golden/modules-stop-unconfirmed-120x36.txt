@@ -1,0 +1,36 @@
+ ◆ CortexKit    1 Home   2 Modules   3 Activity   7 Settings                                       This computer  20:48 
+─────────────────────────━━━━━━━━━──────────────────────────────────────────────────────────────────────────────────────
+                                                                                                                        
+  Modules 1                                                               │  worker                               ● ok  
+                                                                          │  pid unknown · up unknown · build unknown   
+    Module              Health      CPU  Cores 1h   Memory       Up       │  stop not confirmed                         
+  ──────────────────────────────────────────────────────────────────────  │  Health                      never checked  
+  ● worker              stop not confirmed · running                      │  ─────────────────────────────────────────  
+  ──────────────────────────────────────────────────────────────────────  │                                             
+    All of CortexKit                  –         –        –                │  No details reported                        
+                                                                          │                                             
+  Starts and exits                                                 today  │  CPU and memory                last 10 min  
+  ──────────────────────────────────────────────────────────────────────  │  ─────────────────────────────────────────  
+  unknown                                                                 │                                          –  
+                                                                          │                                    unknown  
+                                                                          │  Last hour                not measured yet  
+                                                                          │                                             
+                                                                          │  Processes                                  
+                                                                          │  ─────────────────────────────────────────  
+                                                                          │  not measured yet                           
+                                                                          │                                             
+                                                                          │  Log                                live ●  
+                                                                          │  ─────────────────────────────────────────  
+                                                                          │                                             
+                                                                          │                                             
+                                                                          │                                             
+                                                                          │                                             
+                                                                          │                                             
+                                                                          │                                             
+                                                                          │                                             
+                                                                          │                                             
+                                                                          │                                             
+                                                                          │                                             
+                                                                                                                        
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ↑↓  select    r  restart    s  stop    l  logs    m  all metrics    e  settings                      updated just now 

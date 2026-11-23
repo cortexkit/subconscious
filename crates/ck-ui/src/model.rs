@@ -276,6 +276,14 @@ pub struct ActionResult {
     pub ok: bool,
 }
 
+/// The latest completed Stop on a module. Kept even when no action is in
+/// flight, so a frame that misses the in-flight update still sees completion.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StopCompletion {
+    pub sequence: u64,
+    pub unconfirmed: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Module {
     pub id: String,
@@ -824,6 +832,7 @@ pub struct Snapshot {
     pub log_view: Option<Panel<LogView>>,
     /// What the most recent action did.
     pub last_result: Option<ActionResult>,
+    pub stop_completions: std::collections::HashMap<String, StopCompletion>,
     /// Which keys and screens the app serves; it advertises nothing else.
     pub serves: Serves,
     /// The latest results of the Add a phone exchange, each with its
@@ -1636,6 +1645,7 @@ mod fixture {
             commands,
             log_view: None,
             last_result: None,
+            stop_completions: Default::default(),
             serves: Serves::DESIGN,
             pairing: Vec::new(),
             computer: Vec::new(),

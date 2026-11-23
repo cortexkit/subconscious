@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.21.41
+
+- Require ck-ui 0.9.7 so `ck` shows modules stopping and prevents duplicate
+  Start or Stop requests while a stop is in flight.
+
 ## 0.21.40
 
 - Require subc-daemon 0.50.43 for empty-object source attribution in settings replies.

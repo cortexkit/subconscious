@@ -36,6 +36,9 @@ use crate::model::{
 use crate::pairing::flow::{Command, Refusal};
 use crate::time::Timestamp;
 
+#[path = "stop.rs"]
+mod stop;
+
 /// The longest any one daemon or module request may take before its source
 /// counts it as failed and tries again on its next turn.
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -78,13 +81,12 @@ struct Conn {
 
 impl Shared {
     /// Changes the state and sends the snapshot it now describes.
-    fn update(&self, f: impl FnOnce(&mut State)) {
-        let snap = {
-            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            f(&mut st);
-            assemble(&st, Timestamp::system_now())
-        };
-        self.tx.send_replace(snap);
+    fn update<T>(&self, f: impl FnOnce(&mut State) -> T) -> T {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let result = f(&mut st);
+        // A source poll must not publish an older snapshot over an action result.
+        self.tx.send_replace(assemble(&st, Timestamp::system_now()));
+        result
     }
 
     fn read<T>(&self, f: impl FnOnce(&State) -> T) -> T {
@@ -162,10 +164,13 @@ fn secs(s: f64) -> Duration {
 
 // ---- connection ----------------------------------------------------------------
 
-async fn connect(file: Option<&Path>) -> Result<(SubcConsumer, String), String> {
+async fn connect(
+    file: Option<&Path>,
+    call_timeout: Duration,
+) -> Result<(SubcConsumer, String), String> {
     let discovered = connection_file::discover(file).map_err(|e| e.to_string())?;
     let opts = ConsumerOptions {
-        call_timeout: CALL_TIMEOUT,
+        call_timeout,
         handshake_timeout: Duration::from_secs(5),
         ..ConsumerOptions::default()
     };
@@ -180,7 +185,7 @@ async fn connect(file: Option<&Path>) -> Result<(SubcConsumer, String), String> 
 /// seconds.
 async fn supervise(shared: Arc<Shared>, file: Option<PathBuf>) {
     loop {
-        match connect(file.as_deref()).await {
+        match connect(file.as_deref(), CALL_TIMEOUT).await {
             Ok((consumer, daemon_ver)) => {
                 let consumer = Arc::new(consumer);
                 let dropped = Arc::new(Notify::new());
@@ -214,8 +219,8 @@ async fn supervise(shared: Arc<Shared>, file: Option<PathBuf>) {
                         lost_at: Some(now()),
                         reason: "connection lost".into(),
                     };
-                    // Nothing in flight can be followed without the daemon.
-                    for (id, a) in s.actions.drain() {
+                    // Stop uses its own connection and reports its own outcome.
+                    for (id, a) in s.actions.extract_if(|_, a| a.kind != ActionKind::Stop) {
                         s.last_result = Some(ActionResult {
                             at: now(),
                             text: format!(
@@ -1310,6 +1315,10 @@ async fn handle_requests(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Re
             Request::StartDaemon => {
                 tokio::spawn(start_daemon(Arc::clone(&shared)));
             }
+            Request::Act {
+                kind: ActionKind::Stop,
+                module,
+            } => stop::request(&shared, module),
             Request::Act { kind, module } => {
                 let shared = Arc::clone(&shared);
                 tokio::spawn(async move {
@@ -1805,7 +1814,13 @@ async fn run_action(
     progress_notes: Option<String>,
 ) -> super::apply::RestartResult {
     let started = now();
-    shared.update(|s| {
+    let began = shared.update(|s| {
+        if s.actions
+            .get(&module)
+            .is_some_and(|a| a.kind == ActionKind::Stop)
+        {
+            return false;
+        }
         s.actions.insert(
             module.clone(),
             ModuleAction {
@@ -1814,7 +1829,18 @@ async fn run_action(
                 started_at: started,
             },
         );
+        if let Some(stop) = s.stop_completions.get_mut(&module) {
+            stop.unconfirmed = false;
+        }
+        true
     });
+    if !began {
+        return super::apply::RestartResult {
+            healthy: false,
+            state: "busy".into(),
+            detail: format!("{module}: another action is in progress"),
+        };
+    }
     let result = super::actions::run_action(
         &AppAction(Arc::clone(&shared)),
         kind,
@@ -1823,7 +1849,11 @@ async fn run_action(
         false,
         |phase, _line| {
             shared.update(|s| {
-                if let Some(a) = s.actions.get_mut(&module) {
+                if let Some(a) = s
+                    .actions
+                    .get_mut(&module)
+                    .filter(|a| a.started_at == started && a.kind == kind)
+                {
                     a.phase = phase;
                     if let Some(notes) = &progress_notes {
                         s.last_result = Some(ActionResult {
@@ -1852,6 +1882,13 @@ async fn run_action(
         ),
     };
     shared.update(|s| {
+        if !s
+            .actions
+            .get(&module)
+            .is_some_and(|a| a.started_at == started && a.kind == kind)
+        {
+            return;
+        }
         s.actions.remove(&module);
         clear_pending_restart(s, &module, ok && state == "healthy", new_process);
         s.last_result = Some(ActionResult {
@@ -1903,7 +1940,7 @@ impl super::actions::ActionSource for AppAction {
                         .supervisor_restart(module, drain_timeout_ms)
                         .await
                 }
-                ActionKind::Stop => conn.consumer.supervisor_set_enabled(module, false).await,
+                ActionKind::Stop => unreachable!("the app follows Stop on a dedicated connection"),
                 ActionKind::Start => conn.consumer.supervisor_set_enabled(module, true).await,
             };
             result.map(|ack| ack.applied).map_err(|e| control_error(&e))
@@ -1934,11 +1971,9 @@ mod tests {
         assert!(!state.pending_restarts.contains("broca"));
     }
 
-    #[tokio::test]
-    async fn what_the_app_shows_decides_the_sources_wanted() {
-        let state = State::empty("This computer");
+    pub(super) fn test_shared(state: State) -> Arc<Shared> {
         let (tx, _rx) = watch::channel(assemble(&state, now()));
-        let shared = Arc::new(Shared {
+        Arc::new(Shared {
             connection_file: None,
             state: Mutex::new(state),
             tx,
@@ -1952,7 +1987,12 @@ mod tests {
             identity_ready: Notify::new(),
             raw: Arc::default(),
             upgrade: None,
-        });
+        })
+    }
+
+    #[tokio::test]
+    async fn what_the_app_shows_decides_the_sources_wanted() {
+        let shared = test_shared(State::empty("This computer"));
         let mut gate = shared.gate();
         assert!(
             gate.wanted(Source::Devices),

@@ -403,6 +403,7 @@ pub struct State {
     /// list on the Modules screen.
     pub terminals: HashMap<String, Vec<ProcessEvent>>,
     pub actions: HashMap<String, ModuleAction>,
+    stop_completions: HashMap<String, crate::model::StopCompletion>,
     pub last_result: Option<ActionResult>,
     pub pending_restarts: std::collections::HashSet<String>,
     /// The status each module had when ck last looked, and since when.
@@ -480,6 +481,7 @@ impl State {
             probes: HashMap::new(),
             terminals: HashMap::new(),
             actions: HashMap::new(),
+            stop_completions: HashMap::new(),
             last_result: None,
             pending_restarts: std::collections::HashSet::new(),
             status_since: HashMap::new(),
@@ -1052,6 +1054,7 @@ pub fn assemble(state: &State, now: Timestamp) -> Snapshot {
         commands,
         log_view,
         last_result: state.last_result.clone(),
+        stop_completions: state.stop_completions.clone(),
         serves: crate::model::Serves::LIVE,
         pairing: state.pairing.iter().cloned().collect(),
         computer: state.computer.iter().cloned().collect(),

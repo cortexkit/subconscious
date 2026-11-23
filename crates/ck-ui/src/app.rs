@@ -1,5 +1,6 @@
 //! The app: state, keys and mouse, rendering, and the terminal run loop.
 
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::Duration;
@@ -128,6 +129,8 @@ pub struct App {
     pub log: Option<LogState>,
     /// A confirmation waiting for an answer.
     pub confirm: Option<Confirm>,
+    /// Stops confirmed here but not yet reported complete by the live layer.
+    pending_stops: HashMap<String, u64>,
     /// The all-metrics list's scroll position while it is open over
     /// Modules.
     pub metrics: Option<usize>,
@@ -186,6 +189,7 @@ impl App {
             back: None,
             log: None,
             confirm: None,
+            pending_stops: HashMap::new(),
             metrics: None,
             down_log: false,
             field: None,
@@ -264,7 +268,25 @@ impl App {
 
     /// The palette's commands for the tabs that show.
     fn palette_commands(&self, snap: &Snapshot) -> Vec<PaletteCommand> {
-        overlays::shown_commands(&snap.commands, snap.visible_tabs())
+        let mut commands = overlays::shown_commands(&snap.commands, snap.visible_tabs());
+        commands.retain(|cmd| {
+            if cmd.area != "Modules" {
+                return true;
+            }
+            ["Start ", "Stop ", "Restart "]
+                .iter()
+                .find_map(|prefix| cmd.title.strip_prefix(prefix))
+                .is_none_or(|id| {
+                    !self.stop_pending(snap, id)
+                        && !snap.modules.data.iter().any(|m| {
+                            m.id == id
+                                && m.action
+                                    .as_ref()
+                                    .is_some_and(|a| a.kind == ActionKind::Stop)
+                        })
+                })
+        });
+        commands
     }
 
     fn selected<'a>(&self, snap: &'a Snapshot) -> Option<&'a Module> {
@@ -273,6 +295,16 @@ impl App {
             self.mod_sel
                 .min(screens::modules::row_count(snap).saturating_sub(1)),
         )
+    }
+
+    fn stop_sequence(snap: &Snapshot, module: &str) -> u64 {
+        snap.stop_completions
+            .get(module)
+            .map_or(0, |completion| completion.sequence)
+    }
+
+    fn stop_pending(&self, snap: &Snapshot, module: &str) -> bool {
+        self.pending_stops.get(module) == Some(&Self::stop_sequence(snap, module))
     }
 
     /// The log view's data for the selected module, or an empty panel while
@@ -345,7 +377,9 @@ impl App {
             (Tab::Modules, None, Some(scroll), Some(m)) => {
                 screens::metrics::draw(&mut c, &v, m, scroll)
             }
-            (Tab::Modules, ..) => screens::modules::draw(&mut c, &v),
+            (Tab::Modules, ..) => screens::modules::draw_with_pending_stops(&mut c, &v, &|m| {
+                self.stop_pending(snap, &m.id)
+            }),
             (Tab::Activity, ..) => {
                 screens::activity::draw(&mut c, &v, &self.activity, self.field.is_some())
             }
@@ -478,7 +512,7 @@ impl App {
             return true;
         }
         if self.confirm.is_some() {
-            return self.confirm_key(key);
+            return self.confirm_key(key, snap);
         }
         if self.overlay == Some(Overlay::Pairing) {
             return self.pairing_key(key, snap);
@@ -707,7 +741,7 @@ impl App {
         let Some(m) = self.selected(snap) else {
             return false;
         };
-        if m.action.is_some() {
+        if m.action.is_some() || self.stop_pending(snap, &m.id) {
             return false;
         }
         let id = &m.id;
@@ -738,7 +772,7 @@ impl App {
         let Some(m) = self.selected(snap) else {
             return false;
         };
-        if m.action.is_some() {
+        if m.action.is_some() || self.stop_pending(snap, &m.id) {
             return false;
         }
         let id = m.id.clone();
@@ -835,6 +869,8 @@ impl App {
     /// pairing results not yet applied, and the exchange's timeouts.
     /// Returns whether the frame needs redrawing.
     pub fn on_snapshot(&mut self, snap: &Snapshot, now: Timestamp) -> bool {
+        self.pending_stops
+            .retain(|module, sequence| *sequence == Self::stop_sequence(snap, module));
         let mut settings_changed = self.settings.observe(&snap.settings);
         // A reconnect first, so a reply from before it is not taken for the
         // one the fresh request waits for.
@@ -916,10 +952,14 @@ impl App {
         Some(true)
     }
 
-    fn confirm_key(&mut self, key: KeyEvent) -> bool {
+    fn confirm_key(&mut self, key: KeyEvent, snap: &Snapshot) -> bool {
         match key.code {
             KeyCode::Enter | KeyCode::Char('y') => {
                 if let Some(q) = self.confirm.take() {
+                    if q.kind == ActionKind::Stop {
+                        self.pending_stops
+                            .insert(q.module.clone(), Self::stop_sequence(snap, &q.module));
+                    }
                     self.requests.push(Request::Act {
                         kind: q.kind,
                         module: q.module,
@@ -1732,8 +1772,17 @@ fn forward_requests(
         told.log = Some(focus);
     }
     for request in app.requests.drain(..) {
-        if let Some(out) = out {
-            let _ = out.send(request);
+        let stop = match &request {
+            Request::Act {
+                kind: ActionKind::Stop,
+                module,
+            } => Some(module.clone()),
+            _ => None,
+        };
+        if !out.is_some_and(|out| out.send(request).is_ok()) {
+            if let Some(module) = stop {
+                app.pending_stops.remove(&module);
+            }
         }
     }
 }

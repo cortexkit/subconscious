@@ -13,7 +13,7 @@ use crate::draw::{
     chrome, frame_end, heading, live_dot, pad_right, spark, status_glyph, status_word, trunc,
     width, Canvas, Clip,
 };
-use crate::model::{LogLevel, Module, ProcessEventKind, Status, Tab};
+use crate::model::{ActionKind, LogLevel, Module, ProcessEventKind, Snapshot, Status, Tab};
 use crate::theme::{Bg, Fg, St};
 use crate::time::{ago, js_round};
 
@@ -146,8 +146,22 @@ pub fn module_at(w: i32, h: i32, len: usize, sel: usize, y: i32) -> Option<usize
 }
 
 pub fn draw(c: &mut Canvas, v: &View) {
+    draw_with_pending_stops(c, v, &|_| false);
+}
+
+pub(crate) fn draw_with_pending_stops(
+    c: &mut Canvas,
+    v: &View,
+    awaiting_snapshot: &impl Fn(&Module) -> bool,
+) {
+    let stopping = |m: &Module| {
+        awaiting_snapshot(m)
+            || m.action
+                .as_ref()
+                .is_some_and(|a| a.kind == ActionKind::Stop)
+    };
     if resource_mode(v.snap) {
-        resources::draw(c, v);
+        resources::draw(c, v, &stopping);
         return;
     }
     let snap = v.snap;
@@ -186,13 +200,9 @@ pub fn draw(c: &mut Canvas, v: &View) {
         y += 1;
     }
     for (i, m) in mods.iter().enumerate().skip(r.first).take(r.count) {
-        let (g, gst) = status_glyph(m.status);
         let ok = m.status == Status::Ok;
-        // An action in flight shows its phase where the health word goes.
-        let (g, gst, word) = match &m.action {
-            Some(a) => ("◐", St::A, action_word(a)),
-            None => (g, gst, status_word(m.status).to_string()),
-        };
+        let stopping = stopping(m);
+        let (g, gst, word) = module_label(m, stopping);
         c.put(2, y, g, gst);
         let x = c.put(4, y, &trunc(&m.id, 18), if ok { St::NONE } else { St::B });
         if m.pending_restart.is_some() {
@@ -200,7 +210,7 @@ pub fn draw(c: &mut Canvas, v: &View) {
         }
         // Every column is cut to its own width, so no value runs into the
         // next one; a missing number is a dim dash.
-        let word_st = if m.action.is_some() || !ok {
+        let word_st = if stopping || m.action.is_some() || !ok {
             gst
         } else {
             St::D
@@ -226,6 +236,9 @@ pub fn draw(c: &mut Canvas, v: &View) {
         if l.summary {
             let text = trunc(&m.summary, (lw - SUMMARY_X).max(0) as usize);
             c.put(SUMMARY_X, y, &text, if ok { St::D } else { gst });
+        }
+        if !stopping && stop_unconfirmed(snap, m) {
+            unconfirmed_row(c, m, y, lw);
         }
         if i == sel {
             c.paint(1, y, lw, St::bg(Bg::Sel));
@@ -280,7 +293,7 @@ pub fn draw(c: &mut Canvas, v: &View) {
             x1: c.w,
             y1: last + 1,
         });
-        pane(c, v, sel, lw);
+        pane(c, v, sel, lw, stopping(&mods[sel]));
         c.set_clip(prev);
     }
 
@@ -296,17 +309,12 @@ pub fn draw(c: &mut Canvas, v: &View) {
         c.dim_rect(1, 7, lw, last - 6);
     }
     let selected = mods.get(sel);
-    let s_label = match selected.map(|m| m.status) {
-        Some(Status::Stopped) => "start",
-        _ => "stop",
-    };
     // A key is offered only for what exists: no Settings screen, no `e`.
-    let mut hints = vec![
-        ("↑↓", "select"),
-        ("r", "restart"),
-        ("s", s_label),
-        ("l", "logs"),
-    ];
+    let mut hints = vec![("↑↓", "select")];
+    if !selected.is_some_and(stopping) {
+        hints.extend(action_hints(selected));
+    }
+    hints.push(("l", "logs"));
     if snap.serves.all_metrics {
         hints.push(("m", "all metrics"));
     }
@@ -314,6 +322,50 @@ pub fn draw(c: &mut Canvas, v: &View) {
         hints.push(("e", "settings"));
     }
     frame_end(c, &hints, &status, status_st);
+}
+
+fn action_hints(selected: Option<&Module>) -> [(&'static str, &'static str); 2] {
+    let label = if selected.is_some_and(|m| m.status == Status::Stopped) {
+        "start"
+    } else {
+        "stop"
+    };
+    [("r", "restart"), ("s", label)]
+}
+
+fn module_label(m: &Module, stopping: bool) -> (&'static str, St, String) {
+    if stopping {
+        return ("◐", St::A, "stopping".into());
+    }
+    if let Some(action) = &m.action {
+        return ("◐", St::A, action_word(action));
+    }
+    let (glyph, style) = status_glyph(m.status);
+    (glyph, style, status_word(m.status).into())
+}
+
+fn stop_unconfirmed(snap: &Snapshot, m: &Module) -> bool {
+    m.action.is_none()
+        && snap
+            .stop_completions
+            .get(&m.id)
+            .is_some_and(|r| r.unconfirmed)
+}
+
+fn unconfirmed_row(c: &mut Canvas, m: &Module, y: i32, right: i32) {
+    let state = m.lifecycle.as_deref().unwrap_or_else(|| match m.status {
+        Status::Ok => "running",
+        status => status_word(status),
+    });
+    // The warning and current state don't both fit in the health column.
+    let width = right - 24 + 1;
+    c.fill(24, y, width, 1, ' ', St::NONE);
+    c.put(
+        24,
+        y,
+        &trunc(&format!("stop not confirmed · {state}"), width as usize),
+        St::W,
+    );
 }
 
 /// An action's phase in the table's health column, which is nine columns
@@ -334,13 +386,18 @@ fn uptime(v: &View, m: &Module) -> Option<String> {
 }
 
 /// The detail pane for the selected module.
-fn pane(c: &mut Canvas, v: &View, sel: usize, lw: i32) {
+fn pane(c: &mut Canvas, v: &View, sel: usize, lw: i32, stopping: bool) {
     let m = &v.snap.modules.data[sel];
     let x = lw + 5;
     let dw = c.w - x - 2;
-    let (g, gst) = status_glyph(m.status);
     c.put(x, 3, &m.id, St::B);
-    c.right(x + dw, 3, &format!("{g} {}", status_word(m.status)), gst);
+    let (g, gst, word) = if stopping {
+        module_label(m, true)
+    } else {
+        let (g, gst) = status_glyph(m.status);
+        (g, gst, status_word(m.status).into())
+    };
+    c.right(x + dw, 3, &format!("{g} {word}"), gst);
     let pid = m.pid.map_or_else(|| UNKNOWN.to_string(), |p| p.to_string());
     let up = match (uptime(v, m), m.status) {
         (Some(up), _) => up,
@@ -353,11 +410,17 @@ fn pane(c: &mut Canvas, v: &View, sel: usize, lw: i32) {
         let line = format!(
             "{} · {} · {}",
             a.kind.verb(),
-            a.phase_text(),
+            if stopping {
+                "stopping".into()
+            } else {
+                a.phase_text()
+            },
             ago(v.age(a.started_at))
         );
         c.put(x, 5, "◐", St::A);
         c.put(x + 2, 5, &trunc(&line, (dw - 2).max(0) as usize), St::A);
+    } else if !stopping && stop_unconfirmed(v.snap, m) {
+        c.put(x, 5, "stop not confirmed", St::W);
     }
 
     let mut y = 6;

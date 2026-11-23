@@ -7,6 +7,7 @@
 use ck_ui::app::{App, Request, Tab};
 use ck_ui::model::{
     ActionKind, ActionPhase, ActionResult, Daemon, DaemonDown, ModuleAction, Panel, Status,
+    StopCompletion,
 };
 use ck_ui::theme::{Fg, Theme};
 use ck_ui::Snapshot;
@@ -287,6 +288,90 @@ fn stopping_asks_and_names_who_it_serves_and_starting_does_not_ask() {
     );
     let buf = render(&app, &s, 120, 36);
     assert!(row(&buf, 35).contains(" s  start"));
+}
+
+#[test]
+fn confirmed_stop_is_visible_and_blocks_repeat_keys_before_the_live_snapshot() {
+    let s = Snapshot::fixture();
+    let mut app = App::new(Theme::test());
+    app.tab = Tab::Modules;
+    app.mod_sel = s
+        .modules
+        .data
+        .iter()
+        .position(|m| m.status == Status::Ok)
+        .unwrap();
+    let selected = app.mod_sel;
+    assert!(press(&mut app, &s, KeyCode::Char('s')));
+    assert!(press(&mut app, &s, KeyCode::Enter));
+    assert_eq!(
+        std::mem::take(&mut app.requests),
+        [Request::Act {
+            kind: ActionKind::Stop,
+            module: s.modules.data[selected].id.clone()
+        }]
+    );
+    let buf = render(&app, &s, 120, 36);
+    let table_row = row(&buf, 7 + selected as u16);
+    assert!(table_row.contains("stopping"), "{table_row}");
+    assert!(!press(&mut app, &s, KeyCode::Char('s')));
+    assert!(!press(&mut app, &s, KeyCode::Char('r')));
+    assert!(app.requests.is_empty() && app.confirm.is_none());
+}
+
+#[test]
+fn confirmed_stop_holds_start_until_completion_and_handles_unconfirmed_outcomes() {
+    for stopped in [true, false] {
+        let mut s = Snapshot::fixture();
+        let mut app = App::new(Theme::test());
+        app.tab = Tab::Modules;
+        let selected = s
+            .modules
+            .data
+            .iter()
+            .position(|m| m.status == Status::Ok)
+            .unwrap();
+        app.mod_sel = selected;
+        let id = s.modules.data[selected].id.clone();
+        press(&mut app, &s, KeyCode::Char('s'));
+        press(&mut app, &s, KeyCode::Enter);
+        app.requests.clear();
+
+        if stopped {
+            // An early roster reading must not turn the Stop key into Start.
+            s.modules.data[selected].status = Status::Stopped;
+        }
+        assert!(!row(&render(&app, &s, 120, 36), 35).contains(" s  start"));
+        assert!(!press(&mut app, &s, KeyCode::Char('s')));
+        assert!(app.requests.is_empty());
+
+        // The action's start and completion may be coalesced in the live feed.
+        s.stop_completions.insert(
+            id.clone(),
+            StopCompletion {
+                sequence: 1,
+                unconfirmed: !stopped,
+            },
+        );
+        let buf = render(&app, &s, 120, 36);
+        assert!(!row(&buf, 7 + selected as u16).contains("stopping"));
+        assert!(press(&mut app, &s, KeyCode::Char('s')));
+        if stopped {
+            assert!(row(&buf, 35).contains(" s  start"));
+            assert_eq!(
+                app.requests,
+                [Request::Act {
+                    kind: ActionKind::Start,
+                    module: id
+                }]
+            );
+        } else {
+            assert!(row(&buf, 7 + selected as u16).contains("stop not confirmed · running"));
+            assert!(!row(&buf, 35).contains(" s  start"));
+            assert!(app.requests.is_empty());
+            assert_eq!(app.confirm.unwrap().kind, ActionKind::Stop);
+        }
+    }
 }
 
 #[test]

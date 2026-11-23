@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.9.7
+
+- Show a module as stopping after confirmation and ignore further Start or Stop
+  presses for that module until the stop request completes.
+
 ## 0.9.6
 
 - `metrics::no_headline_line` names a module's nested metric groups, and points at the

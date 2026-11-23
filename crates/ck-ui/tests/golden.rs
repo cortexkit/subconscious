@@ -163,6 +163,53 @@ fn modules_120x36() {
     check("modules-120x36", &app, &Snapshot::fixture());
 }
 
+fn stop_snapshot() -> Snapshot {
+    let now = Snapshot::fixture_now();
+    let mut state = ck_ui::live::State::empty("This computer");
+    state.connection = ck_ui::live::Connection::Up {
+        daemon_ver: "test".into(),
+    };
+    state.record_roster(
+        vec![subc_control::SupervisorEntry::new(
+            "worker",
+            "running",
+            true,
+            true,
+            subc_control::SupervisorHealthStatus::Ok,
+        )],
+        now,
+    );
+    ck_ui::live::assemble(&state, now)
+}
+
+#[test]
+fn modules_stop_pending_80x24() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let snap = stop_snapshot();
+    let mut app = App::new(Theme::test());
+    app.tab = Tab::Modules;
+    for key in [KeyCode::Char('s'), KeyCode::Enter] {
+        assert!(app.handle_key(KeyEvent::new(key, KeyModifiers::NONE), &snap));
+    }
+    check("modules-stop-pending-80x24", &app, &snap);
+}
+
+#[test]
+fn modules_stop_unconfirmed_120x36() {
+    let mut snap = stop_snapshot();
+    snap.modules.data[0].resources = Some(Default::default());
+    snap.stop_completions.insert(
+        "worker".into(),
+        ck_ui::model::StopCompletion {
+            sequence: 1,
+            unconfirmed: true,
+        },
+    );
+    let mut app = App::new(Theme::test());
+    app.tab = Tab::Modules;
+    check("modules-stop-unconfirmed-120x36", &app, &snap);
+}
+
 #[test]
 fn modules_resource_frames() {
     for name in resource_fixture::FRAMES {

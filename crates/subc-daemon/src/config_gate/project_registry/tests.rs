@@ -422,7 +422,11 @@ async fn registry_root_outcomes_keep_healthy_and_refused_roots_distinct() {
         &dir,
     );
     std::fs::remove_dir(&gone).unwrap();
-    let pool = RootIoPool::with_timeout(Duration::from_millis(300)).unwrap();
+    // Every unblocked root must finish its open inside this deadline, so it is
+    // generous: on a loaded Windows CI runner a 0.3 s deadline turned the gone
+    // root's open into a pool timeout instead of OpenRefused. Only the blocked
+    // root is meant to reach it.
+    let pool = RootIoPool::with_timeout(Duration::from_secs(5)).unwrap();
     let (release, wait) = mpsc::channel();
     let (entered, signal) = tokio::sync::oneshot::channel();
     let job = pool
@@ -439,14 +443,22 @@ async fn registry_root_outcomes_keep_healthy_and_refused_roots_distinct() {
         .await
         .unwrap();
     let outcomes = &revision.opened;
-    assert!(matches!(
-        outcomes[&blocked].as_ref(),
-        Err(RootCheckFailure::Pool(RootIoError::RootBusy))
-    ));
-    assert!(matches!(
-        outcomes[&gone].as_ref(),
-        Err(RootCheckFailure::OpenRefused(_))
-    ));
+    assert!(
+        matches!(
+            outcomes[&blocked].as_ref(),
+            Err(RootCheckFailure::Pool(RootIoError::RootBusy))
+        ),
+        "blocked root: {:?}",
+        outcomes[&blocked].as_ref().as_ref().err()
+    );
+    assert!(
+        matches!(
+            outcomes[&gone].as_ref(),
+            Err(RootCheckFailure::OpenRefused(_))
+        ),
+        "gone root: {:?}",
+        outcomes[&gone].as_ref().as_ref().err()
+    );
     let mismatch = revision
         .layer_location("project", &mismatched)
         .err()

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.50.44
+
+- Test only: the project-registry root-outcome test gives unblocked roots a 5 s pool
+  deadline instead of 0.3 s, which a loaded Windows CI runner exceeded, and prints
+  the outcome when an assertion fails.
+
 ## 0.50.43
 
 - Report the source of empty objects in module and project `config.show` replies,

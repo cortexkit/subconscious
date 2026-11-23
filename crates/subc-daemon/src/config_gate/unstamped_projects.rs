@@ -3,12 +3,12 @@
 
 use super::*;
 use crate::config_gate::{
-    capture::{parse_layer, CapturedModule},
+    capture::{parse_layer, CapturedFile, CapturedModule},
     capture_plan,
     project_layers::ProjectLayerSchema,
     project_registry::{live::LiveProjectCapture, RegistryRevision, RegistryScope},
 };
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use subc_config::{raw_digest, Layer};
 use subc_control::config::ConfigFileError;
 use subc_protocol::config::{ConfigChanged, ConfigGetReply, ConfigGetRequest, ConfigLayer};
@@ -28,13 +28,24 @@ pub(super) struct LiveProjects {
     slots: HashMap<ConnectionId, BTreeMap<String, Slot>>,
     sequence: u64,
     pub(super) settings_revision: u64,
+    #[cfg(test)]
+    observations: u64,
+    #[cfg(test)]
+    rebuilds: u64,
 }
 
 #[derive(Default)]
 struct Slot {
     sequence: u64,
     observation: Option<UnstampedProjectObservation>,
-    fingerprint: Option<Digest>,
+    fingerprint: Option<ObservationFingerprint>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ObservationFingerprint {
+    hint: Digest,
+    daemon: Option<Digest>,
+    layer_locations: Vec<(ConfigLayer, Option<String>)>,
 }
 
 impl LiveProjects {
@@ -79,7 +90,7 @@ pub(crate) struct UnstampedProjectHint {
 struct Observation {
     workspace_id: Option<String>,
     present: Option<bool>,
-    result: Result<(ConfigView, Digest)>,
+    result: Result<(ConfigView, ObservationFingerprint)>,
 }
 
 impl RuntimeOwner {
@@ -180,7 +191,9 @@ impl RuntimeOwner {
             .snapshot_scoped(&read.module, &scope)
             .await;
         self.on_blocking(move |owner| {
-            let observation = owner.observe_live_project(&read, revision);
+            let observation = owner
+                .observe_live_project(&read, revision, &OnceLock::new(), &[])
+                .expect("only polls can reuse an observation");
             owner.record_live_project(&read, &observation, false)?;
             let (view, _) = observation.result?;
             Ok(ConfigGetReply::new(Some(view), None))
@@ -204,16 +217,32 @@ impl RuntimeOwner {
             GateError::new("config_unavailable", "registry capture worker stopped")
         })?;
         let mut capture = LiveProjectCapture::new(pool, &reply, requests.keys().cloned());
+        let daemon = Arc::new(OnceLock::new());
         while let Some((key, revision)) = capture.next().await {
             let Some(reads) = requests.remove(&key) else {
                 continue;
             };
             let hints = hints.clone();
+            let daemon = daemon.clone();
             self.on_blocking(move |owner| {
-                for read in reads {
-                    let observation = owner.observe_live_project(&read, revision.clone());
-                    if let Ok(Some(hint)) = owner.record_live_project(&read, &observation, true) {
-                        let _ = hints.send(hint);
+                let mut observations = Vec::<(&ConfigDeclareRequest, Option<Observation>)>::new();
+                // A replacement connection can declare a new schema before it
+                // takes over. Share only equal declarations, in slot order.
+                for read in &reads {
+                    let request = &read.declaration.request;
+                    let index = observations
+                        .iter()
+                        .position(|(previous, _)| *previous == request)
+                        .unwrap_or_else(|| {
+                            let observation =
+                                owner.observe_live_project(read, revision.clone(), &daemon, &reads);
+                            observations.push((request, observation));
+                            observations.len() - 1
+                        });
+                    if let Some(observation) = &observations[index].1 {
+                        if let Ok(Some(hint)) = owner.record_live_project(read, observation, true) {
+                            let _ = hints.send(hint);
+                        }
                     }
                 }
                 Ok(())
@@ -262,7 +291,13 @@ impl RuntimeOwner {
         &self,
         read: &UnstampedProjectRead,
         revision: Result<RegistryRevision>,
-    ) -> Observation {
+        daemon: &OnceLock<Result<Option<Digest>>>,
+        poll_reads: &[UnstampedProjectRead],
+    ) -> Option<Observation> {
+        #[cfg(test)]
+        if let Ok(mut state) = self.lock() {
+            state.state.delivery.live_projects.observations += 1;
+        }
         let mut observation = Observation {
             workspace_id: None,
             present: None,
@@ -280,38 +315,119 @@ impl RuntimeOwner {
                 Ok(file)
             })?;
             observation.present = Some(!layers.is_empty());
-            let captured = self.capturer.capture_module_settings(
-                &BTreeMap::from([(read.module.clone(), read.declaration.request.clone())]),
-                &BTreeSet::from([read.module.clone()]),
-            )?;
-            let user = captured.modules.get(&read.module).ok_or_else(|| {
-                GateError::new("config_gated", "module declaration is unavailable")
-            })?;
-            let fingerprint = subc_config::digest(
-                subc_config::PURPOSE_SNAPSHOT,
-                &serde_json::json!([
-                    revision.digest_for_project(&read.project)?,
-                    user.file.bytes.as_deref().map(raw_digest),
-                    layers
+            // Daemon validation can resolve process and OS paths. Recheck it
+            // once each poll, even when the document itself hasn't changed.
+            let daemon = daemon.get_or_init(|| self.capturer.project_daemon_digest());
+            let daemon = daemon.as_ref().map_err(Clone::clone)?;
+            let request = &read.declaration.request;
+            let user = self
+                .capturer
+                .module_settings_path(&read.module, request)
+                .and_then(|path| CapturedFile::open(&path));
+            let fingerprint = user.as_ref().ok().map(|user| -> Result<_> {
+                let hint = subc_config::digest(
+                    subc_config::PURPOSE_SNAPSHOT,
+                    &serde_json::json!([
+                        revision.digest_for_project(&read.project)?,
+                        user.bytes.as_deref().map(raw_digest),
+                        layers
+                            .iter()
+                            .map(|layer| layer.bytes.as_deref().map(raw_digest))
+                            .collect::<Vec<_>>()
+                    ]),
+                )
+                .map_err(GateError::invalid)?;
+                // Identical bytes can move from one layer to another without
+                // changing the hint fingerprint. The skip key must distinguish them.
+                Ok(ObservationFingerprint {
+                    hint,
+                    daemon: daemon.clone(),
+                    layer_locations: layers
                         .iter()
-                        .map(|layer| layer.bytes.as_deref().map(raw_digest))
-                        .collect::<Vec<_>>()
-                ]),
-            )
-            .map_err(GateError::invalid)?;
-            Ok((
+                        .map(|layer| (layer.layer.clone(), layer.path.clone()))
+                        .collect(),
+                })
+            });
+            if !poll_reads.is_empty()
+                && fingerprint
+                    .as_ref()
+                    .and_then(|fingerprint| fingerprint.as_ref().ok())
+                    .is_some_and(|fingerprint| {
+                        self.confirm_unchanged_live_project(poll_reads, request, fingerprint)
+                    })
+            {
+                return Ok(None);
+            }
+            #[cfg(test)]
+            if let Ok(mut state) = self.lock() {
+                state.state.delivery.live_projects.rebuilds += 1;
+            }
+            let user = self
+                .capturer
+                .capture_project_user(&read.module, request, user)?;
+            let fingerprint = fingerprint.expect("successful user capture has a file result")?;
+            Ok(Some((
                 live_view(
                     &read.module,
                     &read.project,
                     &read.declaration.schema,
-                    user,
+                    &user,
                     layers,
                     None,
                 )?,
                 fingerprint,
-            ))
-        })();
-        observation
+            )))
+        })()
+        .transpose()?;
+        Some(observation)
+    }
+
+    fn confirm_unchanged_live_project(
+        &self,
+        reads: &[UnstampedProjectRead],
+        request: &ConfigDeclareRequest,
+        fingerprint: &ObservationFingerprint,
+    ) -> bool {
+        let Ok(mut state) = self.lock() else {
+            return false;
+        };
+        let equivalent = reads
+            .iter()
+            .filter(|read| &read.declaration.request == request);
+        if !equivalent.clone().all(|read| {
+            read_is_current(&state, read)
+                && state
+                    .delivery
+                    .live_projects
+                    .slots
+                    .get(&read.connection)
+                    .and_then(|slots| slots.get(&read.project))
+                    .is_some_and(|slot| {
+                        read.sequence >= slot.sequence
+                            && slot.fingerprint.as_ref() == Some(fingerprint)
+                    })
+        }) {
+            return false;
+        }
+        let projects = &mut state.state.delivery.live_projects;
+        // Even an unchanged poll supersedes older reads that are still in flight.
+        for read in equivalent {
+            projects
+                .slots
+                .get_mut(&read.connection)
+                .unwrap()
+                .get_mut(&read.project)
+                .unwrap()
+                .sequence = read.sequence;
+        }
+        true
+    }
+
+    #[cfg(test)]
+    pub(in crate::config_gate) fn live_project_counts(&self) -> (u64, u64) {
+        let state = self.lock().unwrap();
+        let projects = &state.delivery.live_projects;
+        (projects.observations, projects.rebuilds)
     }
 
     fn record_live_project(
@@ -321,15 +437,7 @@ impl RuntimeOwner {
         poll: bool,
     ) -> Result<Option<UnstampedProjectHint>> {
         let mut state = self.lock()?;
-        if !live(&state)
-            || !Arc::ptr_eq(&state.authority_incarnation, &read.incarnation)
-            || !state
-                .declarations
-                .get(&read.connection)
-                .is_some_and(|(module, declaration)| {
-                    module == &read.module && declaration == &read.declaration.request
-                })
-        {
+        if !read_is_current(&state, read) {
             return Err(superseded());
         }
         let projects = &mut state.state.delivery.live_projects;
@@ -360,9 +468,16 @@ impl RuntimeOwner {
                     file_error: error.cloned().map(GateError::into_settings_file_error),
                 }
             });
-        let new_fingerprint = observed.result.as_ref().ok().map(|(_, digest)| digest);
+        let new_fingerprint = observed
+            .result
+            .as_ref()
+            .ok()
+            .map(|(_, fingerprint)| fingerprint);
         let hint = new_fingerprint
-            .filter(|fingerprint| poll && Some(*fingerprint) != slot.fingerprint.as_ref())
+            .map(|fingerprint| &fingerprint.hint)
+            .filter(|fingerprint| {
+                poll && Some(*fingerprint) != slot.fingerprint.as_ref().map(|old| &old.hint)
+            })
             .map(|fingerprint| {
                 let mut hint = ConfigChanged::new(0, vec![]);
                 hint.project_id = Some(read.project.clone());
@@ -397,8 +512,20 @@ impl RuntimeOwner {
                 .get(&hint.connection)
                 .and_then(|slots| slots.get(hint.hint.project_id.as_deref()?))
                 .and_then(|slot| slot.fingerprint.as_ref())
+                .map(|fingerprint| &fingerprint.hint)
                 == Some(&hint.fingerprint))
     }
+}
+
+fn read_is_current(state: &OwnerState, read: &UnstampedProjectRead) -> bool {
+    live(state)
+        && Arc::ptr_eq(&state.authority_incarnation, &read.incarnation)
+        && state
+            .declarations
+            .get(&read.connection)
+            .is_some_and(|(module, declaration)| {
+                module == &read.module && declaration == &read.declaration.request
+            })
 }
 
 fn declaration(state: &OwnerState, connection: ConnectionId, module: &str) -> Option<Declaration> {

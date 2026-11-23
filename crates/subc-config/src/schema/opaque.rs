@@ -1,8 +1,7 @@
 //! Assertions on opaque JSON are separate from the managed settings vocabulary.
 
-use super::{matches_type, pointer, same_scalar, schema_error, valid_pointer};
+use super::{matches_type, pointer, same_scalar, schema_error, schema_regex, valid_pointer};
 use crate::Refusal;
-use regex::Regex;
 use serde_json::Value;
 
 pub(super) fn normalize(
@@ -37,7 +36,7 @@ pub(super) fn normalize(
             "minimum" | "maximum" | "exclusiveMinimum" | "exclusiveMaximum"
                 if value.is_number() => {}
             "uniqueItems" if value.is_boolean() => {}
-            "pattern" if value.as_str().is_some_and(|p| Regex::new(p).is_ok()) => {}
+            "pattern" if value.as_str().is_some_and(|p| schema_regex(p).is_some()) => {}
             "required"
                 if value.as_array().is_some_and(|keys| {
                     keys.iter()
@@ -48,7 +47,7 @@ pub(super) fn normalize(
             "properties" | "patternProperties" | "$defs" => {
                 for (name, child) in value.as_object_mut().ok_or_else(bad)? {
                     let child_path = pointer(&here, name);
-                    if key == "patternProperties" && Regex::new(name).is_err() {
+                    if key == "patternProperties" && schema_regex(name).is_none() {
                         return Err(schema_error(&child_path));
                     }
                     normalize(root, child, stack, &child_path, false)?;
@@ -238,8 +237,8 @@ pub(super) fn matches(s: &Value, value: &Value) -> bool {
     true
 }
 
-fn regex(pattern: &str) -> Regex {
-    Regex::new(pattern).expect("checked opaque schema pattern")
+fn regex(pattern: &str) -> std::sync::Arc<regex::Regex> {
+    schema_regex(pattern).expect("checked opaque schema pattern")
 }
 
 fn length(s: &Value, n: usize, min: &str, max: &str) -> bool {

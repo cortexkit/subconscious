@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.21.42
+
+- Require subc-daemon 0.50.45 to avoid redundant project settings validation.
+
 ## 0.21.41
 
 - Require ck-ui 0.9.7 so `ck` shows modules stopping and prevents duplicate

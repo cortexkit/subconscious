@@ -5,9 +5,30 @@ use crate::{
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Arc, LazyLock, Mutex};
 
 mod opaque;
+
+fn schema_regex(pattern: &str) -> Option<Arc<Regex>> {
+    const CACHE_LIMIT: usize = 256;
+    static CACHE: LazyLock<Mutex<HashMap<String, Option<Arc<Regex>>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    let mut cache = CACHE.lock().expect("schema regex cache lock");
+    if let Some(regex) = cache.get(pattern) {
+        return regex.clone();
+    }
+    // The same declared patterns recur on every validation. Keep those entries
+    // (including refusals), but compile overflow patterns without retaining them.
+    if cache.len() >= CACHE_LIMIT {
+        drop(cache);
+        return Regex::new(pattern).ok().map(Arc::new);
+    }
+    let regex = Regex::new(pattern).ok().map(Arc::new);
+    cache.insert(pattern.to_owned(), regex.clone());
+    regex
+}
 
 pub const VOCABULARY_META_SCHEMA: &str = include_str!("../vocabulary.schema.json");
 
@@ -513,7 +534,7 @@ fn normalize(
                 return Err(schema_error(path));
             }
             for (pattern, child) in patterns {
-                Regex::new(pattern).map_err(|_| schema_error(path))?;
+                schema_regex(pattern).ok_or_else(|| schema_error(path))?;
                 *child = normalize(root, child, Some(&policy), stack, &pointer(path, "*"))?;
             }
         }
@@ -529,8 +550,8 @@ fn normalize(
         *child = normalize(root, child, Some(&policy), stack, &pointer(path, "*"))?;
     }
     if let Some(pattern) = node.get("pattern") {
-        Regex::new(pattern.as_str().ok_or_else(|| schema_error(path))?)
-            .map_err(|_| schema_error(path))?;
+        schema_regex(pattern.as_str().ok_or_else(|| schema_error(path))?)
+            .ok_or_else(|| schema_error(path))?;
     }
     node.remove("$defs");
     Ok(Value::Object(node))
@@ -589,7 +610,7 @@ pub fn child_schema<'a>(s: &'a Value, key: &str) -> Option<&'a Value> {
         s.get("patternProperties")?
             .as_object()?
             .iter()
-            .find(|(pattern, _)| Regex::new(pattern).is_ok_and(|r| r.is_match(key)))
+            .find(|(pattern, _)| schema_regex(pattern).is_some_and(|r| r.is_match(key)))
             .map(|(_, v)| v)
     })
 }
@@ -683,7 +704,7 @@ fn validate_setup(
             .get("feature")
             .and_then(Value::as_str)
             .filter(|f| {
-                Regex::new("^[a-z][a-z0-9_]{0,63}$")
+                schema_regex("^[a-z][a-z0-9_]{0,63}$")
                     .expect("feature pattern")
                     .is_match(f)
             })
@@ -881,7 +902,7 @@ fn validate(
         }
         if s.get("pattern")
             .and_then(Value::as_str)
-            .is_some_and(|p| !Regex::new(p).expect("normalized pattern").is_match(text))
+            .is_some_and(|p| !schema_regex(p).expect("normalized pattern").is_match(text))
         {
             return Err(invalid());
         }
@@ -1482,6 +1503,35 @@ mod tests {
     }
     fn context() -> ValidationContext {
         ValidationContext::new("module", Some("project-one".into()))
+    }
+
+    #[test]
+    fn schema_regex_reuses_compiled_patterns_and_refuses_invalid_patterns() {
+        let pattern = r"^config-[0-9]+$";
+        let compiled = schema_regex(pattern).unwrap();
+        let repeat = schema_regex(pattern).unwrap();
+        assert!(
+            Arc::ptr_eq(&compiled, &repeat),
+            "compiled pattern was not reused"
+        );
+        for (text, matches) in [
+            ("config-42", true),
+            ("config-", false),
+            ("xconfig-42", false),
+            ("config-42x", false),
+        ] {
+            assert_eq!(compiled.is_match(text), matches);
+        }
+
+        for _ in 0..2 {
+            assert!(schema_regex("[").is_none());
+        }
+        let mut invalid_field = field("string", json!(""));
+        invalid_field["pattern"] = json!("[");
+        let mut invalid_schema = object(json!({"value": invalid_field}));
+        invalid_schema["$schema"] = json!("https://json-schema.org/draft/2020-12/schema");
+        let refusal = Schema::new(invalid_schema).unwrap_err();
+        assert_eq!(refusal.path, "/value");
     }
 
     #[test]

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.9
+
+- Reuse compiled schema patterns across validation and property lookup.
+
 ## 0.1.8
 
 - Add settings-view source attribution for effective empty objects without changing tuple review.

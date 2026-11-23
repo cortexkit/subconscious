@@ -456,6 +456,28 @@ impl ConfigCapturer {
         )
     }
 
+    pub(super) fn project_daemon_digest(&self) -> Result<Option<subc_config::Digest>> {
+        let daemon = CapturedFile::open(&self.daemon_path)?;
+        let captured =
+            self.capture_layers(daemon, &BTreeMap::new(), None, false, CapturedFile::open)?;
+        Ok(captured
+            .daemon
+            .bytes
+            .as_deref()
+            .map(subc_config::raw_digest))
+    }
+
+    pub(super) fn capture_project_user(
+        &self,
+        module: &str,
+        declaration: &ConfigDeclareRequest,
+        file: Result<CapturedFile>,
+    ) -> Result<CapturedModule> {
+        declaration_input(module, declaration)?;
+        self.capture_module(module, declaration, |_| file)
+            .map(|(module, _)| module)
+    }
+
     fn capture_selected(
         &self,
         declarations: &BTreeMap<String, ConfigDeclareRequest>,
@@ -712,12 +734,11 @@ impl ConfigCapturer {
         })
     }
 
-    pub(super) fn capture_module(
+    pub(super) fn module_settings_path(
         &self,
         module: &str,
         declaration: &ConfigDeclareRequest,
-        layer_file: impl FnOnce(&Path) -> Result<CapturedFile>,
-    ) -> Result<(CapturedModule, CapturedInput)> {
+    ) -> Result<PathBuf> {
         if !declaration.project_dirs.is_empty() {
             // Workspace/project roots must come from the project registry,
             // not from directories supplied by the module.
@@ -742,6 +763,16 @@ impl ConfigCapturer {
                 format!("{module}: user layer must use its canonical config-home path"),
             ));
         }
+        Ok(expected)
+    }
+
+    pub(super) fn capture_module(
+        &self,
+        module: &str,
+        declaration: &ConfigDeclareRequest,
+        layer_file: impl FnOnce(&Path) -> Result<CapturedFile>,
+    ) -> Result<(CapturedModule, CapturedInput)> {
+        let expected = self.module_settings_path(module, declaration)?;
         let schema = Schema::new(declaration.schema.clone()).map_err(|refusal| {
             GateError::new("schema_invalid", format!("{module}: {}", refusal.path))
         })?;

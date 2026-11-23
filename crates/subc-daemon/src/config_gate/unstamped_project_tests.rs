@@ -52,6 +52,105 @@ async fn poll(rig: &CaptureRig) -> Vec<String> {
 }
 
 #[tokio::test]
+async fn unstamped_poll_shares_observation_between_equal_declarations() {
+    let rig = unstamped();
+    let project = root(&rig.project_scratch, "private");
+    rig.set_projects(vec![member("P", None, &[&project])]);
+    let other = ConnectionId::new(11);
+    rig.owner
+        .declare(other, "a", rig.rig.declaration.clone(), false)
+        .unwrap();
+    for connection in [CONNECTION, other] {
+        get(&rig, connection, "P").await.unwrap();
+    }
+
+    write_layer(&project, 9);
+    let (before, rebuilds) = rig.owner.live_project_counts();
+    let (sender, mut hints) = mpsc::unbounded_channel();
+    rig.owner.poll_unstamped_projects(sender).await.unwrap();
+    let (after, after_rebuilds) = rig.owner.live_project_counts();
+    assert_eq!(after - before, 1, "one observation for two connections");
+    assert_eq!(after_rebuilds - rebuilds, 1);
+    let mut recipients = std::collections::HashSet::new();
+    while let Ok(hint) = hints.try_recv() {
+        assert_eq!(hint.hint.project_id.as_deref(), Some("P"));
+        assert!(rig.owner.unstamped_project_hint_current(&hint).unwrap());
+        assert!(recipients.insert(hint.connection));
+    }
+    assert_eq!(
+        recipients,
+        std::collections::HashSet::from([CONNECTION, other])
+    );
+
+    let different = ConnectionId::new(12);
+    let mut declaration = rig.rig.declaration.clone();
+    declaration.schema["properties"]["limit"]["maximum"] = json!(9);
+    rig.owner
+        .declare(different, "a", declaration, false)
+        .unwrap();
+    get(&rig, different, "P").await.unwrap();
+    write_layer(&project, 10);
+    let (sender, mut hints) = mpsc::unbounded_channel();
+    rig.owner.poll_unstamped_projects(sender).await.unwrap();
+    let mut recipients = std::collections::HashSet::new();
+    while let Ok(hint) = hints.try_recv() {
+        assert!(recipients.insert(hint.connection));
+    }
+    assert_eq!(
+        recipients,
+        std::collections::HashSet::from([CONNECTION, other])
+    );
+}
+
+#[tokio::test]
+async fn unstamped_poll_skips_unchanged_view_and_records_layer_edits() {
+    let rig = unstamped();
+    let project = root(&rig.project_scratch, "private");
+    rig.set_projects(vec![member("P", None, &[&project])]);
+    let layer = write_layer(&project, 9);
+    get(&rig, CONNECTION, "P").await.unwrap();
+    let rebuilds = || rig.owner.live_project_counts().1;
+    let before = rebuilds();
+    let row = || {
+        rig.owner
+            .unstamped_project_observations()
+            .unwrap()
+            .remove(&("a".into(), "P".into()))
+            .unwrap()
+    };
+    let changes = rig.owner.subscribe_settings();
+
+    assert!(poll(&rig).await.is_empty());
+    assert_eq!(rebuilds() - before, 0, "unchanged view was rebuilt");
+    assert!(!changes.has_changed().unwrap());
+
+    std::fs::write(&layer, b"{\"limit\":10}").unwrap();
+    assert_eq!(poll(&rig).await, ["P"]);
+    assert_eq!(rebuilds() - before, 1);
+
+    std::fs::write(&layer, b"not jsonc").unwrap();
+    assert!(poll(&rig).await.is_empty());
+    assert_eq!(rebuilds() - before, 2);
+    assert!(row().file_error.is_some());
+
+    std::fs::write(&layer, b"{\"limit\":10}").unwrap();
+    assert_eq!(poll(&rig).await, ["P"]);
+    assert_eq!(rebuilds() - before, 3);
+    assert!(row().file_error.is_none());
+
+    let daemon = rig.rig.path.join("subc.jsonc");
+    let mut bytes = std::fs::read(&daemon).unwrap();
+    bytes.extend_from_slice(b"\n// daemon-only edit\n");
+    std::fs::write(&daemon, bytes).unwrap();
+    assert!(poll(&rig).await.is_empty());
+    assert_eq!(rebuilds() - before, 4);
+
+    std::fs::write(&daemon, b"not jsonc").unwrap();
+    assert!(poll(&rig).await.is_empty());
+    assert_eq!(row().file_error.unwrap().code, "invalid_daemon_config");
+}
+
+#[tokio::test]
 async fn unstamped_projects_poll_first_file_user_change_drop_and_registration() {
     let rig = unstamped();
     let project = root(&rig.project_scratch, "private");

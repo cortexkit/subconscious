@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.50.45
+
+- Cut idle CPU on installs without a sealed approval store (unstamped installs),
+  where the daemon re-reads requested project settings every two seconds. A
+  project requested by several connections with the same declaration is now
+  checked once per pass, and a project whose settings files, user file and
+  daemon file are unchanged is not rebuilt and re-validated.
+
 ## 0.50.44
 
 - Test only: the project-registry root-outcome test gives unblocked roots a 5 s pool

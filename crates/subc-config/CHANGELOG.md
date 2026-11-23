@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.6
+
+- Apply `x-ck-bound` only to workspace and project writes, not to user settings.
+  Bounds have no effect on user-only fields, including opaque JSON fields.
+
 ## 0.1.5
 
 - Add `Schema::review_tuple_attributed` to identify the layer refused during

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.50.39
+
+- Require subc-config 0.1.6 so settings bounds apply only to workspace and project writes.
+
 ## 0.50.38
 
 - Settings views on an unstamped install (one whose settings are not yet

@@ -83,15 +83,20 @@ keys, and array items, prefix items, lengths and uniqueness. Boolean subschemas 
 JSON Pointer `$ref`s are supported. Unsupported keywords refuse the schema at the keyword's path.
 Do not put `x-ck-kind`, `x-ck-bound`, `x-ck-options`, or `x-ck-action` inside the opaque schema.
 
-`raise_only`/`lower_only` compare finite numbers against the effective lower value; `subset_only`
-compares sets of canonical scalars while preserving array order. Boolean and enum monotonic bounds
+`x-ck-bound` restricts only workspace and project writes. Each is compared against the effective
+value from lower layers, or the schema default if no lower layer supplied a value. An optional
+field with no lower value has nothing to compare. The user layer is never checked against the
+default. A bound on a field only the user layer can set has no effect. This includes opaque
+fields, which normalize any layer list that includes `user` to `["user"]`.
+
+`raise_only` and `lower_only` compare finite numbers; `subset_only` compares arrays as sets of
+strings, numbers, or booleans without changing array order. Boolean and enum monotonic bounds
 require `x-ck-ordering`: an enum's values from lowest to highest, or exactly `[false,true]` for a
-boolean. Scalar type lists need an explicit enum ordering unless all types are numeric. A bound on
-an opaque field requires a declared or inherited `x-ck-layers: ["user"]`; unbounded opaque fields
-normalize any layer list that includes `user` to `["user"]`. Bounds compare only when a lower value
-exists for an optional field. No lexical order is inferred. Bounds refuse instead of clamping. Default 5, user 10,
-project 15 is valid under raise_only; changing user to 20 refuses project 15 with `bound_violated`
-and the project id, until the project override is removed or corrected.
+boolean. Scalar type lists need an explicit enum ordering unless all types are numeric. No
+lexical order is inferred.
+Bounds refuse instead of clamping. Default 5, user 10, project 15 is valid under `raise_only`;
+changing user to 20 refuses project 15 with `bound_violated` and the project id until the project
+override is removed or corrected.
 
 Static enum pickers and closed `x-ck-options` sets reject out-of-set values with `value_invalid`.
 Closed dynamic sets are caller-supplied pinned local evidence in `ValidationContext::closed_options`;

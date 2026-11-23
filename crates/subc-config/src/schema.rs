@@ -356,14 +356,11 @@ fn normalize(
         }
     }
     if opaque {
-        let user_only = serde_json::json!(["user"]);
         let layers = node.get("x-ck-layers").and_then(Value::as_array);
-        if layers.is_none_or(|allowed| !allowed.iter().any(|layer| layer == "user"))
-            || (node.contains_key("x-ck-bound") && node.get("x-ck-layers") != Some(&user_only))
-        {
+        if layers.is_none_or(|allowed| !allowed.iter().any(|layer| layer == "user")) {
             return Err(schema_error(path));
         }
-        node.insert("x-ck-layers".into(), user_only);
+        node.insert("x-ck-layers".into(), serde_json::json!(["user"]));
     }
     if let Some(apply) = node.get("x-ck-apply") {
         serde_json::from_value::<ApplyKind>(apply.clone()).map_err(|_| schema_error(path))?;
@@ -1023,7 +1020,7 @@ fn merge(
     sources: &mut BTreeMap<String, Layer>,
     c: &ValidationContext,
 ) -> Result<(), Refusal> {
-    if !bound_ok(s, lower, higher) {
+    if matches!(layer, Layer::Workspace | Layer::Project) && !bound_ok(s, lower, higher) {
         return Err(refusal(RefusalCode::BoundViolated, path, c));
     }
     if credential(s) || is_opaque(s) {
@@ -1650,14 +1647,21 @@ mod tests {
         field["type"] = json!("number");
         field["default"] = json!(1);
         field["x-ck-bound"] = json!("raise_only");
-        assert_eq!(proposed_schema(field.clone()).unwrap_err().path, "/setting");
+        let normalized = proposed_schema(field.clone()).unwrap();
         field["x-ck-layers"] = json!(["user"]);
         let s = proposed_schema(field).unwrap();
-        let result = s.review_tuple(
-            &[LayerValue::new(Layer::User, json!({"setting":0}))],
-            &context(),
+        assert_eq!(normalized.normalized(), s.normalized());
+        assert_eq!(
+            s.normalized()["properties"]["setting"]["x-ck-bound"],
+            json!("raise_only")
         );
-        assert_eq!(result.unwrap_err().code, RefusalCode::BoundViolated);
+        let result = s
+            .review_tuple(
+                &[LayerValue::new(Layer::User, json!({"setting":0}))],
+                &context(),
+            )
+            .unwrap();
+        assert_eq!(result.effective, json!({"setting":0}));
     }
 
     #[test]
@@ -1884,6 +1888,71 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, RefusalCode::BoundViolated);
         assert_eq!(error.path, "/setting");
+    }
+
+    #[test]
+    fn policy_contract_bounds_exempt_user_but_restrict_workspace_and_project() {
+        let mut lower = field("boolean", json!(false));
+        lower["x-ck-bound"] = json!("lower_only");
+        lower["x-ck-ordering"] = json!([false, true]);
+        let mut raise = field("boolean", json!(true));
+        raise["x-ck-bound"] = json!("raise_only");
+        raise["x-ck-ordering"] = json!([false, true]);
+        let mut subset = field("array", json!([]));
+        subset["x-ck-bound"] = json!("subset_only");
+        subset["items"] = field("string", json!("a"));
+
+        for (field, user_value) in [
+            (lower, json!(true)),
+            (raise, json!(false)),
+            (subset, json!(["a"])),
+        ] {
+            let s = proposed_schema(field).unwrap();
+            let default = s.defaults();
+            let user_value = json!({"setting":user_value});
+            let user = s
+                .review_tuple(&layers(user_value.clone(), json!({})), &context())
+                .unwrap();
+            assert_eq!(user.effective, user_value);
+            assert_eq!(user.sources["/setting"], Layer::User);
+
+            let project = s
+                .review_tuple(&layers(user_value.clone(), default.clone()), &context())
+                .unwrap();
+            assert_eq!(project.effective, default);
+            assert_eq!(project.sources["/setting"], Layer::Project);
+
+            for layer in [Layer::Workspace, Layer::Project] {
+                let error = s
+                    .review_tuple_attributed(
+                        &[
+                            LayerValue::new(Layer::User, json!({})),
+                            LayerValue::new(layer, user_value.clone()),
+                        ],
+                        &context(),
+                    )
+                    .unwrap_err();
+                assert_eq!(error.layer, Some(layer));
+                assert_eq!(error.refusal.code, RefusalCode::BoundViolated);
+                assert_eq!(error.refusal.path, "/setting");
+                assert_eq!(error.refusal.project_id.as_deref(), Some("project-one"));
+            }
+
+            let error = s
+                .review_tuple_attributed(
+                    &[
+                        LayerValue::new(Layer::User, user_value.clone()),
+                        LayerValue::new(Layer::Workspace, default),
+                        LayerValue::new(Layer::Project, user_value),
+                    ],
+                    &context(),
+                )
+                .unwrap_err();
+            assert_eq!(error.layer, Some(Layer::Project));
+            assert_eq!(error.refusal.code, RefusalCode::BoundViolated);
+            assert_eq!(error.refusal.path, "/setting");
+            assert_eq!(error.refusal.project_id.as_deref(), Some("project-one"));
+        }
     }
 
     #[test]

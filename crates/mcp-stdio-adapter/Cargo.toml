@@ -1,6 +1,6 @@
 [package]
 name = "mcp-stdio-adapter"
-version = "0.8.7"
+version = "0.8.8"
 edition = "2021"
 license = "MIT"
 publish = false

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.8.8
+
+- Give every server setting a short title, so Settings shows labels instead of raw keys.
+  The schema's top-level title, "MCP Servers", names the settings page.
+
 ## 0.8.7
 
 - Return a retryable `module_warming` error until the adapter has applied its first settings, instead of reporting a configured server as unknown during startup.

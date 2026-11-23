@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.14
+
+- Give every gateway setting a short title, so Settings shows labels instead of raw keys.
+  The schema's top-level title, "MCP Gateway", names the settings page.
+
 ## 0.2.13
 
 - End the tool call's outage wait without a retry hint when the daemon reports

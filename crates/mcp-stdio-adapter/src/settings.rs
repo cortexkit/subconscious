@@ -27,13 +27,17 @@ const LEGACY_FILE: &str = "mcp-servers.jsonc";
 static DECLARED_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     let environment = json!({
         "type": "object", "unevaluatedProperties": false, "default": {},
+        "title": "Environment",
         "description": "Environment variables passed to the program",
         "patternProperties": {"^[^=\\u0000]+$": {
             "type": "object", "unevaluatedProperties": false,
+            "title": "Variable",
             "properties": {
                 "credential_ref": {"type": "object", "x-ck-kind": "credential_ref",
+                    "title": "Vault credential",
                     "description": "Vault credential to resolve when the child starts"},
                 "value": {"type": "string", "x-ck-required": false,
+                    "title": "Value",
                     "description": "Ordinary non-secret environment value"}
             }
         }}
@@ -41,27 +45,34 @@ static DECLARED_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object", "unevaluatedProperties": false,
+        "title": "MCP Servers",
         "properties": {"servers": {
             "type": "object", "unevaluatedProperties": false, "default": {},
+            "title": "Servers",
             "description": "Third-party MCP servers available to the adapter",
             "x-ck-layers": ["user"], "x-ck-apply": "live",
             "patternProperties": {"^[a-z0-9-]{1,64}$": {
                 "type": "object", "unevaluatedProperties": false,
+                "title": "Server",
                 "properties": {
-                    "command": {"type": "string", "description": "Program to launch", "x-ck-required": true},
+                    "command": {"type": "string", "title": "Program", "description": "Program to launch", "x-ck-required": true},
                     "args": {
-                        "type": "array", "description": "Arguments passed to the program", "default": [],
+                        "type": "array", "title": "Arguments", "description": "Arguments passed to the program", "default": [],
                         "items": {"type": "string", "description": "Program argument", "x-ck-required": true}
                     },
-                    "cwd": {"type": "string", "description": "Working directory for the program", "x-ck-required": false},
-                    "disabled": {"type": "boolean", "description": "Prevent this server from starting", "default": false},
+                    "cwd": {"type": "string", "title": "Working folder", "description": "Working directory for the program", "x-ck-required": false},
+                    "disabled": {"type": "boolean", "title": "Disabled", "description": "Prevent this server from starting", "default": false},
                     "idle_ttl_ms": {"type": "integer", "minimum": 0, "default": DEFAULT_IDLE_TTL_MS,
+                        "title": "Idle stop (ms)",
                         "description": "Milliseconds before stopping an idle server; zero uses the default"},
                     "deadline_ms": {"type": "integer", "minimum": 0, "default": DEFAULT_DEADLINE_MS,
+                        "title": "Request deadline (ms)",
                         "description": "Milliseconds allowed for a request; zero uses the default"},
                     "frame_ceiling_bytes": {"type": "integer", "minimum": 0, "default": DEFAULT_FRAME_CEILING_BYTES,
+                        "title": "Largest reply (bytes)",
                         "description": "Maximum size of a child reply frame in bytes"},
                     "cache_tools_list": {"type": "boolean", "default": true,
+                        "title": "Cache tool list",
                         "description": "Cache successful tool listings"},
                     "env": environment
                 }
@@ -582,6 +593,43 @@ mod tests {
             )],
             base,
         )
+    }
+
+    // Settings shows `title` as a field's label and falls back to the raw key
+    // without one. Array items describe a single element and need none.
+    fn untitled(node: &Value, path: &str, missing: &mut Vec<String>) {
+        let Some(object) = node.as_object() else {
+            return;
+        };
+        if object.contains_key("description")
+            && !object.contains_key("title")
+            && !path.ends_with("/items")
+        {
+            missing.push(path.to_owned());
+        }
+        // Walk subschemas only: the keys of a `properties` or
+        // `patternProperties` map are setting names (one is "description").
+        for keyword in ["properties", "patternProperties"] {
+            for (key, child) in object
+                .get(keyword)
+                .and_then(Value::as_object)
+                .into_iter()
+                .flatten()
+            {
+                untitled(child, &format!("{path}/{key}"), missing);
+            }
+        }
+        if let Some(items) = object.get("items") {
+            untitled(items, &format!("{path}/items"), missing);
+        }
+    }
+
+    #[test]
+    fn every_described_setting_has_a_title() {
+        let mut missing = Vec::new();
+        untitled(&DECLARED_SCHEMA, "", &mut missing);
+        assert!(missing.is_empty(), "settings without a title: {missing:?}");
+        assert_eq!(DECLARED_SCHEMA["title"], "MCP Servers");
     }
 
     #[test]

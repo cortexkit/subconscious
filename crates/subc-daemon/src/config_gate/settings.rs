@@ -434,10 +434,15 @@ impl ShowView {
         project_id: Option<String>,
         through: Option<ConfigThrough>,
     ) -> Result<ConfigControlResponse> {
-        let defaults = schema(&self.declaration)?.defaults();
+        let schema = schema(&self.declaration)?;
+        let defaults =
+            (through == Some(ConfigThrough::Default)).then(|| schema.settings_defaults());
         let mut layers = Vec::new();
         if project_id.is_none() {
-            layers.push(ConfigSettingsLayer::new(Layer::Default, defaults.clone()));
+            let document = defaults
+                .as_ref()
+                .map_or_else(|| schema.defaults(), |view| view.effective.clone());
+            layers.push(ConfigSettingsLayer::new(Layer::Default, document));
         }
         for layer in &self.view.layers {
             let layer_name = match layer.layer {
@@ -481,12 +486,16 @@ impl ShowView {
             Layer::Project => 3,
             _ => 4,
         });
-        let (effective, sources) = if through == Some(ConfigThrough::Default) {
-            let mut sources = BTreeMap::new();
-            default_sources(&defaults, "", &mut sources);
-            (defaults, sources)
+        let (effective, sources) = if let Some(defaults) = defaults {
+            (defaults.effective, defaults.sources)
         } else {
-            (self.view.effective, self.view.sources)
+            let documents: Vec<_> = layers
+                .iter()
+                .map(|layer| (layer.layer, &layer.document))
+                .collect();
+            let sources =
+                schema.settings_sources(&self.view.effective, &documents, self.view.sources);
+            (self.view.effective, sources)
         };
         Ok(ConfigControlResponse::Show {
             module_id: module,
@@ -547,24 +556,6 @@ fn included(layer: Layer, through: Option<ConfigThrough>) -> bool {
         Some(ConfigThrough::User) => matches!(layer, Layer::Default | Layer::User),
         Some(ConfigThrough::Workspace) => layer != Layer::Project,
         None => true,
-    }
-}
-
-fn default_sources(value: &Value, path: &str, sources: &mut BTreeMap<String, Layer>) {
-    if let Value::Object(object) = value {
-        if !object.is_empty() && !subc_config::is_vault_reference(value) {
-            for (key, value) in object {
-                default_sources(
-                    value,
-                    &format!("{path}/{}", key.replace('~', "~0").replace('/', "~1")),
-                    sources,
-                );
-            }
-            return;
-        }
-    }
-    if !path.is_empty() {
-        sources.insert(path.into(), Layer::Default);
     }
 }
 

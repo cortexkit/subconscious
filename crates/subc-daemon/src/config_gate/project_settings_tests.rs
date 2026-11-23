@@ -109,6 +109,50 @@ async fn project_settings_stamped_show_retains_cutoffs_for_a_dropped_project() {
 }
 
 #[tokio::test]
+async fn project_settings_show_attributes_empty_objects_without_changing_approval() {
+    let rig = CaptureRig::with_declaration(true, RootIoPool::new().unwrap(), true, |declaration| {
+        declaration.schema["properties"]["projects"] = json!({
+            "type":"object","unevaluatedProperties":false,"default":{},
+            "patternProperties":{"^[a-z]+$":{
+                "type":"boolean","description":"Enable this project.","default":false
+            }}
+        });
+    });
+    let private = root(&rig.project_scratch, "private");
+    let project_file = write_layer(&private, 9);
+    std::fs::write(project_file, br#"{"limit":9,"projects":{}}"#).unwrap();
+    rig.set_projects(vec![member("A", None, &[&private])]);
+    let plan = finish(&rig.owner, rig.prepare().await.unwrap());
+    let generation = rig.apply(&plan).await.unwrap();
+
+    let stored_digest = || {
+        let state = rig.owner.lock().unwrap();
+        let (_, body) = state.store.loaded_admission_state();
+        let delivery = body.generations[&generation].delivery.as_ref().unwrap();
+        let stored = &delivery.project_views["a"]["A"];
+        assert_eq!(stored.effective["projects"], json!({}));
+        assert_eq!(
+            stored.sources,
+            BTreeMap::from([("/limit".into(), subc_config::Layer::Project)])
+        );
+        serde_json::to_vec(&delivery.project_approval_digests["a"]["A"]).unwrap()
+    };
+    let before = stored_digest();
+    for (cutoff, source) in [
+        (Some(ConfigThrough::Default), "default"),
+        (Some(ConfigThrough::User), "default"),
+        (Some(ConfigThrough::Workspace), "default"),
+        (None, "project"),
+    ] {
+        let reply = show(&rig, "A", cutoff).await.unwrap();
+        assert_eq!(reply["effective"]["projects"], json!({}));
+        assert_eq!(reply["sources"]["/projects"], source);
+        assert!(reply["sources"].get("").is_none());
+    }
+    assert_eq!(stored_digest(), before);
+}
+
+#[tokio::test]
 async fn project_settings_unstamped_show_reads_cutoffs_fresh() {
     let rig = CaptureRig::with_state(true, RootIoPool::new().unwrap(), false);
     let private = root(&rig.project_scratch, "private");

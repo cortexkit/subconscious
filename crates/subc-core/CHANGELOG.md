@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.21.40
+
+- Require subc-daemon 0.50.43 for empty-object source attribution in settings replies.
+
 ## 0.21.39
 
 - During setup and upgrade, grant Entorhinal exact `read` and `sign` on `signing:fleet-record:1`.

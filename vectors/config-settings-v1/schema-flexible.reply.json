@@ -29,6 +29,26 @@
           "user"
         ]
       },
+      "projects": {
+        "default": {},
+        "patternProperties": {
+          "^[a-z-]+$": {
+            "default": false,
+            "description": "Enable this project.",
+            "type": "boolean",
+            "x-ck-apply": "live",
+            "x-ck-layers": [
+              "user"
+            ]
+          }
+        },
+        "type": "object",
+        "unevaluatedProperties": false,
+        "x-ck-apply": "live",
+        "x-ck-layers": [
+          "user"
+        ]
+      },
       "rating_override": {
         "description": "Absent uses the catalog rating.",
         "type": "number",
@@ -46,5 +66,5 @@
       "user"
     ]
   },
-  "schema_digest": "sha256:c8def7e79cd2c8c75ede553737f9765ae3ded94087aa2f8df4ab3bd37a173563"
+  "schema_digest": "sha256:c75fdc320aaf948056ae35cd849616e0e1d0232f10776a0ea0a5ba4afa0cc04f"
 }

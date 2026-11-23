@@ -1120,6 +1120,12 @@ async fn config_settings_vectors_match_real_handler_bytes() {
                 "type":"number",
                 "description":"Absent uses the catalog rating.",
                 "x-ck-required":false
+            },
+            "projects":{
+                "type":"object","unevaluatedProperties":false,"default":{},
+                "patternProperties":{"^[a-z-]+$":{
+                    "type":"boolean","description":"Enable this project.","default":false
+                }}
             }
         }
     });
@@ -1154,6 +1160,34 @@ async fn config_settings_vectors_match_real_handler_bytes() {
     );
     samples.push(("schema-flexible.request.json".into(), body));
     samples.push(("schema-flexible.reply.json".into(), reply));
+    std::fs::write(
+        flexible_rig.root.join("cortexkit/sample-flexible.jsonc"),
+        br#"{"projects":{},"language_server":{"telemetry":false}}"#,
+    )
+    .unwrap();
+    flexible_rig.stamp();
+    for (name, through, source) in [
+        ("show-empty-objects", None, "user"),
+        ("show-empty-objects-default", Some("default"), "default"),
+    ] {
+        let mut body = json!({"op":"config.show","module_id":"sample-flexible"});
+        if let Some(through) = through {
+            body["through"] = json!(through);
+        }
+        let reply = flexible_handler
+            .handle_control_frame(&ctx, request(body.clone()))
+            .await
+            .unwrap();
+        assert_eq!(reply[0].header.ty, FrameType::Response);
+        let reply: Value = serde_json::from_slice(&reply[0].body).unwrap();
+        assert_eq!(reply["effective"]["projects"], json!({}));
+        assert_eq!(
+            reply["sources"],
+            json!({"/language_server":source,"/max_runs":"default","/projects":source})
+        );
+        samples.push((format!("{name}.request.json"), body));
+        samples.push((format!("{name}.reply.json"), reply));
+    }
     let (modules, watch) = bad_number_rows().await;
     samples.push(("modules.declaration-error.reply.json".into(), modules));
     samples.push(("watch.declaration-error.resync.json".into(), watch));

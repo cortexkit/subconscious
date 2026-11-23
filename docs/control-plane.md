@@ -102,7 +102,12 @@ The additive `config.settings/v1` capability serves `config.modules`,
 `config.schema`, `config.show` and `config.watch` to authorized local settings
 readers without prompting. `config.show` returns approved effective values and
 layer documents on a stamped install; unstamped reads identify live, unreviewed
-file settings as generation zero. The `config.settings.projects/v1` capability
+file settings as generation zero. `sources` maps JSON pointers to the layers
+that supplied effective leaves and empty objects (never the root), treating opaque
+values and vault references as whole values. An empty object's source is the highest
+layer that supplied it, counting a materialized schema member default as `default`;
+these entries are for display only and do not enter digests.
+The `config.settings.projects/v1` capability
 adds workspace and project settings. These operations remain on channel 0 with
 their existing admission checks; a `project_id` selects settings, not caller authority.
 

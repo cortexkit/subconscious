@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.50.43
+
+- Report the source of empty objects in module and project `config.show` replies,
+  including replies that stop at a requested layer.
+
 ## 0.50.42
 
 - Allow config plan edits to target individual entries in declared maps and

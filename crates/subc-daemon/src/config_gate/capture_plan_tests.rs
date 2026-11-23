@@ -159,6 +159,15 @@ impl CaptureRig {
     }
 
     fn with_state(enabled: bool, pool: RootIoPool, stamped: bool) -> Self {
+        Self::with_declaration(enabled, pool, stamped, |_| {})
+    }
+
+    fn with_declaration(
+        enabled: bool,
+        pool: RootIoPool,
+        stamped: bool,
+        amend: impl FnOnce(&mut subc_protocol::config::ConfigDeclareRequest),
+    ) -> Self {
         let mut rig = Rig::new();
         rig.declaration.schema["x-ck-layers"] = json!(["user", "workspace", "project"]);
         rig.declaration.schema["properties"]
@@ -166,6 +175,7 @@ impl CaptureRig {
             .unwrap()
             .remove("credential");
         rig.declaration.schema["properties"]["limit"]["x-ck-bound"] = json!("raise_only");
+        amend(&mut rig.declaration);
         let registry = Arc::new(Registry {
             reply: Mutex::new(None),
             pool,

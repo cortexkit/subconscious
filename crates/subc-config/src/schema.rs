@@ -105,6 +105,39 @@ impl Schema {
     pub fn defaults(&self) -> Value {
         defaults(&self.normalized).unwrap_or_else(|| Value::Object(Map::new()))
     }
+    /// Defaults and their sources for a settings reader, without tuple validation.
+    pub fn settings_defaults(&self) -> ReviewedTuple {
+        let effective = self.defaults();
+        let sources = self.settings_sources(&effective, &[], self.default_sources(&effective));
+        ReviewedTuple::new(effective, sources)
+    }
+
+    /// Add empty-object attribution for display only. `layers` contains the
+    /// contributing documents in ascending precedence. Do not use the returned
+    /// map for review or approval digests.
+    pub fn settings_sources(
+        &self,
+        effective: &Value,
+        layers: &[(Layer, &Value)],
+        mut sources: BTreeMap<String, Layer>,
+    ) -> BTreeMap<String, Layer> {
+        sources.remove("");
+        mark_empty_sources(&self.normalized, effective, "", layers, &mut sources);
+        sources
+    }
+
+    fn default_sources(&self, effective: &Value) -> BTreeMap<String, Layer> {
+        let mut sources = BTreeMap::new();
+        mark_sources(
+            &self.normalized,
+            effective,
+            "",
+            Layer::Default,
+            &mut sources,
+        );
+        sources
+    }
+
     pub fn validate_layer(
         &self,
         layer: Layer,
@@ -134,14 +167,7 @@ impl Schema {
         context: &ValidationContext,
     ) -> Result<ReviewedTuple, AttributedRefusal> {
         let mut effective = self.defaults();
-        let mut sources = BTreeMap::new();
-        mark_sources(
-            &self.normalized,
-            &effective,
-            "",
-            Layer::Default,
-            &mut sources,
-        );
+        let mut sources = self.default_sources(&effective);
         let mut previous = Layer::Default;
         let mut user_credentials = BTreeSet::new();
         for proposal in layers {
@@ -1143,6 +1169,43 @@ fn mark_sources(
         sources.insert(path.into(), layer);
     }
 }
+
+fn mark_empty_sources(
+    s: &Value,
+    v: &Value,
+    path: &str,
+    layers: &[(Layer, &Value)],
+    sources: &mut BTreeMap<String, Layer>,
+) {
+    let Some(object) = v.as_object() else { return };
+    if is_opaque(s) || is_vault_reference(v) {
+        return;
+    }
+    if object.is_empty() {
+        if !path.is_empty() {
+            // No document holding this path means an optional object's member
+            // default materialized it, so the default layer supplied it.
+            let layer = layers
+                .iter()
+                .rev()
+                .find(|(_, document)| document.pointer(path).is_some_and(Value::is_object))
+                .map_or(Layer::Default, |(layer, _)| *layer);
+            sources.insert(path.into(), layer);
+        }
+    } else {
+        let s = variant(s, v).unwrap_or(s);
+        for (key, value) in object {
+            mark_empty_sources(
+                child_schema(s, key).unwrap_or(&Value::Null),
+                value,
+                &pointer(path, key),
+                layers,
+                sources,
+            );
+        }
+    }
+}
+
 fn collect_credentials(s: &Value, value: &Value, out: &mut BTreeSet<Digest>) {
     if is_opaque(s) {
         return;
@@ -2165,6 +2228,118 @@ mod tests {
         let error = Schema::new(declaration).unwrap_err();
         assert_eq!(error.code, RefusalCode::SchemaInvalid);
         assert_eq!(error.path, "/name");
+    }
+
+    #[test]
+    fn empty_objects_have_sources_only_while_effectively_empty() {
+        let mut projects = object(json!({"sample": field("boolean", json!(false))}));
+        projects["default"] = json!({});
+        let entries = object(json!({"projects": projects}));
+        let mut consumers = object(json!({}));
+        consumers["patternProperties"] = json!({"^example/": entries});
+        consumers["default"] = json!({"example/default": {"projects": {}}});
+        let s = schema(json!({"consumers": consumers}));
+        let context = context();
+
+        let defaults = s.settings_defaults();
+        assert_eq!(
+            defaults.sources,
+            BTreeMap::from([(
+                "/consumers/example~1default/projects".into(),
+                Layer::Default
+            )])
+        );
+        assert!(schema(json!({})).settings_defaults().sources.is_empty());
+
+        let user = LayerValue::new(
+            Layer::User,
+            json!({"consumers": {
+                "example/user": {"projects": {}},
+                "example/default": {"projects": {"sample": true}},
+                "example/implicit": {}
+            }}),
+        );
+        let workspace = LayerValue::new(
+            Layer::Workspace,
+            json!({"consumers": {"example/user": {"projects": {}}}}),
+        );
+        let project = LayerValue::new(
+            Layer::Project,
+            json!({"consumers": {"example/user": {"projects": {}}}}),
+        );
+        let layers = [user, workspace, project];
+        for (index, layer) in [Layer::User, Layer::Workspace, Layer::Project]
+            .into_iter()
+            .enumerate()
+        {
+            let reviewed = s.review_tuple(&layers[..=index], &context).unwrap();
+            assert_eq!(
+                reviewed.effective,
+                json!({"consumers": {
+                    "example/default": {"projects": {"sample": true}},
+                    "example/implicit": {"projects": {}},
+                    "example/user": {"projects": {}}
+                }})
+            );
+            let documents: Vec<_> = layers[..=index]
+                .iter()
+                .map(|layer| (layer.layer, &layer.value))
+                .collect();
+            assert_eq!(
+                s.settings_sources(&reviewed.effective, &documents, reviewed.sources),
+                BTreeMap::from([
+                    (
+                        "/consumers/example~1default/projects/sample".into(),
+                        Layer::User
+                    ),
+                    (
+                        "/consumers/example~1implicit/projects".into(),
+                        Layer::Default
+                    ),
+                    ("/consumers/example~1user/projects".into(), layer),
+                ])
+            );
+        }
+    }
+
+    #[test]
+    fn empty_object_sources_do_not_change_union_refusals() {
+        let mut disk_kind = field("string", json!("disk"));
+        disk_kind["const"] = json!("disk");
+        let mut memory_kind = field("string", json!("memory"));
+        memory_kind["const"] = json!("memory");
+        let mut disk = object(json!({
+            "kind": disk_kind,
+            "options": object(json!({"path": field("string", json!("a"))})),
+        }));
+        disk["required"] = json!(["kind"]);
+        let mut memory = object(json!({"kind": memory_kind}));
+        memory["required"] = json!(["kind"]);
+        let s = schema(json!({"storage": {
+            "oneOf": [disk, memory], "default": {"kind": "disk", "options": {}}
+        }}));
+
+        let switch = json!({"storage": {"kind": "memory"}});
+        let reviewed = s
+            .review_tuple(
+                &layers(json!({"storage": {"options": {}}}), switch.clone()),
+                &context(),
+            )
+            .unwrap();
+        assert_eq!(reviewed.effective, switch);
+        assert_eq!(
+            reviewed.sources,
+            BTreeMap::from([("/storage/kind".into(), Layer::Project)])
+        );
+
+        let refusal = s
+            .review_tuple(
+                &layers(json!({"storage": {"options": {"path": "b"}}}), switch),
+                &context(),
+            )
+            .unwrap_err();
+        assert_eq!(refusal.code, RefusalCode::ValueInvalid);
+        assert_eq!(refusal.path, "/storage/kind");
     }
 
     #[test]

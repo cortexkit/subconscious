@@ -1,0 +1,27 @@
+{
+  "base_generation": 1,
+  "effective": {
+    "language_server": true,
+    "max_runs": 4,
+    "projects": {}
+  },
+  "layers": [
+    {
+      "document": {
+        "language_server": true,
+        "max_runs": 4,
+        "projects": {}
+      },
+      "layer": "default"
+    }
+  ],
+  "module_id": "sample-flexible",
+  "op": "config.show",
+  "sources": {
+    "/language_server": "default",
+    "/max_runs": "default",
+    "/projects": "default"
+  },
+  "stamped": true,
+  "through": "default"
+}

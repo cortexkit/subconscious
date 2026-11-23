@@ -19,6 +19,7 @@ enum Seen {
     State(ConfigState),
     Files,
     Error(String),
+    ProjectError(String, ConfigError),
     Draining,
 }
 struct Sample {
@@ -67,6 +68,34 @@ impl ModuleHandler for Sample {
         self.seen.send(Seen::Draining).unwrap();
     }
 }
+
+struct ProjectErrors(Sample);
+
+#[async_trait]
+impl ModuleHandler for ProjectErrors {
+    async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+        self.0.handle(ctx, body).await
+    }
+    fn config_declaration(&self) -> Option<ConfigDeclareRequest> {
+        self.0.config_declaration()
+    }
+    async fn config_apply(&self, view: ConfigView) -> Result<(), Vec<String>> {
+        self.0.config_apply(view).await
+    }
+    async fn on_config_state(&self, state: ConfigState) {
+        self.0.on_config_state(state).await;
+    }
+    async fn on_config_error(&self, error: ConfigError) {
+        self.0.on_config_error(error).await;
+    }
+    async fn on_project_config_error(&self, project_id: String, error: ConfigError) {
+        self.0
+            .seen
+            .send(Seen::ProjectError(project_id, error))
+            .unwrap();
+    }
+}
+
 struct Rig {
     handle: ModuleHandle,
     wire: DuplexStream,
@@ -741,6 +770,63 @@ async fn config_sdk_project_refresh_returns_false_after_connection_closes() {
     rig.finish().await;
     assert!(handle.is_closed());
     assert!(!handle.refresh_project_config("p"));
+}
+
+async fn refuse_project_refresh(rig: &mut Rig, rx: &mut mpsc::UnboundedReceiver<Seen>) {
+    declared(rig).await;
+    get(rig, Some(view(1, ConfigStatus::Active, 1)), None).await;
+    active(rx, 1).await;
+    assert!(rig.handle.refresh_project_config("p"));
+    let request = rig.request(CONFIG_GET_OP).await;
+    assert_eq!(body(&request), json!({"op":"config.get","project_id":"p"}));
+    rig.refuse(request, "layer_root_ambiguous").await;
+}
+
+#[tokio::test]
+async fn config_sdk_project_refresh_refusal_includes_project_id() {
+    let (handler, mut rx) = sample();
+    let (mut rig, _) = Rig::new(ProjectErrors(handler), true).await;
+    refuse_project_refresh(&mut rig, &mut rx).await;
+    let event = seen(&mut rx).await;
+    assert!(
+        matches!(&event, Seen::ProjectError(project, ConfigError::Refused(body))
+            if project == "p" && body.code == "layer_root_ambiguous"),
+        "expected layer_root_ambiguous on the project callback for p, got {event:?}"
+    );
+    rig.finish().await;
+    assert!(matches!(
+        rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Disconnected)
+    ));
+}
+
+#[tokio::test]
+async fn config_sdk_project_refresh_refusal_defaults_to_config_error() {
+    let (handler, mut rx) = sample();
+    let (mut rig, _) = Rig::new(handler, true).await;
+    refuse_project_refresh(&mut rig, &mut rx).await;
+    assert!(
+        matches!(seen(&mut rx).await, Seen::Error(error) if error == "layer_root_ambiguous: isolated refusal")
+    );
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn config_sdk_user_refresh_refusal_only_calls_config_error() {
+    let (handler, mut rx) = sample();
+    let (mut rig, _) = Rig::new(ProjectErrors(handler), true).await;
+    declared(&mut rig).await;
+    let request = rig.request(CONFIG_GET_OP).await;
+    assert_eq!(body(&request), json!({"op":"config.get"}));
+    rig.refuse(request, "value_invalid").await;
+    assert!(
+        matches!(seen(&mut rx).await, Seen::Error(error) if error == "value_invalid: isolated refusal")
+    );
+    rig.finish().await;
+    assert!(matches!(
+        rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Disconnected)
+    ));
 }
 
 #[tokio::test]

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.26.11
+
+- Add `ModuleConfigOptions.onProjectError` to report which project's refresh
+  failed. If omitted, errors still reach `onError`.
+
 ## 0.26.10
 
 - Stop retrying route opens when the daemon returns boolean `detail.expected_back: false`.

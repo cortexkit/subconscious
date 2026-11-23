@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.41.12
+
+- Add `ModuleHandler::on_project_config_error` to report which project's refresh
+  failed. Modules without an override still receive `on_config_error`.
+
 ## 0.41.11
 
 - Return the daemon's route-open refusal immediately when `detail.expected_back`

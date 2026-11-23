@@ -131,6 +131,9 @@ export interface ModuleConfigOptions {
   /** The second argument names the project; undefined is the user view. */
   onState?(state: ModuleConfigState, projectId?: string): void;
   onError?(error: unknown): void;
+  /** For a named project's refresh failure. Keep its last good view, or use the user view if none exists.
+   * If omitted, errors go to onError as before. */
+  onProjectError?(projectId: string, error: unknown): void;
   /** Retry after anchor_pending at most once per interval (1..30000 ms, default 1000). */
   anchorRetryMs?: number;
 }
@@ -232,7 +235,8 @@ export class ModuleConfig {
     return projectId === undefined ? this.state : this.tuples.get(projectId)?.state;
   }
 
-  /** Queue a refresh; the returned promise does not confirm activation. */
+  /** Queue a refresh; the returned promise does not confirm activation.
+   * Named refresh errors go to onProjectError if supplied; delivery statuses still go to onState. */
   refresh(projectId?: string): Promise<void> {
     if (projectId !== undefined && !this.transport.capabilities().includes("config.gate")) return Promise.resolve();
     const epoch = this.transport.epoch();
@@ -242,7 +246,7 @@ export class ModuleConfig {
       // Once a refresh starts, hints can queue one follow-up for this project.
       if (projectId !== undefined && this.queued.get(projectId)?.done === done) this.queued.delete(projectId);
       return this.synchronize(epoch, projectId);
-    }).catch((error) => this.error(error));
+    }).catch((error) => this.error(error, projectId));
     this.tail = done;
     if (projectId !== undefined) this.queued.set(projectId, { epoch, done });
     return done;
@@ -374,7 +378,7 @@ export class ModuleConfig {
         : { state: "failed", view: tuple.lastView, reasons: result.reasons ?? [] });
       await this.sendReport(epoch, tuple, request);
     } catch (error) {
-      if (this.live(epoch) && !this.refused(error, tuple, epoch)) this.error(error);
+      if (this.live(epoch) && !this.refused(error, tuple, epoch)) this.error(error, projectId);
     }
   }
 
@@ -400,7 +404,7 @@ export class ModuleConfig {
       }
     } else {
       this.publish(tuple, { state: "unknown", rawState: code, view: tuple.lastView });
-      this.error(error);
+      this.error(error, tuple.projectId);
     }
     return true;
   }
@@ -411,8 +415,11 @@ export class ModuleConfig {
     try { this.options.onState?.(state, tuple.projectId); } catch (error) { this.error(error); }
   }
 
-  private error(error: unknown): void {
-    try { if (this.options.onError) this.options.onError(error); else console.warn("Module config failed", error); }
-    catch (callbackError) { console.warn("Module config error callback failed", callbackError); }
+  private error(error: unknown, projectId?: string): void {
+    try {
+      if (projectId !== undefined && this.options.onProjectError) this.options.onProjectError(projectId, error);
+      else if (this.options.onError) this.options.onError(error);
+      else console.warn("Module config failed", error);
+    } catch (callbackError) { console.warn("Module config error callback failed", callbackError); }
   }
 }

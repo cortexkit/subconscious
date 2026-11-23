@@ -2065,6 +2065,13 @@ pub trait ModuleHandler: Send + Sync + 'static {
         tracing::warn!(%error, "module configuration request failed");
     }
 
+    /// Observe refusals and protocol errors for a named project refresh.
+    /// Keep the project's last good view, or use the user view if none exists.
+    /// By default, forwards to [`Self::on_config_error`].
+    async fn on_project_config_error(&self, _project_id: String, error: config::ConfigError) {
+        self.on_config_error(error).await;
+    }
+
     /// Decide a route.bind. This hook is decision-only and must not emit route traffic.
     async fn on_bind(&self, _req: &RouteBindRequest) -> BindDecision {
         BindDecision::accept()

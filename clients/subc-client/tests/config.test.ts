@@ -241,6 +241,21 @@ test("a daemon with config.gate can refuse a project without changing user state
   expect(r.filesRead()).toBe(0);
 });
 
+test("a project refresh refusal names the project on onProjectError, not onError", async () => {
+  const projectErrors: Array<{ projectId: string; error: unknown }> = [];
+  const r = rig({ onProjectError: (projectId, error) => projectErrors.push({ projectId, error }) });
+  await r.config.refresh();
+  r.fail("config.get", "layer_root_ambiguous");
+  await r.config.refresh("A");
+  expect(projectErrors).toEqual([{ projectId: "A", error: refusal("layer_root_ambiguous") }]);
+  expect(r.errors).toEqual([]);
+
+  r.fail("config.get", "value_invalid");
+  await r.config.refresh();
+  expect(r.errors).toEqual([refusal("value_invalid")]);
+  expect(projectErrors).toHaveLength(1);
+});
+
 test("review refuses unknown layers rather than passing them to a merger", async () => {
   let reviews = 0;
   const r = rig({ review: () => { reviews++; return { op: "config.review", fields: [], refusals: [] }; } });

@@ -182,13 +182,12 @@ impl ModuleHandle {
     /// queued, not fetched or applied. Queued refreshes for the same project
     /// coalesce, including those triggered by `config.changed`.
     ///
-    /// Results arrive through the existing [`ModuleHandler`] config callbacks.
+    /// Errors arrive through [`ModuleHandler::on_project_config_error`]. The
+    /// `config_gated`, `not_delivery_target`, and `anchor_pending` refusals
+    /// instead go to [`ModuleHandler::on_config_state`].
+    ///
     /// This does not check project support before sending `config.get`; use
     /// [`Self::daemon_supports`] to check capabilities advertised in HELLO_ACK.
-    /// If an older daemon refuses a named get, the refusal reaches
-    /// [`ModuleHandler::on_config_error`] as [`ConfigError::Refused`], except
-    /// for `config_gated`, `not_delivery_target`, and `anchor_pending`, which
-    /// go to [`ModuleHandler::on_config_state`].
     pub fn refresh_project_config(&self, project_id: impl Into<String>) -> bool {
         let session = &self.shared.config;
         if session.declaration.get().is_none()
@@ -234,7 +233,7 @@ async fn run<H: ModuleHandler>(
     // connection. Future hints fetch again, never declare a second time.
     match call(&handle, &declaration, CONFIG_DECLARE_OP).await {
         Ok(_) => delivery.refresh(&handle, &*handler, None).await,
-        Err(error) => delivery.error(&*handler, error).await,
+        Err(error) => delivery.error(&*handler, None, error).await,
     }
     loop {
         handle.shared.config.changed.notified().await;
@@ -356,25 +355,52 @@ impl Delivery {
             .unwrap_or(ConfigAvailability::NoApprovedConfig)
     }
 
-    async fn error<H: ModuleHandler>(&self, handler: &H, error: ConfigError) {
-        if let ConfigError::Refused(refusal) = error {
-            let view = self.available();
-            let state = match refusal.code.as_str() {
-                "config_gated" => ConfigState::ConfigGated { view, refusal },
-                "not_delivery_target" => ConfigState::NotDeliveryTarget { view, refusal },
-                "anchor_pending" => ConfigState::AnchorPending { view, refusal },
-                _ => {
-                    handler.on_config_error(ConfigError::Refused(refusal)).await;
-                    return;
+    async fn error<H: ModuleHandler>(
+        &self,
+        handler: &H,
+        project: Option<&str>,
+        error: ConfigError,
+    ) {
+        let state = match error {
+            ConfigError::Refused(refusal) if refusal.code == "config_gated" => {
+                ConfigState::ConfigGated {
+                    view: self.available(),
+                    refusal,
                 }
-            };
-            handler.on_config_state(state).await;
-        } else {
-            handler.on_config_error(error).await;
-        }
+            }
+            ConfigError::Refused(refusal) if refusal.code == "not_delivery_target" => {
+                ConfigState::NotDeliveryTarget {
+                    view: self.available(),
+                    refusal,
+                }
+            }
+            ConfigError::Refused(refusal) if refusal.code == "anchor_pending" => {
+                ConfigState::AnchorPending {
+                    view: self.available(),
+                    refusal,
+                }
+            }
+            error => {
+                match project {
+                    Some(project) => {
+                        handler
+                            .on_project_config_error(project.to_owned(), error)
+                            .await
+                    }
+                    None => handler.on_config_error(error).await,
+                }
+                return;
+            }
+        };
+        handler.on_config_state(state).await;
     }
 
-    async fn report<H: ModuleHandler>(&mut self, handle: &ModuleHandle, handler: &H) -> bool {
+    async fn report<H: ModuleHandler>(
+        &mut self,
+        handle: &ModuleHandle,
+        handler: &H,
+        project: Option<&str>,
+    ) -> bool {
         let Some(report) = self.report.as_ref() else {
             return true;
         };
@@ -399,7 +425,7 @@ impl Delivery {
                 if !matches!(&error, ConfigError::Refused(body) if body.code == "anchor_pending") {
                     self.report = None;
                 }
-                self.error(handler, error).await;
+                self.error(handler, project, error).await;
                 false
             }
         }
@@ -411,7 +437,8 @@ impl Delivery {
         handler: &H,
         project: Option<String>,
     ) {
-        if !self.report(handle, handler).await {
+        let project_id = project.as_deref();
+        if !self.report(handle, handler, project_id).await {
             return;
         }
         let mut request = ConfigGetRequest::new();
@@ -422,13 +449,14 @@ impl Delivery {
         {
             Ok(reply) => reply,
             Err(error) => {
-                self.error(handler, error).await;
+                self.error(handler, project_id, error).await;
                 return;
             }
         };
         let Some(mut view) = reply.pending.clone().or(reply.active.clone()) else {
             self.error(
                 handler,
+                project_id,
                 ConfigError::Protocol("config.get returned no view".into()),
             )
             .await;
@@ -443,6 +471,7 @@ impl Delivery {
         {
             self.error(
                 handler,
+                project_id,
                 ConfigError::Protocol("config.get returned another project".into()),
             )
             .await;
@@ -463,6 +492,7 @@ impl Delivery {
         }) {
             self.error(
                 handler,
+                project_id,
                 ConfigError::Protocol("invalid recovery view".into()),
             )
             .await;
@@ -478,6 +508,7 @@ impl Delivery {
         {
             self.error(
                 handler,
+                project_id,
                 ConfigError::Protocol("config.get returned an unknown status or layer".into()),
             )
             .await;
@@ -491,6 +522,7 @@ impl Delivery {
                 None => {
                     self.error(
                         handler,
+                        project_id,
                         ConfigError::Protocol("pending view has no delivery attempt".into()),
                     )
                     .await;
@@ -550,7 +582,7 @@ impl Delivery {
                 }
             }
         }
-        self.report(handle, handler).await;
+        self.report(handle, handler, project_id).await;
     }
 }
 

@@ -98,6 +98,14 @@ impl TerminalJournal {
         }
     }
 
+    /// Wait, at most `budget`, for everything queued so far (the shutdown
+    /// marker included) to reach the journal file. Returns false when the
+    /// writer did not catch up in time; the caller goes on regardless.
+    #[cfg(unix)]
+    pub(crate) async fn flush_within(&self, budget: std::time::Duration) -> bool {
+        self.writer.flush(budget).await
+    }
+
     pub(crate) fn append(&self, module_id: &str, record: &TerminalRecord) {
         self.writer.append(JournalEntry {
             module_id: module_id.to_owned(),
@@ -437,6 +445,54 @@ mod tests {
         assert_eq!(history.journal_skipped_lines, 0);
         assert_eq!(history.entries.len(), 1);
         assert_eq!(history.entries[0].at_ms, 8);
+    }
+
+    /// The shutdown drain waits on `flush_within` before announcing the
+    /// shutdown, so a stalled writer must cost only the budget, and a writer
+    /// that catches up must have the marker in the file when it returns true.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn flush_within_reports_whether_the_queued_shutdown_marker_reached_the_file() {
+        let dir = ScratchDir::new("terminal-journal-marker-flush");
+        let path = dir.join("terminals.jsonl");
+        let journal = TerminalJournal::open(path.clone(), "cut-daemon".into());
+        let marker_on_disk = || {
+            std::fs::read_to_string(&path)
+                .unwrap_or_default()
+                .contains("daemon_shutdown")
+        };
+        // Holding the file gate stalls the writer before it writes anything.
+        // A plain thread holds it, so no lock guard lives across an await.
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let gate = journal.file_gate.clone();
+        let holder = std::thread::spawn(move || {
+            let _held = gate.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        locked_rx.recv().unwrap();
+        journal.stamp_shutdown();
+        assert!(
+            !journal
+                .flush_within(std::time::Duration::from_millis(50))
+                .await
+        );
+        assert!(
+            !marker_on_disk(),
+            "a stalled writer has not written the marker"
+        );
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        assert!(
+            journal
+                .flush_within(std::time::Duration::from_secs(5))
+                .await
+        );
+        assert!(
+            marker_on_disk(),
+            "a completed flush has the marker in the file"
+        );
     }
 
     #[test]

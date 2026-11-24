@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.50.56
+
+- On a planned daemon shutdown, wait up to 500 ms for the shutdown marker to
+  reach the terminal journal before telling modules the daemon is stopping.
+  Since 0.50.21 the marker was only queued, so a module told of the shutdown
+  could look at the journal before the marker was written. A stalled journal
+  writer still delays the notice by at most that wait.
+
 ## 0.50.55
 
 - List every changed field, with its old and new values, in an edit plan on

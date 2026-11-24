@@ -67,9 +67,21 @@ impl Supervisor {
     pub(crate) async fn drain_for_daemon_shutdown(&self) -> Result<(), SuperviseError> {
         const NOTICE_BUDGET: Duration = Duration::from_millis(500);
         const DRAIN_BUDGET: Duration = Duration::from_secs(2);
+        const MARKER_BUDGET: Duration = Duration::from_millis(500);
         let Some(forwarding) = &self.forwarding else {
             return Ok(());
         };
+        // `begin_daemon_shutdown` only queued the shutdown marker. Let it reach
+        // the journal before any module hears the notice, so a module that
+        // looks at the journal on the notice already finds it. A stalled
+        // writer costs at most MARKER_BUDGET; the notice goes out regardless.
+        if let Some(journal) = &self.terminal_journal {
+            if !journal.flush_within(MARKER_BUDGET).await {
+                warn!(
+                    "shutdown marker not written within its budget; announcing the shutdown anyway"
+                );
+            }
+        }
         let notice_started = Instant::now();
         let modules = forwarding
             .begin_daemon_drain()

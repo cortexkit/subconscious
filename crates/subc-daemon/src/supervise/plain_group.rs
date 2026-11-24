@@ -107,6 +107,20 @@ impl PlainGroup {
         // failed check never authorizes a signal to the numeric group.
         ops.observe(self.leader)?;
         let sent = ops.signal(self.group, signal);
+        #[cfg(target_os = "macos")]
+        let sent = match sent {
+            // The macOS kernel skips zombies when signalling a group and
+            // returns EPERM if none can be signalled. Recheck after the signal:
+            // the leader may have just exited, but it still pins the group.
+            Err(error)
+                if error.raw_os_error() == Some(rustix::io::Errno::PERM.raw_os_error())
+                    && matches!(ops.observe(self.leader), Ok(Some(_)))
+                    && matches!(ops.has_live_members(self.leader), Ok(false)) =>
+            {
+                Ok(())
+            }
+            sent => sent,
+        };
         if signal == Signal::TERM {
             owned.term_sent = Some(Instant::now());
         } else if signal == Signal::KILL {
@@ -218,6 +232,7 @@ mod tests {
 
     struct Kernel {
         observed: io::Result<Option<ExitStatus>>,
+        signal_error: Option<rustix::io::Errno>,
         calls: RefCell<Vec<Call>>,
     }
 
@@ -232,11 +247,64 @@ mod tests {
 
         fn signal(&self, group: Pid, signal: Signal) -> io::Result<()> {
             self.calls.borrow_mut().push(Call::Signal(group, signal));
-            Ok(())
+            self.signal_error.map_or(Ok(()), |error| Err(error.into()))
         }
 
         fn has_live_members(&self, _: u32) -> io::Result<bool> {
             Ok(true)
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_stop_kill_accepts_an_unreaped_zombie_only_group() {
+        use super::super::containment::ProcessChild;
+        use std::sync::Arc;
+        use tokio::{process::Command, time::timeout};
+
+        let process = Command::new("/bin/sh")
+            .args(["-c", "exit 23"])
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = process.id().unwrap();
+        let mut child = ProcessChild::plain(process, pid);
+        child.plain_group = PlainGroup::from_spawn(pid).map(Arc::new);
+
+        // The supervisor's group wait leaves the exited leader unreaped. Escalate
+        // while it still pins the group, just as when exit wins the race with KILL.
+        let status = timeout(Duration::from_secs(5), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.code(), Some(23));
+        assert_eq!(subc_os::child_exit::observe(pid).unwrap(), Some(status));
+        child.start_kill().unwrap();
+        child.reap().await.unwrap();
+        assert_eq!(
+            subc_os::child_exit::observe(pid)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(rustix::io::Errno::CHILD.raw_os_error())
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_stop_kill_preserves_eperm_for_a_live_leader_or_member() {
+        for observed in [None, Some(ExitStatus::from_raw(0))] {
+            let group = PlainGroup::from_spawn(42).unwrap();
+            let kernel = Kernel {
+                observed: Ok(observed),
+                signal_error: Some(rustix::io::Errno::PERM),
+                calls: RefCell::default(),
+            };
+            let error = group.signal_with(Signal::KILL, &kernel).unwrap_err();
+            assert_eq!(
+                error.raw_os_error(),
+                Some(rustix::io::Errno::PERM.raw_os_error())
+            );
         }
     }
 
@@ -245,6 +313,7 @@ mod tests {
         let group = PlainGroup::from_spawn(42).unwrap();
         let kernel = Kernel {
             observed: Ok(Some(ExitStatus::from_raw(0))),
+            signal_error: None,
             calls: RefCell::default(),
         };
         let start = Instant::now();
@@ -272,6 +341,7 @@ mod tests {
         let group = PlainGroup::from_spawn(42).unwrap();
         let kernel = Kernel {
             observed: Err(io::Error::from(rustix::io::Errno::CHILD)),
+            signal_error: None,
             calls: RefCell::default(),
         };
         let start = Instant::now();

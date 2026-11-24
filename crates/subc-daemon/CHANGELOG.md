@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.50.49
+
+- On macOS, finish stopping a module whose process group has already exited
+  instead of reporting a permission error while its leader awaits reaping.
+
 ## 0.50.48
 
 - Test only: verify that reapproving registration support starts one replacement

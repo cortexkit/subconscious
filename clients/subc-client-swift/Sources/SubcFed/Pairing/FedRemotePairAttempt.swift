@@ -241,7 +241,7 @@ actor FedRemotePairAttempt {
         if frame.typeName == FedRemotePairCodec.bye {
             return .refused(code: frame.byeCode ?? FedRemotePairCodec.failureBye)
         }
-        if frame.typeName == FedRemotePairCodec.result, try FedPendingRemotePairing.grantedKey(frame) == nil {
+        if frame.typeName == FedRemotePairCodec.result, try FedPendingRemotePairing.grantedResult(frame) == nil {
             return .refused(code: "fed_pairing_declined")
         }
         return nil
@@ -253,8 +253,8 @@ actor FedRemotePairAttempt {
 }
 
 extension RdvRegistryRow {
-    func remotePairGrant(_ key: Data) -> FedPairingGrant {
-        FedPairingGrant(computerStaticPublicKey: key, rawName: name,
+    func remotePairGrant(_ key: Data, machineID: String? = nil) -> FedPairingGrant {
+        FedPairingGrant(computerStaticPublicKey: key, computerMachineID: machineID, rawName: name,
                         displayName: FedRemotePairCodec.displaySafe(name) ? name : String(key.lowercaseHex.prefix(12)))
     }
 }

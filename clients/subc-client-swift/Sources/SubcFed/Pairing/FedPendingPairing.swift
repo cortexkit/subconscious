@@ -3,8 +3,17 @@ import Foundation
 /// Identity to offer the app's final confirmation gate. Contains no dial hints or window secret.
 public struct FedPairingGrant: Sendable, Equatable {
     public let computerStaticPublicKey: Data
+    /// The computer's 32-character lowercase hex machine ID from the remote pairing result, if supplied.
+    public let computerMachineID: String?
     public let rawName: String
     public let displayName: String
+
+    init(computerStaticPublicKey: Data, computerMachineID: String? = nil, rawName: String, displayName: String) {
+        self.computerStaticPublicKey = computerStaticPublicKey
+        self.computerMachineID = computerMachineID
+        self.rawName = rawName
+        self.displayName = displayName
+    }
 }
 
 /// A receive-only ceremony, never a normal fed session. The app persists the pin

@@ -236,12 +236,14 @@ public actor FedPendingRemotePairing {
                 try store.replace(scope: scope, record: nil)
                 throw FedRemotePairingError.refused(code: frame.byeCode ?? FedRemotePairCodec.failureBye)
             }
-            let key = try Self.grantedKey(frame)
+            let result = try Self.grantedResult(frame)
             try store.replace(scope: scope, record: nil)
-            guard let key else { settle(.success(.notGranted)); return }
+            guard let result else { settle(.success(.notGranted)); return }
             guard received.afterMatchWrite, answer == true else { throw FedRemotePairingError.protocolViolation }
-            guard key == receipt.targetKey else { throw FedRemotePairingError.wrongTargetKey }
-            settle(.success(.granted(grant)))
+            guard result.key == receipt.targetKey else { throw FedRemotePairingError.wrongTargetKey }
+            let confirmedGrant = FedPairingGrant(computerStaticPublicKey: result.key, computerMachineID: result.machineID,
+                                                 rawName: grant.rawName, displayName: grant.displayName)
+            settle(.success(.granted(confirmedGrant)))
         } catch {
             // Invalid or early results are not recoverable grants.
             do { try store.replace(scope: scope, record: nil) }
@@ -272,11 +274,15 @@ public actor FedPendingRemotePairing {
         waiter = nil
     }
 
-    static func grantedKey(_ frame: FedFrame) throws -> Data? {
+    static func grantedResult(_ frame: FedFrame) throws -> (key: Data, machineID: String?)? {
         guard frame.typeName == FedRemotePairCodec.result else { throw FedRemotePairingError.protocolViolation }
         if frame.header["outcome"] == .string("not_granted") { return nil }
         guard case .string(let key) = frame.header["target_key"], let raw = FedRemotePairCodec.hex(key, count: 32)
         else { throw FedRemotePairingError.protocolViolation }
-        return raw
+        // The wire codec has already validated the optional ID.
+        let machineID: String?
+        if case .string(let value) = frame.header["machine_id"] { machineID = value }
+        else { machineID = nil }
+        return (raw, machineID)
     }
 }

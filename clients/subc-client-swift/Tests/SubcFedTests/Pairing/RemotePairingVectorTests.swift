@@ -100,6 +100,38 @@ final class RemotePairingVectorTests: XCTestCase {
         }
     }
 
+    func testGrantedResultRoundTripsMachineIDInMemberOrder() throws {
+        let machineID = "0123456789abcdef0123456789abcdef"
+        let bytes = resultBytes(#","machine_id":"\#(machineID)""#)
+        let decoded = try RemotePairingVectors.frame(bytes)
+        XCTAssertEqual(decoded.header["machine_id"], .string(machineID))
+        XCTAssertEqual(try FedRemotePairCodec.encode(decoded), bytes)
+    }
+
+    func testResultKeepsStrictMachineIDValidationAndMemberSets() throws {
+        let validID = "0123456789abcdef0123456789abcdef"
+        for value in [#""abcdef""#, #""0123456789ABCDEF0123456789abcdef""#,
+                      #""g123456789abcdef0123456789abcdef""#, "7", "null"] {
+            XCTAssertThrowsError(try RemotePairingVectors.frame(resultBytes(#","machine_id":\#(value)"#)), value) {
+                XCTAssertEqual(FedRemotePairCodec.rejection($0), .badField, value)
+            }
+        }
+        XCTAssertThrowsError(try RemotePairingVectors.frame(resultBytes(#","machine_id":"\#(validID)""#, granted: false))) {
+            XCTAssertEqual(FedRemotePairCodec.rejection($0), .members)
+        }
+        XCTAssertThrowsError(try RemotePairingVectors.frame(resultBytes(#","machine_id":"\#(validID)","unknown":true"#))) {
+            XCTAssertEqual(FedRemotePairCodec.rejection($0), .members)
+        }
+    }
+
+    private func resultBytes(_ extraMembers: String, granted: Bool = true) -> Data {
+        let key = String(repeating: "ab", count: 32)
+        let fields = granted ? #""outcome":"granted","target_key":"\#(key)""# : #""outcome":"not_granted""#
+        let header = Data(#"{"type":"remote_pair_result",\#(fields)\#(extraMembers)}"#.utf8)
+        let prefix = withUnsafeBytes(of: UInt32(header.count).littleEndian) { Data($0) }
+        return prefix + header + Data(repeating: 0, count: 4)
+    }
+
     func testEveryProofSlotSequence() throws {
         let root = try RemotePairingVectors.json("cases.json")
         let samples = try XCTUnwrap(root["attestation_cases"] as? [RemotePairingVectors.Object])

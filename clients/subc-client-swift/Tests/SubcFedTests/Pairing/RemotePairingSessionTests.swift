@@ -212,7 +212,12 @@ final class RemotePairingSessionTests: XCTestCase {
     }
 
     func testPinRequiresOwnMatchAndTheAuthenticatedTargetKey() async throws {
-        for (early, wrongKey) in [(false, false), (true, false), (false, true)] {
+        let suppliedMachineID = "0123456789abcdef0123456789abcdef"
+        let scenarios: [(early: Bool, wrongKey: Bool, machineID: String?)] = [
+            (false, false, nil), (false, false, suppliedMachineID), (true, false, suppliedMachineID),
+            (false, true, suppliedMachineID),
+        ]
+        for (early, wrongKey, machineID) in scenarios {
             let fixture = try await RemotePairingFixture()
             let pipe = RemotePairingPipe()
             let client = try fixture.client(pipes: [pipe])
@@ -224,7 +229,7 @@ final class RemotePairingSessionTests: XCTestCase {
                     XCTAssertEqual(match.typeName, FedRemotePairCodec.match)
                     XCTAssertEqual(match.header["match"], .boolean(true))
                 }
-                try await wire.send(fixture.result(wrongKey ? "granted_wrong_key" : "granted"))
+                try await wire.send(fixture.result(wrongKey ? "granted_wrong_key" : "granted", machineID: machineID))
                 return code
             }
             let pending = try await client.pair(remote: fixture.target, rendezvous: fixture.rendezvous)
@@ -236,7 +241,12 @@ final class RemotePairingSessionTests: XCTestCase {
             do {
                 let outcome = try await pending.confirmMatch(true)
                 XCTAssertFalse(early || wrongKey, "an early or wrong-key grant must never authorize a pin")
-                XCTAssertEqual(outcome, .granted(fixture.target.remotePairGrant(fixture.targetKey.publicKey)))
+                if case .granted(let grant) = outcome {
+                    XCTAssertEqual(grant.computerStaticPublicKey, fixture.targetKey.publicKey)
+                    XCTAssertEqual(grant.computerMachineID, machineID)
+                    XCTAssertEqual(grant.rawName, "Selected Computer")
+                    XCTAssertEqual(grant.displayName, "Selected Computer")
+                } else { XCTFail("expected a grant, got \(outcome)") }
             } catch {
                 XCTAssertEqual(error as? FedRemotePairingError, early ? .protocolViolation : (wrongKey ? .wrongTargetKey : nil))
             }
@@ -274,14 +284,20 @@ final class RemotePairingSessionTests: XCTestCase {
         let restartedClient = try fixture.client(pipes: [status])
         let hasReceipt = try await restartedClient.hasRemotePairingReceipt(rendezvous: fixture.rendezvous)
         XCTAssertTrue(hasReceipt)
+        let machineID = "fedcba9876543210fedcba9876543210"
         let statusTarget = Task {
             let (wire, _) = try await fixture.targetWire(FedTCPRecordCarrier(stream: status.target), status: true)
             let request = try await wire.receive()
             XCTAssertEqual(request, receipt.request)
-            try await wire.send(fixture.result("granted"))
+            try await wire.send(fixture.result("granted", machineID: machineID))
         }
         let resumed = try await restartedClient.remotePairingStatus(rendezvous: fixture.rendezvous)
-        XCTAssertEqual(resumed, .granted(fixture.target.remotePairGrant(fixture.targetKey.publicKey)))
+        if case .granted(let grant) = resumed {
+            XCTAssertEqual(grant.computerStaticPublicKey, fixture.targetKey.publicKey)
+            XCTAssertEqual(grant.computerMachineID, machineID)
+            XCTAssertEqual(grant.rawName, "Selected Computer")
+            XCTAssertEqual(grant.displayName, "Selected Computer")
+        } else { XCTFail("expected a grant from status, got \(resumed)") }
         try await statusTarget.value
         XCTAssertNil(try fixture.store.load(scope: fixture.scope))
         await fixture.rendezvous.disconnect()

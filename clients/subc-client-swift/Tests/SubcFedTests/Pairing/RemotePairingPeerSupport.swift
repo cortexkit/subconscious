@@ -156,10 +156,14 @@ struct RemotePairingFixture: Sendable {
         return (FedRemotePairWire(session), hash)
     }
 
-    func result(_ label: String) -> FedFrame {
+    func result(_ label: String, machineID: String? = nil) -> FedFrame {
+        if label == "not_granted" {
+            return FedFrame(type: FedRemotePairCodec.result, fields: ["outcome": .string("not_granted")])
+        }
         let key = label == "granted_wrong_key" ? deviceKey.publicKey : targetKey.publicKey
-        return label == "not_granted" ? FedFrame(type: FedRemotePairCodec.result, fields: ["outcome": .string("not_granted")])
-            : FedFrame(type: FedRemotePairCodec.result, fields: ["outcome": .string("granted"), "target_key": .string(key.lowercaseHex)])
+        var fields: [String: FedJSONValue] = ["outcome": .string("granted"), "target_key": .string(key.lowercaseHex)]
+        if let machineID { fields["machine_id"] = .string(machineID) }
+        return FedFrame(type: FedRemotePairCodec.result, fields: fields)
     }
 
     func exchangeAsTarget(wire: FedRemotePairWire, handshakeHash: Data, mode: FedRemotePairMode, pipe: RemotePairingPipe? = nil,

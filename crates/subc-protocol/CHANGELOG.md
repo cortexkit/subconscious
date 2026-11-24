@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.37.8
+
+- Add `CallerAttestation.settings_credentials` (`SettingsCredentials { generation, refs }`):
+  the vault references a module's approved settings name, attested on a `route.bind` to
+  the vault. Optional and additive; readers that don't know the member ignore it.
+
 ## 0.37.7
 
 - Add a route-open refusal predicate that treats boolean `detail.expected_back: false`

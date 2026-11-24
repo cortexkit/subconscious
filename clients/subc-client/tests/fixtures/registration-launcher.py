@@ -92,6 +92,8 @@ else:
     env["SUBC_REGISTRATION_FD"] = f"{child.fileno()}:{os.fstat(child.fileno()).st_ino}"
     args = sys.argv[2:]
     inherited = [child.fileno()]
+    nonce_read = None
+    retirement = None
     if fallback:
         nonce_read, nonce_write = os.pipe()
         os.write(nonce_write, b"inherited-nonce")
@@ -100,19 +102,29 @@ else:
         inherited.append(nonce_read)
         if mode in ("fallback-refused", "fallback-explicit", "fallback-consumer"):
             env["SUBC_REGISTRATION_FD"] = "999:1"
-        if mode == "fallback-leaked":
+        if mode in ("fallback-leaked", "fallback-leaked-no-socket-wait"):
             # The old provider deliberately leaves slot 4 inheritable, then
             # starts the new SDK only after nonce registration retired it.
             assert child.fileno() == 4
             args[1] = os.path.join(os.path.dirname(args[1]), "registration-legacy-parent.ts")
+            retirement = os.pipe()
+            inherited.append(retirement[0])
+            env["TEST_REGISTRATION_RETIRED_FD"] = str(retirement[0])
+            if mode == "fallback-leaked-no-socket-wait":
+                trap = os.path.join(os.path.dirname(args[1]), "registration-no-socket-read.ts")
+                args[1:1] = ["--preload", trap]
     process = subprocess.Popen(args, env=env, pass_fds=inherited)
     child.close()
-    if fallback:
+    if nonce_read is not None:
         os.close(nonce_read)
-        if mode == "fallback-leaked":
+        if retirement is not None:
+            retired_read, retired_write = retirement
+            os.close(retired_read)
             parent.settimeout(8)
             assert parent.recv(10) == b"REGISTERED"
             parent.shutdown(socket.SHUT_RDWR)
+            os.write(retired_write, b"\x01")
+            os.close(retired_write)
         try:
             sys.exit(process.wait(timeout=8))
         except subprocess.TimeoutExpired:

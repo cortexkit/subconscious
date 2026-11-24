@@ -343,6 +343,13 @@ for (const mode of ["fallback-refused", "fallback-explicit", "fallback-consumer"
   }, 15000);
 }
 
+test.skipIf(process.platform === "win32")("fallback-leaked: does not wait for EOF on the retired socketpair", async () => {
+  const result = await run("fallback-leaked-no-socket-wait");
+  expect(result.out).toContain("FALLBACK_OK");
+  expect(result.operations).toEqual(["HELLO", "HELLO", "server.describe", "route.open"]);
+  expect(result.err).toBe("");
+}, 15000);
+
 test("adopted provider close does not exit the process", async () => {
   const result = await run("close");
   expect(result.out).toContain("LOCAL_CLOSE_OK");

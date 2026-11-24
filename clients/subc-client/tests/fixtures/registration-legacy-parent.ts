@@ -2,7 +2,7 @@
 // deliberately pass that still-inheritable endpoint to a new-SDK descendant.
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { readSync, writeSync } from "node:fs";
+import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import { readConnectionFile } from "../../src/connection-file";
 import { authenticateClient } from "../../src/auth";
@@ -21,8 +21,14 @@ await sock.write(encodeFrame(buildFrame(FrameType.Hello, 0, 0, 0, 1n, Buffer.fro
   protocol_ver: PROTOCOL_VERSION, launch_nonce: "inherited-nonce",
 })))), deadline);
 if ((await sock.readFrame(deadline, deadline)).header.ty !== FrameType.HelloAck) throw new Error("legacy registration failed");
-writeSync(4, "REGISTERED");
-if (readSync(4, Buffer.alloc(1), 0, 1, null) !== 0) throw new Error("channel was not retired");
+fs.writeSync(4, "REGISTERED");
+// On macOS a blocked AF_UNIX socketpair read can miss the peer's shutdown.
+// Wait on a pipe that the launcher signals after shutting down the socket.
+const retiredFd = Number(process.env.TEST_REGISTRATION_RETIRED_FD);
+const retired = Buffer.alloc(1);
+try {
+  if (fs.readSync(retiredFd, retired, 0, 1, null) !== 1 || retired[0] !== 1) throw new Error("channel was not retired");
+} finally { fs.closeSync(retiredFd); }
 const [nonceFd, nonceInode] = process.env.SUBC_LAUNCH_NONCE_FD!.split(":");
 const child = spawn(process.execPath, [fileURLToPath(new URL("registration-child.ts", import.meta.url)), "fallback-leaked", connectionFile], {
   env: {...process.env, SUBC_LAUNCH_NONCE_FD: `3:${nonceInode}`}, stdio: ["ignore", "inherit", "inherit", Number(nonceFd), 4],

@@ -33,6 +33,7 @@ mod inline_actions;
 mod inline_views;
 mod log_tail;
 mod policy_root_cli;
+mod response_budget;
 mod stack_cli;
 mod window_cli;
 use ck_help::{is_builtin_domain, top_help, BUILTIN_DOMAINS};
@@ -89,9 +90,6 @@ const AUTH_DEADLINE: Duration = Duration::from_secs(2);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const DASHBOARD_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
-/// The daemon's default operator delivery budget includes queueing, the prompt,
-/// and provider recovery. Reserve it even for older daemons and log mode because
-/// the wire does not advertise whether a privileged request will prompt.
 const OPERATOR_RESPONSE_BUDGET: Duration = Duration::from_secs(290);
 /// Time for the daemon to finish post-drain process teardown, publish the
 /// response, and absorb scheduler jitter after the configured drain budget.
@@ -1722,7 +1720,7 @@ impl CkClient {
         operation: String,
         verify_command: String,
     ) -> Result<Value, CkError> {
-        let response_timeout = response_timeout.saturating_add(OPERATOR_RESPONSE_BUDGET);
+        let response_timeout = response_timeout.saturating_add(response_budget::operator());
         match self.rpc_value_with_timeout(request, response_timeout).await {
             Err(CkError::ResponseTimeout { timeout }) => Err(CkError::OutcomeUnknown {
                 operation,

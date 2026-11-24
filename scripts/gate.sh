@@ -62,7 +62,8 @@ CI adapters (optional [check], for the existing job boundaries and conditions):
         citations, file-size, unbound, vectors, vector <vectors/name/>, shellcheck,
         installer, shell-tests
   lint: workspace, release, alpha, windows, windows-release
-  test: workspace, docs, alpha-setup, alpha-cli, alpha-inode
+  test: workspace, workspace-without-daemon, daemon, docs, alpha-setup,
+        alpha-cli, alpha-inode
   swift: test, ios, macos
   ts: subc-client, store, log, private-files, typecheck <pkg>, unit <pkg>, live
   metadata-online is CI's original --locked metadata (may fetch crates).
@@ -260,26 +261,30 @@ alpha_logged() {
 
 test_check() {
   case "$1" in
-    workspace)
+    workspace|workspace-without-daemon|daemon)
       scratch
       git status --porcelain | sort > "$SCRATCH/tree-before.txt"
       # Daemon tests launch feature-gated fixtures from both packages. Cargo's
       # test scheduling does not guarantee those binaries exist before a test.
       step 'Build helper binaries (test-support)' cargo build --locked -p subc-core -p subc-daemon --bins --features subc-core/test-support,subc-daemon/test-support
-      # ck-bus integration tests shorten sentinel timings in the spawned binary.
-      step 'Whole-workspace tests (except the daemon)' cargo test --workspace --exclude subc-daemon --all-targets --locked --no-fail-fast --features ck-bus/test-support
-      # The config gate's approval tests approve settings changes from a desktop
-      # app the daemon can't verify, which the daemon accepts only when built
-      # with dev-desktop-approval (release daemons never are). Turning the
-      # feature on in the workspace run above would also change the daemon
-      # that other crates' tests link, so the daemon's own targets run here.
-      step 'Daemon tests (test-support, dev-desktop-approval)' cargo test -p subc-daemon --all-targets --locked --no-fail-fast --features test-support,dev-desktop-approval
-      # Tests marked cfg(not(feature = "dev-desktop-approval")) check release
-      # behaviour (an unverified desktop app is refused). The run above
-      # compiles them out, so run the daemon's unit tests once without it.
-      step 'Daemon unit tests (test-support, release features)' cargo test -p subc-daemon --lib --locked --no-fail-fast --features test-support
-      # Reuse the compiled test target while also exercising its shell entry point.
-      step 'Workspace scratch fence wrapper' bash scripts/checks/test-scratch-fence.sh ;;
+      if [ "$1" != daemon ]; then
+        # ck-bus integration tests shorten the probe period and timeout of the
+        # spawned ck-bus binary's health check.
+        step 'Whole-workspace tests (except the daemon)' cargo test --workspace --exclude subc-daemon --all-targets --locked --no-fail-fast --features ck-bus/test-support
+      fi
+      if [ "$1" != workspace-without-daemon ]; then
+        # The config gate's approval tests approve settings changes from a desktop
+        # app the daemon can't verify, which the daemon accepts only when built
+        # with dev-desktop-approval (release daemons never are). Turning the
+        # feature on in the workspace test would also change the daemon that
+        # other crates' tests link, so the daemon's own targets run separately.
+        step 'Daemon tests (test-support, dev-desktop-approval)' cargo test -p subc-daemon --all-targets --locked --no-fail-fast --features test-support,dev-desktop-approval
+        # Tests marked cfg(not(feature = "dev-desktop-approval")) check release
+        # behaviour (an unverified desktop app is refused). The run above
+        # compiles them out, so run the daemon's unit tests once without it.
+        step 'Daemon unit tests (test-support, release features)' cargo test -p subc-daemon --lib --locked --no-fail-fast --features test-support
+        step 'Workspace scratch fence wrapper' bash scripts/checks/test-scratch-fence.sh
+      fi ;;
     docs) step 'Workspace doctests' cargo test --workspace --doc --locked ;;
     alpha-setup) step 'Alpha setup selection (nonzero tests)' alpha_logged 'test result: ok\. [1-9][0-9]* passed;' cargo test -p subc-core --lib --locked setup:: ;;
     alpha-cli) step 'Alpha CLI update-check contract' cargo test -p subc-core --test ck_cli --locked -v ;;

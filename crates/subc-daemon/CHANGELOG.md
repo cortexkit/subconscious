@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.50.47
+
+- Use a zero teardown drain budget in route-open recovery tests without changing
+  the production budget or the refusal assertions.
+
 ## 0.50.46
 
 - Export a read-only live-children roster reader for record versions 1 and 2.

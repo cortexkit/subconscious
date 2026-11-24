@@ -5,10 +5,13 @@ fn recovery_module(
     max_restarts: u32,
 ) -> (SupervisorHandle, crate::supervise::SupervisedModule) {
     let handle = SupervisorHandle::new();
+    // These tests check refusal details, not graceful teardown. A child
+    // parked without a connection would otherwise spend the budget on Windows.
     let supervisor = Supervisor::new_for_test(
         Arc::clone(registry),
         RestartPolicy::new(max_restarts, Duration::ZERO),
     )
+    .with_drain_timeout(Duration::ZERO)
     .with_handle(handle.clone());
     let module = supervisor
         .supervise_configured(

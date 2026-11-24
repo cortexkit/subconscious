@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.21.45
+
+- Shorten the intentional no-reply CLI test with a test-support operator budget
+  override. Shipped `ck` still reserves 290 seconds for the operator response.
+- Require subc-daemon 0.50.47.
+
 ## 0.21.44
 
 - Fix `ck window` protection checks against running daemons by querying

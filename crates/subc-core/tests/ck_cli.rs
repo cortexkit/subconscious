@@ -6832,7 +6832,12 @@ async fn mutating_timeout_exits_outcome_unknown_and_names_status_verification() 
     )
     .await;
 
-    let output = ck_with_subc(&daemon.connection_file_path, ["module", "stop", module_id]);
+    let output = ck_command()
+        .env("CK_TEST_OPERATOR_RESPONSE_BUDGET_MS", "1000")
+        .args(["module", "stop", module_id, "--subc"])
+        .arg(&daemon.connection_file_path)
+        .output()
+        .unwrap();
     assert_exit(&output, 4);
     assert!(output.stdout.is_empty());
     let stderr = text(&output.stderr);
@@ -6840,6 +6845,7 @@ async fn mutating_timeout_exits_outcome_unknown_and_names_status_verification() 
         stderr.contains(&format!("outcome unknown: `ck module stop {module_id}`")),
         "stderr:\n{stderr}"
     );
+    assert!(stderr.contains("timed out after 3s"), "stderr:\n{stderr}");
     assert!(
         stderr.contains(&format!("verify with: ck module status {module_id}")),
         "stderr:\n{stderr}"

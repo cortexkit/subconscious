@@ -66,6 +66,7 @@ cat "$1"
 EOF
   cat >"$STUBS/ck" <<'EOF'
 #!/usr/bin/env bash
+if [ "$*" = 'window current' ]; then exit 3; fi
 if [ "$*" = '--json config status' ]; then
   printf '{"status":{"state":"unstamped","development_switches":[]}}\n'
   exit 0

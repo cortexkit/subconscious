@@ -2,7 +2,7 @@
 
 use serde_json::{json, Value};
 
-use super::super::{CkError, Command, ModuleCommand};
+use super::super::{stack_cli, window_cli, CkError, Command, ModuleCommand};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum JsonForm {
@@ -14,6 +14,22 @@ pub(crate) enum JsonForm {
 pub(crate) fn json_form(command: &Command) -> JsonForm {
     match command {
         Command::Config(_) | Command::PolicyRoot(_) => JsonForm::Exempt,
+        Command::Stack(action) => match action {
+            stack_cli::Action::Status(_) => JsonForm::Schema("ck.stack.status/v1"),
+            stack_cli::Action::Stop(_) | stack_cli::Action::Start(_) => {
+                JsonForm::Schema("ck.stack.result/v1")
+            }
+        },
+        Command::Window(action) => match action {
+            window_cli::Action::List => JsonForm::Schema("ck.window.list/v1"),
+            window_cli::Action::Keep(_)
+            | window_cli::Action::Abandon(_)
+            | window_cli::Action::Revert(_) => JsonForm::Schema("ck.window.result/v1"),
+            window_cli::Action::Begin(_) => JsonForm::None("window begin"),
+            window_cli::Action::Current => JsonForm::None("window current"),
+            window_cli::Action::Record { .. } => JsonForm::None("window record"),
+            window_cli::Action::Done { .. } => JsonForm::None("window done"),
+        },
         Command::Health => JsonForm::Schema("ck.health/v1"),
         Command::HealthDetail { .. } => JsonForm::Schema("ck.health.detail/v1"),
         Command::Activity(_) => JsonForm::Schema("ck.activity/v1"),
@@ -82,17 +98,18 @@ impl JsonOutput {
         enabled: bool,
         ckni: bool,
     ) -> Result<Self, CkError> {
-        let schema = if enabled && ckni {
-            match json_form(command) {
-                JsonForm::Schema(schema) => Some(schema),
-                JsonForm::None(command) => {
-                    return Err(CkError::Usage(format!("{command} has no JSON form")));
+        let schema =
+            if enabled && (ckni || matches!(command, Command::Stack(_) | Command::Window(_))) {
+                match json_form(command) {
+                    JsonForm::Schema(schema) => Some(schema),
+                    JsonForm::None(command) => {
+                        return Err(CkError::Usage(format!("{command} has no JSON form")));
+                    }
+                    JsonForm::Exempt => None,
                 }
-                JsonForm::Exempt => None,
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
         let stream = schema.is_some()
             && matches!(command, Command::Module(ModuleCommand::Logs { options, .. }) if options.follow);
         Ok(Self {
@@ -123,6 +140,24 @@ impl JsonOutput {
             return Ok(());
         }
         super::super::print_json(&self.value(value))
+    }
+
+    pub(crate) fn completion(
+        self,
+        report: &impl serde::Serialize,
+        exit_code: i32,
+        human: impl FnOnce() -> String,
+    ) -> Result<(), CkError> {
+        if self.enabled {
+            self.print(&serde_json::to_value(report)?)?;
+        } else {
+            println!("{}", human());
+        }
+        if exit_code == 0 {
+            Ok(())
+        } else {
+            Err(CkError::StackWindowExit { exit_code })
+        }
     }
 
     pub(crate) fn stream_line(self, value: &Value) -> Result<String, CkError> {
@@ -187,6 +222,61 @@ mod tests {
             // Policy-root replies are the daemon's own replies, printed as piped ck
             // prints them, like the config replies above.
             ("policy-root show", PlainOutput::PipedText, JsonForm::Exempt),
+            (
+                "stack status",
+                PlainOutput::PipedText,
+                JsonForm::Schema("ck.stack.status/v1"),
+            ),
+            (
+                "stack stop",
+                PlainOutput::PipedText,
+                JsonForm::Schema("ck.stack.result/v1"),
+            ),
+            (
+                "stack start",
+                PlainOutput::PipedText,
+                JsonForm::Schema("ck.stack.result/v1"),
+            ),
+            (
+                "window list",
+                PlainOutput::PipedText,
+                JsonForm::Schema("ck.window.list/v1"),
+            ),
+            (
+                "window keep",
+                PlainOutput::PipedText,
+                JsonForm::Schema("ck.window.result/v1"),
+            ),
+            (
+                "window abandon 20261123-010203-abcd",
+                PlainOutput::PipedText,
+                JsonForm::Schema("ck.window.result/v1"),
+            ),
+            (
+                "window revert",
+                PlainOutput::PipedText,
+                JsonForm::Schema("ck.window.result/v1"),
+            ),
+            (
+                "window begin",
+                PlainOutput::PipedText,
+                JsonForm::None("window begin"),
+            ),
+            (
+                "window current",
+                PlainOutput::PipedText,
+                JsonForm::None("window current"),
+            ),
+            (
+                "window record file --target /target --remove --window 20261123-010203-abcd --owner-pid 1",
+                PlainOutput::PipedText,
+                JsonForm::None("window record"),
+            ),
+            (
+                "window done 1 --window 20261123-010203-abcd --owner-pid 1",
+                PlainOutput::PipedText,
+                JsonForm::None("window done"),
+            ),
             (
                 "module resources",
                 PlainOutput::PipedText,
@@ -338,6 +428,8 @@ mod tests {
         let mut commands = HashSet::new();
         let mut modules = HashSet::new();
         let mut configs = HashSet::new();
+        let mut stacks = HashSet::new();
+        let mut windows = HashSet::new();
         let mut schemas = BTreeSet::new();
         let mut walk = |text: &str, plain, json| {
             let args = crate::parse_args(
@@ -358,6 +450,18 @@ mod tests {
                 assert!(
                     configs.insert(discriminant(config)),
                     "duplicate config variant: {text}"
+                );
+            }
+            if let Command::Stack(action) = &args.command {
+                assert!(
+                    stacks.insert(discriminant(action)),
+                    "duplicate stack action: {text}"
+                );
+            }
+            if let Command::Window(action) = &args.command {
+                assert!(
+                    windows.insert(discriminant(action)),
+                    "duplicate window action: {text}"
                 );
             }
             match json {
@@ -396,6 +500,16 @@ mod tests {
             modules.len(),
             variant_count(source, "ModuleCommand"),
             "unclassified ModuleCommand variant"
+        );
+        assert_eq!(
+            stacks.len(),
+            variant_count(include_str!("../stack_cli/mod.rs"), "Action"),
+            "unclassified stack action"
+        );
+        assert_eq!(
+            windows.len(),
+            variant_count(include_str!("../window_cli/mod.rs"), "Action"),
+            "unclassified window action"
         );
         // Settings pages send these requests; `ck config` has no command that
         // produces them, so they have no CLI output to classify. Naming them

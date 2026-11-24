@@ -8,7 +8,7 @@ use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 const NAME: &str = "installer.journal";
-const VERSION: u32 = 1;
+pub(crate) const VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -329,7 +329,7 @@ impl State {
     }
 }
 
-fn valid_id(id: &str) -> bool {
+pub(crate) fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
         && id
@@ -406,7 +406,7 @@ fn next_undo(current: Option<Undo>) -> Option<Undo> {
 
 /// The caller holds the install lock for the lifetime of this handle.
 #[derive(Debug)]
-pub(super) struct Journal {
+pub(crate) struct Journal {
     path: PathBuf,
     file: File,
     state: State,
@@ -487,7 +487,7 @@ impl Journal {
         })
     }
 
-    pub fn status(manifest: &Path) -> Result<Option<Status>, String> {
+    pub(super) fn status(manifest: &Path) -> Result<Option<Status>, String> {
         let path = Self::path(manifest);
         let mut file = match subc_os::open_regular_nofollow(&path) {
             Ok(file) => file,
@@ -527,7 +527,7 @@ impl Journal {
         Ok(removals)
     }
 
-    pub fn prepare(&mut self, step: Step) -> Result<usize, String> {
+    pub(super) fn prepare(&mut self, step: Step) -> Result<usize, String> {
         let index = self.state.steps.len();
         let record = match step.action {
             Action::Bootstrap { .. } => Record::Handover {
@@ -544,7 +544,7 @@ impl Journal {
         Ok(index)
     }
 
-    pub fn step(&self, index: usize) -> &Step {
+    pub(super) fn step(&self, index: usize) -> &Step {
         &self.state.steps[index]
     }
 
@@ -559,7 +559,7 @@ impl Journal {
         self.state.steps.len()
     }
 
-    pub fn handover(&self) -> Option<&Step> {
+    pub(super) fn handover(&self) -> Option<&Step> {
         (self.state.end == End::Handover && self.state.undo.is_none()).then(|| &self.state.steps[0])
     }
 
@@ -567,7 +567,7 @@ impl Journal {
         self.done_with_build(index, None)
     }
 
-    pub fn done_with_build(
+    pub(super) fn done_with_build(
         &mut self,
         index: usize,
         reported_build: Option<Build>,
@@ -578,7 +578,7 @@ impl Journal {
         })
     }
 
-    pub fn recover(mut self, backend: &mut impl Recovery) -> Result<Outcome, String> {
+    pub(super) fn recover(mut self, backend: &mut impl Recovery) -> Result<Outcome, String> {
         self.require_usable()?;
         if self.state.id.is_none() {
             // Creation does not authorize a change until the header is synced.
@@ -684,7 +684,7 @@ impl Journal {
         Ok(true)
     }
 
-    pub fn commit(mut self, backend: &mut impl Recovery) -> Result<Outcome, String> {
+    pub(super) fn commit(mut self, backend: &mut impl Recovery) -> Result<Outcome, String> {
         self.append(Record::Close {
             outcome: Outcome::Committed,
         })?;
@@ -869,7 +869,7 @@ fn read_state(file: &mut File, path: &Path) -> Result<(State, Option<usize>), St
 }
 
 #[cfg(unix)]
-fn open_journal(path: &Path, create: bool) -> io::Result<File> {
+pub(crate) fn open_journal(path: &Path, create: bool) -> io::Result<File> {
     use rustix::fs::{open, Mode, OFlags};
     let mut flags = OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK;
     if create {
@@ -879,7 +879,7 @@ fn open_journal(path: &Path, create: bool) -> io::Result<File> {
 }
 
 #[cfg(windows)]
-fn open_journal(path: &Path, create: bool) -> io::Result<File> {
+pub(crate) fn open_journal(path: &Path, create: bool) -> io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
     if create {
         return subc_os::windows_acl::create_private_file(path);
@@ -893,7 +893,7 @@ fn open_journal(path: &Path, create: bool) -> io::Result<File> {
 }
 
 #[cfg(unix)]
-fn verify_journal_owner(file: &File) -> io::Result<()> {
+pub(crate) fn verify_journal_owner(file: &File) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let info = file.metadata()?;
     if info.uid() != rustix::process::geteuid().as_raw()
@@ -909,11 +909,11 @@ fn verify_journal_owner(file: &File) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn verify_journal_owner(file: &File) -> io::Result<()> {
+pub(crate) fn verify_journal_owner(file: &File) -> io::Result<()> {
     subc_os::windows_acl::verify_owner_only(file)
 }
 
-pub(super) fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+pub(crate) fn is_reparse_point(metadata: &fs::Metadata) -> bool {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
@@ -931,7 +931,7 @@ mod tests;
 pub(super) mod activation;
 pub(super) mod bootstrap;
 #[cfg(unix)]
-pub(super) mod bundle;
+pub(crate) mod bundle;
 pub(super) mod files;
 mod legacy;
 #[cfg(unix)]
@@ -946,7 +946,7 @@ pub(super) mod transaction;
 pub(super) mod user_path;
 pub use bootstrap::entry as bootstrap_entry;
 
-pub(super) fn sync_parent(path: &Path) -> Result<(), String> {
+pub(crate) fn sync_parent(path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     if let Some(parent) = path.parent() {
         File::open(parent)

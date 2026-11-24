@@ -560,6 +560,33 @@ pub fn verify_private_dir(path: &Path) -> io::Result<()> {
     Security::query(handle.0)?.verify(&User::current()?)
 }
 
+/// Check the owner of a regular file or directory without following its final
+/// component or requiring a private access control list. Only the token user is accepted.
+pub fn verify_current_owner(path: &Path, directory: bool) -> io::Result<()> {
+    let security = if directory {
+        Security::query(open_directory(path, READ_CONTROL)?.0)?
+    } else {
+        use std::os::windows::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .access_mode(READ_CONTROL)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        let handle = file.as_raw_handle();
+        if disk_attributes(handle)? & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0
+        {
+            return Err(insecure("not an ordinary file"));
+        }
+        Security::query(handle)?
+    };
+    let user = User::current()?;
+    // SAFETY: Both security identifiers belong to live Win32 token/security buffers.
+    if security.owner.is_null() || unsafe { EqualSid(security.owner, user.sid()) } == 0 {
+        return Err(insecure("owner is not the current user"));
+    }
+    Ok(())
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 #[cfg(test)]

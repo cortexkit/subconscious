@@ -1335,7 +1335,7 @@ pub fn data_directory() -> Result<PathBuf, String> {
     Ok(user_home()?.join(".local").join("share").join("cortexkit"))
 }
 
-pub(super) fn user_home() -> Result<PathBuf, String> {
+pub(crate) fn user_home() -> Result<PathBuf, String> {
     env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)

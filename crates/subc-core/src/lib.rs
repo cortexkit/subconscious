@@ -6,3 +6,9 @@
 pub mod cli_output;
 
 pub mod setup;
+
+#[doc(hidden)]
+pub mod stack;
+
+#[doc(hidden)]
+pub mod window;

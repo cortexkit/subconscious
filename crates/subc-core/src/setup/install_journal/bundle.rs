@@ -237,7 +237,7 @@ fn metadata(path: &Path) -> Result<Option<fs::Metadata>, String> {
     }
 }
 
-fn tree_digest(root: &Path) -> Result<Option<String>, String> {
+pub(crate) fn tree_digest(root: &Path) -> Result<Option<String>, String> {
     let Some(info) = metadata(root)? else {
         return Ok(None);
     };

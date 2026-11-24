@@ -75,6 +75,21 @@ fn validator_rejects_everyone_read_on_opened_file() {
 }
 
 #[test]
+fn placement_owner_check_does_not_require_a_private_dacl() {
+    let root = TempDir::new();
+    let directory = root.0.join("placement");
+    create_private_dir(&directory).unwrap();
+    let path = directory.join("image.exe");
+    let file = create_private_file(&path).unwrap();
+    grant_everyone_read(&path);
+    verify_current_owner(&directory, true).unwrap();
+    verify_current_owner(&path, false).unwrap();
+    assert!(verify_owner_only(&file).is_err());
+    assert!(verify_current_owner(&path, true).is_err());
+    assert!(verify_current_owner(&directory, false).is_err());
+}
+
+#[test]
 fn validator_rejects_null_dacl_on_opened_file() {
     let root = TempDir::new();
     let path = root.0.join("key.json");
@@ -111,6 +126,10 @@ fn validator_accepts_administrators_owner_when_token_can_assign_one() {
         Err(error) => panic!("assign Administrators owner: {error}"),
     }
     verify_owner_only(&file).unwrap();
+    assert_eq!(
+        verify_current_owner(&path, false).unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
 }
 
 /// BUILTIN\Users is an ordinary group: a file it owns could be re-permissioned by

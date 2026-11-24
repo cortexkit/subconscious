@@ -69,7 +69,7 @@ fn same_file(left: &Path, right: &Path) -> bool {
 /// Refuses unless the user manager names `definition` as the file it loads
 /// the unit from. Used after a reload, before anything is done to the unit
 /// by name.
-pub(super) fn verify_fragment<R: CommandRunner + ?Sized>(
+pub(crate) fn verify_fragment<R: CommandRunner + ?Sized>(
     definition: &Path,
     runner: &mut R,
 ) -> Result<(), String> {
@@ -91,7 +91,7 @@ pub(super) fn verify_fragment<R: CommandRunner + ?Sized>(
 /// own unit recorded at the other configuration root, which a migration is
 /// moving). A manager that loads no file is left to registration, which
 /// verifies the fragment after its reload.
-pub(super) fn refuse_foreign_fragment<R: CommandRunner + ?Sized>(
+pub(crate) fn refuse_foreign_fragment<R: CommandRunner + ?Sized>(
     definition: &Path,
     also_setups: &[PathBuf],
     runner: &mut R,

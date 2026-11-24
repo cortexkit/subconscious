@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.50.46
+
+- Export a read-only live-children roster reader for record versions 1 and 2.
+  It distinguishes a missing file from read, decode, and unsupported-version
+  errors without sweeping or quarantining anything.
+- Require subc-os 0.1.51.
+
 ## 0.50.45
 
 - Cut idle CPU on installs without a sealed approval store (unstamped installs),

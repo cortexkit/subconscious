@@ -83,7 +83,7 @@ impl InstallLock {
     /// Locks the install root holding `manifest`, waiting up to `wait` for
     /// another installer command to finish. `command` names this one in the
     /// refusal another command would see.
-    pub(super) fn acquire_within(
+    pub(crate) fn acquire_within(
         manifest: &Path,
         command: &str,
         wait: Duration,
@@ -166,7 +166,7 @@ impl Drop for Held {
 /// prepared (pid and time), created exclusively and without following a
 /// link, then renames it over the holder path. The rename replaces whatever
 /// entry is there, a link included, rather than writing through it.
-fn write_holder(holder: &Path, text: &str) -> Result<(), String> {
+pub(crate) fn write_holder(holder: &Path, text: &str) -> Result<(), String> {
     #[cfg(unix)]
     {
         super::file_modes::write_atomic(holder, text.as_bytes(), 0o600, 0o600, "holder.tmp")
@@ -223,7 +223,7 @@ fn is_reparse_point(metadata: &fs::Metadata) -> bool {
 /// Opens (creating if needed) the lock file, refusing anything but a regular
 /// file this account owns: a link there could point the lock, and with it
 /// the installer, at a file that is not the installer's.
-fn open_lock_file(path: &Path) -> Result<File, String> {
+pub(crate) fn open_lock_file(path: &Path) -> Result<File, String> {
     let refuse = |what: &str| {
         format!(
             "refusal: install lock {} is {what}; remove it and run the command again",
@@ -274,7 +274,7 @@ fn open_lock_file(path: &Path) -> Result<File, String> {
 }
 
 /// The text of `path` when it is a regular file, never following a link.
-fn read_regular(path: &Path) -> Option<String> {
+pub(crate) fn read_regular(path: &Path) -> Option<String> {
     fs::symlink_metadata(path)
         .ok()
         .filter(|metadata| metadata.is_file())

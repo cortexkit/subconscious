@@ -3,7 +3,8 @@
 `ckni` is the non-interactive name of the `ck` executable. Use it for the
 versioned JSON contract below. `ck --json <command>` retains its original
 piped JSON bytes and shapes, even on a terminal: no ANSI, progress, or implicit
-wait for a module to become healthy. An action returns its acknowledgement.
+wait for a module to become healthy. A module action returns its acknowledgement.
+Stack stop/start and window revert wait for completion instead.
 Place `--json` before the command (built-ins also accept it in their tail).
 
 ## Plain output coverage
@@ -16,9 +17,14 @@ Every other built-in prints piped `ck` plain text: `health <module>`, `module
 status`, `module logs`, `module stderr`, `module terminals`, `module rescan`,
 `module release`, `module restart` (including `--swap`), `module stop`, `module
 start`, `routes`, `catalog`, `provenance`, `daemon`, `daemon triage`, `daemon
-lint`, `machine show`, `machine adopt`, `quota`, `setup`, `upgrade`, help and
-version. These are not covered by the three-table formatting guarantees.
-ckni never prompts; setup refuses with a usage error where ck would ask.
+lint`, `machine show`, `machine adopt`, `quota`, `setup`, `upgrade`, `stack`
+and `window` commands, help and version. These are not covered by the
+three-table formatting guarantees.
+ckni never asks on the terminal; setup refuses with a usage error where ck
+would ask. Under both names, `stack stop`, `stack start`, `window keep`,
+`window abandon` and `window revert` ask the person through the system approval
+dialog, including with `--json`, and exit 2 if approval is declined or cannot
+be obtained.
 
 ## JSON conventions and exceptions
 
@@ -43,6 +49,7 @@ query was being printed.
 The following commands have no JSON form and are refused before execution,
 with exit 2 and `ckni: usage: <command> has no JSON form` on stderr (followed
 by the help next step). Bare `ckni --json` is help and is refused too.
+The four `window` commands in this table are also refused under `ck --json`.
 
 | Command | JSON classification |
 | --- | --- |
@@ -50,6 +57,10 @@ by the help next step). Bare `ckni --json` is help and is refused too.
 | `upgrade` | no JSON form |
 | `daemon lint` | no JSON form |
 | `module check-script` | no JSON form |
+| `window begin` | no JSON form |
+| `window current` | no JSON form |
+| `window record` | no JSON form |
+| `window done` | no JSON form |
 | `help` | no JSON form |
 | `version` | no JSON form |
 
@@ -66,6 +77,11 @@ The following outputs are exceptions to the versioned JSON forms:
   applied, state, daemon, module}`. `daemon` is the responding connection-file
   path and `module` is its roster record (or `{}` when absent). Acknowledged
   restart/start/stop is not a promise of eventual healthy/stopped state.
+
+`stack stop`, `stack start` and `window revert` are exceptions to the rule
+against implicit waits, not exceptions to schema versioning. Both executable
+names return a versioned completion report, not an acknowledgement. Their
+process exit code is the report's `exit`, including when nonzero.
 
 **External faces (`ck-<domain>` executables) are not covered by these guarantees.**
 Both names pass through their output, ANSI, JSON, stderr and exit status
@@ -314,8 +330,79 @@ identity/status and freshness/collection diagnostics exactly as reported.
 transformations; the JSON retains all accounts and identity fields. The
 provider argument validates a provider id but does not filter this raw payload.
 
+### `ck.stack.status/v1`
+
+`stack status [--timeout <secs>]`: `{schema, source:"daemon"|"manager+roster",
+manager:"loaded"|"running"|"not_loaded"|"unknown",
+stopped_marker:"absent"|"present"|"stale"|"unknown", daemon_pid:number|null,
+daemon_start_time:number|null, daemon_version:string, roster_error:RosterError|null,
+manager_error:string|null, modules:[{name:string,
+state:"running"|"stopped"|"indeterminate", health:"healthy"|"unhealthy"|"unknown",
+detail:string|null}]}`. The timeout bounds the daemon wait (default 2 seconds).
+When offline, the report uses the service manager and the roster; daemon version
+and module health are `"unknown"`. Exit 0 means a report was rendered, not that
+the daemon, manager or roster was readable; exit 2 means no report could be
+rendered.
+
+### `ck.stack.result/v1`
+
+`stack stop [--timeout <secs>]` and `stack start [--timeout <secs>]`:
+`{schema, ...Completion, degraded:[{name:string, detail:string|null}]}`.
+Stop waits for the daemon and roster processes to go away (default 70 seconds).
+Start waits for the daemon and classifies the expected modules (default 120
+seconds). Exit 2 is a refusal; a start refusal may still remove a stale stopped
+marker, reported in `marker_removed`. Exit 1 is a failure such as a survivor, an
+unreachable daemon after starting, or an unhealthy module. Start lists modules
+that were not health-checked at the deadline without failing on their account.
+
+### `ck.window.list/v1`
+
+`window list`: `{schema, windows:[WindowSummary]}`. The 20 newest windows are
+listed newest first. A summary has `{id:string, note:string|null,
+state:"open"|"interrupted"|"reverting"|"revert-interrupted"|"unreadable"|"kept"|"abandoned"|"reverted",
+step_count:number, disk_bytes:number|null, stopped_at:StepPosition|null,
+busy:StepPosition|null, cleanup_pending:boolean, error:string|null,
+revert_status?:"reverted"|"stopped_part_way"}`. A `StepPosition` is
+`{index:number, total:number}` with a one-based index. `revert_status` appears
+only for reverted and revert-interrupted windows, respectively. A refused
+revert writes no state and does not add a `revert_status`.
+
+### `ck.window.result/v1`
+
+`window keep [<id>]`, `window abandon <id>` and `window revert [<id>]`:
+`{schema, ...Completion, window:string|null, outstanding:[{index:number,
+kind:string, target:string}], warnings:[string]}`. `outstanding` lists steps
+without a durable undo mark, by one-based index. Keep and abandon exit 0 on
+success, 2 on refusal, or 1 on failure after a change began.
+
+Revert also reports `outcome:"reverted"|"refused_before_change"|"stopped_part_way"`
+and `degraded:[{name:string, detail:string|null}]`. When a window was resolved,
+`steps_total:number` counts all recorded steps and `steps_undone:number` counts
+their durable undo marks, including marks from earlier attempts. Both counts
+are omitted when no window was resolved. Read `outcome`, not the message:
+
+| `outcome` | Exit | Meaning |
+| --- | --- | --- |
+| `reverted` | 0 | The window was marked reverted; unhealthy or unchecked modules are reported but do not fail the revert. |
+| `refused_before_change` | 2 | No stack stop, target change or journal append was performed by this attempt. |
+| `stopped_part_way` | 1 | Revert started but did not finish; rerunning it resumes the interrupted revert. |
+
 ## Shared nested records
 
+- **Completion**: `exit:number`, `survivors:[Survivor]`, `unhealthy:[string]`,
+  `not_health_checked:[string]`, `restored:[string]`, `marker_removed:boolean`,
+  `daemon_unreachable:boolean`, `daemon_past_bound:boolean`,
+  `relaunched_pid:number|null`, `manager_error:string|null`,
+  `roster_error:RosterError|null`, `message:string|null`. All these keys are
+  present; inapplicable arrays are empty, flags false and nullable values null.
+- **Survivor**: `{name:string, pid:number, start_time:number|null,
+  executable:object|null, state:"alive"|"indeterminate",
+  reason:"identity_unreadable"|"executable_changed"|"container_unproven"|null}`.
+  `executable` is the recorded platform file identity when known. `reason` is
+  null for `alive`.
+- **RosterError**: `{kind:"unreadable"|"malformed"|"unknown_version",
+  version:number|null, message:string}`. Only `unknown_version` carries a
+  version.
 - **Module**: required `module_id:string`, `state:string`,
   `enabled:boolean`, `live:boolean`, `protocol:"subc"|"none"`, `health:string`,
   and nullable `last_probe_ms:number|null`. Optional fields include
@@ -438,3 +525,6 @@ other failures. A decoded refusal preserves its code, such as
 `fed_not_authorized`; reports that already rendered their error get no extra
 line. External faces retain their own exit codes. `ck --json` output keeps its
 existing bytes and shapes, including when run on a terminal.
+`window current` also exits 3 with no output when no window is open and no
+non-terminal window needs attention. A nonzero completion report is still a
+JSON report on stdout, not an error envelope.

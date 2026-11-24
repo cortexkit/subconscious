@@ -8,8 +8,8 @@ mod daemon_bundle;
 mod definition;
 mod detection;
 mod file_modes;
-mod install_journal;
-mod install_lock;
+pub(crate) mod install_journal;
+pub(crate) mod install_lock;
 mod messages;
 pub use install_lock::InstallHold;
 mod inventory;
@@ -21,8 +21,8 @@ mod planner;
 mod prompt;
 mod release_index;
 mod retained_binary;
-mod runtime;
-mod systemd_unit;
+pub(crate) mod runtime;
+pub(crate) mod systemd_unit;
 #[cfg(all(test, unix))]
 mod test_exec;
 pub mod text;
@@ -37,6 +37,7 @@ mod validation;
 pub mod wizard;
 
 pub use apply::data_directory;
+pub(crate) use apply::user_home;
 pub use apply::{
     default_claustrum_key_path, installed_service_facts, start_installed_service, SetupBackend,
 };

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.51
+
+- On Windows, verify that a placement file or directory is owned by the current
+  user without following its final component or requiring a private access control list.
+
 ## 0.1.50
 
 - Create owner-only directories exclusively without changing existing paths. On

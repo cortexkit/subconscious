@@ -77,6 +77,10 @@ pub use control::{
     DEFAULT_ROUTE_BIND_RELAY_TIMEOUT,
 };
 pub use identity::{IdentityError, ProjectRootId, RequestIdentity, SessionId};
+pub use live_children::{
+    read_live_children_roster, ContainerIdentity, ExecutableIdentity, LiveChild,
+    LiveChildrenRoster, RecordReadError, RetainedReason,
+};
 pub use observability::{ConnectedClients, DaemonCounters};
 pub use registry::{ChannelState, ConnectionId, ModuleRegistration, Registry, RegistryError};
 pub use router::{

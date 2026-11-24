@@ -321,7 +321,7 @@ fn bare_json_prints_the_one_top_help() {
     assert_exit(&output, 0);
     assert_eq!(
         text(&output.stdout),
-        "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  setup     plan and apply the managed CortexKit installation\n  upgrade   plan managed component upgrades\n  config    status, plan, apply, stamp, unstamp, history, rollback, place-program\n  module    supervised modules: list, status, resources, profile, stderr, terminals, restart, stop, start, rescan, release\n  catalog   what is registered on the wire (not the supervised roster)\n  routes    live consumers for one module or the whole daemon\n  provenance daemon-attested and module-declared build/process facts\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, connection info, offline triage, and CI lint\n  machine   this machine's id: show it, or adopt a restored one\n  activity  consequential agent and module events\n\nflags:\n  --subc <file>   use a specific connection file (default: auto-discover)\n  --json          raw JSON output instead of tables\n  --verbose       include diagnostic detail and complete metrics\n\nrun 'ck <domain>' with no verb to see that domain's commands\n"
+        "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  setup     plan and apply the managed CortexKit installation\n  upgrade   plan managed component upgrades\n  config    status, plan, apply, stamp, unstamp, history, rollback, place-program\n  module    supervised modules: list, status, resources, profile, stderr, terminals, restart, stop, start, rescan, release\n  catalog   what is registered on the wire (not the supervised roster)\n  routes    live consumers for one module or the whole daemon\n  provenance daemon-attested and module-declared build/process facts\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, connection info, offline triage, and CI lint\n  machine   this machine's id: show it, or adopt a restored one\n  activity  consequential agent and module events\n  stack     stop, start, and check the stack\n  window    record, keep, revert, or abandon placement changes\n\nflags:\n  --subc <file>   use a specific connection file (default: auto-discover)\n  --json          raw JSON output instead of tables\n  --verbose       include diagnostic detail and complete metrics\n\nrun 'ck <domain>' with no verb to see that domain's commands\n"
     );
 }
 
@@ -339,6 +339,183 @@ fn ckni_command(name: &str) -> (TempDir, Command) {
     let mut command = Command::new(&link);
     isolate_ck_command(&mut command);
     (dir, command)
+}
+
+#[test]
+fn stack_window_help_explains_wait_and_recording_without_running_a_command() {
+    for (args, required) in [
+        (
+            &["stack", "stop", "--help"][..],
+            &[
+                "A stop holds until `ck stack start`, logout or reboot.",
+                "Standalone stop tells modules to stop",
+                "default: 70 s",
+            ][..],
+        ),
+        (
+            &["help", "window"][..],
+            &[
+                "ck window current",
+                "ck window keep",
+                "ck window revert",
+                "ck window abandon",
+            ][..],
+        ),
+        (
+            &["window", "record", "--help"][..],
+            &[
+                "--owner-pid",
+                "Record the daemon placement by hand",
+                "format floors did not change",
+            ][..],
+        ),
+    ] {
+        let output = ck_command().args(args).output().unwrap();
+        assert_exit(&output, 0);
+        assert!(output.stderr.is_empty());
+        let stdout = text(&output.stdout);
+        for fragment in required {
+            assert!(
+                stdout.contains(fragment),
+                "missing {fragment:?} in {stdout}"
+            );
+        }
+    }
+}
+
+#[test]
+fn stack_window_json_refuses_unsupported_forms_before_execution() {
+    let name = if cfg!(windows) { "ckni.exe" } else { "ckni" };
+    for (verb, args) in [
+        ("begin", &["begin"][..]),
+        ("current", &["current"][..]),
+        (
+            "record",
+            &[
+                "record",
+                "file",
+                "--window",
+                "20261123-010203-abcd",
+                "--owner-pid",
+                "1",
+                "--target",
+                "target",
+                "--remove",
+            ][..],
+        ),
+        (
+            "done",
+            &[
+                "done",
+                "--window",
+                "20261123-010203-abcd",
+                "1",
+                "--owner-pid",
+                "1",
+            ][..],
+        ),
+    ] {
+        let (_link, ckni) = ckni_command(name);
+        for mut command in [ck_command(), ckni] {
+            let output = command
+                .arg("window")
+                .args(args)
+                .arg("--json")
+                .output()
+                .unwrap();
+            assert_exit(&output, 2);
+            assert!(output.stdout.is_empty());
+            assert!(text(&output.stderr).contains(&format!("window {verb} has no JSON form")));
+        }
+    }
+}
+
+#[test]
+fn stack_window_json_completion_reports_preserve_the_refusal_exit_code() {
+    let data = TempDir::new("ck-stack-window-missing-install");
+    let missing = data.join("missing");
+    let name = if cfg!(windows) { "ckni.exe" } else { "ckni" };
+    for (args, schema) in [
+        (&["stack", "stop"][..], "ck.stack.result/v1"),
+        (
+            &["stack", "start", "--timeout", "1"][..],
+            "ck.stack.result/v1",
+        ),
+        (&["window", "keep"][..], "ck.window.result/v1"),
+        (
+            &["window", "abandon", "20261123-010203-abcd"][..],
+            "ck.window.result/v1",
+        ),
+        (&["window", "revert"][..], "ck.window.result/v1"),
+    ] {
+        let (_link, ckni) = ckni_command(name);
+        for mut command in [ck_command(), ckni] {
+            let output = command
+                .arg("--json")
+                .args(args)
+                .env("XDG_DATA_HOME", &missing)
+                .env("LOCALAPPDATA", &missing)
+                .env_remove("HOME")
+                .env_remove("USERPROFILE")
+                .output()
+                .unwrap();
+            assert_exit(&output, 2);
+            assert!(output.stderr.is_empty());
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report["schema"], schema);
+            assert_eq!(report["exit"], 2);
+            for key in ["survivors", "unhealthy", "not_health_checked", "restored"] {
+                assert_eq!(report[key], json!([]), "{args:?}: {key}");
+            }
+            for key in ["marker_removed", "daemon_unreachable", "daemon_past_bound"] {
+                assert_eq!(report[key], false, "{args:?}: {key}");
+            }
+            for key in ["relaunched_pid", "manager_error", "roster_error"] {
+                assert_eq!(report.get(key), Some(&Value::Null), "{args:?}: {key}");
+            }
+            if args[0] == "window" {
+                assert_eq!(report.get("window"), Some(&Value::Null));
+                assert_eq!(report["outstanding"], json!([]));
+            }
+            if args[1] == "revert" {
+                assert_eq!(report["outcome"], "refused_before_change");
+                assert!(report.get("steps_total").is_none());
+                assert!(report.get("steps_undone").is_none());
+            }
+        }
+    }
+}
+
+#[test]
+fn stack_window_current_and_list_work_with_no_daemon() {
+    let data = TempDir::new("ck-window-empty-install");
+    fs::create_dir(data.join("cortexkit")).unwrap();
+    let missing = data.join("no-daemon.json");
+    let name = if cfg!(windows) { "ckni.exe" } else { "ckni" };
+    for (args, expected_exit) in [
+        (&["window", "current"][..], 3),
+        (&["window", "list", "--json"][..], 0),
+    ] {
+        let (_link, ckni) = ckni_command(name);
+        for mut command in [ck_command(), ckni] {
+            let output = command
+                .args(args)
+                .arg("--subc")
+                .arg(&missing)
+                .env("XDG_DATA_HOME", data.path())
+                .env("LOCALAPPDATA", data.path())
+                .output()
+                .unwrap();
+            assert_exit(&output, expected_exit);
+            assert!(output.stderr.is_empty());
+            if expected_exit == 3 {
+                assert!(output.stdout.is_empty());
+            } else {
+                let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(report, json!({"schema":"ck.window.list/v1","windows":[]}));
+            }
+        }
+    }
 }
 
 #[test]
@@ -945,7 +1122,9 @@ fn hidden_cli_face_reserved_names_list_every_builtin_domain() {
             "quota",
             "routes",
             "setup",
+            "stack",
             "upgrade",
+            "window",
         ]
     );
     assert!(output.stderr.is_empty());

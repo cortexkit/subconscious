@@ -284,7 +284,7 @@ fn desired_definition(platform: RuntimePlatform, paths: &RuntimePaths) -> String
 
 // Setup resolves the Windows account first so a missing account is a setup
 // error with a message rather than a panic.
-pub(super) fn desired_definition_checked(
+pub(crate) fn desired_definition_checked(
     platform: RuntimePlatform,
     paths: &RuntimePaths,
 ) -> Result<String, String> {
@@ -1113,7 +1113,7 @@ fn windows_create_arguments(paths: &RuntimePaths, task_name: &str) -> Vec<String
     ]
 }
 
-pub(super) fn register<R: CommandRunner>(
+pub(crate) fn register<R: CommandRunner>(
     platform: RuntimePlatform,
     paths: &RuntimePaths,
     runner: &mut R,
@@ -1270,7 +1270,7 @@ pub fn start_installed<R: CommandRunner>(
     start(platform, paths, runner)
 }
 
-fn start<R: CommandRunner>(
+pub(crate) fn start<R: CommandRunner>(
     platform: RuntimePlatform,
     _paths: &RuntimePaths,
     runner: &mut R,
@@ -1441,12 +1441,12 @@ fn restart_commands(platform: RuntimePlatform, definition: &Path) -> Vec<(String
 /// bootstrapped every macOS user's agent into root's domain
 /// (`Bootstrap failed: 125: Domain does not support specified action`).
 #[cfg(unix)]
-pub(super) fn current_uid() -> u32 {
+pub(crate) fn current_uid() -> u32 {
     rustix::process::getuid().as_raw()
 }
 
 #[cfg(not(unix))]
-pub(super) fn current_uid() -> u32 {
+pub(crate) fn current_uid() -> u32 {
     0
 }
 

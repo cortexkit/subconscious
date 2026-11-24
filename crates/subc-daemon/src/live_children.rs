@@ -56,9 +56,11 @@ const RECORD_VERSION: u32 = 2;
 /// For that image only, the identity also records the selected shell, read at
 /// launch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ExecutableIdentity {
-    pub(crate) device: u64,
-    pub(crate) inode: u64,
+pub struct ExecutableIdentity {
+    /// Device number on Unix; zero for a Windows file identity.
+    pub device: u64,
+    /// Inode number on Unix; zero for a Windows file identity.
+    pub inode: u64,
     /// The selected shell for a `/bin/sh` image, read when the child was
     /// recorded; the orphan check never looks it up again, so a selection
     /// changed after a crash cannot make an unrelated process match. Absent on
@@ -156,15 +158,15 @@ impl ExecutableIdentity {
 
 /// A container entry outlives its original leader and every launch generation.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ContainerIdentity {
-    pub(crate) pgid: Option<u32>,
-    pub(crate) created_start_time: Option<u64>,
+pub struct ContainerIdentity {
+    pub pgid: Option<u32>,
+    pub created_start_time: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) boot_id: Option<String>,
+    pub boot_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) session_id: Option<u32>,
+    pub session_id: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) cgroup_path: Option<PathBuf>,
+    pub cgroup_path: Option<PathBuf>,
 }
 
 #[cfg(unix)]
@@ -212,21 +214,21 @@ impl ContainerIdentity {
 
 /// One roster entry as recorded on disk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct LiveChild {
-    pub(crate) module_id: String,
-    pub(crate) pid: u32,
-    pub(crate) protocol: ModuleProtocol,
+pub struct LiveChild {
+    pub module_id: String,
+    pub pid: u32,
+    pub protocol: ModuleProtocol,
     /// `subc_os::start_time` read right after spawn. `None` where the platform
     /// has no source, and then the entry is never signalled.
-    pub(crate) start_time: Option<u64>,
+    pub start_time: Option<u64>,
     /// The running image's device and inode, read after exec at spawn. This
     /// includes PATH resolution and a script's interpreter. `None` if the image
     /// could not be read, and then the entry is never signalled.
-    pub(crate) executable: Option<ExecutableIdentity>,
+    pub executable: Option<ExecutableIdentity>,
     /// The child's cgroup directory name, when it was placed in one (Linux).
-    pub(crate) cgroup_name: Option<String>,
+    pub cgroup_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) container: Option<ContainerIdentity>,
+    pub container: Option<ContainerIdentity>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -259,9 +261,12 @@ pub(crate) fn write_record_with_reasons(
 
 /// Why a record could not be used.
 #[derive(Debug)]
-pub(crate) enum RecordReadError {
+pub enum RecordReadError {
+    /// The file could not be read for a reason other than being absent.
     Io(io::Error),
+    /// The contents could not be decoded as a roster record.
     Malformed(serde_json::Error),
+    /// The record decoded, but its version is not supported.
     UnknownVersion(u32),
 }
 
@@ -278,6 +283,56 @@ impl std::fmt::Display for RecordReadError {
             }
         }
     }
+}
+
+impl std::error::Error for RecordReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::Malformed(error) => Some(error),
+            Self::UnknownVersion(_) => None,
+        }
+    }
+}
+
+/// A snapshot of a decoded `live-children.json` record, not a liveness check.
+#[derive(Debug)]
+pub struct LiveChildrenRoster {
+    /// The version recorded on disk.
+    pub version: u32,
+    pub children: Vec<LiveChild>,
+    /// Reasons why entries were retained, keyed by pid.
+    pub retained_reasons: BTreeMap<u32, RetainedReason>,
+}
+
+/// Read the daemon's `live-children.json` at `path` without modifying it.
+///
+/// A missing file returns `Ok(None)`, distinct from a present roster with no
+/// children. Versions 1 and 2 are supported. This reader never sweeps processes
+/// or quarantines the record.
+///
+/// # Errors
+///
+/// Returns [`RecordReadError::Io`] for other read failures,
+/// [`RecordReadError::Malformed`] if the file cannot be decoded, or
+/// [`RecordReadError::UnknownVersion`] if it decodes with an unsupported version.
+pub fn read_live_children_roster(
+    path: &Path,
+) -> Result<Option<LiveChildrenRoster>, RecordReadError> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(RecordReadError::Io(error)),
+    };
+    let record: RecordFile = serde_json::from_slice(&bytes).map_err(RecordReadError::Malformed)?;
+    if !matches!(record.version, 1 | 2) {
+        return Err(RecordReadError::UnknownVersion(record.version));
+    }
+    Ok(Some(LiveChildrenRoster {
+        version: record.version,
+        children: record.children,
+        retained_reasons: record.retained_reasons,
+    }))
 }
 
 /// The children listed at `path`. A missing file is an empty record: the
@@ -653,7 +708,7 @@ pub(crate) enum SweepDecision {
 /// Kept separately from identity evidence so it can never authorize a signal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum RetainedReason {
+pub enum RetainedReason {
     Hidden,
     Unverifiable,
     Survived,
@@ -1226,6 +1281,140 @@ fn log_decision(entry: &LiveChild, decision: &SweepDecision) {
 /// The record's path inside a daemon run directory.
 pub(crate) fn record_path(run_dir: &Path) -> PathBuf {
     run_dir.join(LIVE_CHILDREN_FILE_NAME)
+}
+
+#[cfg(test)]
+mod strict_roster_reader_tests {
+    use super::record_path;
+    use crate::{read_live_children_roster, RecordReadError, RetainedReason};
+    use cortexkit_test_support::ScratchDir;
+    use std::{fs, path::Path};
+
+    #[test]
+    fn reads_v1_without_container_or_retained_metadata() {
+        let dir = ScratchDir::new("strict-roster-v1");
+        let path = record_path(&dir);
+        let bytes = br#"{
+            "version": 1,
+            "children": [{
+                "module_id": "worker", "pid": 41, "protocol": "none",
+                "start_time": 1000, "executable": {"device": 7, "inode": 11},
+                "cgroup_name": "worker-a"
+            }]
+        }"#;
+        fs::write(&path, bytes).unwrap();
+
+        let roster = read_live_children_roster(&path).unwrap().unwrap();
+        assert_eq!(roster.version, 1);
+        let [child] = roster.children.as_slice() else {
+            panic!("expected one roster child");
+        };
+        assert_eq!(child.module_id, "worker");
+        assert_eq!(child.pid, 41);
+        assert_eq!(child.protocol, subc_control::ModuleProtocol::None);
+        assert_eq!(child.start_time, Some(1000));
+        let image = child.executable.unwrap();
+        assert_eq!((image.device, image.inode), (7, 11));
+        assert_eq!(child.cgroup_name.as_deref(), Some("worker-a"));
+        assert!(child.container.is_none());
+        assert!(roster.retained_reasons.is_empty());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(fs::read_dir(&*dir).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn reads_v2_with_container_and_retained_metadata() {
+        let dir = ScratchDir::new("strict-roster-v2");
+        let path = record_path(&dir);
+        let bytes = br#"{
+            "version": 2,
+            "children": [{
+                "module_id": "worker", "pid": 41, "protocol": "subc",
+                "container": {
+                    "pgid": 41, "created_start_time": 1000, "boot_id": "recorded-boot",
+                    "session_id": 40, "cgroup_path": "worker-a"
+                }
+            }],
+            "retained_reasons": {"41": {"container_survivors": [42]}}
+        }"#;
+        fs::write(&path, bytes).unwrap();
+
+        let roster = read_live_children_roster(&path).unwrap().unwrap();
+        assert_eq!(roster.version, 2);
+        let [child] = roster.children.as_slice() else {
+            panic!("expected one roster child");
+        };
+        let container = child.container.as_ref().unwrap();
+        assert_eq!(container.pgid, Some(41));
+        assert_eq!(container.created_start_time, Some(1000));
+        assert_eq!(container.boot_id.as_deref(), Some("recorded-boot"));
+        assert_eq!(container.session_id, Some(40));
+        assert_eq!(
+            container.cgroup_path.as_deref(),
+            Some(Path::new("worker-a"))
+        );
+        assert_eq!(
+            roster.retained_reasons.get(&41),
+            Some(&RetainedReason::ContainerSurvivors(vec![42]))
+        );
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(fs::read_dir(&*dir).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn absent_is_distinct_from_present_and_empty() {
+        let dir = ScratchDir::new("strict-roster-absent");
+        let path = record_path(&dir);
+        assert!(read_live_children_roster(&path).unwrap().is_none());
+        assert_eq!(fs::read_dir(&*dir).unwrap().count(), 0);
+
+        fs::write(&path, br#"{"version":2,"children":[]}"#).unwrap();
+        let roster = read_live_children_roster(&path).unwrap().unwrap();
+        assert_eq!(roster.version, 2);
+        assert!(roster.children.is_empty());
+    }
+
+    #[test]
+    fn reports_io_errors_without_quarantine() {
+        let dir = ScratchDir::new("strict-roster-unreadable");
+        let path = record_path(&dir);
+        // A directory fails a byte read even when the process is privileged.
+        fs::create_dir(&path).unwrap();
+        assert!(matches!(
+            read_live_children_roster(&path),
+            Err(RecordReadError::Io(_))
+        ));
+        assert!(path.is_dir());
+        assert_eq!(fs::read_dir(&*dir).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn reports_malformed_before_unknown_version_without_quarantine() {
+        let dir = ScratchDir::new("strict-roster-invalid");
+        let path = record_path(&dir);
+        for bytes in [
+            &b"{"[..],
+            br#"{"version":2,"children":[{"pid":41}]}"#,
+            br#"{"version":3,"children":null}"#,
+        ] {
+            fs::write(&path, bytes).unwrap();
+            assert!(matches!(
+                read_live_children_roster(&path),
+                Err(RecordReadError::Malformed(_))
+            ));
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert_eq!(fs::read_dir(&*dir).unwrap().count(), 1);
+        }
+
+        let bytes = br#"{"version":3,"children":[]}"#;
+        fs::write(&path, bytes).unwrap();
+        assert!(matches!(
+            read_live_children_roster(&path),
+            Err(RecordReadError::UnknownVersion(3))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(fs::read_dir(&*dir).unwrap().count(), 1);
+    }
 }
 
 #[cfg(test)]

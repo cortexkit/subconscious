@@ -61,6 +61,7 @@ new_sandbox() {
 #!/usr/bin/env bash
 set -euo pipefail
 case "$*" in
+  'window current') exit 3 ;;
   '--ck-cli-face-reserved-names') echo module; exit 0 ;;
   'module status demo') exit 0 ;;
   '--json config status') echo '{"status":{"state":"unstamped","development_switches":[]}}' ;;

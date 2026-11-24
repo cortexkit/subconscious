@@ -70,6 +70,7 @@ if [ "${1:-}" = "--ck-cli-face-reserved-names" ]; then
   exit 0
 fi
 if [ "${1:-}" = module ] && [ "${2:-}" = status ]; then exit 0; fi
+if [ "$*" = 'window current' ]; then exit 3; fi
 if [ "$*" = '--json config status' ]; then
   case "${CK_CONFIG_STATE:-unstamped}" in
     older) printf 'unknown_control_op — config.status\n' >&2; exit 1 ;;
@@ -336,15 +337,15 @@ functions=[]
 for name in ("config_gate_preflight", "probe_cli_faces", "record_program_placement"):
     body=source.split(name+"() {\n",1)[1].split("\n}\n",1)[0]
     functions.append(name+"() {\n"+body+"\n}\n")
-tail=source.split('say "=== place"\ncp "$STAGED"',1)[1]
-tail='say "=== place"\ncp "$STAGED"'+tail.split('\nif [ "$RESTART" -eq 1 ]; then',1)[0]
+tail=source.split('\nfind_staged_map() {\n',1)[1]
+tail='find_staged_map() {\n'+tail.split('\nif [ "$RESTART" -eq 1 ]; then',1)[0]
 pathlib.Path(sys.argv[2]).write_text('set -euo pipefail\nsay() { printf "%s\\n" "$*"; }\nrefuse() { say "REFUSED: $*"; exit 2; }\nreconcile_cli_faces() { :; }\n'+''.join(functions)+'config_gate_preflight\n'+tail)
 PY
     if [ "$install" -eq 1 ]; then rm "$DEST"; fi
     output=$(CK_CONFIG_STATE=stamped CK_CONFIG_SWITCHES='["dev-placement"]' \
       CK_CALLS="$CASE_DIR/ck-calls" PATH="$STUBS:$PATH" INSTALL="$install" \
       MODULE=demo DEST="$DEST" STAGED="$STAGING/staged" STAGING="$STAGING" \
-      MIGRATES='' PATH_FACE='' bash "$CASE_DIR/tail.sh" 2>&1) \
+      MIGRATES='' PATH_FACE='' WINDOW='' bash "$CASE_DIR/tail.sh" 2>&1) \
       || fail "forward placement failed: $output"
     assert_contains "$output" 'equals staged'
     if [ "$install" -eq 1 ]; then

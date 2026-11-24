@@ -227,6 +227,62 @@ else
   fi
 fi
 
+say() { printf '%s\n' "$*"; }
+# After a terminal stop the module stays down until something starts it, so
+# every later refusal says so rather than leaving a stopped module unexplained.
+TERMINAL_STOPPED=0
+refuse() {
+  printf 'REFUSED: %s\n' "$*" >&2
+  if [ "$TERMINAL_STOPPED" -eq 1 ]; then
+    printf 'NOTE: %s is stopped (terminal placement); start it with: ck module start %s\n' "$MODULE" "$MODULE" >&2
+  fi
+  exit 2
+}
+
+WINDOW=""
+WINDOW_STEPS=""
+WINDOW_STEP=""
+if [ "$PLACE" -eq 1 ]; then
+  command -v ck >/dev/null || refuse "ck is required to check for an open window"
+  if WINDOW=$(ck window current); then
+    [[ "$WINDOW" =~ ^[0-9]{8}-[0-9]{6}-[0-9a-fA-F]{4}$ ]] \
+      || refuse "ck window current did not return a window id"
+    [ "$INSTALL" -eq 0 ] || refuse "--install is not supported in window $WINDOW"
+    [ -z "$ROLLBACK" ] || refuse "--rollback is not supported in window $WINDOW; use ck window revert to undo the window"
+  else
+    window_status=$?
+    [ "$window_status" -eq 3 ] || refuse "ck window current failed (exit $window_status)"
+    WINDOW=""
+  fi
+fi
+
+window_record() {
+  local kind="$1"
+  shift
+  if ! WINDOW_STEP=$(ck window record "$kind" --window "$WINDOW" --owner-pid "$$" --module "$MODULE" "$@") \
+    || ! [[ "$WINDOW_STEP" =~ ^[1-9][0-9]*$ ]]; then
+    refuse "could not record $kind in window $WINDOW (steps recorded: ${WINDOW_STEPS:-none})"
+  fi
+  WINDOW_STEPS="${WINDOW_STEPS:+$WINDOW_STEPS, }$WINDOW_STEP"
+}
+
+window_done() {
+  if ! ck window 'done' "$WINDOW_STEP" --window "$WINDOW" --owner-pid "$$" >/dev/null; then
+    printf 'FAILED: could not mark window %s step %s done\n' "$WINDOW" "$WINDOW_STEP" >&2
+    exit 1
+  fi
+}
+
+clean_window_scratch() {
+  local rc=$?
+  rm -rf -- "$window_scratch"
+  if [ "$rc" -eq 0 ] && [ "${finished:-}" != 1 ]; then
+    printf 'FAILED: placement in window %s exited before finishing\n' "$WINDOW" >&2
+    rc=1
+  fi
+  exit "$rc"
+}
+
 # `--marker none` IS FOR A CHANGE THAT ADDS NO STRING, and it is honest rather
 # than a bypass. A deletion-only fix, a removed call, a private fn that inlines
 # away, or a type-level refactor leaves every literal identical: `strings` is
@@ -281,18 +337,6 @@ else
   fi
 fi
 
-say() { printf '%s\n' "$*"; }
-# After a terminal stop the module stays down until something starts it, so
-# every later refusal says so rather than leaving a stopped module unexplained.
-TERMINAL_STOPPED=0
-refuse() {
-  printf 'REFUSED: %s\n' "$*" >&2
-  if [ "$TERMINAL_STOPPED" -eq 1 ]; then
-    printf 'NOTE: %s is stopped (terminal placement); start it with: ck module start %s\n' "$MODULE" "$MODULE" >&2
-  fi
-  exit 2
-}
-
 # A release daemon cannot admit replaced bytes through the development bypass.
 # Check before mutation, including --no-restart and rollback placements.
 config_gate_preflight() {
@@ -323,6 +367,9 @@ if state not in ("stamped", "unstamped"): raise SystemExit("config gate is in re
 print(state + " " + ("yes" if "dev-placement" in s["development_switches"] else "no"))
 ') || refuse "cannot verify config gate placement authority; nothing placed"
   CONFIG_GATE_STATE=${gate_flags% *}
+  if [ "$CONFIG_GATE_STATE" = stamped ] && [ -n "$WINDOW" ]; then
+    refuse "module placement on a stamped install is not supported in window $WINDOW"
+  fi
   if [ "$CONFIG_GATE_STATE" = stamped ] && [ "$INSTALL" -eq 0 ] && [ "${gate_flags##* }" != yes ]; then
     refuse "stamped daemon has no dev-placement; replace programs through 'ck config plan' and 'ck config apply', not this placement"
   fi
@@ -1551,9 +1598,35 @@ if [ "$PLACE" != "1" ]; then
 fi
 
 config_gate_preflight
-if [ "$TERMINAL" -eq 1 ]; then terminal_stop; fi
+if [ -n "$WINDOW" ]; then
+  if [ "${#FACE_CREATE_NAMES[@]}" -gt 0 ] || [ "${#FACE_REMOVE_PATHS[@]}" -gt 0 ]; then
+    refuse "creating or removing CLI faces is not supported in window $WINDOW"
+  fi
+elif [ "$TERMINAL" -eq 1 ]; then
+  terminal_stop
+fi
 
-if [ "$INSTALL" -eq 1 ]; then
+if [ -n "$WINDOW" ]; then
+  if [ -n "$MIGRATES" ]; then
+    [ -f "$MIGRATES" ] || refuse "--migrates named $MIGRATES, which is not a file; nothing has been placed"
+    mkdir -p "$STAGING"
+    window_scratch=$(mktemp -d "$STAGING/.window-placement.XXXXXX") \
+      || refuse "could not create a staging directory for window $WINDOW"
+    finished=
+    trap clean_window_scratch EXIT
+    window_snapshot="$window_scratch/snapshot.db"
+    snapshot_out=$("$(dirname "$0")/snapshot-store.sh" "$MIGRATES" "$window_snapshot" 2>&1) \
+      || refuse "store snapshot failed for $MIGRATES in window $WINDOW: $snapshot_out"
+    say "$snapshot_out"
+    window_record store --store "$MIGRATES" --snapshot "$window_snapshot"
+    window_done
+    say "store snapshot is held by window $WINDOW"
+  fi
+  window_record file --target "$DEST" --new "$STAGED" --role binary
+  # Leave the binary step unfinished across the stop. That blocks a revert
+  # while the module is stopped but its new binary has not been placed.
+  if [ "$TERMINAL" -eq 1 ]; then terminal_stop; fi
+elif [ "$INSTALL" -eq 1 ]; then
   say "=== rollback"
   say "first install: no previous binary; rolling back means removing $DEST and the module's subc.jsonc entry"
 else
@@ -1622,21 +1695,45 @@ if [ -n "$MIGRATES" ]; then
 fi
 fi
 
-say "=== place"
-cp "$STAGED" "$DEST.tmp" && mv "$DEST.tmp" "$DEST"
 # The live binary's map travels with it, so the next rollback snapshot can carry
 # it. A map left over from the previous binary would describe the wrong build,
 # so it is removed when the new card has none.
-staged_map=""
-for m in "$STAGED.format-versions.json" \
-         "$(dirname "$STAGED")/$(basename "$STAGED" | sed 's/^SIGNED\.//').format-versions.json"; do
-  if [ -f "$m" ]; then staged_map="$m"; break; fi
-done
-if [ -n "$staged_map" ]; then
-  cp "$staged_map" "$DEST.format-versions.json.tmp" && mv "$DEST.format-versions.json.tmp" "$DEST.format-versions.json"
-else
-  rm -f "$DEST.format-versions.json"
+find_staged_map() {
+  local m
+  staged_map=""
+  for m in "$STAGED.format-versions.json" \
+           "$(dirname "$STAGED")/$(basename "$STAGED" | sed 's/^SIGNED\.//').format-versions.json"; do
+    if [ -f "$m" ]; then staged_map="$m"; break; fi
+  done
+}
+
+live_map="$DEST.format-versions.json"
+map_step=0
+if [ -n "$WINDOW" ]; then
+  find_staged_map
+  if [ -n "$staged_map" ] || [ -e "$live_map" ] || [ -L "$live_map" ]; then map_step=1; fi
 fi
+say "=== place"
+cp "$STAGED" "$DEST.tmp" && mv "$DEST.tmp" "$DEST"
+if [ -z "$WINDOW" ]; then
+  find_staged_map
+elif [ "$map_step" -eq 1 ] || [ "$RESTART" -eq 0 ]; then
+  window_done
+fi
+
+if [ "$map_step" -eq 1 ]; then
+  if [ -n "$staged_map" ]; then
+    window_record file --target "$live_map" --new "$staged_map" --role format-map
+  else
+    window_record file --target "$live_map" --remove --role format-map
+  fi
+fi
+if [ -n "$staged_map" ]; then
+  cp "$staged_map" "$live_map.tmp" && mv "$live_map.tmp" "$live_map"
+elif [ -z "$WINDOW" ] || [ "$map_step" -eq 1 ]; then
+  rm -f "$live_map"
+fi
+if [ "$map_step" -eq 1 ] && [ "$RESTART" -eq 0 ]; then window_done; fi
 # THE PLACED BYTES MUST EQUAL THE STAGED BYTES, and this printed a sha without
 # comparing it until 2026-09-18. Found by grepping this file for the shape of
 # the rollback defect fixed forty lines up rather than by anything failing --
@@ -1663,11 +1760,13 @@ reconcile_cli_faces
 # Rollback retention: the newest three per binary (and per module store) are
 # kept, which always includes the one taken above. Without it every placement
 # left a full copy behind for good; staging had grown to 16 GB of them.
-prune="$(dirname "$0")/prune-rollbacks.sh"
-prune_names=("$(basename "$DEST")")
-[ -n "$MIGRATES" ] && prune_names+=("$MODULE.$(basename "$MIGRATES")")
-if ! CK_STAGING="$STAGING" "$prune" --keep 3 --apply "${prune_names[@]}"; then # nonempty-array: seeded with destination basename
-  say "WARNING: rollback prune failed; the placement itself succeeded and older rollbacks were kept"
+if [ -z "$WINDOW" ]; then
+  prune="$(dirname "$0")/prune-rollbacks.sh"
+  prune_names=("$(basename "$DEST")")
+  [ -n "$MIGRATES" ] && prune_names+=("$MODULE.$(basename "$MIGRATES")")
+  if ! CK_STAGING="$STAGING" "$prune" --keep 3 --apply "${prune_names[@]}"; then # nonempty-array: seeded with destination basename
+    say "WARNING: rollback prune failed; the placement itself succeeded and older rollbacks were kept"
+  fi
 fi
 
 # PATH face: the operator may invoke this by name, and that resolution is what decides
@@ -1728,6 +1827,7 @@ if [ "$RESTART" -eq 1 ]; then
       refuse "restart of '$MODULE' failed after placement; the new bytes are on disk but the module still runs the old inode: ${restart_out}"
     fi
   fi
+  if [ -n "$WINDOW" ]; then window_done; fi
   printf '%s\n' "$restart_out" | tail -1
     say "$(date -u +%FT%TZ) $restart_verb initiated -- verify on a lane opened AFTER this point:"
     # THE PID COMES FROM PROVENANCE, NOT FROM `pgrep` AND NOT FROM `module status`.
@@ -1775,7 +1875,7 @@ if [ "$RESTART" -eq 1 ]; then
   # migrations table, no shape change) doesn't show here, so "unchanged" is
   # evidence for a binary-only rollback, not proof; the owner's migration
   # chains decide. Reads only; a failed read never blocks.
-  if [ -n "${store_rb:-}" ] && [ -s "${store_rb:-}" ]; then
+  if [ -z "$WINDOW" ] && [ -n "${store_rb:-}" ] && [ -s "${store_rb:-}" ]; then
     if s_before=$(sqlite3 "file:$store_rb?immutable=1" '.schema' 'PRAGMA user_version;' 2>/dev/null) \
       && s_after=$(sqlite3 "file:$MIGRATES?mode=ro" '.schema' 'PRAGMA user_version;' 2>/dev/null); then
       if [ "$s_before" = "$s_after" ]; then
@@ -1788,3 +1888,4 @@ if [ "$RESTART" -eq 1 ]; then
     fi
   fi
 fi
+finished=1

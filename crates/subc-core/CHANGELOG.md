@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.21.43
+
+- Add the stack stop, start and status implementation for the `ck` dispatcher,
+  including manager observation, presence approval and read-only process checks
+  using subc-daemon 0.50.46's reader for the daemon's persisted child-process roster.
+- Report running degraded modules and their notes without failing the stack start.
+- Add durable placement windows with separate journals, recorded owners and saved copies.
+- Take ownership of store snapshots by rename when the window is on the same filesystem.
+- Revert placement windows explicitly, preserving displaced bundles and store data
+  and resuming interrupted restores before restarting the stack.
+- Add the built-in `ck stack` and `ck window` commands and document their JSON
+  completion and status reports for `ck` and `ckni`.
+
 ## 0.21.42
 
 - Require subc-daemon 0.50.45 to avoid redundant project settings validation.

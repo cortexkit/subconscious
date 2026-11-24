@@ -24,6 +24,7 @@ macro_rules! println {
 
 #[path = "activity/mod.rs"]
 mod activity;
+mod ck_help;
 mod ckni;
 mod config_cli;
 mod connection_choice;
@@ -32,6 +33,9 @@ mod inline_actions;
 mod inline_views;
 mod log_tail;
 mod policy_root_cli;
+mod stack_cli;
+mod window_cli;
+use ck_help::{is_builtin_domain, top_help, BUILTIN_DOMAINS};
 use ckni::JsonOutput;
 use log_tail::{follow_module_logs, LogFollower};
 
@@ -98,23 +102,6 @@ const TRIAGE_LOG_MAX_BYTES: u64 = 64 * 1024;
 const TRIAGE_LOG_TAIL_LINES: usize = 20;
 const EXPECTED_DAEMON_BINARY: &str = "ck-subc";
 const CK_HARNESS: &str = "ck";
-const BUILTIN_DOMAINS: &[&str] = &[
-    "activity",
-    "catalog",
-    "config",
-    "daemon",
-    "health",
-    "help",
-    "machine",
-    "module",
-    "policy-root",
-    "provenance",
-    "quota",
-    "routes",
-    "setup",
-    "upgrade",
-];
-
 #[cfg(feature = "test-support")]
 const CK_BUILD_SHAPE: &str = "test-support: on";
 #[cfg(not(feature = "test-support"))]
@@ -122,13 +109,6 @@ const CK_BUILD_SHAPE: &str = "test-support: off";
 // Keep this conservative until the per-module split has supplied a week of
 // production baseline data; then calibrate whether every window minute is needed.
 const FRAME_DROP_ALERT_REQUIRED_NONZERO_MINUTES: u64 = 10;
-
-const TOP_HELP_BASE: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  setup     plan and apply the managed CortexKit installation\n  upgrade   plan managed component upgrades\n  config    status, plan, apply, stamp, unstamp, history, rollback, place-program\n  module    supervised modules: list, status, resources, profile, stderr, terminals, restart, stop, start, rescan, release\n  catalog   what is registered on the wire (not the supervised roster)
-  routes    live consumers for one module or the whole daemon\n  provenance daemon-attested and module-declared build/process facts\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, connection info, offline triage, and CI lint
-  machine   this machine's id: show it, or adopt a restored one
-  activity  consequential agent and module events";
-
-const TOP_HELP_TAIL: &str = "flags:\n  --subc <file>   use a specific connection file (default: auto-discover)\n  --json          raw JSON output instead of tables\n  --verbose       include diagnostic detail and complete metrics\n\nrun 'ck <domain>' with no verb to see that domain's commands";
 
 const DOMAIN_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -193,23 +173,6 @@ struct DomainProbeCacheEntry {
     modified_secs: u64,
     modified_nanos: u32,
     headline: Option<String>,
-}
-
-/// Top-level help has one domain list. External commands have to opt in so a
-/// module binary on PATH cannot accidentally become an operator command.
-fn top_help() -> String {
-    top_help_with_tail(TOP_HELP_TAIL)
-}
-
-fn top_help_with_tail(tail: &str) -> String {
-    let external = discover_external_domains();
-    let mut out = String::from(TOP_HELP_BASE);
-    for domain in &external {
-        out.push_str(&format!("\n  {:<9} {}", domain.name, domain.headline));
-    }
-    out.push_str("\n\n");
-    out.push_str(tail);
-    out
 }
 
 /// Finds the first executable for each `ck-<name>`, preferring the managed bin
@@ -501,6 +464,7 @@ async fn main() {
         Err(
             CkError::FleetLintExit { exit_code }
             | CkError::TriageExit { exit_code }
+            | CkError::StackWindowExit { exit_code }
             | CkError::RenderedExit { exit_code },
         ) => process::exit(exit_code),
         Err(err) => {
@@ -599,6 +563,12 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
     }
     if let Command::MachineAdopt { id, force } = &args.command {
         return machine_adopt(args.subc.as_deref(), id, *force, json_output).await;
+    }
+    if let Command::Stack(action) = args.command {
+        return stack_cli::run(action, args.subc, json_output).await;
+    }
+    if let Command::Window(action) = args.command {
+        return window_cli::run(action, args.subc, json_output).await;
     }
     if let Command::Activity(options) = &args.command {
         return activity::run(
@@ -751,7 +721,11 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
             }).await?;
             print_json(&reply)
         }
-        Command::DaemonTriage | Command::MachineShow | Command::MachineAdopt { .. } => {
+        Command::DaemonTriage
+        | Command::MachineShow
+        | Command::MachineAdopt { .. }
+        | Command::Stack(_)
+        | Command::Window(_) => {
             unreachable!("handled before connecting")
         }
         Command::Quota {
@@ -1543,6 +1517,8 @@ enum Command {
     Module(ModuleCommand),
     Config(subc_control::config::ConfigControlRequest),
     PolicyRoot(policy_root_cli::Action),
+    Stack(stack_cli::Action),
+    Window(window_cli::Action),
     Activity(activity::Options),
     Routes {
         module_id: Option<String>,
@@ -8221,10 +8197,6 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<CkArgs, CkErro
     })
 }
 
-fn is_builtin_domain(domain: &str) -> bool {
-    BUILTIN_DOMAINS.contains(&domain)
-}
-
 fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
     if !is_builtin_domain(domain) {
         return Ok(Command::External {
@@ -8252,12 +8224,16 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
                 Some("daemon") => DAEMON_HELP.into(),
                 Some("machine") => MACHINE_HELP.into(),
                 Some("activity") => activity::HELP.into(),
+                Some("stack") => stack_cli::HELP.into(),
+                Some("window") => window_cli::HELP.into(),
                 _ => top_help(),
             }))
         }
         "activity" => activity::parse(tail),
         "config" => config_cli::parse(tail),
         "policy-root" => policy_root_cli::parse(tail),
+        "stack" => stack_cli::parse(tail),
+        "window" => window_cli::parse(tail),
         "setup"
             if tail
                 .iter()
@@ -8704,6 +8680,9 @@ enum CkError {
     TriageExit {
         exit_code: i32,
     },
+    StackWindowExit {
+        exit_code: i32,
+    },
     /// The command already printed its complete human-facing refusal.
     RenderedExit {
         exit_code: i32,
@@ -8750,6 +8729,7 @@ impl CkError {
             Self::FleetLintConfig(_) => 2,
             Self::FleetLintExit { exit_code }
             | Self::TriageExit { exit_code }
+            | Self::StackWindowExit { exit_code }
             | Self::RenderedExit { exit_code } => *exit_code,
             Self::WithFooter { error, .. } => error.exit_code(),
         }
@@ -8794,9 +8774,10 @@ impl fmt::Display for CkError {
             ),
             Self::FleetLintConfig(message) => write!(f, "ck daemon lint: {message}"),
             Self::UpdateCheck(error) => error.fmt(f),
-            Self::FleetLintExit { .. } | Self::TriageExit { .. } | Self::RenderedExit { .. } => {
-                Ok(())
-            }
+            Self::FleetLintExit { .. }
+            | Self::TriageExit { .. }
+            | Self::StackWindowExit { .. }
+            | Self::RenderedExit { .. } => Ok(()),
             Self::Json(source) => write!(f, "json: {source}"),
             Self::WithFooter { error, footer } => {
                 write!(f, "{error}\n\nnext:\n  {footer}")

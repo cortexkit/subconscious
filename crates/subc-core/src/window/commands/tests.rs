@@ -765,6 +765,65 @@ fn stamped_and_unconfirmed_begin_refuse_without_writes() {
     rig.close(Some(&id), Closing::Abandon).unwrap();
 }
 
+#[tokio::test]
+async fn reachable_daemon_without_local_endpoint_is_not_offline() {
+    use std::{net::Ipv4Addr, time::Duration};
+    use subc_transport::{
+        authenticate_server, generate_daemon_id, generate_key, read_frame, write_atomic,
+        ConnectionInfo, Endpoint, SCHEMA_VERSION,
+    };
+    use tokio::{net::TcpListener, time::timeout};
+
+    let root = ScratchDir::new("window-tcp-only");
+    let connection = root.join("connection.json");
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let info = ConnectionInfo {
+        schema: SCHEMA_VERSION,
+        wire_version: Some(subc_protocol::PROTOCOL_VERSION),
+        endpoints: vec![Endpoint {
+            host: Ipv4Addr::LOCALHOST.to_string(),
+            port: listener.local_addr().unwrap().port(),
+        }],
+        key: generate_key().unwrap(),
+        daemon_id: generate_daemon_id().unwrap(),
+        pid: std::process::id(),
+        daemon_ver: "test-daemon".into(),
+    };
+    write_atomic(&connection, &info).unwrap();
+    let windows = Windows::at(root.path(), Some(&connection)).unwrap();
+    let client =
+        tokio::task::spawn_blocking(move || windows.current_with(&mut SystemHost(&windows)));
+    let serve_probe = async {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        authenticate_server(
+            &mut stream,
+            &info.key,
+            &info.daemon_id,
+            &info.daemon_ver,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert!(
+            read_frame(&mut stream).await.unwrap().is_none(),
+            "the TCP probe must not send a control request"
+        );
+    };
+    let (result, ()) = timeout(Duration::from_secs(5), async {
+        tokio::join!(client, serve_probe)
+    })
+    .await
+    .expect("the authenticated TCP probe completes");
+    let error = result.unwrap().unwrap_err();
+    assert_eq!(error.exit, 2);
+    assert!(
+        error
+            .message
+            .contains("has no endpoint for the requested transport"),
+        "{error}"
+    );
+}
+
 #[test]
 fn activation_requires_new_incarnation_and_recorded_daemon_content() {
     let mut rig = Rig::new("window-daemon-activation");

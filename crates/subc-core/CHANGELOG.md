@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.21.44
+
+- Fix `ck window` protection checks against running daemons by querying
+  `config.status` over the owner-local connection. Require subc-client-rs 0.41.13.
+
 ## 0.21.43
 
 - Add the stack stop, start and status implementation for the `ck` dispatcher,

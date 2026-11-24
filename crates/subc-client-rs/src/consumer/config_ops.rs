@@ -12,8 +12,8 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use subc_control::config::{ConfigControlRequest, ConfigControlResponse, ConfigWatchResponse};
 pub use subc_control::config::{
     ConfigEdit, ConfigEditAction, ConfigFileError, ConfigFileErrorLayer, ConfigModule,
-    ConfigPlanRefusal, ConfigPlanView, ConfigSettingsLayer, ConfigThrough, ConfigWatchEvent,
-    Digest,
+    ConfigPlanRefusal, ConfigPlanView, ConfigSettingsLayer, ConfigStatus, ConfigThrough,
+    ConfigWatchEvent, Digest,
 };
 use tokio::{sync::Semaphore, time::Instant};
 
@@ -121,6 +121,18 @@ impl SubcConsumer {
                 }
                 Err(err) => return Err(err),
             }
+        }
+    }
+
+    /// Read configuration protection and its diagnostics without prompting (`config.status`).
+    /// Use [`Self::connect_local`] for the daemon's owner-user check.
+    pub async fn config_status(&self) -> Result<ConfigStatus, CallError> {
+        match self
+            .config_request(ConfigControlRequest::Status {}, true)
+            .await?
+        {
+            ConfigControlResponse::Status { status } => Ok(status),
+            _ => Err(unexpected("config.status")),
         }
     }
 

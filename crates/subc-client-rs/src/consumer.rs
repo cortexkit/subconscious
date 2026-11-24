@@ -104,8 +104,8 @@ pub use catalog::CatalogSubscription;
 pub use config_ops::{
     ConfigApplyResponse, ConfigEdit, ConfigEditAction, ConfigFileError, ConfigFileErrorLayer,
     ConfigModule, ConfigModulesResponse, ConfigPlanRefusal, ConfigPlanView, ConfigSchemaResponse,
-    ConfigSettingsLayer, ConfigShowResponse, ConfigSubscription, ConfigThrough, ConfigWatchEvent,
-    Digest,
+    ConfigSettingsLayer, ConfigShowResponse, ConfigStatus, ConfigSubscription, ConfigThrough,
+    ConfigWatchEvent, Digest,
 };
 
 #[cfg(test)]

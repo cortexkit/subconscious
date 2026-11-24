@@ -519,6 +519,28 @@ fn stack_window_current_and_list_work_with_no_daemon() {
 }
 
 #[test]
+fn window_current_and_list_work_with_unstamped_daemon() {
+    let kit = common::kit::Kit::boot_with_config_gate("ck-window-unstamped", &[]);
+    let config = kit.ck(&["config", "status"]);
+    assert_exit(&config, 0);
+    let status: Value = serde_json::from_slice(&config.stdout).unwrap();
+    assert_eq!(status["status"]["state"], "unstamped");
+    assert_eq!(status["status"]["anchor_pending"], false);
+    fs::create_dir(kit.client_root().join("data/cortexkit")).unwrap();
+
+    let current = kit.ck(&["window", "current"]);
+    assert_exit(&current, 3);
+    assert!(current.stdout.is_empty());
+    assert!(current.stderr.is_empty());
+
+    let list = kit.ck(&["window", "list", "--json"]);
+    assert_exit(&list, 0);
+    assert!(list.stderr.is_empty());
+    let report: Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(report, json!({"schema":"ck.window.list/v1","windows":[]}));
+}
+
+#[test]
 fn ckni_with_no_command_is_a_usage_error_not_the_dashboard() {
     let name = if cfg!(windows) { "CKNI.exe" } else { "ckni" };
     let (_dir, mut command) = ckni_command(name);

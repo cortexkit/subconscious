@@ -1,14 +1,11 @@
 use std::{
-    net::IpAddr,
     path::{Path, PathBuf},
     time::Duration,
 };
 
 use subc_client_rs::{ConsumerOptions, SubcConsumer, SupervisorListResponse};
 use subc_control::RunningImageAgreement;
-use subc_daemon::{read_frame, write_frame, Frame};
-use subc_protocol::{Flags, FrameType, Priority};
-use subc_transport::{authenticate_client, connection_file};
+use subc_transport::connection_file;
 
 use super::super::{
     journal::{owner, Liveness, Owner},
@@ -75,79 +72,46 @@ impl SystemHost<'_> {
 impl Host for SystemHost<'_> {
     fn stamped(&mut self) -> Result<Option<bool>, String> {
         executor()?.block_on(async {
-            let mut stream = match tokio::time::timeout(QUERY, async {
-                let found = connection_file::discover(self.0.connection.as_deref()).ok()?;
-                let endpoint = found.info.endpoints.first()?;
-                let ip = endpoint.host.parse::<IpAddr>().ok()?;
-                let mut stream = tokio::net::TcpStream::connect((ip, endpoint.port))
-                    .await
-                    .ok()?;
-                authenticate_client(&mut stream, &found.info, QUERY)
-                    .await
-                    .ok()?;
-                Some(stream)
-            })
-            .await
-            .ok()
-            .flatten()
-            {
-                Some(stream) => stream,
-                None => return Ok(None),
+            let Ok(found) = connection_file::discover(self.0.connection.as_deref()) else {
+                return Ok(None);
             };
-            let result = tokio::time::timeout(QUERY, async {
-                let request = Frame::build(
-                    FrameType::Request,
-                    Flags::new(false, Priority::Interactive, false),
-                    0,
-                    0,
-                    1,
-                    br#"{"op":"config.status"}"#.to_vec(),
-                )
-                .map_err(|error| error.to_string())?;
-                write_frame(&mut stream, &request)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                loop {
-                    let frame = read_frame(&mut stream)
-                        .await
-                        .map_err(|error| error.to_string())?
-                        .ok_or("daemon closed the connection")?;
-                    if frame.header.channel != 0 || frame.header.corr != 1 {
-                        continue;
+            let local = tokio::time::timeout(
+                QUERY,
+                SubcConsumer::connect_local(&found.path, ConsumerOptions::default()),
+            )
+            .await
+            .map_err(|_| "timed out connecting to the daemon's local endpoint".to_owned())
+            .and_then(|result| result.map_err(|error| error.to_string()));
+            let client = match local {
+                Ok(client) => client,
+                Err(error) => {
+                    // A live daemon without an owner connection is not offline.
+                    // TCP can prove reachability, but cannot query protection.
+                    if matches!(
+                        tokio::time::timeout(
+                            QUERY,
+                            SubcConsumer::connect(&found.path, ConsumerOptions::default()),
+                        )
+                        .await,
+                        Ok(Ok(_))
+                    ) {
+                        return Err(error);
                     }
-                    if frame.header.ty != FrameType::Response {
-                        return Err("daemon did not return config.status".into());
-                    }
-                    let response: serde_json::Value =
-                        serde_json::from_slice(&frame.body).map_err(|error| error.to_string())?;
-                    if response.get("op").and_then(serde_json::Value::as_str)
-                        != Some("config.status")
-                    {
-                        return Err("daemon returned an unexpected config.status response".into());
-                    }
-                    let status = response
-                        .get("status")
-                        .ok_or("daemon did not report configuration protection")?;
-                    return match status.get("state").and_then(serde_json::Value::as_str) {
-                        Some("stamped") => Ok(Some(true)),
-                        Some("unstamped")
-                            if status
-                                .get("anchor_pending")
-                                .and_then(serde_json::Value::as_bool)
-                                != Some(true) =>
-                        {
-                            Ok(Some(false))
-                        }
-                        state => Err(format!(
-                            "configuration protection could not be confirmed: {state:?}"
-                        )),
-                    };
+                    return Ok(None);
                 }
-            })
-            .await;
-            match result {
-                Ok(value) => value,
-                Err(_) => Ok(None),
+            };
+            // The owner connection opened, so the daemon is live: a late answer
+            // can't be read as "offline", which would skip the protection check.
+            let Ok(status) = tokio::time::timeout(QUERY, client.config_status()).await else {
+                return Err("daemon did not answer config.status within 2 s".to_owned());
+            };
+            let status = status.map_err(|error| error.to_string())?;
+            match status.state.as_str() {
+                "stamped" => Ok(Some(true)),
+                "unstamped" if !status.anchor_pending => Ok(Some(false)),
+                state => Err(format!(
+                    "configuration protection could not be confirmed: {state:?}"
+                )),
             }
         })
     }

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.41.13
+
+- Add `SubcConsumer::config_status` to read configuration protection and its
+  diagnostics over an owner-local connection.
+
 ## 0.41.12
 
 - Add `ModuleHandler::on_project_config_error` to report which project's refresh

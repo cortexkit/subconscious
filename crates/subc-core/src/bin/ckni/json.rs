@@ -54,6 +54,7 @@ pub(crate) fn json_form(command: &Command) -> JsonForm {
         Command::Provenance { .. } => JsonForm::Schema("ck.provenance/v1"),
         Command::Daemon => JsonForm::Schema("ck.daemon/v1"),
         Command::DaemonTriage => JsonForm::Schema("ck.daemon.triage/v1"),
+        Command::Doctor(_) => JsonForm::Schema("ck.doctor.report/v1"),
         Command::MachineShow => JsonForm::Schema("ck.machine.show/v1"),
         Command::MachineAdopt { .. } => JsonForm::Schema("ck.machine.adopt/v1"),
         Command::Quota { .. } => JsonForm::Schema("ck.quota/v1"),
@@ -98,18 +99,22 @@ impl JsonOutput {
         enabled: bool,
         ckni: bool,
     ) -> Result<Self, CkError> {
-        let schema =
-            if enabled && (ckni || matches!(command, Command::Stack(_) | Command::Window(_))) {
-                match json_form(command) {
-                    JsonForm::Schema(schema) => Some(schema),
-                    JsonForm::None(command) => {
-                        return Err(CkError::Usage(format!("{command} has no JSON form")));
-                    }
-                    JsonForm::Exempt => None,
+        let schema = if enabled
+            && (ckni
+                || matches!(
+                    command,
+                    Command::Stack(_) | Command::Window(_) | Command::Doctor(_)
+                )) {
+            match json_form(command) {
+                JsonForm::Schema(schema) => Some(schema),
+                JsonForm::None(command) => {
+                    return Err(CkError::Usage(format!("{command} has no JSON form")));
                 }
-            } else {
-                None
-            };
+                JsonForm::Exempt => None,
+            }
+        } else {
+            None
+        };
         let stream = schema.is_some()
             && matches!(command, Command::Module(ModuleCommand::Logs { options, .. }) if options.follow);
         Ok(Self {
@@ -366,6 +371,26 @@ mod tests {
                 "daemon triage",
                 PlainOutput::PipedText,
                 JsonForm::Schema("ck.daemon.triage/v1"),
+            ),
+            (
+                "doctor",
+                PlainOutput::PipedText,
+                JsonForm::Schema("ck.doctor.report/v1"),
+            ),
+            (
+                "doctor --json",
+                PlainOutput::PipedText,
+                JsonForm::Schema("ck.doctor.report/v1"),
+            ),
+            (
+                "doctor --fix --report report.json",
+                PlainOutput::PipedText,
+                JsonForm::Schema("ck.doctor.report/v1"),
+            ),
+            (
+                "doctor --subc rig.json",
+                PlainOutput::PipedText,
+                JsonForm::Schema("ck.doctor.report/v1"),
             ),
             (
                 "machine show",

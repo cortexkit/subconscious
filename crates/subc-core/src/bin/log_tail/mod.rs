@@ -13,9 +13,10 @@ use std::{
 };
 
 use super::{
-    body_has_module_id, capture_line_facts, capture_stamp_time, component_matches, lane_matches,
-    line_facts, log_level_rank, rotation_generation, since_stamp, CkError, LogDirs, LogEntry,
-    LogFilterCounts, LogSource, ModuleLogsOptions,
+    app_log_options, body_has_module_id, capture_line_facts, capture_stamp_time, collect_log_text,
+    component_matches, discover_log_sources_in, lane_matches, line_facts, log_level_rank,
+    rotation_generation, since_stamp, CkError, LogDirs, LogEntry, LogFilterCounts, LogSource,
+    ModuleLogsOptions,
 };
 
 mod follow;
@@ -136,6 +137,56 @@ impl LogSink for NewestEntries {
             }
         }
     }
+}
+
+pub(crate) struct BoundedLogTail {
+    pub(crate) entries: Vec<LogEntry>,
+    pub(crate) truncated: bool,
+}
+
+/// Reads the newest 20 entries from the ends of a module's active log files.
+/// `Ok(None)` means no log source exists; `Ok(Some(...))` with no entries
+/// means a successful empty read. The second value is the run-folder warning,
+/// returned on both success and error rather than printed.
+pub(crate) fn read_bounded_tail(
+    module_id: &str,
+) -> (Result<Option<BoundedLogTail>, CkError>, Option<String>) {
+    let (dirs, warning) = LogDirs::for_module(module_id);
+    (read_bounded_tail_in(module_id, &dirs), warning)
+}
+
+fn read_bounded_tail_in(
+    module_id: &str,
+    dirs: &LogDirs,
+) -> Result<Option<BoundedLogTail>, CkError> {
+    const MAX_LINES: usize = 20;
+    let sources = discover_log_sources_in(dirs, module_id, false)?;
+    if sources.is_empty() {
+        return Ok(None);
+    }
+
+    let options = app_log_options(MAX_LINES);
+    let mut counts = LogFilterCounts::default();
+    let mut newest = NewestEntries::new(MAX_LINES);
+    let mut order = 0;
+    let mut truncated = false;
+    for source in &sources {
+        let (text, cut) = follow::read_bounded_log_slice(&source.path, None, MAX_LINES)?;
+        truncated |= cut;
+        collect_log_text(
+            module_id,
+            source,
+            &text,
+            &options,
+            &mut counts,
+            &mut newest,
+            &mut order,
+        );
+    }
+    Ok(Some(BoundedLogTail {
+        entries: newest.into_sorted(),
+        truncated,
+    }))
 }
 
 /// The newest `options.lines` lines across `sources`, in print order, with

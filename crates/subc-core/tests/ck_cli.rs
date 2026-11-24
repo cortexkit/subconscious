@@ -321,7 +321,7 @@ fn bare_json_prints_the_one_top_help() {
     assert_exit(&output, 0);
     assert_eq!(
         text(&output.stdout),
-        "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  setup     plan and apply the managed CortexKit installation\n  upgrade   plan managed component upgrades\n  config    status, plan, apply, stamp, unstamp, history, rollback, place-program\n  module    supervised modules: list, status, resources, profile, stderr, terminals, restart, stop, start, rescan, release\n  catalog   what is registered on the wire (not the supervised roster)\n  routes    live consumers for one module or the whole daemon\n  provenance daemon-attested and module-declared build/process facts\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, connection info, offline triage, and CI lint\n  machine   this machine's id: show it, or adopt a restored one\n  activity  consequential agent and module events\n  stack     stop, start, and check the stack\n  window    record, keep, revert, or abandon placement changes\n\nflags:\n  --subc <file>   use a specific connection file (default: auto-discover)\n  --json          raw JSON output instead of tables\n  --verbose       include diagnostic detail and complete metrics\n\nrun 'ck <domain>' with no verb to see that domain's commands\n"
+        "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  setup     plan and apply the managed CortexKit installation\n  upgrade   plan managed component upgrades\n  config    status, plan, apply, stamp, unstamp, history, rollback, place-program\n  module    supervised modules: list, status, resources, profile, stderr, terminals, restart, stop, start, rescan, release\n  catalog   what is registered on the wire (not the supervised roster)\n  routes    live consumers for one module or the whole daemon\n  provenance daemon-attested and module-declared build/process facts\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, connection info, offline triage, and CI lint\n  doctor    diagnose the stack, even when the daemon is down\n  machine   this machine's id: show it, or adopt a restored one\n  activity  consequential agent and module events\n  stack     stop, start, and check the stack\n  window    record, keep, revert, or abandon placement changes\n\nflags:\n  --subc <file>   use a specific connection file (default: auto-discover)\n  --json          raw JSON output instead of tables\n  --verbose       include diagnostic detail and complete metrics\n\nrun 'ck <domain>' with no verb to see that domain's commands\n"
     );
 }
 
@@ -516,6 +516,314 @@ fn stack_window_current_and_list_work_with_no_daemon() {
             }
         }
     }
+}
+
+const DOCTOR_MODULE: &str = "doctor-fixture";
+const DOCTOR_LOG_LINE: &str =
+    "2026-09-05T10:00:01.000Z INFO  doctor-fixture: saved before shutdown";
+
+struct DoctorRig {
+    root: TempDir,
+}
+
+impl DoctorRig {
+    fn new() -> Self {
+        let root = unique_temp_dir("ck-doctor");
+        for folder in ["data", "run", "config"] {
+            fs::create_dir(root.join(folder)).unwrap();
+        }
+        Self { root }
+    }
+
+    fn command(&self) -> Command {
+        let mut command = ck_command();
+        command
+            .env("XDG_DATA_HOME", self.root.join("data"))
+            .env("XDG_RUNTIME_DIR", self.root.join("run"))
+            .env("XDG_CONFIG_HOME", self.root.join("config"))
+            .env("APPDATA", self.root.join("config"))
+            .env_remove("CK_LOG")
+            .env_remove("SUBC_CONNECTION_FILE")
+            .current_dir(self.root.path());
+        command
+    }
+
+    fn write_offline_module(&self) {
+        let config = self.root.join("config/cortexkit");
+        fs::create_dir(&config).unwrap();
+        let config_value = json!({
+            "version": 1,
+            "modules": {
+                (DOCTOR_MODULE): {
+                    "program": self.root.join("unused-program"),
+                    "protocol": "none",
+                }
+            }
+        });
+        fs::write(config.join("subc.jsonc"), config_value.to_string()).unwrap();
+        let logs = self
+            .root
+            .join("data/cortexkit")
+            .join(DOCTOR_MODULE)
+            .join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(
+            logs.join(format!("{DOCTOR_MODULE}.2026-09-05.log")),
+            format!("{DOCTOR_LOG_LINE}\n"),
+        )
+        .unwrap();
+    }
+
+    async fn report(&self, path: &Path) -> Output {
+        let mut command = self.command();
+        command.args(["doctor", "--json", "--report"]).arg(path);
+        doctor_output(command, Duration::from_secs(15)).await
+    }
+}
+
+async fn doctor_output(command: Command, budget: Duration) -> Output {
+    let mut child = tokio::process::Command::from(command);
+    child.stdin(std::process::Stdio::null()).kill_on_drop(true);
+    timeout(budget, child.output())
+        .await
+        .expect("ck doctor did not exit within its time bound")
+        .expect("run ck doctor")
+}
+
+fn doctor_document(output: &Output, exit_code: i32) -> Value {
+    assert_exit(output, exit_code);
+    assert!(output.stderr.is_empty(), "stderr: {}", text(&output.stderr));
+    let document: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|err| {
+        panic!(
+            "expected one JSON document ({err}): {}",
+            text(&output.stdout)
+        )
+    });
+    assert_eq!(document.as_object().unwrap().len(), 8, "{document}");
+    assert_eq!(document["schema"], "ck.doctor.report/v1");
+    assert!(document["daemon_answered"].is_boolean());
+    assert!(document.get("fix").unwrap().is_null());
+    assert!(document.get("offer").unwrap().is_null());
+    let connection = document.get("connection_override").unwrap();
+    assert!(connection.is_null() || connection.is_string());
+    let report = document.get("report").unwrap();
+    if !report.is_null() {
+        assert_eq!(report.as_object().unwrap().len(), 2, "{report}");
+        assert!(report["path"].is_string());
+        assert_eq!(report["sanitized"], false);
+    }
+    let findings = document["findings"].as_array().unwrap();
+    assert_eq!(
+        document["ok"],
+        !findings.iter().any(|f| f["severity"] == "error")
+    );
+    for finding in findings {
+        assert_eq!(finding.as_object().unwrap().len(), 6, "{finding}");
+        for key in ["id", "layer", "owner", "summary"] {
+            assert!(finding[key].is_string(), "invalid {key}: {finding}");
+        }
+        assert!(matches!(
+            finding["severity"].as_str(),
+            Some("error" | "warning" | "info")
+        ));
+        assert!(finding["evidence"].is_object(), "{finding}");
+    }
+    document
+}
+
+fn doctor_findings(document: &Value) -> &[Value] {
+    document["findings"].as_array().unwrap()
+}
+
+fn only_doctor_finding<'a>(document: &'a Value, ids: &[&str]) -> &'a Value {
+    let findings = doctor_findings(document);
+    let mut matching = findings
+        .iter()
+        .filter(|f| f["id"].as_str().is_some_and(|id| ids.contains(&id)));
+    let found = matching
+        .next()
+        .unwrap_or_else(|| panic!("missing {ids:?} in {findings:?}"));
+    assert!(
+        matching.next().is_none(),
+        "repeated {ids:?} in {findings:?}"
+    );
+    found
+}
+
+fn assert_doctor_empty_install(document: &Value) {
+    let findings = doctor_findings(document);
+    assert!(
+        findings.iter().any(|f| f["id"] == "install.binary_missing"
+            && f["severity"] == "error"
+            && f["evidence"]["binary"].is_string()
+            && f["evidence"]["path"].is_string()),
+        "{findings:?}"
+    );
+    assert!(
+        !findings.iter().any(|f| f["layer"] == "window"),
+        "{findings:?}"
+    );
+}
+
+fn assert_doctor_report_file(document: &Value, path: &Path) -> Vec<Value> {
+    let resolved = fs::canonicalize(path).unwrap();
+    assert_eq!(document["report"]["path"], resolved.to_str().unwrap());
+    #[cfg(unix)]
+    assert_mode(path, 0o600);
+    let mut on_disk: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    let tails = on_disk
+        .as_object_mut()
+        .unwrap()
+        .remove("log_tails")
+        .unwrap();
+    assert_eq!(&on_disk, document);
+    tails.as_array().unwrap().to_vec()
+}
+
+fn doctor_log_tail() -> Value {
+    json!({
+        "module": DOCTOR_MODULE,
+        "source": "log_file",
+        "status": "read",
+        "reason": null,
+        "dropped_lines": null,
+        "truncated": false,
+        "entries": [{"kind": "line", "text": DOCTOR_LOG_LINE, "truncated": false}],
+    })
+}
+
+#[tokio::test]
+async fn doctor_offline_json_reports_no_daemon_and_reads_the_module_log() {
+    let rig = DoctorRig::new();
+    rig.write_offline_module();
+    let mut command = rig.command();
+    command.args(["doctor", "--json"]);
+    let output = doctor_output(command, Duration::from_secs(15)).await;
+    let document = doctor_document(&output, 1);
+    assert_doctor_empty_install(&document);
+    assert_eq!(document["daemon_answered"], false);
+    assert!(document["report"].is_null());
+    assert!(document["connection_override"].is_null());
+
+    let daemon = only_doctor_finding(&document, &["daemon.not_running", "daemon.unreachable"]);
+    assert_eq!(daemon["severity"], "error");
+    let evidence = daemon["evidence"].as_object().unwrap();
+    assert_eq!(evidence.len(), 6, "{evidence:?}");
+    assert!(evidence["manager"].is_string());
+    assert!(evidence["manager_error"].is_string() || evidence["manager_error"].is_null());
+    assert!(evidence["recorded_pid"].is_u64() || evidence["recorded_pid"].is_null());
+    assert!(evidence["process_entry"].is_object() || evidence["process_entry"].is_null());
+    assert!(evidence["connection_pid_hint"].is_null());
+    assert!(evidence["override_path"].is_null());
+
+    let module = only_doctor_finding(&document, &["module.daemon_unavailable"]);
+    assert_eq!(module["owner"], "ck");
+    assert_eq!(module["severity"], "info");
+    assert_eq!(module["evidence"]["tails"], json!([doctor_log_tail()]));
+}
+
+#[tokio::test]
+async fn doctor_unstamped_daemon_answers_without_daemon_or_module_errors() {
+    let daemon = common::kit::Kit::boot("ck-doctor-live", &[]);
+    let rig = DoctorRig::new();
+    let connection = daemon.connection();
+    let mut command = rig.command();
+    command
+        .env("XDG_RUNTIME_DIR", connection.parent().unwrap())
+        .args(["doctor", "--json"]);
+    let output = doctor_output(command, Duration::from_secs(20)).await;
+    let document = doctor_document(&output, 1);
+    assert_doctor_empty_install(&document);
+    assert_eq!(document["daemon_answered"], true);
+    assert!(document["connection_override"].is_null());
+    let findings = doctor_findings(&document);
+    assert!(
+        !findings.iter().any(|f| f["severity"] == "error"
+            && matches!(f["layer"].as_str(), Some("daemon" | "module"))),
+        "{findings:?}"
+    );
+}
+
+#[tokio::test]
+async fn doctor_report_has_the_stdout_document_and_full_log_tails() {
+    let rig = DoctorRig::new();
+    rig.write_offline_module();
+    let path = rig.root.join("diagnosis.json");
+    let output = rig.report(&path).await;
+    let document = doctor_document(&output, 1);
+    assert_eq!(
+        assert_doctor_report_file(&document, &path),
+        [doctor_log_tail()]
+    );
+}
+
+#[tokio::test]
+async fn doctor_existing_report_is_not_replaced() {
+    let rig = DoctorRig::new();
+    let requested = rig.root.join("existing.json");
+    fs::write(&requested, b"previous report").unwrap();
+    let output = rig.report(&requested).await;
+    let document = doctor_document(&output, 1);
+    assert_eq!(fs::read(&requested).unwrap(), b"previous report");
+    assert!(assert_doctor_report_file(&document, &rig.root.join("existing-1.json")).is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn doctor_symlink_report_is_not_followed_or_replaced() {
+    let rig = DoctorRig::new();
+    let destination = rig.root.join("do-not-write.json");
+    fs::write(&destination, b"unrelated file").unwrap();
+    let requested = rig.root.join("linked.json");
+    std::os::unix::fs::symlink(&destination, &requested).unwrap();
+    let output = rig.report(&requested).await;
+    let document = doctor_document(&output, 1);
+    assert_eq!(fs::read_link(&requested).unwrap(), destination);
+    assert_eq!(fs::read(&destination).unwrap(), b"unrelated file");
+    assert!(assert_doctor_report_file(&document, &rig.root.join("linked-1.json")).is_empty());
+}
+
+#[tokio::test]
+async fn doctor_fix_with_subc_is_refused_before_creating_a_report() {
+    let rig = DoctorRig::new();
+    let requested = rig.root.join("refused.json");
+    let mut command = rig.command();
+    command
+        .arg("--subc")
+        .arg(rig.root.join("nonexistent-connection.json"))
+        .args(["doctor", "--json", "--fix", "--report"])
+        .arg(&requested);
+    let output = doctor_output(command, Duration::from_secs(15)).await;
+    assert_exit(&output, 2);
+    assert!(output.stdout.is_empty(), "stdout: {}", text(&output.stdout));
+    assert!(text(&output.stderr).contains("--fix cannot be used with --subc"));
+    assert!(!requested.exists());
+}
+
+#[tokio::test]
+async fn doctor_connection_environment_override_has_no_offer_or_local_log_preview() {
+    let rig = DoctorRig::new();
+    rig.write_offline_module();
+    let connection = rig.root.join("nonexistent-connection.json");
+    let mut command = rig.command();
+    command
+        .env("SUBC_CONNECTION_FILE", &connection)
+        .args(["doctor", "--json"]);
+    let output = doctor_output(command, Duration::from_secs(15)).await;
+    let document = doctor_document(&output, 1);
+    assert_eq!(document["daemon_answered"], false);
+    assert_eq!(
+        document["connection_override"],
+        connection.to_str().unwrap()
+    );
+    let daemon = only_doctor_finding(&document, &["daemon.not_running", "daemon.unreachable"]);
+    assert_eq!(daemon["id"], "daemon.unreachable");
+    assert_eq!(
+        daemon["evidence"]["override_path"],
+        document["connection_override"]
+    );
+    let module = only_doctor_finding(&document, &["module.daemon_unavailable"]);
+    assert_eq!(module["evidence"]["tails"], json!([]));
 }
 
 #[test]
@@ -1135,6 +1443,7 @@ fn hidden_cli_face_reserved_names_list_every_builtin_domain() {
             "catalog",
             "config",
             "daemon",
+            "doctor",
             "health",
             "help",
             "machine",

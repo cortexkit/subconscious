@@ -4,7 +4,7 @@
 versioned JSON contract below. `ck --json <command>` retains its original
 piped JSON bytes and shapes, even on a terminal: no ANSI, progress, or implicit
 wait for a module to become healthy. A module action returns its acknowledgement.
-Stack stop/start and window revert wait for completion instead.
+Stack stop/start, window revert and doctor wait for completion instead.
 Place `--json` before the command (built-ins also accept it in their tail).
 
 ## Plain output coverage
@@ -17,14 +17,15 @@ Every other built-in prints piped `ck` plain text: `health <module>`, `module
 status`, `module logs`, `module stderr`, `module terminals`, `module rescan`,
 `module release`, `module restart` (including `--swap`), `module stop`, `module
 start`, `routes`, `catalog`, `provenance`, `daemon`, `daemon triage`, `daemon
-lint`, `machine show`, `machine adopt`, `quota`, `setup`, `upgrade`, `stack`
+lint`, `doctor`, `machine show`, `machine adopt`, `quota`, `setup`, `upgrade`, `stack`
 and `window` commands, help and version. These are not covered by the
 three-table formatting guarantees.
 ckni never asks on the terminal; setup refuses with a usage error where ck
 would ask. Under both names, `stack stop`, `stack start`, `window keep`,
-`window abandon` and `window revert` ask the person through the system approval
-dialog, including with `--json`, and exit 2 if approval is declined or cannot
-be obtained.
+`window abandon`, `window revert` and `doctor --fix` (when it attempts a revert)
+ask the person through the system approval dialog, including with `--json`, and
+exit 2 if approval is declined or cannot be obtained. `doctor` without `--fix`
+never prompts.
 
 ## JSON conventions and exceptions
 
@@ -82,6 +83,11 @@ The following outputs are exceptions to the versioned JSON forms:
 against implicit waits, not exceptions to schema versioning. Both executable
 names return a versioned completion report, not an acknowledgement. Their
 process exit code is the report's `exit`, including when nonzero.
+
+`doctor` and `doctor --fix` also return a versioned completion report under both
+names. The process exit code reflects the checks, any attempted revert and any
+report write failure. Unlike the stack and window completion reports, doctor's
+top-level `ok` describes only the findings, not the process exit code.
 
 **External faces (`ck-<domain>` executables) are not covered by these guarantees.**
 Both names pass through their output, ANSI, JSON, stderr and exit status
@@ -303,6 +309,94 @@ reason:string}}`. The nested objects have these shapes:
 Connection-file secrets are never included. The report may be printed
 successfully even when the command exits nonzero to reflect a down or ambiguous
 daemon.
+
+### `ck.doctor.report/v1`
+
+`doctor --json` prints one object with these fields:
+
+| Field | Type and meaning |
+| --- | --- |
+| `schema` | `"ck.doctor.report/v1"` |
+| `ok` | boolean; true if the final findings contain no `error` |
+| `daemon_answered` | boolean; whether the daemon answered the `server.describe` identity request within its deadline in the final pass |
+| `connection_override` | string or null; the path from `--subc` or `SUBC_CONNECTION_FILE`, if supplied |
+| `findings` | array of `{id:string, layer:string, severity:"error"\|"warning"\|"info", owner:string, summary:string, evidence:object}` |
+| `offer` | `{window_id:string, command:string}` or null; `command` is `ck window revert <window_id>`; an override suppresses the offer |
+| `report` | `{path:string, sanitized:false}` when the full report was written, otherwise null |
+| `fix` | null without `--fix`, otherwise `{result, skipped, findings_before:[Finding]}` |
+
+`fix.result` is a `ck.window.result/v1` revert result, including on refusal,
+or null if no revert was attempted. `fix.skipped` is null when the revert ran,
+otherwise `"nothing_to_fix"` or `"manager_observation_overdue"`. `findings_before`
+holds the first pass; `findings` repeats it if there was no second pass.
+
+Findings are grouped by `install`, `service`, `daemon`, `disk`, `window`, then
+`module`, with worst severity first within a layer. The owner is `ck`, except
+for findings about an identified module, where it is that module's id. Evidence
+uses the following fields (`?` here denotes an optional key):
+
+| Finding id | Evidence fields |
+| --- | --- |
+| `install.binary_missing`, `install.signature_invalid` | `binary:string`, `path:string` |
+| `install.old_layout` | `path:string` (the legacy `ck` binary) |
+| `install.versions` | `binaries:{[name:string]:string}`; version `"unknown"` when a row has no version |
+| `service.not_loaded`, `service.not_running`, `service.stale_marker`, `service.unknown` | `manager:Manager`, `marker:Marker`, `recorded_pid:number\|null`, `message:string\|null` |
+| `service.stopped` | `manager:Manager`, `marker:Marker`, `recorded_pid:number\|null`, `message:null`, `start_blocked_by?:{id:string,window_id:string}` |
+| `daemon.not_running`, `daemon.unreachable` | `manager:Manager`, `manager_error:string\|null`, `recorded_pid:number\|null`, `process_entry:{pid:number,start_time_ms:number\|null}\|null`, `connection_pid_hint:number\|null`, `override_path:string\|null`; the connection pid is a hint, not an identity |
+| `daemon.resources`, `daemon.cpu_high` | `cpu_ms:number\|null`, `elapsed_ms:number\|null`, `cores:number\|null`, `memory_bytes:number\|null`, `memory_kind:MemoryKind\|null`, `reason:string\|null`; `reason` is set when resources were not measured |
+| `disk.low_space` | `path:string`, `free_bytes:number`, `total_bytes:number` |
+| `disk.folder_permissions` | `path:string`, `mode:number` (Unix permission bits) |
+| `permissions.not_checked_on_windows` | `{}` (in the `disk` layer) |
+| `window.interrupted`, `window.revert_interrupted`, `window.reverting`, `window.update_in_progress`, `window.empty`, `window.not_kept` | `window_id:string`, `state:string`, `began_ms:number`, `step_count:number`, `unfinished_index:number\|null` (one-based), `steps:[{action:string,target:string}]`, `owner_liveness:"alive"\|"gone"\|"unreadable"\|null` |
+| `window.unreadable` | `window_id:string` (`"windows"` for a top-level scan failure), `error:string` |
+| `module.daemon_unavailable` | `tails:[Tail]` (previews from local logs, empty with a connection override) |
+| `module.stopped_by_operator` | `state:string`, `enabled:false`, `configured_enabled:true`, `tail:Tail` |
+| `module.crash_loop` | `restart_count:number`, `max_restarts:number\|null`, `restart_window_secs:number`, `lifetime_restarts:number\|null`, `exits:[ExitRecord]`, `tail:Tail` |
+| `module.admission_refused` | `reason:string`, `tail:Tail` |
+| `module.failed`, `module.unresponsive`, `module.starting`, `module.restarting`, `module.draining`, `module.unknown_state` | `state:string`, `tail:Tail` |
+| `module.unhealthy`, `module.degraded` | `state:string`, `health:string`, `last_probe_ms:number`, `detail:string\|null`, `consecutive_failures:number\|null`, `last_action:JSON`, `tail:Tail` |
+| `module.not_serving` | `state:string`, `last_exit:ExitRecord\|null`, `tail:Tail` |
+| `<layer>.timed_out`, `<layer>.check_failed` | `check:string`, `module:string\|null`, `message:string` |
+
+`Manager` is `running`, `loaded`, `not_loaded` or `unknown`. `Marker` is
+`present`, `absent`, `stale` or `unknown`. `MemoryKind` is `phys_footprint`,
+`resident_set` or `windows_working_set`. An `ExitRecord` is
+`{at_ms:number, code:number|null, signal:number|null, kind:string|null}`.
+
+`--report <file>` adds `log_tails:[Tail]` to the same document in an owner-only,
+unsanitized file. The report path names the actual file; an occupied name is
+never replaced and can acquire a numbered suffix. A `Tail` is
+`{module:string, source:"stderr_tail"|"log_file", status:string,
+reason:string|null, dropped_lines:number|null, truncated:boolean, entries:[TailEntry]}`.
+Finding previews have at most five log lines per module. Full tails are bounded
+to 20 lines per module; daemon tails share a 64 KiB request budget. Local log
+tails read at most 8,000 bytes from the end of each active file.
+
+- Stderr tail statuses: `captured`, `incomplete`, `not_captured`, `unknown`,
+  `request_failed`, `request_timed_out`. The reason carries the daemon's capture
+  reason, an unknown tag or a request error when applicable. `dropped_lines`
+  comes from the daemon and is null without a reply. The record's `truncated`
+  is false; a line can carry its own truncation flag.
+- Local log statuses: `read`, `absent`, `unreadable`, `not_read`. The reason can
+  carry a read error or a run-folder warning; `dropped_lines` is null.
+  `truncated` indicates that the byte window started mid-file or held no
+  complete line. An empty successful read is distinct from a failed or absent one.
+- `TailEntry` is `{kind:"line", text:string, at_ms?:number, truncated:boolean}`,
+  `{kind:"process_start"}` or `{kind:"unknown"}`. Local log text retains its
+  original timestamp, with no separate `at_ms` and with `truncated:false` on
+  the line itself.
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | No error finding in the final pass. |
+| `1` | An error finding, a revert that stopped part way, a fix skipped because the manager observation outlived its deadline, or a report write failure. |
+| `2` | A usage error, `--force`, `--fix` with an override, a refused report path, or a revert refused before any change (including declined or unavailable approval). |
+
+The JSON document is printed on exit `0`, exit `1`, and exit `2` for a revert
+refusal. A pre-check refusal doesn't print a JSON document. For a completed
+diagnostic run stderr is empty, except when the report could not be written:
+stderr names the error and path, stdout still contains only the JSON document
+with `report:null`, and the truncated file is left in place.
 
 ### `ck.machine.show/v1`
 

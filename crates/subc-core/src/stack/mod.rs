@@ -14,7 +14,7 @@ use std::{
 };
 
 use host::{Host, ProcessReading};
-use manager::BoundedRunner;
+use manager::{BoundedRunner, Job};
 use subc_control::{ModuleProtocol, SupervisorEntry, SupervisorHealthStatus};
 use subc_daemon::{LiveChild, LiveChildrenRoster};
 use subc_presence::Outcome;
@@ -41,6 +41,7 @@ pub const START_PROMPT: &str = "Allow `ck stack start` to start the stack?";
 const POLL: Duration = Duration::from_millis(100);
 const DAEMON_STOP_BOUND: Duration = Duration::from_secs(60);
 const DAEMON_REQUEST_BOUND: Duration = Duration::from_secs(2);
+const STOPPED_MARKER: &str = "stack-stopped";
 
 /// Resolve from the same install and session paths as setup. Operations with
 /// deadlines and presence prompts run synchronously; call off the async executor.
@@ -93,7 +94,7 @@ impl Stack {
     }
 
     fn marker(&self) -> PathBuf {
-        self.root.join("stack-stopped")
+        self.root.join(STOPPED_MARKER)
     }
 
     fn engine(&self) -> Result<host::SystemHost<'_>, String> {
@@ -875,6 +876,31 @@ fn health_class(
     }
 }
 
+/// Read the service manager and the stopped marker. The error string describes
+/// why the manager could not be queried or its response was inconclusive. The
+/// marker is read even when the manager observation fails.
+pub(crate) fn observe_manager_and_marker(
+    platform: RuntimePlatform,
+    runner: &mut dyn CommandRunner,
+    marker_root: &Path,
+) -> (Result<Job, String>, MarkerState) {
+    let clock = RealClock::new();
+    let observed = manager::observe(
+        platform,
+        &mut BoundedRunner::new(runner, Budget::new(&clock, Duration::MAX)),
+    );
+    let marker = match fs::symlink_metadata(marker_root.join(STOPPED_MARKER)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => MarkerState::Absent,
+        Err(_) => MarkerState::Unknown,
+        Ok(_) => match observed.as_ref().map(|job| job.state) {
+            Ok(ManagerState::Running) => MarkerState::Stale,
+            Ok(ManagerState::Loaded | ManagerState::NotLoaded) => MarkerState::Present,
+            Ok(ManagerState::Unknown) | Err(_) => MarkerState::Unknown,
+        },
+    };
+    (observed, marker)
+}
+
 impl Stack {
     fn status_inner(
         &self,
@@ -883,24 +909,12 @@ impl Stack {
         host: &mut impl Host,
         runner: &mut dyn CommandRunner,
     ) -> StackStatus {
-        // The status timeout governs the daemon wait, not read-only manager observation.
-        let observed = manager::observe(
-            self.platform,
-            &mut BoundedRunner::new(runner, Budget::new(clock, Duration::MAX)),
-        );
+        // The status timeout governs the daemon wait, not the manager or marker reads.
+        let (observed, marker) = observe_manager_and_marker(self.platform, runner, &self.root);
         let budget = Budget::new(clock, timeout);
         let manager = observed
             .as_ref()
             .map_or(ManagerState::Unknown, |job| job.state);
-        let marker = match fs::symlink_metadata(self.marker()) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => MarkerState::Absent,
-            Err(_) => MarkerState::Unknown,
-            Ok(_) => match manager {
-                ManagerState::Unknown => MarkerState::Unknown,
-                ManagerState::Running => MarkerState::Stale,
-                _ => MarkerState::Present,
-            },
-        };
         let mut report = StackStatus::new(manager, marker);
         report.daemon_pid = observed.as_ref().ok().and_then(|job| job.pid);
         report.manager_error = observed.err();

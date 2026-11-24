@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.21.46
+
+- Add `ck doctor` to diagnose the stack even when the daemon is down, write a
+  local report on request, and offer to restore files and stores replaced by an update.
+
 ## 0.21.45
 
 - Shorten the intentional no-reply CLI test with a test-support operator budget

@@ -253,7 +253,6 @@ impl LogFollower {
     /// them. Reads only the end of each file (about `max` lines' worth),
     /// never the whole set.
     pub(crate) fn tail(&self, max: usize) -> Result<Vec<LogEntry>, CkError> {
-        const BYTES_PER_LINE: u64 = 400;
         let options = app_log_options(max);
         let mut counts = LogFilterCounts::default();
         let mut entries = Vec::new();
@@ -262,16 +261,7 @@ impl LogFollower {
             let Some(cursor) = self.cursors.get(&source.path) else {
                 continue;
             };
-            let start = cursor
-                .offset
-                .saturating_sub(BYTES_PER_LINE.saturating_mul(max as u64));
-            let mut text = read_log_slice(&source.path, start, cursor.offset)?;
-            // A read that starts mid-file drops its first, partial line.
-            if start > 0 {
-                text = text
-                    .split_once('\n')
-                    .map_or(String::new(), |(_, rest)| rest.to_string());
-            }
+            let (text, _) = read_bounded_log_slice(&source.path, Some(cursor.offset), max)?;
             collect_log_text(
                 &self.module_id,
                 &source,
@@ -292,15 +282,41 @@ fn read_error(path: &Path, error: io::Error) -> CkError {
     CkError::Message(format!("{}: {error}", path.display()))
 }
 
-/// The bytes of `path` from `start` up to `end`, as text.
-fn read_log_slice(path: &Path, start: u64, end: u64) -> Result<String, CkError> {
+/// Reads a tail window up to `end`, or up to the opened file's current length.
+/// The flag tells the caller whether the window cut off any of the file.
+pub(super) fn read_bounded_log_slice(
+    path: &Path,
+    end: Option<u64>,
+    max: usize,
+) -> Result<(String, bool), CkError> {
+    const BYTES_PER_LINE: u64 = 400;
     let mut file = fs::File::open(path).map_err(|error| read_error(path, error))?;
-    file.seek(SeekFrom::Start(start))
-        .map_err(|error| read_error(path, error))?;
+    let end = match end {
+        Some(end) => end,
+        None => file
+            .metadata()
+            .map_err(|error| read_error(path, error))?
+            .len(),
+    };
+    let start = end.saturating_sub(BYTES_PER_LINE.saturating_mul(max as u64));
+    let mut text =
+        read_log_slice(&mut file, start, end).map_err(|error| read_error(path, error))?;
+    // A read that starts mid-file drops its first, partial line.
+    if start > 0 {
+        let next_line = text.find('\n').map_or(text.len(), |index| index + 1);
+        text.drain(..next_line);
+    }
+    Ok((text, start > 0))
+}
+
+/// The bytes of a file from `start` up to `end`, as text.
+fn read_log_slice(file: &mut fs::File, start: u64, end: u64) -> io::Result<String> {
+    file.seek(SeekFrom::Start(start))?;
     let mut bytes = Vec::new();
     file.take(end.saturating_sub(start))
-        .read_to_end(&mut bytes)
-        .map_err(|error| read_error(path, error))?;
+        .read_to_end(&mut bytes)?;
+    #[cfg(test)]
+    super::tests::SLICE_BYTES_READ.with(|total| total.set(total.get() + bytes.len()));
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 

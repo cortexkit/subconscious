@@ -1,4 +1,7 @@
 use super::*;
+use crate::doctor::{
+    classify_service_and_daemon, run_with_blocked_describe, DescribeOutcome, Severity,
+};
 use crate::setup::runtime::CommandResult;
 use cortexkit_test_support::ScratchDir;
 use serde_json::{json, Value};
@@ -948,6 +951,140 @@ fn start_returns_early_when_degraded_module_recovers() {
         assert!(!result.human(false).contains("degraded"));
         assert_eq!(serde_json::to_value(result).unwrap()["degraded"], json!([]));
     }
+}
+
+#[test]
+fn doctor_classifies_unanswered_daemon_from_manager_and_marker() {
+    for (platform, seen, marker, manager, pid, service, daemon, manager_error) in [
+        (
+            Macos,
+            Seen::Live(Some(42)),
+            "stale",
+            "running",
+            Some(42),
+            Some(("service.stale_marker", Severity::Info)),
+            "daemon.unreachable",
+            None,
+        ),
+        (
+            Linux,
+            Seen::Live(None),
+            "absent",
+            "running",
+            None,
+            None,
+            "daemon.unreachable",
+            None,
+        ),
+        (
+            Linux,
+            Seen::Idle,
+            "absent",
+            "loaded",
+            None,
+            Some(("service.not_running", Severity::Error)),
+            "daemon.not_running",
+            None,
+        ),
+        (
+            Macos,
+            Seen::Absent,
+            "absent",
+            "not_loaded",
+            None,
+            Some(("service.not_loaded", Severity::Error)),
+            "daemon.not_running",
+            None,
+        ),
+        (
+            Windows,
+            Seen::Failure,
+            "absent",
+            "unknown",
+            None,
+            Some(("service.unknown", Severity::Warning)),
+            "daemon.unreachable",
+            Some("Access is denied"),
+        ),
+        (
+            Windows,
+            Seen::Inconclusive,
+            "unknown",
+            "unknown",
+            None,
+            Some(("service.unknown", Severity::Warning)),
+            "daemon.unreachable",
+            Some("did not report a conclusive status"),
+        ),
+    ] {
+        let fixture = Fixture::new(platform);
+        if marker != "absent" {
+            fs::write(fixture.marker(), "stop").unwrap();
+        }
+        let clock = FakeClock::default();
+        let mut runner = fixture.runner(&clock);
+        runner.jobs.push_back(seen);
+        let (job, marker_state) =
+            observe_manager_and_marker(platform, &mut runner, &fixture.stack.root);
+        assert!(runner.jobs.is_empty());
+        assert!(runner.mutations().is_empty());
+
+        let findings =
+            classify_service_and_daemon(job, marker_state, &DescribeOutcome::default(), None);
+        let expected = service.into_iter().chain([(daemon, Severity::Error)]);
+        assert!(
+            findings
+                .iter()
+                .map(|f| (f.id.as_str(), f.severity))
+                .eq(expected),
+            "{platform:?} {manager} {marker}: {findings:?}"
+        );
+        if service.is_some() {
+            assert_eq!(findings[0].evidence["marker"], marker);
+        }
+        let evidence = &findings.last().unwrap().evidence;
+        assert_eq!(evidence["manager"], manager);
+        assert_eq!(evidence["recorded_pid"], json!(pid));
+        match manager_error {
+            Some(reason) => assert!(evidence["manager_error"].as_str().unwrap().contains(reason)),
+            None => assert_eq!(evidence["manager_error"], Value::Null),
+        }
+    }
+}
+
+#[test]
+fn doctor_describe_deadline_keeps_marker_based_deliberate_stop_verdict() {
+    let fixture = Fixture::new(Windows);
+    fs::write(fixture.marker(), "stop").unwrap();
+    let clock = FakeClock::default();
+    let mut runner = fixture.runner(&clock);
+    runner.jobs.push_back(Seen::Idle);
+    let observation = observe_manager_and_marker(Windows, &mut runner, &fixture.stack.root);
+    assert!(runner.jobs.is_empty());
+    assert!(runner.mutations().is_empty());
+
+    let start = Instant::now();
+    let result = run_with_blocked_describe(observation);
+    assert!(start.elapsed() < Duration::from_secs(15));
+    assert_eq!(result.exit_code, 1);
+    assert!(!result.document.daemon_answered);
+    let findings = &result.document.findings;
+    let stopped = findings.iter().find(|f| f.id == "service.stopped").unwrap();
+    assert_eq!(stopped.severity, Severity::Warning);
+    assert_eq!(stopped.evidence["marker"], "present");
+    assert_eq!(stopped.evidence["manager"], "loaded");
+    let daemon = findings
+        .iter()
+        .find(|f| f.id == "daemon.not_running")
+        .unwrap();
+    assert_eq!(daemon.evidence["connection_pid_hint"], std::process::id());
+    let errors: Vec<_> = findings
+        .iter()
+        .filter(|f| f.severity == Severity::Error)
+        .map(|f| f.id.as_str())
+        .collect();
+    assert_eq!(errors, ["daemon.not_running"]);
+    assert!(!findings.iter().any(|f| f.id == "daemon.timed_out"));
 }
 
 #[test]

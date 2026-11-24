@@ -8,7 +8,7 @@ mod tests;
 pub use placement::{RecordRequest, RECORD_HELP};
 pub use report::{Close, CurrentStep, List, StepSummary, Summary, WindowResult};
 
-use std::{ffi::OsStr, io, path::Path};
+use std::{cell::Cell, ffi::OsStr, io, path::Path};
 
 use super::{
     journal::{self, durable, id, paths, Action, Liveness, Locked, Owner, Record, Snapshot, State},
@@ -366,6 +366,35 @@ impl Windows {
         Ok(rows)
     }
 
+    /// Read every journal, newest first, without probing the daemon.
+    pub(crate) fn disk_rows(&self) -> Vec<DiskRow> {
+        self.disk_rows_with(&SystemHost(self))
+    }
+
+    fn disk_rows_with(&self, host: &impl Host) -> Vec<DiskRow> {
+        let rows = match self.scan() {
+            Ok(rows) => rows,
+            Err(error) => vec![Err(("windows".into(), error.message))],
+        };
+        rows.into_iter()
+            .map(|row| {
+                let owner_liveness = Cell::new(None);
+                if let Ok(snapshot) = &row {
+                    // Use the same owner selection as state classification, including no owner when closed.
+                    snapshot.state(|owner| {
+                        let reading = host.liveness(owner);
+                        owner_liveness.set(Some(reading));
+                        reading
+                    });
+                }
+                DiskRow {
+                    row,
+                    owner_liveness: owner_liveness.into_inner(),
+                }
+            })
+            .collect()
+    }
+
     pub(super) fn check_stack(&self, except: Option<&str>) -> WindowCheck {
         match self.scan() {
             Ok(rows) => {
@@ -403,6 +432,13 @@ impl Windows {
 }
 
 pub(super) type Row = Result<Snapshot, (String, String)>;
+
+pub(crate) struct DiskRow {
+    /// A snapshot or the pair (window directory name, error message); a scan failure uses `windows`.
+    pub(crate) row: Result<Snapshot, (String, String)>,
+    /// The host's reading, or `None` for unreadable rows or when `Snapshot::state` selects no owner.
+    pub(crate) owner_liveness: Option<Liveness>,
+}
 
 fn row_key(row: &Row) -> (String, u64, String) {
     match row {

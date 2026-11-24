@@ -81,6 +81,40 @@ impl Host for Fake {
     }
 }
 
+struct DiskHost(Option<(u32, Liveness)>);
+
+impl Host for DiskHost {
+    fn stamped(&mut self) -> Result<Option<bool>, String> {
+        panic!("disk reads must not probe for a stamped install")
+    }
+    fn owner(&self, _: u32) -> Result<Owner, String> {
+        panic!("disk reads must use the recorded owner")
+    }
+    fn liveness(&self, owner: &Owner) -> Liveness {
+        let (pid, reading) = self.0.expect("no recorded owner should be checked");
+        assert_eq!(owner.pid, pid);
+        reading
+    }
+    fn manager_live(&mut self) -> Result<bool, String> {
+        panic!("disk reads must not query the manager")
+    }
+    fn daemon_path(&self) -> Result<PathBuf, String> {
+        panic!("disk reads must not resolve the daemon path")
+    }
+    fn daemon(&mut self) -> Result<Option<Owner>, String> {
+        panic!("disk reads must not query the daemon")
+    }
+    fn module(&mut self, _: &str) -> Result<ModuleReading, String> {
+        panic!("disk reads must not query module state")
+    }
+    fn has_running_image_proof(&self) -> bool {
+        panic!("disk reads must not check running images")
+    }
+    fn image_matches(&self, _: &Owner, _: &Path) -> bool {
+        panic!("disk reads must not check running images")
+    }
+}
+
 fn identity(pid: u32, start_time: u64) -> Owner {
     Owner {
         pid,
@@ -159,6 +193,140 @@ fn file_request(target: &Path, new: Option<&Path>) -> RecordRequest {
 fn activation(target: &str) -> RecordRequest {
     RecordRequest::Activation {
         target: target.into(),
+    }
+}
+
+fn seed_disk_window(rig: &Rig, began_ms: u64) -> String {
+    let id = id::candidate(began_ms, 1);
+    let dir = journal::dir(rig.windows.root(), &id).unwrap();
+    fs::create_dir_all(&dir).unwrap();
+    journal::create(&dir, &id, began_ms, None).unwrap();
+    id
+}
+
+#[test]
+fn disk_rows_empty_does_not_probe_or_create_windows() {
+    let rig = Rig::new("window-disk-empty");
+    assert!(rig.windows.disk_rows_with(&DiskHost(None)).is_empty());
+    assert!(!rig.windows.root().join("windows").exists());
+}
+
+#[test]
+fn disk_rows_preserves_unreadable_newest_and_older_rows() {
+    for unreadable_index in [0, 1] {
+        let rig = Rig::new("window-disk-unreadable");
+        let older = seed_disk_window(&rig, NOW);
+        let newer = seed_disk_window(&rig, NOW + 1_000);
+        let ids = [newer, older];
+        let path = rig.path(&ids[unreadable_index], "journal");
+        fs::write(&path, b"").unwrap();
+
+        let rows = rig.windows.disk_rows_with(&DiskHost(None));
+        assert_eq!(rows.len(), 2);
+        for (index, (row, id)) in rows.into_iter().zip(ids).enumerate() {
+            assert_eq!(row.owner_liveness, None);
+            if index == unreadable_index {
+                assert_eq!(
+                    row.row.unwrap_err(),
+                    (id, format!("{}: missing begin record", path.display()))
+                );
+            } else {
+                assert_eq!(row.row.unwrap().id, id);
+            }
+        }
+    }
+}
+
+#[test]
+fn disk_rows_reports_a_scan_failure_as_one_unreadable_row() {
+    let rig = Rig::new("window-disk-scan-error");
+    let path = rig.windows.root().join("windows");
+    fs::write(&path, b"not a directory").unwrap();
+
+    let mut rows = rig.windows.disk_rows_with(&DiskHost(None));
+    assert_eq!(rows.len(), 1);
+    let row = rows.pop().unwrap();
+    assert_eq!(row.owner_liveness, None);
+    assert_eq!(
+        row.row.unwrap_err(),
+        (
+            "windows".into(),
+            format!("{}: not a plain directory", path.display())
+        )
+    );
+}
+
+#[test]
+fn disk_rows_keeps_revert_interrupted_behind_closed_newest() {
+    let mut rig = Rig::new("window-disk-reverting");
+    let older = rig.begin(None);
+    let target = rig.file("target", "old");
+    rig.record(&older, file_request(&target, None)).unwrap();
+    let newer = seed_disk_window(&rig, NOW + 1_000);
+    for (id, pid) in [(&older, 41), (&newer, 42)] {
+        let mut locked = Locked::open(rig.windows.root(), id).unwrap();
+        locked
+            .append(Record::RevertStart {
+                owner: identity(pid, 10),
+            })
+            .unwrap();
+        if id == &newer {
+            locked.append(Record::Abandoned).unwrap();
+        }
+    }
+
+    let rows = rig
+        .windows
+        .disk_rows_with(&DiskHost(Some((41, Liveness::Gone))));
+    assert_eq!(rows.len(), 2);
+    let closed = rows[0].row.as_ref().unwrap();
+    assert_eq!(closed.id, newer);
+    assert_eq!(closed.state(|_| unreachable!()), State::Abandoned);
+    assert_eq!(rows[0].owner_liveness, None);
+    let reverting = rows[1].row.as_ref().unwrap();
+    assert_eq!(reverting.id, older);
+    assert_eq!(rows[1].owner_liveness, Some(Liveness::Gone));
+    assert_eq!(
+        reverting.state(|_| rows[1].owner_liveness.unwrap()),
+        State::RevertInterrupted
+    );
+}
+
+#[test]
+fn disk_rows_keeps_the_unfinished_step_owners_reading() {
+    let mut rig = Rig::new("window-disk-liveness");
+    let id = rig.begin(None);
+    let target = rig.file("target", "old");
+    rig.record(&id, file_request(&target, None)).unwrap();
+
+    for reading in [Liveness::Alive, Liveness::Gone, Liveness::Unreadable] {
+        let rows = rig.windows.disk_rows_with(&DiskHost(Some((10, reading))));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].row.as_ref().unwrap().id, id);
+        assert_eq!(rows[0].owner_liveness, Some(reading));
+    }
+
+    fs::remove_file(target).unwrap();
+    rig.done(&id, 1).unwrap();
+    let rows = rig.windows.disk_rows_with(&DiskHost(None));
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].row.as_ref().unwrap().id, id);
+    assert_eq!(rows[0].owner_liveness, None);
+}
+
+#[test]
+fn disk_rows_returns_all_windows_newest_first() {
+    let rig = Rig::new("window-disk-all");
+    let mut ids: Vec<_> = (0..21)
+        .map(|i| seed_disk_window(&rig, NOW + i * 1_000))
+        .collect();
+    ids.reverse();
+
+    let rows = rig.windows.disk_rows_with(&DiskHost(None));
+    assert_eq!(rows.len(), ids.len());
+    for (row, id) in rows.into_iter().zip(ids) {
+        assert_eq!(row.row.unwrap().id, id);
+        assert_eq!(row.owner_liveness, None);
     }
 }
 

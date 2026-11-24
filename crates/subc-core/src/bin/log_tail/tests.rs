@@ -10,12 +10,14 @@ use super::super::{
     collect_log_text, discover_log_sources_in, fixed_lane, log_entry_json, sort_log_entries,
     LogDirs, LogEntry, LogFilterCounts, LogSource, ModuleLogsOptions,
 };
-use super::{newest_log_entries, tail_and_follower};
+use super::{newest_log_entries, read_bounded_tail, read_bounded_tail_in, tail_and_follower};
 
 thread_local! {
     /// How many log entries this thread's reads have built, to show that a
     /// short tail does not copy every line it reads.
     pub(super) static ENTRIES_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Bytes actually read by the tail-window reader, before dropping any partial line.
+    pub(super) static SLICE_BYTES_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Runs once between reading the initial tail and handing over to the
     /// follower, so a test can append in between.
     pub(super) static AFTER_TAIL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
@@ -257,6 +259,128 @@ fn a_missing_source_fails_with_its_path_as_before() {
             .starts_with(&missing.display().to_string()),
         "{error}"
     );
+}
+
+#[test]
+fn bounded_tail_reads_only_the_end_of_each_active_file() {
+    let root = ScratchDir::new("log-tail-disk-window");
+    let dirs = empty_dirs(&root);
+    let module_lines: Vec<_> = (0..30).map(|i| r1(i, 0, &format!("line {i}"))).collect();
+    let capture_line = stamped(r1_ms(59), "capture line");
+    // The undated history and any fragment of the long line would sort after
+    // the dated tail and displace one of the newest 20 entries.
+    let history = format!("undated history\n{}\n", "x".repeat(100_000));
+    write(
+        &dirs.module_logs.join("broca.log"),
+        &format!("{history}{}\n", module_lines.join("\n")),
+    );
+    write(
+        &dirs.run_logs.as_ref().unwrap().join("broca.stderr.log"),
+        &format!("{history}{capture_line}\n"),
+    );
+    write(&dirs.module_logs.join("broca.log.1"), "rotated line\n");
+
+    SLICE_BYTES_READ.with(|total| total.set(0));
+    let tail = read_bounded_tail_in("broca", &dirs).unwrap().unwrap();
+
+    assert_eq!(SLICE_BYTES_READ.with(std::cell::Cell::get), 16_000);
+    assert!(tail.truncated);
+    let expected: Vec<_> = module_lines[11..]
+        .iter()
+        .chain(std::iter::once(&capture_line))
+        .collect();
+    let actual: Vec<_> = tail.entries.iter().map(|entry| &entry.line).collect();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn bounded_tail_reports_a_line_longer_than_the_window_as_truncated() {
+    let root = ScratchDir::new("log-tail-disk-long-line");
+    let dirs = empty_dirs(&root);
+    write(&dirs.module_logs.join("broca.log"), &"x".repeat(8_001));
+
+    let tail = read_bounded_tail_in("broca", &dirs).unwrap().unwrap();
+
+    assert!(tail.truncated);
+    assert!(tail.entries.is_empty());
+}
+
+#[test]
+fn bounded_tail_distinguishes_absent_logs_from_an_empty_read() {
+    let root = ScratchDir::new("log-tail-disk-absent");
+    let dirs = LogDirs {
+        module_logs: root.join("mod-logs"),
+        run_logs: Some(root.join("run-logs")),
+    };
+    assert!(read_bounded_tail_in("broca", &dirs).unwrap().is_none());
+
+    write(&dirs.module_logs.join("broca.log"), "");
+    let tail = read_bounded_tail_in("broca", &dirs).unwrap().unwrap();
+    assert!(tail.entries.is_empty());
+    assert!(!tail.truncated);
+}
+
+#[test]
+fn bounded_tail_returns_run_folder_warning_without_printing() {
+    use std::{env, path::Component, process::Command};
+
+    const CHILD: &str = "CK_TEST_BOUNDED_TAIL_WARNING_CHILD";
+    if env::var_os(CHILD).is_some() {
+        let (dirs, _) = LogDirs::for_module("broca");
+        let cwd = env::current_dir().unwrap();
+        let log_dir = cwd.join(dirs.module_logs);
+        let relative = log_dir.strip_prefix(&cwd).unwrap();
+        assert!(relative
+            .components()
+            .all(|c| matches!(c, Component::Normal(_))));
+        assert!(!relative.as_os_str().is_empty());
+
+        write(&log_dir.join("broca.log"), "module line\n");
+        let (tail, warning) = read_bounded_tail("broca");
+        let tail = tail.unwrap().unwrap();
+        assert_eq!(tail.entries.len(), 1);
+        assert_eq!(tail.entries[0].line, "module line");
+        assert!(!tail.truncated);
+        let warning = warning.unwrap();
+        assert!(
+            warning.starts_with("skipping daemon capture logs:"),
+            "{warning}"
+        );
+        assert!(warning.contains("relative-data-home"), "{warning}");
+
+        // A file in place of the log directory makes discovery fail.
+        fs::remove_file(log_dir.join("broca.log")).unwrap();
+        fs::remove_dir(&log_dir).unwrap();
+        fs::write(&log_dir, "not a directory").unwrap();
+        let (tail, warning_on_error) = read_bounded_tail("broca");
+        assert!(tail.is_err());
+        assert_eq!(warning_on_error.as_deref(), Some(warning.as_str()));
+        return;
+    }
+
+    // A subprocess isolates environment changes and exposes anything printed
+    // to stderr by the reader.
+    let root = ScratchDir::new("log-tail-disk-warning");
+    let cwd = root.join(".").canonicalize().unwrap();
+    let output = Command::new(env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "log_tail::tests::bounded_tail_returns_run_folder_warning_without_printing",
+            "--nocapture",
+        ])
+        .current_dir(&cwd)
+        .env(CHILD, "1")
+        .env("HOME", &cwd)
+        .env("USERPROFILE", &cwd)
+        .env("APPDATA", &cwd)
+        .env("XDG_DATA_HOME", "relative-data-home")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(stdout.contains("1 passed"), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
 }
 
 // ---- following after the initial tail ---------------------------------------

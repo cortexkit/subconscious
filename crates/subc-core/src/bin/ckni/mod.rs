@@ -56,6 +56,7 @@ pub(super) fn plain_output(command: &Command) -> PlainOutput {
         | Command::HealthDetail { .. }
         | Command::Daemon
         | Command::DaemonTriage
+        | Command::Doctor(_)
         | Command::MachineShow
         | Command::MachineAdopt { .. }
         | Command::Quota { .. }

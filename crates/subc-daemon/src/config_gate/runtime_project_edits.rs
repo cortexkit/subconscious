@@ -490,6 +490,46 @@ fn plan_module<'a>(
                 );
                 plan.reviews.insert(tuple, review);
             }
+            Ok(Some(review)) => {
+                // An unstamped plan writes without a module review, so the
+                // daemon lists the tuple's changed fields itself, comparing
+                // the view the files give now with the view after the edit.
+                let before = capture_plan::tuple_layers(module, project, |root, _, _| {
+                    let (_, location) = revision.layer_location(id, root)?;
+                    Ok(location.file.as_ref().map(|file| file.bytes.clone()))
+                })
+                .and_then(|layers| {
+                    let mut user = captured.view.layers[0].clone();
+                    user.project_id = Some(id.clone());
+                    capture_plan::build_review(
+                        module,
+                        id,
+                        captured,
+                        &schema,
+                        build.clone(),
+                        None,
+                        None,
+                        std::iter::once(user).chain(layers).collect(),
+                    )
+                });
+                let before = match before {
+                    Ok(before) => Some(before.approval.view),
+                    Err(error) if error.code == "config_unavailable" => return Err(error),
+                    // The current files are not a valid view, so there is no
+                    // old value to show: every field is listed as new.
+                    Err(_) => None,
+                };
+                plan.unreviewed_fields.extend(
+                    crate::config_gate::review::expected_fields(
+                        module,
+                        &review.schema,
+                        before.as_ref(),
+                        before.as_ref().map(|_| &captured.schema),
+                        &review.approval.view,
+                    )?
+                    .into_values(),
+                );
+            }
             Ok(_) => {}
             Err(error) if error.code == "config_unavailable" => return Err(error),
             Err(error) => plan.refusals.push(capture_plan::notice(

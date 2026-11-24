@@ -431,7 +431,7 @@ impl RuntimeOwner {
                     .map_err(|refusal| {
                         GateError::new(
                             super::super::capture::refusal_code(refusal.code),
-                            "the edit is refused by the admitted schema",
+                            super::super::refusal_rule::describe(&refusal, "user"),
                         )
                     })?;
                 let bytes = edit_text(captured.file.bytes.as_deref(), std::slice::from_ref(&edit))?;
@@ -781,6 +781,29 @@ impl PreparedPlan {
 }
 
 impl PreparedPlan {
+    /// Changed fields of an edit plan that no module review supplies. An
+    /// unstamped install writes accepted edits without asking the module to
+    /// review them, but the person approving the plan still has to see every
+    /// changed field, so the daemon computes these from the before and after
+    /// views, with the same redaction as reviewed fields.
+    pub(crate) fn unreviewed_fields(&self) -> Result<Vec<subc_config::FieldChange>> {
+        let Some(edit) = &self.edits else {
+            return Ok(Vec::new());
+        };
+        let mut fields = Vec::new();
+        let written: BTreeSet<_> = edit.files.iter().map(|file| &file.module).collect();
+        for module in written {
+            if !self.review_modules.contains(module) && self.candidate.modules.contains_key(module)
+            {
+                fields.extend(self.refused_fields(module)?);
+            }
+        }
+        if let Some(capture) = &self.project_capture {
+            fields.extend(capture.unreviewed_fields.iter().cloned());
+        }
+        Ok(fields)
+    }
+
     pub(crate) fn refused_fields(&self, module: &str) -> Result<Vec<subc_config::FieldChange>> {
         let candidate = self.candidate.modules.get(module).ok_or_else(|| {
             GateError::new(

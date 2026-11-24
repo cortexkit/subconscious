@@ -12,4 +12,4 @@ repository = "https://github.com/cortexkit/subconscious"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
-subc-config = { path = "../subc-config", version = "0.1.1" }
+subc-config = { path = "../subc-config", version = "0.1.11" }

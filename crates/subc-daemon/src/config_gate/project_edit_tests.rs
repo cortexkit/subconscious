@@ -683,3 +683,23 @@ async fn project_edit_unstamped_rechecks_membership_target_bytes_and_registry_ou
     );
     assert_eq!(std::fs::read(&target).unwrap(), br#"{"limit":5}"#);
 }
+
+#[tokio::test]
+async fn project_edit_unstamped_lists_each_reading_projects_changed_field() {
+    let rig = CaptureRig::with_state(true, RootIoPool::new().unwrap(), false);
+    rig.set_projects(vec![member("A", Some("W"), &[])]);
+    write_layer(&rig.workspace, 4);
+    let plan = prepare(&rig, vec![edit("workspace", None, Some("W"), 6)])
+        .await
+        .unwrap();
+    assert_eq!(plan.project_reviews().count(), 0);
+    let fields = plan.unreviewed_fields().unwrap();
+    assert_eq!(fields.len(), 1, "{fields:?}");
+    assert_eq!(fields[0].module_id, "a");
+    assert_eq!(fields[0].project_id.as_deref(), Some("A"));
+    assert_eq!(fields[0].path, "/limit");
+    assert_eq!(fields[0].old, subc_config::RecordedValue::new(json!(4)));
+    assert_eq!(fields[0].new, subc_config::RecordedValue::new(json!(6)));
+    assert_eq!(fields[0].old_source, subc_config::Layer::Workspace);
+    assert_eq!(fields[0].new_source, subc_config::Layer::Workspace);
+}

@@ -668,6 +668,10 @@ pub(super) struct CapturePlan {
     pub files: Vec<ProjectFileApproval>,
     pub skipped: Vec<ConfigPlanRefusal>,
     pub refusals: Vec<ConfigPlanRefusal>,
+    /// Changed fields of project tuples an unstamped plan writes without asking
+    /// the module to review them; the daemon computes them from the before
+    /// and after views so the person still sees what changes.
+    pub unreviewed_fields: Vec<subc_config::FieldChange>,
 }
 
 impl CapturePlan {

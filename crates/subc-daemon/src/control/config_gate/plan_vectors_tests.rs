@@ -172,7 +172,7 @@ async fn config_plan_vectors_match_real_handler_bytes() {
         refused["view"]["refusals"],
         json!([{
             "module_id":"demo", "path":"/limit", "code":"value_invalid",
-            "message":"the edit is refused by the admitted schema"
+            "message":"must be a whole number"
         }])
     );
     let refused_get = call(

@@ -3,7 +3,7 @@
     "op": "config.plan",
     "view": {
       "base_revision": 0,
-      "digest": "sha256:94ec2bb8fe9740c651e677f4f8335db5b7aa111e27283733fd3e223f3e5fd830",
+      "digest": "sha256:3a15db22aad89d68b95a0237b7b2b40cc38aa8f57c50bdc8e43d66d5ccc34f9e",
       "plan": {
         "active_generations": {},
         "base_generation": 0,
@@ -18,7 +18,7 @@
             "edit_refusals": [
               {
                 "code": "value_invalid",
-                "message": "the edit is refused by the admitted schema",
+                "message": "must be a whole number",
                 "module_id": "demo",
                 "path": "/limit"
               }
@@ -279,7 +279,7 @@
       "refusals": [
         {
           "code": "value_invalid",
-          "message": "the edit is refused by the admitted schema",
+          "message": "must be a whole number",
           "module_id": "demo",
           "path": "/limit"
         }

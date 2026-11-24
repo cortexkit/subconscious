@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.50.55
+
+- List every changed field, with its old and new values, in an edit plan on
+  an unstamped install. The module is still not asked to review there; the
+  daemon compares the settings before and after the edit itself, for user,
+  workspace and project files, with the same redaction as reviewed fields.
+- Name the rule a refused user settings edit breaks, such as "must be at most
+  90" or "must be one of \"fast\", \"slow\"", instead of a generic refusal.
+  The rule comes from the validator's refusal (subc-config 0.1.11). The
+  refusal code is unchanged.
+
 ## 0.50.54
 
 - On Unix without `XDG_RUNTIME_DIR`, publish the connection file in the daemon's

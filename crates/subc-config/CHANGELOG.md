@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.11
+
+- Name the schema rule a refused value broke in the new `Refusal::rule` field
+  (`RefusalRule`: type, const, enum, length, pattern, numeric bounds, list
+  rules, undeclared and required keys, references, credentials, variants and
+  inheritance bounds), with the bound or allowed values the schema declares
+  and never the refused value. The field is not serialized, so a serialized
+  `Refusal` is unchanged. `Refusal::new` leaves it empty; `with_rule` sets it.
+
 ## 0.1.10
 
 - Refuse `propertyNames` and `not` on ordinary settings nodes instead of silently ignoring them.

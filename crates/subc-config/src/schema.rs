@@ -1,6 +1,6 @@
 use crate::{
     canonical_json, digest, ApplyKind, Bound, Digest, Layer, RecordedValue, Refusal, RefusalCode,
-    PURPOSE_SCHEMA, PURPOSE_VALUE,
+    RefusalRule, PURPOSE_SCHEMA, PURPOSE_VALUE,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -829,12 +829,24 @@ fn validate(
     c: &ValidationContext,
 ) -> Result<(), Refusal> {
     let invalid = || refusal(RefusalCode::ValueInvalid, path, c);
+    let broke = |rule| invalid().with_rule(rule);
     let opaque = is_opaque(s);
     if opaque && matches!(layer, Some(Layer::Workspace | Layer::Project)) {
         return Err(refusal(RefusalCode::LayerForbidden, path, c));
     }
-    if value.is_null() || canonical_json(value).is_err() || contains_expansion(value) {
+    if value.is_null() {
+        return Err(match type_names(&s["type"]) {
+            Some(expected) if !matches_type(&s["type"], value) => {
+                broke(RefusalRule::Type { expected })
+            }
+            _ => invalid(),
+        });
+    }
+    if canonical_json(value).is_err() {
         return Err(invalid());
+    }
+    if contains_expansion(value) {
+        return Err(broke(RefusalRule::Expansion));
     }
     if let Some(layer) = layer.filter(|&layer| layer != Layer::Default) {
         if let Some(layers) = s.get("x-ck-layers").and_then(Value::as_array) {
@@ -848,7 +860,7 @@ fn validate(
         return if layer != Some(Layer::Default) && is_vault_reference(value) {
             Ok(())
         } else {
-            Err(invalid())
+            Err(broke(RefusalRule::Credential))
         };
     }
     if !opaque && s.get("oneOf").is_some() {
@@ -868,19 +880,33 @@ fn validate(
                 return Ok(());
             }
         }
-        return Err(invalid());
+        return Err(broke(RefusalRule::Variant));
     }
-    let matches = if opaque {
-        opaque::matches(s, value)
+    if opaque {
+        if !opaque::matches(s, value) {
+            return Err(invalid());
+        }
     } else {
-        matches_type(&s["type"], value)
-            && s.get("const").is_none_or(|v| same_scalar(v, value))
-            && s.get("enum")
-                .and_then(Value::as_array)
-                .is_none_or(|a| a.iter().any(|v| same_scalar(v, value)))
-    };
-    if !matches {
-        return Err(invalid());
+        if !matches_type(&s["type"], value) {
+            return Err(match type_names(&s["type"]) {
+                Some(expected) => broke(RefusalRule::Type { expected }),
+                None => invalid(),
+            });
+        }
+        if let Some(constant) = s.get("const").filter(|v| !same_scalar(v, value)) {
+            return Err(broke(RefusalRule::Const {
+                value: constant.clone(),
+            }));
+        }
+        if let Some(values) = s
+            .get("enum")
+            .and_then(Value::as_array)
+            .filter(|a| !a.iter().any(|v| same_scalar(v, value)))
+        {
+            return Err(broke(RefusalRule::Enum {
+                values: values.clone(),
+            }));
+        }
     }
     if let Some(options) = s.get("x-ck-options") {
         if options.get("closed") == Some(&Value::Bool(true)) {
@@ -888,7 +914,7 @@ fn validate(
             // a schema enum cannot substitute for an unavailable catalog.
             let set = c.closed_options.get(path);
             if set.is_none_or(|values| !values.iter().any(|v| same_scalar(v, value))) {
-                return Err(invalid());
+                return Err(broke(RefusalRule::ClosedOption));
             }
         }
     }
@@ -897,23 +923,31 @@ fn validate(
     }
     if let Some(text) = value.as_str() {
         if text.contains("{env:") || text.contains("{file:") {
-            return Err(invalid());
+            return Err(broke(RefusalRule::Expansion));
         }
         let len = text.chars().count() as u64;
-        if s.get("minLength")
+        if let Some(bound) = s
+            .get("minLength")
             .and_then(Value::as_u64)
-            .is_some_and(|n| len < n)
-            || s.get("maxLength")
-                .and_then(Value::as_u64)
-                .is_some_and(|n| len > n)
+            .filter(|&n| len < n)
         {
-            return Err(invalid());
+            return Err(broke(RefusalRule::MinLength { bound }));
         }
-        if s.get("pattern")
-            .and_then(Value::as_str)
-            .is_some_and(|p| !schema_regex(p).expect("normalized pattern").is_match(text))
+        if let Some(bound) = s
+            .get("maxLength")
+            .and_then(Value::as_u64)
+            .filter(|&n| len > n)
         {
-            return Err(invalid());
+            return Err(broke(RefusalRule::MaxLength { bound }));
+        }
+        if let Some(pattern) = s
+            .get("pattern")
+            .and_then(Value::as_str)
+            .filter(|p| !schema_regex(p).expect("normalized pattern").is_match(text))
+        {
+            return Err(broke(RefusalRule::Pattern {
+                pattern: pattern.into(),
+            }));
         }
     }
     if let Some(n) = value.as_f64() {
@@ -923,15 +957,24 @@ fn validate(
             ("exclusiveMinimum", true),
             ("exclusiveMaximum", true),
         ] {
-            if let Some(bound) = s.get(key).and_then(Value::as_f64) {
-                let is_min = key.ends_with("Minimum") || key == "minimum";
-                if if is_min {
-                    n < bound || (fails && n == bound)
+            let Some(declared) = s.get(key).and_then(Value::as_number) else {
+                continue;
+            };
+            let Some(bound) = declared.as_f64() else {
+                continue;
+            };
+            let is_min = key.ends_with("Minimum") || key == "minimum";
+            if if is_min {
+                n < bound || (fails && n == bound)
+            } else {
+                n > bound || (fails && n == bound)
+            } {
+                let (bound, exclusive) = (declared.clone(), fails);
+                return Err(broke(if is_min {
+                    RefusalRule::Minimum { bound, exclusive }
                 } else {
-                    n > bound || (fails && n == bound)
-                } {
-                    return Err(invalid());
-                }
+                    RefusalRule::Maximum { bound, exclusive }
+                }));
             }
         }
     }
@@ -946,12 +989,14 @@ fn validate(
                 .iter()
                 .any(|(k, v)| (k == "env" || k == "file") && v.is_string())
         {
-            return Err(invalid());
+            return Err(broke(RefusalRule::Reference));
         }
         for (key, child) in object {
             let child_path = pointer(path, key);
-            let schema = child_schema(s, key)
-                .ok_or_else(|| refusal(RefusalCode::ValueInvalid, &child_path, c))?;
+            let schema = child_schema(s, key).ok_or_else(|| {
+                refusal(RefusalCode::ValueInvalid, &child_path, c)
+                    .with_rule(RefusalRule::Undeclared)
+            })?;
             validate(schema, child, &child_path, layer, partial, c)?;
         }
         if !partial {
@@ -959,7 +1004,8 @@ fn validate(
                 for key in required {
                     let key = key.as_str().ok_or_else(invalid)?;
                     if !object.contains_key(key) {
-                        return Err(refusal(RefusalCode::ValueInvalid, &pointer(path, key), c));
+                        return Err(refusal(RefusalCode::ValueInvalid, &pointer(path, key), c)
+                            .with_rule(RefusalRule::Required { key: key.into() }));
                     }
                 }
             }
@@ -968,21 +1014,28 @@ fn validate(
                     if schema.get("x-ck-required") == Some(&Value::Bool(true))
                         && !object.contains_key(key)
                     {
-                        return Err(refusal(RefusalCode::ValueInvalid, &pointer(path, key), c));
+                        return Err(refusal(RefusalCode::ValueInvalid, &pointer(path, key), c)
+                            .with_rule(RefusalRule::Required { key: key.clone() }));
                     }
                 }
             }
         }
     }
     if let Some(array) = value.as_array() {
-        if s.get("minItems")
+        let count = array.len() as u64;
+        if let Some(bound) = s
+            .get("minItems")
             .and_then(Value::as_u64)
-            .is_some_and(|n| (array.len() as u64) < n)
-            || s.get("maxItems")
-                .and_then(Value::as_u64)
-                .is_some_and(|n| array.len() as u64 > n)
+            .filter(|&n| count < n)
         {
-            return Err(invalid());
+            return Err(broke(RefusalRule::MinItems { bound }));
+        }
+        if let Some(bound) = s
+            .get("maxItems")
+            .and_then(Value::as_u64)
+            .filter(|&n| count > n)
+        {
+            return Err(broke(RefusalRule::MaxItems { bound }));
         }
         if s.get("uniqueItems") == Some(&Value::Bool(true))
             && array
@@ -990,7 +1043,7 @@ fn validate(
                 .enumerate()
                 .any(|(i, v)| array[..i].iter().any(|x| same_scalar(x, v)))
         {
-            return Err(invalid());
+            return Err(broke(RefusalRule::UniqueItems));
         }
         let ids_declared = s["items"]["properties"].get("id").is_some();
         let mut ids = Vec::new();
@@ -998,7 +1051,7 @@ fn validate(
             if ids_declared {
                 if let Some(id) = child.get("id") {
                     if ids.contains(id) {
-                        return Err(invalid());
+                        return Err(broke(RefusalRule::DuplicateId));
                     }
                     ids.push(id.clone());
                 }
@@ -1014,6 +1067,20 @@ fn validate(
         }
     }
     Ok(())
+}
+/// The JSON type names a `type` keyword declares, or `None` when it declares none.
+fn type_names(kind: &Value) -> Option<Vec<String>> {
+    match kind {
+        Value::String(kind) => Some(vec![kind.clone()]),
+        Value::Array(kinds) => Some(
+            kinds
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect(),
+        ),
+        _ => None,
+    }
 }
 fn matches_type(kind: &Value, value: &Value) -> bool {
     match kind.as_str() {
@@ -1079,7 +1146,13 @@ fn merge(
     c: &ValidationContext,
 ) -> Result<(), Refusal> {
     if matches!(layer, Layer::Workspace | Layer::Project) && !bound_ok(s, lower, higher) {
-        return Err(refusal(RefusalCode::BoundViolated, path, c));
+        let refused = refusal(RefusalCode::BoundViolated, path, c);
+        return Err(
+            match serde_json::from_value::<Bound>(s["x-ck-bound"].clone()) {
+                Ok(bound) => refused.with_rule(RefusalRule::Bound { bound }),
+                Err(_) => refused,
+            },
+        );
     }
     if credential(s) || is_opaque(s) {
         *lower = higher.clone();
@@ -2137,6 +2210,12 @@ mod tests {
         assert_eq!(refusal.code, RefusalCode::BoundViolated);
         assert_eq!(refusal.path, "/n");
         assert_eq!(refusal.project_id.as_deref(), Some("project-one"));
+        assert_eq!(
+            refusal.rule.as_deref(),
+            Some(&RefusalRule::Bound {
+                bound: Bound::RaiseOnly
+            })
+        );
         assert!(s
             .review_tuple(&layers(json!({"n":20}), json!({"n":25})), &context())
             .is_ok());
@@ -2628,5 +2707,242 @@ mod tests {
                 "{keyword}"
             );
         }
+    }
+
+    fn rule(s: &Schema, value: Value) -> Option<RefusalRule> {
+        s.validate_layer(Layer::User, &value, &context())
+            .unwrap_err()
+            .rule
+            .map(|rule| *rule)
+    }
+
+    fn bounded(kind: &str, default: Value, bounds: Value) -> Value {
+        let mut node = field(kind, default);
+        node.as_object_mut()
+            .unwrap()
+            .extend(bounds.as_object().unwrap().clone());
+        node
+    }
+
+    #[test]
+    fn refusal_rule_names_type_const_enum_and_numeric_bounds() {
+        let s = schema(json!({
+            "pct": bounded("integer", json!(50), json!({"minimum": 20, "maximum": 90})),
+            "ratio": bounded("number", json!(0.5), json!({"exclusiveMinimum": 0, "exclusiveMaximum": 1.5})),
+            "mode": bounded("string", json!("fast"), json!({"enum": ["fast", "slow"]})),
+            "switch": bounded("string", json!("on"), json!({"const": "on"})),
+            "step": bounded("number", json!(2), json!({"enum": [1, 2], "minimum": 1.5})),
+        }));
+        let number = |n: f64| serde_json::Number::from_f64(n).unwrap();
+        assert_eq!(
+            rule(&s, json!({"pct": 95})),
+            Some(RefusalRule::Maximum {
+                bound: 90.into(),
+                exclusive: false
+            })
+        );
+        assert_eq!(
+            rule(&s, json!({"pct": 5})),
+            Some(RefusalRule::Minimum {
+                bound: 20.into(),
+                exclusive: false
+            })
+        );
+        let integer = Some(RefusalRule::Type {
+            expected: vec!["integer".into()],
+        });
+        assert_eq!(rule(&s, json!({"pct": "x"})), integer);
+        assert_eq!(rule(&s, json!({"pct": null})), integer);
+        assert_eq!(
+            rule(&s, json!({"ratio": 0})),
+            Some(RefusalRule::Minimum {
+                bound: 0.into(),
+                exclusive: true
+            })
+        );
+        assert_eq!(
+            rule(&s, json!({"ratio": 1.5})),
+            Some(RefusalRule::Maximum {
+                bound: number(1.5),
+                exclusive: true
+            })
+        );
+        assert_eq!(
+            rule(&s, json!({"mode": "warp"})),
+            Some(RefusalRule::Enum {
+                values: vec![json!("fast"), json!("slow")]
+            })
+        );
+        assert_eq!(
+            rule(&s, json!({"switch": "off"})),
+            Some(RefusalRule::Const { value: json!("on") })
+        );
+        // Enum membership uses canonical JSON, where 1.0 is the value 1, so the
+        // enum passes and the minimum is what fails. Plain JSON value equality
+        // would wrongly blame the enum.
+        assert_ne!(json!(1.0), json!(1));
+        assert_eq!(
+            rule(&s, json!({"step": 1.0})),
+            Some(RefusalRule::Minimum {
+                bound: number(1.5),
+                exclusive: false
+            })
+        );
+        assert_eq!(
+            rule(&s, json!({"step": 3})),
+            Some(RefusalRule::Enum {
+                values: vec![json!(1), json!(2)]
+            })
+        );
+    }
+
+    #[test]
+    fn refusal_rule_names_text_rules_and_closed_options() {
+        let mut choice = field("string", json!("small"));
+        choice["x-ck-options"] = json!({"source":{"module":"catalog","op":"list","params":{}},"items_pointer":"/items","value_pointer":"/id","label_pointer":"/label","depends_on":[],"closed":true});
+        let s = schema(json!({
+            "name": bounded("string", json!("ab"), json!({"minLength": 2, "maxLength": 4, "pattern": "^[a-z]+$"})),
+            "choice": choice,
+        }));
+        assert_eq!(
+            rule(&s, json!({"name": "a"})),
+            Some(RefusalRule::MinLength { bound: 2 })
+        );
+        assert_eq!(
+            rule(&s, json!({"name": "abcde"})),
+            Some(RefusalRule::MaxLength { bound: 4 })
+        );
+        // "ab1" passes both lengths, so only the declared pattern refuses it.
+        assert_eq!(
+            rule(&s, json!({"name": "ab1"})),
+            Some(RefusalRule::Pattern {
+                pattern: "^[a-z]+$".into()
+            })
+        );
+        assert_eq!(
+            rule(&s, json!({"name": "{env:NAME}"})),
+            Some(RefusalRule::Expansion)
+        );
+        assert_eq!(
+            rule(&s, json!({"choice": "small"})),
+            Some(RefusalRule::ClosedOption)
+        );
+    }
+
+    #[test]
+    fn refusal_rule_names_list_rules() {
+        let mut tags = bounded(
+            "array",
+            json!(["a"]),
+            json!({"minItems": 1, "maxItems": 2, "uniqueItems": true}),
+        );
+        tags["items"] = field("string", json!(""));
+        let mut counts = bounded("array", json!([]), json!({"uniqueItems": true}));
+        counts["items"] = field("number", json!(0));
+        let mut entries = field("array", json!([]));
+        entries["items"] = object(json!({"id": field("string", json!(""))}));
+        let s = schema(json!({"tags": tags, "counts": counts, "entries": entries}));
+        assert_eq!(
+            rule(&s, json!({"tags": []})),
+            Some(RefusalRule::MinItems { bound: 1 })
+        );
+        assert_eq!(
+            rule(&s, json!({"tags": ["a", "b", "c"]})),
+            Some(RefusalRule::MaxItems { bound: 2 })
+        );
+        assert_eq!(
+            rule(&s, json!({"tags": ["a", "a"]})),
+            Some(RefusalRule::UniqueItems)
+        );
+        // 1 and 1.0 are the same value under canonical JSON.
+        assert_eq!(
+            rule(&s, json!({"counts": [1, 1.0]})),
+            Some(RefusalRule::UniqueItems)
+        );
+        assert_eq!(
+            rule(&s, json!({"entries": [{"id": "x"}, {"id": "x"}]})),
+            Some(RefusalRule::DuplicateId)
+        );
+        let refusal = s
+            .validate_layer(Layer::User, &json!({"tags": [3]}), &context())
+            .unwrap_err();
+        assert_eq!(refusal.path, "/tags/0");
+        assert_eq!(
+            refusal.rule.as_deref(),
+            Some(&RefusalRule::Type {
+                expected: vec!["string".into()]
+            })
+        );
+    }
+
+    #[test]
+    fn refusal_rule_names_object_variant_and_credential_rules() {
+        let mut map = object(json!({}));
+        map["patternProperties"] = json!({"^[a-z]+$": field("string", json!(""))});
+        let mut disk_kind = field("string", json!("disk"));
+        disk_kind["const"] = json!("disk");
+        let mut memory_kind = field("string", json!("memory"));
+        memory_kind["const"] = json!("memory");
+        let mut disk = object(json!({"kind": disk_kind}));
+        disk["required"] = json!(["kind"]);
+        let mut memory = object(json!({"kind": memory_kind}));
+        memory["required"] = json!(["kind"]);
+        let mut name = field("string", Value::Null);
+        name.as_object_mut().unwrap().remove("default");
+        name["x-ck-required"] = json!(true);
+        let s = schema(json!({
+            "map": map,
+            "key": credential_field(),
+            "storage": {"oneOf": [disk, memory], "default": {"kind": "disk"}},
+            "name": name,
+        }));
+        let refusal = s
+            .validate_layer(Layer::User, &json!({"unknown": 1}), &context())
+            .unwrap_err();
+        assert_eq!(refusal.path, "/unknown");
+        assert_eq!(refusal.rule.as_deref(), Some(&RefusalRule::Undeclared));
+        assert_eq!(
+            rule(&s, json!({"map": {"env": "HOME"}})),
+            Some(RefusalRule::Reference)
+        );
+        assert_eq!(
+            rule(&s, json!({"key": "literal secret"})),
+            Some(RefusalRule::Credential)
+        );
+        assert_eq!(
+            rule(&s, json!({"storage": {"kind": "tape"}})),
+            Some(RefusalRule::Variant)
+        );
+        let missing = s
+            .review_tuple(&[LayerValue::new(Layer::User, json!({}))], &context())
+            .unwrap_err();
+        assert_eq!(missing.path, "/name");
+        assert_eq!(
+            missing.rule.as_deref(),
+            Some(&RefusalRule::Required { key: "name".into() })
+        );
+    }
+
+    #[test]
+    fn refusal_rule_stays_off_the_wire() {
+        let s = schema(json!({"pct": bounded("integer", json!(50), json!({"maximum": 90}))}));
+        let refusal = s
+            .validate_layer(Layer::User, &json!({"pct": 95}), &context())
+            .unwrap_err();
+        assert!(refusal.rule.is_some());
+        let wire = serde_json::to_value(&refusal).unwrap();
+        assert_eq!(
+            wire,
+            json!({"code": "value_invalid", "path": "/pct", "project_id": "project-one"})
+        );
+        let read: Refusal = serde_json::from_value(wire).unwrap();
+        assert_eq!(
+            read,
+            Refusal::new(
+                RefusalCode::ValueInvalid,
+                "/pct",
+                Some("project-one".into())
+            )
+        );
     }
 }

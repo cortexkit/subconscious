@@ -1113,6 +1113,7 @@ impl ControlHandler {
                     return Ok(ConfigControlResponse::Plan { view });
                 }
                 prepared.add_edit_refusals(edit_refusals);
+                fields.extend(prepared.unreviewed_fields()?);
                 let view = config_work(runtime, ConfigWake::Delivery, move |owner| {
                     owner.finish_plan(prepared, move |old, new| {
                         let mut changeset = crate::config_gate::runtime::daemon_review(old, new)?;

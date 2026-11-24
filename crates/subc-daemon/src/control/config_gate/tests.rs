@@ -5,6 +5,10 @@ use serde_json::{json, Value};
 #[path = "plan_vectors_tests.rs"]
 mod plan_vectors;
 
+#[cfg(target_os = "linux")]
+#[path = "plan_fields_tests.rs"]
+mod plan_fields;
+
 fn frame(body: Value) -> Frame {
     Frame::build(
         FrameType::Request,

@@ -52,6 +52,12 @@ pub struct Refusal {
     pub code: RefusalCode,
     pub path: String,
     pub project_id: Option<String>,
+    /// The schema rule the value at `path` broke, when validation can name a
+    /// single one. It holds schema text, so it is never serialized: a
+    /// serialized refusal keeps only the code and the pointer. Boxed so the
+    /// many `Result<_, Refusal>` returns stay small.
+    #[serde(skip)]
+    pub rule: Option<Box<RefusalRule>>,
 }
 impl Refusal {
     pub fn new(code: RefusalCode, path: impl Into<String>, project_id: Option<String>) -> Self {
@@ -59,8 +65,69 @@ impl Refusal {
             code,
             path: path.into(),
             project_id,
+            rule: None,
         }
     }
+
+    /// The same refusal, naming the rule that failed.
+    pub fn with_rule(mut self, rule: RefusalRule) -> Self {
+        self.rule = Some(Box::new(rule));
+        self
+    }
+}
+
+/// The rule a refused settings value broke, with the bound or the allowed
+/// values the schema declares. It never holds the refused value itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RefusalRule {
+    /// `type`: the value, or a null, is not one of these JSON types.
+    Type { expected: Vec<String> },
+    /// `const`: only this value is allowed.
+    Const { value: Value },
+    /// `enum`: only these values are allowed.
+    Enum { values: Vec<Value> },
+    /// `x-ck-options` with `closed`: the value is not among the offered options.
+    ClosedOption,
+    /// `x-ck-kind: credential_ref`: only a vault reference is allowed.
+    Credential,
+    /// `oneOf`: the value matches none of the tagged variants.
+    Variant,
+    /// Text holds an `{env:...}` or `{file:...}` expansion.
+    Expansion,
+    /// An object is the old `{"env": ...}` or `{"file": ...}` reference form.
+    Reference,
+    /// `minLength`, counted in characters.
+    MinLength { bound: u64 },
+    /// `maxLength`, counted in characters.
+    MaxLength { bound: u64 },
+    /// `pattern`: text must match this regular expression.
+    Pattern { pattern: String },
+    /// `minimum`, or `exclusiveMinimum` when `exclusive`.
+    Minimum {
+        bound: serde_json::Number,
+        exclusive: bool,
+    },
+    /// `maximum`, or `exclusiveMaximum` when `exclusive`.
+    Maximum {
+        bound: serde_json::Number,
+        exclusive: bool,
+    },
+    /// `minItems`.
+    MinItems { bound: u64 },
+    /// `maxItems`.
+    MaxItems { bound: u64 },
+    /// `uniqueItems`: two list items are the same value.
+    UniqueItems,
+    /// Two list items carry the same `id`.
+    DuplicateId,
+    /// The object key is not declared by the schema.
+    Undeclared,
+    /// `required` or `x-ck-required`: the key is missing.
+    Required { key: String },
+    /// `x-ck-bound`: a workspace or project value moves the inherited value
+    /// the way the bound forbids.
+    Bound { bound: Bound },
 }
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

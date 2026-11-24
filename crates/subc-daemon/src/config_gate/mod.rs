@@ -13,6 +13,7 @@ mod capture_plan;
 pub(crate) mod program;
 pub mod project_layers;
 pub mod project_registry;
+mod refusal_rule;
 pub(crate) mod review;
 mod reviewed_build;
 mod root_io;

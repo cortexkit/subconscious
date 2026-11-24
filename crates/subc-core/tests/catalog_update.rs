@@ -335,7 +335,18 @@ async fn declared_not_ready_refuses_without_relay_until_catalog_update_marks_rea
         .unwrap()
         .expect("stub registered");
     assert!(!registration.ready);
-    let (_, initial_catalog) = catalog_list(&server, Some(module_id), 710).await;
+    // The registry reserves the module ID before HELLO publishes it to the catalog.
+    let initial_catalog = timeout(SETUP_TIMEOUT, async {
+        loop {
+            let (_, entries) = catalog_list(&server, Some(module_id), 710).await;
+            if !entries.is_empty() {
+                return entries;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("catalog.list did not list {module_id} within {SETUP_TIMEOUT:?}"));
     assert!(!initial_catalog[0].ready);
 
     let project = TestProject::new("declared-not-ready-first-open");

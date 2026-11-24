@@ -337,6 +337,38 @@ async fn project_settings_status_attributes_forbidden_workspace_field() {
 }
 
 #[tokio::test]
+async fn project_settings_status_explains_forbidden_files_for_user_only_module() {
+    let rig =
+        CaptureRig::with_declaration(true, RootIoPool::new().unwrap(), false, |declaration| {
+            declaration.schema["x-ck-layers"] = json!(["user"]);
+        });
+    let private = root(&rig.project_scratch, "private");
+    let project = write_layer(&private, 9);
+    let workspace = write_layer(&rig.workspace, 4);
+    rig.set_projects(vec![
+        member("A", None, &[&private]),
+        member("B", Some("W"), &[]),
+    ]);
+
+    let invalid = config_status(&status_handler(&rig)).await;
+    assert_eq!(
+        invalid["status"]["file_errors"],
+        json!([
+            {
+                "module_id":"a", "project_id":"A", "code":"layer_forbidden",
+                "message":"a/A: a takes no settings from project files (its settings are user-only)",
+                "layer":"project", "path":project
+            },
+            {
+                "module_id":"a", "project_id":"B", "workspace_id":"W", "code":"layer_forbidden",
+                "message":"a/B: a takes no settings from workspace files (its settings are user-only)",
+                "layer":"workspace", "path":workspace
+            }
+        ])
+    );
+}
+
+#[tokio::test]
 async fn project_settings_status_attributes_a_refused_file_open() {
     let rig = CaptureRig::with_state(true, RootIoPool::new().unwrap(), false);
     let private = root(&rig.project_scratch, "private");

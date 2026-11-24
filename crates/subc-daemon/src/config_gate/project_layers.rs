@@ -4,7 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use regex::Regex;
 use serde_json::Value;
-use subc_config::{ApplyKind, Layer, LayerValue, ReviewedTuple, Schema, ValidationContext};
+use subc_config::{
+    ApplyKind, Layer, LayerValue, RefusalCode, ReviewedTuple, Schema, ValidationContext,
+};
 use subc_protocol::config::ConfigView;
 
 use super::{capture, review, GateError, Result};
@@ -113,10 +115,24 @@ impl ProjectLayerSchema {
             )
             .map_err(|attributed| {
                 let refusal = attributed.refusal;
-                let error = GateError::new(
-                    capture::refusal_code(refusal.code),
-                    format!("{module}/{project}: {}", refusal.path),
-                );
+                let file_layer = match (refusal.code, refusal.path.as_str(), attributed.layer) {
+                    (RefusalCode::LayerForbidden, "", Some(Layer::Workspace)) => Some("workspace"),
+                    (RefusalCode::LayerForbidden, "", Some(Layer::Project)) => Some("project"),
+                    _ => None,
+                };
+                let detail = if let Some(layer) = file_layer {
+                    let reason = match self.schema.normalized()["x-ck-layers"]
+                        .as_array()
+                        .map(Vec::as_slice)
+                    {
+                        Some([only]) if only == "user" => "its settings are user-only",
+                        _ => "its schema does not allow that layer",
+                    };
+                    format!("{module}/{project}: {module} takes no settings from {layer} files ({reason})")
+                } else {
+                    format!("{module}/{project}: {}", refusal.path)
+                };
+                let error = GateError::new(capture::refusal_code(refusal.code), detail);
                 match attributed.layer {
                     Some(layer) => error.at_settings_layer(layer),
                     None => error,

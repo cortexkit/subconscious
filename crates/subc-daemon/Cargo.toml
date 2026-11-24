@@ -1,6 +1,6 @@
 [package]
 name = "subc-daemon"
-version = "0.50.51"
+version = "0.50.52"
 edition = "2021"
 publish = true
 description = "Embeddable subc daemon: bootstrap, module supervision, and opaque-byte splice routing."

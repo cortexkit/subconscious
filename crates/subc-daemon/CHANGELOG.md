@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.50.52
+
+- Explain in configuration status why a module's schema refuses a whole project
+  or workspace settings file. Field-level refusals still name the field.
+
 ## 0.50.51
 
 - Report refused user settings files in the daemon log and configuration

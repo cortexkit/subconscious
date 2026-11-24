@@ -182,7 +182,7 @@ The acceptance bar for a connector joining this plane is the empty-store operato
 
 This section specifies the public cross-repository delivery contract for scheduled wakes.
 
-One WAKE concept: SOURCE (timer | Plexus event | condition script | idleness)
+One WAKE concept: SOURCE (timer | Plexus event | condition script)
 → POLICY (per-source store rows on prefrontal; scope ladder
 Global > Workspace > Project > Alfonso, MOST-SPECIFIC-WINS) → DELIVERY (one
 composer, existing wake-effect machinery over this contract's transport —

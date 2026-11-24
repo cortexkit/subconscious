@@ -862,20 +862,60 @@ async fn audit_registration_missing_support_holds_crash_budget_and_reapproval_re
     assert_eq!(held.lifetime_restarts, before.lifetime_restarts);
     assert!(module.next_retry_at_ms().unwrap().is_none());
     assert_eq!(module.terminal_history().entries.len(), 1);
+    let (idle, mut passes) = tokio::sync::mpsc::unbounded_channel();
     let handler = Arc::new(
         crate::ControlHandler::new(registry)
-            .with_supervisor(handle)
-            .with_config_runtime(owner.clone()),
+            .with_supervisor(handle.clone())
+            .with_config_runtime(owner.clone())
+            .with_delivery_idle_for_test(idle),
     );
     let worker = handler.spawn_config_delivery_worker().unwrap();
+    let resume = tokio::time::timeout(Duration::from_secs(5), passes.recv())
+        .await
+        .expect("delivery worker must finish reconciling the exit")
+        .unwrap();
+    let mut changes = handle.subscribe_process_changes("a");
+    let held_seq = handle.spawn_snapshot().cursor.seq;
+    // Take the module gate after preflight has reserved the spawn generation
+    // but before the supervisor reacquires the gate to start the process.
+    let gate = owner.module_gate("a").unwrap();
+    let (hold, mut held_gate) = tokio::sync::oneshot::channel();
+    owner.set_spawn_preflight_hook_for_test(move || {
+        hold.send(gate.try_lock_owned().unwrap()).unwrap();
+    });
     entry(&rig, "registration_channel", json!(true));
     approve(&rig, &owner, PlanKind::Change);
-    until(|| module.status().unwrap().process_alive).await;
+    resume.send(()).unwrap();
+    let _paused = tokio::time::timeout(Duration::from_secs(5), passes.recv())
+        .await
+        .expect("delivery worker must finish attempting the reapproved spawn")
+        .unwrap();
+    let deferred = module.status().unwrap();
+    assert_eq!(deferred.state, ModuleState::Restarting);
+    assert!(!deferred.process_alive);
+    assert_eq!(handle.spawn_snapshot().cursor.seq, held_seq);
+    drop(
+        held_gate
+            .try_recv()
+            .expect("preflight must hold the module gate"),
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), changes.changed())
+        .await
+        .expect("the deferred spawn must retry after the gate is released")
+        .unwrap();
     let revived = module.status().unwrap();
+    let revived_seq = handle.spawn_snapshot().cursor.seq;
     worker.abort();
+    let _ = worker.await;
     module.stop().await.unwrap();
-    assert_eq!(revived.spawn_generation, before.spawn_generation + 1);
+    assert!(revived.process_alive);
+    // The deferred attempt keeps its generation. Only process events count
+    // actual starts and exits, and the revival must add just one start.
+    assert!(revived.spawn_generation > before.spawn_generation);
+    assert_eq!(revived_seq, held_seq + 1);
     assert_eq!(revived.restart_count, before.restart_count);
+    assert_eq!(revived.lifetime_restarts, before.lifetime_restarts);
     assert_eq!(revived.restart_count, 2);
 }
 

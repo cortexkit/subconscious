@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.50.48
+
+- Test only: verify that reapproving registration support starts one replacement
+  without counting it against the crash-restart limit, even when a deferred
+  launch skips a generation.
+
 ## 0.50.47
 
 - Use a zero teardown drain budget in route-open recovery tests without changing

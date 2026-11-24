@@ -809,7 +809,7 @@ pub fn ensure_daemon_run_dir_private() -> Result<PathBuf, io::Error> {
 /// unsafe in this edition -- which is the better outcome: the seam is a parameter
 /// rather than a global the test has to fight).
 #[cfg(unix)]
-fn ensure_directory_private(path: &Path) -> Result<(), io::Error> {
+pub(crate) fn ensure_directory_private(path: &Path) -> Result<(), io::Error> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
     if !path.exists() {
@@ -856,7 +856,7 @@ pub fn daemon_run_dir() -> Result<PathBuf, DaemonRunDirError> {
 
 /// The policy half of [`daemon_run_dir`], taking the data home as a parameter so
 /// a test can drive both outcomes without touching the process environment.
-fn daemon_run_dir_from(data_home: PathBuf) -> Result<PathBuf, DaemonRunDirError> {
+pub(crate) fn daemon_run_dir_from(data_home: PathBuf) -> Result<PathBuf, DaemonRunDirError> {
     if !data_home.is_absolute() {
         return Err(DaemonRunDirError::RelativeDataHome { data_home });
     }

@@ -33,8 +33,9 @@ port 8757 by default; `port` in `subc.jsonc` or the `SUBC_PORT` environment
 variable overrides it (`DEFAULT_SUBC_PORT` in
 `crates/subc-daemon/src/bootstrap.rs`). The daemon
 writes the endpoint and a fresh 32-byte key to the connection file, mode
-`0600` (`$XDG_RUNTIME_DIR/subc-connection.json`, or a per-user file in the
-system temporary directory; see [`data-model.md`](data-model.md) section 2).
+`0600` on Unix. It prefers `$XDG_RUNTIME_DIR`; on Unix without it, the daemon
+uses its run directory. See [Connection file](data-model.md#2-connection-file)
+for the fallback paths and Windows permissions.
 
 A connection starts with a mutual HMAC-SHA256 handshake over that key
 (`crates/subc-transport/src/auth.rs`): the client sends a nonce, the daemon

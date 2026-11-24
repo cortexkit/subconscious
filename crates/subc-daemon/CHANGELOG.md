@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.50.54
+
+- On Unix without `XDG_RUNTIME_DIR`, publish the connection file in the daemon's
+  run directory so system temporary-file cleanup cannot remove it.
+
 ## 0.50.53
 
 - Tests only: the helper processes that the bootstrap recovery tests start

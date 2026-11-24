@@ -51,6 +51,7 @@ const START_LOCK_RETRY_DELAY: Duration = Duration::from_millis(25);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionFileSource {
     XdgRuntimeDir,
+    DaemonRunDir,
     TempDirFallback,
     Explicit,
 }
@@ -59,6 +60,10 @@ impl ConnectionFileSource {
     fn reason(self) -> &'static str {
         match self {
             Self::XdgRuntimeDir => "XDG_RUNTIME_DIR set and non-empty",
+            Self::DaemonRunDir => "XDG_RUNTIME_DIR unset or empty",
+            Self::TempDirFallback if cfg!(unix) => {
+                "XDG_RUNTIME_DIR unset or empty and daemon run directory could not be resolved"
+            }
             Self::TempDirFallback => "XDG_RUNTIME_DIR unset or empty",
             Self::Explicit => "configured path",
         }
@@ -69,6 +74,7 @@ impl fmt::Display for ConnectionFileSource {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::XdgRuntimeDir => "xdg_runtime_dir",
+            Self::DaemonRunDir => "daemon_run_dir",
             Self::TempDirFallback => "temp_dir_fallback",
             Self::Explicit => "explicit",
         })
@@ -332,8 +338,10 @@ impl BootstrapConfig {
             crate::machine_id::default_machine_id_path().map_err(BootstrapError::MachineId)?;
         // The service supplies its store root after constructing this value.
         // Do not parse live files until that store has selected recovery mode.
-        let (connection_file, source) =
-            connection_file_path_with_source(non_empty_os_var("XDG_RUNTIME_DIR"));
+        let (connection_file, source) = connection_file_path_with_source(
+            env::var_os("XDG_RUNTIME_DIR"),
+            || Ok(run_dir.clone()),
+        );
         let mut config = Self::new(connection_file, DEFAULT_SUBC_PORT)
             .with_connection_file_source(source)
             .with_daemon_config_source(daemon_config::default_config_path(), None)
@@ -439,8 +447,7 @@ impl BootstrapConfig {
             Ok(_) | Err(_) => config_port.unwrap_or(DEFAULT_SUBC_PORT),
         };
 
-        let (connection_file_path, connection_file_source) =
-            connection_file_path_with_source(non_empty_os_var("XDG_RUNTIME_DIR"));
+        let (connection_file_path, connection_file_source) = default_connection_file();
         let config = Self::new(connection_file_path, port)
             .with_configured_modules(configured_modules)
             .with_storage_config(storage_config)
@@ -676,15 +683,24 @@ pub struct BoundDaemon {
 /// Resolve subc's per-user TCP connection-file path.
 ///
 /// `$XDG_RUNTIME_DIR/subc-connection.json` is preferred because the runtime
-/// directory is already per-user on Unix desktops. Without it, subc falls back
-/// to the system temp dir with a per-user token in the filename so different OS
-/// users do not collide on shared temp directories.
+/// directory is already per-user on Unix desktops. Without it, Unix uses the
+/// daemon run directory so system temporary-file cleanup cannot remove the
+/// connection file. If that directory cannot be resolved, or on Windows with
+/// no runtime directory, the fallback is a per-user file in the system temp dir.
 pub fn connection_file_path() -> PathBuf {
-    connection_file_path_with_source(non_empty_os_var("XDG_RUNTIME_DIR")).0
+    default_connection_file().0
+}
+
+fn default_connection_file() -> (PathBuf, ConnectionFileSource) {
+    connection_file_path_with_source(
+        env::var_os("XDG_RUNTIME_DIR"),
+        daemon_config::daemon_run_dir,
+    )
 }
 
 fn connection_file_path_with_source(
     runtime_dir: Option<OsString>,
+    resolve_run_dir: impl FnOnce() -> Result<PathBuf, daemon_config::DaemonRunDirError>,
 ) -> (PathBuf, ConnectionFileSource) {
     if let Some(runtime_dir) = runtime_dir.filter(|value| !value.is_empty()) {
         return (
@@ -692,6 +708,16 @@ fn connection_file_path_with_source(
             ConnectionFileSource::XdgRuntimeDir,
         );
     }
+
+    #[cfg(unix)]
+    if let Ok(run_dir) = resolve_run_dir() {
+        return (
+            run_dir.join(CONNECTION_FILE_NAME),
+            ConnectionFileSource::DaemonRunDir,
+        );
+    }
+    #[cfg(not(unix))]
+    let _ = resolve_run_dir;
 
     (
         env::temp_dir().join(format!("subc-{}.connection.json", user_connection_token())),
@@ -773,7 +799,7 @@ mod config_test_seam {
 /// (they measured 236 daemon lines with the subscriber installed, 0 with the
 /// call commented out) -- otherwise the fix is itself unverified.
 pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapError> {
-    let Some(start_lock) = singleton_start_lock(&config.connection_file_path).await? else {
+    let Some(start_lock) = singleton_start_lock(&config).await? else {
         info!("subc daemon already running");
         return Ok(());
     };
@@ -1647,17 +1673,36 @@ async fn ensure_singleton_inner(
     config: BootstrapConfig,
     publish: bool,
 ) -> Result<Outcome, BootstrapError> {
-    let Some(lock) = singleton_start_lock(&config.connection_file_path).await? else {
+    let Some(lock) = singleton_start_lock(&config).await? else {
         return Ok(Outcome::AlreadyRunning);
     };
     ensure_singleton_with_start_lock(config, publish, lock).await
 }
 
-async fn singleton_start_lock(path: &Path) -> Result<Option<StartLock>, BootstrapError> {
+async fn singleton_start_lock(
+    config: &BootstrapConfig,
+) -> Result<Option<StartLock>, BootstrapError> {
+    let path = &config.connection_file_path;
     if stable_peer(path).await? {
         return Ok(None);
     }
 
+    #[cfg(unix)]
+    if config.connection_file_source == ConnectionFileSource::DaemonRunDir {
+        // The binary prepares the run directory for logging first. Embedded
+        // daemons can reach the start lock before anything creates its parent.
+        if let Some(parent) = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty() && !p.exists())
+        {
+            daemon_config::ensure_directory_private(parent).map_err(|source| {
+                BootstrapError::StartLockCreate {
+                    path: start_lock_path(path),
+                    source,
+                }
+            })?;
+        }
+    }
     let lock = StartLock::acquire(path).await?;
 
     // Re-probe after acquiring the start lock so a peer that won the race between
@@ -1677,6 +1722,14 @@ async fn ensure_singleton_with_start_lock(
     #[cfg(windows)]
     let copy_path = windows_connection_copy::resolve(&config);
     let path = config.connection_file_path;
+    #[cfg(unix)]
+    if config.connection_file_source == ConnectionFileSource::TempDirFallback {
+        warn!(
+            connection_file = %path.display(),
+            reason = config.connection_file_source.reason(),
+            "using the system temporary directory for the daemon connection file"
+        );
+    }
     // The held start lock and its peer check only rule out a daemon using this
     // connection file. A daemon started with another runtime directory but
     // the same data home shares the run directory while passing both, so the
@@ -2279,15 +2332,6 @@ fn start_lock_path(connection_file_path: &Path) -> PathBuf {
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))
         .join(lock_name)
-}
-
-fn non_empty_os_var(key: &str) -> Option<OsString> {
-    let value = env::var_os(key)?;
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
 }
 
 /// Bootstrap-layer errors are deliberately typed so startup never panics for
@@ -2934,22 +2978,12 @@ mod tests {
     }
 
     #[test]
-    fn connection_file_path_uses_xdg_runtime_dir_when_set() {
-        let _env_lock = ENV_LOCK.lock().unwrap();
-        let runtime_dir = unique_temp_dir("xdg-runtime");
-        let _xdg = EnvGuard::set("XDG_RUNTIME_DIR", runtime_dir.path());
-
-        assert_eq!(
-            connection_file_path(),
-            runtime_dir.join(CONNECTION_FILE_NAME)
-        );
-    }
-
-    #[test]
     fn connection_file_path_source_is_xdg_runtime_dir_when_set() {
         let runtime_dir = OsString::from("/run/user/1000");
 
-        let (path, source) = connection_file_path_with_source(Some(runtime_dir));
+        let (path, source) = connection_file_path_with_source(Some(runtime_dir), || {
+            panic!("an explicit runtime directory needs no daemon run directory")
+        });
 
         assert_eq!(
             path,
@@ -2958,26 +2992,57 @@ mod tests {
         assert_eq!(source, ConnectionFileSource::XdgRuntimeDir);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn connection_file_path_falls_back_to_temp_dir_with_user_token_when_xdg_unset() {
-        let _env_lock = ENV_LOCK.lock().unwrap();
-        let _xdg = EnvGuard::unset("XDG_RUNTIME_DIR");
+    fn connection_file_path_uses_daemon_run_dir_without_xdg_runtime_dir() {
+        for runtime_dir in [None, Some(OsString::new())] {
+            let (path, source) = connection_file_path_with_source(runtime_dir, || {
+                daemon_config::daemon_run_dir_from(PathBuf::from("/data/home"))
+            });
 
-        assert_eq!(
-            connection_file_path(),
-            env::temp_dir().join(format!("subc-{}.connection.json", user_connection_token()))
-        );
+            assert_eq!(
+                path,
+                PathBuf::from("/data/home/cortexkit/run/subc-connection.json")
+            );
+            assert_eq!(source, ConnectionFileSource::DaemonRunDir);
+        }
     }
 
+    #[cfg(unix)]
     #[test]
-    fn connection_file_path_source_is_temp_dir_when_xdg_unset() {
-        let (path, source) = connection_file_path_with_source(None);
+    fn connection_file_path_uses_temp_dir_with_relative_data_home() {
+        let (path, source) = connection_file_path_with_source(None, || {
+            daemon_config::daemon_run_dir_from(PathBuf::from("relative-data-home"))
+        });
 
         assert_eq!(
             path,
             env::temp_dir().join(format!("subc-{}.connection.json", user_connection_token()))
         );
         assert_eq!(source, ConnectionFileSource::TempDirFallback);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connection_file_path_creates_private_run_dir_before_start_lock() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = unique_temp_dir("connection-run-dir");
+        let (path, source) = connection_file_path_with_source(None, || {
+            daemon_config::daemon_run_dir_from(root.join("data"))
+        });
+        let parent = path.parent().unwrap();
+        assert!(!parent.exists());
+
+        let config = BootstrapConfig::new(&path, 0).with_connection_file_source(source);
+        let outcome = ensure_singleton_with_config(config).await.unwrap();
+
+        assert!(matches!(outcome, Outcome::Bound(_)));
+        assert!(path.is_file());
+        assert_eq!(
+            fs::metadata(parent).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
     }
 
     /// Concurrent callers must derive one token. The former temp-file uid probe
@@ -2999,15 +3064,20 @@ mod tests {
         }
     }
 
+    #[cfg(not(unix))]
     #[test]
-    fn connection_file_path_source_is_temp_dir_when_xdg_empty() {
-        let (path, source) = connection_file_path_with_source(Some(OsString::new()));
+    fn connection_file_path_source_is_temp_dir_when_xdg_unset_or_empty() {
+        for runtime_dir in [None, Some(OsString::new())] {
+            let (path, source) = connection_file_path_with_source(runtime_dir, || {
+                panic!("the daemon run directory is only checked on Unix")
+            });
 
-        assert_eq!(
-            path,
-            env::temp_dir().join(format!("subc-{}.connection.json", user_connection_token()))
-        );
-        assert_eq!(source, ConnectionFileSource::TempDirFallback);
+            assert_eq!(
+                path,
+                env::temp_dir().join(format!("subc-{}.connection.json", user_connection_token()))
+            );
+            assert_eq!(source, ConnectionFileSource::TempDirFallback);
+        }
     }
 
     /// The shipped binary is the only caller that journals terminal exits into

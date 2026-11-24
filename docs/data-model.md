@@ -28,7 +28,7 @@ instead of being resolved against the working directory
 | --- | --- | --- | --- |
 | `<config home>/cortexkit/subc.jsonc` | Daemon and module configuration. | The operator and `ck setup`. | Yes. |
 | `<data home>/cortexkit/run/` | The run directory, created `0700`. | The daemon. | Yes. |
-| `$XDG_RUNTIME_DIR/subc-connection.json`, or `<temp dir>/subc-<user>.connection.json` when `XDG_RUNTIME_DIR` is unset | Endpoint, key and daemon identity (section 2). | The daemon at start. | Replaced at each start. |
+| `$XDG_RUNTIME_DIR/subc-connection.json`, or `<data home>/cortexkit/run/subc-connection.json` on Unix when `XDG_RUNTIME_DIR` is unset or empty; `<temp dir>/subc-<user>.connection.json` if neither location is available | Endpoint, key and daemon identity (section 2). | The daemon at start. | Replaced at each start. |
 | `<profile>\AppData\Local\cortexkit\run\subc-connection.json` (Windows, temporary-directory fallback only) | The same information, at a location found without the environment (section 2). | The daemon at start; optional. | Published when possible at each such start. A stale file is removed or replaced; one that passes the liveness checks for another daemon is kept. |
 | `run/daemon.lock` | Ownership of the run directory (section 3). | The daemon. | The file stays; the lock dies with the process. |
 | `run/live-children.json` | Supervised processes, for the orphan sweep (section 3). | The daemon. | Yes, read once at the next start. |
@@ -48,14 +48,18 @@ each module, not by the daemon; see [`logging.md`](logging.md).
 The connection file holds the loopback endpoints, a 32-byte random key, the
 daemon id, its pid and its version (`ConnectionInfo` in
 `crates/subc-transport/src/connection_file.rs`). The daemon writes it to
-`$XDG_RUNTIME_DIR/subc-connection.json`, or, when `XDG_RUNTIME_DIR` is unset
-or empty (as under the launch agent `ck setup` installs on macOS), to `subc-<user>.connection.json` in the system
-temporary directory (`connection_file_path` in
-`crates/subc-daemon/src/bootstrap.rs`). On Unix `<user>` is the numeric uid. On
+`$XDG_RUNTIME_DIR/subc-connection.json` when `XDG_RUNTIME_DIR` is non-empty.
+On Unix, when `XDG_RUNTIME_DIR` is unset or empty (as under the launch agent
+`ck setup` installs on macOS), the daemon writes `subc-connection.json` to
+its run directory because the system temporary directory is cleaned of old
+files. The path resolver falls back to `<temp dir>/subc-<user>.connection.json`
+if neither directory is available (`connection_file_path` in
+`crates/subc-daemon/src/bootstrap.rs`). The shipped daemon still refuses to start
+if it cannot resolve its run directory. On Unix `<user>` is the numeric uid. On
 Windows it is the first non-empty value of `USER`, `USERNAME`, `HOME` and
 `USERPROFILE`, with every character other than an ASCII letter, digit, `-` or
-`_` replaced by `_`, or `unknown` when none is set. It writes through a temporary file and
-a rename, mode `0600` on Unix and a private DACL on Windows.
+`_` replaced by `_`, or `unknown` when none is set. The daemon writes through
+a temporary file and a rename, mode `0600` on Unix and a private discretionary access control list (DACL) on Windows.
 
 On Windows, when the file falls back to the temporary directory, the daemon
 also publishes the same information at

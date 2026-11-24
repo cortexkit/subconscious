@@ -2,7 +2,10 @@ use super::*;
 use cortexkit_test_support::ScratchDir;
 
 fn config(root: &Path, runtime: Option<OsString>) -> BootstrapConfig {
-    let source = connection_file_path_with_source(runtime).1;
+    let source = connection_file_path_with_source(runtime, || {
+        panic!("Windows does not use the daemon run directory for the primary copy")
+    })
+    .1;
     let mut config =
         BootstrapConfig::new(root.join("primary.json"), 0).with_connection_file_source(source);
     config.profile_override = Some(root.join("profile"));

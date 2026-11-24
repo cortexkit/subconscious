@@ -1,4 +1,5 @@
 use super::*;
+use crate::router::test_log::{captured_logs, log_capture};
 use crate::{router::RouteCtx, ControlHandler, FrameSink};
 use subc_control::config::{ConfigControlResponse, ConfigThrough};
 use subc_os::local_peer::{ObservedPeer, PeerObservation, PeerUser};
@@ -367,7 +368,91 @@ async fn project_settings_status_reports_user_errors_when_registry_is_down() {
     assert!(errors[0].get("project_id").is_none());
     assert!(errors[0].get("workspace_id").is_none());
     assert!(errors[0].get("layer").is_none());
-    assert!(errors[0].get("path").is_none());
+    assert_eq!(errors[0]["path"], rig.rig.declaration.user_file);
+}
+
+#[tokio::test]
+async fn project_settings_stamped_user_file_refusal_logs_across_status_and_watch() {
+    let rig = CaptureRig::new();
+    let owner = &rig.owner;
+    let path = &rig.rig.declaration.user_file;
+    let handler = status_handler(&rig);
+    let watch_row = || {
+        let observation = owner
+            .observe_settings_rows(BTreeSet::new(), true, true)
+            .unwrap()
+            .unwrap();
+        let ConfigControlResponse::Modules { modules, stamped } = observation.response else {
+            panic!("expected settings rows");
+        };
+        assert!(stamped);
+        modules
+            .into_iter()
+            .find(|row| row.module_id == "a" && row.project_id.is_none())
+            .unwrap()
+    };
+
+    let (logs, _guard) = log_capture(tracing::Level::INFO);
+    std::fs::write(path, br#"{"limit":3,"not/declared":true}"#).unwrap();
+    let expected = json!({"code":"value_invalid", "message":"a: /not~1declared", "path":path});
+    assert_eq!(
+        serde_json::to_value(watch_row().file_error).unwrap(),
+        expected
+    );
+    for _ in 0..3 {
+        assert_eq!(
+            serde_json::to_value(&owner.polled_status().unwrap().file_errors[0].error).unwrap(),
+            expected
+        );
+    }
+    let status = config_status(&handler).await;
+    assert_eq!(status["status"]["state"], "stamped");
+    assert_eq!(
+        status["status"]["file_errors"],
+        json!([{
+            "module_id":"a", "code":"value_invalid", "message":"a: /not~1declared", "path":path
+        }])
+    );
+    let text = captured_logs(&logs);
+    assert_eq!(
+        text.matches("user settings file refused").count(),
+        1,
+        "{text}"
+    );
+    let shown = owner
+        .settings_show(BTreeSet::new(), "a".into(), None)
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(shown).unwrap()["effective"]["limit"],
+        1
+    );
+
+    std::fs::write(path, br#"{"limit":4,"not/declared":true}"#).unwrap();
+    assert_eq!(owner.polled_status().unwrap().file_errors.len(), 1);
+    assert!(watch_row().file_error.is_some());
+    assert_eq!(
+        captured_logs(&logs)
+            .matches("user settings file refused")
+            .count(),
+        2
+    );
+
+    std::fs::write(path, br#"{"limit":4}"#).unwrap();
+    assert!(watch_row().file_error.is_none());
+    assert!(owner.polled_status().unwrap().file_errors.is_empty());
+    assert_eq!(
+        captured_logs(&logs)
+            .matches("user settings file accepted after refusal")
+            .count(),
+        1
+    );
+    let shown = owner
+        .settings_show(BTreeSet::new(), "a".into(), None)
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(shown).unwrap()["effective"]["limit"],
+        1
+    );
 }
 
 #[tokio::test]

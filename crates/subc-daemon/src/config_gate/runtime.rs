@@ -85,6 +85,7 @@ pub struct RuntimeOwner {
     configured_modules: std::sync::RwLock<Option<admission::ConfiguredModuleSnapshot>>,
     inner: Mutex<OwnerState>,
     capturer: ConfigCapturer,
+    user_file_refusals: Mutex<BTreeMap<String, subc_config::Digest>>,
     policy_root_ledger: Option<std::path::PathBuf>,
     policy_root_unstamped: Mutex<crate::policy_root::Section>,
     #[cfg(test)]
@@ -993,6 +994,7 @@ impl RuntimeOwner {
         }));
         let delivery_changed = std::sync::Arc::new(tokio::sync::Notify::new());
         let owner = Self {
+            user_file_refusals: Mutex::new(BTreeMap::new()),
             #[cfg(test)]
             user_file_test_idle: Mutex::new(None),
             #[cfg(test)]
@@ -2779,6 +2781,9 @@ impl RuntimeOwner {
             status_inputs::report_snapshot(&snapshot, &mut status);
         }
         if let Some(captured) = observation {
+            if status.state == "stamped" {
+                self.log_user_file_observations(&captured);
+            }
             captured.report_errors(&mut status);
         }
         status.gated_modules = admission::AdmissionCache::from_state(&state).held_modules();

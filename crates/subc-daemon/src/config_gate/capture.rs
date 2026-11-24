@@ -10,8 +10,10 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use subc_config::{InputState, Layer, LayerValue, RecordedValue, Schema, ValidationContext};
-use subc_control::config::ConfigFileError;
+use subc_config::{
+    Digest, InputState, Layer, LayerValue, RecordedValue, Schema, ValidationContext,
+};
+use subc_control::config::{ConfigFileError, ConfigStatusFileError};
 use subc_protocol::config::{
     ConfigDeclareRequest, ConfigLayer, ConfigLayerSnapshot, ConfigStatus, ConfigView,
 };
@@ -85,6 +87,10 @@ pub(crate) struct UserFileMetadata {
 impl UserFileMetadata {
     pub(crate) fn has_content_digest(&self) -> bool {
         self.content_digest.is_some()
+    }
+
+    pub(super) fn content_digest(&self) -> Option<&Digest> {
+        self.content_digest.as_ref()
     }
 
     pub(crate) fn read(path: &Path) -> Result<Option<Self>> {
@@ -279,6 +285,7 @@ pub struct CapturedConfiguration {
 pub(crate) struct SettingsCapture {
     pub configuration: CapturedConfiguration,
     pub file_errors: BTreeMap<String, ConfigFileError>,
+    pub(super) refused_file_digests: BTreeMap<String, Digest>,
     pub module_errors: BTreeMap<String, GateError>,
 }
 
@@ -312,6 +319,9 @@ impl SettingsCapture {
                 "module {module}: {}: {}",
                 error.code, error.message
             ));
+            status
+                .file_errors
+                .push(ConfigStatusFileError::new(module.clone(), error.clone()));
         }
     }
 }
@@ -681,6 +691,7 @@ impl ConfigCapturer {
         }
         let mut modules = BTreeMap::new();
         let mut file_errors = BTreeMap::new();
+        let mut refused_file_digests = BTreeMap::new();
         let mut module_errors = BTreeMap::new();
         for (module, declaration) in declarations {
             if selected.is_some_and(|modules| !modules.contains(module)) {
@@ -699,10 +710,14 @@ impl ConfigCapturer {
                 Ok(captured) => captured,
                 Err(error) if REPORT_MODULE_ERRORS && !error.is_capture_race() => {
                     if is_settings_file_error(&error) {
-                        file_errors.insert(
-                            module.clone(),
-                            ConfigFileError::new(error.code, error.detail),
-                        );
+                        if let Some(digest) = error
+                            .settings_file
+                            .as_ref()
+                            .and_then(|file| file.content_digest.as_ref())
+                        {
+                            refused_file_digests.insert(module.clone(), digest.clone());
+                        }
+                        file_errors.insert(module.clone(), error.into_settings_file_error());
                     } else {
                         module_errors.insert(module.clone(), error);
                     }
@@ -730,6 +745,7 @@ impl ConfigCapturer {
                 _program_handles: program_handles,
             },
             file_errors,
+            refused_file_digests,
             module_errors,
         })
     }
@@ -780,24 +796,39 @@ impl ConfigCapturer {
             error.detail = format!("{module}: {}: {}", expected.display(), error.detail);
             error
         };
-        let file = layer_file(&expected)?;
-        let value = file.parse_with_canonical_context(file_context)?;
-        refuse_expansions(&value, module, "")?;
+        let file = layer_file(&expected).map_err(|error| {
+            if is_settings_file_error(&error) {
+                error.at_user_file(&expected, None)
+            } else {
+                error
+            }
+        })?;
+        let at_user_file = |error: GateError| error.at_user_file(&expected, file.bytes.as_deref());
+        let value = file
+            .parse_with_canonical_context(file_context)
+            .map_err(at_user_file)?;
+        refuse_expansions(&value, module, "").map_err(at_user_file)?;
         // Record even invalid literals through the schema projection first;
         // nothing raw is retained on the refusal path.
-        let recorded = schema.record(&value).map_err(GateError::invalid)?;
+        let recorded = schema
+            .record(&value)
+            .map_err(|error| at_user_file(GateError::invalid(error)))?;
         let layers = if file.bytes.is_some() {
             vec![LayerValue::new(Layer::User, value)]
         } else {
             Vec::new()
         };
         let reviewed = schema
-            .review_tuple(&layers, &ValidationContext::new(module, None))
-            .map_err(|refusal| {
-                GateError::new(
-                    refusal_code(refusal.code),
-                    format!("{module}: {}", refusal.path),
-                )
+            .review_tuple_attributed(&layers, &ValidationContext::new(module, None))
+            .map_err(|error| {
+                let refusal = GateError::new(
+                    refusal_code(error.refusal.code),
+                    format!("{module}: {}", error.refusal.path),
+                );
+                match error.layer {
+                    Some(Layer::User) => at_user_file(refusal),
+                    _ => refusal,
+                }
             })?;
         let layer = ConfigLayerSnapshot::file(
             module,
@@ -835,7 +866,7 @@ impl ConfigCapturer {
         match self.capture_module(module, declaration, CapturedFile::open) {
             Ok(_) => Ok(None),
             Err(error) if is_settings_file_error(&error) => {
-                Ok(Some(ConfigFileError::new(error.code, error.detail)))
+                Ok(Some(error.into_settings_file_error()))
             }
             Err(error) => Err(error),
         }
@@ -868,7 +899,8 @@ fn declaration_input(module: &str, declaration: &ConfigDeclareRequest) -> Result
 }
 
 fn is_settings_file_error(error: &GateError) -> bool {
-    matches!(error.code.as_str(), "value_invalid" | "input_unavailable")
+    error.settings_file.is_some()
+        || matches!(error.code.as_str(), "value_invalid" | "input_unavailable")
 }
 
 fn redact_launch_values(value: &Value) -> Result<Value> {

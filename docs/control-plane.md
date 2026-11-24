@@ -202,13 +202,14 @@ Without `projects: true`, both the rows and events stay user-only, as does
 
 Module rows, watch changes and successful `config.show` replies may carry
 `file_error: {code, message}`. It describes a file observation failure, for
-example `value_invalid` or `input_unavailable`, independently of `status` and
-its existing precedence. A project file error may also include `layer`
-(`"project"` or `"workspace"`) and `path` (the absolute settings file path as
-resolved by the daemon). These fields are omitted when the failure does not
-identify a single file, and are not added to user-level file errors. A shared
-workspace file can produce a row for each project that reads it, with the same
-layer and path. A tuple validation failure affects only that tuple.
+example `value_invalid` or `input_unavailable`, and does not change the row's
+`status`. When the daemon identifies a file, `path` is its
+absolute settings path. Project and workspace files also include `layer`
+(`"project"` or `"workspace"`). Without `layer`, `path` names the module's own
+user settings file; without either field, the error concerns the combined
+settings. A shared workspace file can produce a row for each project that reads
+it, with the same layer and path. A file that fails validation for one module
+and project marks only that module and project's row.
 Approved effective values, sources and layer documents are
 not replaced by the broken file. One-shot `config.modules` and `config.show`
 reads report this diagnostic without a settling grace.
@@ -322,16 +323,23 @@ plan digest. In edit plans, path and root failures appear in the blocking
 
 `config.status` reports refused settings files in `status.file_errors`, sorted
 by `(module_id, project_id)`. Each row has `module_id`, `code`, and `message`;
-project rows also have `project_id` and, when known, `workspace_id`. The optional
-`layer` and `path` fields appear directly on the row when the daemon has
-identified a particular project or workspace settings file. The list is
-omitted when empty. Like `config.show`, this one-shot read does not apply the
-watch's save-settling grace. If project observations are incomplete, the reply
+project rows also have `project_id` and, when known, `workspace_id`. When the
+daemon can identify a particular file, `path` names it and `layer` identifies
+project or workspace files. A row without `layer` concerns the module's own
+user settings file, or the combined settings if the row also has no `path`.
+The list is omitted when empty. Like `config.show`, this one-shot read does not
+apply the watch's save-settling grace. If project observations are incomplete, the reply
 keeps any rows already read and adds `status.file_errors_incomplete` with a
 `reason` such as `project_registry_unavailable` or `config_unavailable`. An
 absent list with this marker does not mean all settings files are valid.
 `ck config status` prints these diagnostics, including `layer` and `path`, in
 both human and JSON output.
+
+The daemon logs a user settings refusal once for unchanged file contents and
+logs when the file passes validation again. An unstamped daemon observes edits
+through its live user-file poll; a stamped daemon observes them through status
+reads and project-aware watches. Validation alone does not approve a stamped
+edit or change what the module runs on.
 
 | Code | Meaning |
 | --- | --- |

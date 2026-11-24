@@ -2,7 +2,7 @@
 use super::*;
 use crate::config_gate::capture::SettingsCapture;
 use std::sync::Arc;
-use subc_control::config::{ConfigStatus, ConfigStatusFileError};
+use subc_control::config::ConfigStatus;
 
 #[derive(Clone, Default)]
 pub(super) struct Projection {
@@ -67,6 +67,7 @@ impl RuntimeOwner {
             let captured = self.capturer.capture_settings(&view.config_declarations)?;
             let candidate = captured.proposal_snapshot(&view.approved);
             if status.state == "stamped" {
+                self.log_user_file_observations(&captured);
                 let changed = candidate
                     .changed_keys(&view.approved)
                     .iter()
@@ -77,11 +78,6 @@ impl RuntimeOwner {
                 status_inputs::report_snapshot(&candidate, &mut status);
             }
             captured.report_errors(&mut status);
-            status.file_errors.extend(
-                captured.file_errors.iter().map(|(module, error)| {
-                    ConfigStatusFileError::new(module.clone(), error.clone())
-                }),
-            );
             settings = Some(captured);
         }
         status.root_io = self.capturer.projects.root_io_health();

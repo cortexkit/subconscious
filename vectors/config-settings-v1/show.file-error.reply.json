@@ -11,7 +11,8 @@
   },
   "file_error": {
     "code": "value_invalid",
-    "message": "configuration must be JSON with unique keys and lossless finite numbers"
+    "message": "configuration must be JSON with unique keys and lossless finite numbers",
+    "path": "/config/cortexkit/sample-reader.jsonc"
   },
   "layers": [
     {

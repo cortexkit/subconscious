@@ -1,7 +1,9 @@
 //! Observe live user files without holding a module gate or the runtime owner.
 
 use super::*;
-use crate::config_gate::capture::UserFileMetadata;
+use crate::config_gate::capture::{SettingsCapture, UserFileMetadata};
+use std::path::Path;
+use subc_config::Digest;
 
 pub(crate) const USER_FILE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -26,6 +28,47 @@ pub(crate) enum UserFilePoll {
 }
 
 impl RuntimeOwner {
+    pub(super) fn log_user_file_observations(&self, captured: &SettingsCapture) {
+        for (module, accepted) in &captured.configuration.modules {
+            self.log_user_file_observation(module, &accepted.file.path, None);
+        }
+        for (module, digest) in &captured.refused_file_digests {
+            let error = &captured.file_errors[module];
+            if let Some(path) = &error.path {
+                self.log_user_file_observation(
+                    module,
+                    Path::new(path),
+                    Some((digest, &error.code, &error.message)),
+                );
+            }
+        }
+    }
+
+    fn log_user_file_observation(
+        &self,
+        module: &str,
+        path: &Path,
+        refusal: Option<(&Digest, &str, &str)>,
+    ) {
+        // Each module has one canonical user settings path. Sharing
+        // the digest across observers also avoids repeat logs on reconnect.
+        let Ok(mut refused) = self.user_file_refusals.lock() else {
+            return;
+        };
+        match refusal {
+            Some((digest, code, reason)) if refused.get(module) != Some(digest) => {
+                refused.insert(module.to_owned(), digest.clone());
+                tracing::warn!(module_id = %module, path = %path.display(), %code, %reason,
+                    "user settings file refused");
+            }
+            None if refused.remove(module).is_some() => {
+                tracing::info!(module_id = %module, path = %path.display(),
+                    "user settings file accepted after refusal");
+            }
+            _ => {}
+        }
+    }
+
     /// Called on a blocking worker, before acquiring the module's delivery gate.
     /// Anything but `Stopped` means the connection still needs an unstamped
     /// polling timer. An unchanged file costs one plain read of the owner's state and one
@@ -65,7 +108,7 @@ impl RuntimeOwner {
                 state.authority_incarnation.clone(),
             )
         };
-        let path = std::path::Path::new(&declaration.user_file);
+        let path = Path::new(&declaration.user_file);
         let metadata = UserFileMetadata::read(path)?;
         if metadata
             .as_ref()
@@ -82,14 +125,34 @@ impl RuntimeOwner {
             return Ok(UserFilePoll::Unchanged);
         }
         let declarations = BTreeMap::from([(module.to_owned(), declaration.clone())]);
-        let mut captured = self
+        let view = self
             .capturer
-            .capture_module_settings(&declarations, &BTreeSet::from([module.to_owned()]))?;
-        let view = captured
-            .modules
-            .remove(module)
-            .ok_or_else(|| GateError::new("config_gated", "module declaration is unavailable"))?
-            .view;
+            .capture_module_settings(&declarations, &BTreeSet::from([module.to_owned()]))
+            .and_then(|mut captured| {
+                captured
+                    .modules
+                    .remove(module)
+                    .map(|module| module.view)
+                    .ok_or_else(|| {
+                        GateError::new("config_gated", "module declaration is unavailable")
+                    })
+            });
+        let refusal = match &view {
+            Ok(_) => None,
+            Err(error) => {
+                let Some(digest) = error
+                    .settings_file
+                    .as_ref()
+                    .and_then(|file| file.content_digest.as_ref())
+                else {
+                    return Err(error.clone());
+                };
+                if metadata.as_ref().and_then(UserFileMetadata::content_digest) != Some(digest) {
+                    return Ok(UserFilePoll::Observed);
+                }
+                Some((digest, error.code.as_str(), error.detail.as_str()))
+            }
+        };
         // Do not cache a fingerprint for bytes read across an atomic replacement.
         if UserFileMetadata::read(path)? != metadata {
             return Ok(UserFilePoll::Observed);
@@ -98,7 +161,10 @@ impl RuntimeOwner {
         if state.store.loaded_admission_state().0 != StoreState::Unstamped
             || state.authority_exit.is_some()
             || !std::sync::Arc::ptr_eq(&incarnation, &state.authority_incarnation)
-            || state.declarations.get(&connection) != Some(&(module.to_owned(), declaration))
+            || !state
+                .declarations
+                .get(&connection)
+                .is_some_and(|(id, declared)| id == module && declared == &declaration)
         {
             *watch = UserFileWatch::default();
             return Ok(UserFilePoll::Stopped);
@@ -116,7 +182,8 @@ impl RuntimeOwner {
         }
         watch.metadata = Some(metadata);
         watch.served = served.clone();
-        if served.as_ref().is_some_and(|served| **served != view) {
+        self.log_user_file_observation(module, path, refusal);
+        if view.is_ok_and(|view| served.as_ref().is_some_and(|served| **served != view)) {
             state.unstamp_hints.insert(connection);
             self.notify_delivery_changed();
         }

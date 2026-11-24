@@ -49,7 +49,14 @@ pub struct GateError {
     pub code: String,
     pub detail: String,
     capture_race: bool,
-    settings_file: Option<Box<(Layer, Option<String>)>>,
+    settings_file: Option<Box<SettingsFile>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SettingsFile {
+    layer: Layer,
+    path: Option<String>,
+    content_digest: Option<Digest>,
 }
 type Result<T> = std::result::Result<T, GateError>;
 
@@ -65,14 +72,28 @@ impl GateError {
 
     fn at_settings_layer(mut self, layer: Layer) -> Self {
         if matches!(layer, Layer::Project | Layer::Workspace) {
-            self.settings_file = Some(Box::new((layer, None)));
+            self.settings_file = Some(Box::new(SettingsFile {
+                layer,
+                path: None,
+                content_digest: None,
+            }));
         }
+        self
+    }
+
+    fn at_user_file(mut self, path: &std::path::Path, bytes: Option<&[u8]>) -> Self {
+        self.settings_file = Some(Box::new(SettingsFile {
+            layer: Layer::User,
+            path: Some(path.to_string_lossy().into_owned()),
+            content_digest: bytes.map(subc_config::raw_digest),
+        }));
         self
     }
 
     fn with_settings_path(mut self, path_for: impl FnOnce(Layer) -> Option<String>) -> Self {
         if let Some(file) = self.settings_file.as_mut() {
-            file.1 = path_for(file.0).filter(|path| std::path::Path::new(path).is_absolute());
+            file.path =
+                path_for(file.layer).filter(|path| std::path::Path::new(path).is_absolute());
         }
         self
     }
@@ -80,13 +101,12 @@ impl GateError {
     fn into_settings_file_error(self) -> ConfigFileError {
         let mut error = ConfigFileError::new(self.code, self.detail);
         if let Some(file) = self.settings_file {
-            let (layer, path) = *file;
-            error.layer = match layer {
+            error.layer = match file.layer {
                 Layer::Project => Some(ConfigFileErrorLayer::Project),
                 Layer::Workspace => Some(ConfigFileErrorLayer::Workspace),
                 _ => None,
             };
-            error.path = path;
+            error.path = file.path;
         }
         error
     }

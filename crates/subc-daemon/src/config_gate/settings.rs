@@ -210,6 +210,9 @@ impl RuntimeOwner {
         let Some((write_back, captured, files)) = observation else {
             return Ok(None);
         };
+        if projects && snapshot.stamped {
+            self.log_user_file_observations(&captured);
+        }
         let rereview = if snapshot.stamped {
             reviewed_build::pending(body, snapshot.declarations.keys())?
         } else {

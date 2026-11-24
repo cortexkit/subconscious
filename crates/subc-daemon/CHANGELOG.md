@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.50.51
+
+- Report refused user settings files in the daemon log and configuration
+  status, and clear the error when the file is accepted. A refused edit leaves
+  the module's last good settings in place.
+
 ## 0.50.50
 
 - On Windows without a job object, keep the final CPU of exited command

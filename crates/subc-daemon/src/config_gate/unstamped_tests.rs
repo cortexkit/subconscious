@@ -1,4 +1,5 @@
 use super::*;
+use crate::router::test_log::{captured_logs, log_capture};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
@@ -221,6 +222,95 @@ async fn config_gate_unstamped_user_file_same_bytes_and_touch_send_no_push() {
         "an identical replacement must not push: {:?}",
         live.pushes
     );
+}
+
+#[test]
+fn config_gate_unstamped_user_file_refusal_logs_once_and_reports_path() {
+    use crate::config_gate::runtime::unstamped::UserFileWatch;
+
+    let mut rig = Rig::new();
+    rig.declaration.schema["properties"]
+        .as_object_mut()
+        .unwrap()
+        .remove("credential");
+    write_limit(&rig, 1);
+    let owner = rig.owner("user-file-refusal");
+    rig.declare(&owner, INCUMBENT.get());
+    let good = owner
+        .module_get(INCUMBENT, "a", ConfigGetRequest::new())
+        .unwrap();
+    owner
+        .module_view_delivered(INCUMBENT, "a", &good, tokio::time::Instant::now(), true)
+        .unwrap();
+
+    let (logs, _guard) = log_capture(tracing::Level::INFO);
+    let mut watch = UserFileWatch::default();
+    let path = &rig.declaration.user_file;
+    let refused = br#"{"limit":2,"not/declared":true}"#;
+    std::fs::write(path, refused).unwrap();
+    for _ in 0..3 {
+        // Run the same blocking poll as the delivery worker on this thread so
+        // the scoped tracing subscriber can see its events.
+        let _ = owner.poll_user_file(INCUMBENT, "a", &mut watch);
+        assert!(!owner.take_unstamp_hint(INCUMBENT).unwrap());
+    }
+    let text = captured_logs(&logs);
+    let warnings: Vec<_> = text
+        .lines()
+        .filter(|line| line.contains("user settings file refused"))
+        .collect();
+    assert_eq!(warnings.len(), 1, "{text}");
+    for part in ["WARN", "module_id=a", path, "reason=a: /not~1declared"] {
+        assert!(warnings[0].contains(part), "{}", warnings[0]);
+    }
+    assert_eq!(
+        serde_json::to_value(owner.polled_status().unwrap()).unwrap()["file_errors"],
+        json!([{
+            "module_id":"a", "code":"value_invalid", "message":"a: /not~1declared", "path":path
+        }])
+    );
+    assert_eq!(
+        owner.lock().unwrap().delivery.unstamped_views[&INCUMBENT].as_ref(),
+        good.active.as_ref().unwrap()
+    );
+
+    let replacement = rig.path.join("replacement.jsonc");
+    std::fs::write(&replacement, refused).unwrap();
+    std::fs::rename(replacement, path).unwrap();
+    // A fresh worker after reconnect must not log the same bytes again.
+    let mut watch = UserFileWatch::default();
+    owner.poll_user_file(INCUMBENT, "a", &mut watch).unwrap();
+    assert_eq!(
+        captured_logs(&logs)
+            .matches("user settings file refused")
+            .count(),
+        1
+    );
+
+    std::fs::write(path, br#"{"limit":3,"not/declared":true}"#).unwrap();
+    owner.poll_user_file(INCUMBENT, "a", &mut watch).unwrap();
+    assert_eq!(
+        captured_logs(&logs)
+            .matches("user settings file refused")
+            .count(),
+        2
+    );
+    assert!(!owner.take_unstamp_hint(INCUMBENT).unwrap());
+
+    write_limit(&rig, 3);
+    owner.poll_user_file(INCUMBENT, "a", &mut watch).unwrap();
+    assert!(owner.take_unstamp_hint(INCUMBENT).unwrap());
+    owner.poll_user_file(INCUMBENT, "a", &mut watch).unwrap();
+    assert!(owner.polled_status().unwrap().file_errors.is_empty());
+    let text = captured_logs(&logs);
+    let recoveries: Vec<_> = text
+        .lines()
+        .filter(|line| line.contains("user settings file accepted after refusal"))
+        .collect();
+    assert_eq!(recoveries.len(), 1, "{text}");
+    for part in ["INFO", "module_id=a", path] {
+        assert!(recoveries[0].contains(part), "{}", recoveries[0]);
+    }
 }
 
 #[tokio::test(start_paused = true)]

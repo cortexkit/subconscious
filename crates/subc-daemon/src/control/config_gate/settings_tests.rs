@@ -747,7 +747,9 @@ async fn config_settings_watch_unstamped_file_error_does_not_invent_values() {
         .await
         .unwrap();
     assert_eq!(show[0].header.ty, FrameType::Error);
-    let refused: Value = serde_json::from_slice(&show[0].body).unwrap();
+    let mut refused: Value = serde_json::from_slice(&show[0].body).unwrap();
+    assert!(refused.get("path").is_none());
+    refused["path"] = json!(rig.root.join("cortexkit").join("sample-reader.jsonc"));
     assert_eq!(refused, row["file_error"]);
     rig.write(br#"{"limit":9,"credential":{"vault_ref":"sample-reference"}}"#);
     let recovered = event(&mut rx).await;
@@ -1025,8 +1027,12 @@ async fn config_settings_vectors_match_real_handler_bytes() {
     assert_eq!(change["event"], "change");
     samples.push(("watch.change.json".into(), change));
     rig.write(b"{");
-    let failed = event(&mut rx).await;
+    let mut failed = event(&mut rx).await;
     assert_eq!(failed["file_error"]["code"], "value_invalid");
+    let user_path = json!(rig.root.join("cortexkit").join("sample-reader.jsonc"));
+    let sample_path = json!("/config/cortexkit/sample-reader.jsonc");
+    assert_eq!(failed["file_error"]["path"], user_path);
+    failed["file_error"]["path"] = sample_path.clone();
     samples.push(("watch.file-error.json".into(), failed));
     let shown = handler
         .handle_control_frame(
@@ -1036,8 +1042,10 @@ async fn config_settings_vectors_match_real_handler_bytes() {
         .await
         .unwrap();
     assert_eq!(shown[0].header.ty, FrameType::Response);
-    let shown: Value = serde_json::from_slice(&shown[0].body).unwrap();
+    let mut shown: Value = serde_json::from_slice(&shown[0].body).unwrap();
     assert_eq!(shown["effective"]["limit"], 4);
+    assert_eq!(shown["file_error"]["path"], user_path);
+    shown["file_error"]["path"] = sample_path;
     samples.push(("show.file-error.reply.json".into(), shown));
     handler.cleanup_connection(ctx.connection_id).unwrap();
 

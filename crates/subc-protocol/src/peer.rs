@@ -78,6 +78,47 @@ pub struct CallerAttestation {
     pub approved_declarations_digest: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declaration_digest: Option<String>,
+    /// Present only on a bind to the vault, for a module on a stamped install.
+    /// See [`SettingsCredentials`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings_credentials: Option<SettingsCredentials>,
+}
+
+/// The vault references a module's approved settings name, attested on a
+/// `route.bind` to the vault so it can serve exactly those keys to that module.
+///
+/// `refs` lists every `vault_ref` under an `x-ck-kind: credential_ref` value in
+/// the module's approved effective settings, without duplicates and sorted
+/// bytewise. `generation` is the configuration store's approved revision they
+/// were read from; it only rises, and two attestations with the same generation
+/// carry the same `refs`. The daemon leaves the member out on an install whose
+/// settings are not approved (an unstamped install), so its absence means "no
+/// approved settings", never "no keys"; an empty `refs` means "no keys".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SettingsCredentials {
+    #[serde(deserialize_with = "deserialize_attestation_integer")]
+    pub generation: u64,
+    pub refs: Vec<String>,
+}
+
+impl SettingsCredentials {
+    /// Sorts and deduplicates `refs`. Refuses a generation above 2^53-1, which
+    /// JavaScript and Swift readers could not represent exactly.
+    pub fn new<R: Into<String>>(
+        generation: u64,
+        refs: impl IntoIterator<Item = R>,
+    ) -> Result<Self, CallerAttestationError> {
+        if generation > MAX_ATTESTATION_INTEGER {
+            return Err(CallerAttestationError {
+                field: "generation",
+            });
+        }
+        let mut refs: Vec<String> = refs.into_iter().map(Into::into).collect();
+        refs.sort();
+        refs.dedup();
+        Ok(Self { generation, refs })
+    }
 }
 
 /// A caller identity that cannot round-trip exactly through every wire reader.
@@ -87,7 +128,7 @@ pub struct CallerAttestationError {
 }
 
 impl CallerAttestationError {
-    /// The unsafe identity field: `spawn` or `authority_epoch`.
+    /// The unsafe identity field: `spawn`, `authority_epoch` or `generation`.
     pub fn field(&self) -> &'static str {
         self.field
     }
@@ -143,6 +184,7 @@ impl CallerAttestation {
             declaration: None,
             approved_declarations_digest: approved_declarations_digest.into(),
             declaration_digest: None,
+            settings_credentials: None,
         })
     }
 
@@ -156,6 +198,13 @@ impl CallerAttestation {
     ) -> Self {
         self.declaration = Some(declaration);
         self.declaration_digest = Some(digest.into());
+        self
+    }
+
+    /// Adds the vault references the module's approved settings name.
+    #[must_use]
+    pub fn with_settings_credentials(mut self, credentials: SettingsCredentials) -> Self {
+        self.settings_credentials = Some(credentials);
         self
     }
 }

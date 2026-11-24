@@ -8,7 +8,7 @@ use crate::{
     module_id::module_id_path_hazard,
     peer::{
         encode_route_bind, CallerAttestation, CallerClaim, CallerOrigin, RouteBindPeer,
-        CALLER_ATTESTATION_CAPABILITY,
+        SettingsCredentials, CALLER_ATTESTATION_CAPABILITY,
     },
     provider_declarations::{
         catalog_update_has_provider_declarations, validate_hello_provider_declarations,
@@ -291,6 +291,61 @@ fn reader_skew_caller_refuses_unsafe_spawn_and_epoch() {
             );
         }
     }
+}
+
+#[test]
+fn reader_skew_settings_credentials_round_trip_and_stay_optional() {
+    // Without the member nothing is written, and a caller written before it
+    // existed decodes with no credentials.
+    let plain: CallerAttestation = serde_json::from_value(caller()).unwrap();
+    assert!(plain.settings_credentials.is_none());
+    assert!(serde_json::to_value(&plain)
+        .unwrap()
+        .get("settings_credentials")
+        .is_none());
+
+    let credentials =
+        SettingsCredentials::new(7, ["apikey:voyage", "apikey:anthropic", "apikey:voyage"])
+            .unwrap();
+    assert_eq!(credentials.refs, ["apikey:anthropic", "apikey:voyage"]);
+    let peer = RouteBindPeer::new().with_caller(Some(plain.with_settings_credentials(credentials)));
+    let encoded = serde_json::to_value(&peer).unwrap();
+    assert_eq!(
+        encoded["caller"]["settings_credentials"],
+        json!({"generation": 7, "refs": ["apikey:anthropic", "apikey:voyage"]})
+    );
+    assert_eq!(
+        serde_json::from_value::<RouteBindPeer>(encoded).unwrap(),
+        peer
+    );
+
+    // An empty list is "no keys" and stays distinct from the member's absence.
+    let empty = SettingsCredentials::new(8, Vec::<String>::new()).unwrap();
+    let value = serde_json::to_value(&empty).unwrap();
+    assert_eq!(value, json!({"generation": 8, "refs": []}));
+}
+
+#[test]
+fn reader_skew_settings_credentials_generation_is_bounded() {
+    let max = 9_007_199_254_740_991_u64;
+    SettingsCredentials::new(max, ["apikey:a"]).unwrap();
+    let error = SettingsCredentials::new(max + 1, ["apikey:a"]).unwrap_err();
+    assert_eq!(error.field(), "generation");
+    for invalid in [json!(max + 1), json!(-1), json!(1.5)] {
+        let mut value = caller();
+        value["settings_credentials"] = json!({"generation": invalid, "refs": []});
+        assert!(serde_json::from_value::<RouteBindPeer>(json!({"caller": value})).is_err());
+    }
+}
+
+#[test]
+fn reader_skew_unknown_caller_members_are_ignored() {
+    // A newer daemon may attest a member this reader doesn't know; the bind must
+    // still decode, with the members it does know.
+    let mut value = caller();
+    value["future_member"] = json!({"anything": [1, 2]});
+    let peer: RouteBindPeer = serde_json::from_value(json!({"caller": value})).unwrap();
+    assert!(peer.caller.unwrap().first_party);
 }
 
 #[test]

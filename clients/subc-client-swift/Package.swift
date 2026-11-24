@@ -37,7 +37,7 @@ let package = Package(
         .testTarget(
             name: "SubcFedTests",
             dependencies: ["SubcFed"],
-            resources: [.copy("Fixtures/fed-pairing-v1"), .copy("Fixtures/remote-pairing-v1")]
+            resources: [.copy("Fixtures/fed-pairing-v1"), .copy("Fixtures/remote-pairing-v1"), .copy("Fixtures/remote-pairing-v2")]
         ),
         .testTarget(name: "SubcFedTestSupportTests", dependencies: ["SubcFedTestSupport", "SubcFed"]),
         .testTarget(

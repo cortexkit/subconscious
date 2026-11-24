@@ -337,7 +337,8 @@ fn extract_command(archive: &Path, destination: &Path) -> Command {
 const EXPAND_ARCHIVE_SCRIPT: &str =
     "Expand-Archive -LiteralPath $env:CK_ARCHIVE -DestinationPath $env:CK_DEST -Force";
 
-pub(super) fn windows_extract_command(archive: &Path, destination: &Path) -> Command {
+/// Builds a PowerShell extraction command that passes paths via environment variables.
+pub(crate) fn windows_extract_command(archive: &Path, destination: &Path) -> Command {
     let mut command = Command::new("powershell.exe");
     command
         .args([

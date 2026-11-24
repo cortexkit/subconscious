@@ -512,6 +512,11 @@ const SUPERVISED_MODULE_IDS: [(&str, &str); 6] = [
     ("ck-synapse", "synapse"),
 ];
 
+/// Returns the managed program names and their corresponding daemon supervisor IDs.
+pub fn supervised_module_ids() -> &'static [(&'static str, &'static str)] {
+    &SUPERVISED_MODULE_IDS
+}
+
 /// Maps managed program binaries to daemon supervisor ids. Sidecar binaries
 /// deliberately have no row and therefore never trigger a module restart.
 pub fn supervised_module_id(binary: &str) -> Option<&'static str> {

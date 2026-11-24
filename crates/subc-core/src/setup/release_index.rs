@@ -361,7 +361,8 @@ fn verify_and_parse(
     Ok(index)
 }
 
-pub(super) fn download(url: &str, destination: &Path) -> Result<(), String> {
+/// Downloads to the given path and reports any failure from the platform downloader.
+pub(crate) fn download(url: &str, destination: &Path) -> Result<(), String> {
     let destination = destination.to_string_lossy().into_owned();
     let output = download_command(url, &destination)
         .output()

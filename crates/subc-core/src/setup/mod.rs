@@ -7,7 +7,7 @@ mod conversion;
 mod daemon_bundle;
 mod definition;
 mod detection;
-mod file_modes;
+pub(crate) mod file_modes;
 pub(crate) mod install_journal;
 pub(crate) mod install_lock;
 mod messages;
@@ -19,7 +19,7 @@ mod model;
 mod nats_migration;
 mod planner;
 mod prompt;
-mod release_index;
+pub(crate) mod release_index;
 mod retained_binary;
 pub(crate) mod runtime;
 pub(crate) mod systemd_unit;
@@ -30,7 +30,7 @@ mod uninstall;
 mod update_cache;
 mod update_check;
 mod upgrade;
-mod upgrade_assets;
+pub(crate) mod upgrade_assets;
 mod upgrade_executor;
 mod upgrade_verification;
 mod validation;
@@ -41,7 +41,7 @@ pub(crate) use apply::user_home;
 pub use apply::{
     default_claustrum_key_path, installed_service_facts, start_installed_service, SetupBackend,
 };
-pub use components::{component_binaries_for_target, module_program};
+pub use components::{component_binaries_for_target, module_program, supervised_module_ids};
 #[doc(hidden)]
 pub use install_journal::bootstrap_entry;
 pub use model::{

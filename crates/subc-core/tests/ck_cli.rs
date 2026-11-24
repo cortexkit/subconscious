@@ -37,6 +37,9 @@ use common::{
     start_test_daemon_with_image, TestDaemon, TestDaemonImage,
 };
 
+#[cfg(unix)]
+#[path = "ck_cli/doctor_agent.rs"]
+mod doctor_agent;
 mod inline_actions;
 mod inline_views;
 #[path = "ck_cli/install_crashes.rs"]

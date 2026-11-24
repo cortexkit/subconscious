@@ -349,8 +349,9 @@ fn descriptor_type_and_mode(fd: &OwnedFd, path: &Path) -> Result<(FileType, u32)
     Ok((file_type, mode))
 }
 
+/// Changes the mode of the open descriptor, using the path only in errors.
 #[cfg(unix)]
-fn set_descriptor_mode(fd: &OwnedFd, path: &Path, mode: u32) -> Result<(), String> {
+pub(crate) fn set_descriptor_mode(fd: &OwnedFd, path: &Path, mode: u32) -> Result<(), String> {
     let mode = mode_from_u32(mode, path)?;
     fchmod(fd, mode).map_err(|error| format!("could not set mode on {}: {error}", path.display()))
 }

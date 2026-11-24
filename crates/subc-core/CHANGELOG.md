@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.21.47
+
+- Expose the mapping from managed program names to daemon supervisor IDs through
+  `setup::supervised_module_ids`.
+- Add the standalone doctor rescue library with pinned Pi and Node installed
+  for Pi only, protected sign-in and session files, and local credential removal.
+- Add `ck doctor --agent` to open Pi with a local diagnostic report and rescue
+  guide, and `ck doctor --agent --forget` to remove the rescue login.
+
 ## 0.21.46
 
 - Add `ck doctor` to diagnose the stack even when the daemon is down, write a

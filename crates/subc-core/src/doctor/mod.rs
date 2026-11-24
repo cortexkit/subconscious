@@ -4,6 +4,7 @@ mod fix;
 mod host;
 mod module_checks;
 mod report;
+pub mod rescue;
 mod run;
 mod stack_checks;
 mod window_checks;

@@ -20,12 +20,14 @@ start`, `routes`, `catalog`, `provenance`, `daemon`, `daemon triage`, `daemon
 lint`, `doctor`, `machine show`, `machine adopt`, `quota`, `setup`, `upgrade`, `stack`
 and `window` commands, help and version. These are not covered by the
 three-table formatting guarantees.
-ckni never asks on the terminal; setup refuses with a usage error where ck
-would ask. Under both names, `stack stop`, `stack start`, `window keep`,
+ckni never asks on the terminal: setup refuses where ck would ask, and
+`doctor --agent` is refused because it can ask for a login and runs Pi's
+terminal app. `doctor --agent --forget` does not prompt and works under ckni.
+Under both names, `stack stop`, `stack start`, `window keep`,
 `window abandon`, `window revert` and `doctor --fix` (when it attempts a revert)
 ask the person through the system approval dialog, including with `--json`, and
 exit 2 if approval is declined or cannot be obtained. `doctor` without `--fix`
-never prompts.
+or `--agent` never prompts.
 
 ## JSON conventions and exceptions
 
@@ -50,13 +52,15 @@ query was being printed.
 The following commands have no JSON form and are refused before execution,
 with exit 2 and `ckni: usage: <command> has no JSON form` on stderr (followed
 by the help next step). Bare `ckni --json` is help and is refused too.
-The four `window` commands in this table are also refused under `ck --json`.
+The four `window` commands in this table and `doctor --agent` (including with
+`--forget`) are also refused under `ck --json`.
 
 | Command | JSON classification |
 | --- | --- |
 | `setup` | no JSON form |
 | `upgrade` | no JSON form |
 | `daemon lint` | no JSON form |
+| `doctor --agent` | no JSON form |
 | `module check-script` | no JSON form |
 | `window begin` | no JSON form |
 | `window current` | no JSON form |
@@ -88,6 +92,17 @@ process exit code is the report's `exit`, including when nonzero.
 names. The process exit code reflects the checks, any attempted revert and any
 report write failure. Unlike the stack and window completion reports, doctor's
 top-level `ok` describes only the findings, not the process exit code.
+
+`doctor --agent` exits 0 once Pi has run, regardless of Pi's exit code;
+1 on an install, sign-in, session-folder, report, prompt or launch failure;
+and 2 on a usage error or refusal. It requires terminal stdin and stdout,
+diagnoses only the default local stack, and cannot run under ckni or inside
+a rescue session.
+
+`doctor --agent --forget` exits 0 if the local rescue login was deleted or
+was already absent; 1 if it cannot safely check or delete that file; and
+2 on a usage error or refusal, including from inside a rescue session.
+It works without a terminal, under ckni, and with a connection file specified.
 
 **External faces (`ck-<domain>` executables) are not covered by these guarantees.**
 Both names pass through their output, ANSI, JSON, stderr and exit status

@@ -8,6 +8,7 @@ use subc_core::doctor::{
 
 use crate::{log_tail, Command};
 
+mod agent;
 mod report_file;
 use report_file::ReportTarget;
 
@@ -18,17 +19,22 @@ pub(super) const HELP: &str = "ck doctor — diagnose the stack, even when the d
 
 usage:
   ck doctor [--json] [--report <file>] [--fix] [--subc <connection-file>]
+  ck doctor --agent [--forget]
 
   --json           print one JSON document; for a completed run, stderr is used only if the report cannot be written
   --report <file>  save a private, unsanitized report with bounded log tails
   --fix            attempt an offered window revert with system approval
-  --subc <file>    check a specific daemon; cannot be used with --fix
+  --agent          open the standalone Pi rescue agent for the local stack
+  --forget         with --agent, remove only the local rescue login and exit
+  --subc <file>    check a specific daemon; cannot be used with --fix or an interactive rescue
   --force          not available";
 
 #[derive(Debug, Default)]
 pub(super) struct Options {
     report: Option<PathBuf>,
     fix: bool,
+    pub(super) agent: bool,
+    forget: bool,
 }
 
 pub(super) fn parse(
@@ -53,6 +59,8 @@ pub(super) fn parse(
                 options.report = Some(path_value(&mut args, "--report")?);
             }
             Some("--fix") if !options.fix => options.fix = true,
+            Some("--agent") if !options.agent => options.agent = true,
+            Some("--forget") if !options.forget => options.forget = true,
             Some("--force") => {
                 return Err(CkError::Usage("doctor --force is not available".into()))
             }
@@ -105,6 +113,9 @@ pub(super) fn run(
     explicit_connection: Option<PathBuf>,
     output: JsonOutput,
 ) -> Result<(), CkError> {
+    if options.agent || options.forget {
+        return agent::run(&options, explicit_connection.is_some(), output.ckni);
+    }
     let connection_override = explicit_connection.or_else(|| {
         env::var_os("SUBC_CONNECTION_FILE")
             .filter(|value| !value.is_empty())
@@ -151,7 +162,7 @@ struct FullReport<'a> {
     log_tails: &'a [LogTailRecord],
 }
 
-fn write_full_report(file: &mut fs::File, report: &FullReport<'_>) -> io::Result<()> {
+fn write_full_report(file: &mut impl Write, report: &FullReport<'_>) -> io::Result<()> {
     serde_json::to_writer_pretty(&mut *file, report)?;
     writeln!(file)
 }

@@ -54,6 +54,7 @@ pub(crate) fn json_form(command: &Command) -> JsonForm {
         Command::Provenance { .. } => JsonForm::Schema("ck.provenance/v1"),
         Command::Daemon => JsonForm::Schema("ck.daemon/v1"),
         Command::DaemonTriage => JsonForm::Schema("ck.daemon.triage/v1"),
+        Command::Doctor(options) if options.agent => JsonForm::None("doctor --agent"),
         Command::Doctor(_) => JsonForm::Schema("ck.doctor.report/v1"),
         Command::MachineShow => JsonForm::Schema("ck.machine.show/v1"),
         Command::MachineAdopt { .. } => JsonForm::Schema("ck.machine.adopt/v1"),
@@ -79,6 +80,7 @@ pub(crate) fn json_form(command: &Command) -> JsonForm {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct JsonOutput {
     pub(crate) enabled: bool,
+    pub(crate) ckni: bool,
     schema: Option<&'static str>,
     stream: bool,
 }
@@ -87,6 +89,7 @@ impl From<bool> for JsonOutput {
     fn from(enabled: bool) -> Self {
         Self {
             enabled,
+            ckni: false,
             schema: None,
             stream: false,
         }
@@ -119,6 +122,7 @@ impl JsonOutput {
             && matches!(command, Command::Module(ModuleCommand::Logs { options, .. }) if options.follow);
         Ok(Self {
             enabled,
+            ckni,
             schema,
             stream,
         })
@@ -393,6 +397,11 @@ mod tests {
                 JsonForm::Schema("ck.doctor.report/v1"),
             ),
             (
+                "doctor --agent",
+                PlainOutput::PipedText,
+                JsonForm::None("doctor --agent"),
+            ),
+            (
                 "machine show",
                 PlainOutput::PipedText,
                 JsonForm::Schema("ck.machine.show/v1"),
@@ -600,6 +609,7 @@ mod tests {
     fn json_policy_versions_objects_arrays_and_each_stream_line_without_changing_ck() {
         let versioned = JsonOutput {
             enabled: true,
+            ckni: true,
             schema: Some("ck.activity/v1"),
             stream: false,
         };

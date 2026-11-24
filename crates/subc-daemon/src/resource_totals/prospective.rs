@@ -181,6 +181,13 @@ impl Module {
             }
         }
         let mut scope_increments = BTreeMap::new();
+        #[cfg(windows)]
+        let scope_before: BTreeMap<_, _> = self
+            .roots
+            .values()
+            .flat_map(|command| command.process_tree_tails.keys().copied())
+            .filter_map(|identity| Some((identity, self.cpu_floor.own(identity)?)))
+            .collect();
         let raw = if process_tree {
             let observed: Vec<_> = inside
                 .iter()
@@ -362,6 +369,38 @@ impl Module {
                                             )
                                 })),
                     });
+                }
+            }
+            #[cfg(windows)]
+            for (identity, (before, end)) in std::mem::take(&mut command.process_tree_tails) {
+                if !process_tree {
+                    // A job only reports an aggregate, so its counter cannot
+                    // be reconciled against the departed process's interval.
+                    command.windows_lost_final = true;
+                    continue;
+                }
+                let scope_start = scope_before.get(&identity).copied().unwrap_or(0);
+                let scope_end = self.cpu_floor.own(identity).unwrap_or(scope_start);
+                // The live walk and the exit read can cover some of the same
+                // CPU. Only the new overlap can be funded by this walk; only
+                // work beyond the scope's counter can increase the total.
+                let covered = end.min(scope_end).saturating_sub(before);
+                let newly_counted = scope_increments.get(&identity).copied().unwrap_or(0);
+                let inside = end
+                    .min(scope_end)
+                    .saturating_sub(before.max(scope_end.saturating_sub(newly_counted)));
+                let outside = (end - before) - covered;
+                command.measured_cpu = command.measured_cpu.saturating_add(inside + outside);
+                for (cpu, inside_at_both_ends) in [(inside, true), (outside, false)] {
+                    if cpu != 0 {
+                        demands.push(Demand {
+                            owner: Some(*root),
+                            identity: Some(identity),
+                            cpu,
+                            before: 0,
+                            inside_at_both_ends,
+                        });
+                    }
                 }
             }
             #[cfg(windows)]

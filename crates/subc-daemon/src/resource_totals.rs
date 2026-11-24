@@ -199,6 +199,8 @@ struct Command {
     #[cfg(windows)]
     retired_cpu: [u64; 2],
     #[cfg(windows)]
+    process_tree_tails: BTreeMap<cpu_ledger::Identity, (u64, u64)>,
+    #[cfg(windows)]
     windows_unreadable: bool,
     #[cfg(windows)]
     windows_lost_final: bool,
@@ -820,6 +822,7 @@ impl Tracker {
             }));
             module.refresh_windows_for_receipt(
                 &prepared.table,
+                !prepared.scope_target.has_container(),
                 &stopping,
                 &mut _receipt.windows_stop_cpu,
                 _first_pass,
@@ -1376,13 +1379,16 @@ impl Tracker {
         {
             for (id, root, observation) in commands {
                 retired.extend(observation.handles.values().cloned());
-                if let Some(command) = state
-                    .modules
-                    .get_mut(&id)
-                    .and_then(|module| module.roots.get_mut(&root))
-                {
-                    retired.extend(command.member_handles.values().cloned());
-                    command.apply_windows(root, observation);
+                if let Some(module) = state.modules.get_mut(&id) {
+                    let process_tree = observed
+                        .get(&id)
+                        .and_then(|entry| entry.3.as_ref())
+                        .or(module.counter_owner.as_ref())
+                        .is_some_and(|target| !target.has_container());
+                    if let Some(command) = module.roots.get_mut(&root) {
+                        retired.extend(command.member_handles.values().cloned());
+                        command.apply_windows(root, observation, process_tree);
+                    }
                 }
             }
             for module in state.modules.values_mut() {
@@ -1987,6 +1993,7 @@ impl Module {
             }
             if command.measured
                 && (command.retired_cpu.iter().any(|cpu| *cpu != 0)
+                    || !command.process_tree_tails.is_empty()
                     || command.pinned_cpu.iter().any(|(identity, cpu)| {
                         cpu.is_some_and(|cpu| {
                             command.cpu_floor.own(*identity).is_none_or(|old| cpu > old)

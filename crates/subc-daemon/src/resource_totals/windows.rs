@@ -1,6 +1,10 @@
 use super::*;
 
 #[cfg(test)]
+#[path = "windows/process_tree_tests.rs"]
+mod process_tree_tests;
+
+#[cfg(test)]
 mod resumption_tests {
     use super::*;
 
@@ -88,6 +92,10 @@ pub(super) struct Observation {
 }
 
 pub(super) type StopBoundary = BTreeMap<AgentCommandRoot, BTreeMap<(u32, u64), Option<u64>>>;
+
+// Match the live CPU budget per module: one terminal interval per tracked
+// process, without retaining every exit while scope readings are unavailable.
+const CPU_IDENTITY_LIMIT: usize = 1_024;
 
 #[cfg(test)]
 mod stopped_group_tests {
@@ -335,6 +343,7 @@ mod lost_final_tests {
                         handles: BTreeMap::new(),
                         exited_at: BTreeMap::new(),
                     },
+                    false,
                 );
                 module.trim_windows_pending();
                 assert_eq!(
@@ -351,7 +360,12 @@ mod lost_final_tests {
 }
 
 impl Command {
-    pub(super) fn apply_windows(&mut self, root: AgentCommandRoot, observation: Observation) {
+    pub(super) fn apply_windows(
+        &mut self,
+        root: AgentCommandRoot,
+        observation: Observation,
+        process_tree: bool,
+    ) {
         self.windows_unreadable = observation.cpu.iter().any(|(_, cpu)| cpu.is_none());
         self.root_exited |= observation.exited.contains(&(root.pid, self.native_start));
         let mut pending: BTreeMap<_, _> =
@@ -369,33 +383,46 @@ impl Command {
                 self.observed_root_cpu = cpu;
             }
             if observation.exited.contains(&identity) {
-                let delta = cpu.and_then(|cpu| {
-                    self.cpu_floor
-                        .own(identity)
-                        .map(|old| cpu.saturating_sub(old))
-                        .or_else(|| {
-                            let born = (identity.1 / 10_000).checked_sub(11_644_473_600_000)?;
-                            (self.measured
-                                && born
-                                    > self
-                                        .baseline_at_ms
-                                        .saturating_add(subc_os::process_start_time_precision_ms()))
-                            .then_some(cpu)
-                        })
-                });
-                let location = if self.fixed_inside.contains(&identity) {
+                let before = || {
+                    self.cpu_floor.own(identity).or_else(|| {
+                        let born = (identity.1 / 10_000).checked_sub(11_644_473_600_000)?;
+                        (self.measured
+                            && born
+                                > self
+                                    .baseline_at_ms
+                                    .saturating_add(subc_os::process_start_time_precision_ms()))
+                        .then_some(0)
+                    })
+                };
+                let location = if process_tree {
+                    None
+                } else if self.fixed_inside.contains(&identity) {
                     Some(0)
                 } else if self.fixed_outside.contains(&identity) {
                     Some(1)
                 } else {
                     None
                 };
-                if let (Some(delta), Some(location)) = (delta, location) {
-                    self.retired_cpu[location] = self.retired_cpu[location].saturating_add(delta);
-                } else {
-                    // The identity will not be sampled again. A later clean
-                    // pass cannot recover an unknown final counter/location.
-                    self.windows_lost_final = true;
+                match (cpu.and_then(|cpu| Some((before()?, cpu))), location) {
+                    (Some((before, cpu)), _) if process_tree => {
+                        // A process-tree walk may have sampled this identity
+                        // just before it exited. Keep the interval until the
+                        // same identity's scope progress can be reconciled.
+                        if cpu > before {
+                            self.process_tree_tails
+                                .entry(identity)
+                                .or_insert((before, cpu));
+                        }
+                    }
+                    (Some((before, cpu)), Some(location)) => {
+                        self.retired_cpu[location] =
+                            self.retired_cpu[location].saturating_add(cpu.saturating_sub(before));
+                    }
+                    _ => {
+                        // No later pass can recover an unknown final counter
+                        // or prove whether the exited process was in the job.
+                        self.windows_lost_final = true;
+                    }
                 }
                 self.cpu_floor.forget_own(identity);
                 pending.remove(&identity);
@@ -420,12 +447,19 @@ impl Command {
 impl Module {
     #[cfg(test)]
     pub(super) fn refresh_windows(&mut self, table: &ProcessTable) {
-        self.refresh_windows_for_receipt(table, &BTreeSet::new(), &mut StopBoundary::new(), true);
+        self.refresh_windows_for_receipt(
+            table,
+            false,
+            &BTreeSet::new(),
+            &mut StopBoundary::new(),
+            true,
+        );
     }
 
     pub(super) fn refresh_windows_for_receipt(
         &mut self,
         table: &ProcessTable,
+        process_tree: bool,
         stopping: &BTreeSet<AgentCommandRoot>,
         boundary: &mut StopBoundary,
         first_pass: bool,
@@ -474,7 +508,7 @@ impl Module {
                     });
                 }
             }
-            command.apply_windows(*root, observation);
+            command.apply_windows(*root, observation, process_tree);
         }
         self.trim_windows_pending_for_stop(stopping);
     }
@@ -484,10 +518,20 @@ impl Module {
     }
 
     fn trim_windows_pending_for_stop(&mut self, stopping: &BTreeSet<AgentCommandRoot>) {
-        // Final exited counters have already been reduced into aggregate
-        // increments. Even an unavailable scope cannot grow a dead-PID list.
-        let mut remaining = 1_024;
+        let mut remaining = CPU_IDENTITY_LIMIT;
+        let mut remaining_tails = CPU_IDENTITY_LIMIT;
         for (root, command) in &mut self.roots {
+            let tail_count = command.process_tree_tails.len();
+            if tail_count > remaining_tails {
+                let mut keep = remaining_tails;
+                command.process_tree_tails.retain(|_, _| {
+                    let retain = keep > 0;
+                    keep = keep.saturating_sub(1);
+                    retain
+                });
+                command.windows_lost_final = true;
+            }
+            remaining_tails -= command.process_tree_tails.len();
             if (command.windows_lost_final && !command.windows_loss_marked)
                 || (command.root_exited
                     && !command.finished_requested
@@ -550,6 +594,7 @@ mod pending_bounds_tests {
                     handles: BTreeMap::from([(identity, Arc::clone(&process))]),
                     exited_at: BTreeMap::new(),
                 },
+                false,
             );
             module.trim_windows_pending();
             assert!(module
@@ -576,6 +621,7 @@ mod pending_bounds_tests {
                     .collect(),
                 exited_at: BTreeMap::new(),
             },
+            false,
         );
         module.trim_windows_pending();
         assert_eq!(

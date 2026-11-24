@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.50.50
+
+- On Windows without a job object, keep the final CPU of exited command
+  descendants without counting CPU already included in the process-tree sample twice.
+
 ## 0.50.49
 
 - On macOS, finish stopping a module whose process group has already exited

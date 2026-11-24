@@ -352,11 +352,20 @@ fn normalize(
         return result;
     }
     if !opaque
-        && ["allOf", "anyOf", "if", "then", "else", "$dynamicRef"]
-            .iter()
-            .any(|k| node.contains_key(*k))
+        && [
+            "allOf",
+            "anyOf",
+            "if",
+            "then",
+            "else",
+            "$dynamicRef",
+            "propertyNames",
+            "not",
+        ]
+        .iter()
+        .any(|k| node.contains_key(*k))
     {
-        // Policy intersections and conditional policies cannot be skipped safely.
+        // Ordinary validation does not enforce these keywords.
         return Err(schema_error(path));
     }
     if let Some(parent) = parent {
@@ -1629,6 +1638,48 @@ mod tests {
             invalid["type"][0] = json!(forbidden);
             let error = proposed_schema(invalid).unwrap_err();
             assert_eq!(error.code, RefusalCode::SchemaInvalid);
+            assert_eq!(error.path, "/setting");
+        }
+    }
+
+    #[test]
+    fn ordinary_schema_refuses_property_names_on_an_object() {
+        let mut setting = object(json!({"Bad": field("boolean", json!(true))}));
+        setting["propertyNames"] = json!({"pattern": "^[a-z]+$"});
+        let error = proposed_schema(setting).unwrap_err();
+        assert_eq!(error.code, RefusalCode::SchemaInvalid);
+        assert_eq!(error.path, "/setting");
+    }
+
+    #[test]
+    fn ordinary_schema_refuses_not_on_a_leaf() {
+        let mut setting = field("string", json!("allowed"));
+        setting["not"] = json!({"const": "forbidden"});
+        let error = proposed_schema(setting).unwrap_err();
+        assert_eq!(error.code, RefusalCode::SchemaInvalid);
+        assert_eq!(error.path, "/setting");
+    }
+
+    #[test]
+    fn opaque_json_enforces_property_names_and_not() {
+        let mut names = field("object", json!({}));
+        names["propertyNames"] = json!({"pattern": "^[a-z]+$"});
+        let mut negated = field("string", json!("allowed"));
+        negated["not"] = json!({"const": "forbidden"});
+
+        for (mut setting, valid, invalid) in [
+            (names, json!({"good": true}), json!({"Bad": true})),
+            (negated, json!("allowed"), json!("forbidden")),
+        ] {
+            setting["x-ck-kind"] = json!("json");
+            let schema = proposed_schema(setting).unwrap();
+            schema
+                .validate_layer(Layer::User, &json!({"setting": valid}), &context())
+                .unwrap();
+            let error = schema
+                .validate_layer(Layer::User, &json!({"setting": invalid}), &context())
+                .unwrap_err();
+            assert_eq!(error.code, RefusalCode::ValueInvalid);
             assert_eq!(error.path, "/setting");
         }
     }

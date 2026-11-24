@@ -33,9 +33,11 @@ file bytes: comments, BOMs, line endings and absent files remain distinct snapsh
 `vocabulary.schema.json` publishes the policy annotation meta-schema, also exported as
 `VOCABULARY_META_SCHEMA`. `Schema::new` normalizes local references and use-site policies. Remote,
 recursive, unresolved references, conditional/ambiguous policy compositions and nullable types are
-refused. Structural objects require `unevaluatedProperties: false`. Dynamic maps use a constrained
-`patternProperties` value schema, not arbitrary additional JSON. Every primitive, replacement
-array, item and map value needs a description and effective `x-ck-apply` and `x-ck-layers`.
+refused. `propertyNames` and `not` are refused at the settings node's path unless they occur in an
+opaque `x-ck-kind: "json"` schema. Structural objects require `unevaluatedProperties: false`.
+Dynamic maps use a constrained `patternProperties` value schema, not arbitrary additional JSON.
+Every primitive, replacement array, item and map value needs a description and effective
+`x-ck-apply` and `x-ck-layers`.
 Except for credential references, these fields need a default or an explicit `x-ck-required`.
 An object marked `x-ck-required: false` with no default stays absent until a layer sets it;
 that layer starts from the defaults of the object's members.

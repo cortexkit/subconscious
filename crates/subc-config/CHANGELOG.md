@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.10
+
+- Refuse `propertyNames` and `not` on ordinary settings nodes instead of silently ignoring them.
+  Opaque JSON schemas still support both keywords.
+
 ## 0.1.9
 
 - Reuse compiled schema patterns across validation and property lookup.

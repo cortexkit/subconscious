@@ -44,7 +44,8 @@ enum FedRemotePairCodec {
             return ["code"]
         case result:
             switch header["outcome"] {
-            case .string("granted"): return ["outcome", "target_key"]
+            case .string("granted"):
+                return header["machine_id"] == nil ? ["outcome", "target_key"] : ["outcome", "target_key", "machine_id"]
             case .string("not_granted"): return ["outcome"]
             default: throw Rejection.badField
             }
@@ -89,7 +90,7 @@ enum FedRemotePairCodec {
         switch field {
         case "device_key", "confirmer_key", "target_key", "transcript_hash", "commit", "nonce":
             return hex(text, count: 32) != nil
-        case "window_id": return hex(text, count: 16) != nil
+        case "window_id", "machine_id": return hex(text, count: 16) != nil
         case "generation":
             return text.utf8.first != 48 && text.utf8.allSatisfy { (48...57).contains($0) }
                 && UInt64(text) != nil

@@ -470,7 +470,7 @@ public actor SubcFedClient {
                 try await link.wire.requireNoBufferedInput()
                 return frame
             }
-            let grantedKey = try FedPendingRemotePairing.grantedKey(frame)
+            let result = try FedPendingRemotePairing.grantedResult(frame)
             await link.wire.close()
             try checkRemotePairGeneration(generation)
             // A later start or terminal ceremony may have replaced this record
@@ -478,12 +478,12 @@ public actor SubcFedClient {
             guard try FedRemotePairReceipt.load(remotePairingStore.load(scope: scope)) == receipt else {
                 throw FedRemotePairingError.noReceipt
             }
-            if let grantedKey {
-                guard receipt.matched, grantedKey == receipt.targetKey, grantedKey == link.authenticatedTarget else {
+            if let result {
+                guard receipt.matched, result.key == receipt.targetKey, result.key == link.authenticatedTarget else {
                     throw FedRemotePairingError.wrongTargetKey
                 }
                 try remotePairingStore.replace(scope: scope, record: nil)
-                return .granted(dial.target.remotePairGrant(grantedKey))
+                return .granted(dial.target.remotePairGrant(result.key, machineID: result.machineID))
             }
             try remotePairingStore.replace(scope: scope, record: nil)
             return .notGranted

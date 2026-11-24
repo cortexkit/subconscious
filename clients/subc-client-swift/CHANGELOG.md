@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Accept the optional `machine_id` on granted remote pairing results, including
+  status lookups. `FedPairingGrant.computerMachineID` exposes it alongside the
+  authenticated key and is `nil` when the result does not include it.
+
 - Add remote-pairing relaunch fixtures to `SubcFedTestSupport`. The product now requires `SubcFed` to be built with testing enabled and cannot be linked into a normal release build. The public `SubcFed` API is unchanged.
 
 - Add SubcFed remote pairing from the signed account device list. The SDK runs

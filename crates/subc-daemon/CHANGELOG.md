@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.50.53
+
+- Tests only: the helper processes that the bootstrap recovery tests start
+  write the files those tests wait for by renaming a finished file into
+  place, so a test never reads one half-written. The Windows carried-job test
+  counts only processes started after it began, so a system process naming a
+  reused process id as its parent no longer fails it. No daemon behaviour changes.
+
 ## 0.50.52
 
 - Explain in configuration status why a module's schema refuses a whole project

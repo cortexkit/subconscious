@@ -473,7 +473,48 @@ jobs:
           output="$(TEST_BINARY="$test_binary" TEST_NAME="$test_name" dbus-run-session -- bash -c '
             set -euo pipefail
             printf "throwaway-ci-password" | gnome-keyring-daemon --unlock --components=secrets > /dev/null
-            SUBC_TEST_SECRET_SERVICE_BUS="$DBUS_SESSION_BUS_ADDRESS" "$TEST_BINARY" "$TEST_NAME" --exact --ignored --nocapture
+            # The command above returns once its forked daemon listens on its
+            # control socket. The daemon creates and unlocks the login keyring,
+            # and takes org.freedesktop.secrets on this bus, only after that, so
+            # a test started at once can find no default collection. Wait for
+            # the collection itself. --auto-start=no asks only a service that
+            # already runs: a plain call to the missing name would make the bus
+            # start a second keyring daemon, one without the password.
+            bus() { busctl --address="$DBUS_SESSION_BUS_ADDRESS" --auto-start=no "$@"; }
+            default_collection_unlocked() {
+              local alias collection
+              alias="$(bus call org.freedesktop.secrets /org/freedesktop/secrets \
+                org.freedesktop.Secret.Service ReadAlias s default 2> /dev/null)" || return 1
+              # ReadAlias returns the object path "/" while no default collection
+              # exists; busctl prints an object path as: o "<path>".
+              collection="$(sed -n "s|^o \"\(/org/freedesktop/secrets/collection/[^\"]*\)\"\$|\1|p" <<< "$alias")"
+              [ -n "$collection" ] || return 1
+              [ "$(bus get-property org.freedesktop.secrets "$collection" \
+                org.freedesktop.Secret.Collection Locked 2> /dev/null)" = "b false" ]
+            }
+            # Printed when the keyring is not ready or the test fails, so the
+            # log shows which daemon owned the name and what it answered.
+            report_secret_service() {
+              echo "Secret Service state on this bus:" >&2
+              bus call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus \
+                GetNameOwner s org.freedesktop.secrets >&2 || true
+              bus call org.freedesktop.secrets /org/freedesktop/secrets \
+                org.freedesktop.Secret.Service ReadAlias s default >&2 || true
+              pgrep -a gnome-keyring >&2 || true
+            }
+            deadline=$((SECONDS + 30))
+            until default_collection_unlocked; do
+              if [ "$SECONDS" -ge "$deadline" ]; then
+                echo "no unlocked default Secret Service collection after 30 seconds" >&2
+                report_secret_service
+                exit 1
+              fi
+              sleep 0.1
+            done
+            status=0
+            SUBC_TEST_SECRET_SERVICE_BUS="$DBUS_SESSION_BUS_ADDRESS" "$TEST_BINARY" "$TEST_NAME" --exact --ignored --nocapture || status=$?
+            if [ "$status" -ne 0 ]; then report_secret_service; fi
+            exit "$status"
           ')" || status=$?
           printf '%s\n' "$output"
           test "$status" -eq 0

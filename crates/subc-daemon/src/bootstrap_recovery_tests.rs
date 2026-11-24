@@ -932,11 +932,10 @@ fn config_recovery_fixture() {
                     json!({"op":"config.apply","digest":view["view"]["digest"]}),
                 )
                 .await;
-                std::fs::write(
-                    root.join("desktop-result"),
-                    serde_json::to_vec(&result).unwrap(),
-                )
-                .unwrap();
+                publish_file(
+                    &root.join("desktop-result"),
+                    &serde_json::to_vec(&result).unwrap(),
+                );
             }
             "module" => module_fixture(&root).await,
             role => panic!("unknown fixture role {role}"),
@@ -999,12 +998,70 @@ async fn module_fixture(root: &Path) {
                     let result = rpc(&mut stream, serde_json::to_value(ack).unwrap()).await;
                     assert_eq!(result["op"], "config.applied", "{result}");
                 }
-                std::fs::write(root.join("module-view"), serde_json::to_vec(&view).unwrap())
-                    .unwrap();
+                publish_file(
+                    &root.join("module-view"),
+                    &serde_json::to_vec(&view).unwrap(),
+                );
             }
             _ => panic!("unexpected module frame {body}"),
         }
     }
+}
+
+/// Writes a file that a test waits for and then parses, so that the name only
+/// ever shows a complete value.
+///
+/// `std::fs::write` creates the name first and fills it afterwards, so a test
+/// polling with `wait_path` can see the name, read an empty or half-written
+/// file and fail to parse it; an overwrite briefly truncates the old content
+/// the same way. Here the bytes go to a hidden file in the same folder, which
+/// is then renamed onto the name; a rename within one filesystem replaces the
+/// name in a single step.
+fn publish_file(path: &Path, bytes: &[u8]) {
+    publish_file_with(path, |file| {
+        use std::io::Write;
+        file.write_all(bytes).unwrap();
+    });
+}
+
+/// `publish_file` with the content written by `fill`, so a test can look at
+/// the name while the content is only partly written.
+fn publish_file_with(path: &Path, fill: impl FnOnce(&mut std::fs::File)) {
+    let name = path.file_name().unwrap().to_string_lossy();
+    let staging = path.with_file_name(format!(".{name}.partial"));
+    let mut file = std::fs::File::create(&staging).unwrap();
+    fill(&mut file);
+    drop(file);
+    std::fs::rename(&staging, path).unwrap();
+}
+
+/// The CI failure this guards against: a waiter saw `desktop-result` exist
+/// while the desktop fixture was still writing it, read zero bytes and failed
+/// with "EOF while parsing a value". The check runs at the moment that waiter
+/// ran, halfway through the write, and repeats its exact steps.
+#[test]
+fn published_fixture_file_is_never_visible_half_written() {
+    let dir = ScratchDir::new("recovery-publish");
+    let path = dir.join("desktop-result");
+    let value = json!({"op":"config.apply","generation":1});
+    let bytes = serde_json::to_vec(&value).unwrap();
+    let (head, tail) = bytes.split_at(bytes.len() / 2);
+    publish_file_with(&path, |file| {
+        use std::io::Write;
+        file.write_all(head).unwrap();
+        file.flush().unwrap();
+        if path.exists() {
+            let seen = std::fs::read(&path).unwrap();
+            panic!(
+                "a waiter would read {:?} and parse it as {:?}",
+                String::from_utf8_lossy(&seen),
+                serde_json::from_slice::<Value>(&seen)
+            );
+        }
+        file.write_all(tail).unwrap();
+    });
+    let published: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(published, value);
 }
 
 #[cfg(feature = "dev-desktop-approval")]

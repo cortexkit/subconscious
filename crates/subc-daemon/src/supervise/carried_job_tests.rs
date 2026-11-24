@@ -408,7 +408,19 @@ async fn carried_windows_reload_registration_timeout_terminates_holder() {
 
 #[tokio::test]
 async fn carried_windows_replacements_share_the_original_kernel_job() {
-    fn independently_observed_members(leaders: &[u32], holder: u32, current: u32) -> u64 {
+    // Every process the fixture starts begins after this instant, as a FILETIME
+    // (100 ns ticks since 1601), the unit Win32_Process reports.
+    const UNIX_EPOCH_AS_FILETIME: u64 = 116_444_736_000_000_000;
+    let test_started = UNIX_EPOCH_AS_FILETIME
+        + u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+                / 100,
+        )
+        .unwrap();
+    let independently_observed_members = |leaders: &[u32], holder: u32, current: u32| -> u64 {
         let owned = leaders
             .iter()
             .copied()
@@ -418,15 +430,25 @@ async fn carried_windows_replacements_share_the_original_kernel_job() {
             .join(",");
         let output = std::process::Command::new("powershell.exe")
             .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
-            .arg(format!("Get-CimInstance Win32_Process | Where-Object {{ $_.ProcessId -in @({owned}) -or $_.ParentProcessId -in @({owned}) }} | Select-Object ProcessId,ParentProcessId,Name | ConvertTo-Json -Compress"))
+            .arg(format!("Get-CimInstance Win32_Process | Where-Object {{ $_.ProcessId -in @({owned}) -or $_.ParentProcessId -in @({owned}) }} | Select-Object ProcessId,ParentProcessId,Name,@{{n='Created';e={{$_.CreationDate.ToFileTimeUtc()}}}} | ConvertTo-Json -Compress"))
             .output().unwrap();
         assert!(output.status.success());
         let facts: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         let facts = facts
             .as_array()
             .expect("both owned live fixture processes must be present");
+        // Windows reuses process ids, and `ParentProcessId` keeps the id of a
+        // parent that may have exited long ago. So the query can also return
+        // a process started before this test that names one of our ids as its
+        // parent (csrss.exe from boot, say), or one now holding an exited
+        // leader's id. Neither is ours: everything the fixture starts, the
+        // console hosts of exited leaders included, begins after the test.
+        let facts = facts
+            .iter()
+            .filter(|entry| entry["Created"].as_u64().unwrap() >= test_started)
+            .collect::<Vec<_>>();
         let mut stubs = std::collections::BTreeSet::new();
-        for entry in facts {
+        for entry in &facts {
             let name = entry["Name"].as_str().unwrap();
             if name.eq_ignore_ascii_case("fake-aft-stub.exe") {
                 stubs.insert(u32::try_from(entry["ProcessId"].as_u64().unwrap()).unwrap());
@@ -446,7 +468,7 @@ async fn carried_windows_replacements_share_the_original_kernel_job() {
         // the job. Count those from an independent process-tree observation,
         // not from the job query whose membership we are checking.
         u64::try_from(facts.len()).unwrap()
-    }
+    };
     let fixture = Fixture::new("carried-job-kernel-membership", 3, Duration::from_millis(5)).await;
     let crate::subtree_resources::Target::Job(original) = fixture.module().subtree_target() else {
         panic!("Windows resources must expose the job query target")

@@ -13,9 +13,7 @@ allow participant publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EFFECT.*.>
 allow participant publish $JS.ACK.CK_BOX_GOLDENFIXTURE_PEER.*.>
 allow participant publish $JS.ACK.CK_BOX_GOLDENFIXTURE_WAKE.*.>
 allow participant publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS
-allow participant publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow participant publish $JS.API.CONSUMER.DELETE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow participant publish $JS.API.CONSUMER.DURABLE.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow participant publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EFFECT.*
 allow participant publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_PEER.*
 allow participant publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_WAKE.*
@@ -42,9 +40,7 @@ allow delivery-authority publish $JS.ACK.CK_BOX_GOLDENFIXTURE_PEER.*.>
 allow delivery-authority publish $JS.ACK.CK_BOX_GOLDENFIXTURE_ROOM.m_prefrontal.>
 allow delivery-authority publish $JS.ACK.CK_BOX_GOLDENFIXTURE_WAKE.*.>
 allow delivery-authority publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS
-allow delivery-authority publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow delivery-authority publish $JS.API.CONSUMER.DELETE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow delivery-authority publish $JS.API.CONSUMER.DURABLE.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow delivery-authority publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_CORE_WORK.m_prefrontal
 allow delivery-authority publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EFFECT.*
 allow delivery-authority publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EVENT.m_prefrontal
@@ -219,9 +215,7 @@ allow system subscribe _INBOX.cksys.>
 allow flow-engine publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EVENT.m_basal.>
 allow flow-engine publish $JS.API.CONSUMER.CREATE.CK_BOX_GOLDENFIXTURE_EVENT
 allow flow-engine publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS
-allow flow-engine publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow flow-engine publish $JS.API.CONSUMER.DELETE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow flow-engine publish $JS.API.CONSUMER.DURABLE.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow flow-engine publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EVENT.*
 allow flow-engine publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EVENT.m_basal
 allow flow-engine publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_basal
@@ -240,9 +234,7 @@ allow aft publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EVENT.m_aft_sendstate.>
 allow aft publish $JS.ACK.CK_BOX_GOLDENFIXTURE_PEER.*.>
 allow aft publish $JS.ACK.CK_BOX_GOLDENFIXTURE_WAKE.*.>
 allow aft publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS
-allow aft publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow aft publish $JS.API.CONSUMER.DELETE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow aft publish $JS.API.CONSUMER.DURABLE.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow aft publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EFFECT.*
 allow aft publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EVENT.m_aft_cards
 allow aft publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EVENT.m_aft_sendstate
@@ -271,9 +263,7 @@ allow astrocyte publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_media_usa
 allow astrocyte publish $JS.ACK.CK_BOX_GOLDENFIXTURE_PEER.*.>
 allow astrocyte publish $JS.ACK.CK_BOX_GOLDENFIXTURE_WAKE.*.>
 allow astrocyte publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS
-allow astrocyte publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow astrocyte publish $JS.API.CONSUMER.DELETE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow astrocyte publish $JS.API.CONSUMER.DURABLE.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow astrocyte publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EFFECT.*
 allow astrocyte publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte
 allow astrocyte publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte_attribution
@@ -303,9 +293,7 @@ allow broca publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EVENT.m_broca.>
 allow broca publish $JS.ACK.CK_BOX_GOLDENFIXTURE_PEER.*.>
 allow broca publish $JS.ACK.CK_BOX_GOLDENFIXTURE_WAKE.*.>
 allow broca publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS
-allow broca publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow broca publish $JS.API.CONSUMER.DELETE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow broca publish $JS.API.CONSUMER.DURABLE.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow broca publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EFFECT.*
 allow broca publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EVENT.m_broca
 allow broca publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_PEER.*
@@ -329,9 +317,7 @@ allow cerebellum publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EVENT.m_cerebellum.>
 allow cerebellum publish $JS.ACK.CK_BOX_GOLDENFIXTURE_PEER.*.>
 allow cerebellum publish $JS.ACK.CK_BOX_GOLDENFIXTURE_WAKE.*.>
 allow cerebellum publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS
-allow cerebellum publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow cerebellum publish $JS.API.CONSUMER.DELETE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow cerebellum publish $JS.API.CONSUMER.DURABLE.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow cerebellum publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EFFECT.*
 allow cerebellum publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EVENT.m_cerebellum
 allow cerebellum publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_PEER.*
@@ -358,9 +344,7 @@ allow colliculus publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EVENT.m_colliculus_events.
 allow colliculus publish $JS.ACK.CK_BOX_GOLDENFIXTURE_PEER.*.>
 allow colliculus publish $JS.ACK.CK_BOX_GOLDENFIXTURE_WAKE.*.>
 allow colliculus publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS
-allow colliculus publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow colliculus publish $JS.API.CONSUMER.DELETE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow colliculus publish $JS.API.CONSUMER.DURABLE.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow colliculus publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EFFECT.*
 allow colliculus publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EVENT.m_colliculus_events
 allow colliculus publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_PEER.*
@@ -384,9 +368,7 @@ allow entorhinal publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EVENT.m_entorhinal.>
 allow entorhinal publish $JS.ACK.CK_BOX_GOLDENFIXTURE_PEER.*.>
 allow entorhinal publish $JS.ACK.CK_BOX_GOLDENFIXTURE_WAKE.*.>
 allow entorhinal publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS
-allow entorhinal publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow entorhinal publish $JS.API.CONSUMER.DELETE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow entorhinal publish $JS.API.CONSUMER.DURABLE.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow entorhinal publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EFFECT.*
 allow entorhinal publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EVENT.m_entorhinal
 allow entorhinal publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_PEER.*
@@ -411,9 +393,7 @@ allow magic-context publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EVENT.m_magic-context_r
 allow magic-context publish $JS.ACK.CK_BOX_GOLDENFIXTURE_PEER.*.>
 allow magic-context publish $JS.ACK.CK_BOX_GOLDENFIXTURE_WAKE.*.>
 allow magic-context publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS
-allow magic-context publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow magic-context publish $JS.API.CONSUMER.DELETE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow magic-context publish $JS.API.CONSUMER.DURABLE.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow magic-context publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EFFECT.*
 allow magic-context publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EVENT.m_magic-context
 allow magic-context publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EVENT.m_magic-context_runs
@@ -439,9 +419,7 @@ allow occipital publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EVENT.m_occipital.>
 allow occipital publish $JS.ACK.CK_BOX_GOLDENFIXTURE_PEER.*.>
 allow occipital publish $JS.ACK.CK_BOX_GOLDENFIXTURE_WAKE.*.>
 allow occipital publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS
-allow occipital publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow occipital publish $JS.API.CONSUMER.DELETE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow occipital publish $JS.API.CONSUMER.DURABLE.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow occipital publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EFFECT.*
 allow occipital publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EVENT.m_occipital
 allow occipital publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_PEER.*
@@ -465,9 +443,7 @@ allow plexus publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EVENT.m_plexus.>
 allow plexus publish $JS.ACK.CK_BOX_GOLDENFIXTURE_PEER.*.>
 allow plexus publish $JS.ACK.CK_BOX_GOLDENFIXTURE_WAKE.*.>
 allow plexus publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS
-allow plexus publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow plexus publish $JS.API.CONSUMER.DELETE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow plexus publish $JS.API.CONSUMER.DURABLE.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow plexus publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EFFECT.*
 allow plexus publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EVENT.m_plexus
 allow plexus publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_PEER.*
@@ -491,9 +467,7 @@ allow striatum publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EVENT.m_striatum.>
 allow striatum publish $JS.ACK.CK_BOX_GOLDENFIXTURE_PEER.*.>
 allow striatum publish $JS.ACK.CK_BOX_GOLDENFIXTURE_WAKE.*.>
 allow striatum publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS
-allow striatum publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow striatum publish $JS.API.CONSUMER.DELETE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow striatum publish $JS.API.CONSUMER.DURABLE.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow striatum publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EFFECT.*
 allow striatum publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EVENT.m_striatum
 allow striatum publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_PEER.*
@@ -517,9 +491,7 @@ allow thalamus publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus.>
 allow thalamus publish $JS.ACK.CK_BOX_GOLDENFIXTURE_PEER.*.>
 allow thalamus publish $JS.ACK.CK_BOX_GOLDENFIXTURE_WAKE.*.>
 allow thalamus publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS
-allow thalamus publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow thalamus publish $JS.API.CONSUMER.DELETE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow thalamus publish $JS.API.CONSUMER.DURABLE.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow thalamus publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EFFECT.*
 allow thalamus publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus
 allow thalamus publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_PEER.*
@@ -544,9 +516,7 @@ allow thalamus-harness publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus-har
 allow thalamus-harness publish $JS.ACK.CK_BOX_GOLDENFIXTURE_PEER.*.>
 allow thalamus-harness publish $JS.ACK.CK_BOX_GOLDENFIXTURE_WAKE.*.>
 allow thalamus-harness publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS
-allow thalamus-harness publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow thalamus-harness publish $JS.API.CONSUMER.DELETE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow thalamus-harness publish $JS.API.CONSUMER.DURABLE.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow thalamus-harness publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EFFECT.*
 allow thalamus-harness publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus-harness
 allow thalamus-harness publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus-harness_late_results
@@ -572,9 +542,7 @@ allow wernicke publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EVENT.m_wernicke_agents.>
 allow wernicke publish $JS.ACK.CK_BOX_GOLDENFIXTURE_PEER.*.>
 allow wernicke publish $JS.ACK.CK_BOX_GOLDENFIXTURE_WAKE.*.>
 allow wernicke publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS
-allow wernicke publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow wernicke publish $JS.API.CONSUMER.DELETE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
-allow wernicke publish $JS.API.CONSUMER.DURABLE.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow wernicke publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EFFECT.*
 allow wernicke publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EVENT.m_wernicke_agents
 allow wernicke publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_PEER.*

@@ -383,6 +383,10 @@ impl HubServer for NatsHubServer {
                             if config.max_message_size != 0 {
                                 current.max_message_size = config.max_message_size;
                             }
+                            if config.max_consumers != 0 {
+                                // A lower cap gates new consumers without evicting existing ones.
+                                current.max_consumers = config.max_consumers;
+                            }
                             if !config.duplicate_window.is_zero() {
                                 current.duplicate_window = config.duplicate_window;
                             }

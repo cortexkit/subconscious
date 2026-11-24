@@ -52,6 +52,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hub_configs_use_naming_consumer_caps() {
+        let box_id = "0123456789abcdef0123456789abcdef";
+        let hub =
+            cortexkit_bus_naming::federation::HubName::from_key_pin(&"0f1e2d3c4b5a6978".repeat(4))
+                .unwrap();
+        for (stream, spec) in [
+            (
+                HubStream::Inbox {
+                    box_id: box_id.to_owned(),
+                    hub: hub.clone(),
+                },
+                hub_inbox_stream(&BoxId::parse(box_id).unwrap(), &hub),
+            ),
+            (HubStream::IdLog, hub_idlog_stream()),
+            (
+                HubStream::Residence,
+                residence_bucket(HubKind::SelfHosted).backing_stream,
+            ),
+            (HubStream::Cuts, cuts_object_store()),
+            (HubStream::Rooms, hub_rooms_stream()),
+            (HubStream::Memory, hub_memory_stream()),
+            (
+                HubStream::VaultSharedLogins,
+                vault_shared_logins_bucket(HubKind::SelfHosted).backing_stream,
+            ),
+            (
+                HubStream::VaultManifestActive,
+                vault_manifest_active_bucket(HubKind::SelfHosted).backing_stream,
+            ),
+        ] {
+            let config = config_for(&stream).unwrap();
+            assert_eq!(
+                Some(config.max_consumers),
+                spec.stream.max_consumers,
+                "{}",
+                config.name
+            );
+        }
+    }
+
+    #[test]
     fn hub_streams_follow_the_naming_crate() {
         let hub =
             cortexkit_bus_naming::federation::HubName::from_key_pin(&"0f1e2d3c4b5a6978".repeat(4))

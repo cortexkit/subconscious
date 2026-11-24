@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.13.1
+
+- Require cortexkit-bus-naming 0.5.10. Reserve named census consumer creation for the bus credential while preserving participant KV watches.
+- Apply consumer caps to new and existing module buckets, census, and hub streams. Leave box workload and hand-off streams uncapped.
+
 ## 0.13.0
 
 - Require cortexkit-bus-naming 0.5.9. Name each hub inbox and its grant after the pinned hub key, and purge only that stream's confirmed deliveries. Preserve local deliveries across hub switches and drain an inbox under the previous key before retiring it on a self-hosted hub.

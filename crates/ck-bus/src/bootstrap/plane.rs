@@ -16,7 +16,7 @@ use std::{fmt, sync::Arc, time::Duration};
 use async_nats::jetstream::{self, kv, stream};
 use async_trait::async_trait;
 use cortexkit_bus_naming::{
-    AccountNames, DiscardPolicy, ModuleBucket, StreamKind, StreamSpec, MIB,
+    AccountNames, DiscardPolicy, ModuleBucket, StreamKind, StreamSpec, CENSUS_MAX_CONSUMERS, MIB,
 };
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -54,17 +54,15 @@ pub fn census_config(account: &AccountNames) -> stream::Config {
     // The census is a KV bucket: history 1, no TTL. It is created as its backing
     // stream directly, because the client library's bucket helper first reads the
     // account's JetStream info, which ck-bus's grant does not allow.
-    // Every limit is stated: history 1 and no TTL (a zero max age) are the
-    // foundation's; the size cap is `CENSUS_MAX_BYTES`; message and consumer counts
-    // are unlimited (-1) because history 1 bounds the first and every participant's
-    // census watch is a consumer.
+    // History 1 bounds messages per key without a stream-wide message count limit.
+    // The census consumer cap bounds the shared budget for participant watches.
     stream::Config {
         name: buckets.census_stream.clone(),
         subjects: vec![format!("$KV.{}.>", buckets.census)],
         max_messages_per_subject: 1,
         max_bytes: CENSUS_MAX_BYTES,
         max_messages: -1,
-        max_consumers: -1,
+        max_consumers: CENSUS_MAX_CONSUMERS,
         max_age: Duration::ZERO,
         duplicate_window: CENSUS_DUPLICATE_WINDOW,
         allow_rollup: true,
@@ -99,9 +97,7 @@ pub fn module_bucket_config(
         // This is a per-bucket bound, not a per-principal reservation: a reader
         // can block new watches, even the owner's, but not puts, key reads, or other buckets.
         // Unbounded watches would let one reader grow server memory for every module.
-        max_consumers: (8 * (1 + bucket.readers.len())).try_into().map_err(|_| {
-            PlaneError::new(format!("module bucket {name}: consumer cap exceeds i32"))
-        })?,
+        max_consumers: bucket.max_consumers(),
         duplicate_window: bucket
             .ttl
             .map(Duration::from_secs)
@@ -118,7 +114,7 @@ pub fn module_bucket_config(
 }
 
 /// A shipped stream as ck-bus creates it. Optional limits stay at the client's
-/// omission sentinel unless the naming spec supplies them; they never serialize as zero.
+/// defaults unless the naming spec supplies them.
 pub fn stream_config(spec: &StreamSpec) -> stream::Config {
     let mut config = stream::Config {
         name: spec.name.clone(),
@@ -144,6 +140,9 @@ pub fn stream_config(spec: &StreamSpec) -> stream::Config {
     }
     if let Some(cap) = spec.max_message_size {
         config.max_message_size = cap;
+    }
+    if let Some(cap) = spec.max_consumers {
+        config.max_consumers = cap;
     }
     if let Some(window) = spec.duplicate_window {
         config.duplicate_window = window;
@@ -876,6 +875,8 @@ impl BoxPlane for NatsBox {
         config.max_age = desired.max_age;
         config.duplicate_window = desired.duplicate_window;
         config.max_messages = desired.max_messages;
+        // NATS accepts a cap below the current count without evicting consumers.
+        // It refuses new consumers until the count falls below the cap.
         config.max_consumers = desired.max_consumers;
         config.allow_rollup = desired.allow_rollup;
         config.deny_delete = desired.deny_delete;
@@ -895,8 +896,8 @@ impl BoxPlane for NatsBox {
     async fn ensure_census(&self, account: &AccountNames) -> Result<(), PlaneError> {
         let config = census_config(account);
         // Update first, create when absent: a census stream an earlier ck-bus created
-        // without the size cap is brought to it rather than refused as a configuration
-        // mismatch, and its values are kept.
+        // without the current caps is updated in place rather than refused as a
+        // configuration mismatch, and its values are kept.
         let name = config.name.clone();
         self.jetstream
             .create_or_update_stream(config)
@@ -912,6 +913,7 @@ impl BoxPlane for NatsBox {
         );
         if spec.max_msgs_per_subject.is_some()
             || spec.max_message_size.is_some()
+            || spec.max_consumers.is_some()
             || spec.duplicate_window.is_some()
             || spec.kind == StreamKind::Effect
             || spec.kind == StreamKind::Event
@@ -934,6 +936,9 @@ impl BoxPlane for NatsBox {
                         }
                         if let Some(cap) = spec.max_message_size {
                             config.max_message_size = cap;
+                        }
+                        if let Some(cap) = spec.max_consumers {
+                            config.max_consumers = cap;
                         }
                         if let Some(window) = spec.duplicate_window {
                             config.duplicate_window = window;

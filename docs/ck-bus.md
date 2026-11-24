@@ -697,8 +697,8 @@ Ownership of acts.
   | cerebellum | views | occipital | 256 KiB | 32 MiB | - |
 
   History, value size, TTL (seconds in naming) and total byte cap reconcile on the
-  existing stream. Each module bucket also has `max_consumers` set to
-  `8 * (1 + readers.len())`, including the owner in the shared watch budget.
+  existing stream. Each module bucket also has `max_consumers` set to 32, a watch
+  budget shared by the owner and readers.
   NATS 2.15.0 permits updating that cap in place, so an existing bucket reconciles
   without replacing its stream or keys. An incompatible immutable setting fails by bucket and setting
   (`module-bucket-immutable`); a refused broker update reports
@@ -708,8 +708,13 @@ Ownership of acts.
   `$JS.API.CONSUMER.CREATE.KV_<bucket>` watch endpoint, with delivery to their own
   credential-scoped inbox and stream-scoped flow-control replies. No named or
   durable consumer-create endpoint, consumer info/delete/list, or stream
-  create/update/delete/purge is granted to readers. Census remains separate and
-  keeps its existing permissions.
+  create/update/delete/purge is granted to readers. The separate census stream has
+  a 128-consumer cap. Participants keep its bare watch endpoint
+  (`$JS.API.CONSUMER.CREATE.<census stream>`, with no consumer name after it),
+  which is what an ephemeral KV watch uses; only ck-bus can publish to its named
+  or durable consumer-create endpoints. Hub
+  streams have a cap of 256, and box workload streams, dead-letter streams and
+  `FEDOUT` keep the server default.
 
   Plain NATS subject permissions cannot inspect a consumer-create body. The
   bucket-scoped unnamed watch endpoint is the accepted reader surface: it cannot

@@ -410,6 +410,15 @@ async fn generated_grants_hold_on_a_live_server() {
         "the watch's consumer create and the delete under the census stream are allowed: \
          {census_violations:?}"
     );
+    for subject in [
+        format!("$JS.API.CONSUMER.CREATE.{census_stream}.named"),
+        format!("$JS.API.CONSUMER.DURABLE.CREATE.{census_stream}.named"),
+    ] {
+        for participant in [&p, &a] {
+            participant.publish(&subject, b"{}").await;
+            participant.expect_denied(&subject).await;
+        }
+    }
 
     // Allowed: the dead-letter subject and a bound room.
     let dead = names.effect_dead();

@@ -1269,6 +1269,7 @@ mod leaf_link {
 
         let desired = config_for(&HubStream::Memory).unwrap();
         js.create_stream(async_nats::jetstream::stream::Config {
+            max_consumers: -1,
             max_message_size: 1024,
             ..desired.clone()
         })
@@ -1289,6 +1290,12 @@ mod leaf_link {
 
         let mut stream = js.get_stream(&desired.name).await.unwrap();
         let info = stream.info().await.unwrap();
+        assert_eq!(
+            Some(info.config.max_consumers),
+            cortexkit_bus_naming::federation::hub_memory_stream()
+                .stream
+                .max_consumers
+        );
         assert_eq!(info.config.max_message_size, desired.max_message_size);
         assert_eq!(info.state.messages, 1);
         let mut stream = js.get_stream(&immutable.name).await.unwrap();

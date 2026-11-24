@@ -131,6 +131,43 @@ fn module_plane_plan_matches_regenerated_fixture() {
     assert_eq!(module_plane_document(), pinned);
 }
 
+#[test]
+fn module_bucket_configs_use_naming_consumer_caps() {
+    let names = AccountNames::derive(GOLDEN_ACCOUNT).unwrap();
+    for row in cortexkit_bus_naming::MODULE_BUCKETS {
+        let config = bootstrap::plane::module_bucket_config(&names, row).unwrap();
+        assert_eq!(config.max_consumers, row.max_consumers(), "{}", config.name);
+    }
+}
+
+#[test]
+fn census_config_uses_naming_consumer_cap() {
+    let names = AccountNames::derive(GOLDEN_ACCOUNT).unwrap();
+    assert_eq!(
+        bootstrap::plane::census_config(&names).max_consumers,
+        cortexkit_bus_naming::CENSUS_MAX_CONSUMERS,
+    );
+}
+
+#[test]
+fn box_stream_configs_leave_the_consumer_cap_at_default_unless_specified() {
+    let names = AccountNames::derive(GOLDEN_ACCOUNT).unwrap();
+    let mut specs = shipped_streams(&names);
+    specs.push(cortexkit_bus_naming::federation::fedout_stream());
+    for mut spec in specs {
+        assert_eq!(spec.max_consumers, None, "{}", spec.name);
+        assert_eq!(
+            bootstrap::plane::stream_config(&spec).max_consumers,
+            jetstream::stream::Config::default().max_consumers,
+            "{}",
+            spec.name,
+        );
+        // Exercise the mapping as well as the shipped uncapped policy.
+        spec.max_consumers = Some(64);
+        assert_eq!(bootstrap::plane::stream_config(&spec).max_consumers, 64);
+    }
+}
+
 /// Run explicitly after a reviewed naming-table update; ordinary suites never write fixtures.
 #[test]
 #[ignore = "explicit fixture regeneration only"]
@@ -1570,10 +1607,7 @@ async fn module_buckets_reconcile_limits_in_place_and_refuse_immutable_storage()
             i64::from(row.history)
         );
         assert_eq!(original.config.max_bytes, row.max_bytes as i64);
-        assert_eq!(
-            original.config.max_consumers as usize,
-            8 * (1 + row.readers.len())
-        );
+        assert_eq!(original.config.max_consumers, row.max_consumers());
         assert_eq!(
             original.config.max_age,
             row.ttl.map(Duration::from_secs).unwrap_or_default()
@@ -1656,9 +1690,14 @@ async fn module_buckets_consumer_cap_refuses_reader_growth_but_keeps_owner_watch
     let reader = plane.module_client("striatum").await;
     let reader_js = jetstream::new(reader.client.clone());
     let mut handle = reader_js.get_stream(&stream).await.unwrap();
+    let cap = cortexkit_bus_naming::MODULE_BUCKETS
+        .iter()
+        .find(|row| row.owner == "astrocyte" && row.name == "multiplier")
+        .unwrap()
+        .max_consumers() as usize;
 
     // The owner holds one slot before the reader fills the remaining shared budget.
-    for _ in 1..16 {
+    for _ in 1..cap {
         let reply = reader
             .client
             .request(
@@ -1677,7 +1716,7 @@ async fn module_buckets_consumer_cap_refuses_reader_growth_but_keeps_owner_watch
         let reply: Value = serde_json::from_slice(&reply.payload).unwrap();
         assert!(reply.get("error").is_none(), "{reply}");
     }
-    assert_eq!(handle.info().await.unwrap().state.consumer_count, 16);
+    assert_eq!(handle.info().await.unwrap().state.consumer_count, cap);
     for _ in 0..2 {
         let reply = reader
             .client
@@ -1722,7 +1761,7 @@ async fn module_buckets_consumer_cap_refuses_reader_growth_but_keeps_owner_watch
         .await
         .expect("stream-message reads need no consumer slot");
     assert_eq!(raw.payload.as_ref(), b"bounded");
-    assert_eq!(handle.info().await.unwrap().state.consumer_count, 16);
+    assert_eq!(handle.info().await.unwrap().state.consumer_count, cap);
     let other_bucket = plane
         .names
         .module_bucket_name("astrocyte", "read-marks")
@@ -1759,6 +1798,18 @@ async fn module_buckets_reconcile_consumer_cap_in_place_without_recreating_keys(
     let bucket = plane.names.module_bucket_name(row.owner, row.name).unwrap();
     let store = plane.js.get_key_value(&bucket).await.unwrap();
     let revision = store.put("kept", "before".into()).await.unwrap();
+    let over_cap = row.max_consumers() as usize + 1;
+    let consumer_config = |index| pull::Config {
+        durable_name: Some(format!("watch_budget_probe_{index}")),
+        ..Default::default()
+    };
+    for index in 0..over_cap {
+        plane
+            .js
+            .create_consumer_on_stream(consumer_config(index), &desired.name)
+            .await
+            .unwrap();
+    }
     let before = stream_state(&plane.js, &desired.name).await;
     // Probe the server directly before checking bootstrap's reconciliation path.
     let updated = plane
@@ -1766,19 +1817,69 @@ async fn module_buckets_reconcile_consumer_cap_in_place_without_recreating_keys(
         .update_stream(desired.clone())
         .await
         .expect("NATS 2.15.0 permits max_consumers updates in place");
-    assert_eq!(updated.config.max_consumers, 16);
+    assert_eq!(updated.config.max_consumers, row.max_consumers());
     let mut expected = before.clone();
-    expected.0["max_consumers"] = json!(16);
+    expected.0["max_consumers"] = json!(row.max_consumers());
     assert_eq!(stream_state(&plane.js, &desired.name).await, expected);
     plane.js.update_stream(unlimited).await.unwrap();
     assert_eq!(stream_state(&plane.js, &desired.name).await, before);
     let ready = plane.bootstrap().await;
     assert_eq!(ready.orphaned_module_durables, 0);
     assert_eq!(stream_state(&plane.js, &desired.name).await, expected);
+    let mut stream = plane.js.get_stream(&desired.name).await.unwrap();
+    assert_eq!(stream.info().await.unwrap().state.consumer_count, over_cap);
+    let error = plane
+        .js
+        .create_consumer_on_stream(consumer_config(over_cap), &desired.name)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error.kind(), jetstream::stream::ConsumerErrorKind::JetStream(api)
+            if api.error_code() == jetstream::ErrorCode::MAXIMUM_CONSUMERS_LIMIT),
+        "{error}"
+    );
     assert_eq!(
         store.entry("kept").await.unwrap().unwrap().revision,
         revision
     );
+    plane.server.stop().await;
+}
+
+#[tokio::test]
+async fn bootstrap_creates_and_reconciles_module_and_census_consumer_caps() {
+    let _gate = harness::acceptance_gate().await;
+    let Some(plane) = UpgradePlane::start().await else {
+        return;
+    };
+    let row = &cortexkit_bus_naming::MODULE_BUCKETS[1];
+    let buckets = [
+        (
+            plane.names.module_bucket_name(row.owner, row.name).unwrap(),
+            row.max_consumers(),
+        ),
+        (
+            plane.names.buckets().census.clone(),
+            cortexkit_bus_naming::CENSUS_MAX_CONSUMERS,
+        ),
+    ];
+    drop(plane.bootstrap().await);
+    let mut originals = Vec::new();
+    for (bucket, cap) in &buckets {
+        let mut stream = plane.js.get_stream(format!("KV_{bucket}")).await.unwrap();
+        let info = stream.info().await.unwrap();
+        assert_eq!(info.config.max_consumers, *cap, "{bucket} on creation");
+        originals.push(info.created);
+        let mut unlimited = info.config.clone();
+        unlimited.max_consumers = -1;
+        plane.js.update_stream(unlimited).await.unwrap();
+    }
+    drop(plane.bootstrap().await);
+    for ((bucket, cap), created) in buckets.into_iter().zip(originals) {
+        let mut stream = plane.js.get_stream(format!("KV_{bucket}")).await.unwrap();
+        let info = stream.info().await.unwrap();
+        assert_eq!(info.config.max_consumers, cap, "{bucket} after restart");
+        assert_eq!(info.created, created, "{bucket} must not be recreated");
+    }
     plane.server.stop().await;
 }
 

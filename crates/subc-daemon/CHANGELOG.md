@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.50.59
+
+- Tests only: run the Windows agent CPU stop fixtures without a console and
+  wait for job membership to reflect process exits before sampling. No daemon
+  behavior changes.
+
 ## 0.50.58
 
 - Add a byte-checked `config.schema` example for a declared module with no settings fields.

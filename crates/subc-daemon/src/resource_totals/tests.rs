@@ -2,13 +2,20 @@ use super::*;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command as ProcessCommand, Stdio};
 
+#[cfg(windows)]
+const DETACHED_PROCESS: u32 = 0x0000_0008;
+
+#[cfg(windows)]
+#[path = "forced_stop_join.rs"]
+mod forced_stop_join;
+
 #[test]
 fn resource_command_fixture() {
     let Some(mode) = std::env::var_os("SUBC_RESOURCE_COMMAND_FIXTURE") else {
         return;
     };
-    if mode == "parent" {
-        let mut child = command();
+    if mode == "parent" || mode == "headless-parent" {
+        let mut child = spawn_command_fixture(mode == "headless-parent");
         let child_cpu = subc_os::resource_usage(child.id()).map(cpu_ms).unwrap();
         println!("CHILD_READY {} {child_cpu}", child.id());
         std::io::stdout().flush().unwrap();
@@ -32,6 +39,7 @@ fn resource_command_fixture() {
         }
         writeln!(child.stdin.take().unwrap(), "exit").unwrap();
         assert!(child.wait().unwrap().success());
+        drop(child);
         println!("CHILD_REAPED");
         std::io::stdout().flush().unwrap();
         line.clear();
@@ -83,7 +91,19 @@ fn resource_command_fixture() {
 }
 
 fn command() -> std::process::Child {
-    let mut child = ProcessCommand::new(std::env::current_exe().unwrap())
+    spawn_command_fixture(false)
+}
+
+fn spawn_command_fixture(no_console: bool) -> std::process::Child {
+    let mut program = ProcessCommand::new(std::env::current_exe().unwrap());
+    #[cfg(windows)]
+    if no_console {
+        use std::os::windows::process::CommandExt as _;
+        program.creation_flags(DETACHED_PROCESS);
+    }
+    #[cfg(not(windows))]
+    let _ = no_console;
+    let mut child = program
         .args([
             "--exact",
             "resource_totals::tests::resource_command_fixture",
@@ -310,13 +330,65 @@ async fn windows_first_stop_snapshot_survives_a_failed_commit() {
 }
 
 #[cfg(windows)]
+fn spawn_detached_job_fixture(
+    program: &mut ProcessCommand,
+) -> subc_jobobject::ContainedChild<std::process::Child> {
+    use std::os::windows::process::CommandExt as _;
+
+    // Start detached rather than just hiding the window: even a headless
+    // console can have a host process of its own.
+    program.creation_flags(DETACHED_PROCESS | subc_jobobject::CREATE_SUSPENDED_FLAG);
+    let job = subc_jobobject::JobObject::new().unwrap();
+    let child = program.spawn().unwrap();
+    let pid = child.id();
+    subc_jobobject::ContainedChild::contain(child, job, pid).unwrap()
+}
+
+#[cfg(windows)]
+fn windows_wait_for_fixture_members(
+    target: &crate::subtree_resources::Target,
+    expected_pids: &[u32],
+) {
+    // A child's exit wait can finish before the kernel removes its PID from
+    // the job's list. Wait for the expected membership, not an accounting result.
+    let expected: BTreeSet<_> = expected_pids.iter().copied().collect();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let actual: BTreeSet<_> = target
+            .process_ids()
+            .expect("fixture job PID list")
+            .into_iter()
+            .collect();
+        if actual == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "job membership after the fixture handshake: expected {expected:?}, got {actual:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(windows)]
+fn windows_fixture_table(
+    target: &crate::subtree_resources::Target,
+    expected_pids: &[u32],
+) -> ProcessTable {
+    // A process snapshot and the live job list can disagree while a member
+    // enters or leaves the job. Read once after the fixture's live set settles.
+    windows_wait_for_fixture_members(target, expected_pids);
+    ProcessTable::read().expect("fixture process table")
+}
+
+#[cfg(windows)]
 async fn windows_stop_snapshot(retry: bool) {
-    fn line(output: &mut impl BufRead, prefix: &str) {
+    fn line(output: &mut impl BufRead, prefix: &str) -> String {
         loop {
             let mut text = String::new();
             assert_ne!(output.read_line(&mut text).unwrap(), 0);
-            if text.contains(prefix) {
-                return;
+            if let Some((_, tail)) = text.split_once(prefix) {
+                return tail.trim().to_owned();
             }
         }
     }
@@ -328,11 +400,13 @@ async fn windows_stop_snapshot(retry: bool) {
                 "resource_totals::tests::resource_command_fixture",
                 "--nocapture",
             ])
-            .env("SUBC_RESOURCE_COMMAND_FIXTURE", "parent")
+            // A console host can outlive the child we wait for, adding an
+            // uncontrolled member to the job during the stop snapshot.
+            .env("SUBC_RESOURCE_COMMAND_FIXTURE", "headless-parent")
             .env("SUBC_RESOURCE_PARENT_FINAL_BURN", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped());
-        let spawned = subc_jobobject::spawn_contained(&mut program).unwrap();
+        let spawned = spawn_detached_job_fixture(&mut program);
         let mut root = spawned.child;
         let job = Arc::new(Mutex::new(spawned.job));
         let target = crate::subtree_resources::Target::Job(Arc::downgrade(&job));
@@ -345,7 +419,14 @@ async fn windows_stop_snapshot(retry: bool) {
             target: target.clone(),
         };
         let mut output = BufReader::new(root.stdout.take().unwrap());
-        line(&mut output, "CHILD_READY");
+        let child_ready = line(&mut output, "CHILD_READY ");
+        let child_pid = child_ready
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let root_pid = root.id();
         let identity = AgentCommandRoot {
             pid: root.id(),
             start_time_ms: subc_os::process_start_time_ms(root.id()).unwrap(),
@@ -363,18 +444,19 @@ async fn windows_stop_snapshot(retry: bool) {
         );
         writeln!(root.stdin.as_mut().unwrap(), "burn").unwrap();
         line(&mut output, "CHILD_BURNED");
-        let read = || {
+        let read = |expected_pids: &[u32]| {
             tracker.read_observed(
                 BTreeMap::from([("early-finish".into(), Some(launch.clone()))]),
-                Arc::new(ProcessTable::read().unwrap()),
+                Arc::new(windows_fixture_table(&launch.target, expected_pids)),
                 false,
                 now_ms(),
                 Instant::now() + Duration::from_secs(5),
             )
         };
-        read();
+        assert!(read(&[root_pid, child_pid]).agent_commands.is_some());
         writeln!(root.stdin.as_mut().unwrap(), "reap").unwrap();
         line(&mut output, "CHILD_REAPED");
+        windows_wait_for_fixture_members(&target, &[root_pid]);
         let batch = Declaration {
             known: partial.then_some(Vec::new()),
             finished: if partial {
@@ -431,6 +513,7 @@ async fn windows_stop_snapshot(retry: bool) {
             // attempts: only the retried declaration could misattribute it.
             writeln!(root.stdin.take().unwrap(), "exit").unwrap();
             assert!(root.wait().unwrap().success());
+            windows_wait_for_fixture_members(&target, &[]);
             let next = tracker
                 .prepare(
                     "early-finish",
@@ -459,14 +542,24 @@ async fn windows_stop_snapshot(retry: bool) {
                 )
                 .is_some());
         }
-        let stopped = read();
+        let stopped = read(if retry {
+            &[]
+        } else {
+            std::slice::from_ref(&root_pid)
+        });
         if !retry {
             writeln!(root.stdin.take().unwrap(), "exit").unwrap();
             assert!(root.wait().unwrap().success());
         }
-        let after = read();
-        let stopped_agents = &stopped.agent_commands.as_ref().unwrap()[0];
-        let agents = &after.agent_commands.as_ref().unwrap()[0];
+        let after = read(&[]);
+        let stopped_agents = &stopped
+            .agent_commands
+            .as_ref()
+            .unwrap_or_else(|| panic!("unavailable stop observation: {:?}", stopped.reasons))[0];
+        let agents = &after
+            .agent_commands
+            .as_ref()
+            .unwrap_or_else(|| panic!("unavailable post-exit observation: {:?}", after.reasons))[0];
         assert!(
             stopped_agents.cpu_ms >= 100,
             "the independently CPU-burning child must earn nonzero pre-finish credit"

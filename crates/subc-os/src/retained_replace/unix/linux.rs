@@ -2,9 +2,19 @@ use crate::retained_replace::Stage;
 use rustix::fs::{self, RenameFlags};
 use std::{ffi::OsStr, fs::File, io};
 
-pub(super) fn rename_exclusive(parent: &File, name: &str, leaf: &OsStr) -> io::Result<()> {
-    fs::renameat_with(parent, name, parent, leaf, RenameFlags::NOREPLACE)?;
+pub(super) fn rename_exclusive(
+    parent: &File,
+    name: &OsStr,
+    dest: &File,
+    leaf: &OsStr,
+) -> io::Result<()> {
+    fs::renameat_with(parent, name, dest, leaf, RenameFlags::NOREPLACE)?;
     Ok(())
+}
+
+pub(super) fn directory_path(parent: &File) -> io::Result<std::path::PathBuf> {
+    use std::os::fd::AsRawFd;
+    std::fs::read_link(format!("/proc/self/fd/{}", parent.as_raw_fd()))
 }
 
 // An ACL can carry more information than the mode bits, including named user

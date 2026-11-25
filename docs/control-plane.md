@@ -262,6 +262,7 @@ not new variants of the legacy exhaustive client control enums:
 | `config.stamp`, `config.plan`, `config.unstamp`, `config.rollback` | A reviewable plan and digest; none commits configuration. |
 | `config.apply` | Requests approval of that digest, then reports `generation` and `restart_required` (always serialized; absent on older replies means false). |
 | `config.history` | Retained generations and summaries of pruned history. |
+| `config.revert` | Restores the files a pending file-capture plan covers to their approved bytes, skipping any file edited since review. Unlike the other operations in this table, it is listed in `subc_ops`, so a client can tell whether the daemon serves it. |
 
 An edit path may name a declared map entry or a field within it, but not an
 array item; discriminated unions can be set or removed as whole values.
@@ -283,6 +284,49 @@ approval service answers the consent request with an error whose code is
 generation is created and the plan stays pending. Other phone error codes,
 declined approval and unanswered cards return `approval_declined`. Changed plan
 inputs return `plan_stale`, without supplying a new digest.
+
+If the same digest already has an open phone card, `config.apply` returns
+`config_approval_pending` with `detail.digest`; it does not start another
+approval. A later explicit apply for another digest withdraws the previous
+settings card before prompting locally or on the phone. An automatic request
+does not replace an explicit approval. A revert that preserves a
+concurrent save may return `config_changed_since_review` with
+`detail.recovery_path`; the same recovery entry is shown in status under
+`settings_recovery_copies`. An asynchronous phone decline reports the path in
+status rather than changing the consent reply.
+
+A successful `config.revert` returns `files`, with one `{path, status}` row
+per file, even for a one-file plan. A refusal keeps the first failure's code,
+message and detail and adds `detail.files` with every file's outcome. A row's
+`status` is `restored` or `refused`; a refused row has its own `code`,
+`message`, and optional `detail` such as `recovery_path`. Files processed
+before or after a refusal may still be restored.
+
+Decline and revert keep moved-aside settings in the daemon's owner-only
+`settings-recovery` directory until you remove them. In the stamped status,
+`settings_recovery_copies` shows the newest 50 copies actually on disk, whether
+they are routine archive copies or hidden `.declined-` copies left beside
+settings on another filesystem. `settings_recovery_copy_count` reports the
+total when nonzero. The inventory survives daemon restarts. Both members are
+omitted when `config.status` reports `state: "unstamped"`.
+If a settings folder is temporarily inaccessible or its mount has changed,
+its recorded copy remains in the inventory until absence can be verified.
+
+If a decline could not restore a file, the newest kept digest owns that path.
+An older multi-file digest remains usable for paths it still owns. Revert or
+Decline reports `settings_restore_superseded` for any path it no longer owns
+and leaves that file alone.
+The daemon keeps at most 64 settings files with a declined change it could not
+restore, each waiting for a retry with its digest. Decline still tries to
+restore a new file when all 64 are in use. If that restore fails and the file
+cannot be kept, it returns
+`settings_keep_limit` and retains the original per-file refusal details.
+Recreating a settings file without a recorded mode caps its
+Unix permissions to a sibling settings file's mode, or to `0644` if there is
+no sibling, without overriding umask or directory restrictions. On macOS the
+folder's inheritable access-control list (ACL) applies just as it does to a
+file you create there.
+Windows uses the inherited security descriptor in this case.
 
 **Project-tuple plans.** A capture plan (`config.plan` without `edits`) checks
 registered roots for external changes. An edit names `layer: "workspace"`

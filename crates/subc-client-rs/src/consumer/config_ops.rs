@@ -280,6 +280,18 @@ impl SubcConsumer {
         }
     }
 
+    /// Restore the approved settings files covered by a pending capture plan.
+    /// A file changed since capture is not overwritten. Sent once, never retried.
+    pub async fn config_revert(&self, digest: Digest) -> Result<(), CallError> {
+        match self
+            .config_request(ConfigControlRequest::Revert { digest }, false)
+            .await?
+        {
+            ConfigControlResponse::Revert { .. } => Ok(()),
+            _ => Err(unexpected("config.revert")),
+        }
+    }
+
     /// Apply exactly the reviewed digest (`config.apply`). Unstamped installs
     /// apply immediately; stamped installs wait for trusted operator approval.
     /// The timeout adds the daemon's 290-second `OPERATOR_RESPONSE_BUDGET` to the
@@ -646,6 +658,18 @@ mod tests {
         let req = request(&mut rx, json!({"op":"config.plan"})).await;
         respond(&shared, &req, json!({"op":"config.plan","view":plan()})).await;
         call.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn config_revert_sends_the_exact_pending_digest() {
+        let (consumer, mut rx) = consumer();
+        let shared = consumer.shared.clone();
+        let digest = subc_config::raw_digest(b"settings capture");
+        let expected = digest.clone();
+        let call = tokio::spawn(async move { consumer.config_revert(digest).await });
+        let req = request(&mut rx, json!({"op":"config.revert","digest":expected})).await;
+        respond(&shared, &req, json!({"op":"config.revert", "files":[{"path":"/settings/a.jsonc", "status":"restored", "future_extension":true}]})).await;
+        call.await.unwrap().unwrap();
     }
 
     #[tokio::test(start_paused = true)]

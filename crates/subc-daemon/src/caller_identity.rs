@@ -9,6 +9,7 @@ use tokio::net::TcpStream;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CallerIdentity {
     resolved: Option<SocketPeer>,
+    daemon_settings: bool,
 }
 
 impl CallerIdentity {
@@ -38,7 +39,21 @@ impl CallerIdentity {
     }
 
     fn from_lookup_result(resolved: Option<SocketPeer>) -> Self {
-        Self { resolved }
+        Self {
+            resolved,
+            daemon_settings: false,
+        }
+    }
+
+    pub(crate) fn daemon_settings() -> Self {
+        Self {
+            resolved: None,
+            daemon_settings: true,
+        }
+    }
+
+    pub(crate) fn is_daemon_settings(&self) -> bool {
+        self.daemon_settings
     }
 
     pub fn pid(&self) -> Option<u32> {
@@ -56,6 +71,9 @@ impl CallerIdentity {
     /// An unbounded description. Prompt builders must still sanitize and limit
     /// the executable path to their own text budget.
     pub fn description(&self) -> String {
+        if self.daemon_settings {
+            return "A settings file changed".into();
+        }
         match &self.resolved {
             Some(caller) => format!("pid {} ({})", caller.pid, caller.executable.display()),
             None => "an unidentified local process".to_owned(),

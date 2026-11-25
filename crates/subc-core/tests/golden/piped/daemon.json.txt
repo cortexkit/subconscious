@@ -64,7 +64,8 @@ exit: Some(0)
     "supervisor.spawn_subscribe",
     "policy_root.get",
     "policy_root.set",
-    "policy_root.recover"
+    "policy_root.recover",
+    "config.revert"
   ]
 }
 --- stderr ---

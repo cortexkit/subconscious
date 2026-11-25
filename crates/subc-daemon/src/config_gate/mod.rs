@@ -13,7 +13,9 @@ mod capture_plan;
 pub(crate) mod program;
 pub mod project_layers;
 pub mod project_registry;
+mod recovery_inventory;
 mod refusal_rule;
+mod restore;
 pub(crate) mod review;
 mod reviewed_build;
 mod root_io;
@@ -50,7 +52,10 @@ pub struct GateError {
     pub code: String,
     pub detail: String,
     capture_race: bool,
+    restore_installed: bool,
     settings_file: Option<Box<SettingsFile>>,
+    pub(crate) wire_detail: Option<Box<serde_json::Value>>,
+    pub(crate) settings_review_paths: Vec<std::path::PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,8 +72,21 @@ impl GateError {
             code: code.into(),
             detail: detail.to_string(),
             capture_race: false,
+            restore_installed: false,
             settings_file: None,
+            wire_detail: None,
+            settings_review_paths: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_wire_detail(mut self, detail: serde_json::Value) -> Self {
+        self.wire_detail = Some(Box::new(detail));
+        self
+    }
+
+    pub(crate) fn with_settings_review_paths(mut self, paths: Vec<std::path::PathBuf>) -> Self {
+        self.settings_review_paths = paths;
+        self
     }
 
     fn at_settings_layer(mut self, layer: Layer) -> Self {
@@ -216,6 +234,14 @@ impl PlanKind {
 }
 
 struct PendingPlan {
+    settings_attempt_owner: Option<u64>,
+    kept_after_refused_decline: bool,
+    decline_accepted: bool,
+    restoring: bool,
+    restored_paths: BTreeSet<std::path::PathBuf>,
+    user_restore: BTreeMap<std::path::PathBuf, restore::UserRestoreMetadata>,
+    settings_users: Option<BTreeSet<String>>,
+    settings_file_witness: Option<Digest>,
     creation_sequence: u64,
     edits: Option<runtime::edits::EditPlan>,
     development_approval: Option<crate::program_origin::DevelopmentApproval>,
@@ -250,6 +276,7 @@ impl PendingPlan {
 pub struct ConfigGate {
     incarnation: String,
     plans: BTreeMap<Digest, PendingPlan>,
+    kept_paths: BTreeMap<std::path::PathBuf, Digest>,
     attempts: BTreeMap<u64, approval::Attempt>,
     next_attempt: u64,
     next_plan_sequence: u64,
@@ -285,12 +312,14 @@ impl ConfigGate {
     }
 
     pub(crate) fn expire_plan(&mut self, digest: &Digest) -> bool {
+        self.kept_paths.retain(|_, owner| owner != digest);
         self.plans.remove(digest).is_some()
     }
     pub fn new(incarnation: String) -> Self {
         Self {
             incarnation,
             plans: BTreeMap::new(),
+            kept_paths: BTreeMap::new(),
             attempts: BTreeMap::new(),
             next_attempt: 0,
             next_plan_sequence: 0,
@@ -330,7 +359,9 @@ impl ConfigGate {
         record: ReviewRecord<'_>,
         review: impl FnOnce(&GateSnapshot, &GateSnapshot) -> Result<Changeset>,
     ) -> Result<ConfigPlanView> {
-        self.plan_reviewed_inner(store, kind, candidate, observed, record, None, None, review)
+        self.plan_reviewed_inner(
+            store, kind, candidate, observed, record, None, None, None, review,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -343,6 +374,7 @@ impl ConfigGate {
         record: ReviewRecord<'_>,
         edits: Option<runtime::edits::EditPlan>,
         projects: Option<targets::ProjectReviews>,
+        settings_file_witness: Option<Digest>,
         review: impl FnOnce(&GateSnapshot, &GateSnapshot) -> Result<Changeset>,
     ) -> Result<ConfigPlanView> {
         let status = store.status();
@@ -358,7 +390,13 @@ impl ConfigGate {
                 "stamp is required before planning changes",
             ));
         }
-        if self.plans.len() >= 64 {
+        if self
+            .plans
+            .values()
+            .filter(|plan| !plan.kept_after_refused_decline)
+            .count()
+            >= 64
+        {
             return Err(GateError::new("config_busy", "too many pending plans"));
         }
         let mut rollback_programs = Vec::new();
@@ -627,7 +665,8 @@ impl ConfigGate {
         if let Some(projects) = &projects {
             modules.extend(projects.tuples.keys().map(|tuple| tuple.module.clone()));
         }
-        let inputs = observed.read_set(&modules)?;
+        let mut inputs = observed.read_set(&modules)?;
+        add_settings_file_witness(&mut inputs, settings_file_witness.as_ref());
         let (delivery, project_files) = if let Some(projects) = projects {
             let body = if recovery { None } else { Some(store.body()?) };
             let (delivery, files) = projects.bind(body, &inputs, &mut changeset, &user_modules)?;
@@ -654,6 +693,26 @@ impl ConfigGate {
         if let Some(edit) = &edits {
             view.refusals = edit.refusals.clone();
         }
+        if self.plans.get(&view.digest).is_some_and(|plan| {
+            plan.kept_after_refused_decline || plan.decline_accepted || plan.restoring
+        }) {
+            return Err(GateError::new(
+                "settings_decline_kept",
+                "the declined settings plan is waiting for a manual restore",
+            ));
+        }
+        if settings_file_witness.is_some()
+            && self
+                .plans
+                .get(&view.digest)
+                .is_some_and(|plan| plan.settings_attempt_owner.is_some())
+            && self.has_open_approval(&view.digest)
+        {
+            return Err(GateError::new(
+                "config_busy",
+                "a settings approval already owns this plan",
+            ));
+        }
         self.next_plan_sequence = self
             .next_plan_sequence
             .checked_add(1)
@@ -661,6 +720,14 @@ impl ConfigGate {
         self.plans.insert(
             view.digest.clone(),
             PendingPlan {
+                settings_attempt_owner: None,
+                kept_after_refused_decline: false,
+                decline_accepted: false,
+                restoring: false,
+                restored_paths: BTreeSet::new(),
+                user_restore: BTreeMap::new(),
+                settings_users: None,
+                settings_file_witness,
                 creation_sequence: self.next_plan_sequence,
                 edits,
                 development_approval: None,
@@ -793,16 +860,17 @@ impl ConfigGate {
             store.delivery_ready()?;
             store.body()?.base_revision
         };
-        plan.view
-            .plan
-            .check_fresh(base, &current.read_set(&plan.modules)?)
-            .map_err(|_| {
-                if plan.project_capture.is_some() {
-                    capture_plan::changed()
-                } else {
-                    GateError::stale()
-                }
-            })
+        let mut inputs = current.read_set(&plan.modules)?;
+        // Before publication, the registry reopens each reviewed workspace
+        // file. That filesystem work must not hold the owner mutex.
+        add_settings_file_witness(&mut inputs, plan.settings_file_witness.as_ref());
+        plan.view.plan.check_fresh(base, &inputs).map_err(|_| {
+            if plan.project_capture.is_some() {
+                capture_plan::changed()
+            } else {
+                GateError::stale()
+            }
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -871,6 +939,17 @@ impl ConfigGate {
             let body = store.body()?;
             let previous = body.observed.as_ref().unwrap_or(&body.approved);
             let previous = GateSnapshot::from_store(previous)?;
+            if plan.settings_users.is_some() {
+                // The scoped read set intentionally never opens unrelated
+                // inputs. Keep their last observed proposals, not the approved
+                // values that the staged generation carries forward.
+                observed = previous.clone();
+                for key in &plan.changed {
+                    if let Some(input) = plan.snapshot.inputs.get(key) {
+                        observed.inputs.insert(key.clone(), input.clone());
+                    }
+                }
+            }
             // Project file observations are maintained by the project capture,
             // not by the user-only file capturer. Keep deferred observations.
             observed.inputs.retain(|key, _| !key.is_project());
@@ -919,7 +998,7 @@ impl ConfigGate {
         // after a durable commit. The committed base makes the old plan stale;
         // never repeat that generation while retrying the anchor update.
         if result.is_ok() || store.status().base_revision != base_before {
-            self.plans.remove(digest);
+            self.expire_plan(digest);
         }
         let id = result?;
         store.delivery_ready()?;
@@ -928,5 +1007,16 @@ impl ConfigGate {
 }
 
 mod registration;
+
+fn add_settings_file_witness(inputs: &mut subc_config::InputVector, witness: Option<&Digest>) {
+    if let Some(digest) = witness {
+        inputs.inputs.insert(
+            "settings-files".into(),
+            subc_config::InputState::Present {
+                digest: digest.clone(),
+            },
+        );
+    }
+}
 #[cfg(test)]
 mod tests;

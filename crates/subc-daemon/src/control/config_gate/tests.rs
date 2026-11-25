@@ -38,6 +38,7 @@ async fn config_gate_ops_are_explicitly_unprivileged_and_inactive_dispatch_is_na
         json!({"op":"config.plan"}),
         json!({"op":"config.plan_get","digest":subc_config::raw_digest(b"plan")}),
         json!({"op":"config.plan_discard","digest":subc_config::raw_digest(b"plan")}),
+        json!({"op":"config.revert","digest":subc_config::raw_digest(b"plan")}),
         json!({"op":"config.apply","digest":subc_config::raw_digest(b"plan")}),
         json!({"op":"config.stamp"}),
         json!({"op":"config.unstamp"}),
@@ -46,7 +47,11 @@ async fn config_gate_ops_are_explicitly_unprivileged_and_inactive_dispatch_is_na
     ] {
         let request: ConfigControlRequest = serde_json::from_value(body.clone()).unwrap();
         assert!(privileged_operation(&request).is_none(), "{}", request.op());
-        assert!(SUBC_UNADVERTISED_CONTROL_OPS.contains(&request.op()));
+        if request.op() == "config.revert" {
+            assert!(SUBC_CONTROL_OPS.contains(&request.op()));
+        } else {
+            assert!(SUBC_UNADVERTISED_CONTROL_OPS.contains(&request.op()));
+        }
         let response = handler
             .handle_control_frame(&ctx, frame(body))
             .await

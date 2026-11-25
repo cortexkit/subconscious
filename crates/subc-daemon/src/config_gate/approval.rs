@@ -296,6 +296,12 @@ impl ConfigGate {
             .plans
             .get(digest)
             .ok_or_else(|| GateError::new("plan_unknown", "plan is absent or already applied"))?;
+        if plan.restoring {
+            return Err(GateError::new(
+                "config_busy",
+                "the settings plan is being restored",
+            ));
+        }
         if !plan.view.refusals.is_empty() {
             return Err(GateError::new(
                 "plan_refused",
@@ -311,10 +317,9 @@ impl ConfigGate {
         }
         self.next_attempt = self.next_attempt.checked_add(1).ok_or_else(unavailable)?;
         let id = self.next_attempt;
-        let (surface, challenge) = if let Some(channel) = facts
-            .desktop_channel()
-            .filter(|_| !(plan.recovery && plan.kind == PlanKind::Unstamp))
-        {
+        let (surface, challenge) = if let Some(channel) = facts.desktop_channel().filter(|_| {
+            !(facts.caller.is_daemon_settings() || plan.recovery && plan.kind == PlanKind::Unstamp)
+        }) {
             if !facts.os_prompt_available {
                 return Err(unavailable());
             }
@@ -337,7 +342,10 @@ impl ConfigGate {
             )
         } else if plan.desktop_only() {
             return Err(unavailable());
-        } else if let Some(prompt) = plan.small_prompt(&facts.caller) {
+        } else if let Some(prompt) = (!facts.caller.is_daemon_settings())
+            .then(|| plan.small_prompt(&facts.caller))
+            .flatten()
+        {
             if !facts.os_prompt_available {
                 return Err(unavailable());
             }
@@ -379,6 +387,46 @@ impl ConfigGate {
             },
         );
         Ok(challenge)
+    }
+
+    pub(super) fn settings_declined(
+        &self,
+        attempt: u64,
+        facts: &ApprovalFacts,
+        reply: &ApprovalReply,
+    ) -> bool {
+        let Some(pending) = self.attempts.get(&attempt) else {
+            return false;
+        };
+        if !facts.owner_uid
+            || !facts.caller.is_daemon_settings()
+            || facts.connection != pending.caller
+        {
+            return false;
+        }
+        match (&pending.surface, reply) {
+            (
+                Surface::Phone {
+                    facts: sent,
+                    request,
+                    correlation: sent_id,
+                },
+                ApprovalReply::Phone {
+                    connection,
+                    correlation,
+                    response: Some(response),
+                },
+            ) => {
+                facts.phone.as_ref().filter(|phone| phone.trusted()) == Some(sent)
+                    && *connection == sent.connection
+                    && Some(*correlation) == *sent_id
+                    && response.decision == subc_protocol::consent::ConsentDecision::Declined
+                    && response.plan_digest == request.plan_digest
+                    && response.base_revision == request.base_revision
+                    && response.input_vector == request.input_vector
+            }
+            _ => false,
+        }
     }
 
     /// Complete under the commit lock after a fresh snapshot and active-surface

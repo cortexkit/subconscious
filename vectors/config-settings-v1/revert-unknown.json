@@ -1,0 +1,13 @@
+{
+  "reply": {
+    "code": "unknown_plan",
+    "detail": {
+      "files": []
+    },
+    "message": "the plan is no longer pending"
+  },
+  "request": {
+    "digest": "sha256:fefda33846e5646f59b94b2b48b3641a908efec44c71dcf21c320f1ea7d67be4",
+    "op": "config.revert"
+  }
+}

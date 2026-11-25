@@ -1262,6 +1262,7 @@ async fn serve_bound_daemon(
                     },
                 )
                 .with_policy_root_data(daemon_config::default_data_home().join("cortexkit"))
+                .with_settings_recovery_data(daemon_config::default_data_home().join("cortexkit"))
                 .enable_project_settings()
                 .retain_writer_lock(writer_lock)
                 .map_err(io::Error::other)
@@ -1567,6 +1568,9 @@ async fn serve_bound_daemon(
     Arc::clone(&control).spawn_capability_deadline_loop();
     Arc::clone(&control).spawn_scope_expiry_loop();
     let _config_delivery_task = control.spawn_config_delivery_worker().map(AbortOnDrop::new);
+    let _pending_settings_task = control
+        .spawn_pending_settings_worker()
+        .map(AbortOnDrop::new);
     control.spawn_resource_sampler();
 
     #[cfg(unix)]

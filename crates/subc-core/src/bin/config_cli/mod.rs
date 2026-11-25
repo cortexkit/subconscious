@@ -1,7 +1,7 @@
 use super::*;
 use subc_control::config::ConfigControlRequest as Request;
 
-pub(super) const HELP: &str = "ck config — configuration gate\n\nusage:\n  ck config status|plan|stamp|unstamp|history\n  ck config apply <digest>\n  ck config rollback <generation>\n  ck config place-program <module> <path> <sha256> [<manifest-json>]\n\nPlans, stamps, unstamps and rollbacks only prepare a view. Apply its digest to\nrequest approval on a trusted surface; terminal output is not approval.\nplace-program is available only with the daemon's dev-placement feature.\n";
+pub(super) const HELP: &str = "ck config — configuration gate\n\nusage:\n  ck config status|plan|stamp|unstamp|history\n  ck config apply <digest>\n  ck config revert <digest>\n  ck config rollback <generation>\n  ck config place-program <module> <path> <sha256> [<manifest-json>]\n\nPlans, stamps, unstamps and rollbacks only prepare a view. Apply its digest to\nrequest approval on a trusted surface; terminal output is not approval.\nRevert restores the approved settings files covered by a pending capture plan.\nplace-program is available only with the daemon's dev-placement feature.\n";
 
 impl CkClient {
     pub(super) async fn connect_config_local(
@@ -72,10 +72,15 @@ pub(super) fn parse(tail: &[OsString]) -> Result<Command, CkError> {
             "history" => Request::History {},
             _ => return Err(CkError::Usage(HELP.into())),
         },
-        [verb, digest] if *verb == "apply" => Request::Apply {
-            digest: serde_json::from_value(json!(digest))
-                .map_err(|error| CkError::Usage(format!("invalid digest: {error}\n{HELP}")))?,
-        },
+        [verb @ ("apply" | "revert"), digest] => {
+            let digest = serde_json::from_value(json!(digest))
+                .map_err(|error| CkError::Usage(format!("invalid digest: {error}\n{HELP}")))?;
+            if *verb == "revert" {
+                Request::Revert { digest }
+            } else {
+                Request::Apply { digest }
+            }
+        }
         [verb, generation] if *verb == "rollback" => Request::Rollback {
             generation: generation
                 .parse()
@@ -169,6 +174,19 @@ fn describe_channel(value: Option<&mut Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_cli_parses_revert_with_exactly_one_digest() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let parsed = parse(&["revert".into(), digest.clone().into()]).unwrap();
+        assert!(
+            matches!(parsed, Command::Config(Request::Revert { digest: got })
+            if got.to_string() == digest)
+        );
+        assert!(parse(&["revert".into()]).is_err());
+        assert!(parse(&["revert".into(), "bad".into()]).is_err());
+        assert!(parse(&["revert".into(), digest.into(), "extra".into()]).is_err());
+    }
 
     #[test]
     fn origins_placement_cli_carries_exact_manifest() {

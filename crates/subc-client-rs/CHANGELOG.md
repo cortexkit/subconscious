@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.41.14
+
+- Add owner-local `SubcConsumer::config_revert`, which restores files covered
+  by a pending plan without overwriting newer edits. Require subc-control 0.42.8 and subc-os 0.1.53.
+
 ## 0.41.13
 
 - Add `SubcConsumer::config_status` to read configuration protection and its

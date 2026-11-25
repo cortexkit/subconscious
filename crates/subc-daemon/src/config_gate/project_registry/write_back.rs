@@ -31,6 +31,101 @@ impl LayerLocation {
 }
 
 impl RegistryRevision {
+    pub(in crate::config_gate) fn read_reviewed_workspace(
+        &self,
+        target: &ProjectFileTarget,
+    ) -> Result<ExpectedProjectFile> {
+        let reader = self.write_authority(target)?;
+        let (_, saved) = self.layer_location(reader, &target.root)?;
+        let root = subc_os::open_directory_nofollow_all(&target.root).map_err(|_| changed())?;
+        if RegistryFileId::read(&root).map_err(layer_unavailable)? != target.root_identity {
+            return Err(changed());
+        }
+        let leaf = target.relative_path.file_name().ok_or_else(changed)?;
+        let current = read_layer(&root, leaf).map_err(target_changed)?;
+        let expected = current.expected_file();
+        if !saved.same_identity(&current) || saved.expected_file() != expected {
+            return Err(changed());
+        }
+        Ok(expected)
+    }
+
+    pub(in crate::config_gate) fn submit_restore(
+        &self,
+        pool: &RootIoPool,
+        restore: crate::config_gate::restore::ProjectRestore,
+        archive: std::sync::Arc<crate::config_gate::recovery_inventory::RecoveryArchive>,
+        completed: impl FnOnce(&Result<()>) + Send + 'static,
+        #[cfg(test)] hook: Option<super::super::runtime::ProjectWriteHook>,
+    ) -> Result<RootIoJob<Result<()>>> {
+        let revision = self.clone();
+        Ok(pool.submit(restore.target.root.clone(), move || {
+            let result = revision.restore_proposal(
+                restore,
+                &archive,
+                #[cfg(test)]
+                hook,
+            );
+            completed(&result);
+            result
+        })?)
+    }
+
+    fn restore_proposal(
+        &self,
+        restore: crate::config_gate::restore::ProjectRestore,
+        archive: &crate::config_gate::recovery_inventory::RecoveryArchive,
+        #[cfg(test)] hook: Option<super::super::runtime::ProjectWriteHook>,
+    ) -> Result<()> {
+        let target = &restore.target;
+        let reader = self.write_authority(target)?;
+        let (root, saved) = self.layer_location(reader, &target.root)?;
+        let current_root =
+            subc_os::open_directory_nofollow_all(&target.root).map_err(|_| changed())?;
+        if RegistryFileId::read(&current_root).map_err(layer_unavailable)? != target.root_identity {
+            return Err(changed());
+        }
+        let leaf = target.relative_path.file_name().ok_or_else(changed)?;
+        // Validate the directory entry, then do the whole transaction on the
+        // retained handle. A later path substitution cannot redirect a write.
+        let current_directory = subc_os::open_directory_nofollow_at(root, OsStr::new(".cortexkit"))
+            .map_err(|_| changed())?;
+        let directory_id = current_directory.as_ref().map(file_object_id).transpose()?;
+        if directory_id != restore.directory_id || directory_id != saved.directory_id {
+            return Err(changed());
+        }
+        let directory = match current_directory {
+            Some(directory) => directory,
+            None if restore.approved.is_none() => return Ok(()),
+            None => subc_os::create_directory_nofollow_at(root, OsStr::new(".cortexkit"))
+                .map_err(before_write)?,
+        };
+        let path = target.path().ok_or_else(changed)?;
+        debug_assert_eq!(path.file_name(), Some(leaf));
+        crate::config_gate::restore::Restore {
+            path: &path,
+            directory: &directory,
+            expected: crate::config_gate::restore::Expected::Project(&restore.expected),
+            approved: restore.approved.as_deref(),
+            permissions: restore.permissions,
+            archive,
+            layer: match target.layer {
+                ProjectFileLayer::Workspace { .. } => "workspace",
+                ProjectFileLayer::Project { .. } => "project",
+            },
+        }
+        .run(
+            || {
+                #[cfg(test)]
+                if let Some(hook) = hook {
+                    hook(false)?;
+                }
+                Ok(())
+            },
+            || {},
+        )
+    }
+
     pub(in crate::config_gate) fn write_authority(
         &self,
         target: &ProjectFileTarget,

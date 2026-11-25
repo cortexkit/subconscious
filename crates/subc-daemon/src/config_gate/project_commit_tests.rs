@@ -87,6 +87,7 @@ fn prepare(rig: &mut Rig, reviews: ProjectReviews, fields: Vec<FieldChange>) -> 
             ReviewRecord::Absent,
             None,
             Some(reviews),
+            None,
             |_, _| {
                 let mut changeset = Changeset::new();
                 changeset.fields = fields;

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.21.52
+
+- Add `ck config revert <digest>` to drop a pending file-capture plan and
+  restore its approved settings without overwriting newer edits.
+- Require subc-daemon 0.50.62, subc-control 0.42.8 and subc-client-rs 0.41.14.
+
 ## 0.21.51
 
 - Require subc-daemon 0.50.61.

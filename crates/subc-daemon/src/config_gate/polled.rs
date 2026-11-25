@@ -62,6 +62,15 @@ impl RuntimeOwner {
         }
         let view = &snapshot.projection;
         let mut status = view.status.clone();
+        if status.state == "stamped" {
+            match crate::config_gate::recovery_inventory::status(&self.settings_recovery_data) {
+                Ok((count, rows)) => {
+                    status.settings_recovery_copies = rows;
+                    status.settings_recovery_copy_count = (count != 0).then_some(count);
+                }
+                Err(error) => status.warnings.push(error.detail),
+            }
+        }
         let mut settings = None;
         if matches!(status.state.as_str(), "stamped" | "unstamped") && !status.anchor_pending {
             let captured = self.capturer.capture_settings(&view.config_declarations)?;
@@ -175,6 +184,13 @@ impl RuntimeOwner {
         .into();
         status.revision = store.revision;
         status.base_revision = store.base_revision;
+        if store.state == StoreState::Stamped {
+            status.pending_settings_card = state.pending_settings_card_at(store.base_revision);
+            status.pending_settings_card_reason = state.pending_settings_card_reason.clone();
+            if state.settings_review_errors_base == Some(store.base_revision) {
+                status.file_errors.clone_from(&state.settings_review_errors);
+            }
+        }
         status.anchor_pending = store.anchor_pending;
         status.ungated_inputs = self.startup_overrides.clone();
         status.warnings = store.warnings;

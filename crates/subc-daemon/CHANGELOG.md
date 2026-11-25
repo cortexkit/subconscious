@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.50.62
+
+- On a stamped install, review quiet user and workspace settings changes in one
+  daemon-filed phone card, without opening a local OS prompt. Decline or
+  `config.revert` restores approved bytes only if the file still has the
+  reviewed identity and contents. Project settings keep their pending badges.
+- Report the open card digest, or why a change is too large for the phone card,
+  in `config.status`. Require subc-control 0.42.8 and subc-os 0.1.53.
+
 ## 0.50.61
 
 - Open routes without waiting for configuration approvals or other writes to release the configuration owner. Recovery refusals use the last published configuration state.

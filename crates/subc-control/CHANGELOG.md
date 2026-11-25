@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.42.8
+
+- Add typed `config.revert` bodies, pending settings card status, and a
+  display-only grouping of files on daemon-filed plan views.
+
 ## 0.42.7
 
 - Decode optional route opener details while accepting older `supervisor.routes` replies.

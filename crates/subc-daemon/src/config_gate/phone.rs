@@ -279,8 +279,33 @@ impl RuntimeOwner {
                     // The connection's phone entry can be published again.
                     self.projection_stale
                         .store(true, std::sync::atomic::Ordering::Release);
+                    self.phone_withdrawal_changed.notify_waiters();
                 }
             }
+        }
+    }
+
+    pub(crate) async fn await_phone_withdrawal(&self, connection: ConnectionId) {
+        loop {
+            let change = self.phone_withdrawal_changed.notified();
+            if !self.phone_is_withdrawing(connection) {
+                return;
+            }
+            change.await;
+        }
+    }
+
+    pub(crate) async fn await_all_phone_withdrawals(&self) {
+        loop {
+            let change = self.phone_withdrawal_changed.notified();
+            let clear = self
+                .phone_withdrawals
+                .lock()
+                .is_ok_and(|queue| queue.withdrawing.is_empty());
+            if clear {
+                return;
+            }
+            change.await;
         }
     }
 }

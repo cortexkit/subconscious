@@ -1,0 +1,20 @@
+{
+  "reply": {
+    "code": "config_changed_since_review",
+    "detail": {
+      "files": [
+        {
+          "code": "config_changed_since_review",
+          "message": "the user file changed since planning",
+          "path": "/home/example/cortexkit/demo.jsonc",
+          "status": "refused"
+        }
+      ]
+    },
+    "message": "the user file changed since planning"
+  },
+  "request": {
+    "digest": "sha256:fefda33846e5646f59b94b2b48b3641a908efec44c71dcf21c320f1ea7d67be4",
+    "op": "config.revert"
+  }
+}

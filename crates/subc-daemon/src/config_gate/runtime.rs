@@ -24,6 +24,8 @@ use crate::{
 
 #[path = "edits.rs"]
 pub(super) mod edits;
+#[path = "pending_settings.rs"]
+mod pending_settings;
 #[path = "policy_root.rs"]
 pub(super) mod policy_root;
 #[path = "runtime_project_edits.rs"]
@@ -31,6 +33,12 @@ pub(super) mod project_edits;
 
 #[cfg(test)]
 pub(super) type ProjectWriteHook = std::sync::Arc<dyn Fn(bool) -> Result<()> + Send + Sync>;
+
+#[cfg(test)]
+type UserRestoreHook = std::sync::Arc<dyn Fn(&std::path::Path) -> Result<()> + Send + Sync>;
+
+#[cfg(test)]
+type RecoveryProbeHook = Box<dyn FnOnce() -> std::io::Result<()> + Send>;
 
 #[cfg(test)]
 type UserFileTestIdle =
@@ -85,6 +93,12 @@ pub struct RuntimeOwner {
     configured_modules: std::sync::RwLock<Option<admission::ConfiguredModuleSnapshot>>,
     inner: Mutex<OwnerState>,
     capturer: ConfigCapturer,
+    settings_recovery_data: std::path::PathBuf,
+    settings_recovery_updates: std::sync::Arc<super::recovery_inventory::RecoveryLocks>,
+    #[cfg(test)]
+    recovery_probe_hook: Mutex<Option<RecoveryProbeHook>>,
+    #[cfg(test)]
+    after_settings_decline_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     user_file_refusals: Mutex<BTreeMap<String, subc_config::Digest>>,
     policy_root_ledger: Option<std::path::PathBuf>,
     policy_root_unstamped: Mutex<crate::policy_root::Section>,
@@ -96,6 +110,14 @@ pub struct RuntimeOwner {
     settings_projects: settings::projects::ProjectObservations,
     #[cfg(test)]
     project_write_hook: std::sync::Mutex<Option<ProjectWriteHook>>,
+    #[cfg(test)]
+    user_restore_hook: Mutex<Option<UserRestoreHook>>,
+    #[cfg(test)]
+    after_restore_read_hook: Mutex<Option<UserRestoreHook>>,
+    pub(crate) settings_phone_delivery: tokio::sync::Mutex<()>,
+    settings_attempts_changed: tokio::sync::Notify,
+    settings_request_order: std::sync::atomic::AtomicU64,
+    phone_withdrawal_changed: tokio::sync::Notify,
     startup_overrides: Vec<String>,
     module_gates: Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
     delivery_changed: std::sync::Arc<tokio::sync::Notify>,
@@ -431,6 +453,13 @@ struct OwnerState {
     // Keep the original objects alive through approval so an unlinked file's
     // inode/file id cannot be recycled to impersonate the reviewed input.
     retained_plan_files: BTreeMap<Digest, Vec<std::fs::File>>,
+    pending_settings_card: Option<(Digest, u64)>,
+    open_settings_approval: Option<(Digest, u64, bool)>,
+    latest_explicit_settings_request: u64,
+    pending_settings_card_reason: Option<String>,
+    settings_review_errors: Vec<subc_control::config::ConfigStatusFileError>,
+    settings_review_errors_base: Option<u64>,
+    last_settings_decline: Option<(Digest, u64)>,
     expired_plans: VecDeque<Digest>,
     declarations: HashMap<ConnectionId, (String, ConfigDeclareRequest)>,
     live_project_schemas:
@@ -532,10 +561,18 @@ impl OwnerState {
     }
     /// Reclaim idle plans. Returns whether any plan expired.
     fn expire_idle(&mut self, now: Instant) -> bool {
+        let base = self.store.loaded_admission_state().1.base_revision;
         let expired: Vec<_> = self
             .plan_deadlines
             .iter()
-            .filter(|(digest, deadline)| **deadline <= now && !self.gate.has_open_approval(digest))
+            .filter(|(digest, deadline)| {
+                **deadline <= now
+                    && !self.gate.has_open_approval(digest)
+                    && !self.gate.plans.get(*digest).is_some_and(|plan| {
+                        (plan.kept_after_refused_decline || plan.decline_accepted || plan.restoring)
+                            && plan.view.base_revision == base
+                    })
+            })
             .map(|(digest, _)| digest.clone())
             .collect();
         let any = !expired.is_empty();
@@ -794,6 +831,7 @@ pub struct PreparedPlan {
     /// user-only plan leaves this absent to preserve its digest and view.
     pub(crate) projects: Option<super::targets::ProjectReviews>,
     project_capture: Option<CapturePlan>,
+    settings_users: Option<BTreeSet<String>>,
     pub candidate: CapturedConfiguration,
     pub bases: BTreeMap<String, ConfigView>,
     pub base_schemas: BTreeMap<String, subc_config::Schema>,
@@ -911,6 +949,9 @@ mod status_inputs;
 mod runtime_capture;
 pub(crate) use approval_request::{ApprovalRequest, ApprovalRequestGuard, CancelApprovalRequest};
 pub(crate) use runtime_capture::CaptureApply;
+pub(crate) use settings_observation::{
+    SettingsCardResult, SettingsEvent, SettingsHistory, SettingsReviewResult,
+};
 
 impl RuntimeOwner {
     /// Keep store I/O and waits for its synchronous owner lock off runtime threads.
@@ -1069,6 +1110,13 @@ impl RuntimeOwner {
                 delivery: delivery::DeliveryState::new(initial_generation),
                 anchor_retry: super::anchor_retry::AnchorRetry::default(),
                 retained_plan_files: BTreeMap::new(),
+                pending_settings_card: None,
+                open_settings_approval: None,
+                latest_explicit_settings_request: 0,
+                pending_settings_card_reason: None,
+                settings_review_errors: Vec::new(),
+                settings_review_errors_base: None,
+                last_settings_decline: None,
                 expired_plans: VecDeque::new(),
                 declarations: HashMap::new(),
                 live_project_schemas: HashMap::new(),
@@ -1093,6 +1141,12 @@ impl RuntimeOwner {
                 #[cfg(test)]
                 after_approval_drain_hook: None,
             }),
+            settings_recovery_data: capturer.config_home.clone(),
+            settings_recovery_updates: Default::default(),
+            #[cfg(test)]
+            recovery_probe_hook: Mutex::new(None),
+            #[cfg(test)]
+            after_settings_decline_hook: Mutex::new(None),
             capturer,
             policy_root_ledger: None,
             policy_root_unstamped: Mutex::new(Ok(None)),
@@ -1102,6 +1156,14 @@ impl RuntimeOwner {
             settings_projects: Default::default(),
             #[cfg(test)]
             project_write_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            user_restore_hook: Mutex::new(None),
+            #[cfg(test)]
+            after_restore_read_hook: Mutex::new(None),
+            settings_phone_delivery: tokio::sync::Mutex::new(()),
+            settings_attempts_changed: tokio::sync::Notify::new(),
+            settings_request_order: std::sync::atomic::AtomicU64::new(1),
+            phone_withdrawal_changed: tokio::sync::Notify::new(),
             startup_overrides: status_inputs::present_overrides(|name| {
                 std::env::var_os(name).is_some()
             }),
@@ -1931,6 +1993,7 @@ impl RuntimeOwner {
             edits: None,
             projects: None,
             project_capture: project_capture.take(),
+            settings_users: None,
             candidate,
             bases,
             base_schemas,
@@ -1951,6 +2014,20 @@ impl RuntimeOwner {
         mut prepared: PreparedPlan,
         review: impl FnOnce(&super::GateSnapshot, &super::GateSnapshot) -> Result<Changeset>,
     ) -> Result<ConfigPlanView> {
+        let workspaces = if let Some(projects) = &prepared.project_capture {
+            runtime_capture::reviewed_workspace_reads(Some(&projects.context), &projects.files)?
+        } else {
+            Vec::new()
+        };
+        let settings_file_witness = if prepared.settings_users.is_some() || !workspaces.is_empty() {
+            let current = self.read_settings_file_witness(
+                &prepared.settings_users.clone().unwrap_or_default(),
+                workspaces,
+            )?;
+            prepared.settings_users.is_some().then_some(current)
+        } else {
+            None
+        };
         let mut state = self.lock()?;
         Self::check_authority(
             &mut state,
@@ -1977,7 +2054,10 @@ impl RuntimeOwner {
         } else {
             BTreeMap::new()
         };
-        let mut current = if let Some(edit) = &prepared.edits {
+        let mut current = if let Some(users) = &prepared.settings_users {
+            self.capture_settings_users(&state, Some(users), None)
+                .map(|(capture, ..)| capture)
+        } else if let Some(edit) = &prepared.edits {
             self.edit_baseline(
                 &mut state,
                 Some(if edit.unstamped {
@@ -1996,9 +2076,11 @@ impl RuntimeOwner {
             self.capture_modules(&mut state, &prepared.touched_modules)
         }
         .map_err(|_| GateError::stale())?;
-        current
-            .capture_programs(&prepared.program_keys)
-            .map_err(|_| GateError::stale())?;
+        if prepared.settings_users.is_none() {
+            current
+                .capture_programs(&prepared.program_keys)
+                .map_err(|_| GateError::stale())?;
+        }
         if ((prepared.edits.is_none() || project_plan.is_some())
             && state.store.status().base_revision != prepared.base_revision)
             || active_generations != prepared.active_generations
@@ -2055,6 +2137,18 @@ impl RuntimeOwner {
         let mut project_context = None;
         let mut project_skips = Vec::new();
         let mut edit_registry = BTreeMap::new();
+        let mut file_summary = Vec::new();
+        if let Some(users) = &prepared.settings_users {
+            for module in users {
+                file_summary.push(subc_control::config::ConfigSettingsFile {
+                    layer: subc_config::Layer::User,
+                    module_id: module.clone(),
+                    path: prepared.candidate.modules[module].file.path.clone(),
+                    workspace_id: None,
+                    affected_projects: Vec::new(),
+                });
+            }
+        }
         if let Some(projects) = project_plan {
             let CapturePlan {
                 mut context,
@@ -2083,6 +2177,25 @@ impl RuntimeOwner {
                 .inputs
                 .extend(witnesses.inputs);
             if !files.is_empty() {
+                if prepared.settings_users.is_some() {
+                    for file in &files {
+                        let target = file.target();
+                        let crate::config_store::ProjectFileLayer::Workspace { workspace_id } =
+                            &target.layer
+                        else {
+                            unreachable!("automatic settings plans have no project-layer files")
+                        };
+                        let path = target.path().expect("captured workspace path");
+                        let readers = context.authority[&target.module].readers_of(&path);
+                        file_summary.push(subc_control::config::ConfigSettingsFile {
+                            layer: subc_config::Layer::Workspace,
+                            module_id: target.module.clone(),
+                            path,
+                            workspace_id: Some(workspace_id.clone()),
+                            affected_projects: readers.into_iter().collect(),
+                        });
+                    }
+                }
                 prepared.projects.get_or_insert_with(Default::default).files = files;
             }
             project_skips = skipped;
@@ -2110,6 +2223,20 @@ impl RuntimeOwner {
             ..DeliverySnapshot::default()
         };
         let mut handles = prepared.candidate.take_handles();
+        let user_restore = if prepared.kind == PlanKind::Change && prepared.edits.is_none() {
+            prepared
+                .candidate
+                .modules
+                .iter()
+                .filter(|(module, _)| prepared.touched_modules.contains(*module))
+                .filter_map(|(_, captured)| {
+                    super::restore::UserRestoreMetadata::capture(&captured.file)
+                        .map(|metadata| (captured.file.path.clone(), metadata))
+                })
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
         handles.append(&mut prepared.observed_handles);
         let previous_delivery = if state.store.status().state == StoreState::Stamped {
             let body = state.store.body()?;
@@ -2172,6 +2299,7 @@ impl RuntimeOwner {
             super::ReviewRecord::Reviewed(&prepared.review_modules),
             prepared.edits,
             prepared.projects,
+            settings_file_witness,
             |old, new| {
                 let mut changeset = review(old, new)?;
                 layer_file_rows(
@@ -2200,9 +2328,39 @@ impl RuntimeOwner {
             },
         )?;
         view.skipped = project_skips;
+        if !file_summary.is_empty() {
+            let fields = &view.plan.changeset.fields;
+            for file in &mut file_summary {
+                if file.layer == subc_config::Layer::User {
+                    file.affected_projects = fields
+                        .iter()
+                        .filter(|field| {
+                            field.module_id == file.module_id
+                                && (field.old_source == file.layer
+                                    || field.new_source == file.layer)
+                        })
+                        .filter_map(|field| field.project_id.clone())
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect();
+                } else {
+                    file.affected_projects
+                        .retain(|project| view.plan.changeset.affected_projects.contains(project));
+                }
+            }
+            view.settings_file_change = Some(subc_control::config::ConfigSettingsFileChange {
+                label: "A settings file changed".into(),
+                files: file_summary,
+            });
+        }
         if let Some(plan) = gate.plans.get_mut(&view.digest) {
+            plan.user_restore = user_restore;
             plan.project_capture = project_context;
+            plan.settings_users = prepared.settings_users;
             plan.view.skipped.clone_from(&view.skipped);
+            plan.view
+                .settings_file_change
+                .clone_from(&view.settings_file_change);
         }
         if let Err(error) = self.check_route_policy_authority(&view.plan.changeset) {
             gate.expire_plan(&view.digest);
@@ -2230,6 +2388,31 @@ impl RuntimeOwner {
         facts: &ApprovalFacts,
         request: Option<&ApprovalRequest>,
     ) -> Result<ApprovalChallenge> {
+        self.begin_approval_inner(digest, facts, request, None)
+    }
+
+    pub(crate) fn next_settings_request_order(&self) -> u64 {
+        self.settings_request_order
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn begin_settings_apply_for_request(
+        &self,
+        digest: &Digest,
+        facts: &ApprovalFacts,
+        request: &ApprovalRequest,
+        order: u64,
+    ) -> Result<ApprovalChallenge> {
+        self.begin_approval_inner(digest, facts, Some(request), Some(order))
+    }
+
+    fn begin_approval_inner(
+        &self,
+        digest: &Digest,
+        facts: &ApprovalFacts,
+        request: Option<&ApprovalRequest>,
+        settings_apply: Option<u64>,
+    ) -> Result<ApprovalChallenge> {
         #[cfg(test)]
         struct Completion<'a>(&'a std::sync::atomic::AtomicUsize);
         #[cfg(test)]
@@ -2241,12 +2424,29 @@ impl RuntimeOwner {
         #[cfg(test)]
         let _completed = Completion(&self.begin_approval_completions);
         #[cfg(test)]
-        if let Some(hook) = self.begin_approval_hook.lock().unwrap().take() {
-            hook();
+        {
+            let hook = self.begin_approval_hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
         }
+        let settings_file_witness = self.recheck_settings_file_witness(digest)?;
         let mut state = self.lock()?;
         if let Some(request) = request {
             request.ensure_live()?;
+        }
+        let daemon = facts.caller.is_daemon_settings();
+        if let Some(order) = settings_apply {
+            if daemon {
+                state.claim_automatic_settings_plan(digest, order)?;
+            }
+            if !daemon && order < state.latest_explicit_settings_request {
+                return Err(GateError::new(
+                    "approval_surface_unavailable",
+                    "a newer settings approval took precedence",
+                ));
+            }
+            state.check_settings_approval(digest, daemon)?;
         }
         if state.expired_plans.contains(digest) {
             return Err(GateError::new(
@@ -2256,13 +2456,20 @@ impl RuntimeOwner {
         }
         Self::check_authority(&mut state, true)?;
         let modules = state.gate.plan_modules(digest)?;
+        if state.gate.plans[digest].settings_file_witness != settings_file_witness {
+            return Err(capture_plan::changed());
+        }
         let program_keys = state.gate.plan_program_keys(digest)?;
         let projects = state.gate.plans[digest].project_capture.clone();
         let user_edits = state.gate.plans[digest]
             .edits
             .as_ref()
             .map(|edit| edit.user_modules.clone());
-        let mut current = if let Some(user_edits) = &user_edits {
+        let settings_users = state.gate.plans[digest].settings_users.clone();
+        let mut current = if let Some(users) = &settings_users {
+            self.capture_settings_users(&state, Some(users), None)
+                .map(|(capture, ..)| capture)
+        } else if let Some(user_edits) = &user_edits {
             self.edit_baseline(&mut state, Some(user_edits))
         } else if let Some(capture) = &projects {
             self.capture_with_project_context(&mut state, &modules, capture)
@@ -2273,15 +2480,26 @@ impl RuntimeOwner {
         if let Some(capture) = projects {
             current.diagnostic.inputs.extend(capture.witnesses.inputs);
         }
-        current
-            .capture_programs(&program_keys)
-            .map_err(|_| GateError::stale())?;
+        if settings_users.is_none() {
+            current
+                .capture_programs(&program_keys)
+                .map_err(|_| GateError::stale())?;
+        }
         let facts = state.with_desktop_view(digest, facts);
         let OwnerState { gate, store, .. } = &mut *state;
         if let Some(request) = request {
             request.ensure_live()?;
         }
         let challenge = gate.begin_approval(digest, store, &current.diagnostic, &facts)?;
+        if let Some(order) = settings_apply {
+            self.reserve_settings_approval(&mut state, digest, &challenge, daemon);
+            if let Some(plan) = state.gate.plans.get_mut(digest) {
+                plan.settings_attempt_owner = Some(order);
+            }
+            if !daemon {
+                state.latest_explicit_settings_request = order;
+            }
+        }
         state.reviewed(digest, Instant::now());
         Ok(challenge)
     }
@@ -2339,9 +2557,19 @@ impl RuntimeOwner {
                 "approval request witness does not match its attempt",
             ));
         }
+        // The controller now holds the locks that serialize rescan and module
+        // replacement. Reopen the workspace files before publishing the store.
+        let reviewed_digest = self.lock()?.gate.approval_digest(attempt)?;
+        let settings_file_witness = self.recheck_settings_file_witness(&reviewed_digest)?;
         let mut state = self.lock()?;
         let digest = state.gate.approval_digest(attempt)?;
+        if digest != reviewed_digest
+            || state.gate.plans[&digest].settings_file_witness != settings_file_witness
+        {
+            return Err(capture_plan::changed());
+        }
         let project_capture = state.gate.plans[&digest].project_capture.clone();
+        let settings_users = state.gate.plans[&digest].settings_users.clone();
         if let Some(capture) = &project_capture {
             if !capture.authority.is_empty()
                 && project_apply
@@ -2381,7 +2609,10 @@ impl RuntimeOwner {
             .get(&digest)
             .and_then(|plan| plan.edits.clone());
         let current = match Self::check_authority(&mut state, true).and_then(|_| {
-            let mut current = if let Some(edit) = &edit_plan {
+            let mut current = if let Some(users) = &settings_users {
+                self.capture_settings_users(&state, Some(users), None)
+                    .map(|(capture, ..)| capture)
+            } else if let Some(edit) = &edit_plan {
                 self.edit_baseline(&mut state, Some(&edit.user_modules))
             } else if let Some(capture) = &project_capture {
                 self.capture_with_project_context(&mut state, &modules, capture)
@@ -2401,9 +2632,11 @@ impl RuntimeOwner {
                     .inputs
                     .extend(capture.witnesses.inputs.clone());
             }
-            current
-                .capture_programs(&program_keys)
-                .map_err(|_| GateError::stale())?;
+            if settings_users.is_none() {
+                current
+                    .capture_programs(&program_keys)
+                    .map_err(|_| GateError::stale())?;
+            }
             Ok(current)
         }) {
             Ok(current) => current,
@@ -2509,6 +2742,10 @@ impl RuntimeOwner {
         );
         let committed_this_call = state.store.publication_sequence() != publication_before;
         if committed_this_call {
+            if let Some((card, card_attempt)) = state.pending_settings_card.take() {
+                state.cancel_approval(card_attempt);
+                Self::discard_settings_plan(&mut state, &card);
+            }
             if state.store.status().state == StoreState::Unstamped {
                 self.replace_unstamped_root(
                     policy_root::captured_section(&current)
@@ -2573,6 +2810,10 @@ impl RuntimeOwner {
                     .reset_for_authority_exit(if unstamp { generation } else { 0 });
             }
             if unstamp {
+                state.pending_settings_card_reason = None;
+                state.settings_review_errors.clear();
+                state.settings_review_errors_base = None;
+                state.last_settings_decline = None;
                 state.stamp_channel_cutover = false;
                 state.reconciled_entries.clear();
                 state.unstamp_hints.extend(unstamp_hints);

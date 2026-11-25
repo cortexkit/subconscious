@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.26.12
+
+- Export types for pending settings card status, the display-only grouping
+  of files on a daemon-filed plan, and `config.revert` request and reply bodies.
+
 ## 0.26.11
 
 - Add `ModuleConfigOptions.onProjectError` to report which project's refresh

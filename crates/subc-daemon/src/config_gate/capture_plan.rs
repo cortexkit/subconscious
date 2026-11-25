@@ -22,10 +22,12 @@ use super::{
 };
 
 pub(super) struct ModuleRoots {
+    pub(super) settled_settings: BTreeSet<PathBuf>,
     revision: RegistryRevision,
     skipped: BTreeSet<String>,
     held: BTreeSet<PathBuf>,
     physical: BTreeMap<PathBuf, Option<Digest>>,
+    settings_only: bool,
 }
 
 #[derive(Clone)]
@@ -37,6 +39,32 @@ pub(super) struct CaptureAuthority {
 }
 
 impl CaptureAuthority {
+    pub(super) fn read_reviewed_workspace(
+        &self,
+        target: &ProjectFileTarget,
+    ) -> Result<crate::config_store::ExpectedProjectFile> {
+        self.saved.read_reviewed_workspace(target)
+    }
+    pub(super) fn readers_of(&self, path: &Path) -> BTreeSet<String> {
+        self.saved.readers(path)
+    }
+
+    pub(super) fn restore_file(
+        &self,
+        target: &ProjectFileTarget,
+        approved: Option<Vec<u8>>,
+    ) -> Result<super::restore::ProjectRestore> {
+        let reader = self.saved.write_authority(target)?;
+        let (_, location) = self.saved.layer_location(reader, &target.root)?;
+        Ok(super::restore::ProjectRestore {
+            target: target.clone(),
+            expected: location.expected_file(),
+            directory_id: location.directory_id.clone(),
+            permissions: location.file.as_ref().map(|file| file.permissions.clone()),
+            approved,
+        })
+    }
+
     pub fn for_edit(scope: RegistryScope, saved: RegistryRevision) -> Self {
         Self {
             scope: scope.targets_only(),
@@ -247,7 +275,101 @@ impl ModuleRoots {
             skipped,
             held,
             physical,
+            settings_only: false,
+            settled_settings: BTreeSet::new(),
         })
+    }
+
+    pub(super) fn settings(
+        revision: RegistryRevision,
+        body: &StoreBody,
+        approved: &GateSnapshot,
+        captured: &CapturedModule,
+        confirmed: Option<&BTreeMap<PathBuf, InputState>>,
+    ) -> Self {
+        let module = &revision.module;
+        let approved = approved_files(body, approved, module);
+        let schema = ProjectLayerSchema::new(captured.schema.clone());
+        // Project-layer proposals stay visible as pending badges by design.
+        let mut held: BTreeSet<_> = revision
+            .projects
+            .iter()
+            .flat_map(|project| &project.project_roots)
+            .map(|root| layer_path(&root.path, module))
+            .collect();
+        let mut physical = BTreeMap::new();
+        let mut skipped = BTreeSet::new();
+        let mut settled_settings = BTreeSet::new();
+        for project in &revision.projects {
+            if project.roots().any(|root| {
+                revision
+                    .layer_location(&project.project_id, &root.path)
+                    .is_err()
+            }) {
+                skipped.insert(project.project_id.clone());
+                continue;
+            }
+            let Some(root) = &project.workspace_root else {
+                continue;
+            };
+            let path = layer_path(&root.path, module);
+            if confirmed.is_some_and(|paths| !paths.contains_key(&path)) && !held.contains(&path) {
+                skipped.insert(project.project_id.clone());
+                held.insert(path);
+                continue;
+            }
+            if held.contains(&path) {
+                continue;
+            }
+            let changed = (|| {
+                let (_, location) = revision.layer_location(&project.project_id, &root.path)?;
+                let live = location.file.as_ref();
+                if let Some(expected) = confirmed.and_then(|paths| paths.get(&path)) {
+                    let observed = match live {
+                        Some(file) => file.fingerprint.clone(),
+                        None => InputState::Absent,
+                    };
+                    if *expected != observed {
+                        return Err(GateError::capture_race());
+                    }
+                }
+                let old = approved.get(&path).and_then(|layer| layer.bytes.as_deref());
+                let record = |bytes: &[u8]| -> Result<_> {
+                    schema.record_layer(Layer::Workspace, bytes, module, &project.project_id)?;
+                    super::capture::parse_layer(bytes)
+                };
+                let before = old
+                    .map(record)
+                    .transpose()?
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let after = live
+                    .map(|file| record(&file.bytes))
+                    .transpose()?
+                    .unwrap_or_else(|| serde_json::json!({}));
+                Ok::<_, GateError>((before != after).then(|| live.map(|file| file.digest.clone())))
+            })();
+            match changed {
+                Ok(Some(digest)) => {
+                    physical.insert(path, digest);
+                }
+                Ok(None) => {
+                    settled_settings.insert(path.clone());
+                    held.insert(path);
+                }
+                Err(_) => {
+                    held.insert(path);
+                }
+            }
+        }
+        physical.retain(|path, _| !held.contains(path));
+        Self {
+            revision,
+            skipped,
+            held,
+            physical,
+            settings_only: true,
+            settled_settings,
+        }
     }
 
     pub fn holds_user(&self) -> bool {
@@ -308,14 +430,20 @@ impl ModuleRoots {
             .unwrap_or_else(|| super::program::approved_base(approved, module));
         let mut scope = RegistryScope::default();
         let mut readers = BTreeSet::new();
-        if user_changed && !self.holds_user() {
-            scope.include_all();
+        if user_changed && (!self.holds_user() || self.settings_only) {
+            if !self.settings_only || self.skipped.is_empty() {
+                scope.include_all();
+            }
             readers.extend(
                 self.revision
                     .projects
                     .iter()
-                    .map(|project| project.project_id.clone()),
+                    .map(|project| project.project_id.clone())
+                    .filter(|project| !self.skipped.contains(project)),
             );
+            if self.settings_only && !self.skipped.is_empty() {
+                scope.projects.extend(readers.iter().cloned());
+            }
         }
         for (path, digest) in &self.physical {
             let key = file_key(module, path);
@@ -379,7 +507,13 @@ impl ModuleRoots {
         }
         for project in &self.revision.projects {
             let id = &project.project_id;
-            if self.skipped.contains(id) {
+            if self.skipped.contains(id)
+                || (self.settings_only
+                    && !user_changed
+                    && !project.workspace_root.as_ref().is_some_and(|root| {
+                        self.physical.contains_key(&layer_path(&root.path, module))
+                    }))
+            {
                 continue;
             }
             let tuple = Tuple {
@@ -468,14 +602,31 @@ impl ModuleRoots {
         project: &RegistryProject,
         approved: &BTreeMap<PathBuf, &ConfigLayerSnapshot>,
     ) -> Result<Vec<ConfigLayerSnapshot>> {
-        tuple_layers(&self.revision.module, project, |root, path, _layer| {
+        let mut layers = tuple_layers(&self.revision.module, project, |root, path, _layer| {
             if self.held.contains(path) {
                 Ok(approved.get(path).and_then(|layer| layer.bytes.clone()))
             } else {
                 let (_, location) = self.revision.layer_location(&project.project_id, root)?;
                 Ok(location.file.as_ref().map(|file| file.bytes.clone()))
             }
-        })
+        })?;
+        if self.settings_only {
+            if let Some(root) = &project.workspace_root {
+                let path = layer_path(&root.path, &self.revision.module);
+                if self.physical.get(&path) == Some(&None) && !self.held.contains(&path) {
+                    let mut absent = ConfigLayerSnapshot::file(
+                        &self.revision.module,
+                        ConfigLayer::Workspace,
+                        path.to_string_lossy(),
+                        None,
+                    );
+                    absent.project_id = Some(project.project_id.clone());
+                    absent.workspace_id.clone_from(&project.workspace_id);
+                    layers.insert(0, absent);
+                }
+            }
+        }
+        Ok(layers)
     }
 }
 
@@ -591,18 +742,14 @@ pub(super) fn build_review(
         .transpose()?;
     let recorded = layers[1..]
         .iter()
-        .map(|layer| {
+        .filter_map(|layer| Some((layer, layer.bytes.as_deref()?)))
+        .map(|(layer, bytes)| {
             let kind = if layer.layer == ConfigLayer::Workspace {
                 Layer::Workspace
             } else {
                 Layer::Project
             };
-            schema.record_layer(
-                kind,
-                layer.bytes.as_deref().expect("only present project layers"),
-                module,
-                project,
-            )
+            schema.record_layer(kind, bytes, module, project)
         })
         .collect::<Result<Vec<_>>>()?;
     let reviewed = schema.review_tuple(
@@ -620,8 +767,9 @@ pub(super) fn build_review(
     } else {
         1
     };
+    let present_workspace = usize::from(workspace_end == 2 && layers[1].bytes.is_some());
     let prefix =
-        schema.review_tuple(module, project, user, &recorded[..workspace_end - 1], None)?;
+        schema.review_tuple(module, project, user, &recorded[..present_workspace], None)?;
     let view = |reviewed: subc_config::ReviewedTuple, layers| {
         let mut view = ConfigView::new(
             0,

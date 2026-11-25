@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 use subc_config::{ApplyKind, FieldChange, Layer, RecordedValue, Schema};
-use subc_protocol::config::{ConfigReviewReply, ConfigView};
+use subc_protocol::config::{ConfigLayer, ConfigReviewReply, ConfigView};
 
 use super::{GateError, Result};
 
@@ -16,18 +16,20 @@ pub(crate) fn checked_fields(
     candidate: &ConfigView,
     reply: ConfigReviewReply,
 ) -> Result<Vec<FieldChange>> {
-    if let Some(refusal) = reply.refusals.first() {
+    if !reply.refusals.is_empty() {
         // Refusal prose is module-authored. Only bounded field pointers leave
         // this boundary, never unvalidated values echoed by a reviewer.
-        let paths: Vec<_> = refusal
-            .paths
+        let paths: BTreeSet<_> = reply
+            .refusals
             .iter()
+            .flat_map(|refusal| &refusal.paths)
             .filter(|p| p.starts_with('/') && p.len() <= 1024)
             .collect();
-        return Err(GateError::new(
-            "module_review_refused",
-            format!("{module}: {paths:?}"),
-        ));
+        let attribution = attributed_review_refusals(base, candidate, &reply.refusals);
+        return Err(
+            GateError::new("module_review_refused", format!("{module}: {paths:?}"))
+                .with_settings_review_paths(attribution),
+        );
     }
     let expected = expected_fields(module, schema, base, base_schema, candidate)?;
     let mut seen = BTreeSet::new();
@@ -49,6 +51,132 @@ pub(crate) fn checked_fields(
         return Err(invalid(module));
     }
     Ok(expected.into_values().collect())
+}
+
+pub(crate) fn attributed_review_refusals(
+    base: Option<&ConfigView>,
+    candidate: &ConfigView,
+    refusals: &[subc_protocol::config::ConfigReviewRefusal],
+) -> Vec<std::path::PathBuf> {
+    if refusals.is_empty() {
+        return Vec::new();
+    }
+    if candidate.project_id.is_some() {
+        let pointers = refusals
+            .iter()
+            .flat_map(|refusal| refusal.paths.iter().map(String::as_str));
+        project_layer_changes(
+            base,
+            candidate,
+            pointers,
+            refusals.iter().any(|refusal| refusal.paths.is_empty()),
+        )
+    } else {
+        candidate
+            .layers
+            .iter()
+            .filter(|layer| layer.layer == ConfigLayer::User)
+            .filter_map(|layer| layer.path.as_ref().map(std::path::PathBuf::from))
+            .collect()
+    }
+}
+
+pub(crate) fn changed_project_review_paths(
+    base: Option<&ConfigView>,
+    candidate: &ConfigView,
+) -> Vec<std::path::PathBuf> {
+    project_layer_changes(base, candidate, std::iter::empty(), true)
+}
+
+fn project_layer_changes<'a>(
+    base: Option<&ConfigView>,
+    candidate: &ConfigView,
+    pointers: impl IntoIterator<Item = &'a str>,
+    all_changed: bool,
+) -> Vec<std::path::PathBuf> {
+    let documents = |view: Option<&ConfigView>| -> BTreeMap<_, _> {
+        view.into_iter()
+            .flat_map(|view| &view.layers)
+            .filter_map(|layer| {
+                let path = std::path::PathBuf::from(layer.path.as_ref()?);
+                let rank = match layer.layer {
+                    ConfigLayer::User => Some(1),
+                    ConfigLayer::Workspace => Some(2),
+                    ConfigLayer::Project => Some(3),
+                    _ => None,
+                };
+                let document = layer
+                    .bytes
+                    .as_deref()
+                    .map(super::capture::parse_layer)
+                    .transpose();
+                Some((path, (rank, document)))
+            })
+            .collect()
+    };
+    let before = documents(base);
+    let after = documents(Some(candidate));
+    let paths: BTreeSet<_> = before.keys().chain(after.keys()).collect();
+    let mut refused = BTreeSet::new();
+    // An unscoped refusal belongs to the user file. For a project review,
+    // compare each physical layer at the refused pointer, including a missing
+    // candidate document for a deletion. Prefer the narrower changed layer.
+    // If the comparison cannot choose a rank, keep every changed contributor
+    // at that pointer, but never attribute a refusal to an unchanged layer.
+    // A refusal row without pointers names the entire review, so it does not
+    // have enough information to choose a narrower layer.
+    if all_changed {
+        refused.extend(
+            paths
+                .iter()
+                .filter(|path| {
+                    let old = before.get(**path).map(|(_, doc)| doc);
+                    let new = after.get(**path).map(|(_, doc)| doc);
+                    if old.is_some_and(Result::is_err) || new.is_some_and(Result::is_err) {
+                        return false;
+                    }
+                    old.and_then(|doc| doc.as_ref().ok()?.as_ref())
+                        != new.and_then(|doc| doc.as_ref().ok()?.as_ref())
+                })
+                .map(|path| (*path).clone()),
+        );
+    }
+    for pointer in pointers
+        .into_iter()
+        .filter(|pointer| pointer.len() <= 1024 && (pointer.is_empty() || pointer.starts_with('/')))
+    {
+        let changed: Vec<_> = paths
+            .iter()
+            .filter_map(|path| {
+                let old = before.get(*path);
+                let new = after.get(*path);
+                if old.is_some_and(|(_, document)| document.is_err())
+                    || new.is_some_and(|(_, document)| document.is_err())
+                {
+                    return None;
+                }
+                let old_value = old
+                    .and_then(|(_, document)| document.as_ref().ok()?.as_ref())
+                    .and_then(|value| value.pointer(pointer));
+                let new_value = new
+                    .and_then(|(_, document)| document.as_ref().ok()?.as_ref())
+                    .and_then(|value| value.pointer(pointer));
+                (old_value != new_value).then(|| (*path, new.or(old).and_then(|(rank, _)| *rank)))
+            })
+            .collect();
+        let narrower = if changed.iter().all(|(_, rank)| rank.is_some()) {
+            changed.iter().filter_map(|(_, rank)| *rank).max()
+        } else {
+            None
+        };
+        refused.extend(
+            changed
+                .into_iter()
+                .filter(|(_, rank)| narrower.is_none_or(|narrower| *rank == Some(narrower)))
+                .map(|(path, _)| path.clone()),
+        );
+    }
+    refused.into_iter().collect()
 }
 
 pub(super) fn expected_fields(
@@ -388,6 +516,92 @@ mod tests {
             vec![],
             ConfigStatus::Active,
         )
+    }
+
+    #[test]
+    fn config_pending_settings_review_attributes_every_refusal_and_empty_pointer_list() {
+        use std::path::PathBuf;
+        use subc_protocol::config::{ConfigLayerSnapshot, ConfigReviewRefusal};
+
+        let schema = settings_schema(false);
+        let view = |user: &[u8], workspace: Option<&[u8]>| {
+            let mut view = settings_view(&schema, json!({"a": 1}));
+            view.project_id = Some("project".into());
+            view.layers = vec![
+                ConfigLayerSnapshot::file(
+                    "worker",
+                    ConfigLayer::User,
+                    "user.jsonc",
+                    Some(user.to_vec()),
+                ),
+                ConfigLayerSnapshot::file(
+                    "worker",
+                    ConfigLayer::Workspace,
+                    "workspace.jsonc",
+                    workspace.map(<[u8]>::to_vec),
+                ),
+                ConfigLayerSnapshot::file(
+                    "worker",
+                    ConfigLayer::Project,
+                    "unchanged.jsonc",
+                    Some(b"{}".to_vec()),
+                ),
+            ];
+            view
+        };
+        let base = view(br#"{"common":1,"onlyUser":1}"#, Some(br#"{"common":2}"#));
+        let candidate = view(br#"{"common":3,"onlyUser":2}"#, None);
+        let refuse = |pointers: &[&str]| {
+            ConfigReviewRefusal::new(
+                "refused",
+                pointers.iter().map(|p| (*p).into()).collect(),
+                vec![],
+            )
+        };
+        for (refusals, expected) in [
+            (
+                vec![refuse(&["/common"])],
+                vec![PathBuf::from("workspace.jsonc")],
+            ),
+            (
+                vec![refuse(&["/common"]), refuse(&["/onlyUser"])],
+                vec![
+                    PathBuf::from("user.jsonc"),
+                    PathBuf::from("workspace.jsonc"),
+                ],
+            ),
+            (
+                vec![refuse(&[])],
+                vec![
+                    PathBuf::from("user.jsonc"),
+                    PathBuf::from("workspace.jsonc"),
+                ],
+            ),
+        ] {
+            let error = checked_fields(
+                "worker",
+                &schema,
+                Some(&base),
+                Some(&schema),
+                &candidate,
+                ConfigReviewReply::new(vec![], refusals),
+            )
+            .unwrap_err();
+            assert_eq!(error.code, "module_review_refused");
+            assert_eq!(error.settings_review_paths, expected);
+        }
+        let mut unscoped = candidate;
+        unscoped.project_id = None;
+        let error = checked_fields(
+            "worker",
+            &schema,
+            Some(&base),
+            Some(&schema),
+            &unscoped,
+            ConfigReviewReply::new(vec![], vec![refuse(&["/unchanged"])]),
+        )
+        .unwrap_err();
+        assert_eq!(error.settings_review_paths, [PathBuf::from("user.jsonc")]);
     }
 
     #[test]

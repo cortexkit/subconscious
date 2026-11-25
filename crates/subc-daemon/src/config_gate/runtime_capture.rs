@@ -10,6 +10,34 @@ use crate::config_store::Tuple;
 
 use super::*;
 
+type WorkspaceReads = Vec<(
+    capture_plan::CaptureAuthority,
+    crate::config_store::ProjectFileTarget,
+)>;
+
+pub(super) fn reviewed_workspace_reads(
+    context: Option<&ProjectCapture>,
+    files: &[crate::config_store::ProjectFileApproval],
+) -> Result<WorkspaceReads> {
+    files
+        .iter()
+        .filter_map(|file| {
+            let target = file.target();
+            (matches!(file, crate::config_store::ProjectFileApproval::Adopt { .. })
+                && matches!(
+                    target.layer,
+                    crate::config_store::ProjectFileLayer::Workspace { .. }
+                ))
+            .then(|| {
+                let authority = context
+                    .and_then(|context| context.authority.get(&target.module))
+                    .ok_or_else(capture_plan::changed)?;
+                Ok((authority.clone(), target.clone()))
+            })
+        })
+        .collect()
+}
+
 /// Checked registry evidence for exactly one pending capture plan.
 #[derive(Clone)]
 pub(crate) struct CaptureApply {
@@ -19,6 +47,57 @@ pub(crate) struct CaptureApply {
 }
 
 impl RuntimeOwner {
+    pub(super) fn read_settings_file_witness(
+        &self,
+        users: &BTreeSet<String>,
+        workspaces: WorkspaceReads,
+    ) -> Result<Digest> {
+        let mut observed = BTreeMap::new();
+        for (authority, target) in workspaces {
+            let path = target.path().ok_or_else(capture_plan::changed)?;
+            let pool = self
+                .capturer
+                .projects
+                .root_io()
+                .ok_or_else(capture_plan::changed)?;
+            // Root workers may outlive a timed-out observer. They only read,
+            // so waiting for this bounded result never holds the owner mutex.
+            let current = pool.read_blocking(target.root.clone(), move || {
+                authority.read_reviewed_workspace(&target)
+            })??;
+            observed.insert(path, current);
+        }
+        serde_json::to_vec(&(users, observed))
+            .map(|bytes| subc_config::raw_digest(&bytes))
+            .map_err(GateError::invalid)
+    }
+
+    pub(super) fn recheck_settings_file_witness(&self, digest: &Digest) -> Result<Option<Digest>> {
+        let (users, workspaces, expected) = {
+            let state = self.lock()?;
+            let Some(plan) = state.gate.plans.get(digest) else {
+                return Ok(None);
+            };
+            (
+                plan.settings_users.clone(),
+                reviewed_workspace_reads(plan.project_capture.as_ref(), &plan.project_files)?,
+                plan.settings_file_witness.clone(),
+            )
+        };
+        if users.is_none() && workspaces.is_empty() {
+            return Ok(None);
+        }
+        let current =
+            self.read_settings_file_witness(&users.clone().unwrap_or_default(), workspaces)?;
+        if users.is_none() {
+            return Ok(None);
+        }
+        if expected.as_ref() != Some(&current) {
+            return Err(capture_plan::changed());
+        }
+        Ok(Some(current))
+    }
+
     pub(crate) async fn prepare_capture(self: &Arc<Self>, kind: PlanKind) -> Result<PreparedPlan> {
         if kind != PlanKind::Change || !self.project_capture_enabled {
             return self.on_blocking(move |owner| owner.prepare(kind)).await;

@@ -5,6 +5,7 @@ mod admission;
 mod daemon_readers;
 pub(super) use daemon_readers::preview_approved_daemon;
 mod delivery_worker;
+mod pending_settings;
 mod phone;
 mod recovery;
 mod route_policy;
@@ -35,6 +36,7 @@ pub(super) fn is_config_op(op: &str) -> bool {
             | "config.plan"
             | "config.plan_get"
             | "config.plan_discard"
+            | "config.revert"
             | "config.apply"
             | "config.stamp"
             | "config.unstamp"
@@ -701,6 +703,17 @@ impl ControlHandler {
         runtime: Arc<crate::config_gate::runtime::RuntimeOwner>,
         request: ConfigControlRequest,
     ) -> std::result::Result<ConfigControlResponse, GateError> {
+        Box::pin(self.execute_config_request_from(ctx, frame, runtime, request, None)).await
+    }
+
+    async fn execute_config_request_from(
+        &self,
+        ctx: &RouteCtx,
+        frame: &Frame,
+        runtime: Arc<crate::config_gate::runtime::RuntimeOwner>,
+        request: ConfigControlRequest,
+        automatic: Option<pending_settings::AutomaticSettingsAttempt>,
+    ) -> std::result::Result<ConfigControlResponse, GateError> {
         match request {
             ConfigControlRequest::Modules {} => {
                 let known = self.config_settings_known_modules()?;
@@ -745,6 +758,10 @@ impl ControlHandler {
                 })
                 .await?;
                 Ok(ConfigControlResponse::PlanDiscard {})
+            }
+            ConfigControlRequest::Revert { digest } => {
+                let files = self.revert_config_plan(&runtime, digest).await?;
+                Ok(ConfigControlResponse::Revert { files })
             }
             ConfigControlRequest::PlaceProgram {
                 module_id,
@@ -794,6 +811,11 @@ impl ControlHandler {
                 })
             }
             ConfigControlRequest::Apply { digest } => {
+                let daemon_settings = automatic.is_some();
+                let order = automatic.as_ref().map_or_else(
+                    || runtime.next_settings_request_order(),
+                    |attempt| attempt.token,
+                );
                 if let Some(result) = self
                     .apply_unstamped_policy_root(ctx, frame, &runtime, &digest)
                     .await?
@@ -818,14 +840,16 @@ impl ControlHandler {
                         "configuration commit requires the supervisor owner",
                     ));
                 }
-                let facts = self.config_approval_facts(ctx).await;
+                let phone = self.config_phone_surface().await;
+                let facts = self.config_apply_facts(ctx, phone, daemon_settings).await;
                 let cancellation = request_guard.request.clone();
-                let (challenge, mut attempt_guard) =
+                let (challenge, attempt_guard) =
                     config_work(runtime.clone(), ConfigWake::Delivery, move |owner| {
-                        let challenge = owner.begin_approval_for_request(
+                        let challenge = owner.begin_settings_apply_for_request(
                             &digest,
                             &facts,
-                            Some(&cancellation),
+                            &cancellation,
+                            order,
                         )?;
                         // The job owns slot cleanup even if its async caller drops
                         // before this blocking result can be delivered.
@@ -840,12 +864,27 @@ impl ControlHandler {
                     })
                     .await?;
                 request_guard.request.ensure_live()?;
+                let feedback = automatic.and_then(|attempt| attempt.feedback);
+                if let Some(feedback) = &feedback {
+                    let _ = feedback.send(pending_settings::CardFeedback::Filed);
+                }
                 let reply = match &challenge {
                     ApprovalChallenge::Desktop { .. } | ApprovalChallenge::OsPrompt { .. } => {
-                        ApprovalReply::Presence(
-                            self.confirm_config_gate_presence(ctx, frame, &challenge)
-                                .await,
-                        )
+                        let attempt = challenge.attempt();
+                        tokio::select! {
+                            biased;
+                            _ = runtime.wait_settings_attempt_replaced(attempt) => {
+                                return Err(GateError::new("approval_surface_unavailable", "a newer settings approval took precedence"));
+                            }
+                            decision = async {
+                                let _delivery = runtime.settings_phone_delivery.lock().await;
+                                runtime.await_all_phone_withdrawals().await;
+                                if !runtime.on_blocking(move |owner| owner.settings_attempt_active(attempt)).await? {
+                                    return Err(GateError::new("approval_surface_unavailable", "a newer settings approval took precedence"));
+                                }
+                                Ok(self.confirm_config_gate_presence(ctx, frame, &challenge).await)
+                            } => ApprovalReply::Presence(decision?),
+                        }
                     }
                     ApprovalChallenge::Phone {
                         attempt,
@@ -853,273 +892,458 @@ impl ControlHandler {
                         deadline,
                         request,
                     } => {
-                        self.config_phone_rpc(
-                            &runtime,
-                            *attempt,
-                            ConnectionId::new(*connection),
-                            *deadline,
-                            request,
-                        )
-                        .await?
+                        // A withdrawn card sends its cancel before yielding this
+                        // slot, so a new phone request cannot overtake the cancel.
+                        let _delivery = timeout_at(*deadline, async {
+                            let guard = runtime.settings_phone_delivery.lock().await;
+                            runtime
+                                .await_phone_withdrawal(ConnectionId::new(*connection))
+                                .await;
+                            guard
+                        })
+                        .await
+                        .map_err(|_| {
+                            GateError::new(
+                                "approval_surface_unavailable",
+                                "the phone could not receive the settings card",
+                            )
+                        })?;
+                        let exchange = self
+                            .config_phone_rpc(
+                                &runtime,
+                                *attempt,
+                                ConnectionId::new(*connection),
+                                *deadline,
+                                request,
+                            )
+                            .await;
+                        if daemon_settings
+                            && Instant::now() >= *deadline
+                            && !matches!(
+                                &exchange,
+                                Ok(ApprovalReply::Phone {
+                                    response: Some(_),
+                                    ..
+                                })
+                            )
+                        {
+                            return Err(GateError::new(
+                                "settings_card_expired",
+                                "the settings card expired",
+                            ));
+                        }
+                        exchange?
                     }
                 };
                 let attempt = challenge.attempt();
-                let window = matches!(challenge, ApprovalChallenge::Phone { .. }).then(|| {
-                    Arc::new(crate::config_gate::runtime::ApprovalCommitWindow::new(
-                        Instant::now() + CONFIG_APPROVAL_COMMIT_TIMEOUT,
-                    ))
-                });
-                attempt_guard.commit_window = window.clone();
-                let checked_phone = self.config_phone_surface().await;
-                let locks = async {
-                    // A registry root can keep its worker busy until the I/O
-                    // returns. Do not hold supervisor or module gates while
-                    // waiting for that registry check.
-                    let project_apply = runtime.recheck_capture_apply(attempt).await?;
-                    let operation = self.supervisor.operation_lock().lock_owned().await;
-                    let module_gates = runtime.approval_commit_gates(attempt).await?;
-                    let current_phone = self.config_phone_surface_snapshot().await;
-                    let phone = checked_phone.filter(|phone| Some(phone) == current_phone.as_ref());
-                    let facts = self.config_approval_facts_with_phone(ctx, phone).await;
-                    Ok::<_, GateError>((operation, module_gates, facts, project_apply))
-                };
-                let (operation, module_gates, facts, project_apply) = if let Some(window) = &window
-                {
-                    timeout_at(window.deadline, locks)
-                        .await
-                        .map_err(|_| GateError::commit_timeout())??
+                if daemon_settings {
+                    let phone = self.config_phone_surface().await;
+                    let facts = self.config_apply_facts(ctx, phone, true).await;
+                    let operation = self.supervisor.operation_lock();
+                    let declined = config_work(runtime.clone(), ConfigWake::None, move |owner| {
+                        let declined = owner.accept_settings_decline(attempt, &facts, &reply)?;
+                        // This blocking job owns the accepted decision even if
+                        // the settings worker stops waiting for its result.
+                        let restore = declined.map(|digest| {
+                            let owner = owner.clone();
+                            tokio::spawn(async move {
+                                let _operation = operation.lock_owned().await;
+                                let result = owner.revert_capture_plan(digest).await;
+                                if let Err(error) = &result {
+                                    tracing::warn!(code = %error.code, detail = %error.detail, "declined settings could not be restored");
+                                }
+                                result
+                            })
+                        });
+                        #[cfg(test)]
+                        if restore.is_some() {
+                            owner.after_settings_decline_for_test();
+                        }
+                        Ok((restore, reply))
+                    })
+                    .await?;
+                    if let Some(restore) = declined.0 {
+                        if let Err(mut error) = restore
+                            .await
+                            .map_err(|error| GateError::new("config_unavailable", error))?
+                        {
+                            if error.code != "settings_keep_limit" {
+                                error.code = "settings_card_decline_unrestored".into();
+                            }
+                            return Err(error);
+                        }
+                        return Err(GateError::new(
+                            "settings_card_declined",
+                            "approval was declined",
+                        ));
+                    }
+                    self.finish_config_apply(
+                        ctx,
+                        runtime,
+                        challenge,
+                        attempt_guard,
+                        request_guard,
+                        declined.1,
+                        true,
+                    )
+                    .await
                 } else {
-                    locks.await?
-                };
-                let now = now_ms();
-                let publish_window = window.clone();
-                let publication_request = request_guard.request.clone();
-                let exit_runtime = runtime.clone();
-                let work = config_work(runtime, ConfigWake::Delivery, move |owner| {
-                    let _owned_gates = (operation, module_gates);
-                    let write_authority = project_apply.clone();
-                    let generation = owner.finish_approval_with_commit_window(
-                        attempt,
-                        &facts,
+                    self.finish_config_apply(
+                        ctx,
+                        runtime,
+                        challenge,
+                        attempt_guard,
+                        request_guard,
                         reply,
-                        now,
-                        publish_window,
-                        publication_request,
-                        project_apply,
-                    )?;
-                    if let Some(authority) = write_authority {
-                        // The publication job can finish after the control
-                        // request disconnects. It still owns this write-back.
-                        tokio::spawn(async move {
-                            owner
-                                .write_approved_project_files(generation, authority)
-                                .await
+                        false,
+                    )
+                    .await
+                }
+            }
+            request => self.execute_config_plan(runtime, request).await,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_config_apply(
+        &self,
+        ctx: &RouteCtx,
+        runtime: Arc<crate::config_gate::runtime::RuntimeOwner>,
+        challenge: ApprovalChallenge,
+        mut attempt_guard: phone::ApprovalAttemptGuard,
+        request_guard: crate::config_gate::runtime::ApprovalRequestGuard,
+        reply: ApprovalReply,
+        daemon_settings: bool,
+    ) -> std::result::Result<ConfigControlResponse, GateError> {
+        let attempt = challenge.attempt();
+        let window = matches!(challenge, ApprovalChallenge::Phone { .. }).then(|| {
+            Arc::new(crate::config_gate::runtime::ApprovalCommitWindow::new(
+                Instant::now() + CONFIG_APPROVAL_COMMIT_TIMEOUT,
+            ))
+        });
+        attempt_guard.commit_window = window.clone();
+        let checked_phone = self.config_phone_surface().await;
+        let locks = async {
+            // A registry root can keep its worker busy until the I/O
+            // returns. Do not hold supervisor or module gates while
+            // waiting for that registry check.
+            let project_apply = runtime.recheck_capture_apply(attempt).await?;
+            let operation = self.supervisor.operation_lock().lock_owned().await;
+            let module_gates = runtime.approval_commit_gates(attempt).await?;
+            let current_phone = self.config_phone_surface_snapshot().await;
+            let phone = checked_phone.filter(|phone| Some(phone) == current_phone.as_ref());
+            let facts = self.config_apply_facts(ctx, phone, daemon_settings).await;
+            Ok::<_, GateError>((operation, module_gates, facts, project_apply))
+        };
+        let (operation, module_gates, facts, project_apply) = if let Some(window) = &window {
+            timeout_at(window.deadline, locks)
+                .await
+                .map_err(|_| GateError::commit_timeout())??
+        } else {
+            locks.await?
+        };
+        let now = now_ms();
+        let publish_window = window.clone();
+        let publication_request = request_guard.request.clone();
+        let exit_runtime = runtime.clone();
+        let work = config_work(runtime, ConfigWake::Delivery, move |owner| {
+            let _owned_gates = (operation, module_gates);
+            let write_authority = project_apply.clone();
+            let generation = owner.finish_approval_with_commit_window(
+                attempt,
+                &facts,
+                reply,
+                now,
+                publish_window,
+                publication_request,
+                project_apply,
+            )?;
+            if let Some(authority) = write_authority {
+                // The publication job can finish after the control
+                // request disconnects. It still owns this write-back.
+                tokio::spawn(async move {
+                    owner
+                        .write_approved_project_files(generation, authority)
+                        .await
+                });
+            }
+            Ok(generation)
+        });
+        tokio::pin!(work);
+        let generation = if let Some(window) = window {
+            tokio::select! {
+                result = &mut work => result?,
+                _ = tokio::time::sleep_until(window.deadline) => {
+                    if window.expire() { return Err(GateError::commit_timeout()); }
+                    work.await?
+                }
+            }
+        } else {
+            work.await?
+        };
+        let approval_runtime = exit_runtime.clone();
+        if let Some(approval) = config_work(approval_runtime, ConfigWake::None, move |owner| {
+            owner.development_approval(generation)
+        })
+        .await?
+        {
+            self.publish_development_approval(&approval);
+            return Ok(ConfigControlResponse::Applied {
+                generation,
+                restart_required: false,
+            });
+        }
+        #[cfg(test)]
+        self.pause_before_apply_reconcile_for_test().await;
+        self.reconcile_authority_exit(exit_runtime.clone(), generation)
+            .await?;
+        let restart_required = self
+            .daemon_restart_required(&exit_runtime, generation)
+            .await?;
+        Ok(ConfigControlResponse::Applied {
+            generation,
+            restart_required,
+        })
+    }
+
+    async fn execute_config_plan(
+        &self,
+        runtime: Arc<crate::config_gate::runtime::RuntimeOwner>,
+        request: ConfigControlRequest,
+    ) -> std::result::Result<ConfigControlResponse, GateError> {
+        let (kind, edits) = match request {
+            ConfigControlRequest::Plan {
+                base_generations,
+                edits,
+            } => {
+                if edits.is_none() && base_generations.is_some() {
+                    return Err(GateError::new(
+                        "invalid_params",
+                        "base_generations requires edits",
+                    ));
+                }
+                let edits = edits
+                    .map(|edits| {
+                        base_generations.map(|base| (base, edits)).ok_or_else(|| {
+                            GateError::new("invalid_params", "edits requires base_generations")
+                        })
+                    })
+                    .transpose()?;
+                (PlanKind::Change, edits)
+            }
+            ConfigControlRequest::Stamp {} => (PlanKind::Stamp, None),
+            ConfigControlRequest::Unstamp {} => (PlanKind::Unstamp, None),
+            ConfigControlRequest::Rollback { generation } => (PlanKind::Rollback(generation), None),
+            _ => {
+                return Err(GateError::new(
+                    "unsupported_control_frame",
+                    "unknown configuration operation",
+                ))
+            }
+        };
+        let prepared = match edits {
+            Some((base, edits)) => runtime.prepare_control_edits(base, edits).await?,
+            None => {
+                let prepared = runtime.prepare_capture(kind).await?;
+                // Preparing a plan can record observations that delivery reads.
+                runtime.notify_delivery_changed();
+                prepared
+            }
+        };
+        let view = self.review_config_plan(runtime, prepared).await?;
+        Ok(match kind {
+            PlanKind::Change => ConfigControlResponse::Plan { view },
+            PlanKind::Stamp => ConfigControlResponse::Stamp { view },
+            PlanKind::Unstamp => ConfigControlResponse::Unstamp { view },
+            PlanKind::Rollback(_) => ConfigControlResponse::Rollback { view },
+        })
+    }
+
+    async fn review_config_plan(
+        &self,
+        runtime: Arc<crate::config_gate::runtime::RuntimeOwner>,
+        mut prepared: crate::config_gate::runtime::PreparedPlan,
+    ) -> std::result::Result<subc_control::config::ConfigPlanView, GateError> {
+        if prepared.capture_refused() {
+            let view = config_work(runtime, ConfigWake::None, move |owner| {
+                owner.capture_refusal(&prepared)?.ok_or_else(|| {
+                    GateError::new("module_review_invalid", "project refusal is absent")
+                })
+            })
+            .await?;
+            return Ok(view);
+        }
+        let mut fields = Vec::new();
+        let mut edit_refusals = Vec::new();
+        let mut unavailable_rereviews = Vec::new();
+        let mut accepted_paths = std::collections::BTreeSet::new();
+        let mut review_refusal = None;
+        let mut refused_paths = std::collections::BTreeSet::new();
+        let review_base = prepared.settings_review_base();
+        for (module, captured) in &prepared.candidate.modules {
+            if !prepared.review_modules.contains(module) {
+                continue;
+            }
+            let base = prepared.bases.get(module);
+            let reply = self
+                .review_config_tuple(&runtime, module, base, &captured.view)
+                .await;
+            let reply = match reply {
+                Ok(reply) => reply,
+                // A re-review the new program cannot answer now stays
+                // pending in status; it does not hold up this plan.
+                Err(_) if prepared.rereview_modules.contains(module) => {
+                    unavailable_rereviews.push(module.clone());
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error.with_settings_review_paths(vec![captured.file.path.clone()]))
+                }
+            };
+            let reply: subc_protocol::config::ConfigReviewReply = serde_json::from_slice(&reply)
+                .map_err(|_| {
+                    GateError::new(
+                        "module_review_invalid",
+                        format!("{module}: malformed config.review reply"),
+                    )
+                })?;
+            if prepared.is_edit_plan() && !reply.refusals.is_empty() {
+                refused_paths.insert(captured.file.path.clone());
+                let before = edit_refusals.len();
+                for refusal in &reply.refusals {
+                    for path in refusal
+                        .paths
+                        .iter()
+                        .filter(|path| path.starts_with('/') && path.len() <= 1024)
+                    {
+                        edit_refusals.push(subc_control::config::ConfigPlanRefusal {
+                            module_id: module.clone(),
+                            path: path.clone(),
+                            code: "module_review_refused".into(),
+                            message: "the module refused this field".into(),
+                            project_id: None,
+                            workspace_id: None,
                         });
                     }
-                    Ok(generation)
-                });
-                tokio::pin!(work);
-                let generation = if let Some(window) = window {
-                    tokio::select! {
-                        result = &mut work => result?,
-                        _ = tokio::time::sleep_until(window.deadline) => {
-                            if window.expire() { return Err(GateError::commit_timeout()); }
-                            work.await?
-                        }
-                    }
-                } else {
-                    work.await?
-                };
-                let approval_runtime = exit_runtime.clone();
-                if let Some(approval) =
-                    config_work(approval_runtime, ConfigWake::None, move |owner| {
-                        owner.development_approval(generation)
-                    })
-                    .await?
-                {
-                    self.publish_development_approval(&approval);
-                    return Ok(ConfigControlResponse::Applied {
-                        generation,
-                        restart_required: false,
+                }
+                if edit_refusals.len() == before {
+                    edit_refusals.push(subc_control::config::ConfigPlanRefusal {
+                        module_id: module.clone(),
+                        path: String::new(),
+                        code: "module_review_refused".into(),
+                        message: "the module refused the edits".into(),
+                        project_id: None,
+                        workspace_id: None,
                     });
                 }
-                #[cfg(test)]
-                self.pause_before_apply_reconcile_for_test().await;
-                self.reconcile_authority_exit(exit_runtime.clone(), generation)
-                    .await?;
-                let restart_required = self
-                    .daemon_restart_required(&exit_runtime, generation)
-                    .await?;
-                Ok(ConfigControlResponse::Applied {
-                    generation,
-                    restart_required,
-                })
+                fields.extend(prepared.refused_fields(module)?);
+                continue;
             }
-            request => {
-                let (kind, edits) = match request {
-                    ConfigControlRequest::Plan {
-                        base_generations,
-                        edits,
-                    } => {
-                        if edits.is_none() && base_generations.is_some() {
-                            return Err(GateError::new(
-                                "invalid_params",
-                                "base_generations requires edits",
-                            ));
-                        }
-                        let edits = edits
-                            .map(|edits| {
-                                base_generations.map(|base| (base, edits)).ok_or_else(|| {
-                                    GateError::new(
-                                        "invalid_params",
-                                        "edits requires base_generations",
-                                    )
-                                })
-                            })
-                            .transpose()?;
-                        (PlanKind::Change, edits)
+            match crate::config_gate::review::checked_fields(
+                module,
+                &captured.schema,
+                base,
+                prepared.base_schemas.get(module),
+                &captured.view,
+                reply,
+            ) {
+                Ok(changes) => {
+                    accepted_paths.insert(captured.file.path.clone());
+                    fields.extend(changes);
+                }
+                Err(error) if error.code == "module_review_refused" => {
+                    refused_paths.insert(captured.file.path.clone());
+                    review_refusal.get_or_insert(error);
+                }
+                Err(error) => {
+                    return Err(error.with_settings_review_paths(vec![captured.file.path.clone()]))
+                }
+            }
+        }
+        for module in unavailable_rereviews {
+            prepared.review_modules.remove(&module);
+            prepared.rereview_modules.remove(&module);
+        }
+        let mut project_replies = Vec::new();
+        for (tuple, review) in prepared.project_reviews() {
+            let paths = || {
+                review
+                    .approval
+                    .view
+                    .layers
+                    .iter()
+                    .filter_map(|layer| layer.path.as_ref().map(std::path::PathBuf::from))
+                    .collect()
+            };
+            let bytes = self
+                .review_config_tuple(
+                    &runtime,
+                    &tuple.module,
+                    review.base.as_ref(),
+                    &review.approval.view,
+                )
+                .await
+                .map_err(|error| error.with_settings_review_paths(paths()))?;
+            let reply: subc_protocol::config::ConfigReviewReply = serde_json::from_slice(&bytes)
+                .map_err(|_| {
+                    GateError::new(
+                        "module_review_invalid",
+                        format!("{}: malformed project config.review reply", tuple.module),
+                    )
+                })?;
+            let changed = crate::config_gate::review::changed_project_review_paths(
+                review.base.as_ref(),
+                &review.approval.view,
+            );
+            if prepared.is_edit_plan() {
+                refused_paths.extend(crate::config_gate::review::attributed_review_refusals(
+                    review.base.as_ref(),
+                    &review.approval.view,
+                    &reply.refusals,
+                ));
+            }
+            project_replies.push((tuple.clone(), reply, paths(), changed));
+        }
+        for (tuple, reply, paths, changed) in project_replies {
+            if prepared.is_edit_plan() && !reply.refusals.is_empty() {
+                prepared.refuse_project_review(&tuple, &reply);
+            } else {
+                match prepared.accept_project_review(&tuple, reply) {
+                    Ok(changes) => {
+                        accepted_paths.extend(changed);
+                        fields.extend(changes);
                     }
-                    ConfigControlRequest::Stamp {} => (PlanKind::Stamp, None),
-                    ConfigControlRequest::Unstamp {} => (PlanKind::Unstamp, None),
-                    ConfigControlRequest::Rollback { generation } => {
-                        (PlanKind::Rollback(generation), None)
+                    Err(error) if error.code == "module_review_refused" => {
+                        refused_paths.extend(error.settings_review_paths.iter().cloned());
+                        review_refusal.get_or_insert(error);
                     }
-                    _ => {
-                        return Err(GateError::new(
-                            "unsupported_control_frame",
-                            "unknown configuration operation",
-                        ))
-                    }
-                };
-                let mut prepared = match edits {
-                    Some((base, edits)) => runtime.prepare_control_edits(base, edits).await?,
-                    None => {
-                        let prepared = runtime.prepare_capture(kind).await?;
-                        // Preparing a plan can record observations that delivery reads.
-                        runtime.notify_delivery_changed();
-                        prepared
-                    }
-                };
-                if prepared.capture_refused() {
-                    let view = config_work(runtime, ConfigWake::None, move |owner| {
-                        owner.capture_refusal(&prepared)?.ok_or_else(|| {
-                            GateError::new("module_review_invalid", "project refusal is absent")
-                        })
+                    Err(error) => return Err(error.with_settings_review_paths(paths)),
+                }
+            }
+        }
+        accepted_paths.retain(|path| !refused_paths.contains(path));
+        if !accepted_paths.is_empty() {
+            config_work(runtime.clone(), ConfigWake::Delivery, move |owner| {
+                owner.clear_settings_review_success(review_base, &accepted_paths)
+            })
+            .await?;
+        }
+        if let Some(error) = review_refusal {
+            return Err(error.with_settings_review_paths(refused_paths.into_iter().collect()));
+        }
+        if prepared.capture_refused() {
+            let view = runtime
+                .on_blocking(move |owner| {
+                    owner.capture_refusal(&prepared)?.ok_or_else(|| {
+                        GateError::new("module_review_invalid", "project refusal is absent")
                     })
-                    .await?;
-                    return Ok(ConfigControlResponse::Plan { view });
-                }
-                let mut fields = Vec::new();
-                let mut edit_refusals = Vec::new();
-                let mut unavailable_rereviews = Vec::new();
-                for (module, captured) in &prepared.candidate.modules {
-                    if !prepared.review_modules.contains(module) {
-                        continue;
-                    }
-                    let base = prepared.bases.get(module);
-                    let reply = self
-                        .review_config_tuple(&runtime, module, base, &captured.view)
-                        .await;
-                    let reply = match reply {
-                        Ok(reply) => reply,
-                        // A re-review the new program cannot answer now stays
-                        // pending in status; it does not hold up this plan.
-                        Err(_) if prepared.rereview_modules.contains(module) => {
-                            unavailable_rereviews.push(module.clone());
-                            continue;
-                        }
-                        Err(error) => return Err(error),
-                    };
-                    let reply: subc_protocol::config::ConfigReviewReply =
-                        serde_json::from_slice(&reply).map_err(|_| {
-                            GateError::new(
-                                "module_review_invalid",
-                                format!("{module}: malformed config.review reply"),
-                            )
-                        })?;
-                    if prepared.is_edit_plan() && !reply.refusals.is_empty() {
-                        let before = edit_refusals.len();
-                        for refusal in &reply.refusals {
-                            for path in refusal
-                                .paths
-                                .iter()
-                                .filter(|path| path.starts_with('/') && path.len() <= 1024)
-                            {
-                                edit_refusals.push(subc_control::config::ConfigPlanRefusal {
-                                    module_id: module.clone(),
-                                    path: path.clone(),
-                                    code: "module_review_refused".into(),
-                                    message: "the module refused this field".into(),
-                                    project_id: None,
-                                    workspace_id: None,
-                                });
-                            }
-                        }
-                        if edit_refusals.len() == before {
-                            edit_refusals.push(subc_control::config::ConfigPlanRefusal {
-                                module_id: module.clone(),
-                                path: String::new(),
-                                code: "module_review_refused".into(),
-                                message: "the module refused the edits".into(),
-                                project_id: None,
-                                workspace_id: None,
-                            });
-                        }
-                        fields.extend(prepared.refused_fields(module)?);
-                        continue;
-                    }
-                    fields.extend(crate::config_gate::review::checked_fields(
-                        module,
-                        &captured.schema,
-                        base,
-                        prepared.base_schemas.get(module),
-                        &captured.view,
-                        reply,
-                    )?);
-                }
-                for module in unavailable_rereviews {
-                    prepared.review_modules.remove(&module);
-                    prepared.rereview_modules.remove(&module);
-                }
-                let mut project_replies = Vec::new();
-                for (tuple, review) in prepared.project_reviews() {
-                    let bytes = self
-                        .review_config_tuple(
-                            &runtime,
-                            &tuple.module,
-                            review.base.as_ref(),
-                            &review.approval.view,
-                        )
-                        .await?;
-                    let reply: subc_protocol::config::ConfigReviewReply =
-                        serde_json::from_slice(&bytes).map_err(|_| {
-                            GateError::new(
-                                "module_review_invalid",
-                                format!("{}: malformed project config.review reply", tuple.module),
-                            )
-                        })?;
-                    project_replies.push((tuple.clone(), reply));
-                }
-                for (tuple, reply) in project_replies {
-                    if prepared.is_edit_plan() && !reply.refusals.is_empty() {
-                        prepared.refuse_project_review(&tuple, &reply);
-                    } else {
-                        fields.extend(prepared.accept_project_review(&tuple, reply)?);
-                    }
-                }
-                if prepared.capture_refused() {
-                    let view = runtime
-                        .on_blocking(move |owner| {
-                            owner.capture_refusal(&prepared)?.ok_or_else(|| {
-                                GateError::new("module_review_invalid", "project refusal is absent")
-                            })
-                        })
-                        .await?;
-                    return Ok(ConfigControlResponse::Plan { view });
-                }
-                prepared.add_edit_refusals(edit_refusals);
-                fields.extend(prepared.unreviewed_fields()?);
-                let view = config_work(runtime, ConfigWake::Delivery, move |owner| {
+                })
+                .await?;
+            return Ok(view);
+        }
+        prepared.add_edit_refusals(edit_refusals);
+        fields.extend(prepared.unreviewed_fields()?);
+        config_work(runtime, ConfigWake::Delivery, move |owner| {
                     owner.finish_plan(prepared, move |old, new| {
                         let mut changeset = crate::config_gate::runtime::daemon_review(old, new)?;
                         changeset.fields = fields;
@@ -1134,15 +1358,7 @@ impl ControlHandler {
                         Ok(changeset)
                     })
                 })
-                .await?;
-                Ok(match kind {
-                    PlanKind::Change => ConfigControlResponse::Plan { view },
-                    PlanKind::Stamp => ConfigControlResponse::Stamp { view },
-                    PlanKind::Unstamp => ConfigControlResponse::Unstamp { view },
-                    PlanKind::Rollback(_) => ConfigControlResponse::Rollback { view },
-                })
-            }
-        }
+                .await
     }
 
     async fn review_config_tuple(
@@ -1153,7 +1369,40 @@ impl ControlHandler {
         candidate: &subc_protocol::config::ConfigView,
     ) -> Result<Vec<u8>, GateError> {
         #[cfg(test)]
-        if let Some(reply) = &self.config_review_test_reply {
+        if let Some(reply) = self
+            .config_review_test_replies
+            .get(module)
+            .or(self.config_review_test_reply.as_ref())
+        {
+            if let Some(seen) = &self.config_review_test_seen {
+                let _ = seen.send(module.into());
+            }
+            if self
+                .config_review_test_refuse
+                .lock()
+                .unwrap()
+                .contains(module)
+            {
+                let refusal = subc_protocol::config::ConfigReviewReply::new(
+                    vec![],
+                    vec![subc_protocol::config::ConfigReviewRefusal::new(
+                        "refused",
+                        vec!["/limit".into()],
+                        vec![],
+                    )],
+                );
+                return Ok(serde_json::to_vec(&refusal).unwrap());
+            }
+            use std::sync::atomic::Ordering;
+            if self
+                .config_review_test_fail_once
+                .swap(false, Ordering::Relaxed)
+            {
+                return Err(GateError::new(
+                    "approval_surface_unavailable",
+                    "module reviewer temporarily unavailable",
+                ));
+            }
             return serde_json::to_vec(reply).map_err(|_| {
                 GateError::new(
                     "module_review_invalid",
@@ -1205,8 +1454,31 @@ impl ControlHandler {
         .await
     }
 
+    #[cfg(test)]
     async fn config_approval_facts(&self, ctx: &RouteCtx) -> ApprovalFacts {
         let phone = self.config_phone_surface().await;
+        self.config_approval_facts_with_phone(ctx, phone).await
+    }
+
+    async fn config_apply_facts(
+        &self,
+        ctx: &RouteCtx,
+        phone: Option<crate::config_gate::PhoneSurface>,
+        daemon_settings: bool,
+    ) -> ApprovalFacts {
+        if daemon_settings {
+            // Only the internal settings worker can select this origin. It still
+            // needs a response from the trusted phone.
+            return ApprovalFacts {
+                connection: ctx.connection_id.get(),
+                owner_uid: true,
+                desktop_app: false,
+                attested_operator_app: false,
+                os_prompt_available: false,
+                phone,
+                caller: crate::caller_identity::CallerIdentity::daemon_settings(),
+            };
+        }
         self.config_approval_facts_with_phone(ctx, phone).await
     }
 
@@ -1517,7 +1789,7 @@ pub(super) fn config_error_frame(frame: &Frame, error: GateError) -> Result<Fram
         ErrorBody {
             code: error.code,
             message: error.detail,
-            detail: None,
+            detail: error.wire_detail.map(|detail| *detail),
         },
     )
 }

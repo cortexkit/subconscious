@@ -2,6 +2,7 @@ use super::*;
 use crate::caller_identity::CallerIdentity;
 use crate::config_store::StoreRoot;
 use serde_json::json;
+use std::sync::Arc;
 use subc_protocol::config::ConfigGetRequest;
 
 #[path = "capture_plan_tests.rs"]
@@ -772,6 +773,234 @@ impl Drop for Rig {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
     }
+}
+
+#[test]
+fn config_pending_settings_unstamp_hides_and_clears_worker_status() {
+    let rig = Rig::new();
+    let owner = rig.owner("unstamp-kept-settings");
+    rig.stamp(&owner);
+    owner.complete_authority_exit_for_test(1).unwrap();
+    let recovery = rig.path.join("settings-recovery");
+    std::fs::create_dir(&recovery).unwrap();
+    let kept = recovery.join("kept-copy.jsonc");
+    std::fs::write(&kept, b"{}").unwrap();
+    {
+        let mut state = owner.lock().unwrap();
+        state.pending_settings_card_reason = Some("no approving device".into());
+    }
+    assert_eq!(
+        owner
+            .polled_status()
+            .unwrap()
+            .settings_recovery_copies
+            .len(),
+        1
+    );
+    let plan = owner
+        .finish_plan(owner.prepare(PlanKind::Unstamp).unwrap(), daemon_review)
+        .unwrap();
+    owner
+        .desktop_view_delivered(ConnectionId::new(7), &plan)
+        .unwrap();
+    let attempt = owner
+        .begin_approval(&plan.digest, &Rig::facts())
+        .unwrap()
+        .attempt();
+    owner
+        .finish_approval(
+            attempt,
+            &Rig::facts(),
+            ApprovalReply::Presence(super::super::PresenceDecision::InteractiveApproval),
+            2,
+        )
+        .unwrap();
+    let wire = serde_json::to_value(owner.polled_status().unwrap()).unwrap();
+    assert_eq!(wire["state"], "unstamped");
+    for member in [
+        "pending_settings_card",
+        "pending_settings_card_reason",
+        "settings_recovery_copies",
+        "settings_recovery_copy_count",
+    ] {
+        assert!(wire.get(member).is_none(), "{member} must be omitted");
+    }
+    assert!(owner.lock().unwrap().pending_settings_card_reason.is_none());
+    assert!(kept.is_file());
+}
+
+#[test]
+fn config_pending_settings_stale_review_refusals_are_not_published() {
+    use subc_control::config::{ConfigFileError, ConfigStatusFileError};
+    let rig = Rig::new();
+    let owner = rig.owner("review-refusal-epoch");
+    rig.stamp(&owner);
+    owner.complete_authority_exit_for_test(1).unwrap();
+    let base = owner.polled_status().unwrap().base_revision;
+    let error = ConfigStatusFileError::new(
+        "a".into(),
+        ConfigFileError::new("module_review_refused", "refused"),
+    );
+    owner
+        .set_settings_review_errors(base - 1, vec![error.clone()])
+        .unwrap();
+    assert!(!owner
+        .set_pending_settings_card_reason(base - 1, Some("stale reason"))
+        .unwrap());
+    assert!(owner.lock().unwrap().settings_review_errors.is_empty());
+    owner
+        .set_settings_review_errors(base, vec![error.clone()])
+        .unwrap();
+    assert_eq!(
+        owner.lock().unwrap().settings_review_errors.as_slice(),
+        std::slice::from_ref(&error)
+    );
+    let plan = owner
+        .finish_plan(owner.prepare(PlanKind::Unstamp).unwrap(), daemon_review)
+        .unwrap();
+    owner
+        .desktop_view_delivered(ConnectionId::new(7), &plan)
+        .unwrap();
+    let attempt = owner
+        .begin_approval(&plan.digest, &Rig::facts())
+        .unwrap()
+        .attempt();
+    owner
+        .finish_approval(
+            attempt,
+            &Rig::facts(),
+            ApprovalReply::Presence(super::super::PresenceDecision::InteractiveApproval),
+            2,
+        )
+        .unwrap();
+    owner
+        .set_settings_review_errors(base, vec![error.clone()])
+        .unwrap();
+    owner
+        .set_settings_review_errors(owner.polled_status().unwrap().base_revision, vec![error])
+        .unwrap();
+    assert!(owner.lock().unwrap().settings_review_errors.is_empty());
+}
+
+#[test]
+fn config_pending_settings_status_omits_refusal_from_previous_base() {
+    use subc_control::config::{ConfigFileError, ConfigStatusFileError};
+    let rig = Rig::new();
+    let path = rig.path.join("cortexkit/a.jsonc");
+    std::fs::write(
+        &path,
+        br#"{"credential":{"vault_ref":"fixture"},"limit":1}"#,
+    )
+    .unwrap();
+    let owner = rig.owner("refusal-base-filter");
+    rig.declare(&owner, 10);
+    rig.stamp(&owner);
+    owner.complete_authority_exit_for_test(1).unwrap();
+    let before = owner.polled_status().unwrap().base_revision;
+    let mut error = ConfigFileError::new("module_review_refused", "old refusal");
+    error.path = Some(path.to_string_lossy().into_owned());
+    owner
+        .set_settings_review_errors(before, vec![ConfigStatusFileError::new("a".into(), error)])
+        .unwrap();
+    assert_eq!(owner.polled_status().unwrap().file_errors.len(), 1);
+    std::fs::write(path, br#"{"credential":{"vault_ref":"fixture"},"limit":2}"#).unwrap();
+    let plan = owner
+        .finish_plan(owner.prepare(PlanKind::Change).unwrap(), daemon_review)
+        .unwrap();
+    owner
+        .desktop_view_delivered(ConnectionId::new(7), &plan)
+        .unwrap();
+    let attempt = owner
+        .begin_approval(&plan.digest, &Rig::facts())
+        .unwrap()
+        .attempt();
+    owner
+        .finish_approval(
+            attempt,
+            &Rig::facts(),
+            ApprovalReply::Presence(super::super::PresenceDecision::InteractiveApproval),
+            2,
+        )
+        .unwrap();
+    let status = owner.polled_status().unwrap();
+    assert_ne!(status.base_revision, before);
+    assert!(status
+        .file_errors
+        .iter()
+        .all(|error| error.error.code != "module_review_refused"));
+}
+
+#[tokio::test]
+async fn config_pending_settings_routine_recovery_inventory_survives_restart() {
+    let rig = Rig::new();
+    let path = rig.path.join("cortexkit/a.jsonc");
+    let approved = br#"{"credential":{"vault_ref":"fixture"},"limit":1}"#;
+    let proposed = br#"{"credential":{"vault_ref":"fixture"},"limit":2}"#;
+    std::fs::write(&path, approved).unwrap();
+    let owner = Arc::new(rig.owner("archive-first-run"));
+    rig.declare(&owner, 10);
+    rig.stamp(&owner);
+    owner.complete_authority_exit_for_test(1).unwrap();
+    std::fs::write(&path, proposed).unwrap();
+    let plan = owner
+        .finish_plan(owner.prepare(PlanKind::Change).unwrap(), daemon_review)
+        .unwrap();
+    owner.revert_capture_plan(plan.digest).await.unwrap();
+    let first = owner.polled_status().unwrap();
+    assert_eq!(first.settings_recovery_copy_count, Some(1));
+    assert_eq!(
+        first.settings_recovery_copies[0].path,
+        path.to_string_lossy()
+    );
+    assert_eq!(
+        std::fs::read(&first.settings_recovery_copies[0].recovery_path).unwrap(),
+        proposed
+    );
+    drop(owner);
+    let restarted = rig.owner("archive-second-run");
+    let later = restarted.polled_status().unwrap();
+    assert_eq!(later.settings_recovery_copy_count, Some(1));
+    assert_eq!(
+        later.settings_recovery_copies,
+        first.settings_recovery_copies
+    );
+    std::fs::remove_file(&later.settings_recovery_copies[0].recovery_path).unwrap();
+    let removed = restarted.polled_status().unwrap();
+    assert!(removed.settings_recovery_copy_count.is_none());
+    assert!(removed.settings_recovery_copies.is_empty());
+}
+
+#[tokio::test]
+async fn config_pending_settings_repeated_keeps_of_one_file_do_not_fill_the_table() {
+    let rig = Rig::new();
+    let path = rig.path.join("cortexkit/a.jsonc");
+    std::fs::write(
+        &path,
+        br#"{"credential":{"vault_ref":"fixture"},"limit":1}"#,
+    )
+    .unwrap();
+    let owner = Arc::new(rig.owner("keep-capacity"));
+    rig.declare(&owner, 10);
+    rig.stamp(&owner);
+    owner.complete_authority_exit_for_test(1).unwrap();
+    let mut prior = None;
+    for limit in 2..82 {
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&json!({"credential":{"vault_ref":"fixture"},"limit":limit}))
+                .unwrap(),
+        )
+        .unwrap();
+        let prepared = owner.prepare_pending_settings().await.unwrap().unwrap();
+        let plan = owner.finish_plan(prepared, daemon_review).unwrap();
+        RuntimeOwner::keep_declined_files(&mut owner.lock().unwrap(), &plan.digest).unwrap();
+        if let Some(old) = prior.replace(plan.digest.clone()) {
+            assert_eq!(owner.plan_get(&old).unwrap_err().code, "unknown_plan");
+        }
+        assert_eq!(owner.lock().unwrap().gate.kept_paths.len(), 1);
+    }
+    owner.revert_capture_plan(prior.unwrap()).await.unwrap();
+    assert!(owner.lock().unwrap().gate.kept_paths.is_empty());
 }
 
 #[test]

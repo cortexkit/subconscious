@@ -82,6 +82,20 @@ and immutable baseline. No module process is started.
   install, at generation zero, without an operator prompt.
 - `apply-changed.json`: `config_changed_since_review` because the user file
   changed after review. The reviewed digest is the same as in `plan-edit.json`.
+- `settings-card-open.json`: status names the open daemon-filed card by digest,
+  with the corresponding `config.plan_get` view. An oversized pending change
+  instead has `pending_settings_card_reason: "too many changes for the phone card"`.
+  If no approving device can receive the card, the reason is
+  `"no approving device to send the card to"`. The daemon never opens an OS prompt on its own.
+- `workspace-settings-card.json`: a plan view projection illustrating a single
+  workspace file with separate field effects for two inheriting projects.
+  `view.settings_file_change` is display-only; consent sees the digest-bound plan,
+  not the label or file grouping.
+- `revert-success.json`: restore a pending capture's approved files and close
+  the card, with one `files` row per restored file. `revert-changed.json`
+  refuses to replace a newer edit and lists file outcomes in `detail.files`.
+  `revert-unknown.json` shows the refusal for an absent or applied digest, with
+  no file outcomes.
 
 There is no stamped-apply sample: the sample setup has no supervisor to reconcile
 approved configuration, so a stamped apply answers `supervisor_reconcile_unavailable`. A successful stamped

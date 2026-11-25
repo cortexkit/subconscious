@@ -1,0 +1,44 @@
+{
+  "view_projection": {
+    "plan": {
+      "changeset": {
+        "fields": [
+          {
+            "apply": "live",
+            "module_id": "a",
+            "new": { "kind": "value", "value": 6 },
+            "new_source": "workspace",
+            "old": { "kind": "value", "value": 4 },
+            "old_source": "workspace",
+            "path": "/limit",
+            "project_id": "first",
+            "reasons": []
+          },
+          {
+            "apply": "live",
+            "module_id": "a",
+            "new": { "kind": "value", "value": 6 },
+            "new_source": "workspace",
+            "old": { "kind": "value", "value": 4 },
+            "old_source": "workspace",
+            "path": "/limit",
+            "project_id": "second",
+            "reasons": []
+          }
+        ]
+      }
+    },
+    "settings_file_change": {
+      "files": [
+        {
+          "affected_projects": ["first", "second"],
+          "layer": "workspace",
+          "module_id": "a",
+          "path": "/home/example/workspace/.cortexkit/a.jsonc",
+          "workspace_id": "W"
+        }
+      ],
+      "label": "A settings file changed"
+    }
+  }
+}

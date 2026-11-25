@@ -148,6 +148,7 @@ pub struct ConfigCapturer {
 /// serialized: only its file identity, byte digest and redacted values are.
 pub struct CapturedFile {
     _file: Option<File>,
+    pub(super) permissions: Option<std::fs::Permissions>,
     pub path: PathBuf,
     pub bytes: Option<Vec<u8>>,
     pub state: InputState,
@@ -159,6 +160,22 @@ fn capture_error(_: impl std::fmt::Display) -> GateError {
         "input_unavailable",
         "configuration input could not be captured",
     )
+}
+
+pub(super) fn opened_file_state(
+    file: &File,
+    metadata: &std::fs::Metadata,
+    bytes: &[u8],
+) -> Result<InputState> {
+    file_state(file_object_id(file)?, metadata, bytes)
+}
+
+fn file_state(id: FileObjectId, metadata: &std::fs::Metadata, bytes: &[u8]) -> Result<InputState> {
+    let digest = subc_config::raw_digest(&serde_json::to_vec(&json!({
+        "file": id, "raw": subc_config::raw_digest(bytes), "length": metadata.len(),
+        "modified": metadata.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| (d.as_secs(), d.subsec_nanos())),
+    })).map_err(GateError::invalid)?);
+    Ok(InputState::Present { digest })
 }
 
 impl CapturedFile {
@@ -178,6 +195,7 @@ impl CapturedFile {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 return Ok(Self {
                     _file: None,
+                    permissions: None,
                     path: path.into(),
                     bytes: None,
                     state: InputState::Absent,
@@ -224,15 +242,13 @@ impl CapturedFile {
         {
             return Err(GateError::capture_race());
         }
-        let digest = subc_config::raw_digest(&serde_json::to_vec(&json!({
-            "file": id, "raw": subc_config::raw_digest(&bytes), "length": metadata.len(),
-            "modified": metadata.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| (d.as_secs(), d.subsec_nanos())),
-        })).map_err(GateError::invalid)?);
+        let state = file_state(id, &metadata, &bytes)?;
         Ok(Self {
             _file: Some(file),
+            permissions: Some(metadata.permissions()),
             path: path.into(),
             bytes: Some(bytes),
-            state: InputState::Present { digest },
+            state,
         })
     }
 
@@ -518,7 +534,7 @@ impl ConfigCapturer {
         target: &GateSnapshot,
         delivery: &crate::config_store::DeliverySnapshot,
     ) -> Result<CapturedConfiguration> {
-        self.capture_retained_inner(target, delivery, &delivery.declarations, true)
+        self.capture_retained_inner(target, delivery, &delivery.declarations, true, true)
     }
 
     pub(crate) fn capture_retained_declared(
@@ -527,7 +543,18 @@ impl ConfigCapturer {
         delivery: &crate::config_store::DeliverySnapshot,
         declarations: &BTreeMap<String, ConfigDeclareRequest>,
     ) -> Result<CapturedConfiguration> {
-        self.capture_retained_inner(target, delivery, declarations, false)
+        self.capture_retained_inner(target, delivery, declarations, false, true)
+    }
+
+    pub(super) fn capture_approved_settings(
+        &self,
+        target: &GateSnapshot,
+        delivery: &crate::config_store::DeliverySnapshot,
+    ) -> Result<CapturedConfiguration> {
+        let mut captured =
+            self.capture_retained_inner(target, delivery, &delivery.declarations, true, false)?;
+        captured.diagnostic = target.clone();
+        Ok(captured)
     }
 
     fn capture_retained_inner(
@@ -536,6 +563,7 @@ impl ConfigCapturer {
         delivery: &crate::config_store::DeliverySnapshot,
         declarations: &BTreeMap<String, ConfigDeclareRequest>,
         require_identical: bool,
+        programs: bool,
     ) -> Result<CapturedConfiguration> {
         let invalid = || {
             GateError::new(
@@ -554,6 +582,7 @@ impl ConfigCapturer {
                 bytes: layer.bytes.clone(),
                 state: input.state.clone(),
                 _file: None,
+                permissions: None,
             })
         };
         let daemon = retained_file(
@@ -585,7 +614,7 @@ impl ConfigCapturer {
             )?;
             files.insert(file.path.clone(), file);
         }
-        let captured = self.capture_layers(daemon, declarations, None, true, |path| {
+        let captured = self.capture_layers(daemon, declarations, None, programs, |path| {
             files.remove(path).ok_or_else(invalid)
         })?;
         if !files.is_empty()
@@ -877,6 +906,7 @@ impl CapturedFile {
     pub(super) fn retained(path: PathBuf, bytes: Option<Vec<u8>>, state: InputState) -> Self {
         Self {
             _file: None,
+            permissions: None,
             path,
             bytes,
             state,

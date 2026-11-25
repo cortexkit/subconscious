@@ -120,6 +120,9 @@ pub enum ConfigControlRequest {
     PlanGet { digest: Digest },
     #[serde(rename = "config.plan_discard")]
     PlanDiscard { digest: Digest },
+    /// Restore approved bytes only for unchanged files in the pending capture.
+    #[serde(rename = "config.revert")]
+    Revert { digest: Digest },
     #[serde(rename = "config.apply")]
     Apply { digest: Digest },
     #[serde(rename = "config.stamp")]
@@ -152,6 +155,7 @@ impl ConfigControlRequest {
             Self::Plan { .. } => "config.plan",
             Self::PlanGet { .. } => "config.plan_get",
             Self::PlanDiscard { .. } => "config.plan_discard",
+            Self::Revert { .. } => "config.revert",
             Self::Apply { .. } => "config.apply",
             Self::Stamp {} => "config.stamp",
             Self::Unstamp {} => "config.unstamp",
@@ -339,6 +343,10 @@ enum ConfigWatchOp {
 #[non_exhaustive]
 pub struct ConfigPlanView {
     pub digest: Digest,
+    /// Display-only grouping for a daemon-filed settings plan. Returned by
+    /// `config.plan_get` but not covered by the approval digest or sent to consent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings_file_change: Option<ConfigSettingsFileChange>,
     pub base_revision: u64,
     pub plan: Plan,
     /// Every entry prevents applying the plan.
@@ -349,6 +357,21 @@ pub struct ConfigPlanView {
     pub skipped: Vec<ConfigPlanRefusal>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigSettingsFileChange {
+    pub label: String,
+    pub files: Vec<ConfigSettingsFile>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigSettingsFile {
+    pub module_id: String,
+    pub layer: subc_config::Layer,
+    pub path: std::path::PathBuf,
+    pub workspace_id: Option<String>,
+    pub affected_projects: Vec<String>,
+}
+
 impl ConfigPlanView {
     pub fn new(plan: Plan) -> Result<Self, subc_config::CanonicalError> {
         Ok(Self {
@@ -357,6 +380,7 @@ impl ConfigPlanView {
             plan,
             refusals: Vec::new(),
             skipped: Vec::new(),
+            settings_file_change: None,
         })
     }
 }
@@ -390,6 +414,18 @@ pub struct ConfigStatus {
     pub revision: u64,
     pub base_revision: u64,
     pub pending_proposals: u64,
+    /// Present only while the daemon is asking for approval of changed settings files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_settings_card: Option<Digest>,
+    /// Why the daemon did not file a card for the current waiting settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_settings_card_reason: Option<String>,
+    /// Newest recovery copies on disk, including routine archives and copies kept beside settings files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub settings_recovery_copies: Vec<ConfigSettingsRecoveryCopy>,
+    /// Number of recovery copies on disk, including rows beyond the newest 50.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings_recovery_copy_count: Option<u64>,
     pub anchor_pending: bool,
     pub ungated_modules: Vec<String>,
     pub ungated_inputs: Vec<String>,
@@ -405,6 +441,12 @@ pub struct ConfigStatus {
     pub file_errors_incomplete: Option<ConfigFileErrorsIncomplete>,
     #[serde(default, skip_serializing_if = "ConfigRootIo::absent_or_idle")]
     pub root_io: Option<ConfigRootIo>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigSettingsRecoveryCopy {
+    pub path: String,
+    pub recovery_path: String,
 }
 
 /// The file error for one user or project settings row.
@@ -465,6 +507,53 @@ impl ConfigRootIo {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ConfigRevertFile {
+    pub path: String,
+    pub status: ConfigRevertFileStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigRevertFileStatus {
+    Restored,
+    Refused,
+}
+
+impl ConfigRevertFile {
+    pub fn restored(path: String) -> Self {
+        Self {
+            path,
+            status: ConfigRevertFileStatus::Restored,
+            code: None,
+            message: None,
+            detail: None,
+        }
+    }
+
+    pub fn refused(
+        path: String,
+        code: String,
+        message: String,
+        detail: Option<serde_json::Value>,
+    ) -> Self {
+        Self {
+            path,
+            status: ConfigRevertFileStatus::Refused,
+            code: Some(code),
+            message: Some(message),
+            detail,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op")]
 #[non_exhaustive]
 pub enum ConfigControlResponse {
@@ -506,6 +595,11 @@ pub enum ConfigControlResponse {
     PlanGet { view: ConfigPlanView },
     #[serde(rename = "config.plan_discard")]
     PlanDiscard {},
+    #[serde(rename = "config.revert")]
+    Revert {
+        #[serde(default)]
+        files: Vec<ConfigRevertFile>,
+    },
     #[serde(rename = "config.stamp")]
     Stamp { view: ConfigPlanView },
     #[serde(rename = "config.unstamp")]
@@ -570,7 +664,12 @@ mod tests {
         ] {
             assert_wire_bytes::<ConfigControlRequest>(wire);
         }
-        for op in ["config.plan_get", "config.plan_discard", "config.apply"] {
+        for op in [
+            "config.plan_get",
+            "config.plan_discard",
+            "config.apply",
+            "config.revert",
+        ] {
             assert_wire_bytes::<ConfigControlRequest>(&format!(
                 r#"{{"op":"{op}","digest":"{DIGEST}"}}"#
             ));
@@ -620,6 +719,16 @@ mod tests {
         let decoded: T =
             serde_json::from_str(wire).unwrap_or_else(|error| panic!("{wire}: {error}"));
         assert_eq!(serde_json::to_string(&decoded).unwrap(), wire);
+    }
+
+    #[test]
+    fn config_wire_revert_decodes_legacy_success_and_writes_a_file_list() {
+        let old: ConfigControlResponse = serde_json::from_str(r#"{"op":"config.revert"}"#).unwrap();
+        assert!(matches!(old, ConfigControlResponse::Revert { files } if files.is_empty()));
+        assert_wire_bytes::<ConfigControlResponse>(
+            r#"{"op":"config.revert","files":[{"path":"/settings/demo.jsonc","status":"restored"}]}"#,
+        );
+        assert_wire_bytes::<ConfigControlResponse>(r#"{"op":"config.revert","files":[]}"#);
     }
 
     #[test]

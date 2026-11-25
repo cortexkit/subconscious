@@ -40,6 +40,44 @@ export interface ConfigStatusFileError extends ConfigFileError {
   workspace_id?: string;
 }
 
+/** Additive diagnostics on the owner-only config.status reply. */
+export interface ConfigPendingSettingsStatus {
+  pending_settings_card?: string;
+  pending_settings_card_reason?: string;
+  settings_recovery_copies?: Array<{ path: string; recovery_path: string }>;
+  settings_recovery_copy_count?: number;
+}
+
+/** Display-only file grouping on a pending plan view, outside the plan digest. */
+export interface ConfigSettingsFileChange {
+  label: string;
+  files: Array<{
+    module_id: string;
+    layer: "user" | "workspace";
+    path: string;
+    workspace_id: string | null;
+    affected_projects: string[];
+  }>;
+}
+
+export interface ConfigRevertRequest {
+  op: "config.revert";
+  digest: string;
+}
+
+export interface ConfigRevertReply {
+  op: "config.revert";
+  files: ConfigRevertFile[];
+}
+
+export interface ConfigRevertFile {
+  path: string;
+  status: "restored" | "refused";
+  code?: string;
+  message?: string;
+  detail?: unknown;
+}
+
 export interface ConfigView {
   /** Set only by clients from config.get; delivery state, not approved content. */
   declaration_pending?: ConfigDeclarationPending;

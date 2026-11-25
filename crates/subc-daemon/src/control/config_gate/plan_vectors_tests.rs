@@ -60,6 +60,14 @@ fn normalized_view(view: ConfigPlanView, root: &str) -> ConfigPlanView {
     plan.daemon_incarnation = "example-daemon".into();
     let mut normalized = ConfigPlanView::new(plan).unwrap();
     normalized.refusals = view.refusals;
+    normalized.settings_file_change = view.settings_file_change.map(|change| {
+        serde_json::from_value(normalize_capture(
+            serde_json::to_value(change).unwrap(),
+            root,
+            false,
+        ))
+        .unwrap()
+    });
     normalized
 }
 
@@ -287,6 +295,123 @@ async fn config_plan_vectors_match_real_handler_bytes() {
         "apply-unstamped.json",
         json!({"request":{"op":"config.apply","digest":view.digest},"reply":reply}),
     );
+    let runtime = handler.config_runtime.clone().unwrap();
+    let path = root.join("cortexkit/demo.jsonc");
+    let approved = b"{ // Approved comment.\n \"limit\":1}\n";
+    std::fs::write(&path, approved).unwrap();
+    let facts = ApprovalFacts {
+        connection: ctx.connection_id.get(),
+        owner_uid: true,
+        desktop_app: true,
+        attested_operator_app: true,
+        os_prompt_available: true,
+        phone: None,
+        caller: Default::default(),
+    };
+    let stamp = runtime
+        .finish_plan(
+            runtime.prepare(PlanKind::Stamp).unwrap(),
+            crate::config_gate::runtime::daemon_review,
+        )
+        .unwrap();
+    runtime
+        .desktop_view_delivered(ctx.connection_id, &stamp)
+        .unwrap();
+    let attempt = runtime
+        .begin_approval(&stamp.digest, &facts)
+        .unwrap()
+        .attempt();
+    runtime
+        .finish_approval(
+            attempt,
+            &facts,
+            ApprovalReply::Presence(PresenceDecision::InteractiveApproval),
+            1,
+        )
+        .unwrap();
+    for (sample, edit_again) in [
+        ("revert-success.json", false),
+        ("revert-changed.json", true),
+    ] {
+        std::fs::write(&path, b"{\"limit\":4}").unwrap();
+        let prepared = runtime.prepare_pending_settings().await.unwrap().unwrap();
+        let actual = handler
+            .review_config_plan(runtime.clone(), prepared)
+            .await
+            .unwrap();
+        let normalized = normalized_view(actual.clone(), root.to_str().unwrap());
+        if !edit_again {
+            runtime
+                .desktop_view_delivered(ctx.connection_id, &actual)
+                .unwrap();
+            let attempt = runtime
+                .begin_approval(&actual.digest, &facts)
+                .unwrap()
+                .attempt();
+            runtime
+                .mark_settings_card_open(&actual.digest, attempt)
+                .unwrap();
+            let mut status = call(&handler, &ctx, json!({"op":"config.status"})).await;
+            assert_eq!(
+                status["status"]["pending_settings_card"],
+                json!(actual.digest)
+            );
+            status["status"]["pending_settings_card"] = json!(normalized.digest);
+            // A `dev-desktop-approval` build lists that switch; the sample
+            // shows a release daemon either way.
+            status["status"]["development_switches"] = json!([]);
+            let stamp_digest = normalized_view(stamp.clone(), root.to_str().unwrap()).digest;
+            for pending in status["status"]["approved_but_inactive"]
+                .as_array_mut()
+                .unwrap()
+            {
+                if pending["digest"] == json!(stamp.digest) {
+                    pending["digest"] = json!(stamp_digest);
+                }
+            }
+            let fetched = call(
+                &handler,
+                &ctx,
+                json!({"op":"config.plan_get","digest":actual.digest}),
+            )
+            .await;
+            assert_eq!(
+                fetched["view"]["settings_file_change"],
+                json!(actual.settings_file_change)
+            );
+            cases.insert(
+                "settings-card-open.json",
+                json!({
+                    "request": {"op":"config.status"},
+                    "reply": status,
+                    "plan_get_view": normalized,
+                }),
+            );
+        }
+        let request = json!({"op":"config.revert","digest":actual.digest});
+        let reply = if edit_again {
+            std::fs::write(&path, b"{\"limit\":5}").unwrap();
+            let reply = refused_call(
+                &handler,
+                &ctx,
+                request.clone(),
+                "config_changed_since_review",
+            )
+            .await;
+            assert_eq!(std::fs::read(&path).unwrap(), b"{\"limit\":5}");
+            reply
+        } else {
+            let reply = call(&handler, &ctx, request.clone()).await;
+            assert_eq!(std::fs::read(&path).unwrap(), approved);
+            let unknown = refused_call(&handler, &ctx, request, "unknown_plan").await;
+            cases.insert("revert-unknown.json", json!({"request":{"op":"config.revert","digest":normalized.digest},"reply":unknown}));
+            reply
+        };
+        cases.insert(
+            sample,
+            json!({"request":{"op":"config.revert","digest":normalized.digest},"reply":reply}),
+        );
+    }
     let directory =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vectors/config-settings-v1");
     let update = std::env::var_os("UPDATE_GOLDEN").is_some();
@@ -295,7 +420,7 @@ async fn config_plan_vectors_match_real_handler_bytes() {
         let sample = normalize_capture(sample, root.to_str().unwrap(), false);
         let mut bytes = serde_json::to_vec_pretty(&sample).unwrap();
         bytes.push(b'\n');
-        if update {
+        if update && std::fs::read(directory.join(name)).as_deref().ok() != Some(bytes.as_slice()) {
             std::fs::create_dir_all(&directory).unwrap();
             std::fs::write(directory.join(name), &bytes).unwrap();
         }
@@ -311,9 +436,9 @@ async fn config_plan_vectors_match_real_handler_bytes() {
             .unwrap_or_default()
             .lines()
             .filter(|line| {
-                !line.split_once("  ").is_some_and(|(_, name)| {
-                    name.starts_with("plan-") || name.starts_with("apply-")
-                })
+                !line
+                    .split_once("  ")
+                    .is_some_and(|(_, name)| plan_vector(name))
             })
             .map(str::to_owned)
             .collect();
@@ -334,8 +459,15 @@ async fn config_plan_vectors_match_real_handler_bytes() {
         .lines()
         .filter(|line| {
             line.split_once("  ")
-                .is_some_and(|(_, name)| name.starts_with("plan-") || name.starts_with("apply-"))
+                .is_some_and(|(_, name)| plan_vector(name))
         })
         .collect();
     assert_eq!(format!("{}\n", own_rows.join("\n")), sums);
+}
+
+fn plan_vector(name: &str) -> bool {
+    name.starts_with("plan-")
+        || name.starts_with("apply-")
+        || name.starts_with("revert-")
+        || name.starts_with("settings-card-")
 }

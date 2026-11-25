@@ -105,8 +105,11 @@ pub use retained_file::{
 pub use retained_file::{retained_file_index, WindowsFileIndexIdentity};
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub use retained_replace::{
-    create_directory_nofollow_at, open_directory_nofollow_at, open_single_link_file_nofollow_at,
-    OpenRetainedError, RetainedTempFile,
+    create_directory_nofollow_at, move_file_aside_nofollow_at, move_file_to_noreplace_at,
+    open_directory_nofollow_at, open_or_create_private_directory_at,
+    open_single_link_file_nofollow_at, probe_retained_directory_write,
+    probe_retained_regular_file_at, retained_directory_path, retained_regular_file_at,
+    OpenRetainedError, RetainedMovedFile, RetainedTempFile,
 };
 #[cfg(all(unix, feature = "test-support"))]
 pub mod fork_exec_test;

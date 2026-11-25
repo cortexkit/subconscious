@@ -540,6 +540,7 @@ impl RuntimeOwner {
         Ok(PreparedPlan {
             projects: None,
             project_capture: None,
+            settings_users: None,
             candidate,
             bases,
             base_schemas,
@@ -679,7 +680,7 @@ impl RuntimeOwner {
                 "the plan is no longer pending",
             ));
         }
-        if state.gate.has_open_approval(digest) {
+        if state.gate.has_open_approval(digest) || state.gate.plans[digest].restoring {
             return Err(GateError::new(
                 "plan_in_review",
                 "the plan is being approved",

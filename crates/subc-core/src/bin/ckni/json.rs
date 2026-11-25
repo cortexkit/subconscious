@@ -208,6 +208,7 @@ mod tests {
     fn every_builtin_variant_has_one_plain_and_one_documented_json_classification() {
         let digest = format!("sha256:{}", "a".repeat(64));
         let apply = format!("config apply {digest}");
+        let revert = format!("config revert {digest}");
         let place_program = format!("config place-program alpha /program {digest}");
         let cases = [
             // Config replies retain the daemon's complete view instead of a
@@ -215,6 +216,7 @@ mod tests {
             ("config status", PlainOutput::PipedText, JsonForm::Exempt),
             ("config plan", PlainOutput::PipedText, JsonForm::Exempt),
             (apply.as_str(), PlainOutput::PipedText, JsonForm::Exempt),
+            (revert.as_str(), PlainOutput::PipedText, JsonForm::Exempt),
             ("config stamp", PlainOutput::PipedText, JsonForm::Exempt),
             ("config unstamp", PlainOutput::PipedText, JsonForm::Exempt),
             ("config history", PlainOutput::PipedText, JsonForm::Exempt),

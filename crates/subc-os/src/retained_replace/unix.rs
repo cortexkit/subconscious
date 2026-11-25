@@ -1,6 +1,6 @@
 #![allow(unsafe_code)]
 
-use super::{invalid, OpenRetainedError, Stage};
+use super::{invalid, OpenRetainedError, RetainedMovedFile, Stage};
 use crate::{retained_file_identity, RetainedFileIdentity};
 use rustix::fs::{self, AtFlags, FileType, Gid, Mode, OFlags, Uid};
 use std::{ffi::OsStr, fs::File, io, os::unix::fs::MetadataExt};
@@ -17,6 +17,21 @@ pub(super) fn remove_inherited_acl(file: &File) -> io::Result<()> {
 pub(super) fn ensure_directory(parent: &File) -> io::Result<()> {
     if !parent.metadata()?.is_dir() {
         return Err(invalid("retained parent is not a directory"));
+    }
+    Ok(())
+}
+
+#[allow(clippy::unnecessary_cast)] // The platform mode types have different widths.
+pub(super) fn regular_mode_at(parent: &File, leaf: &OsStr) -> Option<u32> {
+    let metadata = fs::statat(parent, leaf, AtFlags::SYMLINK_NOFOLLOW).ok()?;
+    (FileType::from_raw_mode(metadata.st_mode) == FileType::RegularFile)
+        .then_some(Mode::from_raw_mode(metadata.st_mode).as_raw_mode() as u32)
+}
+
+pub(super) fn regular_file_at(parent: &File, leaf: &OsStr) -> io::Result<()> {
+    let metadata = fs::statat(parent, leaf, AtFlags::SYMLINK_NOFOLLOW)?;
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile {
+        return Err(invalid("expected a regular file"));
     }
     Ok(())
 }
@@ -38,7 +53,11 @@ pub(super) fn create(
 ) -> io::Result<File> {
     let nofollow = OFlags::CLOEXEC | OFlags::NOFOLLOW;
     let fd = if directory {
-        fs::mkdirat(parent, name, Mode::from_raw_mode(0o777))?;
+        fs::mkdirat(
+            parent,
+            name,
+            Mode::from_raw_mode(if publish { 0o777 } else { 0o700 }),
+        )?;
         let created = entry(parent, name.as_ref(), true)?;
         let fd = fs::openat(
             parent,
@@ -180,8 +199,54 @@ pub(super) fn rename(stage: &Stage<'_>, leaf: &OsStr, replace: bool) -> io::Resu
         fs::renameat(stage.parent, &stage.name, stage.parent, leaf)?;
         Ok(())
     } else {
-        os::rename_exclusive(stage.parent, &stage.name, leaf)
+        os::rename_exclusive(stage.parent, stage.name.as_ref(), stage.parent, leaf)
     }
+}
+
+pub(super) fn move_aside(parent: &File, leaf: &OsStr, aside: &OsStr) -> io::Result<()> {
+    entry(parent, leaf, false)?;
+    os::rename_exclusive(parent, leaf, parent, aside)
+}
+
+pub(super) fn put_back(moved: &RetainedMovedFile<'_>, leaf: &OsStr) -> io::Result<()> {
+    relocate(moved, moved.parent, leaf)
+}
+
+pub(super) fn relocate(moved: &RetainedMovedFile<'_>, dest: &File, leaf: &OsStr) -> io::Result<()> {
+    os::rename_exclusive(moved.parent, moved.name(), dest, leaf)
+}
+
+pub(super) fn directory_path(parent: &File) -> io::Result<std::path::PathBuf> {
+    os::directory_path(parent)
+}
+
+pub(super) fn verify_private_directory(parent: &File) -> io::Result<()> {
+    let metadata = parent.metadata()?;
+    if metadata.uid() != crate::effective_uid() || metadata.mode() & 0o7777 != 0o700 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "recovery directory must be owned by the daemon user with mode 0700",
+        ));
+    }
+    #[cfg(target_os = "macos")]
+    if os::read_acl(parent)?.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "recovery directory has an extended ACL",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn discard_moved(
+    moved: &RetainedMovedFile<'_>,
+    inspected: RetainedFileIdentity,
+) -> io::Result<()> {
+    if entry(moved.parent, moved.name(), false)? != inspected {
+        return Err(invalid("recovery entry identity changed"));
+    }
+    fs::unlinkat(moved.parent, moved.name(), AtFlags::empty())?;
+    Ok(())
 }
 
 pub(super) fn retry<T>(operation: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
@@ -196,11 +261,12 @@ pub(super) fn flush_publication(stage: &Stage<'_>) -> io::Result<()> {
     os::flush_publication(stage)
 }
 
-pub(super) fn remove_stage(stage: &Stage<'_>) {
+pub(super) fn remove_stage(stage: &Stage<'_>) -> io::Result<()> {
     let flags = if stage.directory {
         AtFlags::REMOVEDIR
     } else {
         AtFlags::empty()
     };
-    let _ = fs::unlinkat(stage.parent, &stage.name, flags);
+    fs::unlinkat(stage.parent, &stage.name, flags)?;
+    Ok(())
 }

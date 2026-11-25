@@ -38,6 +38,166 @@ fn stage(parent: &File, publish: bool) -> RetainedTempFile<'_> {
 }
 
 #[test]
+fn retained_recovery_moves_between_private_directories_without_replacing() {
+    let scratch = ScratchDir::new("retained-recovery-archive");
+    let parent = open_parent(&scratch);
+    let archive = open_or_create_private_directory_at(&parent, leaf("archive")).unwrap();
+    fs::write(scratch.join("proposal"), b"proposal bytes").unwrap();
+    fs::write(scratch.join("archive/existing"), b"older recovery").unwrap();
+    let mut moved = move_file_aside_nofollow_at(&parent, leaf("proposal"))
+        .unwrap()
+        .unwrap();
+    let collision = moved.relocate(&archive, leaf("existing")).unwrap_err();
+    assert_eq!(
+        collision.kind(),
+        io::ErrorKind::AlreadyExists,
+        "{collision:?}"
+    );
+    moved.relocate(&archive, leaf("saved")).unwrap();
+    drop(moved);
+    let path = retained_directory_path(&archive).unwrap();
+    assert_eq!(fs::read(path.join("saved")).unwrap(), b"proposal bytes");
+    assert_eq!(fs::read(path.join("existing")).unwrap(), b"older recovery");
+}
+
+#[test]
+fn retained_recovery_probe_creates_and_removes_a_staged_file() {
+    let scratch = ScratchDir::new("retained-recovery-probe");
+    let parent = open_parent(&scratch);
+    fs::write(scratch.join("unchanged"), b"settings").unwrap();
+    probe_retained_directory_write(&parent).unwrap();
+    let names = fs::read_dir(&*scratch)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(names, [std::ffi::OsString::from("unchanged")]);
+    let file = File::open(scratch.join("unchanged")).unwrap();
+    assert!(probe_retained_directory_write(&file).is_err());
+    assert_eq!(fs::read(scratch.join("unchanged")).unwrap(), b"settings");
+}
+
+#[test]
+fn retained_recovery_move_uses_the_requested_name_without_replacing() {
+    let scratch = ScratchDir::new("retained-named-recovery");
+    let parent = open_parent(&scratch);
+    fs::write(scratch.join("layer"), b"current").unwrap();
+    fs::write(scratch.join(".layer.declined-old"), b"previous").unwrap();
+    assert_eq!(
+        move_file_to_noreplace_at(&parent, leaf("layer"), leaf(".layer.declined-old"))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::AlreadyExists
+    );
+    let moved = move_file_to_noreplace_at(&parent, leaf("layer"), leaf(".layer.declined-new"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(moved.name(), leaf(".layer.declined-new"));
+    drop(moved);
+    assert_eq!(
+        fs::read(scratch.join(".layer.declined-new")).unwrap(),
+        b"current"
+    );
+    assert_eq!(
+        fs::read(scratch.join(".layer.declined-old")).unwrap(),
+        b"previous"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn retained_recovery_mode_uses_a_write_only_sibling() {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = ScratchDir::new("retained-recovery-mode");
+    let parent = open_parent(&scratch);
+    let sample = scratch.join("sibling.jsonc");
+    fs::write(&sample, b"{}").unwrap();
+    fs::set_permissions(&sample, Permissions::from_mode(0o200)).unwrap();
+    let mut replacement = stage(&parent, true);
+    replacement
+        .cap_settings_creation_mode(&["sibling.jsonc".into()])
+        .unwrap();
+    replacement
+        .publish_restored(leaf("restored.jsonc"), None, None)
+        .unwrap();
+    assert_eq!(
+        fs::metadata(scratch.join("restored.jsonc"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o200
+    );
+}
+
+#[test]
+fn retained_recovery_put_back_never_replaces_a_new_leaf() {
+    use std::io::Read;
+    let scratch = ScratchDir::new("retained-recovery-collision");
+    let parent = open_parent(&scratch);
+    let path = scratch.join("layer");
+    fs::write(&path, b"moved contents").unwrap();
+    let moved = move_file_aside_nofollow_at(&parent, leaf("layer"))
+        .unwrap()
+        .unwrap();
+    let recovery = scratch.join(moved.name());
+    let mut verified = Vec::new();
+    moved.open().unwrap().read_to_end(&mut verified).unwrap();
+    assert_eq!(verified, b"moved contents");
+    fs::write(&path, b"new save").unwrap();
+    assert!(moved.put_back(leaf("layer")).is_err());
+    assert_eq!(fs::read(path).unwrap(), b"new save");
+    assert_eq!(fs::read(recovery).unwrap(), b"moved contents");
+}
+
+#[test]
+fn retained_recovery_discard_deletes_only_inspected_entry() {
+    let scratch = ScratchDir::new("retained-recovery-delete");
+    let parent = open_parent(&scratch);
+    let path = scratch.join("layer");
+    assert!(move_file_aside_nofollow_at(&parent, leaf("layer"))
+        .unwrap()
+        .is_none());
+    fs::write(&path, b"reviewed").unwrap();
+    let moved = move_file_aside_nofollow_at(&parent, leaf("layer"))
+        .unwrap()
+        .unwrap();
+    let recovery = scratch.join(moved.name());
+    let inspected = moved.open().unwrap();
+    fs::write(&path, b"different").unwrap();
+    moved.discard(&inspected).unwrap();
+    drop(inspected);
+    assert!(!recovery.exists());
+    assert_eq!(fs::read(path).unwrap(), b"different");
+}
+
+#[cfg(unix)]
+#[test]
+fn retained_recovery_ignores_a_link_at_the_old_parent_path() {
+    use std::os::unix::fs::symlink;
+    let scratch = ScratchDir::new("retained-recovery-link");
+    let config = scratch.join("config");
+    let original = scratch.join("original");
+    let elsewhere = scratch.join("elsewhere");
+    for root in [&config, &elsewhere] {
+        fs::create_dir(root).unwrap();
+        fs::write(root.join("layer"), b"original").unwrap();
+    }
+    let parent = open_parent(&config);
+    fs::rename(&config, &original).unwrap();
+    symlink(&elsewhere, &config).unwrap();
+    let moved = move_file_aside_nofollow_at(&parent, leaf("layer"))
+        .unwrap()
+        .unwrap();
+    let inspected = moved.open().unwrap();
+    stage(&parent, false)
+        .publish_restored(leaf("layer"), Some(&inspected), None)
+        .unwrap();
+    moved.discard(&inspected).unwrap();
+    assert_eq!(fs::read(original.join("layer")).unwrap(), b"replacement");
+    assert_eq!(fs::read(elsewhere.join("layer")).unwrap(), b"original");
+}
+
+#[test]
 fn retained_read_distinguishes_absent_directory_hardlink_and_file() {
     use std::io::Read;
     let scratch = ScratchDir::new("retained-read");

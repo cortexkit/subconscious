@@ -1,4 +1,13 @@
 use super::*;
+
+#[test]
+fn root_io_blocking_read_releases_the_root_before_returning() {
+    let pool = RootIoPool::new().unwrap();
+    let root = std::env::current_dir().unwrap().join("reviewed-workspace");
+    assert_eq!(pool.read_blocking(root.clone(), || 42), Ok(42));
+    assert!(!pool.is_busy(&root));
+    assert_eq!(pool.read_blocking(root, || 43), Ok(43));
+}
 use std::sync::{atomic, mpsc};
 
 const TEST_LIMIT: Duration = Duration::from_secs(5);

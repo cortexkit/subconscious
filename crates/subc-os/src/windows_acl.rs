@@ -260,7 +260,7 @@ impl OwnerAcl {
     }
 }
 
-fn with_security<T>(
+pub(crate) fn with_security<T>(
     directory: bool,
     create: impl FnOnce(&SECURITY_ATTRIBUTES) -> io::Result<T>,
 ) -> io::Result<T> {
@@ -558,6 +558,11 @@ pub fn verify_owner_only(file: &File) -> io::Result<()> {
 pub fn verify_private_dir(path: &Path) -> io::Result<()> {
     let handle = open_directory(path, READ_CONTROL)?;
     Security::query(handle.0)?.verify(&User::current()?)
+}
+
+pub(crate) fn verify_private_dir_handle(file: &File) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    Security::query(file.as_raw_handle())?.verify(&User::current()?)
 }
 
 /// Check the owner of a regular file or directory without following its final

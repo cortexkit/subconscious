@@ -85,6 +85,26 @@ fn open_relative(
     disposition: u32,
     options: u32,
 ) -> io::Result<File> {
+    open_relative_secured(
+        parent,
+        name,
+        access,
+        share,
+        disposition,
+        options,
+        null_mut(),
+    )
+}
+
+fn open_relative_secured(
+    parent: &File,
+    name: &OsStr,
+    access: u32,
+    share: u32,
+    disposition: u32,
+    options: u32,
+    descriptor: *mut std::ffi::c_void,
+) -> io::Result<File> {
     const OBJ_CASE_INSENSITIVE: u32 = 0x40;
     let mut name: Vec<_> = name.encode_wide().collect();
     let length = u16::try_from(name.len().saturating_mul(size_of::<u16>()))
@@ -100,7 +120,7 @@ fn open_relative(
         ObjectName: &name,
         Attributes: OBJ_CASE_INSENSITIVE,
         // A null descriptor lets the filesystem inherit the parent's security.
-        SecurityDescriptor: null(),
+        SecurityDescriptor: descriptor.cast_const().cast(),
         SecurityQualityOfService: null(),
     };
     let mut handle = null_mut();
@@ -184,6 +204,14 @@ pub(super) fn ensure_directory(parent: &File) -> io::Result<()> {
     Ok(())
 }
 
+pub(super) fn regular_file_at(parent: &File, leaf: &OsStr) -> io::Result<()> {
+    let file = open_relative(parent, leaf, FILE_READ_ATTRIBUTES, SHARE_ALL, FILE_OPEN, 0)?;
+    if object_info(&file)?.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+        return Err(invalid("expected a regular file"));
+    }
+    Ok(())
+}
+
 pub(super) fn create(
     parent: &File,
     name: &str,
@@ -202,6 +230,19 @@ pub(super) fn create(
     } else {
         (access | WRITE_DAC | WRITE_OWNER, 0, 0)
     };
+    if directory && !publish {
+        return crate::windows_acl::with_security(true, |attributes| {
+            open_relative_secured(
+                parent,
+                name.as_ref(),
+                access,
+                share,
+                FILE_CREATE,
+                options | FILE_WRITE_THROUGH,
+                attributes.lpSecurityDescriptor,
+            )
+        });
+    }
     open_relative(
         parent,
         name.as_ref(),
@@ -239,6 +280,19 @@ pub(super) fn verify_stage_entry(stage: &Stage<'_>) -> io::Result<()> {
 }
 
 pub(super) fn rename(stage: &Stage<'_>, leaf: &OsStr, replace: bool) -> io::Result<()> {
+    rename_open_file(&stage.file, leaf, replace)
+}
+
+fn rename_open_file(file: &File, leaf: &OsStr, replace: bool) -> io::Result<()> {
+    rename_to(file, None, leaf, replace)
+}
+
+fn rename_to(
+    file: &File,
+    destination: Option<&File>,
+    leaf: &OsStr,
+    replace: bool,
+) -> io::Result<()> {
     let name: Vec<u16> = leaf.encode_wide().collect();
     let name_bytes = name.len() * size_of::<u16>();
     let buffer_bytes =
@@ -251,18 +305,20 @@ pub(super) fn rename(stage: &Stage<'_>, leaf: &OsStr, replace: bool) -> io::Resu
     // SAFETY: The aligned buffer contains the whole variable-length NT rename
     // structure. Both handles and the buffer live throughout each synchronous
     // call. A null RootDirectory with a bare filename renames the source
-    // within its current directory. The source was opened relative to the
-    // retained parent and denies delete sharing, so it cannot move elsewhere.
-    // Supplying RootDirectory would make Windows open that directory again
-    // internally, which can conflict with a retained handle's sharing mode.
+    // within its current directory. The source denies delete sharing. For a
+    // move to a different directory, RootDirectory is the retained destination
+    // handle, and the filename remains a single component.
     unsafe {
+        if let Some(directory) = destination {
+            (*info).RootDirectory = directory.as_raw_handle();
+        }
         (*info).FileNameLength = name_bytes as u32;
         std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
         if replace {
             (*info).Anonymous.Flags =
                 FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
             match nt_result(NtSetInformationFile(
-                stage.file.as_raw_handle(),
+                file.as_raw_handle(),
                 &mut status,
                 info.cast(),
                 length,
@@ -283,13 +339,83 @@ pub(super) fn rename(stage: &Stage<'_>, leaf: &OsStr, replace: bool) -> io::Resu
         // but can refuse replacement when the target has open readers.
         (*info).Anonymous.Flags = u32::from(replace);
         nt_result(NtSetInformationFile(
-            stage.file.as_raw_handle(),
+            file.as_raw_handle(),
             &mut status,
             info.cast(),
             length,
             FileRenameInformation,
         ))
     }
+}
+
+pub(super) fn move_aside(parent: &File, leaf: &OsStr, aside: &OsStr) -> io::Result<File> {
+    let file = open_relative(
+        parent,
+        leaf,
+        FILE_GENERIC_READ | DELETE,
+        FILE_SHARE_READ,
+        FILE_OPEN,
+        0,
+    )?;
+    let info = object_info(&file)?;
+    if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 || info.nNumberOfLinks != 1 {
+        return Err(invalid("expected a singly linked regular file"));
+    }
+    rename_open_file(&file, aside, false)?;
+    Ok(file)
+}
+
+pub(super) fn put_back(moved: &super::RetainedMovedFile<'_>, leaf: &OsStr) -> io::Result<()> {
+    ensure_directory(moved.parent)?;
+    rename_open_file(&moved.file, leaf, false)
+}
+
+pub(super) fn relocate(
+    moved: &super::RetainedMovedFile<'_>,
+    dest: &File,
+    leaf: &OsStr,
+) -> io::Result<()> {
+    let directory = (dest.as_raw_handle() != moved.parent.as_raw_handle()).then_some(dest);
+    rename_to(&moved.file, directory, leaf, false)
+}
+
+pub(super) fn directory_path(parent: &File) -> io::Result<std::path::PathBuf> {
+    use std::{ffi::OsString, os::windows::ffi::OsStringExt};
+    use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+    let mut buffer = vec![0u16; 32768];
+    // SAFETY: the directory handle is borrowed and the buffer is writable.
+    let len = unsafe {
+        GetFinalPathNameByHandleW(
+            parent.as_raw_handle(),
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+            0,
+        )
+    } as usize;
+    if len == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if len >= buffer.len() {
+        return Err(invalid("directory path is too long"));
+    }
+    Ok(std::path::PathBuf::from(OsString::from_wide(
+        &buffer[..len],
+    )))
+}
+
+pub(super) fn verify_private_directory(parent: &File) -> io::Result<()> {
+    ensure_directory(parent)?;
+    crate::windows_acl::verify_private_dir_handle(parent)
+}
+
+pub(super) fn discard_moved(
+    moved: &super::RetainedMovedFile<'_>,
+    inspected: crate::RetainedFileIdentity,
+) -> io::Result<()> {
+    if crate::retained_file_identity(&moved.file)? != inspected {
+        return Err(invalid("recovery handle identity changed"));
+    }
+    remove_by_handle(&moved.file)
 }
 
 pub(super) fn retry<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
@@ -319,16 +445,25 @@ pub(super) fn flush_publication(stage: &Stage<'_>) -> io::Result<()> {
     stage.file.sync_all()
 }
 
-pub(super) fn remove_stage(stage: &Stage<'_>) {
+pub(super) fn remove_stage(stage: &Stage<'_>) -> io::Result<()> {
+    remove_by_handle(&stage.file)
+}
+
+fn remove_by_handle(file: &File) -> io::Result<()> {
     let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
     // SAFETY: The handle is the exact staging object opened with DELETE. The
     // input structure is valid and live through this synchronous call.
-    unsafe {
+    if unsafe {
         SetFileInformationByHandle(
-            stage.file.as_raw_handle(),
+            file.as_raw_handle(),
             FileDispositionInfo,
             (&disposition as *const FILE_DISPOSITION_INFO).cast(),
             size_of::<FILE_DISPOSITION_INFO>() as u32,
-        );
+        )
+    } == 0
+    {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }

@@ -27,6 +27,8 @@ mod cancel_r3_tests;
 mod cancel_r4_tests;
 #[path = "phone_lifecycle_tests.rs"]
 mod lifecycle_tests;
+#[path = "pending_settings_tests.rs"]
+mod pending_settings_tests;
 
 struct Scratch(std::path::PathBuf);
 impl Drop for Scratch {
@@ -248,6 +250,14 @@ impl Fixture {
     }
 
     async fn build_with_development_module(lifecycle: bool, development_module: bool) -> Self {
+        Self::build_with_extra_settings(lifecycle, development_module, None).await
+    }
+
+    async fn build_with_extra_settings(
+        lifecycle: bool,
+        development_module: bool,
+        extra: Option<serde_json::Value>,
+    ) -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/scratch")
@@ -285,15 +295,20 @@ impl Fixture {
         // Keep the dummy phone surface's native image stable for content verification:
         // a shell can exec sleep after its own image was sampled.
         let phone_program = std::path::PathBuf::from("/bin/sleep");
+        let mut daemon = json!({"version":1,"modules":{
+            "a":{"program":path.join("program"),"registration_channel":true,
+                "args": if development_module { vec!["sleep"] } else { vec![] }},
+            "callosum":{"program":phone_program,"args":["600"],"reserved":true,"registration_channel":true,
+                "overlap": if lifecycle { "safe" } else { "exclusive" }}
+        }});
+        if extra.is_some() {
+            daemon["modules"]["b"] =
+                json!({"program": path.join("program"), "registration_channel": true});
+            std::fs::write(path.join("cortexkit/b.jsonc"), b"{}").unwrap();
+        }
         std::fs::write(
             path.join("subc.jsonc"),
-            serde_json::to_vec(&json!({"version":1,"modules":{
-                "a":{"program":path.join("program"),"registration_channel":true,
-                    "args": if development_module { vec!["sleep"] } else { vec![] }},
-                "callosum":{"program":phone_program,"args":["600"],"reserved":true,"registration_channel":true,
-                    "overlap": if lifecycle { "safe" } else { "exclusive" }}
-            }}))
-            .unwrap(),
+            serde_json::to_vec(&daemon).unwrap(),
         )
         .unwrap();
         std::fs::write(path.join("cortexkit/a.jsonc"), b"{\"limit\":1}").unwrap();
@@ -314,6 +329,13 @@ impl Fixture {
                 "properties": if id == "a" { json!({"limit":{"type":"integer","description":"Limit","default":1}}) } else { json!({}) },
                 "unevaluatedProperties":false,"x-ck-layers":["user"],"x-ck-apply":"live"
             }), path.join(format!("cortexkit/{id}.jsonc")).to_string_lossy(), vec![]), true).unwrap();
+        }
+        if let Some(properties) = extra {
+            owner.declare(ConnectionId::new(21), "b", ConfigDeclareRequest::new(json!({
+                "$schema":"https://json-schema.org/draft/2020-12/schema", "type":"object",
+                "properties":properties, "unevaluatedProperties":false,
+                "x-ck-layers":["user"], "x-ck-apply":"live"
+            }), path.join("cortexkit/b.jsonc").to_string_lossy(), vec![]), true).unwrap();
         }
         let view = owner
             .finish_plan(owner.prepare(PlanKind::Stamp).unwrap(), daemon_review)
@@ -467,6 +489,13 @@ impl Fixture {
     fn apply(
         &self,
     ) -> tokio::task::JoinHandle<std::result::Result<ConfigControlResponse, GateError>> {
+        self.apply_with_corr(881)
+    }
+
+    fn apply_with_corr(
+        &self,
+        correlation: u64,
+    ) -> tokio::task::JoinHandle<std::result::Result<ConfigControlResponse, GateError>> {
         let handler = self.handler.clone();
         let owner = self.owner.clone();
         let digest = self.plan.digest.clone();
@@ -477,7 +506,7 @@ impl Fixture {
                 control_flags(),
                 0,
                 0,
-                881,
+                correlation,
                 serde_json::to_vec(&ConfigControlRequest::Apply {
                     digest: digest.clone(),
                 })
@@ -499,6 +528,18 @@ impl Fixture {
     }
 
     async fn request(&mut self) -> (u64, ConsentRequest) {
+        let (corr, request, _) = self.request_with_wire().await;
+        (corr, request)
+    }
+
+    async fn request_with_wire(&mut self) -> (u64, ConsentRequest, Vec<u8>) {
+        let (corr, request, raw) = self.next_phone_request().await;
+        assert_eq!(request.plan_digest, self.plan.digest);
+        assert_eq!(request.plan, self.plan.plan);
+        (corr, request, raw)
+    }
+
+    async fn next_phone_request(&mut self) -> (u64, ConsentRequest, Vec<u8>) {
         let mut outbound =
             tokio::time::timeout(std::time::Duration::from_secs(5), self.frames.recv())
                 .await
@@ -507,12 +548,14 @@ impl Fixture {
         assert_eq!(outbound.frame.header.ty, FrameType::Request);
         let request: ConsentRequest = serde_json::from_slice(&outbound.frame.body).unwrap();
         assert!(request.is_consistent());
-        assert_eq!(request.plan_digest, self.plan.digest);
-        assert_eq!(request.plan, self.plan.plan);
         if let Some(flushed) = outbound.flushed.take() {
             let _ = flushed.send(());
         }
-        (outbound.frame.header.corr, request)
+        (
+            outbound.frame.header.corr,
+            request,
+            outbound.frame.body.to_vec(),
+        )
     }
 
     fn answer(&self, connection: ConnectionId, correlation: u64, request: &ConsentRequest) {

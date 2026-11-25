@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.53
+
+- Add retained-directory helpers that move a settings file aside, restore it with a no-replace rename, and prove a recovery folder writable with a probe file, on Unix and Windows.
+
 ## 0.1.52
 
 - Add local-peer PID and live process-name diagnostics without changing what establishes peer trust.

@@ -776,6 +776,7 @@ fn thin_core_ops() -> BTreeSet<&'static str> {
         "policy_root.get",
         "policy_root.set",
         "policy_root.recover",
+        "config.revert",
         ops::DAEMON_SHUTDOWN_INTENT,
         ops::SERVER_DESCRIBE,
         ops::CATALOG_LIST,

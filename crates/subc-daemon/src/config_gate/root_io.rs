@@ -174,6 +174,37 @@ impl RootIoPool {
         Ok(job)
     }
 
+    /// Read root evidence from a blocking caller. As with `RootIoJob::wait`,
+    /// success means the reservation has been released before returning.
+    pub(super) fn read_blocking<T: Send + 'static>(
+        &self,
+        root: PathBuf,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, RootIoError> {
+        let deadline = self.deadline();
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        let queued = self.prepare_with_completion(root, deadline, work, move |result| {
+            let _ = send.send(result);
+        });
+        self.enqueue(queued).map_err(|(error, _)| error)?;
+        match receive.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) if Instant::now() < deadline => {
+                Err(RootIoError::WorkerStopped)
+            }
+            Err(_) => {
+                let expired = self
+                    .shared
+                    .state
+                    .lock()
+                    .unwrap()
+                    .take_expired(Instant::now());
+                drop(expired);
+                Err(RootIoError::DeadlineElapsed)
+            }
+        }
+    }
+
     pub(super) fn deadline(&self) -> Instant {
         Instant::now() + self.timeout
     }
@@ -230,6 +261,26 @@ impl RootIoPool {
         work: impl FnOnce() -> T + Send + 'static,
     ) -> (Queued, RootIoJob<T>) {
         let (send, result) = oneshot::channel();
+        let queued = self.prepare_with_completion(root, deadline, work, move |finished| {
+            let _ = send.send(finished);
+        });
+        (
+            queued,
+            RootIoJob {
+                shared: self.shared.clone(),
+                deadline,
+                result,
+            },
+        )
+    }
+
+    fn prepare_with_completion<T: Send + 'static>(
+        &self,
+        root: PathBuf,
+        deadline: Instant,
+        work: impl FnOnce() -> T + Send + 'static,
+        finish: impl FnOnce(Result<T, RootIoError>) + Send + 'static,
+    ) -> Queued {
         #[cfg(test)]
         let before = self
             .before_work
@@ -247,27 +298,20 @@ impl RootIoPool {
             // Release the reservation before waking a caller that may submit
             // more work on this root. A timed-out wait never releases it.
             drop(running);
-            let _ = send.send(if in_time {
+            finish(if in_time {
                 Ok(result)
             } else {
                 Err(RootIoError::DeadlineElapsed)
             });
         });
-        (
-            Queued {
-                root,
-                reservation: Reservation {
-                    deadline,
-                    release: None,
-                },
-                run,
-            },
-            RootIoJob {
-                shared: self.shared.clone(),
+        Queued {
+            root,
+            reservation: Reservation {
                 deadline,
-                result,
+                release: None,
             },
-        )
+            run,
+        }
     }
 
     fn enqueue(&self, job: Queued) -> Result<(), (RootIoError, Queued)> {

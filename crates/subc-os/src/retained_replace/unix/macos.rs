@@ -19,16 +19,43 @@ extern "C" {
     fn acl_copy_ext(buffer: *mut c_void, acl: *mut c_void, size: isize) -> isize;
 }
 
-pub(super) fn rename_exclusive(parent: &File, name: &str, leaf: &OsStr) -> io::Result<()> {
-    let name = CString::new(name)?;
+pub(super) fn rename_exclusive(
+    parent: &File,
+    name: &OsStr,
+    dest: &File,
+    leaf: &OsStr,
+) -> io::Result<()> {
+    let name = CString::new(name.as_bytes())?;
     let leaf = CString::new(leaf.as_bytes())?;
     let fd = parent.as_raw_fd();
     // SAFETY: The descriptor is borrowed from parent, and both names are
     // checked, NUL-terminated leaves that outlive the synchronous call.
-    if unsafe { libc::renameatx_np(fd, name.as_ptr(), fd, leaf.as_ptr(), libc::RENAME_EXCL) } != 0 {
+    if unsafe {
+        libc::renameatx_np(
+            fd,
+            name.as_ptr(),
+            dest.as_raw_fd(),
+            leaf.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    } != 0
+    {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+pub(super) fn directory_path(parent: &File) -> io::Result<std::path::PathBuf> {
+    let mut bytes = [0u8; libc::PATH_MAX as usize];
+    // SAFETY: F_GETPATH writes at most PATH_MAX bytes through this live buffer.
+    if unsafe { libc::fcntl(parent.as_raw_fd(), libc::F_GETPATH, bytes.as_mut_ptr()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or_else(|| io::Error::other("directory path is unterminated"))?;
+    Ok(std::path::PathBuf::from(OsStr::from_bytes(&bytes[..end])))
 }
 
 pub(super) struct Acl(NonNull<c_void>);

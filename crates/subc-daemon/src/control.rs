@@ -329,6 +329,15 @@ pub struct ControlHandler {
     #[cfg(test)]
     pub(crate) config_review_test_reply: Option<subc_protocol::config::ConfigReviewReply>,
     #[cfg(test)]
+    pub(crate) config_review_test_replies:
+        std::collections::BTreeMap<String, subc_protocol::config::ConfigReviewReply>,
+    #[cfg(test)]
+    pub(crate) config_review_test_seen: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    #[cfg(test)]
+    pub(crate) config_review_test_refuse: Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
+    #[cfg(test)]
+    pub(crate) config_review_test_fail_once: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
     recovery_exit_test_after_step: Option<fn(usize) -> Result<(), crate::config_gate::GateError>>,
     #[cfg(test)]
     recovery_exit_test_completed: Option<fn(u64)>,
@@ -533,6 +542,14 @@ impl ControlHandler {
             app_open_test_launch: None,
             #[cfg(test)]
             config_review_test_reply: None,
+            #[cfg(test)]
+            config_review_test_replies: Default::default(),
+            #[cfg(test)]
+            config_review_test_seen: None,
+            #[cfg(test)]
+            config_review_test_refuse: Default::default(),
+            #[cfg(test)]
+            config_review_test_fail_once: Default::default(),
             #[cfg(test)]
             recovery_exit_test_after_step: None,
             #[cfg(test)]

@@ -32,6 +32,7 @@ pub(super) const SUBC_CONTROL_OPS: &[&str] = &[
     subc_protocol::policy_root::GET_OP,
     subc_control::policy_root::SET_OP,
     subc_control::policy_root::RECOVER_OP,
+    "config.revert",
 ];
 
 /// Client ops omitted from `subc_ops` advertise via their own capability.

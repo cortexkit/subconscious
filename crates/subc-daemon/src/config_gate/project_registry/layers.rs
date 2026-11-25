@@ -30,6 +30,8 @@ pub struct LayerFile {
     pub id: FileObjectId,
     pub digest: Digest,
     pub bytes: Vec<u8>,
+    pub permissions: std::fs::Permissions,
+    pub fingerprint: subc_config::InputState,
 }
 
 impl LayerLocation {
@@ -125,6 +127,8 @@ fn read_file(handle: File) -> Result<LayerFile> {
         ));
     }
     Ok(LayerFile {
+        fingerprint: crate::config_gate::capture::opened_file_state(&handle, &before, &bytes)?,
+        permissions: before.permissions(),
         handle,
         id,
         digest: raw_digest(&bytes),

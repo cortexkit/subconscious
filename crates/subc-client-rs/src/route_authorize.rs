@@ -29,7 +29,9 @@ impl ModuleHandle {
         target: String,
         expected: RouteAuthorizeExpected,
     ) -> Result<RouteAuthorizeResponse, ScopeCallError> {
-        if !self.shared.supports_route_authorize {
+        let shared = self.shared();
+        crate::live_upgrade::ScopeRequest::check_fence(&shared)?;
+        if !shared.supports_route_authorize {
             return Err(ScopeCallError::NotSupported {
                 op: ROUTE_AUTHORIZE_OP,
             });
@@ -40,7 +42,8 @@ impl ModuleHandle {
             target,
             expected,
         };
-        match self.scope_call(ROUTE_AUTHORIZE_OP, &request).await? {
+        match crate::live_upgrade::ScopeRequest::call(&shared, ROUTE_AUTHORIZE_OP, &request).await?
+        {
             ModuleControlReply::RouteAuthorize(response) => Ok(response),
             other => Err(ScopeCallError::Protocol(format!(
                 "unexpected {ROUTE_AUTHORIZE_OP} response: {other:?}"

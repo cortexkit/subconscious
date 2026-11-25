@@ -201,6 +201,8 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
     assert_golden(
         "module_hello_body_with_role_declarations",
         &ModuleHelloBody {
+            module_capabilities: None,
+            resume_token: None,
             manifest: ModuleManifest::builder("role-test", "1.0.0")
                 .role_declarations(
                     serde_json::from_value(serde_json::json!({
@@ -1530,6 +1532,8 @@ fn principal_reserved() -> Principal {
 
 fn module_hello_body() -> ModuleHelloBody {
     ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest: module_manifest("aft-tools"),
         protocol_ver: PROTOCOL_VERSION,
         control_ops: Some(vec!["route.bind".to_string(), "route.status".to_string()]),
@@ -1559,6 +1563,7 @@ fn module_hello_body_with_provenance() -> ModuleHelloBody {
 
 fn module_hello_ack_body() -> ModuleHelloAckBody {
     ModuleHelloAckBody {
+        resume_token: None,
         negotiated_ver: PROTOCOL_VERSION,
         subc_ops: vec![
             "server.describe".to_string(),

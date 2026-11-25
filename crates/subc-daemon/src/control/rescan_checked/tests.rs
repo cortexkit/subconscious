@@ -690,6 +690,8 @@ async fn disabling_the_only_provider_of_a_required_capability_reports_a_warning(
             0,
             connection,
             serde_json::to_vec(&ModuleHelloBody {
+                module_capabilities: None,
+                resume_token: None,
                 protocol_ver: PROTOCOL_VERSION,
                 manifest,
                 control_ops: None,

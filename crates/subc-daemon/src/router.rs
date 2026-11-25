@@ -36,6 +36,11 @@ pub struct OutboundFrame {
     pub frame: Frame,
     pub enqueued_at: std::time::Instant,
     pub(crate) flushed: Option<tokio::sync::oneshot::Sender<()>>,
+    #[cfg(all(
+        feature = "test-support",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    pub(crate) fixture_flush_gate: Option<Arc<std::path::PathBuf>>,
     /// This frame's share of the connection's queued-byte count. Dropping the
     /// frame (after the writer has written it, or when the queue itself is
     /// dropped with the frame still in it) gives the bytes back. `None` only for
@@ -49,6 +54,11 @@ impl OutboundFrame {
             frame,
             enqueued_at: charge.enqueued_at,
             flushed: None,
+            #[cfg(all(
+                feature = "test-support",
+                any(target_os = "linux", target_os = "macos")
+            ))]
+            fixture_flush_gate: None,
             charge: Some(charge),
         }
     }
@@ -85,7 +95,7 @@ struct EgressAccounting {
     // spends the one opportunity to present a claim after authentication.
     ingress_seen: AtomicBool,
     ingress_terminal: AtomicBool,
-    egress_terminal: AtomicBool,
+    egress_state: std::sync::atomic::AtomicU8,
     egress_stopped: Notify,
     byte_budget: usize,
     queued_bytes: AtomicUsize,
@@ -105,6 +115,8 @@ struct EgressAccounting {
     client_delivery_stopped: Notify,
     #[cfg(test)]
     retire_after_reserve: AtomicBool,
+    #[cfg(test)]
+    retire_before_try_reserve: AtomicBool,
 }
 
 impl EgressAccounting {
@@ -112,7 +124,7 @@ impl EgressAccounting {
         Self {
             ingress_seen: AtomicBool::new(false),
             ingress_terminal: AtomicBool::new(false),
-            egress_terminal: AtomicBool::new(false),
+            egress_state: std::sync::atomic::AtomicU8::new(0),
             egress_stopped: Notify::new(),
             byte_budget,
             queued_bytes: AtomicUsize::new(0),
@@ -125,6 +137,8 @@ impl EgressAccounting {
             client_delivery_stopped: Notify::new(),
             #[cfg(test)]
             retire_after_reserve: AtomicBool::new(false),
+            #[cfg(test)]
+            retire_before_try_reserve: AtomicBool::new(false),
         }
     }
 
@@ -256,7 +270,7 @@ impl EgressPermit {
     /// writer had already gone away or egress was retired, so the frame will
     /// never be written.
     pub(crate) fn send(self, frame: Frame) -> bool {
-        if self.accounting.egress_terminal.load(Ordering::Acquire) {
+        if self.accounting.egress_state.load(Ordering::Acquire) & EGRESS_TERMINAL != 0 {
             return true;
         }
         let charge = self
@@ -264,6 +278,16 @@ impl EgressPermit {
             .charge_unconditionally(queued_frame_bytes(&frame));
         let sender = self.permit.send(OutboundFrame::charged(frame, charge));
         sender.is_closed()
+    }
+}
+
+pub(crate) struct RegistrationAckPermit(mpsc::OwnedPermit<OutboundFrame>, EgressCharge);
+
+impl RegistrationAckPermit {
+    /// Registration has committed. A writer that left after reservation has
+    /// disconnected from an accepted registration, not refused its HELLO.
+    pub(crate) fn send(self, frame: Frame) {
+        self.0.send(OutboundFrame::charged(frame, self.1));
     }
 }
 
@@ -378,7 +402,22 @@ pub struct FrameSink {
     accounting: Arc<EgressAccounting>,
 }
 
+const EGRESS_TERMINAL: u8 = 1;
+const EGRESS_FORWARD_FENCED: u8 = 2;
+
 impl FrameSink {
+    pub(crate) fn try_reserve_registration_ack(
+        &self,
+        template: &Frame,
+    ) -> Option<RegistrationAckPermit> {
+        if self.egress_terminal() {
+            return None;
+        }
+        let charge = self.accounting.try_charge(queued_frame_bytes(template))?;
+        let slot = self.tx.clone().try_reserve_owned().ok()?;
+        (!self.egress_terminal()).then_some(RegistrationAckPermit(slot, charge))
+    }
+
     pub(crate) fn terminate_ingress(&self) {
         self.accounting
             .ingress_terminal
@@ -393,14 +432,32 @@ impl FrameSink {
     // including senders already waiting for bytes or a queue slot.
     pub(crate) fn terminate_egress(&self) {
         self.accounting
-            .egress_terminal
-            .store(true, Ordering::Release);
+            .egress_state
+            .fetch_or(EGRESS_TERMINAL, Ordering::Release);
         self.accounting.egress_stopped.notify_waiters();
         self.accounting.freed.notify_waiters();
     }
 
     pub(crate) fn egress_terminal(&self) -> bool {
-        self.accounting.egress_terminal.load(Ordering::Acquire)
+        self.egress_state(EGRESS_TERMINAL) != 0
+    }
+
+    fn egress_state(&self, mask: u8) -> u8 {
+        self.accounting.egress_state.load(Ordering::Acquire) & mask
+    }
+
+    pub(crate) fn fence_forwarded(&self, fenced: bool) {
+        if fenced {
+            self.accounting
+                .egress_state
+                .fetch_or(EGRESS_FORWARD_FENCED, Ordering::Release);
+            self.accounting.egress_stopped.notify_waiters();
+            self.accounting.freed.notify_waiters();
+        } else {
+            self.accounting
+                .egress_state
+                .fetch_and(!EGRESS_FORWARD_FENCED, Ordering::Release);
+        }
     }
 
     pub(crate) fn first_ingress_frame(&self) -> bool {
@@ -424,14 +481,15 @@ impl FrameSink {
     /// senders (control replies, error replies, shutdown notices) are never
     /// refused by the byte budget: they wait for the writer to free bytes, just
     /// as they wait for a free slot, which is the same backpressure they had
-    /// when the queue was bounded by frame count alone. Returns `None` if the
-    /// writer goes away or egress is retired while waiting.
-    async fn charge_waiting(&self, bytes: usize) -> Option<EgressCharge> {
-        if self.egress_terminal() {
-            return None;
+    /// when the queue was bounded by frame count alone. Failure retains the
+    /// egress flags observed at refusal (zero means the writer is gone).
+    async fn charge_waiting(&self, bytes: usize, mask: u8) -> Result<EgressCharge, u8> {
+        let state = self.egress_state(mask);
+        if state != 0 {
+            return Err(state);
         }
         if let Some(charge) = self.accounting.try_charge(bytes) {
-            return Some(charge);
+            return Ok(charge);
         }
         // Counted as a waiter for as long as this future is parked, including
         // when it is cancelled, so releases notify only while someone waits.
@@ -449,15 +507,16 @@ impl FrameSink {
             // Register interest before checking, so a release that happens
             // between the check and the await still wakes this sender.
             freed.as_mut().enable();
-            if self.egress_terminal() {
-                return None;
+            let state = self.egress_state(mask);
+            if state != 0 {
+                return Err(state);
             }
             if let Some(charge) = self.accounting.try_charge(bytes) {
-                return Some(charge);
+                return Ok(charge);
             }
             tokio::select! {
                 _ = &mut freed => {}
-                _ = self.tx.closed() => return None,
+                _ = self.tx.closed() => return Err(self.egress_state(mask)),
             }
         }
     }
@@ -466,13 +525,7 @@ impl FrameSink {
     // including when the bytes were charged before retirement began. Ordinary
     // sends silently discard retired traffic; flush callers must not report it
     // as queued or written.
-    async fn send_outbound(&self, outbound: OutboundFrame) -> Result<bool, RouterError> {
-        let stopped = self.accounting.egress_stopped.notified();
-        tokio::pin!(stopped);
-        stopped.as_mut().enable();
-        if self.egress_terminal() {
-            return Ok(false);
-        }
+    async fn send_outbound(&self, outbound: OutboundFrame, mask: u8) -> Result<u8, RouterError> {
         let header = &outbound.frame.header;
         let closed = || {
             RouterError::backend_with_epoch(
@@ -482,39 +535,108 @@ impl FrameSink {
                 "connection writer closed",
             )
         };
-        let permit = tokio::select! {
-            biased;
-            _ = &mut stopped => return Ok(false),
-            permit = self.tx.reserve() => permit.map_err(|_| closed())?,
+        let permit = loop {
+            let stopped = self.accounting.egress_stopped.notified();
+            tokio::pin!(stopped);
+            stopped.as_mut().enable();
+            let state = self.egress_state(mask);
+            if state != 0 {
+                return Ok(state);
+            }
+            tokio::select! {
+                biased;
+                _ = &mut stopped => {},
+                permit = self.tx.reserve() => break permit.map_err(|_| closed())?,
+            }
         };
-        if self.egress_terminal() {
-            return Ok(false);
+        let state = self.egress_state(mask);
+        if state != 0 {
+            return Ok(state);
         }
         permit.send(outbound);
-        Ok(true)
+        Ok(0)
     }
 
     pub async fn send(&self, frame: Frame) -> Result<(), RouterError> {
-        if self.egress_terminal() {
-            return Ok(());
+        self.send_with_fence(frame, None).await
+    }
+
+    async fn send_with_fence(
+        &self,
+        frame: Frame,
+        refusal: Option<RouterError>,
+    ) -> Result<(), RouterError> {
+        let mask = EGRESS_TERMINAL
+            | if refusal.is_some() {
+                EGRESS_FORWARD_FENCED
+            } else {
+                0
+            };
+        let result = |state| {
+            if state & EGRESS_FORWARD_FENCED != 0 {
+                Err(refusal.expect("forward fence only sampled by forwarded sends"))
+            } else {
+                Ok(())
+            }
+        };
+        let state = self.egress_state(mask);
+        if state != 0 {
+            return result(state);
         }
         let channel = frame.header.channel;
         let epoch = frame.header.epoch;
         let corr = frame.header.corr;
         let closed =
             || RouterError::backend_with_epoch(channel, epoch, corr, "connection writer closed");
-        let Some(charge) = self.charge_waiting(queued_frame_bytes(&frame)).await else {
-            return if self.egress_terminal() {
-                Ok(())
-            } else {
-                Err(closed())
-            };
+        let charge = match self.charge_waiting(queued_frame_bytes(&frame), mask).await {
+            Ok(charge) => charge,
+            Err(0) => return Err(closed()),
+            Err(state) => return result(state),
         };
-        self.send_outbound(OutboundFrame::charged(frame, charge))
-            .await
-            .map(|_| ())
+        result(
+            self.send_outbound(OutboundFrame::charged(frame, charge), mask)
+                .await?,
+        )
     }
 
+    pub(crate) async fn send_upgrade_fenced(
+        &self,
+        frame: Frame,
+        refusal: RouterError,
+    ) -> Result<(), RouterError> {
+        self.send_with_fence(frame, Some(refusal)).await
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) async fn send_upgrade_goodbye(&self, frame: Frame) -> Result<(), RouterError> {
+        let unavailable =
+            || RouterError::backend(0, 0, "connection writer closed before upgrade GOODBYE");
+        let charge = self
+            .charge_waiting(queued_frame_bytes(&frame), EGRESS_TERMINAL)
+            .await
+            .map_err(|_| unavailable())?;
+        // Reserve every writer slot before closing egress. A sender that
+        // already holds a slot either publishes before GOODBYE (whose flush
+        // covers it) or drops its slot. Once GOODBYE is queued, later daemon
+        // writes, including refused-chunk CANCEL and PONG, are dropped. The
+        // module closes and reconnects separately; handlers that finish late
+        // do not send their old replies on this connection.
+        let mut slots = self
+            .tx
+            .reserve_many(self.tx.max_capacity())
+            .await
+            .map_err(|_| unavailable())?;
+        if self.egress_terminal() {
+            return Err(unavailable());
+        }
+        self.terminate_egress();
+        let (flushed, receipt) = tokio::sync::oneshot::channel();
+        let mut outbound = OutboundFrame::charged(frame, charge);
+        outbound.flushed = Some(flushed);
+        slots.next().expect("nonempty writer queue").send(outbound);
+        drop(slots);
+        receipt.await.map_err(|_| unavailable())
+    }
     /// Shutdown notices must leave the socket writer before an idle daemon exits.
     /// Queue admission alone does not prove this; the writer acknowledges flush.
     ///
@@ -534,12 +656,12 @@ impl FrameSink {
     ) -> Result<(), RouterError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let charge = self
-            .charge_waiting(queued_frame_bytes(&frame))
+            .charge_waiting(queued_frame_bytes(&frame), EGRESS_TERMINAL)
             .await
-            .ok_or_else(|| RouterError::backend(0, 0, "connection writer closed"))?;
+            .map_err(|_| RouterError::backend(0, 0, "connection writer closed"))?;
         let mut outbound = OutboundFrame::charged(frame, charge);
         outbound.flushed = Some(tx);
-        if !self.send_outbound(outbound).await? {
+        if self.send_outbound(outbound, EGRESS_TERMINAL).await? != 0 {
             return Err(RouterError::backend(0, 0, "connection egress retired"));
         }
         queued();
@@ -677,6 +799,49 @@ impl FrameSink {
     }
 
     fn try_send_owned(&self, frame: Frame) -> Result<(), (Frame, RouterError)> {
+        self.try_send_ack(
+            frame,
+            None,
+            #[cfg(all(
+                feature = "test-support",
+                any(target_os = "linux", target_os = "macos")
+            ))]
+            None,
+        )
+    }
+
+    pub(crate) fn try_send_with_flush(
+        &self,
+        frame: Frame,
+        ack: tokio::sync::oneshot::Sender<()>,
+        #[cfg(all(
+            feature = "test-support",
+            any(target_os = "linux", target_os = "macos")
+        ))]
+        fixture_flush_gate: Option<Arc<std::path::PathBuf>>,
+    ) -> Result<(), RouterError> {
+        self.try_send_ack(
+            frame,
+            Some(ack),
+            #[cfg(all(
+                feature = "test-support",
+                any(target_os = "linux", target_os = "macos")
+            ))]
+            fixture_flush_gate,
+        )
+        .map_err(|(_, error)| error)
+    }
+
+    fn try_send_ack(
+        &self,
+        frame: Frame,
+        ack: Option<tokio::sync::oneshot::Sender<()>>,
+        #[cfg(all(
+            feature = "test-support",
+            any(target_os = "linux", target_os = "macos")
+        ))]
+        fixture_flush_gate: Option<Arc<std::path::PathBuf>>,
+    ) -> Result<(), (Frame, RouterError)> {
         if self.egress_terminal() {
             return Ok(());
         }
@@ -707,15 +872,36 @@ impl FrameSink {
         };
         // Return the refused frame for a bounded retry; dropping the rest of
         // the outbound wrapper returns its charge.
+        #[cfg(test)]
+        if self
+            .accounting
+            .retire_before_try_reserve
+            .swap(false, Ordering::Relaxed)
+        {
+            self.terminate_egress();
+        }
         if self.egress_terminal() {
             return Ok(());
         }
-        self.tx
-            .try_send(OutboundFrame::charged(frame, charge))
-            .map_err(|err| {
-                let error = unavailable(err.to_string());
-                (err.into_inner().frame, error)
-            })
+        let permit = match self.tx.try_reserve() {
+            Ok(permit) => permit,
+            Err(_) if self.egress_terminal() => return Ok(()),
+            Err(error) => return Err((frame, unavailable(error.to_string()))),
+        };
+        if self.egress_terminal() {
+            return Ok(());
+        }
+        let mut outbound = OutboundFrame::charged(frame, charge);
+        outbound.flushed = ack;
+        #[cfg(all(
+            feature = "test-support",
+            any(target_os = "linux", target_os = "macos")
+        ))]
+        {
+            outbound.fixture_flush_gate = fixture_flush_gate;
+        }
+        permit.send(outbound);
+        Ok(())
     }
 }
 
@@ -867,6 +1053,8 @@ pub struct Router {
     counters: DaemonCounters,
     next_connection_id: AtomicU64,
     orphan_goodbyes: Arc<OrphanGoodbyeLimiter>,
+    #[cfg(test)]
+    route_open_probes: AtomicU64,
 }
 
 impl Router {
@@ -885,6 +1073,8 @@ impl Router {
             // ConnectionId::LOCAL is 0; real socket ids start at 1 and never collide.
             next_connection_id: AtomicU64::new(1),
             orphan_goodbyes: Arc::default(),
+            #[cfg(test)]
+            route_open_probes: AtomicU64::new(0),
         }
     }
 
@@ -901,6 +1091,24 @@ impl Router {
 
     pub fn forwarding(&self) -> Arc<ForwardingTable> {
         Arc::clone(&self.forwarding)
+    }
+
+    pub(crate) fn track_cutover_task(self: Arc<Self>) -> crate::forwarding::CutoverTask<Arc<Self>> {
+        crate::forwarding::CutoverTask::new(self, |router| {
+            &router.forwarding.upgrade_refusals.tasks
+        })
+    }
+
+    pub(crate) fn prepare_routed_error(&self, error: &RouterError) -> Option<RoutedErrorReply<'_>> {
+        let frame = error.to_error_frame()?;
+        if matches!(error, RouterError::DaemonUpgrade { channel, .. } if *channel != 0) {
+            match self.forwarding.upgrade_refusals.track_fence_refusal(frame) {
+                Ok(tracked) => Some(RoutedErrorReply::Fence(tracked)),
+                Err(frame) => Some(RoutedErrorReply::Plain(frame)),
+            }
+        } else {
+            Some(RoutedErrorReply::Plain(frame))
+        }
     }
 
     pub fn register_backend(
@@ -1031,7 +1239,14 @@ impl Router {
     }
 
     pub(crate) fn route_open_target(&self, frame: &Frame) -> Option<String> {
+        #[cfg(test)]
+        self.route_open_probes.fetch_add(1, Ordering::Relaxed);
         self.control.route_open_target(frame)
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn route_open_probes_for_test(&self) -> u64 {
+        self.route_open_probes.load(Ordering::Relaxed)
     }
 
     pub(crate) fn record_local_connection(&self, connection: ConnectionId) {
@@ -1848,6 +2063,13 @@ impl ForwardBackend {
                 .map_err(RouterError::Forwarding)?
             {
                 RequestAdmission::Admitted => {}
+                RequestAdmission::DaemonUpgrade => {
+                    return Err(RouterError::DaemonUpgrade {
+                        channel,
+                        epoch: frame.header.epoch,
+                        corr,
+                    })
+                }
                 RequestAdmission::Busy(detail) => {
                     let principal = principal_label(&route.principal);
                     let counters = self.forwarding.counters_ref();
@@ -1909,6 +2131,7 @@ impl ForwardBackend {
     ) -> Result<(), RouterError> {
         let channel = frame.header.channel;
         let corr = frame.header.corr;
+        let request = frame.header.ty == FrameType::Request;
         let mut frame = frame;
         frame.header.channel = route.module_channel;
         frame.header.epoch = route.module_epoch;
@@ -1917,14 +2140,25 @@ impl ForwardBackend {
         // so it is cleared here; every other flag bit travels unchanged.
         frame.header.flags = frame.header.flags.without_daemon_origin();
         let counters = self.forwarding.counters_ref();
+        let send = route.module_sink.send_with_fence(
+            frame,
+            Some(RouterError::DaemonUpgrade {
+                channel,
+                epoch: route.client_epoch,
+                corr,
+            }),
+        );
         let result = counters
             .observe_reader_wait(
                 || (route.module_id.clone(), principal_label(&route.principal)),
                 "module_queue",
-                route.module_sink.send(frame),
+                send,
             )
             .await
             .map_err(|err| {
+                if matches!(err, RouterError::DaemonUpgrade { .. }) {
+                    return err;
+                }
                 self.forwarding.warn_frame_drop(
                     route.client_connection_id,
                     channel,
@@ -1937,7 +2171,10 @@ impl ForwardBackend {
         if credited && result.is_err() {
             route.flow.release_corr(corr);
         }
-        result
+        match result {
+            Err(RouterError::DaemonUpgrade { .. }) if !request => Ok(()),
+            result => result,
+        }
     }
 }
 
@@ -1987,6 +2224,11 @@ pub enum RouterError {
         corr: u64,
         code: String,
         message: String,
+    },
+    DaemonUpgrade {
+        channel: u16,
+        epoch: u32,
+        corr: u64,
     },
     FrameBuild(FrameBuildError),
     Forwarding(ForwardingError),
@@ -2039,6 +2281,22 @@ impl RouterError {
     /// Translate route failures that belong on the wire into an `ERROR` frame.
     pub fn to_error_frame(&self) -> Option<Frame> {
         match self {
+            Self::DaemonUpgrade {
+                channel,
+                epoch,
+                corr,
+            } => Frame::build(
+                FrameType::Error,
+                daemon_error_flags(),
+                *channel,
+                *epoch,
+                *corr,
+                serde_json::to_vec(&ErrorBody::module_reloading_for_daemon_upgrade(
+                    "daemon upgrade has fenced requests",
+                ))
+                .ok()?,
+            )
+            .ok(),
             Self::RouteBusy {
                 channel,
                 epoch,
@@ -2181,6 +2439,9 @@ impl fmt::Display for RouterError {
             Self::RouteBusy { channel, corr, .. } => {
                 write!(f, "route busy on channel {channel} corr {corr}")
             }
+            Self::DaemonUpgrade { channel, corr, .. } => {
+                write!(f, "daemon upgrade fenced channel {channel} corr {corr}")
+            }
             Self::Backend {
                 channel,
                 corr,
@@ -2216,8 +2477,26 @@ impl Error for RouterError {
             | Self::UnknownChannel { .. }
             | Self::StaleRouteEpoch { .. }
             | Self::RouteBusy { .. }
+            | Self::DaemonUpgrade { .. }
             | Self::Backend { .. }
             | Self::RouteError { .. } => None,
+        }
+    }
+}
+
+pub(crate) enum RoutedErrorReply<'a> {
+    Plain(Frame),
+    Fence(crate::control::upgrade_in_place::FenceRefusal<'a>),
+}
+
+impl RoutedErrorReply<'_> {
+    pub(crate) async fn send(self, sink: &FrameSink) -> Result<(), RouterError> {
+        match self {
+            Self::Plain(frame) => sink.send(frame).await,
+            Self::Fence(refusal) => {
+                refusal.send(sink);
+                Ok(())
+            }
         }
     }
 }
@@ -2330,6 +2609,22 @@ mod tests {
             1,
             "refusal must release the reserved slot"
         );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn nonblocking_cancel_on_retired_full_writer_is_discarded_silently() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let sink = FrameSink::new(tx);
+        sink.try_send(route_frame(FrameType::Request, 4, 1, 71))
+            .unwrap();
+        sink.accounting
+            .retire_before_try_reserve
+            .store(true, Ordering::Relaxed);
+        assert!(sink
+            .try_send(route_frame(FrameType::Cancel, 4, 1, 71))
+            .is_ok());
+        assert_eq!(rx.try_recv().unwrap().header.ty, FrameType::Request);
         assert!(rx.try_recv().is_err());
     }
 

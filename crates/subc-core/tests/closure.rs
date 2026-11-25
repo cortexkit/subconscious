@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use cortexkit_test_support::ScratchDir;
 use std::{collections::BTreeSet, ops::Deref, path::PathBuf, sync::Arc, time::Duration};
 
@@ -778,6 +780,7 @@ fn thin_core_ops() -> BTreeSet<&'static str> {
         "policy_root.recover",
         "config.revert",
         ops::DAEMON_SHUTDOWN_INTENT,
+        ops::DAEMON_UPGRADE_IN_PLACE,
         ops::SERVER_DESCRIBE,
         ops::CATALOG_LIST,
         ops::CATALOG_WATCH,

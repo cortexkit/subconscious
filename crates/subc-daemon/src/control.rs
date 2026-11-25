@@ -177,6 +177,7 @@ mod agent_commands;
 pub(crate) mod catalog;
 mod policy_root;
 mod rescan_checked;
+pub(crate) mod upgrade_in_place;
 use rescan_checked::RescanMode;
 use rescan_checked::SupervisorRescanContext;
 
@@ -389,6 +390,8 @@ pub struct ControlHandler {
     /// their usual severity (see [`log_requirement_events`]). A handler built
     /// without one has a flag that is never set.
     daemon_shutdown: DaemonShutdownFlag,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) upgrade: Option<Arc<upgrade_in_place::Runtime>>,
     daemon_provenance: DaemonProvenanceFacts,
     #[cfg(test)]
     control_dispatch_delay: Option<Duration>,
@@ -581,6 +584,8 @@ impl ControlHandler {
             counters,
             capability_evaluator: Arc::new(CapabilityRequirementEvaluator::new()),
             daemon_shutdown: DaemonShutdownFlag::default(),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            upgrade: None,
             daemon_provenance: DaemonProvenanceFacts::default(),
             #[cfg(test)]
             control_dispatch_delay: None,
@@ -1033,9 +1038,7 @@ impl ControlHandler {
                         .refuse_claim_connection(ctx, &frame, "claim_hello_not_allowed")
                         .await;
                 }
-                // Resolved once, here: the blocking HELLO below may outlive this
-                // reader and run after cleanup has forgotten the channel, and it
-                // must still be judged as this channel's HELLO.
+                // Resolve before the blocking HELLO can outlive channel cleanup.
                 let channel_spawn = self.supervisor.registration_spawn(ctx.connection_id);
                 if let Some(spawn) = &channel_spawn {
                     spawn.wait_launch().await;
@@ -1049,7 +1052,10 @@ impl ControlHandler {
                     self.pause_hello_ingress_for_test().await;
                 } else if claim_binding.is_none() {
                     if let Ok(hello) = serde_json::from_slice::<serde_json::Value>(&frame.body) {
-                        if let (Some(module), Some(nonce)) = (
+                        if crate::supervise::resume_hello::has_resume_token(&hello) {
+                            self.wait_for_resume_preparation(ctx.connection_id, &hello)
+                                .await;
+                        } else if let (Some(module), Some(nonce)) = (
                             hello
                                 .get("manifest")
                                 .and_then(|value| value.get("module_id"))
@@ -1083,6 +1089,11 @@ impl ControlHandler {
                                     },
                                     "the spawned program binding failed",
                                 )?]);
+                            }
+                            if let Some(spawn) = self.supervisor.nonce_hello_spawn(module, nonce) {
+                                // The child can dial before the supervisor has
+                                // installed its durable roster entry.
+                                spawn.wait_launch().await;
                             }
                         }
                     }
@@ -1775,10 +1786,26 @@ impl ControlHandler {
             }
         }
         if let Some(operation) = privileged_operation(&request) {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            if operation == PrivilegedOperation::UpgradeInPlace {
+                if let Some(upgrade) = &self.upgrade {
+                    if !upgrade.wait_for_identity().await {
+                        return Ok(vec![control_error_frame(
+                            &frame,
+                            subc_control::upgrade_in_place::UPGRADE_IN_PLACE_UNSUPPORTED,
+                            "running executable identity is unavailable",
+                        )?]);
+                    }
+                }
+            }
             let caller = self.resolve_caller(ctx.connection_id).await;
             let op = client_control_request_op(&request);
             let text = prompt_text(operation, &caller);
-            match self.privileged_operator_prompt {
+            match if operation == PrivilegedOperation::UpgradeInPlace {
+                PrivilegedOperatorPrompt::Enforce
+            } else {
+                self.privileged_operator_prompt
+            } {
                 PrivilegedOperatorPrompt::Log => {
                     info!(target: "subc_daemon::privileged_prompt", operation = op,
                         target = ?operation, caller = %caller.description(), summary = %text,
@@ -1787,12 +1814,15 @@ impl ControlHandler {
                 PrivilegedOperatorPrompt::Enforce => {
                     let key =
                         crate::operator_confirm::DeclineKey::for_caller(&caller, ctx.connection_id);
-                    let shortcut =
+                    let shortcut = if operation == PrivilegedOperation::UpgradeInPlace {
+                        None
+                    } else {
                         self.operator_shortcut_stamp(ctx.connection_id)
                             .await
                             .map(|stamp| {
                                 self.shortcut_context(Some(stamp), None, None, ctx.connection_id)
-                            });
+                            })
+                    };
                     let outcome = self
                         .forwarding
                         .operator_confirms()
@@ -1813,47 +1843,19 @@ impl ControlHandler {
             }
         }
         match request {
-            ClientControlRequest::DaemonShutdownIntent { intent } => {
-                if intent.as_str() != Some("restart") {
-                    return Ok(vec![control_error_frame(
-                        &frame,
-                        "invalid_params",
-                        "intent must be 'restart'",
-                    )?]);
-                }
-                // A stamped daemon boots a newer approved generation only from a
-                // durable restart intent, written here before the daemon exits.
-                // Failing to write it never blocks the restart: the next start
-                // then boots the last active generation and the newer one waits.
-                if let Some(owner) = &self.config_runtime {
-                    match owner
-                        .on_blocking(|owner| owner.assign_daemon_restart())
-                        .await
-                    {
-                        Ok(Some(generation)) => {
-                            info!(
-                                generation,
-                                "daemon restart will warm up approved generation"
-                            )
-                        }
-                        Ok(None) => {}
-                        Err(error) => warn!(
-                            %error,
-                            "daemon restart intent not recorded; the next start boots the last active generation"
-                        ),
-                    }
-                }
-                let response = ClientControlResponse::DaemonShutdownIntent {
-                    intent: "restart".to_owned(),
-                    expires_at_ms: self.supervisor.announce_daemon_restart(),
-                };
-                Ok(vec![control_response_body_frame(
-                    &frame,
-                    &response,
-                    "ClientControlResponse::DaemonShutdownIntent",
-                )?])
+            ClientControlRequest::DaemonUpgradeInPlace { executable_sha256 } => {
+                self.upgrade_in_place(ctx, frame, executable_sha256)
             }
-            ClientControlRequest::ServerDescribe {} => self.handle_server_describe(frame),
+            ClientControlRequest::DaemonShutdownIntent { intent } => {
+                self.daemon_restart_intent(frame, intent).await
+            }
+            ClientControlRequest::ServerDescribe {} => {
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                if let Some(upgrade) = &self.upgrade {
+                    upgrade.wait_for_identity().await;
+                }
+                self.handle_server_describe(frame)
+            }
             ClientControlRequest::PolicyRoot(_)
             | ClientControlRequest::PolicyRootSet(_)
             | ClientControlRequest::PolicyRootRecover(_) => {
@@ -2195,6 +2197,7 @@ impl PrivilegedRequest for ClientControlRequest {
         ClientControlRequest::SupervisorRestart { module_id, .. } => {
             Some(PrivilegedOperation::Restart { module_id })
         }
+        ClientControlRequest::DaemonUpgradeInPlace { .. } => Some(PrivilegedOperation::UpgradeInPlace),
         ClientControlRequest::SupervisorSwap { module_id, .. } => {
             Some(PrivilegedOperation::Swap { module_id })
         }
@@ -2208,10 +2211,7 @@ impl PrivilegedRequest for ClientControlRequest {
                 Some(PrivilegedOperation::Rescan)
             }
         }
-        // Only the well-formed apply asks for approval. A preview changes
-        // nothing, and any other combination is refused before it touches
-        // anything, so prompting the operator for it would ask about a request
-        // that cannot run.
+        // Only the well-formed apply can change state, so only it needs approval.
         ClientControlRequest::SupervisorRescanChecked {
             preview,
             candidate,
@@ -2231,8 +2231,7 @@ impl PrivilegedRequest for ClientControlRequest {
         | ClientControlRequest::PolicyRoot(_)
         | ClientControlRequest::PolicyRootSet(_)
         | ClientControlRequest::PolicyRootRecover(_)
-        // The announcement uses the same client admission as supervisor.restart,
-        // but cannot stop anything itself and needs no operator confirmation.
+        // A restart announcement cannot stop anything and requires no prompt.
         | ClientControlRequest::DaemonShutdownIntent { .. }
         | ClientControlRequest::CatalogList { .. }
         | ClientControlRequest::RouteOpen { .. }
@@ -2256,6 +2255,7 @@ fn client_control_request_op(request: &ClientControlRequest) -> &'static str {
         ClientControlRequest::PolicyRootSet(_) => subc_control::policy_root::SET_OP,
         ClientControlRequest::PolicyRootRecover(_) => subc_control::policy_root::RECOVER_OP,
         ClientControlRequest::DaemonShutdownIntent { .. } => ops::DAEMON_SHUTDOWN_INTENT,
+        ClientControlRequest::DaemonUpgradeInPlace { .. } => ops::DAEMON_UPGRADE_IN_PLACE,
         ClientControlRequest::ServerDescribe {} => ops::SERVER_DESCRIBE,
         ClientControlRequest::SupervisorProvenance { .. } => ops::SUPERVISOR_PROVENANCE,
         ClientControlRequest::CatalogList { .. } => ops::CATALOG_LIST,
@@ -2413,6 +2413,7 @@ fn forwarding_error_code(err: &ForwardingError) -> &'static str {
         // Only a swap candidate's registration can produce this, and it means
         // exactly what a second active HELLO for a live id means.
         ForwardingError::CandidateSlotOccupied { .. } => "duplicate_module_id",
+        ForwardingError::HelloRegistrationRefused(code) => code,
         ForwardingError::TargetRegistrationChanged(_) => "capability_forbidden",
         ForwardingError::RelayDeadlineElapsed => "module_timeout",
         ForwardingError::RelayCorrelationExhausted

@@ -6,7 +6,7 @@ use subc_core::doctor::{
     LogTail, LogTailRecord, ReportFile, Severity,
 };
 
-use crate::{log_tail, Command};
+use super::{log_tail, Command};
 
 mod agent;
 mod report_file;
@@ -340,7 +340,7 @@ mod tests {
                 .map(OsString::from)
                 .chain([target.clone().into_os_string()])
                 .chain(tail.iter().map(OsString::from));
-            let error = crate::run(argv).await.unwrap_err();
+            let error = super::super::run(argv).await.unwrap_err();
             assert_eq!(error.exit_code(), 2, "{tail:?}");
             assert!(!target.exists(), "{tail:?}");
         }

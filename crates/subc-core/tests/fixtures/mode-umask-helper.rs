@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 #[cfg(unix)]
 fn main() {
     use std::os::unix::process::CommandExt;

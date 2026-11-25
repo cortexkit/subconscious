@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use cortexkit_test_support::ScratchDir;
 use std::{collections::VecDeque, ops::Deref, time::Duration};
 
@@ -946,6 +948,8 @@ fn route_bind_ack(request: &Frame) -> Frame {
 
 fn hello_frame(manifest: ModuleManifest, corr: u64) -> Frame {
     let body = serde_json::to_vec(&ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest,
         protocol_ver: PROTOCOL_VERSION,
         control_ops: None,

@@ -17,6 +17,13 @@ exit: Some(0)
     "client_egress_close_delivery_failed": 0,
     "client_frames_dropped_stale_route": 0,
     "control_usage": "<control_usage>",
+    "daemon_identity": {
+      "build_git_sha": "<build_ids>",
+      "core_version": "<daemon_image>",
+      "executable": "<daemon_image>",
+      "executable_sha256": "<build_ids>",
+      "pid": "<pids>"
+    },
     "drains_with_undeclared_gauge": 0,
     "goodbye_relay_client_failed": 0,
     "goodbye_relay_module_dropped": 0,
@@ -37,6 +44,7 @@ exit: Some(0)
     "claim.mint",
     "claim.present",
     "daemon.shutdown_intent",
+    "daemon.upgrade_in_place",
     "activity.record",
     "activity.query",
     "activity.subscribe",

@@ -507,6 +507,14 @@ impl ControlHandler {
         if !self.config_owner_connection(connection) {
             return Ok(false);
         }
+        #[cfg(test)]
+        if self
+            .config_runtime
+            .as_ref()
+            .is_some_and(|owner| owner.has_trusted_review_connection_for_test(connection))
+        {
+            return Ok(true);
+        }
         #[cfg(feature = "dev-desktop-approval")]
         {
             // Requesting and receiving the complete immutable review is the
@@ -664,6 +672,13 @@ impl ControlHandler {
                 &response,
                 "ConfigControlResponse",
             )?]),
+            Err(error) if error.code == subc_control::upgrade_in_place::UPGRADE_BUSY => {
+                Ok(vec![control_error_body_frame(
+                    &frame,
+                    ErrorBody::new(error.code, error.detail)
+                        .with_detail(serde_json::json!({"reason":"upgrade"})),
+                )?])
+            }
             Err(error) => Ok(vec![
                 self.config_request_error_frame(&frame, op, false, error)?
             ]),
@@ -714,6 +729,16 @@ impl ControlHandler {
         request: ConfigControlRequest,
         automatic: Option<pending_settings::AutomaticSettingsAttempt>,
     ) -> std::result::Result<ConfigControlResponse, GateError> {
+        let settings = if matches!(
+            request,
+            ConfigControlRequest::Apply { .. } | ConfigControlRequest::PlaceProgram { .. }
+        ) {
+            self.upgrade_settings_guard()
+                .map_err(|body| GateError::new(&body.code, body.message))?
+                .map(Arc::new)
+        } else {
+            None
+        };
         match request {
             ConfigControlRequest::Modules {} => {
                 let known = self.config_settings_known_modules()?;
@@ -772,6 +797,7 @@ impl ControlHandler {
                 let gate = runtime.module_gate(&module_id)?;
                 let _guard = gate.lock().await;
                 let generation = config_work(runtime, ConfigWake::Delivery, move |owner| {
+                    let _settings = settings;
                     owner.place_program_with_manifest(&module_id, &path, &sha256, manifest.as_ref())
                 })
                 .await?;
@@ -823,7 +849,10 @@ impl ControlHandler {
                     return Ok(result);
                 }
                 let apply_digest = digest.clone();
-                if let Some(generation) = runtime.apply_control_edits(apply_digest).await? {
+                if let Some(generation) = runtime
+                    .apply_control_edits(apply_digest, settings.clone())
+                    .await?
+                {
                     return Ok(ConfigControlResponse::Applied {
                         generation,
                         restart_required: false,
@@ -940,6 +969,7 @@ impl ControlHandler {
                     let phone = self.config_phone_surface().await;
                     let facts = self.config_apply_facts(ctx, phone, true).await;
                     let operation = self.supervisor.operation_lock();
+                    let restore_settings = settings.clone();
                     let declined = config_work(runtime.clone(), ConfigWake::None, move |owner| {
                         let declined = owner.accept_settings_decline(attempt, &facts, &reply)?;
                         // This blocking job owns the accepted decision even if
@@ -947,6 +977,7 @@ impl ControlHandler {
                         let restore = declined.map(|digest| {
                             let owner = owner.clone();
                             tokio::spawn(async move {
+                                let _settings = restore_settings;
                                 let _operation = operation.lock_owned().await;
                                 let result = owner.revert_capture_plan(digest).await;
                                 if let Err(error) = &result {
@@ -977,7 +1008,8 @@ impl ControlHandler {
                             "approval was declined",
                         ));
                     }
-                    self.finish_config_apply(
+                    // Approval publication keeps several guards across awaits.
+                    Box::pin(self.finish_config_apply(
                         ctx,
                         runtime,
                         challenge,
@@ -985,10 +1017,11 @@ impl ControlHandler {
                         request_guard,
                         declined.1,
                         true,
-                    )
+                        settings,
+                    ))
                     .await
                 } else {
-                    self.finish_config_apply(
+                    Box::pin(self.finish_config_apply(
                         ctx,
                         runtime,
                         challenge,
@@ -996,7 +1029,8 @@ impl ControlHandler {
                         request_guard,
                         reply,
                         false,
-                    )
+                        settings,
+                    ))
                     .await
                 }
             }
@@ -1014,6 +1048,7 @@ impl ControlHandler {
         request_guard: crate::config_gate::runtime::ApprovalRequestGuard,
         reply: ApprovalReply,
         daemon_settings: bool,
+        settings: Option<super::upgrade_in_place::SettingsPermit>,
     ) -> std::result::Result<ConfigControlResponse, GateError> {
         let attempt = challenge.attempt();
         let window = matches!(challenge, ApprovalChallenge::Phone { .. }).then(|| {
@@ -1063,7 +1098,7 @@ impl ControlHandler {
                 // request disconnects. It still owns this write-back.
                 tokio::spawn(async move {
                     owner
-                        .write_approved_project_files(generation, authority)
+                        .write_approved_project_files(generation, authority, settings)
                         .await
                 });
             }

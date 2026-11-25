@@ -67,6 +67,62 @@ fn oversized_stream_chunk(route: &crate::forwarding::PendingRouteBindRelay, corr
     )
 }
 
+#[tokio::test]
+async fn delivered_request_keeps_stream_refusal_when_next_socket_write_blocks() {
+    let (router, forwarding, _, mut client_replies, module, route, module_queue) =
+        audit_route("writer-stall", Concurrency::ModuleManaged, crate::server::CONNECTION_EGRESS_BYTE_BUDGET).await;
+    let binding = module_route_for_test(&router, &module, &route);
+    let client = RouteCtx { connection_id: binding.client_connection_id, egress: binding.client_sink.clone() };
+    let first = route_frame(FrameType::Request, route.client_channel, route.client_epoch, 401);
+    let second = Frame::build(FrameType::Request, first.header.flags, route.client_channel, route.client_epoch, 402, vec![b'x'; 64 * 1024]).unwrap();
+    router.route_for_connection(&client, first).await.unwrap();
+    router.route_for_connection(&client, second).await.unwrap();
+    let (socket, mut peer) = tokio::io::duplex(128);
+    let writer = tokio::spawn(crate::server::drain_writer(socket, module_queue));
+    assert_eq!(crate::read_frame(&mut peer).await.unwrap().unwrap().header.corr, 401);
+    // Leave B unread so it occupies the writer; check that CANCEL for A
+    // can enter the same queue without needing B to finish writing.
+    let blocked = binding.module_sink.backlog().queued_frames;
+    assert_eq!(blocked, 1);
+
+    router.route_for_connection(&module, oversized_stream_chunk(&route, 401)).await.unwrap();
+    assert_eq!(client_replies.try_recv().unwrap().header.ty, FrameType::Error);
+    router.route_for_connection(&module, stream_frame(route.module_channel, route.module_epoch, 401, b"late".to_vec())).await.unwrap();
+    assert!(client_replies.try_recv().is_err(), "the oversized chunk already ended this request at the client");
+    assert_eq!(binding.module_sink.backlog().queued_frames, blocked + 1, "CANCEL is queued while B is blocked");
+    assert!(!forwarding.upgrade_admission.borrow().fenced());
+    writer.abort();
+    let _ = writer.await;
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn upgrade_goodbye_waits_for_writer_slot_and_blocks_late_cancel_and_pong() {
+    let (router, forwarding, _, mut client_replies, mut module, route, mut module_queue) =
+        audit_route("carried-writer", Concurrency::ModuleManaged, crate::server::CONNECTION_EGRESS_BYTE_BUDGET).await;
+    let binding = module_route_for_test(&router, &module, &route);
+    module.egress = binding.module_sink.clone();
+    binding.flow.acquire_tagged(401, false).await.unwrap();
+    let slot = module.egress.reserve_owned().await.unwrap();
+    forwarding.set_upgrade_admission(crate::control::upgrade_in_place::Admission::Fenced);
+    let goodbye = module.egress.send_upgrade_goodbye(route_frame(FrameType::Goodbye, 0, 0, 0));
+    tokio::pin!(goodbye);
+    assert!(poll_once(goodbye.as_mut()).await.is_pending());
+    assert!(module_queue.try_recv().is_err(), "GOODBYE jumped a writer slot already held by a request");
+    assert!(!slot.send(route_frame(FrameType::Request, route.module_channel, route.module_epoch, 401)));
+    assert_eq!(module_queue.try_recv().unwrap().header.ty, FrameType::Request);
+    assert!(poll_once(goodbye.as_mut()).await.is_pending());
+    let cut = module_queue.try_recv().unwrap();
+    assert_eq!(cut.header.ty, FrameType::Goodbye);
+
+    router.route_for_connection(&module, oversized_stream_chunk(&route, 401)).await.unwrap();
+    assert_eq!(client_replies.try_recv().unwrap().header.ty, FrameType::Error);
+    router.route_for_connection(&module, route_frame(FrameType::Ping, 0, 0, 9)).await.unwrap();
+    assert!(module_queue.try_recv().is_err(), "no CANCEL or PONG may be queued behind upgrade GOODBYE");
+    cut.flushed.unwrap().send(()).unwrap();
+    goodbye.await.unwrap();
+}
+
 /// A module that emits one stream chunk larger than the client's byte budget
 /// is refused with `frame_too_large`, but it is still computing the request.
 /// On a Serial route the next request must not be admitted to the module until

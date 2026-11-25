@@ -59,6 +59,8 @@ fn router_with_registry() -> (Arc<Router>, Arc<Registry>) {
 fn hello_frame(module_id: &str, launch_nonce: Option<&str>) -> Frame {
     let manifest = ModuleManifest::builder(module_id, "0.0.1").build();
     let hello = ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         protocol_ver: PROTOCOL_VERSION,
         manifest,
         launch_nonce: launch_nonce.map(str::to_owned),

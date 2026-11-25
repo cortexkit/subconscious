@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! The ck app's live layer against a real daemon: a private daemon with two
 //! test modules, read through `ck_ui::live` exactly as `ck` opens the app.
 //!

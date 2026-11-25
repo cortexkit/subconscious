@@ -549,6 +549,8 @@ impl Registry {
     /// callback may take forwarding's lock, but must not re-enter the registry:
     /// the lock order is Registry -> ForwardingTable::inner.
     ///
+    /// Skip install if a disconnect removed the unpublished entry. Otherwise
+    /// an install could queue a HELLO_ACK for a registration that cannot publish.
     /// An install error leaves the registration unpublished. The caller must
     /// roll it back after this method releases the registry lock. The outer
     /// result reports registry locking errors; the inner result reports install
@@ -559,10 +561,21 @@ impl Registry {
         install: impl FnOnce() -> Result<(), E>,
     ) -> Result<Result<bool, E>, RegistryError> {
         let mut inner = self.lock_inner()?;
+        if !inner.unpublished.contains(&connection_id)
+            || inner.find_by_connection(connection_id).is_none()
+        {
+            return Ok(Ok(false));
+        }
         if let Err(err) = install() {
             return Ok(Err(err));
         }
         Ok(Ok(inner.publish_registration(connection_id)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_lock_for_test(&self, while_locked: impl FnOnce()) {
+        let _hold = self.lock_inner().unwrap();
+        while_locked();
     }
 
     #[cfg(test)]

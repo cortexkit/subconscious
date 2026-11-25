@@ -144,6 +144,8 @@ fn legacy_hello(module: &str, nonce: &str) -> subc_protocol::Frame {
         0,
         1,
         serde_json::to_vec(&subc_protocol::ModuleHelloBody {
+            module_capabilities: None,
+            resume_token: None,
             manifest: subc_protocol::manifest::ModuleManifest::builder(module, "1.0.0").build(),
             protocol_ver: subc_protocol::PROTOCOL_VERSION,
             control_ops: None,

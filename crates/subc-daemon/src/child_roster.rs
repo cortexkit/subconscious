@@ -25,7 +25,9 @@ use std::{
 use subc_control::ModuleProtocol;
 use tracing::warn;
 
-use crate::live_children::{ExecutableIdentity, LiveChild};
+use crate::live_children::{
+    AdoptedPids, ExecutableIdentity, LiveChild, ProtectedChild, RecordedChild, RetainedReason,
+};
 
 /// One live supervised process.
 ///
@@ -34,6 +36,8 @@ use crate::live_children::{ExecutableIdentity, LiveChild};
 #[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Debug, Clone)]
 pub(crate) struct RosterEntry {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    adopted_signal: Option<std::sync::Weak<crate::supervise::live_upgrade::VerifiedChild>>,
     pub(crate) module_id: String,
     pub(crate) pid: u32,
     pub(crate) protocol: ModuleProtocol,
@@ -43,9 +47,27 @@ pub(crate) struct RosterEntry {
     /// What the live-children record says about this process, for the next
     /// daemon's orphan sweep if this one dies without stopping it.
     recorded: RecordedIdentity,
+    resume_token_sha256: Option<String>,
     /// The module's resolved drain budget, shared with its supervisor so a
     /// configuration rescan that changes it is seen at shutdown.
     drain_budget: Arc<Mutex<Duration>>,
+}
+
+impl RosterEntry {
+    fn to_recorded_child(&self) -> RecordedChild {
+        RecordedChild {
+            child: LiveChild {
+                module_id: self.module_id.clone(),
+                pid: self.pid,
+                protocol: self.protocol,
+                start_time: self.recorded.start_time,
+                executable: self.recorded.executable,
+                cgroup_name: self.recorded.cgroup_name.clone(),
+                container: self.recorded.container.clone(),
+            },
+            resume_token_sha256: self.resume_token_sha256.clone(),
+        }
+    }
 }
 
 /// The identity facts the live-children record keeps for one process beyond
@@ -108,7 +130,7 @@ struct RosterInner {
     recovery_block: OnceLock<String>,
     pending_admissions: Mutex<HashMap<String, (u32, String)>>,
     unquarantined_record: std::sync::atomic::AtomicBool,
-    retained: Mutex<Vec<(LiveChild, crate::live_children::RetainedReason)>>,
+    retained: Mutex<Vec<RetainedEntry>>,
     rechecking: AtomicBool,
     #[cfg(target_os = "macos")]
     privacy_trampoline: OnceLock<Result<PathBuf, String>>,
@@ -124,6 +146,25 @@ struct RosterInner {
     fail_adoption: AtomicBool,
     #[cfg(all(test, unix))]
     placement_pause: Mutex<HashMap<String, subc_os::admission_gate::PlacementPause>>,
+}
+
+#[derive(Debug)]
+struct RetainedEntry {
+    recorded: RecordedChild,
+    reason: Option<RetainedReason>,
+    protection: Option<ProtectedChild>,
+}
+
+impl RetainedEntry {
+    fn waiting_reason(&self) -> &RetainedReason {
+        if self.protection.is_some() {
+            // Handover children block starts even if the old on-disk reason
+            // was non-blocking. Don't replace that reason in the record.
+            &RetainedReason::Hidden
+        } else {
+            self.reason.as_ref().unwrap_or(&RetainedReason::Hidden)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -227,26 +268,17 @@ impl RosterInner {
         }
         let mut entries: Vec<(&u64, &RosterEntry)> = live.iter().collect();
         entries.sort_by_key(|(key, _)| **key);
-        let children: Vec<LiveChild> = entries
+        let retained = lock(&self.retained);
+        let children: Vec<_> = entries
             .into_iter()
-            .map(|(_, entry)| LiveChild {
-                module_id: entry.module_id.clone(),
-                pid: entry.pid,
-                protocol: entry.protocol,
-                start_time: entry.recorded.start_time,
-                executable: entry.recorded.executable,
-                cgroup_name: entry.recorded.cgroup_name.clone(),
-                container: entry.recorded.container.clone(),
-            })
+            .map(|(_, entry)| entry.to_recorded_child())
+            .chain(retained.iter().map(|entry| entry.recorded.clone()))
             .collect();
-        let children: Vec<_> = children
-            .into_iter()
-            .chain(lock(&self.retained).iter().map(|(entry, _)| entry.clone()))
-            .collect();
-        let reasons = lock(&self.retained)
+        let reasons = retained
             .iter()
-            .map(|(entry, reason)| (entry.pid, reason.clone()))
+            .filter_map(|entry| Some((entry.recorded.child.pid, entry.reason.clone()?)))
             .collect();
+        drop(retained);
         if let Err(error) =
             crate::live_children::write_record_with_reasons(path, &children, reasons)
         {
@@ -275,11 +307,16 @@ impl RosterInner {
             let mut updated = false;
             #[cfg(not(unix))]
             let updated = false;
-            retained.retain_mut(|(entry, reason)| {
-                #[cfg(not(unix))]
-                let _ = reason;
+            retained.retain_mut(|retained| {
+                // Only the handover's exit handling may remove a Held child.
+                // The same rule protects an adopted child awaiting import.
+                if retained.protection.is_some() {
+                    return true;
+                }
+                let entry = &retained.recorded.child;
                 #[cfg(unix)]
                 {
+                    let reason = retained.reason.get_or_insert(RetainedReason::Hidden);
                     if entry.container.is_some() {
                         return match crate::live_children::recheck_container(entry,
                             #[cfg(target_os = "linux")]
@@ -365,6 +402,14 @@ impl Default for ChildRoster {
 pub(crate) struct RetainedView(std::sync::Weak<RosterInner>);
 
 impl RetainedView {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn blocks_upgrade(&self) -> bool {
+        self.0.upgrade().is_none_or(|inner| {
+            let retained = !lock(&inner.retained).is_empty();
+            let awaiting_admission = !lock(&inner.pending_admissions).is_empty();
+            inner.recovery_block.get().is_some() || retained || awaiting_admission
+        })
+    }
     pub(crate) fn has_carried_container(&self, module_id: &str) -> bool {
         let Some(inner) = self.0.upgrade() else {
             return false;
@@ -391,12 +436,15 @@ impl RetainedView {
         let retained = lock(&inner.retained);
         retained
             .iter()
-            .find(|(entry, reason)| {
-                entry.module_id == module_id
-                    && entry.container.is_some()
-                    && reason.blocks_fresh_copy()
+            .find(|entry| {
+                entry.recorded.child.module_id == module_id
+                    && (entry.recorded.child.container.is_some() || entry.protection.is_some())
+                    && entry.waiting_reason().blocks_fresh_copy()
             })
-            .map(|(entry, reason)| (entry.pid, reason.waiting_message(entry.pid)))
+            .map(|entry| {
+                let pid = entry.recorded.child.pid;
+                (pid, entry.waiting_reason().waiting_message(pid))
+            })
     }
 }
 
@@ -406,6 +454,105 @@ impl RetainedView {
 pub(crate) struct RosterGuard {
     inner: Arc<RosterInner>,
     key: u64,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    adoption: Option<Box<crate::supervise::live_upgrade::AdoptionRecovery>>,
+}
+
+impl RosterGuard {
+    /// Return the durable identity for the exact launch owned by this guard.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn recorded_identity(&self) -> Option<RecordedChild> {
+        lock(&self.inner.live)
+            .get(&self.key)
+            .map(RosterEntry::to_recorded_child)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn bind_adopted_signal(
+        &mut self,
+        signal: &Arc<crate::supervise::live_upgrade::VerifiedChild>,
+        recovery: crate::supervise::live_upgrade::AdoptionRecovery,
+    ) {
+        if let Some(entry) = lock(&self.inner.live).get_mut(&self.key) {
+            entry.adopted_signal = Some(Arc::downgrade(signal));
+        }
+        self.adoption = Some(Box::new(recovery));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn retain_held_adoption(&self) {
+        self.inner.without_stalling_runtime(|| {
+            let _write = lock(&self.inner.record_write);
+            let Some(entry) = lock(&self.inner.live).remove(&self.key) else {
+                return;
+            };
+            lock(&self.inner.retained).push(RetainedEntry {
+                recorded: entry.to_recorded_child(),
+                reason: None,
+                protection: Some(ProtectedChild::Held),
+            });
+        });
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn stop_adoption_without_replacement(&mut self) {
+        if let Some(recovery) = &mut self.adoption {
+            recovery.no_restart();
+        }
+    }
+
+    pub(crate) fn resume_token_record(&self) -> Option<ResumeTokenRecord> {
+        self.inner.record_path.get()?;
+        Some(ResumeTokenRecord {
+            inner: Arc::downgrade(&self.inner),
+            key: self.key,
+        })
+    }
+
+    #[cfg(test)]
+    fn set_resume_token_sha256(&self, hash: &str) -> std::io::Result<()> {
+        self.resume_token_record()
+            .ok_or_else(|| std::io::Error::other("no live-children record configured"))?
+            .set_sha256(hash)
+    }
+}
+
+/// Permission to update one record, without prolonging its lifetime past reap.
+#[derive(Debug)]
+pub(crate) struct ResumeTokenRecord {
+    inner: std::sync::Weak<RosterInner>,
+    key: u64,
+}
+
+impl ResumeTokenRecord {
+    /// Persist the hash for this exact child before registration acknowledges
+    /// the token. Leave the in-memory hash unchanged if writing fails.
+    pub(crate) fn set_sha256(&self, hash: &str) -> std::io::Result<()> {
+        if !crate::live_children::valid_resume_token_sha256(hash) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "resume token hash is not a lowercase hex SHA-256 digest",
+            ));
+        }
+        let inner = self.inner.upgrade().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "child roster no longer live")
+        })?;
+        inner.without_stalling_runtime(|| {
+            let _write = lock(&inner.record_write);
+            let mut snapshot = lock(&inner.live).clone();
+            let entry = snapshot.get_mut(&self.key).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "child no longer rostered")
+            })?;
+            entry.resume_token_sha256 = Some(hash.to_owned());
+            inner.write_record(&snapshot)?;
+            // Removing the entry also takes the write gate.
+            lock(&inner.live)
+                .get_mut(&self.key)
+                .expect("child stays rostered until the write gate is released")
+                .resume_token_sha256 = Some(hash.to_owned());
+            Ok(())
+        })
+    }
 }
 
 impl RosterGuard {
@@ -448,21 +595,18 @@ impl RosterGuard {
             let Some(entry) = lock(&self.inner.live).remove(&self.key) else {
                 return;
             };
-            let recorded = LiveChild {
-                module_id: entry.module_id,
-                pid: entry.pid,
-                protocol: entry.protocol,
-                start_time: entry.recorded.start_time,
-                executable: entry.recorded.executable,
-                cgroup_name: entry.recorded.cgroup_name,
-                container: entry.recorded.container.or(identity),
-            };
+            let mut recorded = entry.to_recorded_child();
+            recorded.child.container = recorded.child.container.or(identity);
             if reason.blocks_fresh_copy() {
-                tracing::error!(module_id = %recorded.module_id, container = ?recorded.container,
-                    reason = %reason.waiting_message(recorded.pid),
+                tracing::error!(module_id = %recorded.child.module_id, container = ?recorded.child.container,
+                    reason = %reason.waiting_message(recorded.child.pid),
                     "container survivors block a fresh instance; retaining the container record");
             }
-            lock(&self.inner.retained).push((recorded, reason));
+            lock(&self.inner.retained).push(RetainedEntry {
+                recorded,
+                reason: Some(reason),
+                protection: None,
+            });
             let live = lock(&self.inner.live).clone();
             let _ = self.inner.write_record(&live);
         });
@@ -494,6 +638,13 @@ impl AdmissionError {
 
 impl Drop for RosterGuard {
     fn drop(&mut self) {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(recovery) = self.adoption.take().filter(|recovery| !recovery.settled()) {
+            recovery.block();
+            self.retain_held_adoption();
+            recovery.observe();
+            return;
+        }
         self.inner.without_stalling_runtime(|| {
             let _write = lock(&self.inner.record_write);
             let snapshot = {
@@ -598,10 +749,16 @@ impl ChildRoster {
     /// Keep the live-children record at `path` from now on. Set once, before
     /// anything is admitted; a second call is ignored.
     pub(crate) fn record_to(&self, path: PathBuf) {
+        self.record_to_with_adopted(path, &AdoptedPids::none());
+    }
+
+    /// Seed the record after startup's sweep. Protected entries stay in the
+    /// record until the supervisor takes ownership or confirms a Held exit.
+    pub(crate) fn record_to_with_adopted(&self, path: PathBuf, protected: &AdoptedPids) {
         if self.inner.record_path.set(path.clone()).is_err() {
             return;
         }
-        let (retained, reasons) = match crate::live_children::read_record_with_reasons(&path) {
+        let (retained, reasons) = match crate::live_children::read_record_entries(&path) {
             Ok(record) => record,
             Err(error) => {
                 if let Err(quarantine_error) =
@@ -627,12 +784,17 @@ impl ChildRoster {
         {
             *lock(&self.inner.retained) = retained
                 .into_iter()
-                .map(|entry| {
+                .map(|recorded| {
+                    let protection = protected.protection(recorded.child.pid);
                     let reason = reasons
-                        .get(&entry.pid)
+                        .get(&recorded.child.pid)
                         .cloned()
-                        .unwrap_or(crate::live_children::RetainedReason::Hidden);
-                    (entry, reason)
+                        .or_else(|| protection.is_none().then_some(RetainedReason::Hidden));
+                    RetainedEntry {
+                        recorded,
+                        reason,
+                        protection,
+                    }
                 })
                 .collect();
         }
@@ -664,15 +826,18 @@ impl ChildRoster {
         // until there is actually retained state for this module to recheck.
         if !lock(&self.inner.retained)
             .iter()
-            .any(|(entry, _)| entry.module_id == module_id)
+            .any(|entry| entry.recorded.child.module_id == module_id)
         {
             return None;
         }
         self.inner.recheck_retained();
         lock(&self.inner.retained)
             .iter()
-            .find(|(entry, reason)| entry.module_id == module_id && reason.blocks_fresh_copy())
-            .map(|(entry, reason)| (entry.pid, reason.clone()))
+            .find(|entry| {
+                entry.recorded.child.module_id == module_id
+                    && entry.waiting_reason().blocks_fresh_copy()
+            })
+            .map(|entry| (entry.recorded.child.pid, entry.waiting_reason().clone()))
     }
 
     pub(crate) fn admission_pending(&self, module_id: &str) -> bool {
@@ -681,10 +846,12 @@ impl ChildRoster {
 
     #[cfg(target_os = "linux")]
     pub(crate) fn has_retained_cgroup(&self, module_id: &str) -> bool {
-        lock(&self.inner.retained).iter().any(|(entry, reason)| {
-            entry.module_id == module_id
-                && reason.blocks_fresh_copy()
+        lock(&self.inner.retained).iter().any(|entry| {
+            entry.recorded.child.module_id == module_id
+                && entry.waiting_reason().blocks_fresh_copy()
                 && entry
+                    .recorded
+                    .child
                     .container
                     .as_ref()
                     .is_some_and(|identity| identity.cgroup_path.is_some())
@@ -799,17 +966,22 @@ impl ChildRoster {
         lock(&self.inner.live).insert(
             key,
             RosterEntry {
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                adopted_signal: None,
                 module_id,
                 pid,
                 protocol,
                 start_time,
                 recorded,
+                resume_token_sha256: None,
                 drain_budget: Arc::clone(&self.drain_budget),
             },
         );
         let guard = RosterGuard {
             inner: Arc::clone(&self.inner),
             key,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            adoption: None,
         };
         let recorded = self.inner.without_stalling_runtime(|| {
             let _write = lock(&self.inner.record_write);
@@ -820,6 +992,100 @@ impl ChildRoster {
             Ok(()) => Ok(guard),
             Err(source) => Err(AdmissionError { source, guard }),
         }
+    }
+
+    /// Transfer a verified child staged by `record_to_with_adopted` into the
+    /// live roster. The disk record already includes the child and its hash;
+    /// only its in-memory owner changes here.
+    // The startup adoption path calls this after verifying the child's identity.
+    #[allow(dead_code)]
+    pub(crate) fn admit_adopted(
+        &self,
+        verified: &RecordedChild,
+        mut identity: RecordedIdentity,
+    ) -> std::io::Result<RosterGuard> {
+        self.inner.without_stalling_runtime(|| {
+            let _write = lock(&self.inner.record_write);
+            let recorded = {
+                let mut retained = lock(&self.inner.retained);
+                let mut matching = retained
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, entry)| entry.recorded.child.pid == verified.child.pid);
+                match (matching.next(), matching.next()) {
+                    (Some((index, entry)), None)
+                        if entry.protection == Some(ProtectedChild::Adopted)
+                            && verified.resume_token_sha256.is_some()
+                            && &entry.recorded == verified =>
+                    {
+                        retained.remove(index).recorded
+                    }
+                    _ => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "verified child is not staged for adoption",
+                        ));
+                    }
+                }
+            };
+            let child = recorded.child;
+            identity.start_time = child.start_time;
+            identity.executable = child.executable;
+            identity.cgroup_name = child.cgroup_name;
+            identity.container = child.container;
+            let key = self.inner.next_key.fetch_add(1, Ordering::Relaxed);
+            lock(&self.inner.live).insert(
+                key,
+                RosterEntry {
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    adopted_signal: None,
+                    module_id: child.module_id,
+                    pid: child.pid,
+                    protocol: child.protocol,
+                    start_time: child.start_time,
+                    recorded: identity,
+                    resume_token_sha256: recorded.resume_token_sha256,
+                    drain_budget: Arc::clone(&self.drain_budget),
+                },
+            );
+            Ok(RosterGuard {
+                inner: Arc::clone(&self.inner),
+                key,
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                adoption: None,
+            })
+        })
+    }
+
+    /// Remove only the protected row whose exact pid and start time the
+    /// supervisor confirmed and reaped as its own child.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn remove_reaped_adoption(
+        &self,
+        module: &str,
+        pid: u32,
+        start_time: u64,
+    ) -> std::io::Result<bool> {
+        self.inner.without_stalling_runtime(|| {
+            let _write = lock(&self.inner.record_write);
+            let removed = {
+                let mut retained = lock(&self.inner.retained);
+                let before = retained.len();
+                retained.retain(|entry| {
+                    let child = &entry.recorded.child;
+                    !(entry.protection.is_some()
+                        && child.pid == pid
+                        && child.module_id == module
+                        && child.start_time == Some(start_time))
+                });
+                retained.len() != before
+            };
+            if removed {
+                let live = lock(&self.inner.live).clone();
+                self.inner.write_record(&live)?;
+            }
+            Ok(removed)
+        })
     }
 
     #[cfg(all(test, unix))]
@@ -876,6 +1142,181 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod resume_hash_tests {
+    use super::*;
+    use crate::live_children::{
+        fail_next_file_sync, read_record_entries, write_record_with_reasons,
+    };
+    use cortexkit_test_support::ScratchDir;
+    use std::{collections::BTreeMap, fs, path::Path};
+
+    fn admit(roster: &ChildRoster, module: &str, pid: u32) -> RosterGuard {
+        roster
+            .admit(
+                module.into(),
+                pid,
+                ModuleProtocol::Subc,
+                Some(1000),
+                RecordedIdentity {
+                    start_time: Some(1000),
+                    ..RecordedIdentity::default()
+                },
+            )
+            .unwrap()
+    }
+
+    fn record(module: &str, pid: u32, hash: Option<&str>) -> RecordedChild {
+        RecordedChild {
+            child: LiveChild {
+                module_id: module.into(),
+                pid,
+                protocol: ModuleProtocol::Subc,
+                start_time: Some(1000),
+                executable: None,
+                cgroup_name: None,
+                container: None,
+            },
+            resume_token_sha256: hash.map(str::to_owned),
+        }
+    }
+
+    fn entries(path: &Path) -> Vec<RecordedChild> {
+        read_record_entries(path).unwrap().0
+    }
+
+    #[test]
+    fn module_a_hash_survives_module_b_admit_and_reap() {
+        let dir = ScratchDir::new("roster-hash-admit-reap");
+        let path = dir.join("live-children.json");
+        let roster = ChildRoster::default();
+        roster.record_to(path.clone());
+        let hash = "a".repeat(64);
+        let a = admit(&roster, "a", 41);
+        assert_eq!(entries(&path), [record("a", 41, None)]);
+        let bytes = fs::read_to_string(&path).unwrap();
+        assert!(!bytes.contains("resume_token_sha256"));
+        a.set_resume_token_sha256(&hash).unwrap();
+        let expected = record("a", 41, Some(&hash));
+        assert_eq!(entries(&path), std::slice::from_ref(&expected));
+
+        let b = admit(&roster, "b", 42);
+        assert_eq!(entries(&path), [expected.clone(), record("b", 42, None)]);
+        drop(b);
+        assert_eq!(entries(&path), [expected]);
+        drop(a);
+        assert!(entries(&path).is_empty());
+    }
+
+    #[test]
+    fn failed_hash_write_leaves_previous_hash_for_later_rewrites() {
+        let dir = ScratchDir::new("roster-hash-write-failure");
+        let path = dir.join("live-children.json");
+        let roster = ChildRoster::default();
+        roster.record_to(path.clone());
+        let a = admit(&roster, "a", 41);
+        let hash = "a".repeat(64);
+        a.set_resume_token_sha256(&hash).unwrap();
+        fail_next_file_sync();
+        assert!(a.set_resume_token_sha256(&"b".repeat(64)).is_err());
+        let expected = record("a", 41, Some(&hash));
+        assert_eq!(entries(&path), std::slice::from_ref(&expected));
+        drop(admit(&roster, "b", 42));
+        assert_eq!(entries(&path), [expected]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_guard_keeps_child_hash() {
+        let dir = ScratchDir::new("roster-retained-hash");
+        let path = dir.join("live-children.json");
+        let roster = ChildRoster::default();
+        roster.record_to(path.clone());
+        let a = admit(&roster, "a", 41);
+        let hash = "a".repeat(64);
+        a.set_resume_token_sha256(&hash).unwrap();
+        a.retain(RetainedReason::Unverifiable);
+        drop(admit(&roster, "b", 42));
+        assert_eq!(entries(&path), [record("a", 41, Some(&hash))]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn held_is_exempt_from_cold_rechecks_and_survives_admit_and_reap() {
+        let dir = ScratchDir::new("roster-held-hash");
+        let path = dir.join("live-children.json");
+        let held_pid = i32::MAX as u32;
+        let cold_pid = held_pid - 1;
+        let held = record("held", held_pid, Some(&"b".repeat(64)));
+        let cold = record("cold", cold_pid, None);
+        let reasons = BTreeMap::from([(held_pid, RetainedReason::EmptyContainerDirectory)]);
+        write_record_with_reasons(&path, &[held.clone(), cold], reasons.clone()).unwrap();
+        let roster = ChildRoster::default();
+        roster.record_to_with_adopted(path.clone(), &AdoptedPids::from_classes([], [held_pid]));
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let start = held.child.start_time.expect("test child has a start time");
+            assert!(!roster
+                .remove_reaped_adoption("held", cold_pid, start)
+                .unwrap());
+            assert!(!roster
+                .remove_reaped_adoption("held", held_pid, start + 1)
+                .unwrap());
+        }
+
+        // Both PIDs are outside the OS's allocation range. Cold recovery can
+        // drop its entry when the PID doesn't exist, but must not touch Held.
+        roster.inner.recheck_retained_now();
+        assert_eq!(
+            read_record_entries(&path).unwrap(),
+            (vec![held.clone()], reasons.clone())
+        );
+        assert_eq!(roster.previous_instance_pid("held"), Some(held_pid));
+        let b = admit(&roster, "b", 42);
+        assert_eq!(entries(&path), [record("b", 42, None), held.clone()]);
+        drop(b);
+        assert_eq!(read_record_entries(&path).unwrap(), (vec![held], reasons));
+    }
+
+    #[test]
+    fn adopt_moves_the_verified_entry_and_hash_into_the_live_roster_once() {
+        let dir = ScratchDir::new("roster-adopted-hash");
+        let path = dir.join("live-children.json");
+        let adopted = record("adopted", 41, Some(&"a".repeat(64)));
+        let unhashed = record("unhashed", 42, None);
+        let held = record("held", 43, Some(&"c".repeat(64)));
+        let initial = [adopted.clone(), unhashed.clone(), held.clone()];
+        write_record_with_reasons(&path, &initial, BTreeMap::new()).unwrap();
+        let roster = ChildRoster::default();
+        roster.record_to_with_adopted(path.clone(), &AdoptedPids::from_classes([41, 42], [43]));
+        let bytes = fs::read(&path).unwrap();
+
+        let mut mismatched = adopted.clone();
+        mismatched.child.start_time = Some(2000);
+        for rejected in [&mismatched, &unhashed, &held] {
+            assert!(roster
+                .admit_adopted(rejected, RecordedIdentity::default())
+                .is_err());
+        }
+        let guard = roster
+            .admit_adopted(&adopted, RecordedIdentity::default())
+            .unwrap();
+        assert!(roster
+            .admit_adopted(&adopted, RecordedIdentity::default())
+            .is_err());
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            bytes,
+            "adoption needs no record rewrite"
+        );
+        drop(admit(&roster, "other", 44));
+        assert_eq!(entries(&path), initial);
+        drop(guard);
+        assert_eq!(entries(&path), [unhashed, held]);
+    }
 }
 
 #[cfg(unix)]
@@ -1003,9 +1444,11 @@ mod unix_shutdown {
                         "supervised child did not exit during daemon shutdown; sending SIGKILL"
                     );
                     #[cfg(target_os = "linux")]
-                    if entry.start_time.is_none_or(|expected| {
-                        crate::provenance::process_start_time(entry.pid) == Some(expected)
-                    }) {
+                    if entry.adopted_signal.is_none()
+                        && entry.start_time.is_none_or(|expected| {
+                            crate::provenance::process_start_time(entry.pid) == Some(expected)
+                        })
+                    {
                         if let Some(name) = &entry.recorded.cgroup_name {
                             crate::supervise::kill_module_cgroup(
                                 entry.recorded.cgroup_placement.as_ref(),
@@ -1265,6 +1708,15 @@ mod unix_shutdown {
     }
 
     fn signal(entry: &RosterEntry, signal: Signal) {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(adopted) = &entry.adopted_signal {
+            if let Some(adopted) = adopted.upgrade() {
+                if let Err(error) = adopted.signal(signal) {
+                    debug!(module_id = %entry.module_id, %error, "verified shutdown signal was not delivered");
+                }
+            }
+            return;
+        }
         if let Some(group) = &entry.recorded.plain_group {
             if let Some(group) = group.upgrade() {
                 if let Err(error) = group.signal(signal) {

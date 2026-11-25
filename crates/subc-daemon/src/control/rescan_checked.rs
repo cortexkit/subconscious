@@ -61,6 +61,7 @@ pub(super) struct RescanInput {
 }
 
 pub(super) enum RescanInputError {
+    Lifecycle(crate::supervise::live_upgrade::LifecycleRefusal),
     Config(&'static str, String),
     Gate(crate::config_gate::GateError),
 }
@@ -70,6 +71,7 @@ impl RescanInputError {
         match self {
             Self::Config(code, message) => control_error_frame(request, code, message),
             Self::Gate(error) => config_gate::config_error_frame(request, error),
+            Self::Lifecycle(refusal) => super::control_error_body_frame(request, refusal.body()),
         }
     }
 }
@@ -442,6 +444,10 @@ impl ControlHandler {
         use tokio::time::{timeout_at, Instant};
         use RescanInputError::Config;
 
+        if let Some(refusal) = self.supervisor.lifecycle_refusal(None) {
+            return Err(RescanInputError::Lifecycle(refusal));
+        }
+
         let staged = self.staged_generation(context);
         let (config, approved_preview) = if matches!(mode, RescanMode::Candidate(_)) {
             (Self::read_rescan_config(mode, &context.config_path)?, None)
@@ -514,7 +520,11 @@ impl ControlHandler {
             })??
         };
 
-        let guard = self.supervisor.operation_lock().lock_owned().await;
+        let guard = self
+            .supervisor
+            .lifecycle_operation(None)
+            .await
+            .map_err(RescanInputError::Lifecycle)?;
         let current = self.staged_generation(context);
         let changed = match mode {
             RescanMode::Candidate(_) => None,

@@ -36,7 +36,7 @@ async fn unusable_records_are_quarantined_without_resetting_the_evidence() {
             &owner,
             &AdoptedPids::none(),
             SweepBounds::default(),
-            |_, _, _| async { panic!("unusable identities must never reach the signal sweep") },
+            |_, _| async { panic!("unusable identities must never reach the signal sweep") },
         )
         .await;
         assert!(decisions.is_empty());

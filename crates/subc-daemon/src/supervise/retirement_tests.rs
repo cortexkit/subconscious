@@ -10,6 +10,8 @@ fn provider_hello(module: &str) -> subc_protocol::Frame {
         Concurrency, ExecutionMode, IdentityScope, ModuleManifest, ProviderRole, Tool,
     };
     let body = subc_protocol::ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest: ModuleManifest::builder(module, "1.0.0")
             .provides(vec![ProviderRole::ToolProvider {
                 tools: vec![Tool {

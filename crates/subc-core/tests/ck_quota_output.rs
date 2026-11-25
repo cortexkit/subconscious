@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! `ck quota` prints exactly what it printed before the quota module's row
 //! parsing moved into `ck_ui::quota` (shared with the app's Usage panel):
 //! the default table and `--verbose`, for recorded `usage.get` rows covering

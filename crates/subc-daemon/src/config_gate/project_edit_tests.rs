@@ -51,7 +51,7 @@ async fn apply_edit(rig: &CaptureRig, plan: PreparedPlan) -> u64 {
     let view = finish(&rig.owner, plan);
     let (generation, witness) = publish(rig, &view).await;
     rig.owner
-        .write_approved_project_files(generation, witness)
+        .write_approved_project_files(generation, witness, None)
         .await;
     generation
 }
@@ -416,7 +416,7 @@ async fn project_edit_late_write_adopts_by_content_after_restart_without_writing
         }
     }));
     rig.owner
-        .write_approved_project_files(generation, witness.clone())
+        .write_approved_project_files(generation, witness.clone(), None)
         .await;
     assert_eq!(writes.load(Ordering::Relaxed), 1);
     assert!(intents(&rig).contains_key(&path));
@@ -433,12 +433,12 @@ async fn project_edit_late_write_adopts_by_content_after_restart_without_writing
             .write_back_behind
     );
     rig.owner
-        .write_approved_project_files(generation, witness)
+        .write_approved_project_files(generation, witness, None)
         .await;
     assert_eq!(writes.load(Ordering::Relaxed), 1);
     assert_eq!(
         rig.owner
-            .apply_control_edits(next.digest)
+            .apply_control_edits(next.digest, None)
             .await
             .unwrap_err()
             .code,
@@ -512,6 +512,252 @@ async fn project_edit_late_write_adopts_by_content_after_restart_without_writing
     assert_eq!(std::fs::read(path).unwrap(), expected);
 }
 
+// The test-only OS prompt policy below exists only with `test-support`.
+#[cfg(all(
+    feature = "test-support",
+    any(target_os = "linux", target_os = "macos")
+))]
+#[tokio::test]
+async fn stalled_project_write_keeps_upgrade_out_after_waiter_expires() {
+    use crate::operator_confirm::{OperatorProvider, OperatorWithdraw, ProviderResult};
+    use sha2::Digest;
+    struct Approve;
+    impl OperatorProvider for Approve {
+        fn config_gate_ready(&self) -> bool {
+            true
+        }
+        fn prompt(
+            &self,
+            _: &str,
+            _: Box<dyn FnOnce(Arc<dyn OperatorWithdraw>) + Send>,
+        ) -> ProviderResult {
+            ProviderResult::Approved
+        }
+    }
+
+    let mut rig = CaptureRig::with_state(
+        true,
+        RootIoPool::with_timeout(Duration::from_secs(1)).unwrap(),
+        false,
+    );
+    // Keep module a's settings, but disable it so config.apply does not
+    // try to launch its nonexecutable fixture file during reconciliation.
+    let config = rig.rig.path.join("subc.jsonc");
+    let mut daemon_config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+    daemon_config["modules"]["a"]["enabled"] = serde_json::json!(false);
+    std::fs::write(&config, serde_json::to_vec(&daemon_config).unwrap()).unwrap();
+    rig.stamp = rig.rig.stamp(&rig.owner);
+    rig.owner
+        .lock()
+        .unwrap()
+        .store
+        .record_delivery(&tuple(None), rig.stamp, true)
+        .unwrap();
+    let private = root(&rig.project_scratch, "writer-held");
+    rig.set_projects(vec![member("A", None, &[&private])]);
+    let path = private.join(".cortexkit/a.jsonc");
+    let view = finish(
+        &rig.owner,
+        prepare(&rig, vec![edit("project", Some("A"), None, 4)])
+            .await
+            .unwrap(),
+    );
+    let (entered, reached) = tokio::sync::oneshot::channel();
+    let entered = Mutex::new(Some(entered));
+    let (published, wrote) = tokio::sync::oneshot::channel();
+    let published_file = Mutex::new(Some(published));
+    let (release, hold) = std::sync::mpsc::channel();
+    let hold = Mutex::new(hold);
+    *rig.owner.project_write_hook.lock().unwrap() = Some(Arc::new(move |published| {
+        if !published {
+            entered.lock().unwrap().take().unwrap().send(()).unwrap();
+            hold.lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+        } else {
+            published_file
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .send(())
+                .unwrap();
+        }
+        Ok(())
+    }));
+    let daemon = root(&rig.project_scratch, "upgrade-daemon");
+    let registry = Arc::new(crate::Registry::default());
+    let handle = crate::supervise::SupervisorHandle::new();
+    let supervisor = crate::Supervisor::new_for_test(registry.clone(), Default::default())
+        .with_handle(handle.clone());
+    let executable = cortexkit_test_support::cargo_profile_bin("ck-subc-under-test");
+    let checksum = format!(
+        "{:x}",
+        sha2::Sha256::digest(std::fs::read(&executable).unwrap())
+    );
+    let declared = crate::supervise::ModuleSpec {
+        module_id: "write-fixture".into(),
+        program: "/bin/sleep".into(),
+        args: vec!["60".into()],
+        env: ["XDG_DATA_HOME", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"]
+            .into_iter()
+            .map(|key| (key.into(), daemon.display().to_string()))
+            .collect(),
+        protocol: subc_control::ModuleProtocol::None,
+        script: None,
+        carry_containment: false,
+        reserved: false,
+        reserved_prefixes: vec![],
+        overlap: Default::default(),
+    };
+    let forwarding = Arc::new(crate::ForwardingTable::default());
+    forwarding
+        .operator_confirms()
+        .configure(Arc::new(Approve), Default::default());
+    let runtime =
+        crate::bootstrap::upgrade_runtime_for_test(&daemon, &supervisor, executable).await;
+    let mut control = crate::ControlHandler::with_forwarding(registry, forwarding)
+        .with_config_runtime(rig.owner.clone())
+        .with_supervisor(handle)
+        .with_supervisor_rescan(supervisor.clone(), rig.rig.path.join("subc.jsonc"), None)
+        .with_config_os_prompt_policy_for_tests();
+    control.upgrade = Some(runtime.clone());
+    let control = Arc::new(control);
+    let router = Arc::new(crate::Router::with_control_handler(control.clone()));
+    let (connection, mut client, task) = crate::server::config_test_connection_loop(router);
+    control.record_observed_peer(
+        connection,
+        subc_os::local_peer::ObservedPeer::Observed(subc_os::local_peer::PeerObservation {
+            user: subc_os::local_peer::PeerUser::Uid(subc_os::effective_uid()),
+            pid: std::process::id(),
+            exe: None,
+            signing_id: None,
+        }),
+    );
+    rig.owner.desktop_view_delivered(connection, &view).unwrap();
+    *rig.owner.trusted_review_connection_for_test.lock().unwrap() = Some(connection);
+    let (finished, waiter_done) = tokio::sync::oneshot::channel();
+    *rig.owner.project_write_waiter_done.lock().unwrap() = Some(finished);
+    let request = |corr, body: serde_json::Value| {
+        crate::Frame::build(
+            subc_protocol::FrameType::Request,
+            subc_protocol::Flags::new(false, subc_protocol::Priority::Passive, false),
+            0,
+            0,
+            corr,
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap()
+    };
+    async fn response(client: &mut tokio::io::DuplexStream) -> crate::Frame {
+        tokio::time::timeout(Duration::from_secs(10), crate::read_frame(client))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+    }
+    crate::write_frame(
+        &mut client,
+        &request(
+            11,
+            serde_json::json!({"op":"config.apply", "digest":view.digest}),
+        ),
+    )
+    .await
+    .unwrap();
+    let applied = response(&mut client).await;
+    assert_eq!(
+        applied.header.ty,
+        subc_protocol::FrameType::Response,
+        "{}",
+        String::from_utf8_lossy(&applied.body)
+    );
+    tokio::time::timeout(Duration::from_secs(5), reached)
+        .await
+        .unwrap()
+        .unwrap();
+    let registered = supervisor
+        .register_configured_with_health(
+            declared,
+            true,
+            Default::default(),
+            Some(0),
+            Default::default(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    let child = supervisor
+        .start_registered_configured_async(registered, None, true)
+        .await
+        .unwrap();
+    let pid = child.status().unwrap().pid.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), waiter_done)
+        .await
+        .unwrap()
+        .unwrap();
+    let upgrade = request(
+        12,
+        serde_json::json!({"op":"daemon.upgrade_in_place","executable_sha256":checksum}),
+    );
+    crate::write_frame(&mut client, &upgrade).await.unwrap();
+    let reply = response(&mut client).await;
+    assert_eq!(
+        reply.header.ty,
+        subc_protocol::FrameType::Error,
+        "the upgrade must not begin while publication is blocked: {}",
+        String::from_utf8_lossy(&reply.body)
+    );
+    let refused: subc_protocol::ErrorBody = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(refused.code, "upgrade_busy");
+    assert_eq!(refused.detail.unwrap()["reason"], "settings");
+    assert!(rig.registry.pool.health().unwrap().charged_workers > 0);
+    assert!(!path.exists());
+    assert_eq!(
+        child.status().unwrap().pid,
+        Some(pid),
+        "the busy upgrade must not start stopping the child"
+    );
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), wrote)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap()
+            ["limit"],
+        4
+    );
+    crate::write_frame(
+        &mut client,
+        &request(
+            13,
+            serde_json::json!({"op":"daemon.upgrade_in_place","executable_sha256":checksum}),
+        ),
+    )
+    .await
+    .unwrap();
+    let receipt = response(&mut client).await;
+    assert_eq!(
+        receipt.header.ty,
+        subc_protocol::FrameType::Response,
+        "{}",
+        String::from_utf8_lossy(&receipt.body)
+    );
+    tokio::time::timeout(Duration::from_secs(5), runtime.wait_for_idle())
+        .await
+        .unwrap();
+    assert_ne!(
+        child.status().unwrap().pid,
+        Some(pid),
+        "the valid candidate must get as far as planned stop"
+    );
+    child.set_enabled(false).await.unwrap();
+    drop(client);
+    task.await.unwrap().unwrap();
+}
+
 #[tokio::test]
 async fn project_edit_prepublication_failure_does_not_block_the_next_approval() {
     let rig = CaptureRig::new();
@@ -570,7 +816,10 @@ async fn project_edit_unstamped_checks_only_target_and_distinguishes_late_public
     let view = finish(&rig.owner, plan);
     std::fs::write(&sibling, b"{\"limit\": 8}").unwrap();
     assert_eq!(
-        rig.owner.apply_control_edits(view.digest).await.unwrap(),
+        rig.owner
+            .apply_control_edits(view.digest, None)
+            .await
+            .unwrap(),
         Some(0)
     );
     assert_eq!(std::fs::read(&workspace).unwrap(), b"{\"limit\":6}");
@@ -594,7 +843,7 @@ async fn project_edit_unstamped_checks_only_target_and_distinguishes_late_public
     }));
     assert_eq!(
         rig.owner
-            .apply_control_edits(view.digest)
+            .apply_control_edits(view.digest, None)
             .await
             .unwrap_err()
             .code,
@@ -619,7 +868,10 @@ async fn project_edit_unstamped_refuses_invalid_or_unreadable_affected_tuple() {
     assert_eq!(view.refusals.len(), 1);
     assert_eq!(view.refusals[0].project_id.as_deref(), Some("B"));
     assert_eq!(
-        rig.owner.apply_control_edits(view.digest).await.unwrap(),
+        rig.owner
+            .apply_control_edits(view.digest, None)
+            .await
+            .unwrap(),
         None
     );
     assert_eq!(std::fs::read(&workspace).unwrap(), br#"{"limit":4}"#);
@@ -653,7 +905,7 @@ async fn project_edit_unstamped_rechecks_membership_target_bytes_and_registry_ou
     rig.set_projects(vec![a.clone(), member("B", Some("W"), &[])]);
     assert_eq!(
         rig.owner
-            .apply_control_edits(view.digest)
+            .apply_control_edits(view.digest, None)
             .await
             .unwrap_err()
             .code,
@@ -665,7 +917,7 @@ async fn project_edit_unstamped_rechecks_membership_target_bytes_and_registry_ou
     *rig.registry.reply.lock().unwrap() = None;
     assert_eq!(
         rig.owner
-            .apply_control_edits(view.digest.clone())
+            .apply_control_edits(view.digest.clone(), None)
             .await
             .unwrap_err()
             .code,
@@ -675,7 +927,7 @@ async fn project_edit_unstamped_rechecks_membership_target_bytes_and_registry_ou
     std::fs::write(&target, br#"{"limit":5}"#).unwrap();
     assert_eq!(
         rig.owner
-            .apply_control_edits(view.digest)
+            .apply_control_edits(view.digest, None)
             .await
             .unwrap_err()
             .code,

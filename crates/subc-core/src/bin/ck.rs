@@ -1,4 +1,4 @@
-// `ck` — the CortexKit operator CLI.
+#![forbid(unsafe_code)]
 //
 // This binary is the founding piece of the CortexKit umbrella command. The
 // daemon/module control domain ships first, and the argument parser is shaped as
@@ -25,6 +25,8 @@ macro_rules! println {
 #[path = "activity/mod.rs"]
 mod activity;
 mod ck_help;
+mod ck_upgrade_in_place;
+use ck_upgrade_in_place::DAEMON_HELP;
 mod ckni;
 mod config_cli;
 mod connection_choice;
@@ -418,8 +420,6 @@ const HEALTH_HELP: &str = "ck health — module health\n\nusage: ck [--json] [--
 
 const MACHINE_HELP: &str = "ck machine — this machine's id, the name the daemon gives every module\n\nusage:\n  ck [--json] machine show\n  ck [--json] machine adopt <id> [--force]\n\n  show prints the id stored in <data home>/cortexkit/machine-id and the id the\n  running daemon serves, and says when they differ.\n  adopt replaces the stored id with <id> (32 lowercase hex characters), for\n  restoring a machine's identity. It takes effect at the next daemon start, and\n  every module on this machine then reports the new id. It refuses while the\n  daemon is running unless --force is given; even then the running daemon keeps\n  serving its current id until it restarts.";
 
-const DAEMON_HELP: &str = "ck daemon — daemon version, uptime, connection info, offline triage, and CI lint\n\nusage:\n  ck [--json] [--verbose] daemon\n  ck [--json] daemon triage\n  ck daemon lint [<config>] [--verbose]\n\n  triage reads only the local run directory; it never contacts the daemon.\n  lint reads module manifests without connecting to the daemon.";
-
 const SETUP_HELP: &str = "ck setup — plan managed CortexKit installation\n\nusage:\n  ck setup [aft|mc|insula|claustrum|synapse] [--with aft,mc,insula,claustrum,synapse] [--dry-run] [--verbose] [--yes|-y]\n  ck setup claustrum [--key-path <file>]\n  ck setup <aft|mc> --convert [--confirm]\n  ck setup --uninstall [--dry-run]\n  ck setup operator-prompt [--uninstall]\n\n  Bare setup installs core and lists available optional modules to add with\n  `ck setup <name>`; it does not prompt to select optional modules. --dry-run prints the\n  complete plan without changing anything. Interactive setup shows that plan and\n  asks Continue? [y/N] before changes; --yes (-y) skips the question. Piped or\n  non-terminal setup proceeds without a question. --convert is explicit and requires\n  --confirm before it can apply a conversion plan. --verbose includes plan outcomes\n  and download diagnostics when a network request fails.";
 
 const UPGRADE_HELP: &str = "ck upgrade — plan managed component upgrades\n\nusage:\n  ck upgrade [--dry-run] [--verbose]\n  ck upgrade --check [--verbose]\n\n  --check reports available updates without changing anything. --dry-run prints\n  the complete plan without changing anything. --verbose includes plan outcomes\n  and execution evidence. --check exits 0 for current binaries or available\n  updates, and 1 when ownership is missing or an unowned destination is found.";
@@ -443,7 +443,7 @@ fn record_test_probe(path: &Path) {
 }
 
 #[tokio::main]
-async fn main() {
+pub(crate) async fn main() {
     let argv = env::args_os().collect::<Vec<_>>();
     if let Some(result) = setup::bootstrap_entry(&argv) {
         process::exit(
@@ -467,6 +467,7 @@ async fn main() {
             CkError::FleetLintExit { exit_code }
             | CkError::TriageExit { exit_code }
             | CkError::StackWindowExit { exit_code }
+            | CkError::DaemonUpgradeExit { exit_code }
             | CkError::RenderedExit { exit_code },
         ) => process::exit(exit_code),
         Err(err) => {
@@ -720,6 +721,7 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
             health_detail(&mut client, &module_id, json_output, args.verbose).await
         }
         Command::Daemon => daemon(&mut client, json_output, args.verbose).await,
+        Command::DaemonUpgradeInPlace => ck_upgrade_in_place::run(client, json_output).await,
         Command::DaemonAnnounceRestart => {
             let reply = client.rpc_value(ClientControlRequest::DaemonShutdownIntent {
                 intent: json!("restart"),
@@ -1505,6 +1507,7 @@ struct CkArgs {
 
 enum Command {
     DaemonAnnounceRestart,
+    DaemonUpgradeInPlace,
     /// Prints the compile-time test-support state so integration tests reject a
     /// binary that cannot verify their fixture-signed release index.
     BuildShape,
@@ -7761,29 +7764,7 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
                 }
             }
         },
-        "daemon" => {
-            if tail
-                .iter()
-                .any(|arg| arg == "-h" || arg == "--help" || arg == "help")
-            {
-                return Ok(Command::Help(DAEMON_HELP.into()));
-            }
-            if tail.first().is_some_and(|verb| verb == "lint") {
-                return parse_daemon_lint(&tail[1..]);
-            }
-            let positional = tail
-                .iter()
-                .filter(|argument| argument.as_os_str() != "--verbose")
-                .collect::<Vec<_>>();
-            match positional.as_slice() {
-                [] => Ok(Command::Daemon),
-                [verb] if verb.as_os_str() == "announce-restart" => {
-                    Ok(Command::DaemonAnnounceRestart)
-                }
-                [verb] if verb.as_os_str() == "triage" => Ok(Command::DaemonTriage),
-                _ => Ok(Command::Help(DAEMON_HELP.into())),
-            }
-        }
+        "daemon" => ck_upgrade_in_place::parse_daemon(tail),
         "machine" => parse_machine_command(tail),
         "quota" => {
             let mut provider_id = None;
@@ -8013,6 +7994,9 @@ enum CkError {
     StackWindowExit {
         exit_code: i32,
     },
+    DaemonUpgradeExit {
+        exit_code: i32,
+    },
     /// The command already printed its complete human-facing refusal.
     RenderedExit {
         exit_code: i32,
@@ -8060,6 +8044,7 @@ impl CkError {
             Self::FleetLintExit { exit_code }
             | Self::TriageExit { exit_code }
             | Self::StackWindowExit { exit_code }
+            | Self::DaemonUpgradeExit { exit_code }
             | Self::RenderedExit { exit_code } => *exit_code,
             Self::WithFooter { error, .. } => error.exit_code(),
         }
@@ -8107,6 +8092,7 @@ impl fmt::Display for CkError {
             Self::FleetLintExit { .. }
             | Self::TriageExit { .. }
             | Self::StackWindowExit { .. }
+            | Self::DaemonUpgradeExit { .. }
             | Self::RenderedExit { .. } => Ok(()),
             Self::Json(source) => write!(f, "json: {source}"),
             Self::WithFooter { error, footer } => {

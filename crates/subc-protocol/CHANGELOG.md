@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.37.9
+
+- Define `module.upgrading`, `live-upgrade/v1`, the optional HELLO and HELLO_ACK
+  members for reconnecting after an in-place daemon upgrade, and terminal
+  `resume_refused`. Upgrade-related `module_reloading` refusals carry
+  `detail.reason: "daemon_upgrade"` and retain the pre-send retry guarantee.
+- Roll out daemon support before modules opt in. Older peers ignore the optional
+  fields; modules only return tokens they received, and only modules that
+  declared the capability receive the notice. HELLO and HELLO_ACK bytes are
+  unchanged when the new members are absent.
+- Rust HELLO and HELLO_ACK struct literals must supply the new optional fields;
+  match or ignore `ModuleControlCommand::Upgrading` when handling commands.
+
 ## 0.37.8
 
 - Add `CallerAttestation.settings_credentials` (`SettingsCredentials { generation, refs }`):

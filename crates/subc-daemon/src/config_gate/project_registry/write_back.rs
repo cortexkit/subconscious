@@ -166,10 +166,14 @@ impl RegistryRevision {
         &self,
         pool: &RootIoPool,
         intent: ProjectWriteBackIntent,
+        settings: Option<crate::control::upgrade_in_place::SettingsPermit>,
         #[cfg(test)] hook: Option<super::super::runtime::ProjectWriteHook>,
     ) -> Result<RootIoJob<Result<()>>> {
         let revision = self.clone();
         let job = pool.submit(intent.target.root.clone(), move || {
+            // The root worker keeps writing if its waiter reaches the deadline.
+            // Exclude upgrades until this writer actually returns.
+            let _settings = settings;
             revision.write_retained(
                 &intent,
                 #[cfg(test)]

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! The service argument, never ambient home variables, selects config authority.
 
 mod common;
@@ -216,6 +218,41 @@ fn config_artifacts(root: &Path, paths: &mut Vec<PathBuf>) {
             paths.push(entry.path());
         }
     }
+}
+
+#[tokio::test]
+async fn cold_start_configuration_error_reaches_daemon_log() {
+    let root = Temp::new();
+    let store = root.0.join("missing/config-store");
+    let mut daemon = Daemon::start(root.0.path().to_path_buf(), Some(&store));
+    let status = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(status) = daemon.child.try_wait().unwrap() {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("invalid configuration did not stop startup");
+    assert_eq!(status.code(), Some(2));
+    let logs = root.0.join("data/cortexkit/run/logs");
+    let found = fs::read_dir(&logs).into_iter().flatten().any(|entry| {
+        let path = entry.unwrap().path();
+        path.file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("subc.")
+            && fs::read_to_string(path)
+                .unwrap()
+                .lines()
+                .any(|line| line.contains("--config-store-root requires a readable parent"))
+    });
+    assert!(
+        found,
+        "missing invalid store-root refusal in {}",
+        logs.display()
+    );
 }
 
 #[tokio::test]

@@ -6,6 +6,7 @@ use super::*;
 
 fn module(capability: bool) -> (ModuleHandle, mpsc::Receiver<Frame>) {
     let ack = ModuleHelloAckBody {
+        resume_token: None,
         negotiated_ver: PROTOCOL_VERSION,
         subc_ops: vec![subc_control::ops::ACTIVITY_RECORD.to_owned()],
         subc_capabilities: if capability {
@@ -171,7 +172,7 @@ async fn activity_record_timeout_cancel_and_connection_close_release_waiters() {
         Err(ActivityRecordError::Timeout)
     ));
     assert!(handle
-        .shared
+        .shared()
         .lock_inner()
         .pending_activity_records
         .is_empty());
@@ -181,7 +182,7 @@ async fn activity_record_timeout_cancel_and_connection_close_release_waiters() {
     call.abort();
     assert!(call.await.unwrap_err().is_cancelled());
     assert!(handle
-        .shared
+        .shared()
         .lock_inner()
         .pending_activity_records
         .is_empty());
@@ -197,7 +198,7 @@ async fn activity_record_timeout_cancel_and_connection_close_release_waiters() {
         Err(ActivityRecordError::ConnectionClosed)
     ));
     assert!(handle
-        .shared
+        .shared()
         .lock_inner()
         .pending_activity_records
         .is_empty());

@@ -206,6 +206,28 @@ canonicalized by the daemon. A target providing `scope-workdir/v1` receives the
 directory as `workdir` in the bind's `scope`. A carrier uses the selector shown above
 with its own supervised consumer identity; the selector alone grants nothing.
 
+### In-place daemon upgrades
+
+Set `liveUpgrade: true` on a supervised Linux or macOS provider only after it can
+rebuild its connection-local state. The SDK resumes an announced upgrade over
+the daemon's local socket, keeps the same provider, and leaves `provider.closed`
+pending. An ordinary disconnect or a refused or expired resume still ends a
+supervised provider as usual.
+
+- Scope owners should implement `async resumeScopeSync(provider)` and return
+  `{ generation, scopes }` with the full surviving set, including its persisted
+  scope epochs. The SDK sends it before any other frame on the new connection.
+  Do not call outbound methods from this hook; they are still fenced.
+- In `onReconnected(provider, outcome)`, rebuild watches, subscriptions, routes
+  and consumer connections. `outcome` is `undefined` when no sync was attempted,
+  `{ ok: true, reply }` when it returned a reply (inspect the per-record results),
+  or `{ ok: false, error }` on refusal or failure. Configuration refresh runs
+  independently, so the hook can wait for it or make its own round trips.
+- Between the announcement and resume startup, newly fenced calls fail with
+  `kind: "not_sent"` and `code: "daemon_upgrade"`. A written call without a
+  terminal reply may have run; do not assume it is safe to resend. Inbound data
+  handlers can finish, but old routes and their replies do not resume.
+
 ### Opt-in configuration delivery
 
 Pass `config: ModuleConfigOptions` to `SubcProvider.connect()` to list

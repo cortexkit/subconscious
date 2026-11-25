@@ -4,6 +4,7 @@ pub(super) const SUBC_CONTROL_OPS: &[&str] = &[
     "claim.mint",
     "claim.present",
     ops::DAEMON_SHUTDOWN_INTENT,
+    ops::DAEMON_UPGRADE_IN_PLACE,
     ops::ACTIVITY_RECORD,
     ops::ACTIVITY_QUERY,
     ops::ACTIVITY_SUBSCRIBE,

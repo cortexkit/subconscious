@@ -627,6 +627,32 @@ clock that keeps counting while the computer sleeps, and each accepted
 announcement replaces the previous one. It does not
 stop the daemon itself.
 
+### In-place upgrade receipt
+
+`daemon.upgrade_in_place` asks the daemon to replace itself with the build at
+its own executable path, keeping opted-in modules running (see
+[module-surface.md](module-surface.md), "Daemon upgrade in place"). It is refused
+with `upgrade_busy` while a settings approval or publication, or a module
+spawn, swap, drain or restart, is in progress, so nothing irreversible is left
+half done. During the switch the daemon holds an upgrade fence: it stops
+admitting new client requests and `route.open` calls, refuses them with
+`module_reloading` and `detail.reason: "daemon_upgrade"`, and lets work
+already admitted settle before the new image starts.
+
+The `exec_started` reply to `daemon.upgrade_in_place` includes three diagnostic
+fields:
+
+- `refusals_tracked`: data `REQUEST` and `route.open` refusals issued by the
+  daemon's upgrade fence. Other refusals are not tracked.
+- `refusals_unconfirmed`: tracked refusals that were lost or not confirmed
+  flushed by the deadline.
+- `settled_in_time`: whether all tracked work, readers and flushes settled by
+  the deadline. This can be true even when a known loss was counted.
+
+These fields do not determine whether a request is safe to retry. If a client
+misses its refusal and sees the connection close during cutover, it treats the
+request's outcome as unknown.
+
 ## 5. Module requests to the daemon
 
 A module sends these on the connection it registered with `HELLO`; the same

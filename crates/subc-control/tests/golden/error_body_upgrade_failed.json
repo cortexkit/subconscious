@@ -1,0 +1,1 @@
+{"code":"upgrade_failed","message":"daemon upgrade failed","detail":{"announced":[],"attempt_id":"00112233445566778899aabbccddeeff","restarted":["worker"],"stage":"planned_stop"}}

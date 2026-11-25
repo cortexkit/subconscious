@@ -119,13 +119,21 @@ impl ModuleHandle {
         &self,
         request: ActivityRecordRequest,
     ) -> Result<ActivityRecordResponse, ActivityRecordError> {
-        if !self.shared.supports_activity {
+        let shared = self.shared();
+        shared.check_upgrade_fence().map_err(|err| match err {
+            crate::CatalogUpdateError::Rejected(body) => ActivityRecordError::Refused {
+                reason: ActivityRefusal::from_code(&body.code),
+                body: Box::new(body),
+            },
+            _ => ActivityRecordError::ConnectionClosed,
+        })?;
+        if !shared.supports_activity {
             return Err(ActivityRecordError::NotSupported);
         }
         let body = serde_json::to_vec(&request)
             .map_err(|err| ActivityRecordError::Protocol(err.to_string()))?;
         let (corr, writer, rx) = {
-            let mut inner = self.shared.lock_inner();
+            let mut inner = shared.lock_inner();
             if inner.closed {
                 return Err(ActivityRecordError::ConnectionClosed);
             }
@@ -141,11 +149,11 @@ impl ModuleHandle {
         };
         // Cancellation removes the waiter even when the caller drops mid-send.
         let _guard = RecordWaiter {
-            handle: self.clone(),
+            shared: shared.clone(),
             corr,
         };
         let frame = Frame::build_with_version(
-            self.shared.negotiated_ver,
+            shared.negotiated_ver,
             FrameType::Request,
             crate::control_flags(),
             0,
@@ -156,10 +164,16 @@ impl ModuleHandle {
         .map_err(|err| ActivityRecordError::Protocol(err.to_string()))?;
         let deadline = Instant::now() + CATALOG_UPDATE_TIMEOUT;
         let reply = tokio::time::timeout_at(deadline, async {
-            writer
-                .send(frame)
+            shared
+                .queue_request(&writer, frame)
                 .await
-                .map_err(|_| ActivityRecordError::ConnectionClosed)?;
+                .map_err(|err| match err {
+                    crate::CatalogUpdateError::Rejected(body) => ActivityRecordError::Refused {
+                        reason: ActivityRefusal::from_code(&body.code),
+                        body: Box::new(body),
+                    },
+                    _ => ActivityRecordError::ConnectionClosed,
+                })?;
             rx.await.map_err(|_| ActivityRecordError::ConnectionClosed)
         })
         .await
@@ -183,13 +197,12 @@ impl ModuleHandle {
 }
 
 struct RecordWaiter {
-    handle: ModuleHandle,
+    shared: std::sync::Arc<crate::ModuleHandleShared>,
     corr: u64,
 }
 impl Drop for RecordWaiter {
     fn drop(&mut self) {
-        self.handle
-            .shared
+        self.shared
             .lock_inner()
             .pending_activity_records
             .remove(&self.corr);

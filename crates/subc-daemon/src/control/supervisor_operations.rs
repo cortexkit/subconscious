@@ -981,8 +981,10 @@ impl ControlHandler {
         drain_timeout_ms: Option<u64>,
         requester: Principal,
     ) -> Result<Vec<Frame>, RouterError> {
-        let operation_lock = self.supervisor.operation_lock();
-        let _operation_guard = operation_lock.lock().await;
+        let _operation_guard = match self.supervisor.lifecycle_operation(Some(&module_id)).await {
+            Ok(guard) => guard,
+            Err(refusal) => return Ok(vec![control_error_body_frame(&frame, refusal.body())?]),
+        };
         let Some(module) = self.supervisor.get(&module_id) else {
             return Ok(vec![control_error_frame(
                 &frame,
@@ -1042,8 +1044,11 @@ impl ControlHandler {
         // meant to abort. A rescan or stop that reaches the module during the
         // swap is served by the swap itself (see `supervise_swap`).
         let module = {
-            let operation_lock = self.supervisor.operation_lock();
-            let _operation_guard = operation_lock.lock().await;
+            let _operation_guard = match self.supervisor.lifecycle_operation(Some(&module_id)).await
+            {
+                Ok(guard) => guard,
+                Err(refusal) => return Ok(vec![control_error_body_frame(&frame, refusal.body())?]),
+            };
             self.supervisor.get(&module_id)
         };
         let Some(module) = module else {
@@ -1114,8 +1119,10 @@ impl ControlHandler {
         module_id: String,
         requester: Principal,
     ) -> Result<Vec<Frame>, RouterError> {
-        let operation_lock = self.supervisor.operation_lock();
-        let _operation_guard = operation_lock.lock().await;
+        let _operation_guard = match self.supervisor.lifecycle_operation(Some(&module_id)).await {
+            Ok(guard) => guard,
+            Err(refusal) => return Ok(vec![control_error_body_frame(&frame, refusal.body())?]),
+        };
         let Some(module) = self.supervisor.get(&module_id) else {
             return Ok(vec![control_error_frame(
                 &frame,
@@ -1169,8 +1176,10 @@ impl ControlHandler {
                 "reserved-id release requires a daemon started with a reloadable config path",
             )?]);
         };
-        let operation_lock = self.supervisor.operation_lock();
-        let _operation_guard = operation_lock.lock().await;
+        let _operation_guard = match self.supervisor.lifecycle_operation(Some(&module_id)).await {
+            Ok(guard) => guard,
+            Err(refusal) => return Ok(vec![control_error_body_frame(&frame, refusal.body())?]),
+        };
         let approved = if let Some(owner) = &self.config_runtime {
             // Observe the file as a proposal, but decide membership solely from
             // approved bytes. A proposed re-add must not retain a removed id.
@@ -1255,8 +1264,10 @@ impl ControlHandler {
         enabled: bool,
         requester: Principal,
     ) -> Result<Vec<Frame>, RouterError> {
-        let operation_lock = self.supervisor.operation_lock();
-        let _operation_guard = operation_lock.lock().await;
+        let _operation_guard = match self.supervisor.lifecycle_operation(Some(&module_id)).await {
+            Ok(guard) => guard,
+            Err(refusal) => return Ok(vec![control_error_body_frame(&frame, refusal.body())?]),
+        };
         let Some(module) = self.supervisor.get(&module_id) else {
             return Ok(vec![control_error_frame(
                 &frame,
@@ -1307,6 +1318,17 @@ impl ControlHandler {
         frame: Frame,
         module_id: String,
     ) -> Result<Vec<Frame>, RouterError> {
+        use crate::supervise::live_upgrade::LifecycleRefusal;
+
+        if let Some(refusal) = self.supervisor.lifecycle_refusal(Some(&module_id)) {
+            return Ok(vec![control_error_body_frame(&frame, refusal.body())?]);
+        }
+        if self.forwarding.upgrade_admission.borrow().fenced() {
+            return Ok(vec![control_error_body_frame(
+                &frame,
+                LifecycleRefusal::UpgradeBusy.body(),
+            )?]);
+        }
         self.refresh_capability_requirements();
         let Some(registration) = self
             .registry
@@ -1392,8 +1414,24 @@ impl ControlHandler {
 
                 // Queue admission and the reply share one deadline, so a module that
                 // stops reading cannot park the requesting connection's reader forever.
-                match timeout_at(deadline, module_sink.send(probe_frame)).await {
+                let fenced = RouterError::DaemonUpgrade {
+                    channel: 0,
+                    epoch: 0,
+                    corr: frame.header.corr,
+                };
+                match timeout_at(
+                    deadline,
+                    module_sink.send_upgrade_fenced(probe_frame, fenced),
+                )
+                .await
+                {
                     Ok(Ok(())) => {}
+                    Ok(Err(RouterError::DaemonUpgrade { .. })) => {
+                        return Ok(vec![control_error_body_frame(
+                            &frame,
+                            LifecycleRefusal::UpgradeBusy.body(),
+                        )?]);
+                    }
                     Ok(Err(err)) => {
                         return Ok(vec![control_error_frame(
                             &frame,

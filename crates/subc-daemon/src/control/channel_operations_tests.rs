@@ -126,6 +126,8 @@ async fn after_exit(rig: &Rig, body: impl Serialize) -> Frame {
 
 fn hello(module_id: &str) -> Frame {
     let hello = subc_protocol::ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest: ModuleManifest::builder(module_id, "1.0.0").build(),
         protocol_ver: PROTOCOL_VERSION,
         control_ops: None,
@@ -1034,6 +1036,8 @@ async fn unregistered_channel(
 
 fn hello_with_nonce(module_id: &str, nonce: &str) -> Frame {
     let body = subc_protocol::ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest: ModuleManifest::builder(module_id, "1.0.0").build(),
         protocol_ver: PROTOCOL_VERSION,
         control_ops: None,

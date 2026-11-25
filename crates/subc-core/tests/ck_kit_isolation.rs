@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! The private-daemon kit (`common::kit`) keeps `ck` away from every daemon
 //! but its own, on every platform.
 //!

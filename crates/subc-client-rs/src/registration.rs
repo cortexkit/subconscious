@@ -99,6 +99,10 @@ pub fn install_claim_minter(minter: Arc<dyn ClaimMinter>) -> Result<(), Registra
     if !CHANNEL_ADOPTED.load(Ordering::Acquire) {
         return Err(RegistrationError::NotAdopted);
     }
+    publish_claim_minter(minter)
+}
+
+fn publish_claim_minter(minter: Arc<dyn ClaimMinter>) -> Result<(), RegistrationError> {
     OWNER
         .set(minter)
         .map_err(|_| RegistrationError::AlreadyInstalled)?;
@@ -106,13 +110,13 @@ pub fn install_claim_minter(minter: Arc<dyn ClaimMinter>) -> Result<(), Registra
     Ok(())
 }
 
-struct SdkClaimMinter(Weak<ModuleHandleShared>);
+struct SdkClaimMinter(Weak<live_upgrade::Generations>);
 
 #[async_trait]
 impl ClaimMinter for SdkClaimMinter {
     async fn mint(&self, request: ClaimMintRequest) -> Result<ClaimMintReply, ClaimError> {
         ModuleHandle {
-            shared: self.0.upgrade().ok_or(ClaimError::Unavailable)?,
+            generations: self.0.upgrade().ok_or(ClaimError::Unavailable)?,
         }
         .mint_claim_reply(request)
         .await
@@ -126,6 +130,12 @@ pub(crate) struct Session {
     pool: tokio::sync::Mutex<Vec<PoolEntry>>,
 }
 
+impl Session {
+    pub(super) fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+}
+
 struct PoolEntry {
     path: PathBuf,
     options: ConsumerOptions,
@@ -135,6 +145,8 @@ struct PoolEntry {
 
 /// Claim failures never permit continuing with an unbound connection. Debug and
 /// Display omit daemon-authored messages and bodies, which can contain secrets.
+/// During an announced daemon upgrade, a new mint is refused locally with
+/// `module_reloading` before sending to the daemon.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ClaimError {
@@ -248,12 +260,28 @@ fn take_channel_stream() -> Result<Option<Box<dyn ModuleStream>>, RegistrationEr
 
 pub(crate) fn install_owner(handle: &ModuleHandle) -> Result<(), SubcModuleError> {
     handle
-        .shared
+        .shared()
         .registration
         .active
         .store(true, Ordering::Release);
-    install_claim_minter(Arc::new(SdkClaimMinter(Arc::downgrade(&handle.shared))))
-        .map_err(|error| SubcModuleError::RegistrationChannel(io::Error::other(error)))
+    install_claim_minter(Arc::new(SdkClaimMinter(Arc::downgrade(
+        &handle.generations,
+    ))))
+    .map_err(|error| SubcModuleError::RegistrationChannel(io::Error::other(error)))
+}
+
+pub(super) fn rebind_owner(shared: &ModuleHandleShared) {
+    shared.registration.active.store(true, Ordering::Release);
+}
+
+pub(super) fn install_resumed_nonce_owner(handle: &ModuleHandle) -> Result<(), SubcModuleError> {
+    // A nonce launch does not have a claim minter until the daemon accepts its
+    // first resume. From then on the minter follows the stable handle just as
+    // an inherited channel's minter does.
+    publish_claim_minter(Arc::new(SdkClaimMinter(Arc::downgrade(
+        &handle.generations,
+    ))))
+    .map_err(|error| SubcModuleError::RegistrationChannel(io::Error::other(error)))
 }
 
 pub(crate) async fn prefix_claim(module_id: &str) -> Result<Option<Claim>, ClaimError> {
@@ -329,20 +357,16 @@ impl ModuleHandle {
         options: ConsumerOptions,
         local: bool,
     ) -> Result<Arc<SubcConsumer>, ConsumerError> {
-        if self
-            .shared
-            .registration
-            .prefix_child
-            .load(Ordering::Acquire)
-        {
+        let shared = self.shared();
+        Self::check_claim_fence(&shared).map_err(ConsumerError::claim)?;
+        if shared.registration.prefix_child.load(Ordering::Acquire) {
             return Err(ConsumerError::claim(ClaimError::PrefixChildConsumer));
         }
-        if !self.shared.registration.active.load(Ordering::Acquire)
-            || self.shared.close_token.is_cancelled()
+        if !shared.registration.active.load(Ordering::Acquire) || shared.close_token.is_cancelled()
         {
             return Err(ConsumerError::claim(ClaimError::Unavailable));
         }
-        let mut pool = self.shared.registration.pool.lock().await;
+        let mut pool = shared.registration.pool.lock().await;
         pool.retain(|entry| {
             entry
                 .consumer
@@ -392,12 +416,14 @@ impl ModuleHandle {
         &self,
         request: ClaimMintRequest,
     ) -> Result<ClaimMintReply, ClaimError> {
-        if !self.shared.registration.active.load(Ordering::Acquire) {
+        let shared = self.shared();
+        Self::check_claim_fence(&shared)?;
+        if !shared.registration.active.load(Ordering::Acquire) {
             return Err(ClaimError::Unavailable);
         }
         let deadline = Instant::now() + CATALOG_UPDATE_TIMEOUT;
         loop {
-            let reply = timeout_at(deadline, self.claim_call(&request))
+            let reply = timeout_at(deadline, Self::claim_call(&shared, &request))
                 .await
                 .map_err(|_| ClaimError::Timeout)??;
             if reply.header.ty == FrameType::Error {
@@ -428,10 +454,22 @@ impl ModuleHandle {
         }
     }
 
-    async fn claim_call(&self, request: &ClaimMintRequest) -> Result<Frame, ClaimError> {
+    fn check_claim_fence(shared: &ModuleHandleShared) -> Result<(), ClaimError> {
+        shared.check_upgrade_fence().map_err(claim_send_error)
+    }
+
+    async fn claim_call(
+        shared: &Arc<ModuleHandleShared>,
+        request: &ClaimMintRequest,
+    ) -> Result<Frame, ClaimError> {
         let body = serde_json::to_vec(request).map_err(|_| ClaimError::Protocol)?;
         let (corr, writer, rx) = {
-            let mut inner = self.shared.lock_inner();
+            let mut inner = shared.lock_inner();
+            if inner.upgrade.fenced() {
+                return Err(claim_send_error(CatalogUpdateError::Rejected(
+                    live_upgrade::upgrade_refusal(),
+                )));
+            }
             let writer = inner.writer.clone().ok_or(ClaimError::Unavailable)?;
             let corr = next_module_control_corr(&mut inner).ok_or(ClaimError::Unavailable)?;
             let (tx, rx) = oneshot::channel();
@@ -439,11 +477,11 @@ impl ModuleHandle {
             (corr, writer, rx)
         };
         let _guard = ClaimWaiter {
-            handle: self.clone(),
+            shared: shared.clone(),
             corr,
         };
         let frame = Frame::build_with_version(
-            self.shared.negotiated_ver,
+            shared.negotiated_ver,
             FrameType::Request,
             control_flags(),
             0,
@@ -452,30 +490,36 @@ impl ModuleHandle {
             body,
         )
         .map_err(|_| ClaimError::Protocol)?;
-        writer
-            .send(frame)
+        shared
+            .queue_request(&writer, frame)
             .await
-            .map_err(|_| ClaimError::Unavailable)?;
+            .map_err(claim_send_error)?;
         rx.await.map_err(|_| ClaimError::Unavailable)
     }
 }
 
 struct ClaimWaiter {
-    handle: ModuleHandle,
+    shared: Arc<ModuleHandleShared>,
     corr: u64,
 }
 impl Drop for ClaimWaiter {
     fn drop(&mut self) {
-        self.handle
-            .shared
+        self.shared
             .lock_inner()
             .pending_claim_calls
             .remove(&self.corr);
     }
 }
 
+fn claim_send_error(error: CatalogUpdateError) -> ClaimError {
+    match error {
+        CatalogUpdateError::Rejected(body) => ClaimError::Refused { code: body.code },
+        _ => ClaimError::Unavailable,
+    }
+}
+
 pub(crate) fn bound() -> bool {
-    supervised() || HELPER_BOUND.load(Ordering::Acquire)
+    supervised() || OWNER.get().is_some() || HELPER_BOUND.load(Ordering::Acquire)
 }
 
 async fn mint_claim(minter: &dyn ClaimMinter, purpose: ClaimPurpose) -> Result<Claim, ClaimError> {
@@ -492,9 +536,10 @@ pub(crate) async fn bind_consumer<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     deadline: Duration,
 ) -> Result<(), ClaimError> {
-    let claim = if supervised() {
-        let owner = OWNER.get().ok_or(ClaimError::Unavailable)?;
+    let claim = if let Some(owner) = OWNER.get() {
         Some(mint_claim(owner.as_ref(), ClaimPurpose::SelfConnection).await?)
+    } else if supervised() {
+        return Err(ClaimError::Unavailable);
     } else {
         os::helper_claim()
             .map_err(|_| ClaimError::Handoff)?

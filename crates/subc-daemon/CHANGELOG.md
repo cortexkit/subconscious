@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.50.63
+
+- Add the privileged in-place upgrade operation on Linux and macOS. Verify
+  the replacement image, require operator approval, pause listeners and hand
+  over the locks and eligible children. If exec fails, recover on the same
+  listening sockets. Settings work and module lifecycle changes can block an
+  upgrade rather than being interrupted by it.
+- Authenticate the handover and validate inherited locks, child streams and
+  containment before adopting children with exit watchers. Preserve partial
+  output lines, prepare adopted modules concurrently and publish discovery only
+  once both listeners are ready. Report the new image and module dispositions
+  in `server.describe`, and distinguish a resume from a cold start in the log.
+- Issue supervised primary modules resume tokens after persisting their hashes,
+  and accept tokens only on the local Unix endpoint for a matching adoption and
+  process identity. Planned restarts of other running children don't count
+  toward their crash-restart limit. Preserve manual start and stop choices and
+  block replacement until the old process group or cgroup is proven empty.
+- Require subc-control 0.42.9, subc-os 0.1.54 and subc-protocol 0.37.9.
+
 ## 0.50.62
 
 - On a stamped install, review quiet user and workspace settings changes in one

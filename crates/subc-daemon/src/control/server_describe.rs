@@ -16,6 +16,15 @@ impl ControlHandler {
         // contended.
         let mut counters = self.counters.snapshot();
         if let Some(obj) = counters.as_object_mut() {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                if let Some(report) = self.supervisor.resume_report() {
+                    obj.insert("last_upgrade".into(), report);
+                }
+                if let Some(runtime) = &self.upgrade {
+                    runtime.describe(obj);
+                }
+            }
             obj.insert(
                 "control_usage".into(),
                 self.control_usage

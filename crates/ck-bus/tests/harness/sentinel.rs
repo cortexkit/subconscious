@@ -297,6 +297,8 @@ pub fn healthless_child_entry() {
             .await
             .expect("the module authenticates");
         let body = serde_json::to_vec(&ModuleHelloBody {
+            module_capabilities: None,
+            resume_token: None,
             manifest: ModuleManifest::builder(&module_id, "0.0.0-healthless").build(),
             protocol_ver: PROTOCOL_VERSION,
             // The control: no `health.check` among the advertised control ops.

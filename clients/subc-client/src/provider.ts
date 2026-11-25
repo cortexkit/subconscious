@@ -13,7 +13,7 @@ import {
   type RouteTarget,
   type SubcCallErrorKind,
 } from "./client.js";
-import { ConnectionFileError, readConnectionFile, type ConnectionInfo } from "./connection-file.js";
+import { ConnectionFileError, readConnectionFile, readConnectionFileWithLocalEndpoint, type ConnectionInfo } from "./connection-file.js";
 import { readCaller, type CallerAttestation } from "./attestation.js";
 import { presentClaim, registrationOwner } from "./registration-channel.js";
 import { ClaimError } from "./claim.js";
@@ -57,6 +57,8 @@ import {
 } from "./socket.js";
 
 import { ModuleConfig, type ModuleConfigOptions } from "./config.js";
+import { LIVE_UPGRADE_CAPABILITY, LOCAL_ENDPOINT_CLIENTS_ONLY, RESUME_REFUSED,
+  raceAbort, resumeDeadline, untilResumeDeadline } from "./live-upgrade.js";
 
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
 const CONTROL_REQUEST_TIMEOUT_MS = 10_000;
@@ -312,6 +314,17 @@ export type ProviderConnectionState =
   | { state: "reconnecting"; attempt: number }
   | { state: "restored"; epoch: number };
 
+export interface ResumeScopeSync {
+  generation: number;
+  scopes: readonly ScopeRecord[];
+}
+
+/** `undefined` means that no scope sync was attempted on this reconnect. */
+export type ReconnectOutcome =
+  | undefined
+  | { ok: true; reply: ScopeSyncReply }
+  | { ok: false; error: Error };
+
 export interface SubcProviderConnectOptions {
   connectionFile: string;
   manifest: ManifestInput;
@@ -341,6 +354,12 @@ export interface SubcProviderConnectOptions {
    * gauge counts as busy), or for its deadline. A pending hook alone is not busy.
    */
   onDraining?: (reason: RouteCloseReason, deadline: Date) => void | Promise<void>;
+  /** Opt a supervised Linux or macOS provider into announced daemon upgrades. */
+  liveUpgrade?: boolean;
+  /** Return the full scope set to send first after resume. Outbound calls are still fenced here. */
+  resumeScopeSync?: (provider: SubcProvider) => Promise<ResumeScopeSync | undefined>;
+  /** Rebuild connection-local state after resume, while dispatch and configuration delivery run. */
+  onReconnected?: (provider: SubcProvider, outcome: ReconnectOutcome) => void | Promise<void>;
   /** Backoff for provider reconnect after an unexpected socket drop. */
   reconnectBackoff?: ReconnectBackoff;
   /** Injectable sleep for timer-free reconnect and debounce tests. */
@@ -390,6 +409,9 @@ interface NormalizedSubcProviderConnectOptions {
   onBound?: (handle: RouteHandle) => void | Promise<void>;
   onRouteGone?: (handle: RouteHandle) => void | Promise<void>;
   onDraining?: (reason: RouteCloseReason, deadline: Date) => void | Promise<void>;
+  liveUpgrade: boolean;
+  resumeScopeSync?: SubcProviderConnectOptions["resumeScopeSync"];
+  onReconnected?: SubcProviderConnectOptions["onReconnected"];
   reconnectBackoff: ReconnectBackoff;
   sleep: (ms: number) => Promise<void>;
   restoredDebounceMs: number;
@@ -405,6 +427,8 @@ interface NormalizedSubcProviderConnectOptions {
 interface ControlPushState {
   undecodablePushLogged: boolean;
   drainingHooks: Set<Promise<void>>;
+  bindTail?: Promise<void>;
+  stop?: AbortController;
 }
 
 interface OpenedProviderConnection {
@@ -418,6 +442,17 @@ interface ReconnectCycle {
   socket: SubcSocket | null;
   socketDied: boolean;
   superseded: boolean;
+}
+
+export interface ModuleHelloBody {
+  manifest: Pick<ManifestInput, "module_id" | "module_version" | "protocol_ver" | "provides">
+    & Partial<ManifestInput>;
+  protocol_ver: number;
+  control_ops: string[] | null;
+  launch_nonce?: string;
+  module_capabilities?: string[];
+  /** Credential carried in place of a launch nonce on resume. Do not log. */
+  resume_token?: string;
 }
 
 export interface ModuleHelloAckBody {
@@ -438,6 +473,8 @@ export interface ModuleHelloAckBody {
    * predates the machine id.
    */
   machine_id?: string;
+  /** Single-use credential for the next announced upgrade. Do not log. */
+  resume_token?: string;
 }
 
 const MACHINE_ID_PATTERN = /^[0-9a-f]{32}$/;
@@ -553,8 +590,8 @@ export function jsonProviderHandler<Request = unknown, Response = unknown>(
 export class SubcProvider {
   /**
    * Resolves exactly once, when this provider will serve no more: after the
-   * daemon sends a channel-0 GOODBYE (supervisor restart or stop, daemon
-   * shutdown), after `close()`, and after a connection loss the provider will
+   * daemon sends a channel-0 GOODBYE without an upgrade announcement, after
+   * `close()`, and after a connection loss the provider will
    * not recover from (a drop under `reconnectOnDrop: false`, which is the
    * default for a supervised module, or a permanent reconnect failure). It
    * never rejects and stays pending while the provider is reconnecting.
@@ -569,9 +606,8 @@ export class SubcProvider {
   private closeStarted = false;
   private locallyClosed = false;
   private closedErr: Error | null = null;
-  // In-flight data requests are keyed by generation, channel, and correlation id.
-  // A socket drop only makes the reply path stale; handlers may still finish their
-  // durable work, and their late sends are ignored by the generation guard.
+  // Only the current connection's handlers are keyed by route and correlation
+  // id. Retired upgrade handlers keep their cancellation signals but no routes.
   private readonly inflight = new Map<string, AbortController>();
   private readonly pending = new Map<string, { resolve: (frame: Frame) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   private readonly liveRoutes = new Map<number, RouteHandle>();
@@ -583,8 +619,13 @@ export class SubcProvider {
   get subcCapabilities(): readonly string[] { return this.currentSubcCapabilities; }
   readonly config: ModuleConfig | undefined;
   private ingressEpochDropCount = 0;
-  private readonly requestGate = new AsyncPermitPool(DEFAULT_PROVIDER_HANDLER_CAPACITY);
+  private requestGate = new AsyncPermitPool(DEFAULT_PROVIDER_HANDLER_CAPACITY);
   private reconnecting: ReconnectCycle | null = null;
+  #resumeToken: string | undefined;
+  private upgradeDeadline: number | undefined;
+  private upgradeStop: AbortController | undefined;
+  private resumed = false;
+  private retiredData?: Set<AbortController>;
   private generation = 1;
   private connectionEpoch = 1;
   private stateQueue: Array<{ event: ProviderConnectionState; generation?: number; reconnect?: ReconnectCycle }> = [];
@@ -619,9 +660,11 @@ export class SubcProvider {
       capabilities: () => this.subcCapabilities,
       epoch: () => this.currentEpoch(),
       request: (body) => this.configControl(body),
+      checkSendAllowed: () => this.checkUpgradeFence(),
     }, opts.config) : undefined;
     this.storage = ack.storage;
     this.machineId = machineIdFromHelloAck(ack);
+    this.#resumeToken = opts.liveUpgrade ? resumeTokenFromAck(ack) : undefined;
     this.closed = new Promise<void>((resolve) => {
       this.resolveClosed = resolve;
     });
@@ -644,9 +687,13 @@ export class SubcProvider {
 
   /** Replace this owner's scope set. Omitted scopes end; per-record refusals remain reply data. */
   async scopeSync(generation: number, scopes: readonly ScopeRecord[]): Promise<ScopeSyncReply> {
+    return this.sendScopeSync({ generation, scopes });
+  }
+
+  private async sendScopeSync({ generation, scopes }: ResumeScopeSync, firstAfterResume = false): Promise<ScopeSyncReply> {
     const reply = await this.scopeControl("scope.sync", () => ({
       op: "scope.sync", generation: scopeInteger(generation), scopes: scopes.map(scopeRecordWire),
-    }));
+    }), firstAfterResume);
     return { generation: reply.generation, results: reply.results, ended: reply.ended ?? [] };
   }
 
@@ -658,7 +705,8 @@ export class SubcProvider {
     return { generation: reply.generation, results: reply.results, end_results: reply.end_results!, ended: reply.ended ?? [] };
   }
 
-  private async scopeControl(op: "scope.sync" | "scope.apply", body: () => object): Promise<ScopeSyncReply & { end_results?: ScopeEndResult[] }> {
+  private async scopeControl(op: "scope.sync" | "scope.apply", body: () => object, firstAfterResume = false): Promise<ScopeSyncReply & { end_results?: ScopeEndResult[] }> {
+    if (!firstAfterResume) this.checkUpgradeFence();
     if (this.closedErr) throw this.closedErr;
     if (this.reconnecting) throw new SubcProviderError("provider is reconnecting", "connection_lost", "not_sent");
     if (!this.subcOps.includes(op)) throw new SubcProviderError(`${op} is not supported by the daemon`, "not_supported", "not_sent");
@@ -675,10 +723,10 @@ export class SubcProvider {
       const timer = setTimeout(() => {
         if (this.pending.delete(key)) reject(new SubcProviderError(`${op} timed out; the mutation may have applied`, "request_timeout"));
       }, CONTROL_REQUEST_TIMEOUT_MS);
-      this.pending.set(key, { resolve, reject, timer });
+      const pending = { resolve, reject, timer };
+      this.pending.set(key, pending);
       this.sendOn(this.sock, this.generation, frame).catch((error) => {
-        const pending = this.pending.get(key);
-        if (!pending) return;
+        if (this.pending.get(key) !== pending) return;
         this.pending.delete(key);
         clearTimeout(pending.timer);
         reject(error instanceof Error ? error : new SubcProviderError(String(error)));
@@ -696,6 +744,7 @@ export class SubcProvider {
   }
 
   private async configControl(body: object): Promise<unknown> {
+    this.checkUpgradeFence();
     if (this.closedErr) throw this.closedErr;
     if (this.reconnecting) throw new SubcProviderError("provider is reconnecting", "connection_lost", "not_sent");
     const op = (body as { op: string }).op;
@@ -706,9 +755,11 @@ export class SubcProvider {
       const timer = setTimeout(() => {
         if (this.pending.delete(key)) reject(new SubcProviderError(`${op} timed out`, "request_timeout"));
       }, CONTROL_REQUEST_TIMEOUT_MS);
-      this.pending.set(key, { resolve, reject, timer });
+      const pending = { resolve, reject, timer };
+      this.pending.set(key, pending);
       this.sendOn(this.sock, this.generation, frame).catch((error) => {
-        if (!this.pending.delete(key)) return;
+        if (this.pending.get(key) !== pending) return;
+        this.pending.delete(key);
         clearTimeout(timer);
         reject(error);
       });
@@ -720,6 +771,7 @@ export class SubcProvider {
 
   /** Send a reverse request on exactly one installed route generation. */
   async request(handle: RouteHandle, body: Uint8Array, opts: RequestOptions = {}): Promise<Uint8Array> {
+    this.checkUpgradeFence();
     this.assertLiveHandle(handle);
     const corr = this.allocateCorr();
     const key = routeKey(handle, corr);
@@ -741,14 +793,14 @@ export class SubcProvider {
       const timer = setTimeout(() => {
         if (this.pending.delete(key)) reject(new SubcProviderError("reverse request timed out", "request_timeout"));
       }, timeoutMs);
-      this.pending.set(key, {
-        resolve: (response) => resolve(response.body),
+      const pending = {
+        resolve: (response: Frame) => resolve(response.body),
         reject,
         timer,
-      });
+      };
+      this.pending.set(key, pending);
       this.sendOn(this.sock, this.generation, frame).catch((error) => {
-        const pending = this.pending.get(key);
-        if (!pending) return;
+        if (this.pending.get(key) !== pending) return;
         this.pending.delete(key);
         clearTimeout(pending.timer);
         reject(error instanceof Error ? error : new SubcProviderError(String(error)));
@@ -758,6 +810,7 @@ export class SubcProvider {
 
   /** Emit an unsolicited Push after onBound has published the route. */
   async push(handle: RouteHandle, body: Uint8Array, opts: ProviderEmitOptions = {}): Promise<void> {
+    this.checkUpgradeFence();
     this.assertLiveHandle(handle);
     await this.sendOn(
       this.sock,
@@ -779,6 +832,7 @@ export class SubcProvider {
   }
 
   cancel(handle: RouteHandle, corr: bigint): void {
+    this.checkUpgradeFence();
     this.assertLiveHandle(handle);
     this.sendOn(
       this.sock,
@@ -788,6 +842,7 @@ export class SubcProvider {
   }
 
   closeRoute(handle: RouteHandle): void {
+    this.checkUpgradeFence();
     this.assertLiveHandle(handle);
     this.liveRoutes.delete(handle.channel);
     this.abortHandle(handle);
@@ -812,7 +867,7 @@ export class SubcProvider {
     const provider = new SubcProvider(opened.sock, opened.conn, normalized, opened.ack);
     const owner = registrationOwner();
     if (normalized.registrationChannel) {
-      owner.bind((body) => provider.configControl(body));
+      owner.bind((body) => provider.configControl(body), () => provider.checkUpgradeFence());
       void provider.closed.then(() => {
         owner.broker?.close();
         if (!provider.locallyClosed) {
@@ -823,7 +878,7 @@ export class SubcProvider {
         }
       });
     }
-    await provider.config?.refresh();
+    if (provider.upgradeDeadline === undefined) await provider.config?.refresh();
     return provider;
   }
 
@@ -879,7 +934,8 @@ export class SubcProvider {
   }
 
   private async readLoop(sock: SubcSocket, generation: number): Promise<void> {
-    const control: ControlPushState = { undecodablePushLogged: false, drainingHooks: new Set() };
+    const control: ControlPushState = { undecodablePushLogged: false, drainingHooks: new Set(),
+      stop: this.opts.liveUpgrade ? new AbortController() : undefined };
     try {
       for (;;) {
         const frame = await sock.readFrame(Number.POSITIVE_INFINITY, {
@@ -888,7 +944,9 @@ export class SubcProvider {
         const keepGoing = await this.dispatch(frame, sock, generation, control);
         if (!keepGoing) {
           if (this.sock === sock && this.generation === generation) {
-            this.endServing(new SubcProviderError("daemon closed provider connection", "connection_closed"));
+            if (!this.handleUpgradeEnd(sock, generation)) {
+              this.endServing(new SubcProviderError("daemon closed provider connection", "connection_closed"));
+            }
           }
           break;
         }
@@ -896,10 +954,13 @@ export class SubcProvider {
     } catch (error) {
       await this.waitForDrainingHooksToStart(control);
       if (this.sock === sock && this.generation === generation && !this.closeStarted) {
+        if ((error instanceof SocketClosedError || errorCode(error) === "ECONNRESET" || errorCode(error) === "EPIPE")
+          && this.handleUpgradeEnd(sock, generation)) return;
         this.handleUnexpectedDrop(sock, generation, error instanceof Error ? error : new SubcProviderError(String(error)));
         return;
       }
     } finally {
+      control.stop?.abort();
       if (this.sock === sock && this.generation === generation) {
         sock.close();
         if (this.closeStarted) this.finishClosed();
@@ -921,7 +982,7 @@ export class SubcProvider {
       const pendingKey = handle ? routeKey(handle, frame.header.corr) : `0:${frame.header.epoch}:${frame.header.corr}`;
       const pending = this.pending.get(pendingKey);
       if (pending) {
-        if (frame.header.ty === FrameType.Push || frame.header.ty === FrameType.StreamData) return true;
+        if (handle && (frame.header.ty === FrameType.Push || frame.header.ty === FrameType.StreamData)) return true;
         if (frame.header.ty === FrameType.Response || frame.header.ty === FrameType.StreamEnd) {
           this.pending.delete(pendingKey);
           clearTimeout(pending.timer);
@@ -970,7 +1031,7 @@ export class SubcProvider {
         return true;
       case FrameType.Request:
         if (frame.header.channel === 0) {
-          await this.handleControlRequest(frame, sock, generation);
+          await this.handleControlRequest(frame, sock, generation, control);
         } else if (handle) {
           void this.handleDataRequest(frame, handle, sock, generation).catch((error) => {
             if (!this.closeStarted && this.sock === sock && this.generation === generation) {
@@ -985,14 +1046,18 @@ export class SubcProvider {
   }
 
   private handleControlPush(frame: Frame, control: ControlPushState): void {
-    let body: { op?: unknown; reason?: unknown; deadline_ms?: unknown; project_id?: unknown };
+    let body: { op?: unknown; reason?: unknown; deadline_ms?: unknown; project_id?: unknown; reconnect_by_ms?: unknown };
     try {
       body = JSON.parse(Buffer.from(frame.body).toString("utf8"));
+      if (body?.op === "module.upgrading") {
+        if (this.#resumeToken !== undefined) this.upgradeDeadline ??= resumeDeadline(body.reconnect_by_ms);
+        return;
+      }
       if (body?.op === "config.changed" && this.config) {
         if (body.project_id !== undefined && typeof body.project_id !== "string") {
           throw new Error("invalid config.changed project_id");
         }
-        void this.config.refresh(body.project_id);
+        if (this.upgradeDeadline === undefined) void this.config.refresh(body.project_id);
         return;
       }
       if (body === null || body.op !== "module.draining" || typeof body.reason !== "string" ||
@@ -1091,9 +1156,11 @@ export class SubcProvider {
 
   private abortAllInflight(): void {
     for (const controller of this.inflight.values()) controller.abort();
+    for (const controller of this.retiredData ?? []) controller.abort();
+    this.retiredData?.clear();
   }
 
-  private async handleControlRequest(frame: Frame, sock: SubcSocket, generation: number): Promise<void> {
+  private async handleControlRequest(frame: Frame, sock: SubcSocket, generation: number, control?: ControlPushState): Promise<void> {
     const request = parseJson(frame.body) as {
       op?: string;
       route_channel?: unknown;
@@ -1124,7 +1191,23 @@ export class SubcProvider {
     if (request.op !== "route.bind") {
       throw new SubcProviderError(`unsupported module control request ${request.op ?? "<missing op>"}`);
     }
+    const bind = () => this.bindRoute(frame, sock, generation, request, control?.stop?.signal);
+    if (control?.stop) {
+      // Process binds in wire order, but let a notice and GOODBYE pass a bind
+      // whose application callback is waiting. Its reply belongs to the old socket.
+      control.bindTail = (control.bindTail ?? Promise.resolve()).then(bind).catch((error) => {
+        if (this.isCurrentConnection(sock, generation)) this.failFatal(error instanceof Error ? error : new Error(String(error)));
+      });
+    } else {
+      await bind();
+    }
+  }
 
+  private async bindRoute(frame: Frame, sock: SubcSocket, generation: number, request: {
+    route_channel?: unknown; epoch?: unknown; target?: unknown; identity?: unknown;
+    principal?: unknown; caller?: unknown; consumer_capabilities?: unknown;
+  }, stop?: AbortSignal): Promise<void> {
+    if (!this.isCurrentConnection(sock, generation)) return;
     const boundChannel = numberField(request.route_channel, "route_channel");
     const boundEpoch = numberField(request.epoch, "epoch");
     // Implicit-replace rule (wire spec 3.3.0): the daemon never rebinds a live
@@ -1149,6 +1232,7 @@ export class SubcProvider {
       this.liveRoutes.delete(stale.channel);
       this.abortHandle(stale);
       await this.reportRouteGone(stale);
+      if (!this.isCurrentConnection(sock, generation)) return;
     }
     const tentative = createRouteHandle(boundChannel, boundEpoch, this.connectionToken);
     const bindRequest: RouteBindRequest = {
@@ -1162,7 +1246,8 @@ export class SubcProvider {
 
     let decision: BindDecision | undefined;
     try {
-      decision = await this.opts.onBind?.(bindRequest);
+      const binding = this.opts.onBind?.(bindRequest);
+      decision = stop ? await raceAbort(Promise.resolve(binding), stop) : await binding;
     } catch (error) {
       try {
         await this.sendError(
@@ -1176,6 +1261,10 @@ export class SubcProvider {
       } finally {
         await this.reportRouteGone(tentative);
       }
+      return;
+    }
+    if (!this.isCurrentConnection(sock, generation)) {
+      await this.reportRouteGone(tentative);
       return;
     }
     const rejection = bindRejection(decision);
@@ -1238,6 +1327,7 @@ export class SubcProvider {
       signal: controller.signal,
       currentEpoch: () => this.connectionEpoch,
       emit: async (eventBody, options = {}) => {
+        if (!this.isCurrentConnection(sock, generation)) return;
         this.assertLiveHandle(handle);
         if (controller.signal.aborted) return;
         await this.sendOn(
@@ -1263,6 +1353,7 @@ export class SubcProvider {
     const releasePermit = await (this.requestGate ?? new AsyncPermitPool(DEFAULT_PROVIDER_HANDLER_CAPACITY)).acquire();
     const dataFlags = buildFlags(false, Priority.Interactive, false);
     try {
+      if (this.retiredData?.has(controller)) return;
       if (controller.signal.aborted) {
         await this.sendError(frame, "cancelled", "request cancelled", dataFlags, sock, generation);
         return;
@@ -1321,6 +1412,7 @@ export class SubcProvider {
     } finally {
       releasePermit();
       if (this.inflight.get(key) === controller) this.inflight.delete(key);
+      this.retiredData?.delete(controller);
     }
   }
 
@@ -1333,6 +1425,7 @@ export class SubcProvider {
     try {
       if (controller.signal.aborted) return;
       const report = await this.opts.health();
+      if (controller.signal.aborted) return;
       await this.sendOn(
         sock,
         generation,
@@ -1352,6 +1445,7 @@ export class SubcProvider {
         ),
       );
     } catch (error) {
+      if (controller.signal.aborted) return;
       await this.sendError(
         frame,
         error instanceof SubcProviderError && error.code ? error.code : "health_error",
@@ -1396,13 +1490,146 @@ export class SubcProvider {
   }
 
   private async sendOn(sock: SubcSocket, generation: number, frame: Frame): Promise<void> {
-    if (this.sock !== sock || this.generation !== generation || this.closeStarted || this.closedErr) return;
+    if (!this.isCurrentConnection(sock, generation)) return;
     await sendFrame(sock, frame);
+  }
+
+  private isCurrentConnection(sock: SubcSocket, generation: number): boolean {
+    return this.sock === sock && this.generation === generation && !this.closeStarted && !this.closedErr;
+  }
+
+  private checkUpgradeFence(): void {
+    if (this.upgradeDeadline !== undefined && !this.closeStarted) {
+      throw new SubcProviderError("provider is reconnecting after a daemon upgrade", "daemon_upgrade", "not_sent");
+    }
+  }
+
+  private handleUpgradeEnd(sock: SubcSocket, generation: number): boolean {
+    const deadline = this.upgradeDeadline;
+    const token = this.#resumeToken;
+    if (deadline === undefined || token === undefined || !this.isCurrentConnection(sock, generation)) return false;
+
+    this.upgradeStop?.abort();
+    const stop = new AbortController();
+    this.upgradeStop = stop;
+    this.cancelRestoredDebounce();
+    const nextGeneration = ++this.generation;
+    sock.close();
+    // Written calls that received a terminal frame already settled in dispatch.
+    // Still-pending calls cannot be retried: the old daemon may have delivered them.
+    const cause = new SubcProviderError("provider connection dropped for a daemon upgrade", "connection_dropped", "outcome_unknown");
+    this.rejectPendingRequests(cause);
+    this.config?.pauseForUpgrade();
+    for (const [key, controller] of this.inflight) {
+      if (key.startsWith(`control:${generation}:`)) controller.abort();
+      else (this.retiredData ??= new Set()).add(controller);
+    }
+    this.inflight.clear();
+    const routes = [...this.liveRoutes.values()];
+    this.liveRoutes.clear();
+    for (const route of routes) void this.reportRouteGone(route);
+    this.enqueueConnectionState({ state: "down", cause });
+    void this.resumeUpgrade(deadline, token, stop, nextGeneration);
+    return true;
+  }
+
+  private async resumeUpgrade(deadline: number, token: string, stop: AbortController, generation: number): Promise<void> {
+    try {
+      const hello = buildHelloFrame(this.opts, token);
+      const opened = await untilResumeDeadline(deadline, stop.signal, async (signal) => {
+        for (let attempt = 1; ; attempt++) {
+          signal.throwIfAborted();
+          this.enqueueConnectionState({ state: "reconnecting", attempt }, generation);
+          const next = performance.now() + 100;
+          try {
+            return await SubcProvider.openResume(this.opts, hello, deadline, signal);
+          } catch (error) {
+            signal.throwIfAborted();
+            if (!isRetryableResumeError(error)) throw error;
+          }
+          const remaining = next - performance.now();
+          if (remaining > 0) await raceAbort(this.opts.sleep(remaining), signal);
+        }
+      });
+      if (stop.signal.aborted || this.closeStarted || this.generation !== generation) {
+        opened.sock.close();
+        return;
+      }
+      const epoch = this.replaceConnection(opened);
+      this.requestGate = new AsyncPermitPool(DEFAULT_PROVIDER_HANDLER_CAPACITY);
+      registrationOwner().rebind((body) => this.configControl(body), () => this.checkUpgradeFence());
+      this.resumed = true;
+
+      let outcome: Promise<ReconnectOutcome> = Promise.resolve(undefined);
+      try {
+        const sync = this.opts.resumeScopeSync && await raceAbort(this.opts.resumeScopeSync(this), stop.signal);
+        if (!this.isCurrentConnection(opened.sock, generation)) return;
+        if (sync) {
+          // sendScopeSync hands the frame to the socket synchronously, before
+          // dispatch can send a Pong or configuration can declare itself.
+          outcome = this.sendScopeSync(sync, true).then(
+            (reply) => ({ ok: true, reply }),
+            (error) => ({ ok: false, error: asError(error) }),
+          );
+        }
+      } catch (error) {
+        outcome = Promise.resolve({ ok: false, error: asError(error) });
+      }
+      if (!this.isCurrentConnection(opened.sock, generation)) return;
+      this.upgradeDeadline = undefined;
+      void this.readLoop(opened.sock, generation);
+      this.config?.resumeAfterUpgrade();
+      void this.config?.refresh();
+      this.scheduleRestored(generation, epoch);
+      const result = await outcome;
+      if (this.isCurrentConnection(opened.sock, generation)) {
+        try {
+          if (this.opts.onReconnected) await raceAbort(Promise.resolve(this.opts.onReconnected(this, result)), stop.signal);
+        } catch {
+          if (!stop.signal.aborted) console.warn("SubcProvider reconnect callback failed");
+        }
+      }
+    } catch {
+      // Don't print errors from a handshake that carried a resume credential.
+      if (!this.closeStarted && this.generation === generation) {
+        this.failFatal(new SubcProviderError("provider could not resume after a daemon upgrade", "connection_dropped"));
+      }
+    } finally {
+      if (this.upgradeStop === stop) this.upgradeStop = undefined;
+    }
+  }
+
+  private static async openResume(
+    opts: NormalizedSubcProviderConnectOptions, hello: Frame, deadline: number, signal: AbortSignal,
+  ): Promise<OpenedProviderConnection> {
+    const conn = await readConnectionFileWithLocalEndpoint(opts.connectionFile);
+    signal.throwIfAborted();
+    if (conn.localEndpoint?.kind !== "unix") throw new SubcProviderError("no Unix endpoint", LOCAL_ENDPOINT_CLIENTS_ONLY);
+    const remaining = () => deadline - performance.now();
+    if (remaining() <= 0) throw new SocketTimeoutError("resume deadline expired");
+    const wallDeadline = Date.now() + Math.min(remaining(), opts.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS);
+    const sock = await SubcSocket.connectLocal(conn.localEndpoint.path, wallDeadline, signal);
+    const abort = () => sock.close();
+    signal.addEventListener("abort", abort, { once: true });
+    try {
+      signal.throwIfAborted();
+      await authenticateClient(sock, conn, wallDeadline);
+      await writeBorrowed(sock, encodeFrame(hello), wallDeadline);
+      const ack = await expectHelloAck(sock, wallDeadline, true);
+      signal.throwIfAborted();
+      if (remaining() <= 0) throw new SocketTimeoutError("resume deadline expired");
+      return { sock, conn, ack };
+    } catch (error) {
+      sock.close();
+      throw error;
+    } finally {
+      signal.removeEventListener("abort", abort);
+    }
   }
 
   private handleUnexpectedDrop(sock: SubcSocket, generation: number, cause: Error): void {
     if (this.closeStarted || this.sock !== sock || this.generation !== generation) return;
-    if (!this.opts.reconnectOnDrop) {
+    if (!this.opts.reconnectOnDrop || this.resumed || this.upgradeDeadline !== undefined) {
       // Serving ends with the connection: resolve `closed` so the module can
       // exit instead of re-registering behind its supervisor's back.
       this.failFatal(cause);
@@ -1470,7 +1697,8 @@ export class SubcProvider {
           return;
         }
 
-        const epoch = this.replaceConnection(opened, cycle.generation);
+        const epoch = this.replaceConnection(opened);
+        void this.readLoop(opened.sock, cycle.generation);
         this.reconnecting = null;
         void this.config?.refresh();
         if (this.reconnecting !== null) {
@@ -1506,12 +1734,13 @@ export class SubcProvider {
     this.enqueueConnectionState({ state: "reconnecting", attempt }, cycle.generation, cycle);
   }
 
-  private replaceConnection(opened: OpenedProviderConnection, generation: number): number {
+  private replaceConnection(opened: OpenedProviderConnection): number {
     this.sock.close();
     this.sock = opened.sock;
     this.currentConn = opened.conn;
     this.storage = opened.ack.storage;
     this.machineId = machineIdFromHelloAck(opened.ack);
+    this.#resumeToken = this.opts.liveUpgrade ? resumeTokenFromAck(opened.ack) : undefined;
     this.subcOps = opened.ack.subc_ops;
     this.currentSubcCapabilities = Object.freeze([...(opened.ack.subc_capabilities ?? [])]);
     this.closedErr = null;
@@ -1519,7 +1748,6 @@ export class SubcProvider {
     this.connectionToken = newConnectionToken();
     this.liveRoutes.clear();
     this.nextCorr = HELLO_CORR + 1n;
-    void this.readLoop(opened.sock, generation);
     return this.connectionEpoch;
   }
 
@@ -1620,6 +1848,9 @@ export class SubcProvider {
   /** End work before closing the socket, which cannot settle requests on its own. */
   private endServing(err: Error): void {
     this.config?.close();
+    this.upgradeStop?.abort();
+    this.#resumeToken = undefined;
+    if (this.resumed) registrationOwner().unbind();
     if (!this.closedErr) this.closedErr = err;
     this.closeStarted = true;
     this.cancelRestoredDebounce();
@@ -1635,6 +1866,10 @@ export class SubcProvider {
 
 function routeKey(handle: RouteHandle, corr: bigint): string {
   return `${handle.channel}:${handle.epoch}:${corr}`;
+}
+
+function asError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
 }
 
 function providerErrorFromFrame(frame: Frame): SubcProviderError {
@@ -1684,6 +1919,7 @@ async function normalizeProviderConnectOptions(opts: SubcProviderConnectOptions)
     processNonce = (await launchNonceOrUndefinedAsync())?.value;
   }
   const envLaunchNonce = nonEmpty(processNonce);
+  const launchNonce = nonEmpty(opts.launchNonce ?? envLaunchNonce);
   // Every provider in a launched process keeps the no-reconnect default.
   const supervised = owner.supervised || !launchIdentity || (envModuleId !== undefined && envLaunchNonce !== undefined);
   return {
@@ -1698,12 +1934,16 @@ async function normalizeProviderConnectOptions(opts: SubcProviderConnectOptions)
     onBound: opts.onBound,
     onRouteGone: opts.onRouteGone,
     onDraining: opts.onDraining,
+    liveUpgrade: opts.liveUpgrade === true && launchIdentity && (registrationChannel || launchNonce !== undefined)
+      && (process.platform === "linux" || process.platform === "darwin"),
+    resumeScopeSync: opts.resumeScopeSync,
+    onReconnected: opts.onReconnected,
     reconnectBackoff: opts.reconnectBackoff ?? DEFAULT_RECONNECT_BACKOFF,
     sleep: opts.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))),
     restoredDebounceMs: opts.restoredDebounceMs ?? DEFAULT_RESTORED_DEBOUNCE_MS,
     bodyReadTimeoutMs: opts.bodyReadTimeoutMs,
     onConnectionState: opts.onConnectionState,
-    launchNonce: nonEmpty(opts.launchNonce ?? envLaunchNonce),
+    launchNonce,
     registrationChannel,
     prefixRegistration,
     reconnectOnDrop: registrationChannel ? false : opts.reconnectOnDrop ?? !supervised,
@@ -1733,26 +1973,46 @@ function launchNonceUnavailable(error: LaunchNonceError): SubcProviderError {
   return wrapped;
 }
 
-function buildHelloFrame(opts: NormalizedSubcProviderConnectOptions): Frame {
-  const nonce = opts.launchNonce;
+function buildHelloFrame(opts: NormalizedSubcProviderConnectOptions, resumeToken?: string): Frame {
   return buildFrame(
     FrameType.Hello,
     controlFlags(),
     0,
     0,
     HELLO_CORR,
-    encodeJson({
-      manifest: normalizeManifest(opts.manifest, nonce),
+    encodeModuleHello({
+      manifest: normalizeManifest(opts.manifest, opts.launchNonce),
       protocol_ver: PROTOCOL_VERSION,
       control_ops: normalizedControlOps(opts.controlOps),
-      // Echo the one-time launch nonce subc injects for a reserved module
-      // (SUBC_LAUNCH_NONCE), so only the daemon-spawned process can register a
-      // reserved module_id. Omitted when unset (non-reserved / self-connecting).
-      ...(nonce ? { launch_nonce: nonce } : {}),
+      launch_nonce: resumeToken === undefined ? opts.launchNonce : undefined,
+      module_capabilities: opts.liveUpgrade ? [LIVE_UPGRADE_CAPABILITY] : undefined,
+      resume_token: resumeToken,
     }),
   );
 }
 
+/** @internal Keep the old field order and omit empty capabilities, as Rust does. */
+export function encodeModuleHello(body: ModuleHelloBody): Uint8Array {
+  return encodeJson({
+    manifest: body.manifest,
+    protocol_ver: body.protocol_ver,
+    control_ops: body.control_ops,
+    launch_nonce: body.launch_nonce,
+    module_capabilities: body.module_capabilities?.length ? body.module_capabilities : undefined,
+    resume_token: body.resume_token,
+  });
+}
+
+function resumeTokenFromAck(ack: ModuleHelloAckBody): string | undefined {
+  return typeof ack.resume_token === "string" && /^[A-Za-z0-9_-]{43}$/.test(ack.resume_token) ? ack.resume_token : undefined;
+}
+
+function isRetryableResumeError(err: unknown): boolean {
+  if (err instanceof SubcProviderError) return err.code === LOCAL_ENDPOINT_CLIENTS_ONLY;
+  if (err instanceof AuthError || err instanceof SocketClosedError || err instanceof SocketTimeoutError) return true;
+  const code = errorCode(err);
+  return code === "ENOENT" || code === "ECONNREFUSED" || code === "ECONNRESET" || code === "EPIPE";
+}
 
 function isProviderReconnectTransient(err: unknown): boolean {
   if (err instanceof SubcProviderError) return err.code === "duplicate_module_id";
@@ -1791,11 +2051,16 @@ async function sendFrame(sock: SubcSocket, frame: Frame): Promise<void> {
   await writeBorrowed(sock, encodeFrame(frame), Date.now() + WRITE_TIMEOUT_MS);
 }
 
-async function expectHelloAck(sock: SubcSocket, deadline: number): Promise<ModuleHelloAckBody> {
+async function expectHelloAck(sock: SubcSocket, deadline: number, resuming = false): Promise<ModuleHelloAckBody> {
   const frame = await sock.readFrame(deadline, deadline);
   switch (frame.header.ty) {
     case FrameType.HelloAck: {
-      const ack = parseJson(frame.body) as ModuleHelloAckBody;
+      let ack: ModuleHelloAckBody;
+      try { ack = parseJson(frame.body) as ModuleHelloAckBody; }
+      catch { throw new SubcProviderError("invalid HELLO_ACK body", "protocol_error"); }
+      if (!ack || typeof ack.negotiated_ver !== "number") {
+        throw new SubcProviderError("invalid HELLO_ACK body", "protocol_error");
+      }
       if (ack.negotiated_ver !== PROTOCOL_VERSION) {
         throw new SubcProviderError(
           `subc negotiated protocol ${ack.negotiated_ver}; expected exactly ${PROTOCOL_VERSION}`,
@@ -1806,6 +2071,11 @@ async function expectHelloAck(sock: SubcSocket, deadline: number): Promise<Modul
     }
     case FrameType.Error: {
       const error = parseJson(frame.body) as { code?: string; message?: string };
+      if (resuming) {
+        const code = error?.code;
+        throw new SubcProviderError("subc rejected resume HELLO",
+          code === LOCAL_ENDPOINT_CLIENTS_ONLY || code === RESUME_REFUSED ? code : undefined);
+      }
       throw new SubcProviderError(
         `subc rejected HELLO: ${error.code ?? "unknown"} — ${error.message ?? "subc error"}`,
         error.code,

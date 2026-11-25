@@ -66,8 +66,8 @@ use spawn::CapturedRegistrationEndpoint;
 pub(crate) use spawn::LaunchSpecDigest;
 pub use spawn::ModuleOverlap;
 pub use spawn::ModuleSpec;
-#[cfg(all(test, unix))]
-use spawn::RegisteredConfiguredModule;
+#[cfg(any(all(test, unix), target_os = "linux", target_os = "macos"))]
+pub(crate) use spawn::RegisteredConfiguredModule;
 pub use spawn::ScriptEntry;
 pub use spawn::ScriptRuntime;
 pub(crate) use spawn::SpawnProgramBinding;
@@ -103,7 +103,8 @@ use actor::supervisor_sleep;
 use actor::ActorSelectCheckpoint;
 use actor::NextAction;
 use actor::SupervisorCommand;
-
+pub(crate) mod handover;
+pub(crate) mod live_upgrade;
 mod restart;
 use restart::finish_reload_child;
 use restart::reload_child;
@@ -299,6 +300,7 @@ use config_delivery::CONFIG_ADMISSION_RETRY_DELAY;
 mod content_binding;
 mod program_binding;
 mod registration;
+pub(crate) mod resume_hello;
 use registration::arm_registration_deadline;
 use registration::constant_time_eq;
 use registration::handle_reload_child_registration_failure;
@@ -478,8 +480,6 @@ struct SupervisedChild {
     /// process is reaped or this handle is dropped.
     roster_guard: Option<crate::child_roster::RosterGuard>,
 }
-
-impl SupervisedChild {}
 
 /// Typed lifecycle state for a supervised module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -859,9 +859,9 @@ struct SupervisorRuntimeConfig {
     connection_file_path: Option<PathBuf>,
     capture_logs_dir: Option<PathBuf>,
     forwarding: Option<Arc<ForwardingTable>>,
-    /// The shared handle, so every spawn path (initial, restart, reload) records the
-    /// reserved-module launch nonce the HELLO verifier checks against.
     supervisor_handle: Option<SupervisorHandle>,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    replacement_ticket: Option<live_upgrade::ReplacementTicket>,
     /// This module's stderr tail, shared with the [`SupervisedModule`] that answers
     /// status queries.
     ///
@@ -899,13 +899,12 @@ struct SupervisedConfiguration {
     restart_policy: RestartPolicy,
 }
 
-/// Shared daemon lookup table for supervised module handles.
-///
-/// Shared by clone between the [`Supervisor`] (which spawns processes) and the
-/// channel-0 control handler (which verifies HELLOs and consumer route opens), so
-/// launch nonces recorded at spawn are checked by the same daemon instance.
+/// Shared lookup table for module handles and launch authority. The supervisor
+/// records each launch and the control handler verifies HELLOs and route opens.
 #[derive(Debug, Clone, Default)]
 pub struct SupervisorHandle {
+    pub(crate) pending_adoptions: resume_hello::PendingAdoptions,
+    upgrade_state: live_upgrade::UpgradeState,
     #[cfg(test)]
     resource_commit_pause: Arc<Mutex<Option<resource_launch::ResourceCommitPause>>>,
     #[cfg(test)]
@@ -1201,6 +1200,16 @@ impl Supervisor {
     /// record is kept.
     pub fn with_live_children_record(self, path: impl Into<PathBuf>) -> Self {
         self.child_roster.record_to(path.into());
+        self
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn with_resume_roster(
+        self,
+        path: PathBuf,
+        protected: &crate::live_children::AdoptedPids,
+    ) -> Self {
+        self.child_roster.record_to_with_adopted(path, protected);
         self
     }
 
@@ -1796,6 +1805,7 @@ impl SwapOutcome {
 
 #[derive(Debug)]
 pub enum SuperviseError {
+    UpgradeInProgress,
     ConfigHeld {
         module_id: String,
         code: String,
@@ -2035,6 +2045,7 @@ impl fmt::Display for SuperviseError {
                     "supervisor command channel for module '{module_id}' is closed"
                 )
             }
+            Self::UpgradeInProgress => f.write_str("daemon upgrade is in progress"),
             Self::SwapInProgress { module_id } => write!(
                 f,
                 "module '{module_id}' is being swapped; retry once the swap has cut over or failed, or stop the module to abort the swap"
@@ -2094,6 +2105,7 @@ impl Error for SuperviseError {
             | Self::StatePoisoned { .. }
             | Self::CommandClosed { .. }
             | Self::SwapInProgress { .. }
+            | Self::UpgradeInProgress
             | Self::SwapRefused { .. }
             | Self::SwapFailed { .. } => None,
         }

@@ -27,6 +27,8 @@ async fn windows_channel_foreign_connect_close_does_not_prevent_child_hello() {
             .await
             .unwrap();
         let hello = subc_protocol::ModuleHelloBody {
+            module_capabilities: None,
+            resume_token: None,
             manifest: subc_protocol::manifest::ModuleManifest::builder(
                 "channel-foreign-close",
                 "1.0.0",

@@ -149,6 +149,8 @@ mod tests {
             // Resource-accounting helper inputs, never daemon startup overrides.
             ("bin/ckdev-resource-helper.rs", 2),
             ("bootstrap.rs", 11),
+            // Only the daemon fixture can pause an adoption during resume.
+            ("bootstrap/resume.rs", 1),
             // The isolated process CPU/memory reader fixture is test-only.
             ("child_resources.rs", 1),
             ("config_gate/program.rs", 1),

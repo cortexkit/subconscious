@@ -83,6 +83,35 @@ The following outputs are exceptions to the versioned JSON forms:
   path and `module` is its roster record (or `{}` when absent). Acknowledged
   restart/start/stop is not a promise of eventual healthy/stopped state.
 
+### In-place daemon upgrades
+
+`ck --json daemon upgrade --in-place` and `ckni --json daemon upgrade --in-place`
+print one object with no `schema` field:
+
+```text
+{outcome, reason?, attempt_id?, daemon_pid, carried, restarted, stopped, blocked, build}
+```
+
+`daemon_pid` is the original daemon's PID. The four arrays contain module IDs:
+`carried` modules resumed their original processes, `restarted` modules were
+started again, `stopped` modules were not started, and `blocked` modules were
+left alone because the daemon could not verify the old process. On an unknown
+outcome, the arrays reflect only the dispositions observed so far. `build` is
+`{core_version, build_git_sha}` from the daemon (the SHA may be `null`), or
+`null` if the daemon did not advertise its identity.
+
+| `outcome` | Exit | Meaning |
+| --- | --- | --- |
+| `upgraded` | 0 | The same daemon PID reported this attempt complete, and each carried or restarted module is serving. |
+| `refused` | 3 | The daemon or CLI refused before making any change; `reason` is the refusal code. |
+| `failed` | 4 | The matching attempt failed or has blocked modules. `reason`, when known, is the failure stage or `blocked`. |
+| `unknown` | 5 | Completion could not be confirmed within the poll window. The upgrade request was not retried. |
+
+`attempt_id` is omitted if no attempt could be identified. Usage, discovery,
+and initial connection errors still use stderr rather than this report.
+
+## Other completion reports
+
 `stack stop`, `stack start` and `window revert` are exceptions to the rule
 against implicit waits, not exceptions to schema versioning. Both executable
 names return a versioned completion report, not an acknowledgement. Their

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! The daemon's machine id, through the shipped daemon binary and the ck CLI.
 //!
 //! Every daemon and every ck here runs with XDG_DATA_HOME, XDG_CONFIG_HOME and

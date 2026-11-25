@@ -723,6 +723,16 @@ fn serve_command_while_warming(
         module_id: module_id.to_string(),
     };
     match command {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        SupervisorCommand::Upgrade { request, .. } => {
+            request.refuse_running_swap(module_id);
+            None
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        SupervisorCommand::HeldAdoptionResolved { .. } => {
+            end.requeue.push(command);
+            None
+        }
         SupervisorCommand::ConfigPolicyProbe { .. } => {
             end.requeue.push(command);
             None
@@ -1364,6 +1374,24 @@ pub(super) async fn retire_incumbent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn running_swap_refuses_upgrade_without_interrupting_candidate() {
+        let (reply, response) = oneshot::channel();
+        let mut end = SwapEnd::default();
+        let request = SupervisorCommand::Upgrade {
+            key: Arc::new(()),
+            request: crate::supervise::live_upgrade::ActorRequest::Select(reply),
+        };
+        assert!(serve_command_while_warming("candidate", request, &mut end, false).is_none());
+        let refusal = response.await.unwrap().unwrap_err();
+        assert_eq!(refusal.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(refusal
+            .to_string()
+            .contains("module 'candidate' is swapping"));
+        assert!(end.requeue.is_empty());
+    }
 
     #[cfg(unix)]
     #[tokio::test]

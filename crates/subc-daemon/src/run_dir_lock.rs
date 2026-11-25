@@ -41,6 +41,18 @@ pub(crate) struct RunDirLock {
 }
 
 impl RunDirLock {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn from_inherited(live_children_record: PathBuf, file: fs::File) -> Self {
+        Self {
+            _file: file,
+            live_children_record,
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn file(&self) -> &fs::File {
+        &self._file
+    }
     /// Lock the directory containing `live_children_record`, creating the
     /// directory and the lock file when absent. Never waits: a directory
     /// another process holds belongs to a running daemon, and waiting for it

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::{ops::Deref, path::PathBuf, sync::Arc, time::Duration};
 
 use cortexkit_test_support::ScratchDir;

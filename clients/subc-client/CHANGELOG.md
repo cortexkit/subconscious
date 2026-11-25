@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.27.0
+
+- Supervised providers on Linux and macOS can opt into in-place daemon upgrades
+  with `liveUpgrade`. The provider resumes over the local endpoint, queues
+  optional `resumeScopeSync` before other traffic, and reports the result to
+  `onReconnected` while configuration delivery runs. New calls fenced by an
+  upgrade fail with `not_sent` / `daemon_upgrade`; old route handles do not resume.
+- Check live-upgrade message bytes against the Rust fixtures. The published
+  0.26.8 decoder accepts a HELLO_ACK with an extra `resume_token`, so daemons can
+  ship token support before providers opt in. Credentials stay private to the SDK.
+
 ## 0.26.12
 
 - Export types for pending settings card status, the display-only grouping

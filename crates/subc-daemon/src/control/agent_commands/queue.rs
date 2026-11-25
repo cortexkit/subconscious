@@ -375,13 +375,10 @@ mod tests {
         let (release, wait_release) = std::sync::mpsc::channel::<()>();
         let held = registry.clone();
         let holder = std::thread::spawn(move || {
-            held.publish_registration_after(ConnectionId::new(906), || {
+            held.hold_lock_for_test(|| {
                 locked.send(()).unwrap();
                 let _ = wait_release.recv();
-                Ok::<_, ()>(())
-            })
-            .unwrap()
-            .unwrap();
+            });
         });
         wait_locked.recv().unwrap();
         let attempted = registry.observe_next_lock_attempt();

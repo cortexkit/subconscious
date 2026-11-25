@@ -214,6 +214,8 @@ async fn installed_flow_identity_is_gated_in_real_daemon_binds_and_describe() {
 async fn wire_provider(path: &Path, module_id: &str, capability: Option<&str>) -> TcpStream {
     let mut stream = connect_authed_client(path).await.unwrap();
     let hello = ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest: inline_capability_module_manifest(module_id, capability),
         protocol_ver: PROTOCOL_VERSION,
         control_ops: Some(vec!["health.check".to_string()]),

@@ -53,6 +53,16 @@ pub fn process_cdhash(pid: u32) -> Result<CodeDirectoryHash, SignatureError> {
     })
 }
 
+/// Read the native CodeDirectory identity of this running image, without
+/// spawning a tool or trusting a lookup of the executable by path.
+pub fn self_cdhash() -> Result<CodeDirectoryHash, SignatureError> {
+    let hash = ffi::self_cdhash()?;
+    if process_cdhash(std::process::id())? != hash {
+        return Err(SignatureError::NotValid);
+    }
+    Ok(hash)
+}
+
 fn process_cdhash_with_query(
     mut query: impl FnMut(u32, &mut [u8]) -> io::Result<()>,
 ) -> Result<CodeDirectoryHash, SignatureError> {
@@ -107,7 +117,9 @@ pub fn file_signature(
 
 #[allow(unsafe_code)]
 mod ffi {
+    use super::{io, CodeDirectoryHash, SignatureError};
     use std::ffi::c_void;
+    use std::ptr;
     unsafe extern "C" {
         pub(super) fn csops(
             pid: libc::pid_t,
@@ -119,6 +131,69 @@ mod ffi {
         pub(super) fn CC_SHA256(data: *const c_void, length: u32, output: *mut u8) -> *mut u8;
         pub(super) fn CC_SHA384(data: *const c_void, length: u32, output: *mut u8) -> *mut u8;
         pub(super) fn CC_SHA512(data: *const c_void, length: u32, output: *mut u8) -> *mut u8;
+    }
+
+    type CfRef = *const c_void;
+
+    #[link(name = "Security", kind = "framework")]
+    unsafe extern "C" {
+        fn SecCodeCopySelf(flags: u32, code: *mut CfRef) -> i32;
+        fn SecCodeCopySigningInformation(code: CfRef, flags: u32, info: *mut CfRef) -> i32;
+        static kSecCodeInfoUnique: CfRef;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFRelease(value: CfRef);
+        fn CFDictionaryGetValue(dictionary: CfRef, key: CfRef) -> CfRef;
+        fn CFGetTypeID(value: CfRef) -> usize;
+        fn CFDataGetTypeID() -> usize;
+        fn CFDataGetLength(data: CfRef) -> isize;
+        fn CFDataGetBytePtr(data: CfRef) -> *const u8;
+    }
+
+    struct Owned(CfRef);
+
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            // SAFETY: Owned takes the non-null retained result of a Copy API.
+            unsafe { CFRelease(self.0) };
+        }
+    }
+
+    fn copy(api: impl FnOnce(*mut CfRef) -> i32) -> Result<Owned, SignatureError> {
+        let mut value = ptr::null();
+        match api(&mut value) {
+            0 if !value.is_null() => Ok(Owned(value)),
+            -67062 => Err(SignatureError::NotSigned), // errSecCSUnsigned
+            status => Err(SignatureError::Other(io::Error::other(format!(
+                "could not read running code signature (OSStatus {status})"
+            )))),
+        }
+    }
+
+    pub(super) fn self_cdhash() -> Result<CodeDirectoryHash, SignatureError> {
+        const SIGNING_INFORMATION: u32 = 1 << 1;
+        // SAFETY: each Copy call receives a writable out-pointer; code and
+        // dictionary stay retained while accessing the borrowed CFData value.
+        unsafe {
+            let code = copy(|out| SecCodeCopySelf(0, out))?;
+            let info = copy(|out| SecCodeCopySigningInformation(code.0, SIGNING_INFORMATION, out))?;
+            let data = CFDictionaryGetValue(info.0, kSecCodeInfoUnique);
+            if data.is_null() {
+                return Err(SignatureError::NotSigned);
+            }
+            if CFGetTypeID(data) != CFDataGetTypeID() || CFDataGetLength(data) != 20 {
+                return Err(SignatureError::Parse);
+            }
+            let bytes = CFDataGetBytePtr(data);
+            if bytes.is_null() {
+                return Err(SignatureError::Parse);
+            }
+            let mut hash = [0; 20];
+            ptr::copy_nonoverlapping(bytes, hash.as_mut_ptr(), hash.len());
+            Ok(CodeDirectoryHash(hash))
+        }
     }
 }
 

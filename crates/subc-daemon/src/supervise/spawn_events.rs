@@ -115,6 +115,14 @@ impl SpawnEventFeed {
         (state.daemon_incarnation.clone(), generation)
     }
 
+    /// Reserve the generation of the verified child before any later spawn.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn reserve_adopted_generation(&self, module: &str, generation: u64) {
+        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let latest = state.generations.entry(module.to_owned()).or_default();
+        *latest = (*latest).max(generation);
+    }
+
     /// Publish a running process. `allocated` is the generation its launch
     /// was given before it started; a launch without one (a process with no
     /// registration channel) is numbered here.

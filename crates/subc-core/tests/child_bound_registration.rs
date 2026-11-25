@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Real-daemon child-bound registration acceptance. Build helper binaries as in
 //! `scripts/test-daemon-lib.sh`, with `subc-daemon/dev-desktop-approval` enabled.
 #![cfg(all(unix, feature = "test-support"))]

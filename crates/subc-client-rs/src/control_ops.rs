@@ -25,7 +25,8 @@ pub(crate) async fn request<H: ModuleHandler>(
     dispatcher: &RequestDispatcher,
     handle: &ModuleHandle,
 ) -> Result<bool, SubcModuleError> {
-    let Some(ops) = handle.shared.served_control_ops.get() else {
+    let shared = handle.shared();
+    let Some(ops) = shared.served_control_ops.get() else {
         return Ok(false);
     };
     let Ok(body) = serde_json::from_slice::<serde_json::Value>(&frame.body) else {

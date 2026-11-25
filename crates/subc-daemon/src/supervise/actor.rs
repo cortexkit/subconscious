@@ -12,6 +12,13 @@ pub(super) struct ActorSelectCheckpoint {
 
 #[derive(Debug)]
 pub(super) enum SupervisorCommand {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    Upgrade {
+        key: Arc<()>,
+        request: live_upgrade::ActorRequest,
+    },
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    HeldAdoptionResolved { restart: bool },
     ApprovedConfiguration {
         approved: crate::config_gate::runtime::ApprovedDaemonConfiguration,
         reply: oneshot::Sender<Result<(), SuperviseError>>,
@@ -113,12 +120,65 @@ pub(super) async fn supervise_loop(
     // Commands a swap handed back to run next (see `swap::SwapEnd`). Served
     // before anything else so a stop that interrupted a swap runs at once.
     let mut requeued: VecDeque<SupervisorCommand> = VecDeque::new();
+    let upgrades = runtime
+        .supervisor_handle
+        .as_ref()
+        .map(|handle| handle.upgrade_state.clone())
+        .unwrap_or_default();
+    let mut upgrade_events = upgrades.subscribe();
     let mut previous_instance_recheck = tokio::time::interval_at(
         Instant::now() + Duration::from_secs(5),
         Duration::from_secs(5),
     );
     previous_instance_recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     'supervision: loop {
+        let active_upgrade = upgrade_events.borrow_and_update().clone();
+        if let Some(key) = active_upgrade {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            if let Some(index) = requeued
+                .iter()
+                .position(|command| matches!(command, SupervisorCommand::Upgrade { .. }))
+            {
+                let command = requeued.remove(index).expect("located upgrade command");
+                live_upgrade::paused_command(
+                    command,
+                    &key,
+                    &spec,
+                    &runtime,
+                    &registry,
+                    &process_liveness,
+                    &snapshot,
+                    &mut child,
+                    &mut requeued,
+                )
+                .await;
+                continue;
+            }
+            tokio::select! {
+                biased;
+                _ = upgrade_events.changed() => {},
+                command = commands.recv() => {
+                    let Some(command) = command else { return; };
+                    live_upgrade::paused_command(command, &key, &spec, &runtime, &registry, &process_liveness, &snapshot, &mut child, &mut requeued).await;
+                }
+            }
+            continue;
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if live_upgrade::drive_pending_child(
+            &spec,
+            &runtime,
+            &registry,
+            &process_liveness,
+            &snapshot,
+            &mut child,
+            &mut commands,
+            &mut requeued,
+        )
+        .await
+        {
+            continue;
+        }
         #[cfg(test)]
         {
             lock_snapshot(&snapshot).unwrap().actor_select = None;
@@ -226,6 +286,7 @@ pub(super) async fn supervise_loop(
                         runtime.forwarding.as_ref(),
                         &registry,
                         active,
+                        &upgrades,
                     );
                 }
             }
@@ -299,7 +360,9 @@ pub(super) async fn supervise_loop(
             };
             let active_child = child.as_mut().expect("child checked above");
             tokio::select! {
+                _ = upgrade_events.changed() => continue,
                 _ = registration_failed => {
+                    let Some(_work) = upgrades.background_work() else { continue; };
                     if !active_child.registered_since_spawn() && registration_child_is_running(active_child) {
                         active_child.registration_deadline = None;
                         active_child.spawn_failure = Some("registration_channel_closed".into());
@@ -313,6 +376,7 @@ pub(super) async fn supervise_loop(
                     continue;
                 }
                 wait_result = active_child.wait(), if !registration_before_exit => {
+                    if upgrade_events.has_changed().unwrap_or(false) { continue; }
                     if let Ok(mut state) = lock_snapshot(&snapshot) {
                         state.failed_retry.uptime_reset_at(no_checks, runtime.restart_policy.window);
                     }
@@ -329,7 +393,11 @@ pub(super) async fn supervise_loop(
                     let exit_report = match wait_result {
                         Ok(status) => classify_reaped_child_exit(&snapshot, active_child, &status),
                         Err(err) => {
-                            active_child.drain_stderr(&spec.module_id).await;
+                            #[cfg(any(target_os = "linux", target_os = "macos"))]
+                            let adopted = active_child.child.verified_adoptee().is_some();
+                            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                            let adopted = false;
+                            if !adopted { active_child.drain_stderr(&spec.module_id).await; }
                             fail_after_wait_error(
                                 &spec.module_id,
                                 &snapshot,
@@ -375,10 +443,12 @@ pub(super) async fn supervise_loop(
                                 if let Err(error)=result {warn!(module_id=%spec.module_id,%error,"configuration exit observation failed");}
                                 break;
                             }
-                            command=commands.recv()=>{
-                                let Some(command)=command else {containment::terminate(&runtime.child_roster.containment).await;return;};
-                                let deferred=||SuperviseError::ConfigDeliveryDeferred {module_id:spec.module_id.clone()};
-                                let command=match command {
+                             command=commands.recv()=>{
+                                 let Some(command)=command else {containment::terminate(&runtime.child_roster.containment).await;return;};
+                                 #[cfg(any(target_os = "linux", target_os = "macos"))]
+                                 let Some(command) = live_upgrade::defer_exit_publication_command(command, &mut requeued) else { continue; };
+                                 let deferred=||SuperviseError::ConfigDeliveryDeferred {module_id:spec.module_id.clone()};
+                                 let command=match command {
                                     SupervisorCommand::Restart {reply,..}|SupervisorCommand::Reload {reply,..}=>{let _=reply.send(Err(deferred()));continue;}
                                     SupervisorCommand::Swap {reply,..}=>{let _=reply.send(Err(deferred()));continue;}
                                     command @ (SupervisorCommand::ConfigApplyRestart {..}|SupervisorCommand::ConfigPolicyProbe {..}|SupervisorCommand::ConfigDeliveryFailed {..})=>{requeued.push_back(command);continue;}
@@ -391,6 +461,7 @@ pub(super) async fn supervise_loop(
                             }
                         }
                     }
+                    let Some(_work) = upgrades.background_work() else { continue 'supervision; };
                     let active_child=child.as_mut().expect("exit observation retained its child");
                     // An unavailable image can race the program's own exit.
                     // Only the admission kill is budget-free; another exit must
@@ -501,6 +572,7 @@ pub(super) async fn supervise_loop(
                     { lock_snapshot(&snapshot).unwrap().actor_select = None; }
                 }
                 _ = &mut probe_sleep => {
+                    let Some(_work) = upgrades.background_work() else { continue; };
                     #[cfg(test)]
                     { lock_snapshot(&snapshot).unwrap().actor_select = None; }
                     if registration_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
@@ -548,6 +620,7 @@ pub(super) async fn supervise_loop(
             }
         } else if let Some(pending) = pending_respawn.clone() {
             tokio::select! {
+                _ = upgrade_events.changed() => continue,
                 _ = runtime.child_roster.closed() => {
                     pending_respawn = None;
                     let _ = update_snapshot(&snapshot, Some(&spec.module_id), |state| {
@@ -564,6 +637,7 @@ pub(super) async fn supervise_loop(
                         delivery.unfenced(&spec.module_id).await;
                     }
                 } => {
+                    let Some(_work) = upgrades.background_work() else { continue; };
                     pending_respawn = None;
                     let failure = pending.failure_context(&runtime);
                 let _ = update_snapshot(&snapshot, Some(&spec.module_id), |state| state.respawn_pending = false);
@@ -676,8 +750,10 @@ pub(super) async fn supervise_loop(
                 .is_ok_and(|state| state.waiting_for_previous_pid.is_some())
             {
                 tokio::select! {
+                    _ = upgrade_events.changed() => continue,
                     command = commands.recv() => command,
                     _ = previous_instance_recheck.tick() => {
+                        let Some(_work) = upgrades.background_work() else { continue; };
                         if runtime.child_roster.previous_instance_pid(&spec.module_id).is_none() {
                             let enabled = lock_snapshot(&snapshot).is_ok_and(|state| state.enabled);
                             if enabled && !runtime.child_roster.is_closed() {
@@ -708,6 +784,7 @@ pub(super) async fn supervise_loop(
             } else {
                 tokio::select! {
                     biased;
+                    _ = upgrade_events.changed() => continue,
                     command = commands.recv() => command,
                     _ = async {
                         match slow_retry {
@@ -715,6 +792,7 @@ pub(super) async fn supervise_loop(
                             None => std::future::pending().await,
                         }
                     } => {
+                        let Some(_work) = upgrades.background_work() else { continue; };
                         let retry = slow_retry.expect("only a scheduled slow retry can wake");
                         let _ = update_snapshot(&snapshot, Some(&spec.module_id), |state| {
                             state.failed_retry.pending = None;
@@ -788,6 +866,20 @@ pub(super) async fn handle_supervisor_command(
     commands: &mut mpsc::Receiver<SupervisorCommand>,
     requeued: &mut VecDeque<SupervisorCommand>,
 ) -> bool {
+    let _work = if let Some(handle) = &runtime.supervisor_handle {
+        let Some(work) = handle.upgrade_state.background_work() else {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            if matches!(command, SupervisorCommand::Upgrade { .. }) {
+                requeued.push_back(command);
+                return true;
+            }
+            live_upgrade::refuse_and_defer(command, requeued);
+            return true;
+        };
+        Some(work)
+    } else {
+        None
+    };
     if let SupervisorCommand::SetEnabled {
         enabled: true,
         reset_budget: false,
@@ -931,6 +1023,17 @@ pub(super) async fn handle_supervisor_command(
         });
     }
     match command {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        SupervisorCommand::Upgrade { request, .. } => {
+            request.refuse_inactive();
+            true
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        SupervisorCommand::HeldAdoptionResolved { restart } => {
+            live_upgrade::held_resolved(spec, runtime, snapshot, process_liveness, child, restart)
+                .await;
+            true
+        }
         SupervisorCommand::ApprovedConfiguration { approved, reply } => {
             let result = async {
                 let next = approved.module_entry(&spec.module_id).map_err(|error| {
@@ -1322,7 +1425,11 @@ pub(super) async fn handle_supervisor_command(
             if registration_released {
                 process_liveness.untrack_if_current(&spec.module_id, snapshot);
             }
-            false
+            !registration_released
+                && runtime
+                    .supervisor_handle
+                    .as_ref()
+                    .is_some_and(|handle| handle.adoption_blocks(&spec.module_id))
         }
         SupervisorCommand::Retire { requester, reply } => {
             let result = async {

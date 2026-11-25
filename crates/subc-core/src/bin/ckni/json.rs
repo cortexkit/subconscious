@@ -71,6 +71,7 @@ pub(crate) fn json_form(command: &Command) -> JsonForm {
         }
         Command::BuildShape
         | Command::DaemonAnnounceRestart
+        | Command::DaemonUpgradeInPlace
         | Command::CliFaceReservedNames
         | Command::Dashboard
         | Command::External { .. } => JsonForm::Exempt,
@@ -190,8 +191,8 @@ mod tests {
         mem::discriminant,
     };
 
+    use super::super::{plain_output, PlainOutput, Table};
     use super::*;
-    use crate::ckni::{plain_output, PlainOutput, Table};
 
     #[test]
     fn versioned_module_json_retains_tree_verbatim() {
@@ -374,6 +375,11 @@ mod tests {
                 JsonForm::Schema("ck.daemon/v1"),
             ),
             (
+                "daemon upgrade --in-place",
+                PlainOutput::PipedText,
+                JsonForm::Exempt,
+            ),
+            (
                 "daemon triage",
                 PlainOutput::PipedText,
                 JsonForm::Schema("ck.daemon.triage/v1"),
@@ -468,7 +474,7 @@ mod tests {
         let mut windows = HashSet::new();
         let mut schemas = BTreeSet::new();
         let mut walk = |text: &str, plain, json| {
-            let args = crate::parse_args(
+            let args = super::super::super::parse_args(
                 std::iter::once(OsString::from("ckni"))
                     .chain(text.split_whitespace().map(OsString::from)),
             )

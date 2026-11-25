@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.42.9
+
+- Define the `daemon.upgrade_in_place` operator request and its error codes.
+  Require subc-protocol 0.37.9.
+
 ## 0.42.8
 
 - Add typed `config.revert` bodies, pending settings card status, and a

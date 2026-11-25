@@ -66,6 +66,8 @@ async fn reverse_response_reaches_the_module_while_a_second_serial_request_waits
         0,
         1,
         serde_json::to_vec(&ModuleHelloBody {
+            module_capabilities: None,
+            resume_token: None,
             manifest,
             protocol_ver: PROTOCOL_VERSION,
             control_ops: None,

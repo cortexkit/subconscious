@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 #![cfg(unix)]
 
 use cortexkit_test_support::{ckdev_binary, dev_command, ScratchDir};

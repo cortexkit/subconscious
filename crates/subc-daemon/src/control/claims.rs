@@ -1545,6 +1545,8 @@ pub(crate) mod tests {
         let mut primary = Wire::new(&router);
         spawn.bind(primary.connection.id());
         let hello = subc_protocol::ModuleHelloBody {
+            module_capabilities: None,
+            resume_token: None,
             manifest: ModuleManifest::builder(module_id, "1.0.0").build(),
             protocol_ver: PROTOCOL_VERSION,
             control_ops: None,
@@ -1627,6 +1629,8 @@ pub(crate) mod tests {
         spawn.bind(connection);
         if register {
             let hello = subc_protocol::ModuleHelloBody {
+                module_capabilities: None,
+                resume_token: None,
                 manifest: ModuleManifest::builder(module_id, "1.0.0").build(),
                 protocol_ver: PROTOCOL_VERSION,
                 control_ops: None,
@@ -1766,6 +1770,8 @@ pub(crate) mod tests {
             );
             let module = format!("claimed-{index}");
             let hello = subc_protocol::ModuleHelloBody {
+                module_capabilities: None,
+                resume_token: None,
                 manifest: ModuleManifest::builder(&module, "1.0.0").build(),
                 protocol_ver: PROTOCOL_VERSION,
                 control_ops: None,
@@ -2224,6 +2230,8 @@ pub(crate) mod tests {
         let rig = rig().await;
         let mut legacy = Net::new(rig.router.clone()).await;
         let hello = subc_protocol::ModuleHelloBody {
+            module_capabilities: None,
+            resume_token: None,
             manifest: ModuleManifest::builder("claims-legacy", "1.0.0").build(),
             protocol_ver: PROTOCOL_VERSION,
             control_ops: None,
@@ -2353,6 +2361,8 @@ pub(crate) mod tests {
             0,
             8,
             serde_json::to_vec(&subc_protocol::ModuleHelloBody {
+                module_capabilities: None,
+                resume_token: None,
                 manifest: ModuleManifest::builder(module_id, "1.0.0").build(),
                 protocol_ver: PROTOCOL_VERSION,
                 control_ops: None,
@@ -3338,6 +3348,8 @@ pub(crate) mod tests {
         let mut manifest = ModuleManifest::builder(module_id, "1.0.0").build();
         manifest.ready = Some(false);
         let hello = subc_protocol::ModuleHelloBody {
+            module_capabilities: None,
+            resume_token: None,
             manifest,
             protocol_ver: PROTOCOL_VERSION,
             control_ops: None,
@@ -3789,6 +3801,8 @@ pub(crate) mod tests {
         let mut primary = Wire::new(&rig.router);
         replacement.bind(primary.connection.id());
         let hello = subc_protocol::ModuleHelloBody {
+            module_capabilities: None,
+            resume_token: None,
             manifest: ModuleManifest::builder("claims-module", "1.0.0").build(),
             protocol_ver: PROTOCOL_VERSION,
             control_ops: None,

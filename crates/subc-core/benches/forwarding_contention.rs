@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Forwarding-table contention benchmark (fusion + RouteBinding + RwLock).
 //!
 //! Run: `cargo bench -p subc-core --bench forwarding_contention --features bench-harness`

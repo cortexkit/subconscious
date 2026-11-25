@@ -4,7 +4,14 @@ pub mod activity;
 mod agent_commands;
 pub mod config;
 mod control_ops;
+mod live_upgrade;
 pub use agent_commands::AgentCommandsError;
+#[cfg(any(test, feature = "test-support"))]
+use live_upgrade::connection_serve_future_with_options;
+use live_upgrade::register_connection;
+#[cfg(test)]
+use live_upgrade::registration_channel_exit_code;
+pub use live_upgrade::ResumeScopeSync;
 pub use subc_protocol::session::{AgentCommandFinished, AgentCommandRoot};
 pub mod consumer;
 mod operator_app;
@@ -389,6 +396,8 @@ struct RequestDispatcher {
     failed: CancellationToken,
     tasks: TaskTracker,
     aborts: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
+    data_tasks: TaskTracker,
+    data_aborts: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
     undelivered_replies: Arc<AtomicU64>,
 }
 
@@ -411,6 +420,8 @@ impl RequestDispatcher {
             failed: CancellationToken::new(),
             tasks: TaskTracker::new(),
             aborts: Arc::new(Mutex::new(Vec::new())),
+            data_tasks: TaskTracker::new(),
+            data_aborts: Arc::new(Mutex::new(Vec::new())),
             undelivered_replies: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -438,14 +449,8 @@ impl RequestDispatcher {
     }
 
     fn abort_all(&self) {
-        for task in self
-            .aborts
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .drain(..)
-        {
-            task.abort();
-        }
+        live_upgrade::abort_tasks(&self.aborts);
+        live_upgrade::abort_tasks(&self.data_aborts);
     }
 
     fn fold_health(&self, mut report: HealthReport) -> HealthReport {
@@ -500,7 +505,7 @@ impl RequestDispatcher {
 /// Cloneable handle for module-originated control RPCs on channel 0.
 #[derive(Clone)]
 pub struct ModuleHandle {
-    shared: Arc<ModuleHandleShared>,
+    generations: Arc<live_upgrade::Generations>,
 }
 
 struct ModuleHandleShared {
@@ -520,10 +525,10 @@ struct ModuleHandleShared {
     supports_activity: bool,
     connection_runtime: tokio::runtime::Handle,
     connection_token: u64,
-    machine_id: Option<MachineId>,
     live_routes: Mutex<HashMap<u16, RouteHandle>>,
     dropped_route_frames: AtomicU64,
     close_token: CancellationToken,
+    upgrade_notice: CancellationToken,
     /// The handler-slot pools this connection's dispatcher uses. Replaced once,
     /// with the pools the module's handler declares, before serving starts.
     dispatch_pools: Mutex<Arc<DispatchPools>>,
@@ -546,17 +551,28 @@ struct ModuleHandleState {
     pending_agent_commands: HashMap<u64, oneshot::Sender<Frame>>,
     current_provides: Option<Vec<ProviderRole>>,
     catalog_changes: VecDeque<CatalogChange>,
+    upgrade: live_upgrade::UpgradeState,
     closed: bool,
 }
 
 struct CatalogChange {
     corr: u64,
-    provides: Vec<ProviderRole>,
+    update: CatalogManifestChange,
     outcome: Option<CatalogChangeOutcome>,
 }
 
+enum CatalogManifestChange {
+    Catalog {
+        provides: Vec<ProviderRole>,
+        capabilities: Option<CapabilityDeclarations>,
+        ready: Option<bool>,
+    },
+    RoleDeclarations(BTreeMap<String, serde_json::Map<String, serde_json::Value>>),
+}
+
 enum CatalogChangeOutcome {
-    Accepted,
+    AcceptedCatalog,
+    AcceptedRoleDeclarations,
     Rejected,
     Unknown,
 }
@@ -581,88 +597,115 @@ impl ModuleHandle {
         connection_runtime: tokio::runtime::Handle,
     ) -> Self {
         Self {
-            shared: Arc::new(ModuleHandleShared {
-                registration: registration::Session::default(),
-                negotiated_ver: ack.negotiated_ver,
-                daemon_capabilities: ack.subc_capabilities.clone(),
-                supports_catalog_update: ack
-                    .subc_ops
-                    .iter()
-                    .any(|op| op == MODULE_TO_SUBC_OP_CATALOG_UPDATE),
-                supports_role_declarations_update: ack
-                    .subc_ops
-                    .iter()
-                    .any(|op| op == MODULE_TO_SUBC_OP_CATALOG_UPDATE_ROLE_DECLARATIONS),
-                supports_live_roots: ack.subc_ops.iter().any(|op| op == "supervisor.live_roots"),
-                supports_agent_commands: ack
-                    .subc_ops
-                    .iter()
-                    .any(|op| op == "supervisor.agent_commands"),
-                supports_scope_sync: ack.subc_ops.iter().any(|op| op == SCOPE_SYNC_OP),
-                supports_scope_apply: ack.subc_ops.iter().any(|op| op == SCOPE_APPLY_OP),
-                supports_scope_describe: ack.subc_ops.iter().any(|op| op == SCOPE_DESCRIBE_OP),
-                supports_scope_watch: ack
-                    .subc_ops
-                    .iter()
-                    .any(|op| op == subc_control::ops::SCOPE_WATCH),
-                supports_route_authorize: ack
-                    .subc_ops
-                    .iter()
-                    .any(|op| op == subc_protocol::scope::ROUTE_AUTHORIZE_OP),
-                supports_operator_confirm: ack.subc_ops.iter().any(|op| op == OPERATOR_CONFIRM_OP),
-                supports_activity: ack
-                    .subc_capabilities
-                    .iter()
-                    .any(|capability| capability == ACTIVITY_LEDGER_CAPABILITY),
-                connection_runtime,
-                connection_token,
-                // A value that does not parse is treated like an absent one:
-                // the module learns nothing rather than a name that is wrong.
-                machine_id: ack
-                    .machine_id
-                    .as_deref()
-                    .and_then(|id| MachineId::parse(id).ok()),
-                live_routes: Mutex::new(HashMap::new()),
-                dropped_route_frames: AtomicU64::new(0),
-                close_token,
-                dispatch_pools: Mutex::new(Arc::new(DispatchPools::new(RequestPools::new()))),
-                catalog_send: tokio::sync::Mutex::new(()),
-                config: config::Session::default(),
-                served_control_ops: std::sync::OnceLock::new(),
-                inner: Mutex::new(ModuleHandleState {
-                    pending_control_streams: HashMap::new(),
-                    pending_claim_calls: HashMap::new(),
-                    writer: Some(writer),
-                    next_corr: Some(HELLO_CORR + 1),
-                    pending_catalog_updates: HashMap::new(),
-                    pending_operator_confirms: HashMap::new(),
-                    pending_activity_records: HashMap::new(),
-                    pending_scope_served_by: HashMap::new(),
-                    pending_config_calls: HashMap::new(),
-                    pending_agent_commands: HashMap::new(),
-                    current_provides: None,
-                    catalog_changes: VecDeque::new(),
-                    closed: false,
-                }),
+            generations: Arc::new(live_upgrade::Generations::new(
+                ack,
+                Arc::new(ModuleHandleShared::new(
+                    ack,
+                    writer,
+                    connection_token,
+                    close_token,
+                    connection_runtime,
+                )),
+            )),
+        }
+    }
+}
+
+impl ModuleHandleShared {
+    fn new(
+        ack: &ModuleHelloAckBody,
+        writer: mpsc::Sender<Frame>,
+        connection_token: u64,
+        close_token: CancellationToken,
+        connection_runtime: tokio::runtime::Handle,
+    ) -> Self {
+        Self {
+            registration: registration::Session::default(),
+            negotiated_ver: ack.negotiated_ver,
+            daemon_capabilities: ack.subc_capabilities.clone(),
+            supports_catalog_update: ack
+                .subc_ops
+                .iter()
+                .any(|op| op == MODULE_TO_SUBC_OP_CATALOG_UPDATE),
+            supports_role_declarations_update: ack
+                .subc_ops
+                .iter()
+                .any(|op| op == MODULE_TO_SUBC_OP_CATALOG_UPDATE_ROLE_DECLARATIONS),
+            supports_live_roots: ack.subc_ops.iter().any(|op| op == "supervisor.live_roots"),
+            supports_agent_commands: ack
+                .subc_ops
+                .iter()
+                .any(|op| op == "supervisor.agent_commands"),
+            supports_scope_sync: ack.subc_ops.iter().any(|op| op == SCOPE_SYNC_OP),
+            supports_scope_apply: ack.subc_ops.iter().any(|op| op == SCOPE_APPLY_OP),
+            supports_scope_describe: ack.subc_ops.iter().any(|op| op == SCOPE_DESCRIBE_OP),
+            supports_scope_watch: ack
+                .subc_ops
+                .iter()
+                .any(|op| op == subc_control::ops::SCOPE_WATCH),
+            supports_route_authorize: ack
+                .subc_ops
+                .iter()
+                .any(|op| op == subc_protocol::scope::ROUTE_AUTHORIZE_OP),
+            supports_operator_confirm: ack.subc_ops.iter().any(|op| op == OPERATOR_CONFIRM_OP),
+            supports_activity: ack
+                .subc_capabilities
+                .iter()
+                .any(|capability| capability == ACTIVITY_LEDGER_CAPABILITY),
+            connection_runtime,
+            connection_token,
+            live_routes: Mutex::new(HashMap::new()),
+            dropped_route_frames: AtomicU64::new(0),
+            close_token,
+            upgrade_notice: CancellationToken::new(),
+            dispatch_pools: Mutex::new(Arc::new(DispatchPools::new(RequestPools::new()))),
+            catalog_send: tokio::sync::Mutex::new(()),
+            config: config::Session::default(),
+            served_control_ops: std::sync::OnceLock::new(),
+            inner: Mutex::new(ModuleHandleState {
+                pending_control_streams: HashMap::new(),
+                pending_claim_calls: HashMap::new(),
+                writer: Some(writer),
+                next_corr: Some(HELLO_CORR + 1),
+                pending_catalog_updates: HashMap::new(),
+                pending_operator_confirms: HashMap::new(),
+                pending_activity_records: HashMap::new(),
+                pending_scope_served_by: HashMap::new(),
+                pending_config_calls: HashMap::new(),
+                pending_agent_commands: HashMap::new(),
+                current_provides: None,
+                catalog_changes: VecDeque::new(),
+                upgrade: live_upgrade::UpgradeState::default(),
+                closed: false,
             }),
         }
     }
+}
 
-    /// The daemon's machine id, as delivered on HELLO_ACK.
+impl ModuleHandle {
+    /// The current connection's machine id, as delivered on HELLO_ACK. A
+    /// reference held across a resume remains valid for the earlier connection.
     ///
     /// `None` means the daemon did not send one (it predates the machine id, or
     /// was embedded without one) or sent a malformed value. Read that as "the
     /// daemon has not named this machine", never as "no machine", and never mint
     /// a substitute. The id is a name, never an authority: see [`MachineId`].
     pub fn machine_id(&self) -> Option<&MachineId> {
-        self.shared.machine_id.as_ref()
+        self.generations.metadata().machine_id.as_ref()
     }
 
     /// The daemon capability identifiers delivered in this connection's HELLO_ACK.
     ///
     /// The list preserves the daemon's order and unknown capability identifiers.
+    /// A reference held across a resume remains valid for the earlier connection.
     pub fn daemon_capabilities(&self) -> &[String] {
-        &self.shared.daemon_capabilities
+        &self.generations.metadata().capabilities
+    }
+
+    /// The current connection's storage descriptor, if supplied by HELLO_ACK.
+    /// A reference held across resume still describes the earlier connection.
+    pub fn storage(&self) -> Option<&serde_json::Value> {
+        self.generations.metadata().storage.as_ref()
     }
 
     /// Whether this daemon advertised `capability` in this connection's HELLO_ACK.
@@ -676,7 +719,8 @@ impl ModuleHandle {
     /// `config.settings.projects/v1` only in `server.describe`. Modules that
     /// support those versions must check `server.describe` as well.
     pub fn daemon_supports(&self, capability: &str) -> bool {
-        self.shared
+        let shared = self.shared();
+        shared
             .daemon_capabilities
             .iter()
             .any(|advertised| advertised == capability)
@@ -684,14 +728,17 @@ impl ModuleHandle {
 
     /// Resolves once this module's connection to the daemon has closed: after a
     /// channel-0 GOODBYE, EOF, or a connection error. A module ends its own
-    /// background work on it, so nothing outlives the connection.
+    /// background work on it, so nothing outlives the connection. This future
+    /// observes the connection current when it was created, even across resume.
     pub fn closed(&self) -> impl Future<Output = ()> + Send + 'static {
-        self.shared.close_token.clone().cancelled_owned()
+        let shared = self.shared();
+        shared.close_token.clone().cancelled_owned()
     }
 
     /// Whether this module's connection to the daemon has closed.
     pub fn is_closed(&self) -> bool {
-        self.shared.close_token.is_cancelled()
+        let shared = self.shared();
+        shared.close_token.is_cancelled()
     }
 
     /// Ask the daemon to replace this module's advertised provider roles in place.
@@ -716,23 +763,26 @@ impl ModuleHandle {
         &self,
         role_declarations: BTreeMap<String, serde_json::Map<String, serde_json::Value>>,
     ) -> Result<(), CatalogUpdateError> {
-        if !self.shared.supports_role_declarations_update {
+        let shared = self.shared();
+        shared.check_upgrade_fence()?;
+        if !shared.supports_role_declarations_update {
             return Err(CatalogUpdateError::NotSupported);
         }
         let body = serde_json::to_vec(
             &ModuleControlRequestFromModule::CatalogUpdateRoleDeclarations {
-                role_declarations: serde_json::to_value(role_declarations)
+                role_declarations: serde_json::to_value(&role_declarations)
                     .map_err(|err| CatalogUpdateError::Protocol(err.to_string()))?,
             },
         )
         .map_err(|err| CatalogUpdateError::Protocol(err.to_string()))?;
-        let (corr, writer, rx) = self.shared.begin_catalog_update()?;
+        let send_guard = shared.catalog_send.lock().await;
+        let (corr, writer, rx) = shared.begin_catalog_update()?;
         let _pending = CatalogUpdateGuard {
-            shared: self.shared.clone(),
+            shared: shared.clone(),
             corr,
         };
         let frame = Frame::build_with_version(
-            self.shared.negotiated_ver,
+            shared.negotiated_ver,
             FrameType::Request,
             control_flags(),
             0,
@@ -741,9 +791,14 @@ impl ModuleHandle {
             body,
         )
         .map_err(|err| CatalogUpdateError::Protocol(err.to_string()))?;
-        if writer.send(frame).await.is_err() {
-            return Err(CatalogUpdateError::ConnectionClosed);
-        }
+        shared
+            .queue_catalog_change(
+                &writer,
+                frame,
+                CatalogManifestChange::RoleDeclarations(role_declarations),
+            )
+            .await?;
+        drop(send_guard);
         match timeout(CATALOG_UPDATE_TIMEOUT, rx).await {
             Ok(Ok(Ok(reply))) => match reply.control()? {
                 ModuleControlResponseToModule::CatalogUpdateRoleDeclarations {} => Ok(()),
@@ -792,24 +847,30 @@ impl ModuleHandle {
         capabilities: Option<CapabilityDeclarations>,
         ready: Option<bool>,
     ) -> Result<(), CatalogUpdateError> {
-        if !self.shared.supports_catalog_update {
+        let shared = self.shared();
+        shared.check_upgrade_fence()?;
+        if !shared.supports_catalog_update {
             return Err(CatalogUpdateError::NotSupported);
         }
 
         // Order role snapshots and outbound updates together, but release the lock
         // before waiting for ACKs so existing concurrent catalog RPCs still work.
-        let send_guard = self.shared.catalog_send.lock().await;
+        let send_guard = shared.catalog_send.lock().await;
         let provides = match provides {
             Some(provides) => provides,
             None => {
-                let inner = self.shared.lock_inner();
+                let inner = shared.lock_inner();
                 if inner.closed {
                     return Err(CatalogUpdateError::ConnectionClosed);
                 }
                 inner
                     .current_provides
                     .as_ref()
-                    .filter(|_| inner.catalog_changes.is_empty())
+                    .filter(|_| {
+                        !inner.catalog_changes.iter().any(|change| {
+                            matches!(change.update, CatalogManifestChange::Catalog { .. })
+                        })
+                    })
                     .cloned()
                     .ok_or_else(|| {
                         CatalogUpdateError::Protocol(
@@ -821,7 +882,7 @@ impl ModuleHandle {
         };
         let body = serde_json::to_vec(&ModuleControlRequestFromModule::CatalogUpdate {
             provides: provides.clone(),
-            capabilities,
+            capabilities: capabilities.clone(),
             ready,
         })
         .map_err(|err| {
@@ -829,13 +890,13 @@ impl ModuleHandle {
                 "failed to encode catalog.update request body: {err}"
             ))
         })?;
-        let (corr, writer, rx) = self.shared.begin_catalog_update()?;
+        let (corr, writer, rx) = shared.begin_catalog_update()?;
         let _pending = CatalogUpdateGuard {
-            shared: self.shared.clone(),
+            shared: shared.clone(),
             corr,
         };
         let frame = Frame::build_with_version(
-            self.shared.negotiated_ver,
+            shared.negotiated_ver,
             FrameType::Request,
             control_flags(),
             0,
@@ -844,28 +905,23 @@ impl ModuleHandle {
             body,
         )
         .map_err(|err| {
-            self.shared.remove_pending_catalog_update(corr);
+            shared.remove_pending_catalog_update(corr);
             CatalogUpdateError::Protocol(format!(
                 "failed to build catalog.update request frame: {err}"
             ))
         })?;
 
-        let permit = match writer.reserve().await {
-            Ok(permit) => permit,
-            Err(_) => {
-                self.shared.remove_pending_catalog_update(corr);
-                return Err(CatalogUpdateError::ConnectionClosed);
-            }
-        };
-        self.shared
-            .lock_inner()
-            .catalog_changes
-            .push_back(CatalogChange {
-                corr,
-                provides,
-                outcome: None,
-            });
-        permit.send(frame);
+        shared
+            .queue_catalog_change(
+                &writer,
+                frame,
+                CatalogManifestChange::Catalog {
+                    provides,
+                    capabilities,
+                    ready,
+                },
+            )
+            .await?;
         drop(send_guard);
 
         match timeout(CATALOG_UPDATE_TIMEOUT, async {
@@ -881,7 +937,7 @@ impl ModuleHandle {
             Ok(Ok(Err(err))) => Err(err),
             Ok(Err(_)) => Err(CatalogUpdateError::ConnectionClosed),
             Err(_) => {
-                self.shared.remove_pending_catalog_update(corr);
+                shared.remove_pending_catalog_update(corr);
                 Err(CatalogUpdateError::Timeout)
             }
         }
@@ -889,14 +945,16 @@ impl ModuleHandle {
 
     /// Snapshot the roots served by this module's routable endpoint.
     pub async fn live_roots(&self) -> Result<LiveRootsSnapshot, CatalogUpdateError> {
-        if !self.shared.supports_live_roots {
+        let shared = self.shared();
+        shared.check_upgrade_fence()?;
+        if !shared.supports_live_roots {
             return Err(CatalogUpdateError::NotSupported);
         }
         let body = serde_json::to_vec(&ModuleControlRequestFromModule::LiveRoots {})
             .map_err(|err| CatalogUpdateError::Protocol(err.to_string()))?;
-        let (corr, writer, rx) = self.shared.begin_catalog_update()?;
+        let (corr, writer, rx) = shared.begin_catalog_update()?;
         let frame = Frame::build_with_version(
-            self.shared.negotiated_ver,
+            shared.negotiated_ver,
             FrameType::Request,
             control_flags(),
             0,
@@ -905,12 +963,12 @@ impl ModuleHandle {
             body,
         )
         .map_err(|err| {
-            self.shared.remove_pending_catalog_update(corr);
+            shared.remove_pending_catalog_update(corr);
             CatalogUpdateError::Protocol(err.to_string())
         })?;
-        if writer.send(frame).await.is_err() {
-            self.shared.remove_pending_catalog_update(corr);
-            return Err(CatalogUpdateError::ConnectionClosed);
+        if let Err(error) = shared.queue_request(&writer, frame).await {
+            shared.remove_pending_catalog_update(corr);
+            return Err(error);
         }
         match timeout(CATALOG_UPDATE_TIMEOUT, async {
             rx.await
@@ -933,7 +991,7 @@ impl ModuleHandle {
             Ok(Ok(Err(err))) => Err(err),
             Ok(Err(_)) => Err(CatalogUpdateError::ConnectionClosed),
             Err(_) => {
-                self.shared.remove_pending_catalog_update(corr);
+                shared.remove_pending_catalog_update(corr);
                 Err(CatalogUpdateError::Timeout)
             }
         }
@@ -959,29 +1017,14 @@ impl ModuleHandle {
         generation: u64,
         scopes: Vec<ScopeRecord>,
     ) -> Result<ScopeSyncReply, ScopeCallError> {
-        if !self.shared.supports_scope_sync {
+        let shared = self.shared();
+        live_upgrade::ScopeRequest::check_fence(&shared)?;
+        if !shared.supports_scope_sync {
             return Err(ScopeCallError::NotSupported { op: SCOPE_SYNC_OP });
         }
         let request = ModuleControlRequestFromModule::ScopeSync { generation, scopes };
-        match self
-            .scope_call(SCOPE_SYNC_OP, &request)
-            .await?
-            .control()
-            .map_err(ScopeCallError::from_control_error)?
-        {
-            ModuleControlResponseToModule::ScopeSync {
-                generation,
-                results,
-                ended,
-            } => Ok(ScopeSyncReply {
-                generation,
-                results,
-                ended,
-            }),
-            other => Err(ScopeCallError::Protocol(format!(
-                "unexpected {SCOPE_SYNC_OP} response: {other:?}"
-            ))),
-        }
+        let reply = live_upgrade::ScopeRequest::call(&shared, SCOPE_SYNC_OP, &request).await?;
+        live_upgrade::ScopeRequest::decode_sync(reply)
     }
 
     /// Apply a delta to this module's scope set (`scope.apply`).
@@ -1000,7 +1043,9 @@ impl ModuleHandle {
         upsert: Vec<ScopeRecord>,
         end: Vec<ScopeEnd>,
     ) -> Result<ScopeApplyReply, ScopeCallError> {
-        if !self.shared.supports_scope_apply {
+        let shared = self.shared();
+        live_upgrade::ScopeRequest::check_fence(&shared)?;
+        if !shared.supports_scope_apply {
             return Err(ScopeCallError::NotSupported { op: SCOPE_APPLY_OP });
         }
         let request = ModuleControlRequestFromModule::ScopeApply {
@@ -1008,8 +1053,7 @@ impl ModuleHandle {
             upsert,
             end,
         };
-        match self
-            .scope_call(SCOPE_APPLY_OP, &request)
+        match live_upgrade::ScopeRequest::call(&shared, SCOPE_APPLY_OP, &request)
             .await?
             .control()
             .map_err(ScopeCallError::from_control_error)?
@@ -1043,14 +1087,15 @@ impl ModuleHandle {
         owner: Principal,
         scope_ref: String,
     ) -> Result<ScopeDescribeReply, ScopeCallError> {
-        if !self.shared.supports_scope_describe {
+        let shared = self.shared();
+        live_upgrade::ScopeRequest::check_fence(&shared)?;
+        if !shared.supports_scope_describe {
             return Err(ScopeCallError::NotSupported {
                 op: SCOPE_DESCRIBE_OP,
             });
         }
         let request = ModuleControlRequestFromModule::ScopeDescribe { owner, scope_ref };
-        match self
-            .scope_call(SCOPE_DESCRIBE_OP, &request)
+        match live_upgrade::ScopeRequest::call(&shared, SCOPE_DESCRIBE_OP, &request)
             .await?
             .control()
             .map_err(ScopeCallError::from_control_error)?
@@ -1201,10 +1246,11 @@ impl ModuleHandle {
         operation: Option<String>,
         duration: Duration,
     ) -> Result<(), OperatorConfirmError> {
-        if caller_route.connection_token() != self.shared.connection_token {
+        let shared = self.shared();
+        if caller_route.connection_token() != shared.connection_token {
             return Err(OperatorConfirmError::NotPermitted);
         }
-        if !self.shared.supports_operator_confirm {
+        if !shared.supports_operator_confirm {
             return Err(OperatorConfirmError::Unsupported);
         }
         // Use the same absolute deadline for both capacity and the reply: a
@@ -1216,17 +1262,17 @@ impl ModuleHandle {
                 .with_operation(operation),
         )
         .map_err(|_| OperatorConfirmError::PresenceUnavailable)?;
-        let (corr, writer, rx) = self.shared.begin_operator_confirm()?;
+        let (corr, writer, rx) = shared.begin_operator_confirm()?;
         let mut guard = OperatorConfirmGuard {
-            shared: Arc::clone(&self.shared),
-            runtime: self.shared.connection_runtime.clone(),
+            shared: Arc::clone(&shared),
+            runtime: shared.connection_runtime.clone(),
             writer: writer.clone(),
             corr,
             accepted: false,
             armed: true,
         };
         let frame = Frame::build_with_version(
-            self.shared.negotiated_ver,
+            shared.negotiated_ver,
             FrameType::Request,
             control_flags(),
             0,
@@ -1236,11 +1282,11 @@ impl ModuleHandle {
         )
         .map_err(|_| OperatorConfirmError::PresenceUnavailable)?;
         tokio::select! {
-            result = timeout_at(deadline, writer.send(frame)) => {
+            result = timeout_at(deadline, shared.queue_request(&writer, frame)) => {
                 result.map_err(|_| OperatorConfirmError::PresenceUnavailable)?
                     .map_err(|_| OperatorConfirmError::PresenceUnavailable)?;
             }
-            _ = self.shared.close_token.cancelled() => {
+            _ = shared.close_token.cancelled() => {
                 return Err(OperatorConfirmError::PresenceUnavailable);
             }
         }
@@ -1298,48 +1344,6 @@ impl ModuleHandle {
         }
     }
 
-    /// Send one channel-0 control request and wait for its reply, through the
-    /// same correlation table, writer and timeout as `catalog_update` and
-    /// `live_roots`. The caller checks that the reply is the right variant.
-    async fn scope_call(
-        &self,
-        op: &'static str,
-        request: &ModuleControlRequestFromModule,
-    ) -> Result<ModuleControlReply, ScopeCallError> {
-        let body = serde_json::to_vec(request).map_err(|err| {
-            ScopeCallError::Protocol(format!("failed to encode {op} request body: {err}"))
-        })?;
-        let (corr, writer, rx) = self
-            .shared
-            .begin_catalog_update()
-            .map_err(ScopeCallError::from_control_error)?;
-        let frame = Frame::build_with_version(
-            self.shared.negotiated_ver,
-            FrameType::Request,
-            control_flags(),
-            0,
-            0,
-            corr,
-            body,
-        )
-        .map_err(|err| {
-            self.shared.remove_pending_catalog_update(corr);
-            ScopeCallError::Protocol(format!("failed to build {op} request frame: {err}"))
-        })?;
-        if writer.send(frame).await.is_err() {
-            self.shared.remove_pending_catalog_update(corr);
-            return Err(ScopeCallError::ConnectionClosed);
-        }
-        match timeout(CATALOG_UPDATE_TIMEOUT, rx).await {
-            Ok(Ok(reply)) => reply.map_err(ScopeCallError::from_control_error),
-            Ok(Err(_)) => Err(ScopeCallError::ConnectionClosed),
-            Err(_) => {
-                self.shared.remove_pending_catalog_update(corr);
-                Err(ScopeCallError::Timeout)
-            }
-        }
-    }
-
     /// Emit an uncorrelated Push on a live route.
     pub async fn push(
         &self,
@@ -1347,15 +1351,15 @@ impl ModuleHandle {
         body: Vec<u8>,
         admission_class: Option<AdmissionClass>,
     ) -> Result<(), SubcModuleError> {
+        let shared = self.shared();
         self.validate_route(*handle)?;
-        let writer = self
-            .shared
+        let writer = shared
             .lock_inner()
             .writer
             .clone()
             .ok_or(SubcModuleError::WriterClosed)?;
         let frame = Frame::build_with_version(
-            self.shared.negotiated_ver,
+            shared.negotiated_ver,
             FrameType::Push,
             data_flags().with_admission_class(admission_class.unwrap_or(AdmissionClass::Normal)),
             handle.channel,
@@ -1364,20 +1368,24 @@ impl ModuleHandle {
             body,
         )
         .map_err(SubcModuleError::FrameBuild)?;
-        send_outbound(&writer, frame).await
+        shared
+            .queue_request(&writer, frame)
+            .await
+            .map_err(|_| SubcModuleError::WriterClosed)
     }
 
     /// Number of unknown or stale route frames silently dropped by endpoint validation.
     pub fn dropped_route_frames(&self) -> u64 {
-        self.shared.dropped_route_frames.load(Ordering::Relaxed)
+        let shared = self.shared();
+        shared.dropped_route_frames.load(Ordering::Relaxed)
     }
 
     fn validate_route(&self, handle: RouteHandle) -> Result<(), SubcModuleError> {
-        if handle.connection_token() != self.shared.connection_token {
+        let shared = self.shared();
+        if handle.connection_token() != shared.connection_token {
             return Err(SubcModuleError::StaleRouteHandle(handle));
         }
-        let routes = self
-            .shared
+        let routes = shared
             .live_routes
             .lock()
             .map_err(|_| SubcModuleError::InFlightPoisoned)?;
@@ -1389,7 +1397,8 @@ impl ModuleHandle {
     }
 
     fn install_route(&self, handle: RouteHandle) -> Result<(), SubcModuleError> {
-        self.shared
+        let shared = self.shared();
+        shared
             .live_routes
             .lock()
             .map_err(|_| SubcModuleError::InFlightPoisoned)?
@@ -1398,18 +1407,19 @@ impl ModuleHandle {
     }
 
     fn installed_route(&self, channel: u16) -> Result<Option<RouteHandle>, SubcModuleError> {
-        Ok(self
-            .shared
+        let shared = self.shared();
+        let route = shared
             .live_routes
             .lock()
             .map_err(|_| SubcModuleError::InFlightPoisoned)?
             .get(&channel)
-            .copied())
+            .copied();
+        Ok(route)
     }
 
     fn remove_route(&self, handle: RouteHandle) -> Result<bool, SubcModuleError> {
-        let mut routes = self
-            .shared
+        let shared = self.shared();
+        let mut routes = shared
             .live_routes
             .lock()
             .map_err(|_| SubcModuleError::InFlightPoisoned)?;
@@ -1422,32 +1432,31 @@ impl ModuleHandle {
     }
 
     fn validate_ingress(&self, channel: u16, epoch: u32) -> Result<bool, SubcModuleError> {
-        let handle = RouteHandle::new(channel, epoch, self.shared.connection_token);
-        let valid = self
-            .shared
+        let shared = self.shared();
+        let handle = RouteHandle::new(channel, epoch, shared.connection_token);
+        let valid = shared
             .live_routes
             .lock()
             .map_err(|_| SubcModuleError::InFlightPoisoned)?
             .get(&channel)
             == Some(&handle);
         if !valid {
-            self.shared
-                .dropped_route_frames
-                .fetch_add(1, Ordering::Relaxed);
+            shared.dropped_route_frames.fetch_add(1, Ordering::Relaxed);
         }
         Ok(valid)
     }
 
     fn route_handle(&self, channel: u16, epoch: u32) -> RouteHandle {
-        RouteHandle::new(channel, epoch, self.shared.connection_token)
+        let shared = self.shared();
+        RouteHandle::new(channel, epoch, shared.connection_token)
     }
 
     fn handle_control_reply(&self, frame: Frame) -> bool {
+        let shared = self.shared();
         let Some(frame) = self.handle_control_stream_frame(frame) else {
             return true;
         };
-        let claim_reply = self
-            .shared
+        let claim_reply = shared
             .lock_inner()
             .pending_claim_calls
             .remove(&frame.header.corr);
@@ -1455,8 +1464,7 @@ impl ModuleHandle {
             let _ = reply.send(frame);
             return true;
         }
-        let config_reply = self
-            .shared
+        let config_reply = shared
             .lock_inner()
             .pending_config_calls
             .remove(&frame.header.corr);
@@ -1464,8 +1472,7 @@ impl ModuleHandle {
             let _ = reply.send(frame);
             return true;
         }
-        if let Some(reply) = self
-            .shared
+        if let Some(reply) = shared
             .lock_inner()
             .pending_agent_commands
             .remove(&frame.header.corr)
@@ -1473,8 +1480,7 @@ impl ModuleHandle {
             let _ = reply.send(frame);
             return true;
         }
-        let served_by_reply = self
-            .shared
+        let served_by_reply = shared
             .lock_inner()
             .pending_scope_served_by
             .remove(&frame.header.corr);
@@ -1482,8 +1488,7 @@ impl ModuleHandle {
             let _ = reply.send(frame);
             return true;
         }
-        let activity_reply = self
-            .shared
+        let activity_reply = shared
             .lock_inner()
             .pending_activity_records
             .remove(&frame.header.corr);
@@ -1491,8 +1496,7 @@ impl ModuleHandle {
             let _ = reply.send(frame);
             return true;
         }
-        let operator_reply = self
-            .shared
+        let operator_reply = shared
             .lock_inner()
             .pending_operator_confirms
             .remove(&frame.header.corr);
@@ -1500,7 +1504,7 @@ impl ModuleHandle {
             let _ = reply.send(frame);
             return true;
         }
-        let Some(reply) = self.shared.take_pending_catalog_update(frame.header.corr) else {
+        let Some(reply) = shared.take_pending_catalog_update(frame.header.corr) else {
             return false;
         };
         let result = match frame.header.ty {
@@ -1525,33 +1529,44 @@ impl ModuleHandle {
             ))),
         };
         let outcome = match &result {
-            Ok(ModuleControlReply::Control(reply))
-                if matches!(
-                    reply.as_ref(),
-                    ModuleControlResponseToModule::CatalogUpdate {}
-                ) =>
-            {
-                CatalogChangeOutcome::Accepted
-            }
+            Ok(ModuleControlReply::Control(reply)) => match reply.as_ref() {
+                ModuleControlResponseToModule::CatalogUpdate {} => {
+                    CatalogChangeOutcome::AcceptedCatalog
+                }
+                ModuleControlResponseToModule::CatalogUpdateRoleDeclarations {} => {
+                    CatalogChangeOutcome::AcceptedRoleDeclarations
+                }
+                _ => CatalogChangeOutcome::Unknown,
+            },
             Err(CatalogUpdateError::FrozenField(_))
             | Err(CatalogUpdateError::NotRegistered(_))
             | Err(CatalogUpdateError::Rejected(_)) => CatalogChangeOutcome::Rejected,
             _ => CatalogChangeOutcome::Unknown,
         };
-        self.shared
-            .finish_catalog_change(frame.header.corr, outcome);
+        shared.finish_catalog_change(frame.header.corr, outcome);
         let _ = reply.send(result);
         true
     }
 
     fn close_connection(&self) {
-        self.shared.close_connection();
+        let shared = self.shared();
+        shared.close_connection();
     }
 }
 
 impl ModuleHandleShared {
     fn begin_catalog_update(&self) -> Result<CatalogUpdateRequest, CatalogUpdateError> {
+        self.begin_control_call(false)
+    }
+
+    fn begin_control_call(
+        &self,
+        resume_sync: bool,
+    ) -> Result<CatalogUpdateRequest, CatalogUpdateError> {
         let mut inner = self.lock_inner();
+        if !resume_sync && inner.upgrade.fenced() {
+            return Err(CatalogUpdateError::Rejected(live_upgrade::upgrade_refusal()));
+        }
         if inner.closed {
             return Err(CatalogUpdateError::ConnectionClosed);
         }
@@ -1572,7 +1587,7 @@ impl ModuleHandleShared {
 
     fn begin_operator_confirm(&self) -> Result<OperatorConfirmRequestWaiter, OperatorConfirmError> {
         let mut inner = self.lock_inner();
-        if inner.closed {
+        if inner.closed || inner.upgrade.fenced() {
             return Err(OperatorConfirmError::PresenceUnavailable);
         }
         let Some(writer) = inner.writer.clone() else {
@@ -1622,10 +1637,39 @@ impl ModuleHandleShared {
             .is_some_and(|change| change.outcome.is_some())
         {
             let change = inner.catalog_changes.pop_front().expect("completed change");
-            match change.outcome.expect("completed outcome") {
-                CatalogChangeOutcome::Accepted => inner.current_provides = Some(change.provides),
-                CatalogChangeOutcome::Rejected => {}
-                CatalogChangeOutcome::Unknown => inner.current_provides = None,
+            match (change.outcome.expect("completed outcome"), change.update) {
+                (
+                    CatalogChangeOutcome::AcceptedCatalog,
+                    CatalogManifestChange::Catalog {
+                        provides,
+                        capabilities,
+                        ready,
+                    },
+                ) => {
+                    inner.current_provides = Some(provides.clone());
+                    inner.upgrade.update_manifest(|manifest| {
+                        manifest.provides = provides;
+                        if capabilities.is_some() {
+                            manifest.capabilities = capabilities;
+                        }
+                        if ready.is_some() {
+                            manifest.ready = ready;
+                        }
+                    });
+                }
+                (
+                    CatalogChangeOutcome::AcceptedRoleDeclarations,
+                    CatalogManifestChange::RoleDeclarations(declarations),
+                ) => {
+                    inner
+                        .upgrade
+                        .update_manifest(|manifest| manifest.role_declarations = declarations);
+                }
+                (
+                    CatalogChangeOutcome::Unknown | CatalogChangeOutcome::AcceptedRoleDeclarations,
+                    CatalogManifestChange::Catalog { .. },
+                ) => inner.current_provides = None,
+                _ => {}
             }
         }
     }
@@ -1638,7 +1682,6 @@ impl ModuleHandleShared {
             }
             inner.closed = true;
             inner.writer = None;
-            inner.current_provides = None;
             inner.catalog_changes.clear();
             self.close_token.cancel();
             // Dropping these senders wakes raw-frame waiters immediately.
@@ -1809,6 +1852,8 @@ impl Error for OperatorConfirmError {}
 
 /// Errors returned by [`ModuleHandle::catalog_update`], [`ModuleHandle::set_ready`]
 /// and [`ModuleHandle::update_role_declarations`].
+/// An announced upgrade rejects new calls locally with `module_reloading` and
+/// `detail.reason` set to `daemon_upgrade`; no request was sent.
 #[derive(Debug)]
 pub enum CatalogUpdateError {
     NotSupported,
@@ -1865,8 +1910,9 @@ pub enum ScopeCallError {
     /// HELLO_ACK did not advertise the operation (or its required capability),
     /// so nothing was sent.
     NotSupported { op: &'static str },
-    /// The daemon refused the request with a channel-0 Error frame. `code` is
-    /// the daemon's code as sent, to compare against the constants in
+    /// The daemon sent a channel-0 Error frame, or the SDK refused to send the
+    /// request during an announced upgrade (`module_reloading`). Compare `code` against
+    /// the constants in
     /// `subc_protocol::error_codes` (`SCOPE_SYNC_STALE`,
     /// `SCOPE_SYNC_NOT_AUTHORITY`, `SCOPE_LIVE_LIMIT_EXCEEDED`, ...).
     Refused { code: String, message: String },
@@ -1986,9 +2032,26 @@ pub trait ModuleHandler: Send + Sync + 'static {
     /// handler cannot head-of-line-block another route.
     async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome;
 
-    /// Called once after HELLO_ACK so the module can inspect the ack body for
+    /// Called after each HELLO_ACK so the module can inspect the ack body for
     /// negotiated capabilities and any storage descriptor supplied by the daemon.
     async fn on_hello_ack(&self, _ack: &ModuleHelloAckBody) {}
+
+    /// Supply a full scope sync to send before dispatching any resumed frames.
+    /// The handle exposes the new ACK metadata, but cannot send RPCs in this
+    /// hook. Make calls and reopen routes in [`Self::on_reconnected`] instead.
+    async fn resume_scope_sync(&self, _handle: &ModuleHandle) -> Option<ResumeScopeSync> {
+        None
+    }
+
+    /// Rebuild connection-local state after an announced daemon upgrade. The
+    /// reader and config session are already running. A refused scope sync is
+    /// reported here and does not end the connection.
+    async fn on_reconnected(
+        &self,
+        _handle: &ModuleHandle,
+        _scope_sync: Option<Result<ScopeSyncReply, ScopeCallError>>,
+    ) {
+    }
 
     /// Extra daemon-to-module operations served on channel 0, such as `consent/v1`.
     /// Read and validated once before HELLO: names must be nonempty ASCII names
@@ -2334,7 +2397,8 @@ impl RequestCtx {
     }
 
     /// Completes when the other side sends Cancel for this request or the route
-    /// is torn down.
+    /// is torn down. An announced daemon upgrade lets already running data
+    /// handlers finish without cancelling them at disconnect.
     pub fn cancelled(&self) -> WaitForCancellationFuture<'_> {
         self.cancelled.cancelled()
     }
@@ -2627,6 +2691,8 @@ pub struct ServeOptions {
     prefix_child: bool,
     writer_drain_timeout: Duration,
     stop_handle: ModuleStopHandle,
+    live_upgrade: bool,
+    connection_file: Option<PathBuf>,
 }
 
 impl Default for ServeOptions {
@@ -2636,6 +2702,8 @@ impl Default for ServeOptions {
             registration_channel: false,
             prefix_child: false,
             stop_handle: ModuleStopHandle::new(),
+            live_upgrade: false,
+            connection_file: None,
         }
     }
 }
@@ -2644,7 +2712,7 @@ impl ServeOptions {
     /// Set the writer drain budget (default: two seconds). A module stop also
     /// gives in-flight handlers up to this long to finish before sending
     /// GOODBYE, then gives the writer its own budget to flush. Other connection
-    /// ends cancel handlers immediately. Work still running at a drain
+    /// ends cancel handlers immediately unless an upgrade was announced. Work still running at a drain
     /// deadline is aborted.
     ///
     /// Keep the combined handler and writer waits below the daemon's per-module
@@ -2802,6 +2870,9 @@ async fn prepare_connection<H: ModuleHandler>(
     handler: H,
     mut options: ServeOptions,
 ) -> Result<Option<(ModuleHandle, ModuleServeFuture)>, SubcModuleError> {
+    if options.live_upgrade {
+        options.connection_file = Some(connection_file.to_owned());
+    }
     options.registration_channel = registration::adopt(&manifest.module_id)?;
     let stream = tokio::select! {
         biased;
@@ -2823,143 +2894,6 @@ async fn prepare_connection<H: ModuleHandler>(
         } => stream?,
     };
     register_connection(stream, manifest, handler, options).await
-}
-
-async fn register_connection<S, H>(
-    stream: S,
-    manifest: ModuleManifest,
-    handler: H,
-    options: ServeOptions,
-) -> Result<Option<(ModuleHandle, ModuleServeFuture)>, SubcModuleError>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    H: ModuleHandler,
-{
-    let control_ops = control_ops::validate(handler.control_ops())?;
-    let (mut read_half, write_half) = tokio::io::split(stream);
-    let (tx, rx) = mpsc::channel::<Frame>(EGRESS_BUFFER);
-    let connection_runtime = tokio::runtime::Handle::current();
-    let mut writer = tokio::spawn(drain_writer(write_half, rx));
-    let handler = Arc::new(handler);
-    let declaration = if options.prefix_child {
-        None
-    } else {
-        handler.config_declaration()
-    };
-
-    let mut hello_ack = None;
-    let provides = manifest.provides.clone();
-    let handshake = async {
-        send_hello(&tx, manifest, declaration.is_some(), &control_ops).await?;
-        // A validated ACK means the daemon accepted the module, even while the
-        // module's callback is pending. Keep that boundary when the writer wins.
-        hello_ack = Some(expect_hello_ack(&mut read_half).await?);
-        handler
-            .on_hello_ack(hello_ack.as_ref().expect("validated HELLO_ACK"))
-            .await;
-        Ok::<_, SubcModuleError>(())
-    };
-    let mut writer_result = None;
-    let handshake_result = tokio::select! {
-        biased;
-        () = options.stop_handle.token.cancelled() => None,
-        result = handshake => Some(result),
-        result = &mut writer => {
-            writer_result = Some(result);
-            Some(Ok(()))
-        }
-    };
-    match handshake_result {
-        Some(Ok(())) => {}
-        other => {
-            let result = match other {
-                None => {
-                    let deadline = Instant::now() + options.writer_drain_timeout;
-                    let result = timeout_at(deadline, send_goodbye(&tx)).await;
-                    drop(tx);
-                    let flush = finish_writer_and_drain(writer, &mut read_half, deadline).await;
-                    handler.on_connection_end(ConnectionEnd::Closed).await;
-                    match result.unwrap_or(Ok(())) {
-                        Ok(()) | Err(SubcModuleError::WriterClosed) => {}
-                        Err(error) => return Err(error),
-                    }
-                    match flush.0 {
-                        Err(SubcModuleError::FrameIo(FrameIoError::Io(error)))
-                            if is_disconnect(&error) => {}
-                        result => result?,
-                    }
-                    return Ok(None);
-                }
-                Some(Err(error)) => error,
-                Some(Ok(_)) => unreachable!(),
-            };
-            drop(tx);
-            let deadline = Instant::now() + options.writer_drain_timeout;
-            let _ = finish_writer_and_drain(writer, &mut read_half, deadline).await;
-            return Err(result);
-        }
-    }
-    let mut ack = match hello_ack {
-        Some(ack) => ack,
-        None => {
-            return Err(writer_ended(
-                writer_result.expect("writer ended before HELLO_ACK"),
-            ))
-        }
-    };
-    if options.prefix_child {
-        // A prefix registration is brokered, not another primary channel. Keep
-        // its registration RPCs while refusing owner-only operations locally.
-        ack.subc_ops.retain(|op| {
-            matches!(
-                op.as_str(),
-                "catalog.update" | "scope.describe" | "supervisor.live_roots" | "activity.record"
-            )
-        });
-    }
-    // The callback can be cancelled by a writer failure, but a failure after
-    // acceptance belongs to the serving lifecycle, including its teardown hook.
-    let writer_end = writer_result.map(writer_connection_end);
-
-    let Some(connection_token) = checked_increment(&NEXT_MODULE_CONNECTION_TOKEN) else {
-        drop(tx);
-        let deadline = Instant::now() + options.writer_drain_timeout;
-        if writer_end.is_none() {
-            let _ = finish_writer_and_drain(writer, &mut read_half, deadline).await;
-        }
-        return Err(SubcModuleError::ConnectionTokenExhausted);
-    };
-    let close_token = CancellationToken::new();
-    let handle = ModuleHandle::new(
-        &ack,
-        tx.clone(),
-        connection_token,
-        close_token,
-        connection_runtime,
-    );
-    handle.shared.lock_inner().current_provides = Some(provides);
-    handle
-        .shared
-        .registration
-        .prefix_child
-        .store(options.prefix_child, Ordering::Release);
-    let _ = handle.shared.served_control_ops.set(control_ops);
-    if options.registration_channel {
-        registration::install_owner(&handle)?;
-    }
-    if let Some(declaration) = declaration {
-        let _ = handle.shared.config.declaration.set(declaration);
-    }
-    let serve_future = connection_serve_future_with_options(
-        read_half,
-        tx,
-        handler,
-        handle.clone(),
-        writer,
-        options,
-        writer_end,
-    );
-    Ok(Some((handle, serve_future)))
 }
 
 // Both real connections and the in-memory test stand-in run this lifecycle,
@@ -2985,159 +2919,6 @@ where
         ServeOptions::default(),
         None,
     )
-}
-
-fn registration_channel_exit_code(result: &Result<ConnectionEnd, SubcModuleError>) -> i32 {
-    if matches!(result, Ok(ConnectionEnd::Goodbye)) {
-        0
-    } else {
-        1
-    }
-}
-
-fn connection_serve_future_with_options<R, H>(
-    mut read_half: R,
-    tx: mpsc::Sender<Frame>,
-    handler: Arc<H>,
-    handle: ModuleHandle,
-    mut writer: tokio::task::JoinHandle<Result<(), WriterFailure>>,
-    options: ServeOptions,
-    writer_end: Option<Result<ConnectionEnd, SubcModuleError>>,
-) -> ModuleServeFuture
-where
-    R: AsyncRead + Unpin + Send + 'static,
-    H: ModuleHandler,
-{
-    let serve_handle = handle.clone();
-    // Before the caller gets the future (and before the serve loop reads its
-    // first frame after HELLO_ACK), so the
-    // handle's pool figures describe the pools the dispatcher will use.
-    handle.install_dispatch_pools(handler.request_pools());
-    Box::pin(async move {
-        // Connection loss ends this serve future. Module serving retains no
-        // reconnect task or in-flight reconnect gate; a supervisor that needs
-        // recovery starts a fresh serve_with_handle invocation.
-        let dispatcher = RequestDispatcher::with_pools(serve_handle.dispatch_pools());
-        if !options.prefix_child {
-            config::start(serve_handle.clone(), Arc::clone(&handler), &dispatcher);
-        }
-        let mut writer_finished = writer_end.is_some();
-        let mut loop_result = if let Some(end) = writer_end {
-            end
-        } else {
-            tokio::select! {
-                biased;
-                result = module_loop(&mut read_half, &tx, Arc::clone(&handler), serve_handle.clone(), &dispatcher, &options.stop_handle) => result,
-                result = &mut writer => {
-                    writer_finished = true;
-                    writer_connection_end(result)
-                }
-            }
-        };
-        // A failed terminal enqueue can win the select just before the writer
-        // reports why it closed. Classify that same disconnect before calling
-        // the connection-end hook, rather than exposing a scheduling race.
-        if matches!(loop_result, Err(SubcModuleError::WriterClosed)) && !writer_finished {
-            writer_finished = true;
-            loop_result = writer_connection_end((&mut writer).await);
-        }
-        let deadline = Instant::now() + options.writer_drain_timeout;
-        serve_handle.shared.config.stop.cancel();
-        dispatcher.wait_for_draining_hooks_to_start().await;
-        dispatcher.tasks.close();
-        if matches!(loop_result, Ok(ConnectionEnd::Closed))
-            && options.stop_handle.token.is_cancelled()
-        {
-            // Keep routes live until accepted work has sent its terminal reply.
-            let _ = timeout_at(deadline, dispatcher.tasks.wait()).await;
-        }
-        let orderly = loop_result.is_ok();
-        if let Some(error) = dispatcher.take_failure() {
-            if !orderly || !matches!(error, SubcModuleError::WriterClosed) {
-                loop_result = Err(error);
-            }
-        }
-        dispatcher.cancel_all();
-        let _ = timeout_at(deadline, dispatcher.tasks.wait()).await;
-        let abandoned_replies = dispatcher
-            .in_flight
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .len();
-        if let Some(error) = dispatcher.take_failure() {
-            if !orderly || !matches!(error, SubcModuleError::WriterClosed) {
-                loop_result = Err(error);
-            }
-        }
-        dispatcher.abort_all();
-        dispatcher.tasks.wait().await;
-        let daemon_eof = matches!(loop_result, Ok(ConnectionEnd::Eof));
-        let locally_closed = matches!(loop_result, Ok(ConnectionEnd::Closed));
-        // The module ended the connection itself: a stop, an internal close
-        // or a module-side error. Close it in order, so the daemon reads a
-        // FIN rather than a reset. When the daemon ended it (EOF, GOODBYE or
-        // a reset) or the writer already failed, there is nothing to drain.
-        let module_ended =
-            !writer_finished && matches!(loop_result, Ok(ConnectionEnd::Closed) | Err(_));
-        let deadline = Instant::now() + options.writer_drain_timeout;
-        if matches!(loop_result, Ok(ConnectionEnd::Closed))
-            && options.stop_handle.token.is_cancelled()
-        {
-            match timeout_at(deadline, send_goodbye(&tx)).await {
-                Ok(Ok(())) | Err(_) => {}
-                Ok(Err(SubcModuleError::WriterClosed)) => {}
-                Ok(Err(error)) => loop_result = Err(error),
-            }
-        }
-        serve_handle.close_connection();
-        drop(tx);
-        let loop_result = match loop_result {
-            Ok(end) => {
-                handler.on_connection_end(end).await;
-                Ok(end)
-            }
-            Err(error) => Err(error),
-        };
-
-        let (writer_result, undelivered_replies) = if writer_finished {
-            (Ok(()), 0)
-        } else if module_ended {
-            finish_writer_and_drain(writer, &mut read_half, deadline).await
-        } else {
-            finish_writer(writer, deadline).await
-        };
-        let undelivered_replies = undelivered_replies as u64
-            + dispatcher.undelivered_replies.load(Ordering::Relaxed)
-            + abandoned_replies as u64;
-        if daemon_eof && undelivered_replies > 0 {
-            tracing::warn!(
-                undelivered_replies,
-                "daemon EOF: replies could not be delivered during drain"
-            );
-        }
-        if options.registration_channel && !locally_closed {
-            // An inherited registration cannot be recreated. Finish the hook
-            // and teardown before letting the supervisor restart the process.
-            // The supervisor treats an unrequested clean exit as a stop, so
-            // only a daemon GOODBYE may exit successfully.
-            std::process::exit(registration_channel_exit_code(&loop_result));
-        }
-        match (loop_result.map(|_| ()), writer_result) {
-            (Err(SubcModuleError::WriterClosed), Err(writer_error)) => Err(writer_error),
-            (Err(loop_err), _) => Err(loop_err),
-            (Ok(()), Ok(())) => Ok(()),
-            // EOF or GOODBYE can precede a failed flush, especially when a
-            // daemon restart outlasts its drain budget. Once the daemon has
-            // ended the connection, Windows RST and Unix BrokenPipe are
-            // consequences of that orderly end, not independent failures.
-            (Ok(()), Err(SubcModuleError::FrameIo(FrameIoError::Io(err))))
-                if is_disconnect(&err) =>
-            {
-                Ok(())
-            }
-            (Ok(()), Err(error)) => Err(error),
-        }
-    })
 }
 
 async fn module_loop<R, H>(
@@ -3175,12 +2956,13 @@ where
     R: AsyncRead + Unpin,
     H: ModuleHandler,
 {
+    let shared = module_handle.shared();
     loop {
         let read = tokio::select! {
             biased;
             () = dispatcher.failed.cancelled() => return Err(dispatcher.take_failure().expect("failure signalled")),
             () = stop.token.cancelled() => return Ok(ConnectionEnd::Closed),
-            () = module_handle.shared.close_token.cancelled() => return Ok(ConnectionEnd::Closed),
+            () = shared.close_token.cancelled() => return Ok(ConnectionEnd::Closed),
             read = read_frame(reader) => read,
         };
         let frame = match read {
@@ -3275,19 +3057,20 @@ where
             if config::changed(&frame, &module_handle) {
                 return Ok(true);
             }
-            handle_control_push(&frame, handler, &dispatcher);
+            handle_control_push(&frame, handler, &dispatcher, &module_handle);
             Ok(true)
         }
         _ => Ok(true),
     }
 }
 
-/// Act on a one-way channel-0 command from the daemon. Never fails the
-/// connection: a push this SDK cannot decode is most likely a newer daemon's
-/// command, and ignoring it is what an older module did before this SDK
-/// decoded any of them.
-fn handle_control_push<H>(frame: &Frame, handler: Arc<H>, dispatcher: &RequestDispatcher)
-where
+/// Dispatch known channel-0 commands without closing on newer commands.
+fn handle_control_push<H>(
+    frame: &Frame,
+    handler: Arc<H>,
+    dispatcher: &RequestDispatcher,
+    module_handle: &ModuleHandle,
+) where
     H: ModuleHandler,
 {
     match serde_json::from_slice::<ModuleControlCommand>(&frame.body) {
@@ -3306,6 +3089,9 @@ where
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(started);
+        }
+        Ok(ModuleControlCommand::Upgrading { reconnect_by_ms }) => {
+            module_handle.announce_upgrade(reconnect_by_ms)
         }
         Err(error) => {
             if !dispatcher
@@ -3409,7 +3195,7 @@ where
     let (pool, op) = dispatcher.pools.classify(&body);
     let pool = pool.clone();
     let wait = pool.start_waiting((handle.channel, handle.epoch, corr));
-    dispatcher.clone().spawn(async move {
+    dispatcher.clone().spawn_data(async move {
         let waiting = WaitingRequest {
             op,
             channel: handle.channel,
@@ -3830,40 +3616,6 @@ where
         }
     }
     Ok(())
-}
-
-async fn send_hello(
-    egress: &mpsc::Sender<Frame>,
-    mut manifest: ModuleManifest,
-    config_gate: bool,
-    extra_control_ops: &[String],
-) -> Result<(), SubcModuleError> {
-    let launch_nonce = if registration::supervised() {
-        None
-    } else {
-        match retained_launch_nonce() {
-            Some(retained) => Some(retained),
-            None => launch_nonce()
-                .map_err(SubcModuleError::LaunchNonce)?
-                .map(|nonce| nonce.value().to_string()),
-        }
-    };
-    stamp_launch_nonce_source(&mut manifest, launch_nonce.as_deref());
-    let mut control_ops = vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_string()];
-    if config_gate {
-        control_ops.push(config::CONFIG_REVIEW_OP.to_owned());
-    }
-    control_ops.extend_from_slice(extra_control_ops);
-    let body = serde_json::to_vec(&ModuleHelloBody {
-        manifest,
-        protocol_ver: PROTOCOL_VERSION,
-        control_ops: Some(control_ops),
-        launch_nonce,
-    })
-    .map_err(SubcModuleError::Json)?;
-    let frame = Frame::build(FrameType::Hello, control_flags(), 0, 0, HELLO_CORR, body)
-        .map_err(SubcModuleError::FrameBuild)?;
-    send_outbound(egress, frame).await
 }
 
 async fn expect_hello_ack<R>(reader: &mut R) -> Result<ModuleHelloAckBody, SubcModuleError>
@@ -4407,6 +4159,7 @@ mod tests {
     fn test_module_handle(subc_ops: &[&str]) -> (ModuleHandle, mpsc::Receiver<Frame>) {
         let (tx, rx) = mpsc::channel(4);
         let ack = ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: subc_ops.iter().map(|op| (*op).to_string()).collect(),
             subc_capabilities: Vec::new(),
@@ -4431,6 +4184,7 @@ mod tests {
         let handle_for = |machine_id: Option<&str>| {
             let (tx, _rx) = mpsc::channel(1);
             let ack = ModuleHelloAckBody {
+                resume_token: None,
                 negotiated_ver: PROTOCOL_VERSION,
                 subc_ops: Vec::new(),
                 subc_capabilities: Vec::new(),
@@ -4565,7 +4319,7 @@ mod tests {
         let (handle, mut rx) =
             test_module_handle(&[MODULE_TO_SUBC_OP_CATALOG_UPDATE_ROLE_DECLARATIONS]);
         let initial_roles = vec![test_provider_role(&["original"])];
-        handle.shared.lock_inner().current_provides = Some(initial_roles.clone());
+        handle.shared().lock_inner().current_provides = Some(initial_roles.clone());
         for declarations in [
             json!({"media-provider/v1": {"engines": ["image"]}}),
             json!({}),
@@ -4601,7 +4355,7 @@ mod tests {
             "role_declarations key must use capability-name grammar"
         );
         assert_eq!(
-            handle.shared.lock_inner().current_provides,
+            handle.shared().lock_inner().current_provides,
             Some(initial_roles)
         );
     }
@@ -4644,7 +4398,7 @@ mod tests {
     async fn catalog_update_set_ready_preserves_registered_and_replaced_roles() {
         let (handle, mut rx) = test_module_handle(&[MODULE_TO_SUBC_OP_CATALOG_UPDATE]);
         let initial = vec![test_provider_role(&["initial", "second"])];
-        handle.shared.lock_inner().current_provides = Some(initial.clone());
+        handle.shared().lock_inner().current_provides = Some(initial.clone());
         let (result, ()) = tokio::join!(
             handle.set_ready(true),
             ack_catalog_update(&handle, &mut rx, &initial, Some(true), None)
@@ -4726,7 +4480,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn catalog_update_set_ready_timeout_does_not_replay_stale_roles() {
         let (handle, mut rx) = test_module_handle(&[MODULE_TO_SUBC_OP_CATALOG_UPDATE]);
-        handle.shared.lock_inner().current_provides = Some(vec![test_provider_role(&["old"])]);
+        handle.shared().lock_inner().current_provides = Some(vec![test_provider_role(&["old"])]);
         assert!(matches!(
             handle
                 .catalog_update(vec![test_provider_role(&["new"])])
@@ -4746,7 +4500,7 @@ mod tests {
     async fn catalog_update_set_ready_rejection_retains_last_accepted_roles() {
         let (handle, mut rx) = test_module_handle(&[MODULE_TO_SUBC_OP_CATALOG_UPDATE]);
         let initial = vec![test_provider_role(&["kept"])];
-        handle.shared.lock_inner().current_provides = Some(initial.clone());
+        handle.shared().lock_inner().current_provides = Some(initial.clone());
         let (result, ()) = tokio::join!(
             handle.catalog_update(vec![test_provider_role(&["rejected"])]),
             async {
@@ -4796,6 +4550,7 @@ mod tests {
     async fn route_authorize_requires_advertised_operation() {
         let (tx, mut rx) = mpsc::channel(4);
         let ack = ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: vec![],
             // A module-provided capability is not the daemon's op advertisement.
@@ -4948,6 +4703,7 @@ mod tests {
         assert!(rx.try_recv().is_err());
         let (tx, mut rx) = mpsc::channel(4);
         let ack = ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: vec![],
             subc_capabilities: vec![subc_protocol::scope::SCOPE_SERVED_BY_CAPABILITY.into()],
@@ -5867,7 +5623,7 @@ mod tests {
     #[tokio::test]
     async fn on_bound_runs_only_after_ack_queue_and_handle_install() {
         let (module_handle, mut rx) = test_module_handle(&[]);
-        let tx = module_handle.shared.lock_inner().writer.clone().unwrap();
+        let tx = module_handle.shared().lock_inner().writer.clone().unwrap();
         let bind_emit_rejected = Arc::new(AtomicUsize::new(0));
         let bound = Arc::new(AtomicUsize::new(0));
         let cleanup = Arc::new(AtomicUsize::new(0));
@@ -5939,7 +5695,7 @@ mod tests {
     #[tokio::test]
     async fn rejected_bind_cleans_up_without_installing_or_calling_on_bound() {
         let (module_handle, mut rx) = test_module_handle(&[]);
-        let tx = module_handle.shared.lock_inner().writer.clone().unwrap();
+        let tx = module_handle.shared().lock_inner().writer.clone().unwrap();
         let bound = Arc::new(AtomicUsize::new(0));
         let cleanup = Arc::new(AtomicUsize::new(0));
         let handler = Arc::new(RejectingHandler {
@@ -5987,7 +5743,7 @@ mod tests {
     #[tokio::test]
     async fn rejected_bind_carries_its_detail_to_the_daemon() {
         let (module_handle, mut rx) = test_module_handle(&[]);
-        let tx = module_handle.shared.lock_inner().writer.clone().unwrap();
+        let tx = module_handle.shared().lock_inner().writer.clone().unwrap();
         handle_frame(
             route_bind_frame(6, 3, 92),
             &tx,
@@ -6035,7 +5791,7 @@ mod tests {
     #[tokio::test]
     async fn rebind_on_installed_channel_replaces_on_higher_epoch_only() {
         let (module_handle, mut rx) = test_module_handle(&[]);
-        let tx = module_handle.shared.lock_inner().writer.clone().unwrap();
+        let tx = module_handle.shared().lock_inner().writer.clone().unwrap();
         let bound = Arc::new(AtomicUsize::new(0));
         let cleanup = Arc::new(AtomicUsize::new(0));
         let handler = Arc::new(RebindCountingHandler {
@@ -6123,7 +5879,8 @@ mod tests {
     #[tokio::test]
     async fn module_control_corr_is_monotonic_and_exhausts_without_wrap() {
         let (module_handle, _rx) = test_module_handle(&[MODULE_TO_SUBC_OP_CATALOG_UPDATE]);
-        let mut inner = module_handle.shared.lock_inner();
+        let shared = module_handle.shared();
+        let mut inner = shared.lock_inner();
         inner.next_corr = Some(u64::MAX);
         assert_eq!(next_module_control_corr(&mut inner), Some(u64::MAX));
         assert_eq!(next_module_control_corr(&mut inner), None);

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::{
     fs, io,
     net::Ipv4Addr,

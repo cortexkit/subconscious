@@ -847,6 +847,8 @@ async fn run_scripted_provider(
         .await
         .expect("scripted test provider should authenticate to the daemon");
     let hello = ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest: raw_provider_manifest(module_id, tool_name),
         protocol_ver: PROTOCOL_VERSION,
         control_ops: None,
@@ -5951,6 +5953,8 @@ async fn run_raw_provider(
         .await
         .expect("raw test provider should authenticate to the daemon");
     let hello = ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest: raw_provider_manifest(module_id, tool_name),
         protocol_ver: PROTOCOL_VERSION,
         control_ops: None,

@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 #![cfg(windows)]
 
 //! A daemon-only crash must close carried jobs without affecting its siblings.

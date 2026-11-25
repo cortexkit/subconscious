@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::{
     collections::BTreeMap,
     fs,
@@ -2318,6 +2320,8 @@ fn control_request_frame(corr: u64, request: ClientControlRequest) -> Frame {
 fn untrusted_hello_frame(module_id: &str, corr: u64) -> Frame {
     let manifest = ModuleManifest::builder(module_id, "0.0.0-test").build();
     let body = serde_json::to_vec(&ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest,
         protocol_ver: PROTOCOL_VERSION,
         control_ops: None,

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.41.15
+
+- Add opt-in live daemon upgrades for supervised primary modules on Linux and
+  macOS. New sends are fenced while old requests can still resolve. Data handlers
+  can finish after disconnect, but their old replies are discarded.
+- Resume on the local socket with the same module handle. Use `resume_scope_sync`
+  to send the full scope set before any other frame and `on_reconnected` to
+  rebuild connection-local state while configuration delivery and dispatch run.
+- Decode the optional live-upgrade wire members even without opting in. Require
+  subc-control 0.42.9, subc-os 0.1.54 and subc-protocol 0.37.9.
+
 ## 0.41.14
 
 - Add owner-local `SubcConsumer::config_revert`, which restores files covered

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use serde_json::{json, Value};
 mod common;
 use common::kit::Kit;

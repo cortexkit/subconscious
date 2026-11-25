@@ -172,6 +172,8 @@ async fn config_admission_post_exec_unattached_binding_never_publishes_ready() {
     let registry = Arc::new(Registry::default());
     let handler = crate::ControlHandler::new(registry.clone()).with_supervisor(handle.clone());
     let hello = subc_protocol::ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest: subc_protocol::manifest::ModuleManifest::builder("binding-probe", "0.1.0")
             .build(),
         protocol_ver: subc_protocol::PROTOCOL_VERSION,
@@ -308,6 +310,8 @@ async fn config_recovery_registration_deadline_reap_retires_before_probe_await()
     let handler =
         crate::ControlHandler::new(Arc::new(Registry::default())).with_supervisor(handle.clone());
     let hello = subc_protocol::ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest: subc_protocol::manifest::ModuleManifest::builder("deadline", "1.0.0").build(),
         protocol_ver: subc_protocol::PROTOCOL_VERSION,
         control_ops: None,
@@ -409,6 +413,8 @@ fn retired_nonce_hello_code(
 ) -> serde_json::Value {
     let handler = crate::ControlHandler::new(Arc::new(Registry::default())).with_supervisor(handle);
     let hello = subc_protocol::ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest: subc_protocol::manifest::ModuleManifest::builder(module, "1.0.0").build(),
         protocol_ver: subc_protocol::PROTOCOL_VERSION,
         control_ops: None,

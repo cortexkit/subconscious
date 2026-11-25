@@ -109,6 +109,7 @@ impl Rig {
                 0,
                 hello.header.corr,
                 serde_json::to_vec(&ModuleHelloAckBody {
+                    resume_token: None,
                     negotiated_ver: PROTOCOL_VERSION,
                     subc_ops: vec![],
                     subc_capabilities: if config {
@@ -358,6 +359,7 @@ async fn cancel_signals_handler_and_drops_its_late_reply() {
     let (writer, mut outbound) = mpsc::channel(1);
     let handle = ModuleHandle::new(
         &ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: vec![],
             subc_capabilities: vec![],
@@ -370,7 +372,7 @@ async fn cancel_signals_handler_and_drops_its_late_reply() {
         tokio::runtime::Handle::current(),
     );
     handle
-        .shared
+        .shared()
         .served_control_ops
         .set(vec!["sample.check".into()])
         .unwrap();

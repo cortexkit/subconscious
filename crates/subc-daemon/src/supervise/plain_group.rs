@@ -4,6 +4,7 @@ use tokio::time::{sleep_until, Instant};
 
 pub(crate) const TERM_GRACE: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(50);
+const EMPTY_GRACE: Duration = Duration::from_secs(2);
 
 trait GroupOperations {
     fn observe(&self, leader: u32) -> io::Result<Option<ExitStatus>>;
@@ -41,6 +42,95 @@ impl GroupOperations for Unix {
     }
 }
 
+/// Finish cleanup while the daemon still owns the exited, unreaped leader.
+/// A group-wide signal is permitted only in this state: after the leader is
+/// reaped, its numeric group id can be reused by an unrelated process.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn settle_pinned_exited_group(leader: u32, may_signal: bool) -> io::Result<()> {
+    let work = || settle_pinned_exited_group_inline(leader, may_signal);
+    let multi_threaded = tokio::runtime::Handle::try_current()
+        .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+    if multi_threaded {
+        // The complete scan can wait on another process's parent reaping a
+        // zombie. Hand this worker's async tasks to another worker while that
+        // wait holds the child's reap lock. A current-thread runtime has no
+        // such handoff, so the bounded scan runs inline there.
+        tokio::task::block_in_place(work)
+    } else {
+        work()
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn settle_pinned_exited_group_inline(leader: u32, may_signal: bool) -> io::Result<()> {
+    let group = i32::try_from(leader)
+        .ok()
+        .and_then(Pid::from_raw)
+        .ok_or_else(|| io::Error::other("invalid adopted process group"))?;
+    leader_is_held(leader)?;
+    if may_signal {
+        match Unix.signal(group, Signal::KILL) {
+            #[cfg(target_os = "macos")]
+            Err(error)
+                if error.raw_os_error() == Some(rustix::io::Errno::PERM.raw_os_error())
+                    && matches!(Unix.has_live_members(leader), Ok(false)) =>
+            {
+                Ok(())
+            }
+            result => result,
+        }?;
+    }
+    // A replacement must not launch beside a surviving descendant. The full
+    // scan runs only while the unreaped leader reserves the group id, and only
+    // the leader's own zombie is ignored. A zombie cannot fork, so no new
+    // descendant of the old module can appear after an empty scan. An unrelated
+    // process in the daemon's session that joined before the group stop shares
+    // that stop; one that joins after the scan is not the old module's tree and
+    // is never signalled after the leader is reaped. Any unreadable entry makes
+    // the scan inconclusive, never proof that the group is empty.
+    let deadline = std::time::Instant::now() + EMPTY_GRACE;
+    let reason = loop {
+        leader_is_held(leader)?;
+        let reason = match subc_os::process_group::members(leader) {
+            Ok(members) if members.iter().all(|member| *member == leader) => {
+                leader_is_held(leader)?;
+                return Ok(());
+            }
+            Ok(members) => {
+                let survivors = members.iter().filter(|member| **member != leader).count();
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!("process group {leader} still contains {survivors} other process(es)"),
+                )
+            }
+            Err(error) => error,
+        };
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break reason;
+        }
+        std::thread::sleep(POLL.min(deadline.saturating_duration_since(now)));
+    };
+    Err(io::Error::new(
+        reason.kind(),
+        format!("process group {leader} was not proven empty: {reason}"),
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn leader_is_held(leader: u32) -> io::Result<()> {
+    // macOS does not expose a zombie's process-group ID, but waitid with
+    // WNOWAIT observes exit without reaping, proving that this daemon still
+    // owns the leader pinning the group.
+    if matches!(subc_os::child_exit::observe(leader), Ok(Some(_))) {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "process-group leader {leader} is not held as an exited, unreaped child"
+        )))
+    }
+}
+
 #[derive(Debug, Default)]
 struct Ownership {
     term_sent: Option<Instant>,
@@ -56,6 +146,8 @@ pub(crate) struct PlainGroup {
     leader: u32,
     group: Pid,
     ownership: Mutex<Ownership>,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    adopted: Option<std::sync::Weak<super::live_upgrade::VerifiedChild>>,
 }
 
 impl PlainGroup {
@@ -69,7 +161,19 @@ impl PlainGroup {
             leader,
             group,
             ownership: Mutex::default(),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            adopted: None,
         })
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn from_adopted(
+        leader: u32,
+        verified: &std::sync::Arc<super::live_upgrade::VerifiedChild>,
+    ) -> Option<Self> {
+        let mut group = Self::from_spawn(leader)?;
+        group.adopted = Some(std::sync::Arc::downgrade(verified));
+        Some(group)
     }
 
     pub(super) fn observe(&self) -> io::Result<Option<ExitStatus>> {
@@ -105,8 +209,21 @@ impl PlainGroup {
         }
         // Check that the child still belongs to us without reaping it. A
         // failed check never authorizes a signal to the numeric group.
-        ops.observe(self.leader)?;
-        let sent = ops.signal(self.group, signal);
+        let ordinary_signal = || {
+            ops.observe(self.leader)?;
+            ops.signal(self.group, signal)
+        };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let sent = if let Some(verified) = &self.adopted {
+            verified
+                .upgrade()
+                .ok_or_else(|| io::Error::other("adopted group lost its owner"))?
+                .signal(signal)
+        } else {
+            ordinary_signal()
+        };
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let sent = ordinary_signal();
         #[cfg(target_os = "macos")]
         let sent = match sent {
             // The macOS kernel skips zombies when signalling a group and

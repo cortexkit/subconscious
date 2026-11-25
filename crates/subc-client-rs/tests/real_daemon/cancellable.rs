@@ -45,6 +45,8 @@ impl HeldCall {
             .await
             .unwrap();
         let hello = ModuleHelloBody {
+            module_capabilities: None,
+            resume_token: None,
             manifest: inline_module_manifest(PROVIDER, &["hold"]),
             protocol_ver: PROTOCOL_VERSION,
             control_ops: None,

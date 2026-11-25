@@ -239,6 +239,8 @@ async fn config_admission_windows_keeps_covered_file_write_exclusion_until_hello
     let mut manifest = subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build();
     manifest.ready = Some(true);
     let hello = subc_protocol::ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest,
         protocol_ver: subc_protocol::PROTOCOL_VERSION,
         control_ops: None,
@@ -1893,6 +1895,8 @@ async fn windows_removed_registration_preserves_binding(candidate: bool) {
     let mut manifest = subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build();
     manifest.ready = Some(true);
     let hello = subc_protocol::ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest,
         protocol_ver: subc_protocol::PROTOCOL_VERSION,
         control_ops: None,
@@ -1975,7 +1979,7 @@ async fn windows_removed_registration_preserves_binding(candidate: bool) {
     assert_eq!(registry.deregister_connection(connection).unwrap().len(), 1);
     hold.wait();
     let reply = pending.join().unwrap();
-    let ack = frames.try_recv().unwrap().frame.header.ty;
+    let received = frames.try_recv().ok().map(|frame| frame.frame.header.ty);
     let retained = std::fs::OpenOptions::new()
         .write(true)
         .open(&covered)
@@ -2009,7 +2013,10 @@ async fn windows_removed_registration_preserves_binding(candidate: bool) {
         let _ = swapping.await.unwrap();
     }
     assert!(reply.is_empty());
-    assert_eq!(ack, subc_protocol::FrameType::HelloAck);
+    assert_eq!(
+        received, None,
+        "a registration removed before publication must not receive an ACK"
+    );
     assert_eq!(
         retained,
         Some(32),

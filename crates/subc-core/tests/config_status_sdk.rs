@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 // Linux prerequisites, from the workspace root (all children use isolated homes):
 // mkdir -p target/scratch/config-sdk
 // cargo build --locked -p subc-core --bins

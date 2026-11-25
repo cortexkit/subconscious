@@ -149,7 +149,17 @@ pub enum ModuleControlCommand {
         /// therefore treat this as "no later than", never as a grant.
         deadline_ms: u64,
     },
+    /// Sent only to modules that declared [`LIVE_UPGRADE_CAPABILITY`].
+    #[serde(rename = "module.upgrading")]
+    Upgrading {
+        /// Absolute Unix-millisecond reconnect deadline. Convert it once on
+        /// receipt to a monotonic deadline and treat it as a ceiling, not a grant.
+        reconnect_by_ms: u64,
+    },
 }
+
+/// Opt-in to staying alive and reconnecting across an in-place daemon upgrade.
+pub const LIVE_UPGRADE_CAPABILITY: &str = "live-upgrade/v1";
 
 /// Module-to-subc channel-0 response body.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

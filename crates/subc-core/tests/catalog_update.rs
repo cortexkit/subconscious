@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use cortexkit_test_support::ScratchDir;
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -544,6 +546,8 @@ async fn hello_self_signals_are_mirrored_and_missing_axes_are_refused() {
     let mut invalid_module = connect_endpoint(&server, "invalid-self-signal-module").await;
     let invalid_manifest = supervision_only_manifest("invalid-self-signal-module");
     let mut body = serde_json::to_value(ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest: invalid_manifest,
         protocol_ver: PROTOCOL_VERSION,
         control_ops: None,
@@ -734,6 +738,8 @@ async fn hello_event_declaration_refusals_name_each_malformed_field() {
         let mut module = connect_endpoint(&server, name).await;
         let corr = 800 + index as u64;
         let mut body = serde_json::to_value(ModuleHelloBody {
+            module_capabilities: None,
+            resume_token: None,
             manifest: supervision_only_manifest(name),
             protocol_ver: PROTOCOL_VERSION,
             control_ops: None,
@@ -787,6 +793,8 @@ async fn hello_with_fields_absent_manifest_registers_and_serves_catalog_list() {
     assert!(manifest.ready.is_none());
 
     let hello_body = serde_json::to_value(&ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest: manifest.clone(),
         protocol_ver: PROTOCOL_VERSION,
         control_ops: None,
@@ -1427,6 +1435,8 @@ fn assert_tool_names(entry: &CatalogEntry, expected: &[&str]) {
 
 fn hello_frame(manifest: ModuleManifest, corr: u64) -> Frame {
     let body = serde_json::to_vec(&ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest,
         protocol_ver: PROTOCOL_VERSION,
         control_ops: None,

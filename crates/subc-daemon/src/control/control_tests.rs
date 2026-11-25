@@ -426,6 +426,8 @@ fn hello_frame_full(
     launch_nonce: Option<String>,
 ) -> Frame {
     let body = serde_json::to_vec(&ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest: manifest(module_id, protocol_ver),
         protocol_ver,
         control_ops,
@@ -443,6 +445,8 @@ fn hello_frame_with_rich_ui(
     rich_ui: Value,
 ) -> Frame {
     let mut body = serde_json::to_value(ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest: manifest(module_id, protocol_ver),
         protocol_ver,
         control_ops: None,
@@ -469,6 +473,8 @@ fn non_routable_hello_frame_with_control_ops(
     let mut manifest = manifest(module_id, PROTOCOL_VERSION);
     manifest.provides.clear();
     let body = serde_json::to_vec(&ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest,
         protocol_ver: PROTOCOL_VERSION,
         control_ops,
@@ -484,6 +490,8 @@ fn capability_grammar_hello_frame(
     corr: u64,
 ) -> Frame {
     let mut body = serde_json::to_value(ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest: manifest("capability-grammar-test", PROTOCOL_VERSION),
         protocol_ver: PROTOCOL_VERSION,
         control_ops: None,
@@ -1119,6 +1127,8 @@ fn hello_display_name_refuses_invalid_manifest_by_field() {
     {
         let module_id = format!("bad-display-name-{index}");
         let mut body = serde_json::to_value(ModuleHelloBody {
+            module_capabilities: None,
+            resume_token: None,
             manifest: manifest(&module_id, PROTOCOL_VERSION),
             protocol_ver: PROTOCOL_VERSION,
             control_ops: None,
@@ -1392,6 +1402,8 @@ fn catalog_list_mirrors_registered_operation_delivery() {
     let delivery =
         json!({"status": "watch", "future": "stream-v2", "reset": "watch", "missing": "watch"});
     let mut body = serde_json::to_value(ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest: manifest("watch-management", PROTOCOL_VERSION),
         protocol_ver: PROTOCOL_VERSION,
         control_ops: None,
@@ -1511,6 +1523,8 @@ fn catalog_list_mirrors_rich_ui_through_hello_and_catalog_update() {
 
 fn hello_with_role_declarations(declarations: Value) -> Frame {
     let mut body = serde_json::to_value(ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest: manifest("role-test", PROTOCOL_VERSION),
         protocol_ver: PROTOCOL_VERSION,
         control_ops: None,
@@ -1831,6 +1845,8 @@ fn hello_oversized_role_declarations_drop_whole_map_and_warn() {
 
 fn hello_with_flow_operations(capabilities: Value, flow_operations: Option<Value>) -> Frame {
     let mut body = serde_json::to_value(ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest: manifest("flow-ops", PROTOCOL_VERSION),
         protocol_ver: PROTOCOL_VERSION,
         control_ops: None,
@@ -2204,6 +2220,8 @@ fn catalog_list_with_provenance_mirrors_declared_build_bytes() {
             0,
             220,
             serde_json::to_vec(&ModuleHelloBody {
+                module_capabilities: None,
+                resume_token: None,
                 manifest: ModuleManifest::builder("built", "0.1.0")
                     .provenance(Some(serde_json::from_str(provenance_json).unwrap()))
                     .build(),
@@ -2259,6 +2277,8 @@ fn catalog_list_without_rich_ui_or_nonce_keeps_legacy_entry_bytes() {
         0,
         220,
         serde_json::to_vec(&ModuleHelloBody {
+            module_capabilities: None,
+            resume_token: None,
             manifest: ModuleManifest::builder("plain", "0.1.0").build(),
             protocol_ver: PROTOCOL_VERSION,
             control_ops: None,
@@ -2332,6 +2352,8 @@ fn reserved_capability_refusal_mutation_proof_leaves_no_catalog_entry() {
         0,
         77,
         serde_json::to_vec(&ModuleHelloBody {
+            module_capabilities: None,
+            resume_token: None,
             manifest: squatter,
             protocol_ver: PROTOCOL_VERSION,
             control_ops: None,
@@ -2576,6 +2598,8 @@ fn server_describe_surfaces_required_capability_verdict_fields() {
         0,
         78,
         serde_json::to_vec(&ModuleHelloBody {
+            module_capabilities: None,
+            resume_token: None,
             manifest: consumer,
             protocol_ver: PROTOCOL_VERSION,
             control_ops: None,
@@ -8201,6 +8225,8 @@ fn hello_frame_with_manifest(manifest: ModuleManifest, corr: u64) -> Frame {
         0,
         corr,
         serde_json::to_vec(&ModuleHelloBody {
+            module_capabilities: None,
+            resume_token: None,
             protocol_ver: manifest.protocol_ver,
             manifest,
             control_ops: None,
@@ -8944,9 +8970,12 @@ mod swap {
         );
         hold.wait();
         assert!(hello.join().unwrap().is_empty());
-        assert_eq!(
-            swap.candidate_rx.try_recv().unwrap().frame.header.ty,
-            FrameType::HelloAck
+        assert!(
+            matches!(
+                swap.candidate_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "a candidate removed before publication must not receive an ACK"
         );
         assert!(swap.registry.get_candidate("aft").unwrap().is_none());
         assert_eq!(

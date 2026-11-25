@@ -41,7 +41,7 @@ async fn scope_watch_module_snapshot_push_cancel_and_drop() {
     let (watch, corr) = open_watch(&handle, &mut rx).await;
     drop(watch);
     assert_eq!(timeout(Duration::from_secs(1), rx.recv()).await.unwrap().unwrap().header.corr, corr);
-    assert!(handle.shared.lock_inner().pending_control_streams.is_empty());
+    assert!(handle.shared().lock_inner().pending_control_streams.is_empty());
 }
 
 #[tokio::test]

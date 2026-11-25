@@ -250,6 +250,31 @@ async fn route_open_is_answered_by_its_relay_deadline_while_client_egress_is_ful
     assert!(module_rx.try_recv().is_err(), "no route.bind was relayed");
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test(start_paused = true)]
+async fn upgrade_reports_unsettled_route_open_without_counting_an_unissued_refusal() {
+    use crate::control::upgrade_in_place::Admission;
+    let forwarding = Arc::new(ForwardingTable::default());
+    let handler = ControlHandler::with_forwarding(Arc::new(Registry::default()), forwarding.clone()).with_route_bind_relay_timeout(Duration::from_secs(30));
+    let (module, mut module_rx) = route_ctx(ConnectionId::new(1724));
+    hello_via_sink(&handler, &module, &mut module_rx, hello_frame("waiting-provider", PROTOCOL_VERSION, 1)).await;
+    let (client, _client_rx) = route_ctx(ConnectionId::new(1725));
+    while client.egress.try_send(Frame::build(FrameType::Push, control_flags(), 0, 0, 0, Vec::new()).unwrap()).is_ok() {}
+    let open = handler.handle_control_frame(&client, route_open_frame(3, "waiting-provider", unique_project_root("before-upgrade")));
+    tokio::pin!(open);
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(open.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    }).await;
+
+    forwarding.upgrade_refusals.begin();
+    forwarding.set_upgrade_admission(Admission::ClientsFrozen);
+    let active = forwarding.route_bind_concurrency().track_upgrade_producers();
+    assert_eq!(*active.borrow(), 1, "the request passed admission and is waiting for its reply slot");
+    assert_eq!(forwarding.upgrade_refusals.drain_with_binds(Duration::from_secs(2), active).await, (0, 0, false), "a blocked bind is unsettled, not a refusal already issued by the daemon");
+    assert!(module_rx.try_recv().is_err(), "the undelivered request never reached its module");
+}
+
 fn audit_activity_frame(body: Value, corr: u64) -> Frame {
     Frame::build(
         FrameType::Request,

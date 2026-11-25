@@ -24,6 +24,8 @@ async fn activity_bootstrap_installs_the_run_directory_ledger() {
         .await
         .unwrap();
     let hello = subc_protocol::ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest: subc_protocol::manifest::ModuleManifest::builder("worker", "0.1.0")
             .protocol_ver(PROTOCOL_VERSION)
             .build(),

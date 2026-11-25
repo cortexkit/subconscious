@@ -16,6 +16,7 @@ fn handle_on(
 ) -> (ModuleHandle, mpsc::Receiver<Frame>) {
     let (writer, rx) = mpsc::channel(1);
     let ack = ModuleHelloAckBody {
+        resume_token: None,
         negotiated_ver: PROTOCOL_VERSION,
         subc_ops: ops.iter().map(|op| (*op).to_owned()).collect(),
         subc_capabilities: Vec::new(),
@@ -53,7 +54,7 @@ fn confirmed(corr: u64) -> Frame {
 }
 
 fn pending_count(handle: &ModuleHandle) -> usize {
-    handle.shared.lock_inner().pending_operator_confirms.len()
+    handle.shared().lock_inner().pending_operator_confirms.len()
 }
 
 async fn still_pending<F: Future>(mut future: Pin<&mut F>) {
@@ -69,7 +70,7 @@ async fn still_pending<F: Future>(mut future: Pin<&mut F>) {
 
 fn fill_egress(handle: &ModuleHandle) {
     handle
-        .shared
+        .shared()
         .lock_inner()
         .writer
         .as_ref()
@@ -401,14 +402,17 @@ async fn operator_confirm_only_well_formed_confirmed_reply_succeeds() {
 #[tokio::test]
 async fn operator_confirm_uses_separate_table_and_shared_corr_allocator() {
     let (handle, mut rx) = handle();
-    let (catalog_corr, _, catalog_rx) = handle.shared.begin_catalog_update().unwrap();
+    let (catalog_corr, _, catalog_rx) = handle.shared().begin_catalog_update().unwrap();
     let route = handle.route_handle(7, 3);
     let mut call = Box::pin(handle.confirm_operator("Replace identity", &route));
     still_pending(call.as_mut()).await;
     let request = rx.recv().await.unwrap();
     assert!(request.header.corr > catalog_corr);
     assert_eq!(pending_count(&handle), 1);
-    assert_eq!(handle.shared.lock_inner().pending_catalog_updates.len(), 1);
+    assert_eq!(
+        handle.shared().lock_inner().pending_catalog_updates.len(),
+        1
+    );
     handle.handle_control_reply(confirmed(request.header.corr));
     assert_eq!(call.await, Ok(()));
     handle.handle_control_reply(reply(
@@ -617,27 +621,27 @@ async fn operator_confirm_close_drains_pending_table_and_wakes_waiter() {
 async fn operator_confirm_corr_exhaustion_drains_both_tables_from_either_allocator() {
     for catalog_exhausts in [true, false] {
         let (handle, mut rx) = handle();
-        let (_, _, catalog_rx) = handle.shared.begin_catalog_update().unwrap();
+        let (_, _, catalog_rx) = handle.shared().begin_catalog_update().unwrap();
         let route = handle.route_handle(7, 3);
         let mut call = Box::pin(handle.confirm_operator("Replace identity", &route));
         still_pending(call.as_mut()).await;
         let _ = rx.recv().await.unwrap();
-        handle.shared.lock_inner().next_corr = None;
+        handle.shared().lock_inner().next_corr = None;
         if catalog_exhausts {
             assert!(matches!(
-                handle.shared.begin_catalog_update(),
+                handle.shared().begin_catalog_update(),
                 Err(CatalogUpdateError::ConnectionClosed)
             ));
         } else {
             assert!(matches!(
-                handle.shared.begin_operator_confirm(),
+                handle.shared().begin_operator_confirm(),
                 Err(OperatorConfirmError::PresenceUnavailable)
             ));
         }
         assert!(handle.is_closed());
         assert_eq!(pending_count(&handle), 0);
         assert!(handle
-            .shared
+            .shared()
             .lock_inner()
             .pending_catalog_updates
             .is_empty());

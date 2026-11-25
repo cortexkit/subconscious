@@ -114,6 +114,7 @@ impl PoolHarness {
         let (tx, rx) = mpsc::channel(256);
         let (control_tx, _control_rx) = mpsc::channel(4);
         let ack = ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: Vec::new(),
             subc_capabilities: Vec::new(),

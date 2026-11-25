@@ -107,6 +107,8 @@ async fn config_settings_capabilities_are_advertised_in_module_hello() {
             handler = handler.with_config_runtime(Arc::new(owner));
         }
         let hello = subc_protocol::ModuleHelloBody {
+            module_capabilities: None,
+            resume_token: None,
             manifest: ModuleManifest::builder("probe", "0.1.0").build(),
             protocol_ver: subc_protocol::PROTOCOL_VERSION,
             control_ops: None,
@@ -197,6 +199,8 @@ async fn config_admission_production_reviewer_requires_the_active_live_child_non
     .await
     .unwrap());
     let hello = subc_protocol::ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest: ModuleManifest::builder("a", "0.1.0").build(),
         protocol_ver: subc_protocol::PROTOCOL_VERSION,
         control_ops: Some(vec!["config.review".into()]),

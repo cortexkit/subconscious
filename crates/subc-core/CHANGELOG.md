@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.21.53
+
+- Add `ck daemon upgrade --in-place` to replace a running Linux or macOS
+  daemon and report the confirmed outcome and disposition of its modules.
+- Resume from authenticated daemon handover records (format version 2). The
+  offline `ck-subc --build-info` probe advertises the supported format without
+  starting a daemon, and only the daemon entry point can take ownership of
+  inherited descriptors.
+- Require subc-daemon 0.50.63, subc-control 0.42.9, subc-client-rs 0.41.15,
+  subc-os 0.1.54 and subc-protocol 0.37.9.
+
 ## 0.21.52
 
 - Add `ck config revert <digest>` to drop a pending file-capture plan and

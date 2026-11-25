@@ -9,7 +9,7 @@ use subc_core::setup;
 use subc_daemon::daemon_config;
 use subc_transport::connection_file;
 
-use crate::CkError;
+use super::super::CkError;
 
 const CANDIDATES: u8 = 16;
 
@@ -274,9 +274,9 @@ mod tests {
     use cortexkit_test_support::ScratchDir;
     use serde_json::Value;
 
+    use super::super::super::{Command, JsonOutput};
+    use super::super::{complete, tests::diagnostic, write_full_report, Options};
     use super::*;
-    use crate::doctor_cli::{complete, tests::diagnostic, write_full_report, Options};
-    use crate::{Command, JsonOutput};
 
     fn assert_refused(path: &Path, protected: &ProtectedPaths) {
         let error = ReportTarget::create_with(path, protected).unwrap_err();

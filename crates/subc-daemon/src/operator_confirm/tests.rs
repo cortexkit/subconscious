@@ -166,6 +166,8 @@ impl Fixture {
             manifest.confirm_operations = Some(operations);
         }
         let hello = ModuleHelloBody {
+            module_capabilities: None,
+            resume_token: None,
             manifest,
             protocol_ver: PROTOCOL_VERSION,
             control_ops: None,

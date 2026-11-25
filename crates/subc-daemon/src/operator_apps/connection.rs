@@ -12,6 +12,15 @@ pub(super) struct PeerCapture {
     recognized: std::sync::OnceLock<Recognition>,
 }
 
+impl PeerCapture {
+    pub(super) fn observed_pid(&self) -> Option<u32> {
+        match self.peer.observation() {
+            subc_os::local_peer::ObservedPeer::Observed(peer) => Some(peer.pid),
+            subc_os::local_peer::ObservedPeer::Unobserved => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Recognition {
     deadline: std::time::Instant,

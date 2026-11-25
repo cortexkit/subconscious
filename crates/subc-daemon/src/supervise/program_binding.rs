@@ -4,12 +4,22 @@ use super::*;
 /// Internal channel identity, allocated before a process starts. Once launches
 /// own their spawn-event generation before HELLO, this type will use that
 /// generation instead of the private sequence without changing binding consumers.
-pub(super) struct ProgramBindingKey {
+pub(crate) struct ProgramBindingKey {
     pub(super) incarnation: String,
-    channel_launch_seq: u64,
+    pub(super) channel_launch_seq: u64,
 }
 
 impl ProgramBindingKey {
+    /// Rebuild a validated channel key from the old image's incarnation and
+    /// launch sequence. Only `supervise::live_upgrade` imports these keys.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn adopted_from_handover(incarnation: String, channel_launch_seq: u64) -> Self {
+        Self {
+            incarnation,
+            channel_launch_seq,
+        }
+    }
+
     pub(super) fn new(handle: &SupervisorHandle) -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Self {
@@ -98,7 +108,7 @@ pub(super) struct ProgramBindingEntry {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct ProgramBindingPublication {
+pub(crate) struct ProgramBindingPublication {
     signal: Arc<tokio::sync::watch::Sender<Option<bool>>>,
     live: Arc<Mutex<std::sync::Weak<content_binding::LiveProgramBinding>>>,
     bindings: std::sync::Weak<ProgramBindingTable>,
@@ -796,9 +806,28 @@ impl SupervisorHandle {
             SpawnRole::SwapCandidate => None,
         }
         .filter(|nonce| !nonce.is_empty());
+        self.publish_program_binding(module, role, ProgramBindingKey::new(self), nonce)
+    }
+
+    /// Install the validated key from a prior launch without publishing a nonce.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn publish_adopted_program_binding(
+        &self,
+        module: &str,
+        key: ProgramBindingKey,
+    ) -> Option<ProgramBindingPublication> {
+        self.publish_program_binding(module, SpawnRole::Plain, key, None)
+    }
+
+    fn publish_program_binding(
+        &self,
+        module: &str,
+        role: SpawnRole,
+        channel_key: ProgramBindingKey,
+        nonce: Option<String>,
+    ) -> Option<ProgramBindingPublication> {
         let (sender, receiver) = tokio::sync::watch::channel(None);
         let signal = Arc::new(sender);
-        let channel_key = ProgramBindingKey::new(self);
         let mut bindings = self.program_bindings.lock().ok()?;
         bindings.configured.insert(module.to_owned());
         if let Some(nonce) = nonce {

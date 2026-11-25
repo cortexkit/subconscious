@@ -576,7 +576,14 @@ pub(super) fn terminate_blocking(slot: &Slot) {
 /// The initial Unix group leader belongs to the container, not its launch.
 /// All carried Unix waits observe only; the actor reaps after classifying exit.
 #[derive(Debug)]
-pub(super) struct ProcessChild {
+pub(super) enum ProcessChild {
+    Spawned(ProcessFields),
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    Adopted(ProcessFields, super::live_upgrade::AdoptedProcess),
+}
+
+#[derive(Debug)]
+pub(super) struct ProcessFields {
     process: Option<Child>,
     #[cfg(unix)]
     pub(super) plain_group: Option<Arc<super::plain_group::PlainGroup>>,
@@ -587,6 +594,28 @@ pub(super) struct ProcessChild {
     #[cfg(unix)]
     observed: Option<ExitStatus>,
     settled: bool,
+}
+
+impl std::ops::Deref for ProcessChild {
+    type Target = ProcessFields;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Spawned(fields) => fields,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Self::Adopted(fields, _) => fields,
+        }
+    }
+}
+
+impl std::ops::DerefMut for ProcessChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Spawned(fields) => fields,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Self::Adopted(fields, _) => fields,
+        }
+    }
 }
 
 impl ProcessChild {
@@ -605,7 +634,7 @@ impl ProcessChild {
     }
     pub(super) fn plain(process: Child, pid: u32) -> Self {
         let _ = pid;
-        Self {
+        Self::Spawned(ProcessFields {
             process: Some(process),
             #[cfg(unix)]
             plain_group: None,
@@ -616,6 +645,34 @@ impl ProcessChild {
             #[cfg(unix)]
             observed: None,
             settled: false,
+        })
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn adopted(
+        pid: u32,
+        watcher: super::live_upgrade::AdoptedProcess,
+        plain_group: Option<Arc<super::plain_group::PlainGroup>>,
+    ) -> Self {
+        Self::Adopted(
+            ProcessFields {
+                process: None,
+                plain_group,
+                container: Weak::new(),
+                slot: Weak::new(),
+                pid,
+                observed: None,
+                settled: false,
+            },
+            watcher,
+        )
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn verified_adoptee(&self) -> Option<&Arc<super::live_upgrade::VerifiedChild>> {
+        match self {
+            Self::Adopted(_, process) => Some(process.verified()),
+            Self::Spawned(_) => None,
         }
     }
 
@@ -631,6 +688,10 @@ impl ProcessChild {
 
     #[cfg(unix)]
     pub(super) fn id(&self) -> Option<u32> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Self::Adopted(fields, _) = self {
+            return Some(fields.pid);
+        }
         if self.container().is_some() {
             Some(self.pid)
         } else {
@@ -639,6 +700,10 @@ impl ProcessChild {
     }
 
     pub(super) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Self::Adopted(_, watcher) = self {
+            return watcher.try_wait();
+        }
         #[cfg(unix)]
         if let Some(group) = &self.plain_group {
             if self.observed.is_none() {
@@ -668,6 +733,10 @@ impl ProcessChild {
     }
 
     pub(super) async fn wait(&mut self) -> io::Result<ExitStatus> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Self::Adopted(_, watcher) = self {
+            return watcher.wait().await;
+        }
         #[cfg(unix)]
         if let Some(group) = &self.plain_group {
             if self.observed.is_none() {
@@ -696,6 +765,10 @@ impl ProcessChild {
     }
 
     pub(super) fn start_kill(&mut self) -> io::Result<()> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Self::Adopted(fields, watcher) = self {
+            return watcher.kill(fields.plain_group.as_deref());
+        }
         #[cfg(unix)]
         if let Some(group) = &self.plain_group {
             return group.signal(rustix::process::Signal::KILL);
@@ -726,6 +799,13 @@ impl ProcessChild {
     }
 
     pub(super) async fn reap(&mut self) -> io::Result<()> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Self::Adopted(fields, watcher) = self {
+            if let Some(group) = &fields.plain_group {
+                group.close();
+            }
+            return watcher.reap();
+        }
         if self.settled {
             return Ok(());
         }
@@ -1066,6 +1146,10 @@ impl GroupTarget {
 
 impl Drop for ProcessChild {
     fn drop(&mut self) {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if matches!(self, Self::Adopted(..)) {
+            return;
+        }
         if !self.settled {
             #[cfg(unix)]
             if let Some(group) = &self.plain_group {
@@ -1144,6 +1228,8 @@ mod anchor_tests {
         let handler =
             crate::ControlHandler::new(Arc::new(Registry::default())).with_supervisor(handle);
         let hello = subc_protocol::ModuleHelloBody {
+            module_capabilities: None,
+            resume_token: None,
             manifest: subc_protocol::manifest::ModuleManifest::builder("pin-error", "1.0.0")
                 .build(),
             protocol_ver: subc_protocol::PROTOCOL_VERSION,
@@ -1400,7 +1486,7 @@ mod anchor_tests {
             hard_killed: std::sync::atomic::AtomicBool::new(false),
             kill_notify: tokio::sync::Notify::new(),
         });
-        let mut observed = ProcessChild {
+        let mut observed = ProcessChild::Spawned(ProcessFields {
             process: None,
             plain_group: None,
             container: Arc::downgrade(&container),
@@ -1408,7 +1494,7 @@ mod anchor_tests {
             pid: pgid,
             observed: None,
             settled: false,
-        };
+        });
         // Deliberately reproduce another waiter reaping the first group leader.
         // Capturing group signals prevents even a broken finalizer from using
         // killpg after that reservation is lost; real signals target owned children.

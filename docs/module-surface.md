@@ -293,6 +293,38 @@ also be treated as a stop. Only the module's notice reason depends on the
 announcement: clients' `route.closing` and `route.closed` still carry `restart`,
 and the shutdown drain, GOODBYE and EOF sequence is unchanged.
 
+### Daemon upgrade in place
+
+On macOS and Linux, `ck daemon upgrade --in-place` replaces the running daemon
+with a newer build in the same process, without stopping modules. A module
+opts in by listing `live-upgrade/v1` in its HELLO `module_capabilities`. Its
+HELLO_ACK then carries a `resume_token`: 32 random bytes, unpadded base64url,
+good for one reconnect. Keep the newest one in memory only.
+
+Before the switch the daemon sends each opted-in module `module.upgrading`
+with `reconnect_by_ms`, an absolute Unix-millisecond deadline. Convert it once
+to a monotonic deadline and treat it as a ceiling. Then the connection ends.
+The module keeps running, with its stores, caches and in-flight work. It
+reconnects to the daemon's local socket (the Unix socket named in the
+connection file) before the deadline, with a HELLO that carries the
+`resume_token` in place of a launch nonce. The new daemon accepts it only from
+the same process (pid and start time) with the same declarations. The module
+then repeats its normal start sequence: catalog update, settings, scope sync.
+Everything that lived on the old connection, such as routes, watches and
+subscriptions, must be opened again.
+
+While the switch is in progress, the daemon refuses new requests with
+`module_reloading` and `detail.reason: "daemon_upgrade"`, a code that proves
+the request was never delivered, so it is safe to resend. A call that was
+already running when the connection ended has an unknown outcome. Recover it
+the way a restart does: fetch its late result or withdraw it, never resend a
+call that may have run.
+
+A module that did not opt in, or that misses the deadline, is restarted by the
+new daemon as before. A connection that ends without `module.upgrading` is
+still a stop. The Rust and TypeScript SDKs implement this reconnect when the
+module declares the capability.
+
 ### Module lifecycle
 
 - **Drain.** Before a restart, reload or disable, the daemon sends

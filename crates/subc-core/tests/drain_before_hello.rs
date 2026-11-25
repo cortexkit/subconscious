@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! A drain that starts before the module has registered.
 //!
 //! Between spawn and HELLO a supervised subc module has a process but no

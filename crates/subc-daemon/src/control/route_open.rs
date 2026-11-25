@@ -225,7 +225,13 @@ pub(crate) struct RouteBindBreakers {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RouteBindConcurrency {
-    modules: Arc<Mutex<HashMap<String, usize>>>,
+    state: Arc<Mutex<RouteBindConcurrencyState>>,
+}
+
+#[derive(Debug, Default)]
+struct RouteBindConcurrencyState {
+    modules: HashMap<String, usize>,
+    upgrade_producers: Option<tokio::sync::watch::Sender<usize>>,
 }
 
 pub(super) struct RouteBindConcurrencyGuard {
@@ -241,38 +247,64 @@ impl RouteBindConcurrency {
         module_id: &str,
         limit: usize,
     ) -> Result<RouteBindConcurrencyGuard, usize> {
-        let mut modules = self
-            .modules
+        let mut state = self
+            .state
             .lock()
             .expect("route.bind concurrency mutex poisoned");
-        let in_flight = modules.entry(module_id.to_string()).or_default();
+        let in_flight = state.modules.entry(module_id.to_string()).or_default();
         if *in_flight >= limit {
             return Err(*in_flight);
         }
         *in_flight += 1;
+        if let Some(producers) = &state.upgrade_producers {
+            producers.send_modify(|count| *count += 1);
+        }
         Ok(RouteBindConcurrencyGuard {
             concurrency: self.clone(),
             module_id: module_id.to_string(),
         })
     }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn track_upgrade_producers(&self) -> tokio::sync::watch::Receiver<usize> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("route.bind concurrency mutex poisoned");
+        let (sender, receiver) = tokio::sync::watch::channel(state.modules.values().sum());
+        state.upgrade_producers = Some(sender);
+        receiver
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn clear_upgrade_producers(&self) {
+        self.state
+            .lock()
+            .expect("route.bind concurrency mutex poisoned")
+            .upgrade_producers = None;
+    }
 }
 
 impl Drop for RouteBindConcurrencyGuard {
     fn drop(&mut self) {
-        let mut modules = self
+        let mut state = self
             .concurrency
-            .modules
+            .state
             .lock()
             .expect("route.bind concurrency mutex poisoned");
         let remove = {
-            let in_flight = modules
+            let in_flight = state
+                .modules
                 .get_mut(&self.module_id)
                 .expect("admitted route.bind has a concurrency entry");
             *in_flight -= 1;
             *in_flight == 0
         };
         if remove {
-            modules.remove(&self.module_id);
+            state.modules.remove(&self.module_id);
+        }
+        if let Some(producers) = &state.upgrade_producers {
+            producers.send_modify(|count| *count -= 1);
         }
     }
 }
@@ -528,6 +560,20 @@ impl RouteBindBreakers {
 }
 
 impl ControlHandler {
+    fn deliver_route_open_fence_refusal(&self, ctx: &RouteCtx, refusal: Frame) -> Vec<Frame> {
+        match self
+            .forwarding
+            .upgrade_refusals
+            .track_fence_refusal(refusal)
+        {
+            Ok(tracked) => {
+                tracked.send(&ctx.egress);
+                Vec::new()
+            }
+            Err(refusal) => vec![refusal],
+        }
+    }
+
     /// Override the route.bind relay timeout. Used by tests that assert the
     /// timeout path so they don't block on the production-safe default.
     pub fn with_route_bind_relay_timeout(mut self, timeout: Duration) -> Self {
@@ -806,7 +852,9 @@ impl ControlHandler {
         message: impl Into<String>,
     ) -> Result<Frame, RouterError> {
         self.observe_route_open_refusal(ctx, caller, module_id, reason, code);
-        let detail = if matches!(
+        let detail = if reason == "daemon_upgrade" {
+            Some(serde_json::json!({"reason": "daemon_upgrade"}))
+        } else if matches!(
             reason,
             "registration_not_active"
                 | "supervisor_not_live"
@@ -1202,6 +1250,20 @@ impl ControlHandler {
             )?]);
         }
 
+        if self.forwarding.upgrade_admission.phase().fenced()
+            || self.supervisor.adoption_blocks(&target_module_id)
+        {
+            let refusal = self.route_open_refusal_frame(
+                ctx,
+                &caller,
+                &frame,
+                &target_module_id,
+                "daemon_upgrade",
+                "module_reloading",
+                "module is awaiting daemon upgrade recovery",
+            )?;
+            return Ok(self.deliver_route_open_fence_refusal(ctx, refusal));
+        }
         if let Some((status, _)) = self.supervisor_status(&target_module_id, frame.header.corr)? {
             if status.waiting_for_previous_pid.is_some() {
                 return Ok(vec![self.supervised_absent_route_open_refusal_frame(
@@ -2093,7 +2155,18 @@ impl ControlHandler {
 
         timings.enter(RouteOpenPhase::BindSend);
         // Enqueueing the bind spends the same absolute budget as its ack.
-        let sent = timeout_at(relay_deadline, module_sink.send(relay_frame)).await;
+        let sent = timeout_at(
+            relay_deadline,
+            module_sink.send_upgrade_fenced(
+                relay_frame,
+                RouterError::DaemonUpgrade {
+                    channel: 0,
+                    epoch: 0,
+                    corr: frame.header.corr,
+                },
+            ),
+        )
+        .await;
         timings.enter(RouteOpenPhase::Admission);
         let Ok(sent) = sent else {
             // Never enqueued: the module's queue, not its bind handler, was
@@ -2109,6 +2182,19 @@ impl ControlHandler {
         };
         if let Err(err) = sent {
             reservation.release_and_disarm();
+            if matches!(err, RouterError::DaemonUpgrade { .. }) {
+                breaker.record_inconclusive();
+                let refusal = self.route_open_refusal_frame(
+                    ctx,
+                    &caller,
+                    &frame,
+                    &target_module_id,
+                    "daemon_upgrade",
+                    "module_reloading",
+                    "daemon upgrade has fenced route admission",
+                )?;
+                return Ok(self.deliver_route_open_fence_refusal(ctx, refusal));
+            }
             return Ok(vec![self.route_open_refusal_frame(
                 ctx,
                 &caller,

@@ -839,6 +839,112 @@ async fn config_pending_settings_decline_restores_exact_bytes() {
     fixture.stop().await;
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn detached_phone_decline_restore_blocks_in_place_upgrade() {
+    use sha2::{Digest, Sha256};
+
+    let mut fixture = Fixture::new().await;
+    file_plan(&mut fixture).await;
+    let executable = cortexkit_test_support::cargo_profile_bin("ck-subc-under-test");
+    let checksum = format!("{:x}", Sha256::digest(std::fs::read(&executable).unwrap()));
+    let supervisor = &fixture.handler.rescan.as_ref().unwrap().supervisor;
+    let runtime =
+        crate::bootstrap::upgrade_runtime_for_test(&fixture.scratch.0, supervisor, executable)
+            .await;
+    Arc::get_mut(&mut fixture.handler).unwrap().upgrade = Some(runtime.clone());
+
+    let apply = request(&fixture);
+    let (corr, card) = fixture.request().await;
+    let operation = fixture.handler.supervisor.operation_lock();
+    let held = operation.lock().await;
+    let (accepted, observed) = tokio::sync::oneshot::channel();
+    fixture
+        .owner
+        .set_after_settings_decline_hook_for_test(move || {
+            accepted.send(()).unwrap();
+        });
+    decline(&fixture, corr, &card);
+    tokio::time::timeout(Duration::from_secs(5), observed)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // The restore job has been spawned but cannot write yet. Drop the request
+    // so only the detached job can retain the settings permit.
+    apply.abort();
+    assert!(apply.await.unwrap_err().is_cancelled());
+    assert_eq!(fixture.owner.upgrade_blocker(), None);
+
+    let (sender, mut replies) = mpsc::channel(1);
+    let ctx = RouteCtx {
+        connection_id: CALLER,
+        egress: crate::FrameSink::new(sender),
+    };
+    let upgrade = |corr| {
+        let frame = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            corr,
+            serde_json::to_vec(&json!({
+                "op": "daemon.upgrade_in_place", "executable_sha256": checksum,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fixture
+            .handler
+            .upgrade_in_place(&ctx, frame, checksum.clone())
+            .unwrap()
+    };
+
+    let refused = upgrade(901);
+    assert_eq!(refused.len(), 1);
+    assert_eq!(refused[0].header.ty, FrameType::Error);
+    let body: subc_protocol::ErrorBody = serde_json::from_slice(&refused[0].body).unwrap();
+    assert_eq!(body.code, "upgrade_busy");
+    assert_eq!(body.detail.unwrap()["reason"], "settings");
+    let path = fixture.scratch.0.join("cortexkit/a.jsonc");
+    assert_eq!(std::fs::read(&path).unwrap(), b"{\"limit\":2}");
+
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while std::fs::read(&path).ok().as_deref() != Some(APPROVED) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Wait until the detached job releases the operation lock as well.
+        drop(operation.lock().await);
+    })
+    .await
+    .expect("accepted decline must finish restoring the settings file");
+    // The mock phone only answers settings cards, not the upgrade's drain.
+    fixture
+        .handler
+        .registry
+        .deregister_connection(PHONE)
+        .unwrap();
+    fixture.module.stop().await.unwrap();
+    assert!(upgrade(902).is_empty());
+    let mut receipt = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        receipt.frame.header.ty,
+        FrameType::Response,
+        "{}",
+        String::from_utf8_lossy(&receipt.frame.body)
+    );
+    let body: serde_json::Value = serde_json::from_slice(&receipt.frame.body).unwrap();
+    assert_eq!(body["outcome"], "exec_started");
+    receipt.flushed.take().unwrap().send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), runtime.wait_for_idle())
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn config_pending_settings_decline_leaves_a_newer_edit_alone() {
     let mut fixture = Fixture::new().await;

@@ -116,6 +116,8 @@ async fn config_modules_ignores_registration_only_prefix_children() {
     ] {
         module_ctx.connection_id = ConnectionId::new(connection);
         let hello = ModuleHelloBody {
+            module_capabilities: None,
+            resume_token: None,
             manifest: ModuleManifest::builder(module_id, "1.0.0").build(),
             protocol_ver: PROTOCOL_VERSION,
             control_ops: None,

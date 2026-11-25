@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 #![cfg(unix)]
 
 mod common;
@@ -315,6 +316,8 @@ impl Fixture {
             0,
             1,
             serde_json::to_vec(&ModuleHelloBody {
+                module_capabilities: None,
+                resume_token: None,
                 manifest,
                 protocol_ver: PROTOCOL_VERSION,
                 control_ops: None,

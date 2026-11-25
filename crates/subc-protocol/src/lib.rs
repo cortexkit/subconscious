@@ -126,6 +126,18 @@ pub mod error_codes {
     /// own its longest matching reserved prefix. TERMINAL.
     pub const CLAIM_PREFIX_REFUSED: &str = "claim_prefix_refused";
 
+    /// A resume HELLO was refused. The module must stop rather than retry.
+    pub const RESUME_REFUSED: &str = "resume_refused";
+    /// The local endpoint does not yet accept module HELLOs.
+    pub const LOCAL_ENDPOINT_CLIENTS_ONLY: &str = "local_endpoint_clients_only";
+
+    /// Retry only a refusal from a local listener that is not serving resume.
+    /// Other HELLO refusals, including unknown codes, are terminal. Connection
+    /// and handshake failures are not HELLO refusals and are classified separately.
+    pub fn is_retryable_resume_hello(code: &str) -> bool {
+        code == LOCAL_ENDPOINT_CLIENTS_ONLY
+    }
+
     /// Retry classification for `claim.mint` and `claim.present` refusals.
     /// Unknown codes are terminal. Every refused presentation closes its
     /// connection, including retryable refusals; retry on a new connection,
@@ -707,6 +719,13 @@ impl ErrorBody {
         self.detail = Some(detail);
         self
     }
+
+    /// A pre-send refusal while the daemon is upgrading or the target is
+    /// waiting to resume. The rejected request never reached the module.
+    pub fn module_reloading_for_daemon_upgrade(message: impl Into<String>) -> Self {
+        Self::new(error_codes::MODULE_RELOADING, message)
+            .with_detail(serde_json::json!({ "reason": "daemon_upgrade" }))
+    }
 }
 
 /// Module-to-subc `HELLO` body used during module registration.
@@ -725,12 +744,19 @@ pub struct ModuleHelloBody {
     /// self-connecting providers, which are never nonce-checked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_nonce: Option<String>,
+    /// Capabilities of the module connection, separate from provider declarations.
+    #[serde(default, skip_serializing_if = "no_module_capabilities")]
+    pub module_capabilities: Option<Vec<String>>,
+    /// Credential from the last HELLO_ACK, sent on a local resume HELLO instead of a launch nonce.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_token: Option<String>,
 }
 
-// Hand-written so the launch nonce is never printed. The nonce is the credential
-// that attributes a connection to a supervised module, and a derived Debug would
-// write it into any log line or panic message that formats this value. Same
-// reasoning as ConnectionInfo's Debug in subc-transport.
+fn no_module_capabilities(capabilities: &Option<Vec<String>>) -> bool {
+    capabilities.as_ref().is_none_or(Vec::is_empty)
+}
+
+// A derived Debug would expose the module's registration credentials in logs and panics.
 impl fmt::Debug for ModuleHelloBody {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ModuleHelloBody")
@@ -744,12 +770,17 @@ impl fmt::Debug for ModuleHelloBody {
                     .as_ref()
                     .map(|nonce| format!("<{} bytes redacted>", nonce.len())),
             )
+            .field("module_capabilities", &self.module_capabilities)
+            .field(
+                "resume_token",
+                &self.resume_token.as_ref().map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
 
 /// subc-to-module `HELLO_ACK` body used during module registration.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModuleHelloAckBody {
     pub negotiated_ver: u8,
     pub subc_ops: Vec<String>,
@@ -773,6 +804,25 @@ pub struct ModuleHelloAckBody {
     /// its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine_id: Option<String>,
+    /// Credential for the next local resume: 32 random bytes in unpadded base64url.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_token: Option<String>,
+}
+
+impl fmt::Debug for ModuleHelloAckBody {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ModuleHelloAckBody")
+            .field("negotiated_ver", &self.negotiated_ver)
+            .field("subc_ops", &self.subc_ops)
+            .field("subc_capabilities", &self.subc_capabilities)
+            .field("storage", &self.storage)
+            .field("machine_id", &self.machine_id)
+            .field(
+                "resume_token",
+                &self.resume_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 /// Frame kind (`type` byte at offset 5).
@@ -1514,6 +1564,8 @@ mod launch_nonce_redaction_tests {
     #[test]
     fn hello_body_debug_never_prints_the_nonce() {
         let body = ModuleHelloBody {
+            module_capabilities: None,
+            resume_token: None,
             manifest: manifest::ModuleManifest::builder("broca", "0.1.0").build(),
             protocol_ver: 2,
             control_ops: None,

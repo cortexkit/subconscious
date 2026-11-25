@@ -169,6 +169,8 @@ async fn refused_nonce_hello_pipeline(
     handler.defer_refusal_notifications_for_test();
     let mut peer = Net::new(router).await;
     let hello = subc_protocol::ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest: subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build(),
         protocol_ver: subc_protocol::PROTOCOL_VERSION,
         control_ops: None,
@@ -209,6 +211,8 @@ async fn audit2_nonchannel_hello_cannot_use_a_channel_locator_as_nonce() {
     let handler = crate::ControlHandler::new(Arc::new(crate::Registry::default()))
         .with_supervisor(fixture.handle.clone());
     let hello = subc_protocol::ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest: subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build(),
         protocol_ver: subc_protocol::PROTOCOL_VERSION,
         control_ops: None,
@@ -1014,8 +1018,9 @@ fn rig_with_program(program: &str) -> Rig {
             std::process::id(),
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-    std::fs::create_dir_all(path.join("store")).unwrap();
-    std::fs::create_dir_all(path.join("cortexkit")).unwrap();
+    create_admission_fixture_directory(&path).unwrap();
+    std::fs::create_dir(path.join("store")).unwrap();
+    std::fs::create_dir(path.join("cortexkit")).unwrap();
     std::fs::copy(program, path.join("program")).unwrap();
     #[cfg(target_os = "macos")]
     assert!(
@@ -1038,6 +1043,33 @@ fn rig_with_program(program: &str) -> Rig {
         declaration,
         program_mode: std::sync::OnceLock::new(),
     }
+}
+
+fn create_admission_fixture_directory(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path.parent().expect("fixture path has a parent"))?;
+    std::fs::create_dir(path).or_else(|error| {
+        if error.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(error);
+        }
+        // A test process killed before teardown may leave this path behind.
+        // Reused pids must not inherit files from the previous fixture.
+        std::fs::remove_dir_all(path)?;
+        std::fs::create_dir(path)
+    })
+}
+
+#[test]
+fn admission_fixture_recreates_stale_pid_scratch() {
+    let scratch = cortexkit_test_support::ScratchDir::new("admission-stale-fixture");
+    let path = scratch.join("admission-reused");
+    let previous = path.join("store/approved.json");
+    std::fs::create_dir_all(previous.parent().unwrap()).unwrap();
+    std::fs::write(&previous, b"previous fixture").unwrap();
+
+    create_admission_fixture_directory(&path).unwrap();
+
+    assert!(path.is_dir());
+    assert!(!previous.exists());
 }
 
 fn spec(rig: &Rig) -> ModuleSpec {
@@ -1236,6 +1268,8 @@ async fn gated_nonce_policy_stamp_between_agent_validation_and_commit_refuses_wi
         .await
         .unwrap();
     let hello = subc_protocol::ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest: subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build(),
         protocol_ver: subc_protocol::PROTOCOL_VERSION,
         control_ops: None,
@@ -1356,6 +1390,8 @@ async fn stamped_nonce_hello(
         .await
         .unwrap();
     let body = subc_protocol::ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest: subc_protocol::manifest::ModuleManifest::builder(module, "1.0.0").build(),
         protocol_ver: subc_protocol::PROTOCOL_VERSION,
         control_ops: None,
@@ -1510,6 +1546,8 @@ async fn gated_nonce_policy_refuses_stopped_uncached_identity_over_real_server()
         "activity_read_forbidden"
     );
     let hello = subc_protocol::ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest: subc_protocol::manifest::ModuleManifest::builder("callosum", "1.0.0").build(),
         protocol_ver: subc_protocol::PROTOCOL_VERSION,
         control_ops: None,
@@ -2065,6 +2103,8 @@ fn config_admission_recovery_and_a_missing_binding_cannot_complete_hello() {
             .with_supervisor(handle)
             .with_config_runtime(owner);
         let hello = subc_protocol::ModuleHelloBody {
+            module_capabilities: None,
+            resume_token: None,
             manifest: subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build(),
             protocol_ver: subc_protocol::PROTOCOL_VERSION,
             control_ops: None,
@@ -2544,6 +2584,8 @@ async fn config_admission_swap_cutover_does_not_park_stop_behind_owner_publicati
         }
         candidate_nonce.bind(ConnectionId::new(772));
         let hello = subc_protocol::ModuleHelloBody {
+            module_capabilities: None,
+            resume_token: None,
             manifest: subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build(),
             protocol_ver: subc_protocol::PROTOCOL_VERSION,
             control_ops: None,
@@ -3148,6 +3190,8 @@ async fn refused_content_hello(
         .with_supervisor(handle)
         .with_config_runtime(owner.clone());
     let hello = subc_protocol::ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest: subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build(),
         protocol_ver: subc_protocol::PROTOCOL_VERSION,
         control_ops: None,
@@ -3237,6 +3281,8 @@ async fn config_admission_hello_accepts_only_the_approved_current_native_image()
         .with_supervisor(handle)
         .with_config_runtime(owner);
     let hello = subc_protocol::ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest: subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build(),
         protocol_ver: subc_protocol::PROTOCOL_VERSION,
         control_ops: None,
@@ -3314,6 +3360,8 @@ async fn config_recovery_dead_child_retires_channel_without_legacy_fallback() {
             .with_supervisor(handle)
             .with_config_runtime(owner);
         let hello = subc_protocol::ModuleHelloBody {
+            module_capabilities: None,
+            resume_token: None,
             manifest: subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build(),
             protocol_ver: subc_protocol::PROTOCOL_VERSION,
             control_ops: None,
@@ -3354,6 +3402,8 @@ async fn config_recovery_direct_hello_refuses_from_the_published_state() {
     let registry = Arc::new(crate::Registry::default());
     let handler = crate::ControlHandler::new(registry.clone()).with_config_runtime(owner);
     let hello = subc_protocol::ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest: subc_protocol::manifest::ModuleManifest::builder("unconfigured", "1.0.0").build(),
         protocol_ver: subc_protocol::PROTOCOL_VERSION,
         control_ops: None,
@@ -3409,6 +3459,8 @@ async fn config_recovery_hello_accepts_only_a_preexisting_bound_launch() {
             proof.bind(ConnectionId::new(445));
         }
         let hello = subc_protocol::ModuleHelloBody {
+            module_capabilities: None,
+            resume_token: None,
             manifest: subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build(),
             protocol_ver: subc_protocol::PROTOCOL_VERSION,
             control_ops: None,
@@ -3713,6 +3765,8 @@ fn module_hello(
         proof.bind(connection);
     }
     let body = subc_protocol::ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest: subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build(),
         protocol_ver: subc_protocol::PROTOCOL_VERSION,
         control_ops: None,
@@ -4236,6 +4290,8 @@ async fn config_admission_promoted_unreserved_child_restarts_with_a_fresh_channe
         .with_supervisor(handle.clone())
         .with_config_runtime(owner.clone());
     let hello = subc_protocol::ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest,
         protocol_ver: subc_protocol::PROTOCOL_VERSION,
         control_ops: None,
@@ -4813,6 +4869,8 @@ async fn registration_declaration_stamp_restarts_nonce_spawn_before_completing_c
     let router = Arc::new(crate::Router::with_control_handler(handler.clone()));
     let mut primary = Net::new(router.clone()).await;
     let hello = subc_protocol::ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest: subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build(),
         protocol_ver: subc_protocol::PROTOCOL_VERSION,
         control_ops: None,

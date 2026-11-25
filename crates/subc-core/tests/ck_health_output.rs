@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! `ck health <id>` prints exactly what it printed before its headline rule
 //! and value wording moved into `ck_ui::metrics`: the default view (headline
 //! metrics) and `--verbose` (the whole tree), for one module that names a

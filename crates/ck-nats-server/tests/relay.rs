@@ -185,6 +185,7 @@ impl Fixture {
         assert_eq!(body.manifest.registration_channel, Some(true));
         assert!(body.manifest.provides.is_empty());
         let ack = ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: vec![],
             subc_capabilities: vec![],

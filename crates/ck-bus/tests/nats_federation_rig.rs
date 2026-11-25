@@ -1669,6 +1669,7 @@ mod leaf_link {
         let body: ModuleHelloBody = serde_json::from_slice(&hello.body).unwrap();
         assert_eq!(body.manifest.module_id, module_id);
         let ack = ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: vec![],
             subc_capabilities: vec![],

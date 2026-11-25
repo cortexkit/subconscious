@@ -39,8 +39,8 @@ class RegistrationOwner {
   private taken = false;
   helperTaken = false;
   broker?: ClaimBroker;
-  private onReady!: (broker: ClaimBroker) => void;
-  private readonly ready = new Promise<ClaimBroker>(resolve => { this.onReady = resolve; });
+  private onReady!: () => void;
+  private readonly ready = new Promise<void>(resolve => { this.onReady = resolve; });
   adopt(): void {
     if (this.adoptionError) throw this.adoptionError;
     if (this.decided) return;
@@ -70,10 +70,20 @@ class RegistrationOwner {
     this.taken = true;
     return this.socket!;
   }
-  bind(request: ConstructorParameters<typeof ClaimBroker>[0]): void {
+  bind(request: ConstructorParameters<typeof ClaimBroker>[0], beforeMint?: () => void): void {
     if (this.broker || !this.supervised) throw new ClaimError("registration_owner_conflict");
-    this.broker = new ClaimBroker(request);
-    this.onReady(this.broker);
+    this.rebind(request, beforeMint);
+  }
+  rebind(request: ConstructorParameters<typeof ClaimBroker>[0], beforeMint?: () => void): void {
+    // Old claims were minted by the previous daemon image. A fresh broker also
+    // prevents its outstanding mints from occupying the new connection's queue.
+    this.broker?.close();
+    this.broker = new ClaimBroker(request, undefined, undefined, beforeMint);
+    this.onReady();
+  }
+  unbind(): void {
+    this.broker?.close();
+    if (!this.supervised) this.broker = undefined;
   }
   async mintPrefix(moduleId: string, deadline: number): Promise<string> {
     // Extra providers can start first, but only the launched provider may use
@@ -81,9 +91,9 @@ class RegistrationOwner {
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       return await Promise.race([
-        this.ready.then(broker => {
+        this.ready.then(() => {
           if (Date.now() >= deadline) throw new ClaimError("registration_not_ready");
-          return broker.mint({purpose: "prefix", module_id: moduleId});
+          return this.broker!.mint({purpose: "prefix", module_id: moduleId});
         }),
         new Promise<never>((_, reject) => {
           timer = setTimeout(() => reject(new ClaimError(this.broker ? "request_timeout" : "registration_not_ready")),
@@ -100,7 +110,7 @@ export function registrationOwner(): RegistrationOwner { return globals[key] ??=
 export async function bindConsumer(sock: SubcSocket, deadline: number): Promise<void> {
   const owner = registrationOwner();
   let claim: string | undefined;
-  if (owner.supervised) {
+  if (owner.supervised || owner.broker) {
     if (!owner.broker) throw new ClaimError("registration_not_ready");
     claim = await owner.broker.mint({purpose: "self"});
   } else if (process.env.SUBC_HELPER_CLAIM_FD !== undefined || process.env.SUBC_HELPER_CLAIM_PIPE !== undefined) {
@@ -132,7 +142,7 @@ export function boundIdentityOverride(value: unknown): void {
 }
 export function hasClaimBinding(): boolean {
   const owner = registrationOwner();
-  return owner.supervised || owner.helperTaken;
+  return owner.supervised || owner.broker !== undefined || owner.helperTaken;
 }
 
 export interface HelperClaimHandoff {
@@ -148,7 +158,7 @@ export interface HelperClaimHandoff {
  * and merge environment; Windows: merge environment, leaving stdio unchanged. */
 export function prepareHelperClaim(childSlot = 3): HelperClaimHandoff {
   const owner = registrationOwner();
-  if (!owner.supervised || !owner.broker) throw new ClaimError("registration_not_ready");
+  if (!owner.broker) throw new ClaimError("registration_not_ready");
   const prepared = native().prepareHelperClaim(childSlot);
   let active = true;
   return {

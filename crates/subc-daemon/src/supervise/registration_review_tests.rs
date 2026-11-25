@@ -68,6 +68,8 @@ async fn registration_channel_sync_spawn_budget_ignores_previous_same_id_configu
 
 pub(super) fn hello(module: &str) -> Frame {
     let hello = subc_protocol::ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest: subc_protocol::manifest::ModuleManifest::builder(module, "1.0.0").build(),
         protocol_ver: subc_protocol::PROTOCOL_VERSION,
         control_ops: None,

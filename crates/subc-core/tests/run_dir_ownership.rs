@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 #![cfg(unix)]
 
 //! A daemon owns its run directory for its whole life, and a second daemon

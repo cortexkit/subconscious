@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Process-kill tests of the bootstrap and setup entry points. All install paths
 //! are redirected to a scratch root; no service manager or daemon is run.
 

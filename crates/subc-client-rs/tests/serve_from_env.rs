@@ -219,6 +219,7 @@ async fn registered_child(entry: &str, equals: bool, module_id: Option<&str>, se
             }
         );
         let ack = ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: Vec::new(),
             subc_capabilities: Vec::new(),

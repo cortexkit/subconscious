@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Pins of what piped `ck quota` prints today, byte for byte: the default
 //! table, `--verbose`, `--redact` and `--json`, with stdout, stderr and the
 //! exit code.

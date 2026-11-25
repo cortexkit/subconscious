@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -7477,6 +7479,8 @@ fn hello_frame(manifest: ModuleManifest, corr: u64) -> Frame {
 
 fn hello_frame_with_protocol(manifest: ModuleManifest, protocol_ver: u8, corr: u64) -> Frame {
     let body = serde_json::to_vec(&ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest,
         protocol_ver,
         control_ops: None,

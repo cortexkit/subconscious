@@ -1,39 +1,72 @@
-use std::{path::PathBuf, process};
+#![deny(unsafe_code)]
+
+use std::{ffi::OsString, path::PathBuf, process};
 
 use cortexkit_log::{Config, SegmentRetention};
 
 fn main() {
-    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    // Upgrade executes exactly this standalone probe, even when the active
+    // daemon itself was started with resume flags. No startup code runs for it.
+    if args == ["--build-info"] {
+        #[cfg(all(
+            feature = "test-support",
+            any(target_os = "linux", target_os = "macos")
+        ))]
+        if env!("CARGO_BIN_NAME") == "ck-subc-under-test" && upgrade_target_fixture::run(&args) {
+            return;
+        }
+        print_build_info();
+        return;
+    }
     // Module arguments (including --version) are settled before any runtime,
     // logger, config, or daemon probe can interpret them.
     #[cfg(feature = "test-support")]
     if env!("CARGO_BIN_NAME") == "ck-subc-under-test" {
         subc_os::privacy_identity::trampoline_main_for_test(&args);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if upgrade_target_fixture::run(&args) {
+            return;
+        }
     }
     subc_os::privacy_identity::trampoline_main(&args);
-    if args.iter().any(|arg| arg == "--build-info") {
+    let resume_requested = args
+        .iter()
+        .any(|arg| arg == "--resume-handover" || arg == "--handover-key-fd");
+    if !resume_requested && args.iter().any(|arg| arg == "--build-info") {
         // Upgrade compares this offline identity with the running daemon's
         // server.describe response before claiming the new release is live.
-        println!(
-            "{}",
-            serde_json::json!({
-                "core_version": env!("CARGO_PKG_VERSION"),
-                "build_git_sha": embedded_build_identity(option_env!("SUBC_BUILD_GIT_SHA"), 40),
-                "build_lock_digest": embedded_build_identity(option_env!("SUBC_BUILD_LOCK_DIGEST"), 64),
-            })
-        );
+        print_build_info();
         return;
     }
-    daemon_main(args);
+    startup(&args, resume_requested);
 }
+
+fn print_build_info() {
+    println!(
+        "{}",
+        serde_json::json!({
+            "core_version": env!("CARGO_PKG_VERSION"),
+            "build_git_sha": embedded_build_identity(option_env!("SUBC_BUILD_GIT_SHA"), 40),
+            "build_lock_digest": embedded_build_identity(option_env!("SUBC_BUILD_LOCK_DIGEST"), 64),
+            "handover_versions": subc_daemon::bootstrap::HANDOVER_VERSIONS,
+        })
+    );
+}
+
+#[cfg(all(
+    feature = "test-support",
+    any(target_os = "linux", target_os = "macos")
+))]
+#[path = "upgrade_target_fixture.rs"]
+mod upgrade_target_fixture;
 
 fn embedded_build_identity(value: Option<&str>, length: usize) -> Option<&str> {
     value
         .filter(|value| value.len() == length && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
-#[tokio::main]
-async fn daemon_main(args: Vec<std::ffi::OsString>) {
+fn startup(args: &[OsString], resume_requested: bool) {
     // Side-effect-free provenance probes: evaluated before tracing, bootstrap, or
     // any runtime state so neither touches the start-lock nor reports an
     // already-running daemon.
@@ -48,7 +81,7 @@ async fn daemon_main(args: Vec<std::ffi::OsString>) {
     //
     // Scanned across all arguments rather than only the first, because the shape
     // someone types is a real invocation with the flag appended.
-    if args.iter().any(|arg| arg == "--version") {
+    if !resume_requested && args.iter().any(|arg| arg == "--version") {
         println!("ck-subc {}", env!("CARGO_PKG_VERSION"));
         return;
     }
@@ -56,18 +89,41 @@ async fn daemon_main(args: Vec<std::ffi::OsString>) {
     // just the two recognised ones. Handling --help and --version early while
     // letting anything else fall through leaves the original defect for every OTHER
     // argument -- a typo, a flag copied from another tool, a stale invocation -- all
-    // of which would silently START A DAEMON. Only probes and the service-pinned
-    // config-store argument are recognized before bootstrap can write anything.
-    let config_store_root = match parse_config_store_root(&args) {
-        Ok(root) => root,
+    // of which would silently START A DAEMON.
+    let DaemonArgs {
+        config_store_root,
+        resume,
+    } = match parse_daemon_args(args) {
+        Ok(parsed) => parsed,
         Err(error) => {
             eprintln!("ck-subc: {error}\nRun ck-subc --help for accepted arguments.");
             process::exit(2);
         }
     };
-    if args
-        .iter()
-        .any(|arg| arg == "--help" || arg == "-h" || arg == "help")
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    if resume.is_some() {
+        eprintln!("ck-subc: in-place daemon resume is not supported on this platform");
+        process::exit(2);
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let resume = resume.map(|(path, key_fd)| {
+        // SAFETY: This is synchronous process entry with both resume arguments
+        // checked. Neither a probe flag nor the privacy-identity trampoline
+        // (`subc_os::privacy_identity::trampoline_main`, which returns at once
+        // for these arguments) ran anything else first; no
+        // descriptor, thread or runtime has been created. Only resume validation
+        // claims the named descriptors; no other code closes or replaces them.
+        #[allow(unsafe_code)]
+        let inherited = unsafe {
+            subc_os::child_spawn::InheritedDescriptors::capture_daemon_resume(&path, key_fd)
+        }
+        .unwrap_or_else(|error| refuse_start(error));
+        (path, key_fd, inherited)
+    });
+    if !resume_requested
+        && args
+            .iter()
+            .any(|arg| arg == "--help" || arg == "-h" || arg == "help")
     {
         println!(
             "ck-subc {} — the CortexKit subc daemon\n\n\
@@ -106,13 +162,6 @@ async fn daemon_main(args: Vec<std::ffi::OsString>) {
             process::exit(1);
         }
     };
-
-    if let Err(err) = init_tracing(&run_dir) {
-        eprintln!("ck-subc: failed to initialize logging: {err}");
-        process::exit(1);
-    }
-    install_panic_hook();
-
     let privacy_trampoline = match std::env::current_exe() {
         Ok(path) => path,
         Err(error) => {
@@ -120,7 +169,28 @@ async fn daemon_main(args: Vec<std::ffi::OsString>) {
             process::exit(1);
         }
     };
-    let daemon = async {
+    #[cfg(target_os = "linux")]
+    let upgrade_image = std::fs::File::open("/proc/self/exe");
+    #[cfg(target_os = "macos")]
+    let upgrade_image = rustix::fs::open(
+        &privacy_trampoline,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map(std::fs::File::from)
+    .map_err(std::io::Error::from);
+    if !resume_requested {
+        start_logging(&run_dir);
+        if config_store_root.as_ref().is_some_and(|root| {
+            root.parent()
+                .is_none_or(|parent| std::fs::read_dir(parent).is_err())
+        }) {
+            tracing::error!("--config-store-root requires a readable parent");
+            eprintln!("ck-subc: --config-store-root requires a readable parent\nRun ck-subc --help for accepted arguments.");
+            process::exit(2);
+        }
+    }
+    let config = (|| {
         let config = subc_daemon::bootstrap::BootstrapConfig::from_env_for_daemon_binary()?
             .with_cgroup_placement(placement);
         let config = match config_store_root {
@@ -128,6 +198,21 @@ async fn daemon_main(args: Vec<std::ffi::OsString>) {
             None => config,
         };
         let config = config.with_privacy_trampoline(privacy_trampoline);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let config = config.with_upgrade_binary(
+            upgrade_image,
+            env!("CARGO_PKG_VERSION"),
+            embedded_build_identity(option_env!("SUBC_BUILD_GIT_SHA"), 40),
+        );
+        #[cfg(all(
+            feature = "test-support",
+            any(target_os = "linux", target_os = "macos")
+        ))]
+        let config = if env!("CARGO_BIN_NAME") == "ck-subc-under-test" {
+            config.with_upgrade_test_hooks()
+        } else {
+            config
+        };
         #[cfg(feature = "test-support")]
         let config = match std::env::var("SUBC_TEST_SHUTDOWN_INTENT_WINDOW_MS") {
             Ok(ms) if env!("CARGO_BIN_NAME") == "ck-subc-under-test" => config
@@ -137,9 +222,39 @@ async fn daemon_main(args: Vec<std::ffi::OsString>) {
                 )),
             _ => config,
         };
-        subc_daemon::bootstrap::run_with_config(config).await
-    };
-    if let Err(err) = daemon.await {
+        Ok::<_, subc_daemon::bootstrap::BootstrapError>(config)
+    })()
+    .unwrap_or_else(|error| refuse_start(error));
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Some((path, key_fd, inherited)) = resume {
+        let resume =
+            subc_daemon::bootstrap::ResumeBootstrap::validate(config, &path, key_fd, inherited)
+                .unwrap_or_else(|error| refuse_start(error));
+        start_logging(&run_dir);
+        daemon_main(resume.run());
+    }
+    daemon_main(subc_daemon::bootstrap::run_with_config(config));
+}
+
+fn start_logging(run_dir: &std::path::Path) {
+    if let Err(err) = init_tracing(run_dir) {
+        eprintln!("ck-subc: failed to initialize logging: {err}");
+        process::exit(1);
+    }
+    install_panic_hook();
+}
+
+fn refuse_start(error: impl std::fmt::Display) -> ! {
+    tracing::error!(%error, "ck-subc: refusing to start");
+    eprintln!("ck-subc: refusing to start: {error}");
+    process::exit(1);
+}
+
+#[tokio::main]
+async fn daemon_main(
+    start: impl std::future::Future<Output = Result<(), subc_daemon::bootstrap::BootstrapError>>,
+) -> ! {
+    if let Err(err) = start.await {
         tracing::error!(error = %err, "subc-core failed");
         eprintln!("subc-core: {err}");
         process::exit(1);
@@ -154,10 +269,17 @@ async fn daemon_main(args: Vec<std::ffi::OsString>) {
     process::exit(0);
 }
 
-fn parse_config_store_root(
-    args: &[std::ffi::OsString],
-) -> Result<Option<std::path::PathBuf>, String> {
+#[derive(Debug)]
+struct DaemonArgs {
+    config_store_root: Option<PathBuf>,
+    resume: Option<(PathBuf, i32)>,
+}
+
+fn parse_daemon_args(args: &[OsString]) -> Result<DaemonArgs, String> {
     let mut root = None;
+    let mut handover = None;
+    let mut key_fd = None;
+    let mut probe = false;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         if arg == "--config-store-root" {
@@ -171,17 +293,45 @@ fn parse_config_store_root(
             if !path.is_absolute() {
                 return Err("--config-store-root requires an absolute path".into());
             }
-            let parent = path
-                .parent()
-                .ok_or("--config-store-root requires a readable parent")?;
-            std::fs::read_dir(parent)
-                .map_err(|_| "--config-store-root requires a readable parent")?;
             root = Some(path);
-        } else if !matches!(arg.to_str(), Some("--help" | "-h" | "help" | "--version")) {
+        } else if arg == "--resume-handover" {
+            if handover.is_some() {
+                return Err("--resume-handover may be given only once".into());
+            }
+            handover = Some(PathBuf::from(
+                args.next().ok_or("--resume-handover requires a path")?,
+            ));
+        } else if arg == "--handover-key-fd" {
+            if key_fd.is_some() {
+                return Err("--handover-key-fd may be given only once".into());
+            }
+            key_fd = Some(
+                args.next()
+                    .and_then(|fd| fd.to_str()?.parse::<i32>().ok())
+                    .filter(|fd| *fd > 2)
+                    .ok_or("--handover-key-fd requires a descriptor above 2")?,
+            );
+        } else if matches!(
+            arg.to_str(),
+            Some("--help" | "-h" | "help" | "--version" | "--build-info")
+        ) {
+            probe = true;
+        } else {
             return Err(format!("unexpected argument '{}'", arg.to_string_lossy()));
         }
     }
-    Ok(root)
+    let resume = match (handover, key_fd) {
+        (Some(path), Some(fd)) if !probe => Some((path, fd)),
+        (None, None) => None,
+        (Some(_), Some(_)) => {
+            return Err("resume arguments cannot be combined with a startup probe".into())
+        }
+        _ => return Err("--resume-handover and --handover-key-fd must be given together".into()),
+    };
+    Ok(DaemonArgs {
+        config_store_root: root,
+        resume,
+    })
 }
 
 /// The binary uses the caller's cgroup in production; test harnesses can opt out
@@ -300,20 +450,24 @@ mod tests {
             .unwrap()
             .join("isolated-config-store");
         assert_eq!(
-            super::parse_config_store_root(&[
+            super::parse_daemon_args(&[
                 "--config-store-root".into(),
                 path.clone().into_os_string()
             ])
-            .unwrap(),
+            .unwrap()
+            .config_store_root,
             Some(path)
         );
-        assert_eq!(super::parse_config_store_root(&[]).unwrap(), None);
-        assert!(super::parse_config_store_root(&["status".into()]).is_err());
+        assert_eq!(
+            super::parse_daemon_args(&[]).unwrap().config_store_root,
+            None
+        );
+        assert!(super::parse_daemon_args(&["status".into()]).is_err());
     }
 
     #[test]
     fn config_store_root_parser_refuses_relative_path() {
-        assert!(super::parse_config_store_root(&[
+        assert!(super::parse_daemon_args(&[
             "--config-store-root".into(),
             "relative/config".into()
         ])
@@ -327,7 +481,7 @@ mod tests {
             .unwrap()
             .join("isolated-config-store")
             .into_os_string();
-        assert!(super::parse_config_store_root(&[
+        assert!(super::parse_daemon_args(&[
             "--config-store-root".into(),
             path.clone(),
             "--config-store-root".into(),
@@ -335,6 +489,41 @@ mod tests {
         ])
         .unwrap_err()
         .contains("only once"));
+    }
+
+    #[test]
+    fn resume_flags_require_one_path_and_one_non_stdio_fd() {
+        let parse = |args: &[&str]| {
+            super::parse_daemon_args(&args.iter().map(OsString::from).collect::<Vec<_>>())
+        };
+        assert_eq!(
+            parse(&["--handover-key-fd", "3", "--resume-handover", "/x/handover"])
+                .unwrap()
+                .resume,
+            Some((PathBuf::from("/x/handover"), 3))
+        );
+        for invalid in [
+            &["--resume-handover", "/x/handover"][..],
+            &["--handover-key-fd", "3"],
+            &["--resume-handover", "/x/handover", "--handover-key-fd", "2"],
+            &[
+                "--resume-handover",
+                "/x/handover",
+                "--handover-key-fd",
+                "3",
+                "--handover-key-fd",
+                "4",
+            ],
+            &[
+                "--resume-handover",
+                "/x/handover",
+                "--handover-key-fd",
+                "3",
+                "--build-info",
+            ],
+        ] {
+            assert!(parse(invalid).is_err(), "accepted {invalid:?}");
+        }
     }
     use std::{
         fs,

@@ -64,6 +64,29 @@ async fn windows_copy_matches_primary_when_runtime_is_unset() {
 }
 
 #[tokio::test]
+async fn windows_profile_publication_does_not_reacquire_the_primary_lock() {
+    let root = ScratchDir::new("windows-copy-with-held-primary");
+    let mut daemon = bound(
+        ensure_singleton_inner(config(&root, None), false)
+            .await
+            .unwrap(),
+    );
+    let _primary = daemon.publication_lock.take().unwrap();
+    let copy = fixed(&root);
+    assert_ne!(
+        start_lock_path(&copy),
+        start_lock_path(&daemon.connection_file_path)
+    );
+    publish(&daemon).await;
+    assert_eq!(
+        connection_file::read(&copy).unwrap(),
+        daemon.connection_info
+    );
+    // The copy guard belongs only to startup publication, not to the daemon.
+    let _copy = claim(&copy).await.unwrap();
+}
+
+#[tokio::test]
 async fn windows_copy_is_not_written_with_explicit_runtime_directory() {
     let root = ScratchDir::new("windows-copy-xdg");
     let config = config(&root, Some(root.join("runtime").into_os_string()));

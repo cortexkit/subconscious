@@ -231,10 +231,42 @@ pub struct LiveChild {
     pub container: Option<ContainerIdentity>,
 }
 
+/// Daemon-private fields travel with the child's identity in the v2 record,
+/// but aren't part of the public inspection API.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RecordedChild {
+    #[serde(flatten)]
+    pub(crate) child: LiveChild,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "read_resume_token_sha256"
+    )]
+    pub(crate) resume_token_sha256: Option<String>,
+}
+
+pub(crate) fn valid_resume_token_sha256(hash: &str) -> bool {
+    hash.len() == 64
+        && hash
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn read_resume_token_sha256<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    // A damaged hash cannot resume a child, but must not prevent a cold start
+    // from using that child's process identity for orphan recovery.
+    Ok(match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::String(hash) if valid_resume_token_sha256(&hash) => Some(hash),
+        _ => None,
+    })
+}
+
 #[derive(Debug, Serialize, Deserialize)]
-struct RecordFile {
+struct RecordFile<Child> {
     version: u32,
-    children: Vec<LiveChild>,
+    children: Vec<Child>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     retained_reasons: BTreeMap<u32, RetainedReason>,
 }
@@ -245,14 +277,14 @@ pub(crate) fn write_record(path: &Path, children: &[LiveChild]) -> io::Result<()
     write_record_with_reasons(path, children, BTreeMap::new())
 }
 
-pub(crate) fn write_record_with_reasons(
+pub(crate) fn write_record_with_reasons<Child: Serialize>(
     path: &Path,
-    children: &[LiveChild],
+    children: &[Child],
     retained_reasons: BTreeMap<u32, RetainedReason>,
 ) -> io::Result<()> {
     let bytes = serde_json::to_vec_pretty(&RecordFile {
         version: RECORD_VERSION,
-        children: children.to_vec(),
+        children: children.iter().collect(),
         retained_reasons,
     })
     .map_err(io::Error::other)?;
@@ -324,7 +356,8 @@ pub fn read_live_children_roster(
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(RecordReadError::Io(error)),
     };
-    let record: RecordFile = serde_json::from_slice(&bytes).map_err(RecordReadError::Malformed)?;
+    let record: RecordFile<LiveChild> =
+        serde_json::from_slice(&bytes).map_err(RecordReadError::Malformed)?;
     if !matches!(record.version, 1 | 2) {
         return Err(RecordReadError::UnknownVersion(record.version));
     }
@@ -337,13 +370,26 @@ pub fn read_live_children_roster(
 
 /// The children listed at `path`. A missing file is an empty record: the
 /// previous daemon never spawned anything, or this is the first boot.
+#[cfg(test)]
 pub(crate) fn read_record(path: &Path) -> Result<Vec<LiveChild>, RecordReadError> {
     read_record_with_reasons(path).map(|(children, _)| children)
 }
 
+#[cfg(test)]
 pub(crate) fn read_record_with_reasons(
     path: &Path,
 ) -> Result<(Vec<LiveChild>, BTreeMap<u32, RetainedReason>), RecordReadError> {
+    read_record_entries(path).map(|(children, reasons)| {
+        (
+            children.into_iter().map(|entry| entry.child).collect(),
+            reasons,
+        )
+    })
+}
+
+pub(crate) fn read_record_entries(
+    path: &Path,
+) -> Result<(Vec<RecordedChild>, BTreeMap<u32, RetainedReason>), RecordReadError> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -351,7 +397,8 @@ pub(crate) fn read_record_with_reasons(
         }
         Err(error) => return Err(RecordReadError::Io(error)),
     };
-    let record: RecordFile = serde_json::from_slice(&bytes).map_err(RecordReadError::Malformed)?;
+    let record: RecordFile<RecordedChild> =
+        serde_json::from_slice(&bytes).map_err(RecordReadError::Malformed)?;
     if !matches!(record.version, 1 | RECORD_VERSION) {
         return Err(RecordReadError::UnknownVersion(record.version));
     }
@@ -555,29 +602,46 @@ fn write_new_owner_only(path: &Path, bytes: &[u8]) -> io::Result<()> {
     file.sync_all()
 }
 
-/// Pids a handover from a previous daemon image says are being adopted, which
-/// the sweep must leave alone.
-///
-/// An in-place upgrade execs the new daemon binary in the same process, so the
-/// record then lists exactly the children the new image is taking over, still
-/// running and with matching start times; sweeping them would kill the fleet
-/// the upgrade exists to keep. Nothing adopts children yet, so every caller
-/// passes [`AdoptedPids::none`] today; the handover work fills this in.
+/// Children owned by the new daemon image after a handover. The orphan sweep
+/// must leave both verified adoptees and unresolved children alone.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct AdoptedPids(BTreeSet<u32>);
+pub(crate) struct AdoptedPids {
+    adopted: BTreeSet<u32>,
+    held: BTreeSet<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProtectedChild {
+    Adopted,
+    Held,
+}
 
 impl AdoptedPids {
     pub(crate) fn none() -> Self {
         Self::default()
     }
 
-    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-    pub(crate) fn of(pids: impl IntoIterator<Item = u32>) -> Self {
-        Self(pids.into_iter().collect())
+    // The startup adoption path supplies the two sets after reconciliation.
+    #[allow(dead_code)]
+    pub(crate) fn from_classes(
+        adopted: impl IntoIterator<Item = u32>,
+        held: impl IntoIterator<Item = u32>,
+    ) -> Self {
+        Self {
+            adopted: adopted.into_iter().collect(),
+            held: held.into_iter().collect(),
+        }
     }
 
-    fn contains(&self, pid: u32) -> bool {
-        self.0.contains(&pid)
+    pub(crate) fn protection(&self, pid: u32) -> Option<ProtectedChild> {
+        // If a caller lists a PID in both sets, keep the stricter protection.
+        if self.held.contains(&pid) {
+            Some(ProtectedChild::Held)
+        } else if self.adopted.contains(&pid) {
+            Some(ProtectedChild::Adopted)
+        } else {
+            None
+        }
     }
 }
 
@@ -677,6 +741,8 @@ pub(crate) fn identity_verdict(
 pub(crate) enum SweepDecision {
     /// Claimed by a handover; left running.
     Adopted,
+    /// Still owned but not verified at handover; left unsignalled.
+    Held,
     /// No process holds the pid any more, or it has exited.
     Gone,
     /// Something holds the pid, but not the recorded process; not signalled.
@@ -763,6 +829,10 @@ pub(crate) fn recheck_container(
 }
 
 impl SweepDecision {
+    fn is_protected(&self) -> bool {
+        matches!(self, Self::Adopted | Self::Held)
+    }
+
     pub(crate) fn retained_reason(&self) -> Option<RetainedReason> {
         match self {
             #[cfg(target_os = "linux")]
@@ -807,7 +877,8 @@ const POLL: Duration = Duration::from_millis(20);
 
 /// End every process the previous daemon's record lists that is still
 /// exactly the process recorded, except those in `adopted`, then replace the
-/// record with instances that could not be verified or stopped. Runs before any module is spawned.
+/// record with protected children and instances that could not be verified or
+/// stopped. Runs before any module is spawned.
 ///
 /// The record is the one in the run directory `owner` locks. Requiring the
 /// lock means the record cannot belong to a daemon that is still running:
@@ -830,61 +901,51 @@ pub(crate) async fn sweep_orphans_with_placement(
     bounds: SweepBounds,
     placement: Option<&subc_cgroup::Placement>,
 ) -> Vec<(LiveChild, SweepDecision)> {
-    sweep_orphans_with(
-        owner,
-        adopted,
-        bounds,
-        |entries, adopted, bounds| async move {
-            let mut decisions = Vec::new();
-            let mut other = Vec::new();
-            for entry in entries {
-                if !adopted.contains(entry.pid) {
-                    if let Some(container) = &entry.container {
-                        let decision = match container.current_boot() {
-                            Ok(false) => Some(SweepDecision::Gone),
-                            Ok(true) => None,
-                            Err(error) => Some(SweepDecision::Unverifiable(error.to_string())),
-                        };
-                        if let Some(decision) = decision {
-                            decisions.push((entry, decision));
-                            continue;
-                        }
-                    }
-                }
-                if let Some(path) = entry
-                    .container
-                    .as_ref()
-                    .and_then(|container| container.cgroup_path.as_ref())
-                {
-                    let decision = if adopted.contains(entry.pid) {
-                        SweepDecision::Adopted
-                    } else {
-                        crate::cgroup_recovery::sweep(placement, path, bounds).await
-                    };
+    sweep_orphans_with(owner, adopted, bounds, |entries, bounds| async move {
+        let mut decisions = Vec::new();
+        let mut other = Vec::new();
+        for entry in entries {
+            if let Some(container) = &entry.child.container {
+                let decision = match container.current_boot() {
+                    Ok(false) => Some(SweepDecision::Gone),
+                    Ok(true) => None,
+                    Err(error) => Some(SweepDecision::Unverifiable(error.to_string())),
+                };
+                if let Some(decision) = decision {
                     decisions.push((entry, decision));
-                } else {
-                    other.push(entry);
+                    continue;
                 }
             }
-            decisions.extend(sweep_entries(other, adopted, bounds).await);
-            decisions
-        },
-    )
+            if let Some(path) = entry
+                .child
+                .container
+                .as_ref()
+                .and_then(|container| container.cgroup_path.as_ref())
+            {
+                let decision = crate::cgroup_recovery::sweep(placement, path, bounds).await;
+                decisions.push((entry, decision));
+            } else {
+                other.push(entry);
+            }
+        }
+        decisions.extend(sweep_entries(other, bounds).await);
+        decisions
+    })
     .await
 }
 
-async fn sweep_orphans_with<'a, F, Fut>(
+async fn sweep_orphans_with<F, Fut>(
     owner: &RunDirLock,
-    adopted: &'a AdoptedPids,
+    adopted: &AdoptedPids,
     bounds: SweepBounds,
     sweep: F,
 ) -> Vec<(LiveChild, SweepDecision)>
 where
-    F: FnOnce(Vec<LiveChild>, &'a AdoptedPids, SweepBounds) -> Fut,
-    Fut: std::future::Future<Output = Vec<(LiveChild, SweepDecision)>>,
+    F: FnOnce(Vec<RecordedChild>, SweepBounds) -> Fut,
+    Fut: std::future::Future<Output = Vec<(RecordedChild, SweepDecision)>>,
 {
     let path = owner.live_children_record();
-    let entries = match read_record(path) {
+    let (entries, previous_reasons) = match read_record_entries(path) {
         Ok(entries) => entries,
         Err(error) => {
             let quarantine = quarantine_record(path, &error);
@@ -899,50 +960,63 @@ where
             return Vec::new();
         }
     };
-    let decisions = sweep(entries, adopted, bounds).await;
+    // A Held child has no verified identity. Filter it out before passing any
+    // entries to platform recovery, which may inspect or signal containers.
+    let mut decisions = Vec::new();
+    let mut orphans = Vec::new();
+    for entry in entries {
+        match adopted.protection(entry.child.pid) {
+            Some(ProtectedChild::Adopted) => decisions.push((entry, SweepDecision::Adopted)),
+            Some(ProtectedChild::Held) => decisions.push((entry, SweepDecision::Held)),
+            None => orphans.push(entry),
+        }
+    }
+    decisions.extend(sweep(orphans, bounds).await);
     for (entry, decision) in &decisions {
-        log_decision(entry, decision);
+        log_decision(&entry.child, decision);
     }
     let retained: Vec<_> = decisions
         .iter()
-        .filter(|(_, decision)| decision.retained_reason().is_some())
+        .filter(|(_, decision)| decision.is_protected() || decision.retained_reason().is_some())
         .map(|(entry, _)| entry.clone())
         .collect();
     let reasons = decisions
         .iter()
         .filter_map(|(entry, decision)| {
             let reason = match decision {
-                SweepDecision::Unverifiable(error) if entry.container.is_some() => {
+                SweepDecision::Unverifiable(error) if entry.child.container.is_some() => {
                     Some(RetainedReason::ContainerUnverifiable(error.clone()))
                 }
+                _ if decision.is_protected() => previous_reasons.get(&entry.child.pid).cloned(),
                 _ => decision.retained_reason(),
             };
-            reason.map(|reason| (entry.pid, reason))
+            reason.map(|reason| (entry.child.pid, reason))
         })
         .collect();
     if let Err(error) = write_record_with_reasons(path, &retained, reasons) {
         warn!(path = %path.display(), %error, "could not reset the live-children record after the orphan sweep");
     }
     decisions
+        .into_iter()
+        .map(|(entry, decision)| (entry.child, decision))
+        .collect()
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn sweep_entries(
-    entries: Vec<LiveChild>,
-    adopted: &AdoptedPids,
+    entries: Vec<RecordedChild>,
     bounds: SweepBounds,
-) -> Vec<(LiveChild, SweepDecision)> {
-    sweep_entries_with_verdict(entries, adopted, bounds, current_verdict).await
+) -> Vec<(RecordedChild, SweepDecision)> {
+    sweep_entries_with_verdict(entries, bounds, current_verdict).await
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn sweep_entries_with_verdict(
-    entries: Vec<LiveChild>,
-    adopted: &AdoptedPids,
+    entries: Vec<RecordedChild>,
     bounds: SweepBounds,
     verdict_for: impl Fn(&LiveChild, &subc_os::Process) -> Option<IdentityVerdict>,
-) -> Vec<(LiveChild, SweepDecision)> {
-    sweep_entries_with_hooks(entries, adopted, bounds, verdict_for, |process, signal| {
+) -> Vec<(RecordedChild, SweepDecision)> {
+    sweep_entries_with_hooks(entries, bounds, verdict_for, |process, signal| {
         process.signal(signal)
     })
     .await
@@ -950,23 +1024,18 @@ async fn sweep_entries_with_verdict(
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn sweep_entries_with_hooks(
-    entries: Vec<LiveChild>,
-    adopted: &AdoptedPids,
+    entries: Vec<RecordedChild>,
     bounds: SweepBounds,
     verdict_for: impl Fn(&LiveChild, &subc_os::Process) -> Option<IdentityVerdict>,
     signal: impl Fn(&subc_os::Process, subc_os::Signal) -> io::Result<bool>,
-) -> Vec<(LiveChild, SweepDecision)> {
+) -> Vec<(RecordedChild, SweepDecision)> {
     use subc_os::{Process, Signal};
     use tokio::time::{sleep, Instant};
 
-    let mut decisions: Vec<(LiveChild, SweepDecision)> = Vec::new();
-    let mut signalled: Vec<(LiveChild, Process)> = Vec::new();
+    let mut decisions = Vec::new();
+    let mut signalled = Vec::new();
     for entry in entries {
-        if adopted.contains(entry.pid) {
-            decisions.push((entry, SweepDecision::Adopted));
-            continue;
-        }
-        if let Some(container) = &entry.container {
+        if let Some(container) = &entry.child.container {
             let decision = match container.current_boot() {
                 Ok(false) => SweepDecision::Gone,
                 Err(error) => SweepDecision::Unverifiable(error.to_string()),
@@ -980,7 +1049,7 @@ async fn sweep_entries_with_hooks(
         }
         // Opened before any check, so on Linux the checks and the signal
         // below all refer to one process through its pidfd.
-        let process = match Process::open(entry.pid) {
+        let process = match Process::open(entry.child.pid) {
             Ok(Some(process)) => process,
             Ok(None) => {
                 decisions.push((entry, SweepDecision::Gone));
@@ -991,7 +1060,7 @@ async fn sweep_entries_with_hooks(
                 continue;
             }
         };
-        match verdict_for(&entry, &process) {
+        match verdict_for(&entry.child, &process) {
             None => decisions.push((entry, SweepDecision::Gone)),
             #[cfg(target_os = "linux")]
             Some(IdentityVerdict::ProcessHidden) => {
@@ -1001,23 +1070,23 @@ async fn sweep_entries_with_hooks(
                 #[cfg(target_os = "linux")]
                 if verdict == IdentityVerdict::MatchesWithExecutablePermissionDenied {
                     info!(
-                        module_id = %entry.module_id,
-                        pid = entry.pid,
+                        module_id = %entry.child.module_id,
+                        pid = entry.child.pid,
                         pidfd = process.signals_through_pidfd(),
                         "orphan sweep: pid and start time match; executable not readable (non-dumpable); sending SIGTERM"
                     );
                 } else {
                     info!(
-                        module_id = %entry.module_id,
-                        pid = entry.pid,
+                        module_id = %entry.child.module_id,
+                        pid = entry.child.pid,
                         pidfd = process.signals_through_pidfd(),
                         "orphan sweep: previous daemon's child still running and matches pid, start time and executable; sending SIGTERM"
                     );
                 }
                 #[cfg(not(target_os = "linux"))]
                 info!(
-                    module_id = %entry.module_id,
-                    pid = entry.pid,
+                    module_id = %entry.child.module_id,
+                    pid = entry.child.pid,
                     pidfd = process.signals_through_pidfd(),
                     "orphan sweep: previous daemon's child still running and matches pid, start time and executable; sending SIGTERM"
                 );
@@ -1057,7 +1126,7 @@ async fn sweep_entries_with_hooks(
     let term_deadline = Instant::now() + bounds.term_grace;
     loop {
         signalled.retain(|(entry, process)| {
-            if let Some(decision) = departed(entry, process, SweepDecision::Terminated) {
+            if let Some(decision) = departed(&entry.child, process, SweepDecision::Terminated) {
                 decisions.push((entry.clone(), decision));
                 false
             } else {
@@ -1074,12 +1143,12 @@ async fn sweep_entries_with_hooks(
         // Checked again right before the signal: without a pidfd this is what
         // keeps a SIGKILL from reaching a process that took the pid after the
         // orphan exited.
-        if !verdict_for(entry, process).is_some_and(IdentityVerdict::permits_signal) {
+        if !verdict_for(&entry.child, process).is_some_and(IdentityVerdict::permits_signal) {
             continue;
         }
         warn!(
-            module_id = %entry.module_id,
-            pid = entry.pid,
+            module_id = %entry.child.module_id,
+            pid = entry.child.pid,
             grace_ms = bounds.term_grace.as_millis() as u64,
             "orphan sweep: previous daemon's child still running after SIGTERM grace; sending SIGKILL"
         );
@@ -1088,7 +1157,7 @@ async fn sweep_entries_with_hooks(
     let kill_deadline = Instant::now() + bounds.kill_bound;
     loop {
         signalled.retain(|(entry, process)| {
-            if let Some(decision) = departed(entry, process, SweepDecision::Killed) {
+            if let Some(decision) = departed(&entry.child, process, SweepDecision::Killed) {
                 decisions.push((entry.clone(), decision));
                 false
             } else {
@@ -1149,20 +1218,16 @@ fn verdict_with_executable_access(
 
 #[cfg(windows)]
 async fn sweep_entries(
-    entries: Vec<LiveChild>,
-    adopted: &AdoptedPids,
+    entries: Vec<RecordedChild>,
     bounds: SweepBounds,
-) -> Vec<(LiveChild, SweepDecision)> {
+) -> Vec<(RecordedChild, SweepDecision)> {
     let mut decisions = Vec::new();
     for entry in entries {
-        let decision = if adopted.contains(entry.pid) {
-            SweepDecision::Adopted
-        } else {
-            let recorded = entry.clone();
+        let recorded = entry.child.clone();
+        let decision =
             tokio::task::spawn_blocking(move || sweep_windows_entry(&recorded, bounds.kill_bound))
                 .await
-                .unwrap_or_else(|error| SweepDecision::Unverifiable(error.to_string()))
-        };
+                .unwrap_or_else(|error| SweepDecision::Unverifiable(error.to_string()));
         decisions.push((entry, decision));
     }
     decisions
@@ -1198,20 +1263,12 @@ fn sweep_windows_entry(entry: &LiveChild, wait_bound: Duration) -> SweepDecision
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 async fn sweep_entries(
-    entries: Vec<LiveChild>,
-    adopted: &AdoptedPids,
+    entries: Vec<RecordedChild>,
     _bounds: SweepBounds,
-) -> Vec<(LiveChild, SweepDecision)> {
+) -> Vec<(RecordedChild, SweepDecision)> {
     entries
         .into_iter()
-        .map(|entry| {
-            let decision = if adopted.contains(entry.pid) {
-                SweepDecision::Adopted
-            } else {
-                SweepDecision::NotSignalledOnThisPlatform
-            };
-            (entry, decision)
-        })
+        .map(|entry| (entry, SweepDecision::NotSignalledOnThisPlatform))
         .collect()
 }
 
@@ -1221,6 +1278,9 @@ fn log_decision(entry: &LiveChild, decision: &SweepDecision) {
     match decision {
         SweepDecision::Adopted => {
             info!(module_id, pid, "orphan sweep: child adopted by the handover; left running")
+        }
+        SweepDecision::Held => {
+            info!(module_id, pid, "orphan sweep: handover child could not be adopted; left unsignalled")
         }
         SweepDecision::Gone => {
             info!(module_id, pid, "orphan sweep: previous daemon's child is gone; dropped from the record")
@@ -1424,6 +1484,235 @@ mod quarantine_tests;
 #[cfg(test)]
 #[path = "live_children/boot_session_tests.rs"]
 mod boot_session_tests;
+
+#[cfg(test)]
+mod roster_resume_hash_tests {
+    use super::*;
+    use cortexkit_test_support::ScratchDir;
+
+    fn child(module_id: &str, pid: u32, hash_digit: char) -> RecordedChild {
+        RecordedChild {
+            child: LiveChild {
+                module_id: module_id.into(),
+                pid,
+                protocol: ModuleProtocol::Subc,
+                start_time: Some(1000),
+                executable: None,
+                cgroup_name: None,
+                container: None,
+            },
+            resume_token_sha256: Some(hash_digit.to_string().repeat(64)),
+        }
+    }
+
+    #[test]
+    fn last_release_startup_and_inspection_read_inline_hash_records() {
+        let dir = ScratchDir::new("released-roster-readers");
+        let path = record_path(&dir);
+        let recorded = child("worker", 41, 'a');
+        let reasons = BTreeMap::from([(41, RetainedReason::Unverifiable)]);
+        write_record_with_reasons(&path, std::slice::from_ref(&recorded), reasons.clone()).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        let wire: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(wire["version"], 2);
+        assert_eq!(wire["children"][0]["resume_token_sha256"], "a".repeat(64));
+
+        let (startup_children, startup_reasons) =
+            released_v2::read_record_with_reasons(&path).unwrap();
+        let inspection = released_v2::read_live_children_roster(&path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(inspection.version, 2);
+        let expected = serde_json::to_value([&recorded.child]).unwrap();
+        assert_eq!(serde_json::to_value(startup_children).unwrap(), expected);
+        assert_eq!(serde_json::to_value(inspection.children).unwrap(), expected);
+        assert_eq!(startup_reasons, reasons);
+        assert_eq!(inspection.retained_reasons, reasons);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert!(quarantine_block(&path).is_none());
+    }
+
+    #[test]
+    fn public_inspection_does_not_return_the_hash() {
+        let dir = ScratchDir::new("inspect-roster-with-hash");
+        let path = record_path(&dir);
+        let recorded = child("worker", 41, 'b');
+        let hash = recorded.resume_token_sha256.as_deref().unwrap();
+        write_record_with_reasons(&path, std::slice::from_ref(&recorded), BTreeMap::new()).unwrap();
+        assert!(fs::read_to_string(&path).unwrap().contains(hash));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        let inspection = read_live_children_roster(&path).unwrap().unwrap();
+        assert!(!format!("{inspection:?}").contains(hash));
+        assert_eq!(inspection.children, [recorded.child]);
+        let child = serde_json::to_value(&inspection.children[0]).unwrap();
+        assert!(child.get("resume_token_sha256").is_none());
+    }
+
+    #[tokio::test]
+    async fn protected_sweep_keeps_both_identities_hashes_and_reasons() {
+        let dir = ScratchDir::new("sweep-protected-children");
+        let path = record_path(&dir);
+        let owner = RunDirLock::acquire(&path).unwrap();
+        let adopted = child("adopted", 41, 'a');
+        let held = child("held", 42, 'b');
+        let orphan = child("orphan", 43, 'c');
+        let entries = [adopted.clone(), held.clone(), orphan.clone()];
+        let reasons = BTreeMap::from([(42, RetainedReason::Unverifiable)]);
+        write_record_with_reasons(&path, &entries, reasons.clone()).unwrap();
+
+        let decisions = sweep_orphans_with(
+            &owner,
+            &AdoptedPids::from_classes([41], [42]),
+            SweepBounds::default(),
+            |entered_recovery, _| async move {
+                assert_eq!(entered_recovery, [orphan]);
+                entered_recovery
+                    .into_iter()
+                    .map(|entry| (entry, SweepDecision::Gone))
+                    .collect()
+            },
+        )
+        .await;
+
+        assert_eq!(
+            decisions,
+            [
+                (adopted.child.clone(), SweepDecision::Adopted),
+                (held.child.clone(), SweepDecision::Held),
+                (entries[2].child.clone(), SweepDecision::Gone),
+            ]
+        );
+        assert_eq!(
+            read_record_entries(&path).unwrap(),
+            (vec![adopted, held], reasons)
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_record_and_damaged_optional_hash_do_not_block_cold_recovery() {
+        let dir = ScratchDir::new("sweep-without-usable-hash");
+        let path = record_path(&dir);
+        let owner = RunDirLock::acquire(&path).unwrap();
+        let protected = AdoptedPids::none();
+        let bounds = SweepBounds::default();
+        let decisions = sweep_orphans_with(&owner, &protected, bounds, |entries, _| async move {
+            assert!(entries.is_empty());
+            Vec::new()
+        })
+        .await;
+        assert!(decisions.is_empty());
+
+        let expected = child("worker", 41, 'a').child;
+        for hash in [
+            serde_json::json!({"damaged": true}),
+            serde_json::json!("not a digest"),
+        ] {
+            let mut wire = serde_json::to_value(&expected).unwrap();
+            wire["resume_token_sha256"] = hash;
+            fs::write(
+                &path,
+                serde_json::json!({"version": 2, "children": [wire]}).to_string(),
+            )
+            .unwrap();
+            let decisions =
+                sweep_orphans_with(&owner, &protected, bounds, |mut entries, _| async move {
+                    assert_eq!(entries.len(), 1);
+                    let entry = entries.pop().unwrap();
+                    assert!(entry.resume_token_sha256.is_none());
+                    vec![(entry, SweepDecision::Gone)]
+                })
+                .await;
+            assert_eq!(decisions, [(expected.clone(), SweepDecision::Gone)]);
+            assert!(read_record(&path).unwrap().is_empty());
+            assert!(quarantine_block(&path).is_none());
+        }
+    }
+
+    // Frozen v0.50.49 readers and record shape from crates/subc-daemon/src/live_children.rs
+    // (tag subc-daemon-v0.50.49, commit a92c126175d7081bc9706c26c77af427909925d5).
+    mod released_v2 {
+        use super::{
+            ContainerIdentity, ExecutableIdentity, ModuleProtocol, RecordReadError, RetainedReason,
+        };
+        use serde::{Deserialize, Serialize};
+        use std::{collections::BTreeMap, fs, io, path::Path};
+
+        const RECORD_VERSION: u32 = 2;
+
+        #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+        pub struct LiveChild {
+            pub module_id: String,
+            pub pid: u32,
+            pub protocol: ModuleProtocol,
+            pub start_time: Option<u64>,
+            pub executable: Option<ExecutableIdentity>,
+            pub cgroup_name: Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub container: Option<ContainerIdentity>,
+        }
+
+        #[derive(Debug, Serialize, Deserialize)]
+        struct RecordFile {
+            version: u32,
+            children: Vec<LiveChild>,
+            #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+            retained_reasons: BTreeMap<u32, RetainedReason>,
+        }
+
+        #[derive(Debug)]
+        pub struct LiveChildrenRoster {
+            pub version: u32,
+            pub children: Vec<LiveChild>,
+            pub retained_reasons: BTreeMap<u32, RetainedReason>,
+        }
+
+        pub fn read_live_children_roster(
+            path: &Path,
+        ) -> Result<Option<LiveChildrenRoster>, RecordReadError> {
+            let bytes = match fs::read(path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(RecordReadError::Io(error)),
+            };
+            let record: RecordFile =
+                serde_json::from_slice(&bytes).map_err(RecordReadError::Malformed)?;
+            if !matches!(record.version, 1 | 2) {
+                return Err(RecordReadError::UnknownVersion(record.version));
+            }
+            Ok(Some(LiveChildrenRoster {
+                version: record.version,
+                children: record.children,
+                retained_reasons: record.retained_reasons,
+            }))
+        }
+
+        pub(crate) fn read_record_with_reasons(
+            path: &Path,
+        ) -> Result<(Vec<LiveChild>, BTreeMap<u32, RetainedReason>), RecordReadError> {
+            let bytes = match fs::read(path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Ok((Vec::new(), BTreeMap::new()))
+                }
+                Err(error) => return Err(RecordReadError::Io(error)),
+            };
+            let record: RecordFile =
+                serde_json::from_slice(&bytes).map_err(RecordReadError::Malformed)?;
+            if !matches!(record.version, 1 | RECORD_VERSION) {
+                return Err(RecordReadError::UnknownVersion(record.version));
+            }
+            Ok((record.children, record.retained_reasons))
+        }
+    }
+}
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -2470,11 +2759,12 @@ pub(crate) mod tests {
             // Inject an unavailable image into a live child's observation. Unlike
             // EACCES/EPERM, an ENOENT or I/O failure must still prevent signalling
             // even when the recorded PID and start time match.
-            let decisions = sweep_entries_with_verdict(
-                vec![entry.clone()],
-                &AdoptedPids::none(),
-                quick(),
-                |entry, process| {
+            let recorded = RecordedChild {
+                child: entry,
+                resume_token_sha256: None,
+            };
+            let decisions =
+                sweep_entries_with_verdict(vec![recorded.clone()], quick(), |entry, process| {
                     let mut observed = process.observe().unwrap();
                     observed.executable = None;
                     Some(verdict_with_executable_access(
@@ -2483,16 +2773,15 @@ pub(crate) mod tests {
                         &observed,
                         subc_os::ExecutableAccess::Unavailable,
                     ))
-                },
-            )
-            .await;
+                })
+                .await;
             let alive = still_running(&mut child);
             child.kill().unwrap();
             child.wait().unwrap();
             assert_eq!(
                 decisions,
                 vec![(
-                    entry,
+                    recorded,
                     SweepDecision::Unverifiable(
                         IdentityVerdict::ExecutableUnreadable.describe().to_owned()
                     )
@@ -2524,10 +2813,9 @@ pub(crate) mod tests {
                     term_grace: Duration::ZERO,
                     kill_bound: Duration::ZERO,
                 },
-                |entries, adopted, bounds| async move {
+                |entries, bounds| async move {
                     sweep_entries_with_hooks(
                         entries,
-                        adopted,
                         bounds,
                         |entry, process| {
                             if survived {
@@ -2781,7 +3069,7 @@ pub(crate) mod tests {
 
             let decisions = sweep_orphans(
                 &RunDirLock::acquire(&path).unwrap(),
-                &AdoptedPids::of([entry.pid]),
+                &AdoptedPids::from_classes([entry.pid], []),
                 quick(),
             )
             .await;

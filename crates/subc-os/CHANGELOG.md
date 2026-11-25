@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.54
+
+- Expose the child-creation lock and direct Unix exec support. Restore
+  descriptor flags before another spawn if exec fails; on Linux, exec the
+  verified descriptor without resolving its path again.
+- Adopt only the named inherited descriptor set at daemon resume, requiring the
+  caller to uphold descriptor ownership. Expose the running macOS native
+  CodeDirectory hash from Security.
+- Enumerate complete process-group membership on Linux and macOS, returning
+  errors rather than partial results. A process that exits while Linux is
+  scanning `/proc` is skipped rather than failing the scan. On macOS, watch an owned, unreaped
+  child's exit through a close-on-exec kqueue.
+
 ## 0.1.53
 
 - Add retained-directory helpers that move a settings file aside, restore it with a no-replace rename, and prove a recovery folder writable with a probe file, on Unix and Windows.

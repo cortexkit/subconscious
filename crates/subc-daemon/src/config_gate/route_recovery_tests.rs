@@ -43,6 +43,8 @@ impl RouteRig {
                 protocol_ver: subc_protocol::PROTOCOL_VERSION,
                 control_ops: None,
                 launch_nonce: None,
+                module_capabilities: None,
+                resume_token: None,
             })
             .unwrap(),
         );

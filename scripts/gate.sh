@@ -59,7 +59,7 @@ Version comparisons:
 
 CI adapters (optional [check], for the existing job boundaries and conditions):
   fast: fmt, versions, metadata, metadata-online, paths, layout, links,
-        citations, file-size, unbound, vectors, vector <vectors/name/>, shellcheck,
+        citations, file-size, core-unsafe, unbound, vectors, vector <vectors/name/>, shellcheck,
         installer, shell-tests
   lint: workspace, release, alpha, windows, windows-release
   test: workspace, workspace-without-daemon, daemon, docs, alpha-setup,
@@ -201,6 +201,7 @@ fast_check() {
     file-size)
       step 'Source file size checker tests' python3 scripts/checks/test_file_size.py
       step 'Source file size pins' python3 scripts/checks/check-file-size.py ;;
+    core-unsafe) step 'Single subc-core unsafe exception' python3 scripts/checks/check-core-unsafe.py ;;
     unbound)
       step 'Unbound-variable fail-open hazards' bash scripts/checks/no-unbound-fail-open.sh
       step 'Unbound-variable checker tests' bash scripts/checks/no-unbound-fail-open.test.sh ;;
@@ -267,6 +268,9 @@ test_check() {
       # Daemon tests launch feature-gated fixtures from both packages. Cargo's
       # test scheduling does not guarantee those binaries exist before a test.
       step 'Build helper binaries (test-support)' cargo build --locked -p subc-core -p subc-daemon --bins --features subc-core/test-support,subc-daemon/test-support
+      # ck-subc and ck-subc-under-test share src/main.rs, and `--bins` builds
+      # only one target per source file, so name the daemon fixture itself.
+      step 'Build the daemon fixture binary (test-support)' cargo build --locked -p subc-core --bin ck-subc-under-test --features test-support
       if [ "$1" != daemon ]; then
         # ck-bus integration tests shorten the probe period and timeout of the
         # spawned ck-bus binary's health check.
@@ -398,7 +402,7 @@ case "$STAGE" in
   fast)
     if [ -n "$CHECK" ]; then fast_check "$CHECK" "${3:-}"; else
       step 'Pinned vector Python prerequisite' require_vector_python
-      for check in fmt versions metadata paths layout links citations file-size unbound vectors shellcheck installer shell-tests; do fast_check "$check"; done
+      for check in fmt versions metadata paths layout links citations file-size core-unsafe unbound vectors shellcheck installer shell-tests; do fast_check "$check"; done
     fi ;;
   lint)
     if [ -n "$CHECK" ]; then lint_check "$CHECK"; else collect workspace release alpha windows windows-release; fi ;;

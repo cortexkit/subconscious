@@ -190,6 +190,23 @@ impl Drop for RegistrationGuard {
     }
 }
 
+pub(super) fn dispatch_registered_work(
+    upgrades: &live_upgrade::UpgradeState,
+    observation: impl std::future::Future<Output = ()> + Send + 'static,
+) -> bool {
+    // Registration changes can arrive after the actor's last upgrade-watch
+    // read. Hold the same background-work token until this queued observation
+    // finishes, so an upgrade either refuses or prevents the dispatch.
+    let Some(work) = upgrades.background_work() else {
+        return false;
+    };
+    tokio::spawn(async move {
+        let _work = work;
+        observation.await;
+    });
+    true
+}
+
 impl ConfigDelivery {
     pub(super) async fn unfenced(&self, module: &str) {
         if let Ok(gate) = self.0.module_gate(module) {
@@ -216,6 +233,7 @@ impl ConfigDelivery {
         forwarding: Option<&Arc<ForwardingTable>>,
         registry: &Arc<Registry>,
         child: &mut SupervisedChild,
+        upgrades: &live_upgrade::UpgradeState,
     ) {
         let Some(spawn) = &child.config_delivery else {
             return;
@@ -236,13 +254,12 @@ impl ConfigDelivery {
         if child.registered_config_connection == Some(connection) {
             return;
         }
-        child.registered_config_connection = Some(connection);
         let spawn = spawn.clone();
         let owner = self.0.clone();
         let registry = registry.clone();
         let forwarding = forwarding.cloned();
         let module = module.to_owned();
-        tokio::spawn(async move {
+        let dispatched = dispatch_registered_work(upgrades, async move {
             let _guard = gate.lock().await;
             if registry
                 .get_module(&module)
@@ -266,6 +283,9 @@ impl ConfigDelivery {
             }
             owner.notify_delivery_changed();
         });
+        if dispatched {
+            child.registered_config_connection = Some(connection);
+        }
     }
 
     pub(super) async fn health_probe(

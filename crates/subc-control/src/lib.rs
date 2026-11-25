@@ -87,6 +87,7 @@ macro_rules! open_string_enum {
 
 pub mod policy_root;
 mod rescan_checked;
+pub mod upgrade_in_place;
 pub use rescan_checked::*;
 
 mod app_open;
@@ -147,6 +148,7 @@ pub mod ops {
 
     pub const SERVER_DESCRIBE: &str = "server.describe";
     pub const DAEMON_SHUTDOWN_INTENT: &str = "daemon.shutdown_intent";
+    pub const DAEMON_UPGRADE_IN_PLACE: &str = "daemon.upgrade_in_place";
     pub const CATALOG_LIST: &str = "catalog.list";
     pub const CATALOG_WATCH: &str = "catalog.watch";
     pub const SCOPE_WATCH: &str = "scope.watch";
@@ -197,6 +199,8 @@ pub enum ClientControlRequest {
         #[serde(default)]
         intent: serde_json::Value,
     },
+    #[serde(rename = "daemon.upgrade_in_place")]
+    DaemonUpgradeInPlace { executable_sha256: String },
     #[serde(rename = "server.describe")]
     ServerDescribe {},
     #[serde(rename = "catalog.list")]

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::{error::Error, io, path::PathBuf, process, time::Duration};
 
 use cortexkit_test_support::ScratchDir as TestDir;

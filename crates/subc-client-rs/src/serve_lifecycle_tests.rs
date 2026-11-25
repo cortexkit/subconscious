@@ -61,6 +61,7 @@ impl ModuleHandler for EndRecorder {
 
 fn ack() -> ModuleHelloAckBody {
     ModuleHelloAckBody {
+        resume_token: None,
         negotiated_ver: PROTOCOL_VERSION,
         subc_ops: Vec::new(),
         subc_capabilities: Vec::new(),

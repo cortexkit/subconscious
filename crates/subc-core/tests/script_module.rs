@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Run with the prerequisites and exact command in `script_module/README.md`.
 
 mod common;

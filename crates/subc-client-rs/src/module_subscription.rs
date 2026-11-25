@@ -25,7 +25,9 @@ impl ModuleHandle {
         &self,
         scopes: Vec<ScopeWatchSelector>,
     ) -> Result<ScopeSubscription, ScopeCallError> {
-        if !self.shared.supports_scope_watch {
+        let shared = self.shared();
+        crate::live_upgrade::ScopeRequest::check_fence(&shared)?;
+        if !shared.supports_scope_watch {
             return Err(ScopeCallError::NotSupported {
                 op: subc_control::ops::SCOPE_WATCH,
             });
@@ -34,7 +36,7 @@ impl ModuleHandle {
             .map_err(|err| ScopeCallError::Protocol(err.to_string()))?;
         // One snapshot and at most 256 terminal events can arrive before the
         // caller next polls; the reader must never block module RPC dispatch.
-        let mut inner = self.control_subscribe(body, 257).await?;
+        let mut inner = Self::control_subscribe(shared, body, 257).await?;
         let first = timeout(CATALOG_UPDATE_TIMEOUT, inner.next())
             .await
             .map_err(|_| ScopeCallError::Timeout)??
@@ -53,14 +55,14 @@ impl ModuleHandle {
     }
 
     async fn control_subscribe(
-        &self,
+        shared: Arc<ModuleHandleShared>,
         body: Vec<u8>,
         capacity: usize,
     ) -> Result<ModuleControlSubscription, ScopeCallError> {
         let (events, rx) = mpsc::channel(capacity);
         let (terminal, closed) = oneshot::channel();
         let (corr, writer) = {
-            let mut state = self.shared.lock_inner();
+            let mut state = shared.lock_inner();
             if state.closed {
                 return Err(ScopeCallError::ConnectionClosed);
             }
@@ -76,14 +78,14 @@ impl ModuleHandle {
             (corr, writer)
         };
         let stream = ModuleControlSubscription {
-            shared: Arc::clone(&self.shared),
+            shared: Arc::clone(&shared),
             corr,
             events: rx,
             terminal: Some(closed),
             finished: false,
         };
         let frame = Frame::build_with_version(
-            self.shared.negotiated_ver,
+            shared.negotiated_ver,
             FrameType::Request,
             Flags(control_flags().0 | subc_protocol::FLAG_SUBSCRIPTION),
             0,
@@ -92,15 +94,16 @@ impl ModuleHandle {
             body,
         )
         .map_err(|err| ScopeCallError::Protocol(err.to_string()))?;
-        timeout(CATALOG_UPDATE_TIMEOUT, writer.send(frame))
+        timeout(CATALOG_UPDATE_TIMEOUT, shared.queue_request(&writer, frame))
             .await
             .map_err(|_| ScopeCallError::Timeout)?
-            .map_err(|_| ScopeCallError::ConnectionClosed)?;
+            .map_err(ScopeCallError::from_control_error)?;
         Ok(stream)
     }
 
     pub(crate) fn handle_control_stream_frame(&self, frame: Frame) -> Option<Frame> {
-        let mut state = self.shared.lock_inner();
+        let shared = self.shared();
+        let mut state = shared.lock_inner();
         let corr = frame.header.corr;
         let Some(stream) = state.pending_control_streams.remove(&corr) else {
             return Some(frame);
@@ -138,7 +141,7 @@ impl ModuleHandle {
         let writer = cancel.then(|| state.writer.clone()).flatten();
         drop(state);
         if let Some(writer) = writer {
-            send_cancel(&self.shared, corr, writer);
+            send_cancel(&shared, corr, writer);
         }
         None
     }

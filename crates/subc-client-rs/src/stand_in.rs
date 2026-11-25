@@ -19,6 +19,7 @@ pub(crate) async fn serve_against_stand_in_with_ops<H: ModuleHandler>(
     let (read_half, write_half) = tokio::io::split(module);
     let (tx, rx) = mpsc::channel(EGRESS_BUFFER);
     let ack = ModuleHelloAckBody {
+        resume_token: None,
         negotiated_ver: PROTOCOL_VERSION,
         subc_ops: subc_ops.iter().map(|op| (*op).to_owned()).collect(),
         subc_capabilities: Vec::new(),

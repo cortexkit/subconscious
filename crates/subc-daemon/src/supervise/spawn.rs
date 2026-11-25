@@ -768,6 +768,10 @@ impl Supervisor {
             let activity_spawn = runtime.begin_activity_spawn(&spec.module_id);
             let registration_watch = watch_registration(&self.registry, &spec);
             let spawned = spawn_child_async(&spec, &runtime).await;
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                runtime.replacement_ticket = None;
+            }
             #[cfg(test)]
             self.test_after_first_spawn.run(&spec.module_id);
             match spawned {
@@ -851,6 +855,8 @@ impl Supervisor {
             capture_logs_dir: self.capture_logs_dir.clone(),
             forwarding: self.forwarding.clone(),
             supervisor_handle: self.supervisor_handle.clone(),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            replacement_ticket: None,
             stderr_ring: Arc::new(Mutex::new(StderrRing::new(StderrTailConfig::default()))),
             terminal_ring: Arc::new(Mutex::new(
                 TerminalRing::new(
@@ -1267,7 +1273,7 @@ pub(super) fn observed_launch_nonce_source(snapshot: &SupervisorSnapshot) -> Opt
 /// Which slot a spawn fills: the module's ordinary one, or the candidate slot
 /// of a blue/green swap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum SpawnRole {
+pub(crate) enum SpawnRole {
     Plain,
     SwapCandidate,
 }
@@ -1723,6 +1729,12 @@ pub(super) async fn spawn_child_in_slot_async(
     .map_err(|_| SuperviseError::InvalidSpec {
         reason: "configuration launch preparation stopped".into(),
     })??;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let (Some(ticket), Some(launch)) =
+        (&runtime.replacement_ticket, &prepared.registration_spawn)
+    {
+        ticket.bind(launch);
+    }
     if let Some(registration) = &prepared.delivery_registration {
         if !registration.launch_current()? {
             return Err(spawn_plan_stale(spec));
@@ -2161,23 +2173,7 @@ pub(super) fn prepare_child_in_slot(
         apply_cgroup_placement(&mut command, spec, path)?;
     }
 
-    let output_sink = if let Some(logs_dir) = capture_logs_dir {
-        let path = logs_dir.join(format!("{}.stderr.log", spec.module_id));
-        match ChildOutputSink::open(&path, capture_retention(spec)) {
-            Ok(sink) => sink,
-            Err(error) => {
-                warn!(
-                    module_id = %spec.module_id,
-                    path = %path.display(),
-                    error = %error,
-                    "could not open child output capture file; forwarding to stderr"
-                );
-                ChildOutputSink::Stderr
-            }
-        }
-    } else {
-        ChildOutputSink::Stderr
-    };
+    let output_sink = capture_sink(spec, capture_logs_dir);
 
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
@@ -2940,6 +2936,13 @@ pub(super) fn launch_child_in_slot(
         registration.commit();
     }
     if let Some(spawn) = &supervised.registration_spawn {
+        if let Some(record) = supervised
+            .roster_guard
+            .as_ref()
+            .and_then(crate::child_roster::RosterGuard::resume_token_record)
+        {
+            let _ = spawn.resume_token_record.set(record);
+        }
         if let Some(identity) = supervised.process_identity {
             let _ = spawn.identity.set(identity);
         }
@@ -3097,6 +3100,24 @@ fn capture_retention(spec: &ModuleSpec) -> Retention {
         max_age_days: value(CAPTURE_MAX_AGE_DAYS_ENV)
             .and_then(|value| value.parse().ok())
             .unwrap_or(defaults.max_age_days),
+    }
+}
+
+pub(super) fn capture_sink(
+    spec: &ModuleSpec,
+    logs_dir: Option<&std::path::Path>,
+) -> ChildOutputSink {
+    let Some(logs_dir) = logs_dir else {
+        return ChildOutputSink::Stderr;
+    };
+    let path = logs_dir.join(format!("{}.stderr.log", spec.module_id));
+    match ChildOutputSink::open(&path, capture_retention(spec)) {
+        Ok(sink) => sink,
+        Err(error) => {
+            warn!(module_id = %spec.module_id, path = %path.display(), %error,
+                "could not open child output capture file; forwarding to stderr");
+            ChildOutputSink::Stderr
+        }
     }
 }
 

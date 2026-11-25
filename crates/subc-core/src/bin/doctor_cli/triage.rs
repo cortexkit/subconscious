@@ -13,7 +13,7 @@ use cortexkit_log::segment_day;
 use serde_json::{json, Value};
 use subc_transport::{connection_file, CONNECTION_FILE_NAME};
 
-use crate::{format_age_from_epoch_ms_now, humanize_identifier, CkError, JsonOutput};
+use super::{format_age_from_epoch_ms_now, humanize_identifier, CkError, JsonOutput};
 
 pub(super) const TRIAGE_LOG_MAX_BYTES: u64 = 64 * 1024;
 const TRIAGE_LOG_TAIL_LINES: usize = 20;
@@ -268,6 +268,24 @@ fn triage_file_fact(path: &Path) -> Value {
             "path": path.display().to_string(), "status": "skipped", "skipped": format!("stat failed: {error}")
         }),
     }
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn daemon_triage_reports_a_held_live_start_lock_as_present() {
+    let dir = cortexkit_test_support::ScratchDir::new("triage-held-start-lock");
+    let connection = dir.join(CONNECTION_FILE_NAME);
+    let lock = fs::File::create(triage_start_lock_path(&connection)).unwrap();
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive).unwrap();
+    fs::write(&connection, serde_json::to_vec(&json!({
+        "schema": 1, "wire_version": 1, "endpoints": [{"host": "127.0.0.1", "port": 8757}],
+        "key": "fixture-key", "daemon_id": "daemon-test", "pid": process::id(),
+    })).unwrap()).unwrap();
+    let triage = collect_daemon_triage(&[connection], &dir);
+    assert_eq!(triage.json["verdict"]["status"], "daemon-appears-live");
+    let lock = &triage.json["start_lock"]["candidates"][0];
+    assert_eq!(lock["status"], "present");
+    assert!(lock.get("finding").is_none());
 }
 
 fn triage_mtime_fact(metadata: &fs::Metadata) -> Value {

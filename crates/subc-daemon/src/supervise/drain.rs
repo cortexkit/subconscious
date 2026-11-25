@@ -1392,7 +1392,108 @@ pub(super) async fn drain_child_to_state(
     enabled: Option<bool>,
     failure: &FailureContext,
 ) -> Result<(), SuperviseError> {
+    drain_child_to_state_inner(
+        module_id,
+        stop_notice,
+        registry,
+        forwarding,
+        snapshot,
+        terminal_ring,
+        spawn_events,
+        &mut child,
+        drain_timeout,
+        final_state,
+        enabled,
+        failure,
+        None,
+        &mut false,
+    )
+    .await
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) const UPGRADE_KILL_GRACE: Duration = Duration::from_secs(2);
+
+/// The attempt must retain a child it could not stop within the kill grace.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) async fn drain_for_upgrade(
+    spec: &ModuleSpec,
+    runtime: &SupervisorRuntimeConfig,
+    registry: &Registry,
+    snapshot: &SharedSnapshot,
+    child: &mut Option<SupervisedChild>,
+    stop_notice: StopNotice,
+) -> Result<(), SuperviseError> {
+    let failure = runtime.failure_context(true);
+    let Some(active) = child.as_mut() else {
+        return drain_optional_child(
+            &spec.module_id,
+            spec.protocol,
+            stop_notice,
+            registry,
+            runtime.forwarding.as_deref(),
+            snapshot,
+            &runtime.terminal_ring,
+            &runtime.spawn_events,
+            child,
+            runtime.drain_timeout,
+            ModuleState::Stopped,
+            None,
+            &failure,
+        )
+        .await;
+    };
+    let mut exit_finalized = false;
+    let result = drain_child_to_state_inner(
+        &spec.module_id,
+        stop_notice,
+        registry,
+        runtime.forwarding.as_deref(),
+        snapshot,
+        &runtime.terminal_ring,
+        &runtime.spawn_events,
+        active,
+        runtime.drain_timeout,
+        ModuleState::Stopped,
+        None,
+        &failure,
+        Some(UPGRADE_KILL_GRACE),
+        &mut exit_finalized,
+    )
+    .await;
+    let stuck = matches!(&result, Err(SuperviseError::Wait { source, .. }) if source.kind() == io::ErrorKind::TimedOut);
+    // A lingering registration can fail the stop after finish_exit has
+    // reaped the process. Unwind must not mistake that handle for a live child.
+    if exit_finalized || (!stuck && active.child.verified_adoptee().is_some()) {
+        *child = None;
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drain_child_to_state_inner(
+    module_id: &str,
+    stop_notice: StopNotice,
+    registry: &Registry,
+    forwarding: Option<&ForwardingTable>,
+    snapshot: &SharedSnapshot,
+    terminal_ring: &Arc<Mutex<TerminalRing>>,
+    spawn_events: &SpawnEventFeed,
+    child: &mut SupervisedChild,
+    drain_timeout: Duration,
+    final_state: ModuleState,
+    enabled: Option<bool>,
+    failure: &FailureContext,
+    kill_grace: Option<Duration>,
+    exit_finalized: &mut bool,
+) -> Result<(), SuperviseError> {
     let protocol = child.protocol;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if kill_grace.is_none() && final_state != ModuleState::Restarting {
+        if let Some(guard) = &mut child.roster_guard {
+            guard.stop_adoption_without_replacement();
+        }
+    }
     child.retire_registration();
     update_snapshot(snapshot, Some(module_id), |state| {
         state.state = ModuleState::Draining;
@@ -1421,12 +1522,12 @@ pub(super) async fn drain_child_to_state(
                 "module has no connection yet; requesting stop by signal"
             );
         }
-        request_graceful_stop(module_id, &child);
+        request_graceful_stop(module_id, child);
     }
 
     let drain_timeout = child.group_drain_budget(drain_timeout, stop_notice);
     let exit_report = match timeout(drain_timeout, child.wait()).await {
-        Ok(Ok(status)) => classify_reaped_child_exit(snapshot, &child, &status),
+        Ok(Ok(status)) => classify_reaped_child_exit(snapshot, child, &status),
         Ok(Err(source)) => {
             fail_after_wait_error(
                 module_id,
@@ -1482,7 +1583,13 @@ pub(super) async fn drain_child_to_state(
                     source,
                 }
             })?;
-            let status = child.wait().await.map_err(|source| {
+            let waited = match kill_grace {
+                Some(grace) => timeout(grace, child.wait()).await.unwrap_or_else(|_| {
+                    Err(io::Error::new(io::ErrorKind::TimedOut, "upgrade stop did not reap the child within the kill grace; child remains owned"))
+                }),
+                None => child.wait().await,
+            };
+            let status = waited.map_err(|source| {
                 fail_after_wait_error(
                     module_id,
                     snapshot,
@@ -1496,7 +1603,7 @@ pub(super) async fn drain_child_to_state(
                     source,
                 }
             })?;
-            classify_reaped_child_exit(snapshot, &child, &status)
+            classify_reaped_child_exit(snapshot, child, &status)
         }
     };
 
@@ -1545,6 +1652,7 @@ pub(super) async fn drain_child_to_state(
             module_id: module_id.to_owned(),
             source,
         })?;
+    *exit_finalized = true;
     released
 }
 
@@ -1572,6 +1680,13 @@ pub(super) fn request_graceful_stop(module_id: &str, child: &SupervisedChild) {
     if let Some(group) = &child.child.plain_group {
         if let Err(error) = group.signal(rustix::process::Signal::TERM) {
             debug!(module_id, %error, "group TERM was not delivered; the drain wait and kill still apply");
+        }
+        return;
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Some(verified) = child.child.verified_adoptee() {
+        if let Err(error) = verified.signal(rustix::process::Signal::TERM) {
+            debug!(module_id, %error, "verified adopted child TERM was not delivered");
         }
         return;
     }

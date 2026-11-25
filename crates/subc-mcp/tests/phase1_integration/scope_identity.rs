@@ -101,6 +101,8 @@ impl IdentityProvider {
             });
         }
         let hello = ModuleHelloBody {
+            module_capabilities: None,
+            resume_token: None,
             manifest,
             protocol_ver: PROTOCOL_VERSION,
             control_ops: None,
@@ -440,6 +442,8 @@ async fn scope_observer(server: &TestServer) -> TcpStream {
         .await
         .unwrap();
     let hello = ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest: ModuleManifest::builder("scope-observer", "0.0.0").build(),
         protocol_ver: PROTOCOL_VERSION,
         control_ops: None,

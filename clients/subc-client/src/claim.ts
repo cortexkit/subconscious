@@ -73,10 +73,13 @@ export class ClaimBroker {
   private live = true;
   constructor(private readonly request: (body: ClaimMintRequest) => Promise<unknown>,
     private readonly sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms)),
-    private readonly now = () => performance.now()) {}
+    private readonly now = () => performance.now(),
+    private readonly beforeMint?: () => void) {}
   close(): void { this.live = false; this.pool = []; }
-  mint(purpose: ClaimPurpose): Promise<string> {
+  async mint(purpose: ClaimPurpose): Promise<string> {
+    this.beforeMint?.();
     const result = this.tail.then(async () => {
+      this.beforeMint?.();
       if (!this.live) throw new ClaimError("registration_closed");
       if (purpose.purpose !== "self") return this.fresh(purpose);
       this.pool = this.pool.filter(c => this.now() - c.minted < 20_000);
@@ -96,6 +99,7 @@ export class ClaimBroker {
   private async fresh(purpose: ClaimPurpose): Promise<string> {
     for (let attempt = 0; ; attempt++) {
       if (!this.live) throw new ClaimError("registration_closed");
+      this.beforeMint?.();
       let reply: unknown;
       try { reply = await this.request({op: "claim.mint", ...purpose}); }
       catch (error) {

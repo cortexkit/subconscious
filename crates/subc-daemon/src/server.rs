@@ -352,8 +352,9 @@ where
     A: FnMut() -> F,
     F: std::future::Future<Output = io::Result<(tokio::net::TcpStream, SocketAddr)>>,
 {
+    let mut admission = router.forwarding().upgrade_admission.subscribe();
     loop {
-        let (stream, peer_addr) = match accept().await {
+        let (stream, peer_addr) = match accept_when_unpaused(&mut admission, &mut accept).await {
             Ok(accepted) => accepted,
             Err(source) => {
                 let kind = source.kind();
@@ -442,8 +443,8 @@ fn accept_resource_exhausted(error: &io::Error) -> bool {
 /// Serve this daemon's local endpoint (a Unix-domain socket, or a Windows named
 /// pipe) until its accept loop fails.
 ///
-/// Uses the TCP key handshake and router, but refuses module registration
-/// with [`crate::local_listener::LOCAL_ENDPOINT_CLIENTS_ONLY`]. A peer read
+/// Uses the TCP key handshake and router. Only an adopted module can register
+/// here with a resume token; plain HELLOs remain clients-only. A peer read
 /// failure costs that connection; a terminal accept error ends the listener.
 pub async fn serve_local_listener(
     bound: crate::local_listener::BoundLocalListener,
@@ -473,6 +474,31 @@ async fn serve_unix_local(
     router: Arc<Router>,
     auth: ServerAuth,
 ) -> Result<(), ServerError> {
+    serve_unix_local_with_start(listener, path, router, auth, None::<fn()>).await
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) async fn serve_resumed_local_listener(
+    bound: crate::local_listener::BoundLocalListener,
+    router: Arc<Router>,
+    auth: ServerAuth,
+    on_accepting: impl FnOnce() + Send,
+) -> Result<(), ServerError> {
+    match bound {
+        crate::local_listener::BoundLocalListener::Unix { listener, path } => {
+            serve_unix_local_with_start(listener, path, router, auth, Some(on_accepting)).await
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn serve_unix_local_with_start(
+    listener: std::os::unix::net::UnixListener,
+    path: std::path::PathBuf,
+    router: Arc<Router>,
+    auth: ServerAuth,
+    on_accepting: Option<impl FnOnce() + Send>,
+) -> Result<(), ServerError> {
     // The socket file is removed when this future ends, whether it returns or is
     // dropped during shutdown, so a later daemon start finds no leftover.
     let _release = SocketFileRelease(path.clone());
@@ -481,8 +507,15 @@ async fn serve_unix_local(
         .map_err(|source| local_accept_error(&path, source))?;
     let listener = tokio::net::UnixListener::from_std(listener)
         .map_err(|source| local_accept_error(&path, source))?;
+    let mut admission = router.forwarding().upgrade_admission.subscribe();
+    // A bound socket or a live TCP loop cannot accept a module's resume HELLO.
+    // Record readiness here, after the Unix socket enters the async accept loop.
+    if let Some(on_accepting) = on_accepting {
+        on_accepting();
+    }
     loop {
-        let (stream, _addr) = match listener.accept().await {
+        let (stream, _addr) = match accept_when_unpaused(&mut admission, || listener.accept()).await
+        {
             Ok(accepted) => accepted,
             Err(source) if temporary_accept_failure(&source) => {
                 warn!(error = %source, "temporary local-socket accept failure");
@@ -587,8 +620,7 @@ fn create_pipe_instance(
     })
 }
 
-/// Run one local-endpoint connection: the same handshake as TCP, with the
-/// clients-only rule attached after it.
+/// Run the shared handshake with local peer credentials for resumable HELLOs.
 async fn handle_accepted_local_connection<S>(
     stream: S,
     router: Arc<Router>,
@@ -676,6 +708,11 @@ struct ConnectionTasks {
     routes: JoinSet<Result<(), RouterError>>,
     privileged: JoinSet<Result<(), RouterError>>,
     activity: JoinSet<Result<(), RouterError>>,
+    #[cfg(test)]
+    refusal_before_send: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
 }
 
 impl ConnectionTasks {
@@ -760,6 +797,7 @@ where
         LocalOrigin::RegistrationChannel(spawn) => Some(spawn.clone()),
         _ => None,
     };
+    let mut upgrade_admission = router.forwarding().upgrade_admission.subscribe();
     struct RetireRegistration(Option<Arc<crate::supervise::RegistrationSpawn>>);
     impl Drop for RetireRegistration {
         fn drop(&mut self) {
@@ -806,6 +844,8 @@ where
         None
     } else {
         Some(tokio::select! {
+            biased;
+            _ = wait_for_upgrade_listener_pause(&mut upgrade_admission) => return Ok(()),
             _ = &mut channel_closed => return Ok(()),
             result = tokio::time::timeout(auth.deadline, auth.unauthenticated.clone().acquire_owned()) => match result {
                 Ok(Ok(permit)) => permit,
@@ -822,6 +862,8 @@ where
             .saturating_duration_since(tokio::time::Instant::now())
     });
     let authenticated = tokio::select! {
+        biased;
+        _ = wait_for_upgrade_listener_pause(&mut upgrade_admission) => return Ok(()),
         _ = &mut channel_closed => { let _ = stream.shutdown().await; return Ok(()); },
         result = authenticate_server(
         &mut stream,
@@ -1107,11 +1149,18 @@ async fn connection_loop<R>(
 where
     R: AsyncRead + Unpin,
 {
+    #[cfg(test)]
+    let mut refusal_before_send = tasks.refusal_before_send.take();
     let ConnectionTasks {
         routes: route_open_tasks,
         privileged: privileged_tasks,
         activity: activity_tasks,
+        ..
     } = tasks;
+    let forwarding = router.forwarding();
+    let mut upgrade_admission = forwarding.upgrade_admission.subscribe();
+    let (phase, _live_reader) = forwarding.start_upgrade_reader(ctx.connection_id);
+    close_receiver.initialize_phase(phase);
     loop {
         while let Some(result) = activity_tasks.try_join_next() {
             finish_route_open_task(result)?;
@@ -1127,10 +1176,20 @@ where
         // partial header/body buffers that would be lost if that future were dropped.
         let read = read_frame(&mut *read_half);
         tokio::pin!(read);
+        close_receiver.acknowledge_reader();
         let frame = loop {
+            let can_read = !close_receiver.phase().clients_frozen();
             tokio::select! {
-                close = &mut close_receiver => {
-                    return Ok(ConnectionLoopExit::CloseRequested(close_reason(close)));
+                biased;
+                signal = close_receiver.next_signal() => {
+                    match signal {
+                        Ok(None) => close_receiver.acknowledge_reader(),
+                        Ok(Some(reason)) => return Ok(ConnectionLoopExit::CloseRequested(reason)),
+                        Err(error) => return Ok(ConnectionLoopExit::CloseRequested(close_reason(Err(error)))),
+                    }
+                }
+                _ = wait_for_upgrade_listener_pause(&mut upgrade_admission), if matches!(&origin, LocalOrigin::RegistrationChannel(spawn) if !spawn.registered()) => {
+                    return Ok(ConnectionLoopExit::PeerClosed);
                 }
                 result = route_open_tasks.join_next(), if !route_open_tasks.is_empty() => {
                     finish_route_open_task(
@@ -1143,7 +1202,7 @@ where
                 result = privileged_tasks.join_next(), if !privileged_tasks.is_empty() => {
                     finish_route_open_task(result.expect("non-empty privileged task set"))?;
                 }
-                result = &mut read => {
+                result = &mut read, if can_read => {
                     break match result.map_err(ConnectionError::FrameIo)? {
                         Some(frame) => frame,
                         None => return Ok(ConnectionLoopExit::PeerClosed),
@@ -1158,32 +1217,17 @@ where
             return Ok(ConnectionLoopExit::PeerClosed);
         }
         let first = ctx.egress.first_ingress_frame();
+        let hello = frame.header.ty == subc_protocol::FrameType::Hello;
+        if hello && upgrade_admission.borrow().listeners_paused() {
+            return Ok(ConnectionLoopExit::PeerClosed);
+        }
         if frame.header.channel == 0 && frame.header.ty == subc_protocol::FrameType::Goodbye {
             activity_tasks.shutdown().await;
         }
-        if let LocalOrigin::RegistrationChannel(spawn) = &origin {
-            let hello = frame.header.ty == subc_protocol::FrameType::Hello;
-            if (!spawn.registered() && !hello) || (spawn.registered() && hello) {
-                ctx.egress.terminate_ingress();
-                spawn.retire_registration_channel();
-                return Ok(ConnectionLoopExit::PeerClosed);
-            }
-        }
-
-        if matches!(origin, LocalOrigin::Local)
-            && frame.header.ty == subc_protocol::FrameType::Hello
-        {
-            // A module registers over TCP only. Refusing here, before the router
-            // sees the frame, is what guarantees the local endpoint leaves no
-            // registration, catalog entry or route behind, whatever the HELLO
-            // carries.
+        if let Some((code, message)) = hello_transport_refusal(&origin, &frame) {
             ctx.egress.terminate_ingress();
-            let refusal = crate::control::control_error_frame(
-                &frame,
-                crate::local_listener::LOCAL_ENDPOINT_CLIENTS_ONLY,
-                "the local endpoint serves clients only; modules register over TCP",
-            )
-            .map_err(ConnectionError::Router)?;
+            let refusal = crate::control::control_error_frame(&frame, code, message)
+                .map_err(ConnectionError::Router)?;
             // The connection ends as soon as the refusal is sent, so the bytes
             // must reach the socket first: a client that has not yet read its
             // reply would otherwise see only the end of the stream.
@@ -1197,21 +1241,17 @@ where
             return Ok(ConnectionLoopExit::PeerClosed);
         }
 
-        if frame.header.channel == 0
-            && frame.header.ty == subc_protocol::FrameType::Request
-            && serde_json::from_slice::<serde_json::Value>(&frame.body)
-                .ok()
-                .is_some_and(|body| {
-                    matches!(
-                        body["op"].as_str(),
-                        Some(
-                            subc_control::ops::ACTIVITY_RECORD
-                                | subc_control::ops::ACTIVITY_QUERY
-                                | subc_control::ops::ACTIVITY_SUBSCRIBE
-                        )
-                    )
-                })
-        {
+        if let LocalOrigin::RegistrationChannel(spawn) = &origin {
+            let hello = frame.header.ty == subc_protocol::FrameType::Hello;
+            if (!spawn.registered() && !hello) || (spawn.registered() && hello) {
+                ctx.egress.terminate_ingress();
+                spawn.retire_registration_channel();
+                return Ok(ConnectionLoopExit::PeerClosed);
+            }
+        }
+
+        let control_dispatch = ControlDispatch::of(&frame);
+        if control_dispatch == ControlDispatch::Activity {
             // Bound outstanding activity tasks as well as the disk queue,
             // so the reader never waits for either capacity when the disk stalls.
             if activity_tasks.len() >= 128 {
@@ -1236,13 +1276,16 @@ where
                 let task_ctx = ctx.clone();
                 activity_tasks.spawn(async move {
                     let _reservation = reservation;
-                    route_open_tail(task_router, task_ctx, frame, Instant::now(), first).await
+                    route_open_tail(&task_router, task_ctx, frame, Instant::now(), first).await
                 });
             }
             continue;
         }
 
-        if let Some(target_module_id) = router.route_open_target(&frame) {
+        if let Some(target_module_id) = (control_dispatch == ControlDispatch::RouteOpen)
+            .then(|| router.route_open_target(&frame))
+            .flatten()
+        {
             // A task can finish while the reader is waiting for the next frame.
             // Reap it before checking admission so completed work never occupies
             // one of the deliberately scarce connection slots.
@@ -1272,13 +1315,20 @@ where
                 continue;
             }
 
-            let task_router = Arc::clone(&router);
+            let task_router = router.clone().track_cutover_task();
             let task_ctx = ctx.clone();
             // Start slow-dispatch timing before spawn so it covers the task's
             // full scheduler and handler lifetime, as inline timing did.
             let dispatch_started_at = Instant::now();
             route_open_tasks.spawn(async move {
-                route_open_tail(task_router, task_ctx, frame, dispatch_started_at, first).await
+                route_open_tail(
+                    task_router.owner(),
+                    task_ctx,
+                    frame,
+                    dispatch_started_at,
+                    first,
+                )
+                .await
             });
             continue;
         }
@@ -1313,7 +1363,7 @@ where
                 // The future owns cleanup even if it is dropped before its
                 // first poll or authorization refuses before approval begins.
                 let _reservation = reservation;
-                route_open_tail(task_router, task_ctx, frame, started, first).await
+                route_open_tail(&task_router, task_ctx, frame, started, first).await
             });
             continue;
         }
@@ -1321,6 +1371,10 @@ where
         // Other frames still route serially: routing can backpressure reads,
         // and a connection close cancels the in-progress route.
         let route_result = tokio::select! {
+            biased;
+            _ = wait_for_upgrade_listener_pause(&mut upgrade_admission), if hello => {
+                return Ok(ConnectionLoopExit::PeerClosed);
+            }
             close = &mut close_receiver => {
                 return Ok(ConnectionLoopExit::CloseRequested(close_reason(close)));
             }
@@ -1328,17 +1382,23 @@ where
         };
 
         if let Err(err) = route_result {
-            if let Some(error_frame) = err.to_error_frame() {
+            if let Some(reply) = router.prepare_routed_error(&err) {
+                #[cfg(test)]
+                if let Some((built, release)) = refusal_before_send.take() {
+                    let _ = built.send(());
+                    let _ = release.await;
+                }
                 warn!(
                     connection_id = ctx.connection_id.get(),
                     error = %err,
                     "routing failure recovered with ERROR frame"
                 );
                 let send_result = tokio::select! {
+                    biased;
                     close = &mut close_receiver => {
                         return Ok(ConnectionLoopExit::CloseRequested(close_reason(close)));
                     }
-                    result = router.observe_connection_wait(&ctx, "reply_egress", ctx.egress.send(error_frame)) => result,
+                    result = router.observe_connection_wait(&ctx, "reply_egress", reply.send(&ctx.egress)) => result,
                 };
                 send_result.map_err(ConnectionError::Router)?;
             } else {
@@ -1351,6 +1411,64 @@ where
             }
         }
     }
+}
+
+async fn accept_when_unpaused<F, T>(
+    admission: &mut tokio::sync::watch::Receiver<crate::control::upgrade_in_place::Admission>,
+    mut accept: impl FnMut() -> F,
+) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    loop {
+        let _ = admission.wait_for(|phase| !phase.listeners_paused()).await;
+        tokio::select! {
+            biased;
+            _ = wait_for_upgrade_listener_pause(admission) => {},
+            accepted = accept() => {
+                // If accept raced the pause, keep the socket unopened at the
+                // protocol layer until unwind. Exec closes it like the backlog.
+                let _ = admission.wait_for(|phase| !phase.listeners_paused()).await;
+                return accepted;
+            }
+        }
+    }
+}
+
+async fn wait_for_upgrade_listener_pause(
+    admission: &mut tokio::sync::watch::Receiver<crate::control::upgrade_in_place::Admission>,
+) {
+    let _ = admission.wait_for(|phase| phase.listeners_paused()).await;
+}
+
+fn hello_transport_refusal(
+    origin: &LocalOrigin,
+    frame: &crate::Frame,
+) -> Option<(&'static str, &'static str)> {
+    use crate::supervise::resume_hello;
+    if frame.header.ty != subc_protocol::FrameType::Hello {
+        return None;
+    }
+    let local = matches!(origin, LocalOrigin::Local);
+    let value = serde_json::from_slice::<serde_json::Value>(&frame.body).ok();
+    if let Some(value) = value
+        .as_ref()
+        .filter(|value| resume_hello::has_resume_token(value))
+    {
+        if !local
+            || !cfg!(any(target_os = "macos", target_os = "linux"))
+            || frame.header.channel != 0
+            || resume_hello::parse_resume_hash(value).is_none()
+        {
+            return Some((resume_hello::REFUSED, resume_hello::REFUSAL_MESSAGE));
+        }
+    } else if local {
+        return Some((
+            crate::local_listener::LOCAL_ENDPOINT_CLIENTS_ONLY,
+            "the local endpoint serves clients only; modules register over TCP",
+        ));
+    }
+    None
 }
 
 /// Send a refusal before ending the connection. Unix waits for a writer flush;
@@ -1366,8 +1484,38 @@ async fn send_refusal(sink: &FrameSink, frame: crate::Frame) -> Result<(), Route
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ControlDispatch {
+    Activity,
+    RouteOpen,
+    Other,
+}
+
+impl ControlDispatch {
+    fn of(frame: &crate::Frame) -> Self {
+        if frame.header.channel != 0 || frame.header.ty != subc_protocol::FrameType::Request {
+            return Self::Other;
+        }
+        #[derive(serde::Deserialize)]
+        struct Op<'a> {
+            #[serde(borrow)]
+            op: std::borrow::Cow<'a, str>,
+        }
+        let Ok(op) = serde_json::from_slice::<Op<'_>>(&frame.body) else {
+            return Self::Other;
+        };
+        match op.op.as_ref() {
+            subc_control::ops::ACTIVITY_RECORD
+            | subc_control::ops::ACTIVITY_QUERY
+            | subc_control::ops::ACTIVITY_SUBSCRIBE => Self::Activity,
+            subc_control::ops::ROUTE_OPEN => Self::RouteOpen,
+            _ => Self::Other,
+        }
+    }
+}
+
 async fn route_open_tail(
-    router: Arc<Router>,
+    router: &Router,
     ctx: RouteCtx,
     frame: crate::Frame,
     dispatch_started_at: Instant,
@@ -1379,7 +1527,7 @@ async fn route_open_tail(
     {
         Ok(()) => Ok(()),
         Err(err) => {
-            let Some(error_frame) = err.to_error_frame() else {
+            let Some(reply) = router.prepare_routed_error(&err) else {
                 return Err(err);
             };
             warn!(
@@ -1388,7 +1536,7 @@ async fn route_open_tail(
                 "routing failure recovered with ERROR frame"
             );
             router
-                .observe_connection_wait(&ctx, "reply_egress", ctx.egress.send(error_frame))
+                .observe_connection_wait(&ctx, "reply_egress", reply.send(&ctx.egress))
                 .await
         }
     }
@@ -1430,7 +1578,7 @@ pub(crate) fn connection_egress() -> (FrameSink, mpsc::Receiver<crate::router::O
     )
 }
 
-async fn drain_writer<W>(
+pub(crate) async fn drain_writer<W>(
     write_half: W,
     mut rx: mpsc::Receiver<crate::router::OutboundFrame>,
 ) -> Result<(), FrameIoError>
@@ -1471,6 +1619,15 @@ where
         charge.taken_by_writer();
     }
     let frame = outbound.frame;
+    #[cfg(all(
+        feature = "test-support",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    if let Some(gate) = outbound.fixture_flush_gate {
+        crate::control::upgrade_in_place::wait_at_gate(&gate, 3)
+            .await
+            .map_err(FrameIoError::Io)?;
+    }
     if frame.header.channel == 0 && queued >= SLOW_REPLY_QUEUE {
         let write_started = std::time::Instant::now();
         let result = write_frame(writer, &frame).await;
@@ -1485,6 +1642,9 @@ where
         write_frame(writer, &frame).await?;
     }
     if let Some(flushed) = outbound.flushed {
+        // Upgrade GOODBYE reserves every queue slot before entering this FIFO.
+        // An earlier sender with a slot either queued before it or did not
+        // send. Flushing GOODBYE therefore flushes all earlier writes too.
         writer.flush().await.map_err(FrameIoError::Io)?;
         let _ = flushed.send(());
     }
@@ -1520,6 +1680,409 @@ async fn shutdown_notice_ack_waits_for_socket_flush() {
     .unwrap();
     sent.unwrap();
     assert_eq!(received.unwrap().unwrap().body, b"notice");
+    writer.abort();
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[tokio::test]
+async fn close_requested_reader_stays_counted_while_its_request_is_parked() {
+    closing_reader_accounts_for_dropped_request(false).await;
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[tokio::test]
+async fn closing_reader_accounts_for_a_refusal_built_before_close() {
+    closing_reader_accounts_for_dropped_request(true).await;
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+async fn closing_reader_accounts_for_dropped_request(already_built_refusal: bool) {
+    use crate::{
+        forwarding::{DataRoute, DataRouteState, RouteBindRelayOutcome},
+        ConnectionId,
+    };
+    use subc_protocol::{
+        manifest::Concurrency, Flags, Frame, FrameType, Priority, PROTOCOL_VERSION,
+    };
+
+    let router = Arc::new(Router::default());
+    let forwarding = router.forwarding();
+    let mut connection = router.begin_connection();
+    let (reader_sink, mut reader_replies) = connection_egress();
+    let ctx = RouteCtx {
+        connection_id: connection.id(),
+        egress: reader_sink,
+    };
+    let (module_tx, mut module_rx) = mpsc::channel(1);
+    let sink = FrameSink::new(module_tx);
+    let module = ConnectionId::new(15_000);
+    forwarding
+        .register_module_connection(
+            module,
+            "blocked-module".into(),
+            PROTOCOL_VERSION,
+            Concurrency::ModuleManaged,
+            sink.clone(),
+        )
+        .unwrap();
+    let (client_sink, mut client_rx) = connection_egress();
+    let route = forwarding
+        .begin_route_bind_relay_for_test(ctx.connection_id, client_sink, 80, "blocked-module")
+        .unwrap();
+    forwarding
+        .complete_pending_relay(module, route.corr, RouteBindRelayOutcome::Accepted)
+        .unwrap();
+    assert_eq!(client_rx.try_recv().unwrap().header.corr, 80);
+    let flags = Flags::new(false, Priority::Passive, false);
+    sink.try_send(Frame::build(FrameType::Push, flags, 0, 0, 81, vec![]).unwrap())
+        .unwrap();
+    let (mut peer, mut reader) = tokio::io::duplex(4096);
+    let request = Frame::build(
+        FrameType::Request,
+        flags,
+        route.client_channel,
+        route.client_epoch,
+        82,
+        vec![],
+    )
+    .unwrap();
+    crate::write_frame(&mut peer, &request).await.unwrap();
+
+    let mut tasks = ConnectionTasks::default();
+    let refusal_pause = already_built_refusal.then(|| {
+        let (built, seen) = tokio::sync::oneshot::channel();
+        let (resume, wait) = tokio::sync::oneshot::channel();
+        tasks.refusal_before_send = Some((built, wait));
+        (seen, resume)
+    });
+    let loop_future = connection_loop(
+        &mut reader,
+        router,
+        ctx.clone(),
+        connection.take_close_receiver(),
+        &mut tasks,
+        LocalOrigin::Tcp,
+    );
+    tokio::pin!(loop_future);
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(loop_future.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    let DataRoute::Client(DataRouteState::Bound(binding)) = forwarding
+        .lookup_data_route(ctx.connection_id, route.client_channel, route.client_epoch)
+        .unwrap()
+    else {
+        panic!("expected bound route");
+    };
+    assert_eq!(
+        binding.flow.in_flight(),
+        1,
+        "the reader decoded the request and took credit before blocking on the writer"
+    );
+
+    forwarding.upgrade_refusals.begin();
+    let resume = if let Some((mut seen, resume)) = refusal_pause {
+        forwarding.set_upgrade_admission(crate::control::upgrade_in_place::Admission::Fenced);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(loop_future.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        seen.try_recv()
+            .expect("the reader already built its upgrade refusal");
+        Some(resume)
+    } else {
+        None
+    };
+    assert!(forwarding.request_connection_close(
+        ctx.connection_id,
+        CloseReason::new("test_close", "reader is still dispatching")
+    ));
+    // Do not poll the reader again until the freeze has counted it.
+    let readers = forwarding.freeze_upgrade_readers();
+    let remaining = readers.subscribe();
+    assert_eq!(
+        *remaining.borrow(),
+        1,
+        "requesting close does not acknowledge the reader's current frame"
+    );
+    if let Some(resume) = resume {
+        resume.send(()).unwrap();
+    }
+    assert!(matches!(
+        loop_future.await.unwrap(),
+        ConnectionLoopExit::CloseRequested(_)
+    ));
+    assert_eq!(
+        *remaining.borrow(),
+        0,
+        "the reader has returned and no longer owns its frame"
+    );
+    assert_eq!(module_rx.try_recv().unwrap().header.corr, 81);
+    assert!(module_rx.try_recv().is_err());
+    assert!(reader_replies.try_recv().is_err());
+    let tracked = usize::from(already_built_refusal);
+    assert_eq!(
+        forwarding.upgrade_refusals.receipt_for_test(&readers).await,
+        (tracked, tracked, true),
+        "only a daemon fence refusal already built before the close is counted"
+    );
+}
+
+#[cfg(all(test, unix))]
+#[tokio::test]
+async fn activity_and_other_control_ops_skip_the_typed_route_open_probe() {
+    use subc_protocol::{Flags, Frame, FrameType, Priority};
+    let router = Arc::new(Router::default());
+    let (_id, mut client, server) = config_test_connection_loop(router.clone());
+    let request = |corr, body: serde_json::Value| {
+        Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Passive, false),
+            0,
+            0,
+            corr,
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap()
+    };
+    for (i, op) in [
+        "activity.query",
+        "activity.record",
+        "activity.subscribe",
+        "server.describe",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let corr = 100 + i as u64;
+        crate::write_frame(&mut client, &request(corr, serde_json::json!({"op":op})))
+            .await
+            .unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(2), read_frame(&mut client))
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .header
+                .corr,
+            corr
+        );
+        assert_eq!(
+            router.route_open_probes_for_test(),
+            0,
+            "{op} must not reach the typed route.open probe"
+        );
+    }
+    crate::write_frame(
+        &mut client,
+        &request(
+            200,
+            serde_json::json!({
+                "op":"route.open",
+                "target":subc_protocol::RouteTarget::ToolProvider { module_id: "no-module".into() },
+                "identity":subc_protocol::BindIdentity::new("probe-fixture", "route"),
+            }),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(2), read_frame(&mut client))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .header
+            .corr,
+        200
+    );
+    assert_eq!(router.route_open_probes_for_test(), 1);
+    drop(client);
+    server.await.unwrap().unwrap();
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[tokio::test]
+async fn relayed_health_error_with_upgrade_body_does_not_enter_refusal_accounting() {
+    use crate::{ConnectionId, ControlHandler, ForwardingTable, Registry};
+    use subc_protocol::{
+        manifest::{Concurrency, ModuleManifest},
+        ErrorBody, Flags, Frame, FrameType, Priority, PROTOCOL_VERSION,
+    };
+    let registry = Arc::new(Registry::default());
+    let forwarding = Arc::new(ForwardingTable::default());
+    let router = Arc::new(Router::with_control_handler(Arc::new(
+        ControlHandler::with_forwarding(registry.clone(), forwarding.clone()),
+    )));
+    let module_id = "receipt-probe";
+    let module_connection = ConnectionId::new(400);
+    let (module_sink, mut module_reader) = connection_egress();
+    registry
+        .register_with_control_ops(
+            ModuleManifest::builder(module_id, "1.0.0").build(),
+            PROTOCOL_VERSION,
+            module_connection,
+            vec!["health.check".into()],
+        )
+        .unwrap();
+    forwarding
+        .register_module_connection(
+            module_connection,
+            module_id.into(),
+            PROTOCOL_VERSION,
+            Concurrency::ModuleManaged,
+            module_sink.clone(),
+        )
+        .unwrap();
+    let (client_sink, mut replies) = connection_egress();
+    let flags = Flags::new(false, Priority::Passive, false);
+    let make = |ty, corr, body| Frame::build(ty, flags, 0, 0, corr, body).unwrap();
+    let health = make(
+        FrameType::Request,
+        501,
+        serde_json::to_vec(
+            &serde_json::json!({"op":"supervisor.health_probe","module_id":module_id}),
+        )
+        .unwrap(),
+    );
+    let active = tokio::spawn({
+        let router = router.clone();
+        async move {
+            router
+                .route_for_connection(
+                    &RouteCtx {
+                        connection_id: ConnectionId::new(401),
+                        egress: client_sink,
+                    },
+                    health,
+                )
+                .await
+        }
+    });
+    let probe = timeout(Duration::from_secs(2), module_reader.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    forwarding.upgrade_refusals.begin();
+    forwarding.set_upgrade_admission(crate::control::upgrade_in_place::Admission::Fenced);
+    let error = ErrorBody::module_reloading_for_daemon_upgrade("module-authored error");
+    router
+        .route_for_connection(
+            &RouteCtx {
+                connection_id: module_connection,
+                egress: module_sink,
+            },
+            make(
+                FrameType::Error,
+                probe.header.corr,
+                serde_json::to_vec(&error).unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+    active.await.unwrap().unwrap();
+    let reply = replies.try_recv().unwrap();
+    assert_eq!(reply.header.corr, 501);
+    assert_eq!(
+        serde_json::from_slice::<ErrorBody>(&reply.body).unwrap(),
+        error
+    );
+    assert!(
+        reply.flushed.is_none(),
+        "a module-authored error is not a tracked fence refusal"
+    );
+    assert_eq!(
+        forwarding
+            .upgrade_refusals
+            .receipt_for_test(&Default::default())
+            .await,
+        (0, 0, true)
+    );
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[tokio::test]
+async fn upgrade_fence_refuses_health_and_flushes_queued_request_before_goodbye() {
+    use crate::control::upgrade_in_place::Admission;
+    use crate::{ControlHandler, ForwardingTable, Registry};
+    use subc_protocol::{Flags, Frame, FrameType, Priority};
+
+    let (socket, mut peer) = tokio::io::duplex(1);
+    let (sink, queued) = connection_egress();
+    let writer = tokio::spawn(drain_writer(socket, queued));
+    let frame = |ty, channel, corr, body| {
+        Frame::build(
+            ty,
+            Flags::new(false, Priority::Passive, false),
+            channel,
+            0,
+            corr,
+            body,
+        )
+        .unwrap()
+    };
+    sink.try_send(frame(FrameType::Request, 1, 33, b"request".to_vec()))
+        .unwrap();
+
+    let forwarding = Arc::new(ForwardingTable::default());
+    forwarding.set_upgrade_admission(Admission::Fenced);
+    let control = ControlHandler::with_forwarding(Arc::new(Registry::default()), forwarding);
+    let (egress, _replies) = connection_egress();
+    let probe = frame(
+        FrameType::Request,
+        0,
+        44,
+        serde_json::to_vec(
+            &serde_json::json!({"op":"supervisor.health_probe", "module_id":"module"}),
+        )
+        .unwrap(),
+    );
+    let replies = control
+        .handle_control_frame_timed(
+            &RouteCtx {
+                connection_id: crate::ConnectionId::new(15),
+                egress,
+            },
+            probe,
+            None,
+        )
+        .await
+        .unwrap();
+    let refused: subc_protocol::ErrorBody = serde_json::from_slice(&replies[0].body).unwrap();
+    assert_eq!(refused.code, "upgrade_busy");
+
+    let notices = async {
+        sink.send_flushed(frame(FrameType::Push, 0, 0, b"upgrading".to_vec()))
+            .await
+            .unwrap();
+        sink.send_flushed(frame(FrameType::Goodbye, 0, 0, vec![]))
+            .await
+            .unwrap();
+    };
+    tokio::pin!(notices);
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(notices.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    let (_, ()) = timeout(Duration::from_secs(2), async {
+        tokio::join!(
+            async {
+                for expected in [FrameType::Request, FrameType::Push, FrameType::Goodbye] {
+                    assert_eq!(
+                        read_frame(&mut peer).await.unwrap().unwrap().header.ty,
+                        expected
+                    );
+                }
+            },
+            &mut notices
+        )
+    })
+    .await
+    .unwrap();
     writer.abort();
 }
 
@@ -1686,6 +2249,37 @@ mod tests {
 
     const TEST_DEADLINE: Duration = Duration::from_secs(2);
     const TEST_DAEMON_VER: &str = "test-subc-server";
+
+    #[test]
+    fn null_resume_token_is_an_ordinary_hello() {
+        let frame = Frame::build(
+            FrameType::Hello,
+            Flags::new(false, Priority::Interactive, false),
+            0,
+            0,
+            1,
+            serde_json::to_vec(&serde_json::json!({
+                "protocol_ver": PROTOCOL_VERSION,
+                "manifest": subc_protocol::manifest::ModuleManifest::builder("fresh", "1.0.0")
+                    .build(),
+                "resume_token": null,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(hello_transport_refusal(&LocalOrigin::Tcp, &frame), None);
+        assert_eq!(
+            hello_transport_refusal(&LocalOrigin::Local, &frame)
+                .unwrap()
+                .0,
+            crate::local_listener::LOCAL_ENDPOINT_CLIENTS_ONLY
+        );
+        let control = ControlHandler::new(Arc::new(Registry::default()));
+        let replies = control
+            .handle_control(crate::ConnectionId::new(1), frame)
+            .unwrap();
+        assert_eq!(replies[0].header.ty, FrameType::HelloAck);
+    }
 
     /// Modules size their replies against the published limit, and the router
     /// refuses any module frame over the egress budget, so the two must be the
@@ -1935,6 +2529,11 @@ mod tests {
             frame: reply,
             enqueued_at: std::time::Instant::now() - Duration::from_millis(1500),
             flushed: None,
+            #[cfg(all(
+                feature = "test-support",
+                any(target_os = "linux", target_os = "macos")
+            ))]
+            fixture_flush_gate: None,
             charge: None,
         })
         .await
@@ -1988,6 +2587,11 @@ mod tests {
             frame: control,
             enqueued_at: std::time::Instant::now(),
             flushed: None,
+            #[cfg(all(
+                feature = "test-support",
+                any(target_os = "linux", target_os = "macos")
+            ))]
+            fixture_flush_gate: None,
             charge: None,
         })
         .await
@@ -2011,6 +2615,11 @@ mod tests {
             frame: data,
             enqueued_at: std::time::Instant::now() - Duration::from_millis(5000),
             flushed: None,
+            #[cfg(all(
+                feature = "test-support",
+                any(target_os = "linux", target_os = "macos")
+            ))]
+            fixture_flush_gate: None,
             charge: None,
         })
         .await
@@ -2771,6 +3380,8 @@ mod tests {
             0,
             1,
             serde_json::to_vec(&ModuleHelloBody {
+                module_capabilities: None,
+                resume_token: None,
                 manifest,
                 protocol_ver: PROTOCOL_VERSION,
                 control_ops: None,
@@ -2884,6 +3495,8 @@ mod tests {
                 0,
                 1,
                 serde_json::to_vec(&ModuleHelloBody {
+                    module_capabilities: None,
+                    resume_token: None,
                     manifest: ModuleManifest::builder(name, "0.1.0")
                         .protocol_ver(PROTOCOL_VERSION)
                         .provides(vec![ProviderRole::ToolProvider {

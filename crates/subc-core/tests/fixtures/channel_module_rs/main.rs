@@ -1,20 +1,29 @@
-use std::{fs, io::Write, path::PathBuf, time::Duration};
+#![forbid(unsafe_code)]
+
+use std::{
+    fs,
+    io::{self, Write},
+    path::PathBuf,
+    time::Duration,
+};
 
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use subc_client_rs::{
     async_trait,
     config::{ConfigDeclareRequest, ConfigReviewReply, ConfigReviewRequest, ConfigState},
-    serve_from_env_with_handle, BindDecision, CallOptions, HandlerOutcome, ModuleHandler,
-    RequestCtx, RouteBindRequest, SubcConsumer,
+    BindDecision, CallOptions, ConnectionEnd, HandlerOutcome, ModuleHandle, ModuleHandler,
+    RequestCtx, RouteBindRequest, ScopeCallError, ScopeSyncReply, ServeOptions, SubcConsumer,
 };
 use subc_protocol::{
     manifest::{Concurrency, ModuleManifest, ProviderRole},
-    BindIdentity, RouteTarget,
+    BindIdentity, ModuleHelloAckBody, RouteTarget,
 };
 
 struct Module {
     root: PathBuf,
     id: String,
+    upgrade_fixture: Option<String>,
 }
 
 impl Module {
@@ -26,12 +35,87 @@ impl Module {
             .unwrap();
         writeln!(file, "{value}").unwrap();
     }
+
+    fn e2e_carried(&self) -> bool {
+        self.upgrade_fixture.as_deref() == Some("e2e-carry")
+    }
+
+    async fn attest_principal(&self, handle: &ModuleHandle, phase: &str) {
+        let consumer = handle
+            .consumer_local(
+                &self.root.join("runtime/subc-connection.json"),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let payload = phase.as_bytes();
+        let reply = consumer
+            .call(
+                RouteTarget::ToolProvider {
+                    module_id: self.id.clone(),
+                },
+                BindIdentity::new(phase, "live-upgrade"),
+                payload.to_vec(),
+                CallOptions {
+                    timeout: Duration::from_secs(5),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply, payload);
+        self.event(json!({"event":phase}));
+    }
 }
 
 #[async_trait]
 impl ModuleHandler for Module {
-    async fn handle(&self, _: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+    async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+        if self.e2e_carried() && body == b"original-generation payload" {
+            print!("upgrade output crosses ");
+            io::stdout().flush().unwrap();
+            eprintln!("upgrade stderr before exec");
+            self.event(json!({"event":"entered_barrier"}));
+            while !self.root.join("release-handler").exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(!ctx.cancellation_token().is_cancelled());
+            println!("the exec");
+            println!("upgrade original-generation handler completed");
+            self.event(json!({"event":"finished_barrier"}));
+        }
         HandlerOutcome::Response(body)
+    }
+
+    async fn on_hello_ack(&self, ack: &ModuleHelloAckBody) {
+        if self.e2e_carried() {
+            let hash = ack
+                .resume_token
+                .as_ref()
+                .map(|token| format!("{:x}", Sha256::digest(token)));
+            self.event(json!({"event":"hello_ack", "pid":std::process::id(), "token_sha256":hash}));
+        }
+    }
+
+    async fn on_reconnected(
+        &self,
+        handle: &ModuleHandle,
+        _: Option<Result<ScopeSyncReply, ScopeCallError>>,
+    ) {
+        if self.e2e_carried() {
+            self.attest_principal(handle, "reconnected").await;
+        }
+    }
+
+    async fn on_connection_end(&self, end: ConnectionEnd) {
+        if self.e2e_carried() || self.upgrade_fixture.as_deref() == Some("slow-stop") {
+            self.event(
+                json!({"event":"connection_end", "reason":end.as_str(), "pid":std::process::id()}),
+            );
+        }
+        if self.upgrade_fixture.as_deref() == Some("slow-stop") {
+            std::future::pending::<()>().await;
+        }
     }
 
     async fn on_bind(&self, request: &RouteBindRequest) -> BindDecision {
@@ -93,16 +177,38 @@ async fn run() {
             sub_supervises: false,
         }])
         .build();
-    let (handle, serving) = serve_from_env_with_handle(
-        manifest,
+    let upgrade_fixture = std::env::var("CHANNEL_MODULE_UPGRADE_FIXTURE").ok();
+    let live_upgrade = matches!(upgrade_fixture.as_deref(), Some("carry" | "e2e-carry"));
+    let (handle, serving) = ServeOptions::default()
+        .with_live_upgrade(live_upgrade)
+        .serve_from_env_with_handle(
+            manifest,
+            Module {
+                root: root.clone(),
+                id: id.clone(),
+                upgrade_fixture: upgrade_fixture.clone(),
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    if upgrade_fixture.is_some() {
+        fs::write(
+            root.join(format!("{id}.registered")),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+    }
+    let task = tokio::spawn(serving);
+    if upgrade_fixture.as_deref() == Some("e2e-carry") {
         Module {
             root: root.clone(),
             id: id.clone(),
-        },
-    )
-    .await
-    .unwrap();
-    let task = tokio::spawn(serving);
+            upgrade_fixture,
+        }
+        .attest_principal(&handle, "connected")
+        .await;
+    }
     if id == "caller" {
         while !root.join("go").exists() {
             tokio::time::sleep(Duration::from_millis(20)).await;

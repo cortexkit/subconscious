@@ -11,6 +11,7 @@ const TARGET_LIMIT: usize = 64;
 /// free-form summary or caller description for a client to supply.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrivilegedOperation<'a> {
+    UpgradeInPlace,
     Restart { module_id: &'a str },
     Swap { module_id: &'a str },
     Reload { module_id: &'a str },
@@ -22,6 +23,7 @@ pub enum PrivilegedOperation<'a> {
 impl PrivilegedOperation<'_> {
     fn description(self) -> String {
         let (verb, target) = match self {
+            Self::UpgradeInPlace => return "Upgrade the daemon in place".into(),
             Self::Restart { module_id } => ("Restart module", module_id),
             Self::Swap { module_id } => ("Swap module", module_id),
             Self::Reload { module_id } => ("Reload module", module_id),

@@ -147,30 +147,39 @@ export class SubcSocket {
   /** Adopt an already validated, uniquely owned registration transport. */
   static adopt(stream: Duplex): SubcSocket { return new SubcSocket(stream); }
 
-  static connectLocal(path: string, deadlineMs: number): Promise<SubcSocket> {
-    return SubcSocket.connectTo({ path }, path, deadlineMs);
+  static connectLocal(path: string, deadlineMs: number, signal?: AbortSignal): Promise<SubcSocket> {
+    return SubcSocket.connectTo({ path }, path, deadlineMs, signal);
   }
 
   private static connectTo(
     options: net.NetConnectOpts,
     endpoint: string,
     deadlineMs: number,
+    signal?: AbortSignal,
   ): Promise<SubcSocket> {
     return new Promise((resolve, reject) => {
+      if (signal?.aborted) { reject(signal.reason); return; }
       const sock = net.connect(options);
       sock.setNoDelay(true);
+      const abort = () => { cleanup(); sock.destroy(); reject(signal?.reason); };
+      const cleanup = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", abort);
+      };
       const timer = setTimeout(() => {
+        cleanup();
         sock.destroy();
         reject(new SocketTimeoutError(`timed out connecting to ${endpoint}`));
       }, Math.max(0, deadlineMs - Date.now()));
       sock.once("connect", () => {
-        clearTimeout(timer);
+        cleanup();
         resolve(new SubcSocket(sock));
       });
       sock.once("error", (err) => {
-        clearTimeout(timer);
+        cleanup();
         reject(err);
       });
+      signal?.addEventListener("abort", abort, { once: true });
     });
   }
 

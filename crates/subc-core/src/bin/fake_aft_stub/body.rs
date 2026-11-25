@@ -853,6 +853,8 @@ where
 
 async fn send_hello(writer: &mpsc::Sender<Frame>, config: &StubConfig) -> Result<(), StubError> {
     let body = serde_json::to_vec(&ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest: manifest(
             &config.module_id,
             config.role.clone(),
@@ -1112,6 +1114,8 @@ async fn handle_frame(
                         emit_response(writer, config, request).await?;
                     }
                 }
+                // This stub does not opt in to reconnecting on an upgrade.
+                ModuleControlCommand::Upgrading { .. } => {}
             }
             Ok(true)
         }

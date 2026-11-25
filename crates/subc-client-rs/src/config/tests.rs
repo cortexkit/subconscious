@@ -119,6 +119,7 @@ impl Rig {
             FrameType::HelloAck,
             hello.header.corr,
             serde_json::to_value(ModuleHelloAckBody {
+                resume_token: None,
                 negotiated_ver: PROTOCOL_VERSION,
                 subc_ops: vec![],
                 subc_capabilities: if gate {
@@ -491,6 +492,8 @@ async fn config_sdk_unopted_handler_keeps_original_hello_bytes_and_sends_no_conf
     let (mut rig, hello) = Rig::new(Unchanged, true).await;
     let decoded: ModuleHelloBody = serde_json::from_slice(&hello.body).unwrap();
     let original = ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest: decoded.manifest,
         protocol_ver: PROTOCOL_VERSION,
         control_ops: Some(vec!["health.check".into()]),

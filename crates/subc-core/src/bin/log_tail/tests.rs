@@ -362,12 +362,13 @@ fn bounded_tail_returns_run_folder_warning_without_printing() {
     // to stderr by the reader.
     let root = ScratchDir::new("log-tail-disk-warning");
     let cwd = root.join(".").canonicalize().unwrap();
+    // This file is compiled inside the `ck` module of the ck-under-test
+    // binary, so libtest names the test with that module prefix but without
+    // the crate name.
+    let (_, module) = module_path!().split_once("::").unwrap();
+    let test = format!("{module}::bounded_tail_returns_run_folder_warning_without_printing");
     let output = Command::new(env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "log_tail::tests::bounded_tail_returns_run_folder_warning_without_printing",
-            "--nocapture",
-        ])
+        .args(["--exact", &test, "--nocapture"])
         .current_dir(&cwd)
         .env(CHILD, "1")
         .env("HOME", &cwd)

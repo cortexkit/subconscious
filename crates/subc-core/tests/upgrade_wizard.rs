@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! The terminal app's update wizard and `ck upgrade --check` refuse with the
 //! same words, because both take them from the same function. This runs the
 //! wizard's check in this process and `ck upgrade --check` as a child, both

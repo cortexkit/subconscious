@@ -56,6 +56,7 @@ pub(super) fn plain_output(command: &Command) -> PlainOutput {
         | Command::HealthDetail { .. }
         | Command::Daemon
         | Command::DaemonTriage
+        | Command::DaemonUpgradeInPlace
         | Command::Doctor(_)
         | Command::MachineShow
         | Command::MachineAdopt { .. }
@@ -249,7 +250,9 @@ pub(super) fn exit_code(error: &CkError) -> i32 {
         CkError::Usage(_) | CkError::FleetLintConfig(_) => 2,
         CkError::Discovery { .. } | CkError::Connection { .. } => 3,
         CkError::WithFooter { error, .. } => exit_code(error),
-        CkError::StackWindowExit { exit_code } => *exit_code,
+        CkError::StackWindowExit { exit_code } | CkError::DaemonUpgradeExit { exit_code } => {
+            *exit_code
+        }
         CkError::FleetLintExit { exit_code }
         | CkError::TriageExit { exit_code }
         | CkError::RenderedExit { exit_code } => i32::from(*exit_code != 0),
@@ -307,6 +310,7 @@ fn error_parts(error: &CkError) -> Option<(&str, String, String)> {
         CkError::FleetLintExit { .. }
         | CkError::TriageExit { .. }
         | CkError::StackWindowExit { .. }
+        | CkError::DaemonUpgradeExit { .. }
         | CkError::RenderedExit { .. } => return None,
     };
     let message = match error {
@@ -533,6 +537,7 @@ mod tests {
                     "provenance alpha",
                     "health alpha",
                     "daemon",
+                    "daemon upgrade --in-place",
                     "daemon triage",
                     "machine show",
                     "machine adopt example --force",

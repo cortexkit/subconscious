@@ -426,8 +426,8 @@ impl ModuleHandle {
     /// Replace this connection's pools with the ones `config` declares.
     /// Called once, before the connection's dispatcher exists.
     pub(crate) fn install_dispatch_pools(&self, config: RequestPools) {
-        *self
-            .shared
+        let shared = self.shared();
+        *shared
             .dispatch_pools
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
@@ -435,12 +435,11 @@ impl ModuleHandle {
     }
 
     pub(crate) fn dispatch_pools(&self) -> Arc<DispatchPools> {
-        Arc::clone(
-            &self
-                .shared
-                .dispatch_pools
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        )
+        let shared = self.shared();
+        let pools = shared
+            .dispatch_pools
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(&pools)
     }
 }

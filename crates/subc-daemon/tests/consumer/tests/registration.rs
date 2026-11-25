@@ -40,6 +40,8 @@ async fn consumer_bootstraps_daemon_and_registers_module() {
             .await
             .unwrap();
         let hello = ModuleHelloBody {
+            module_capabilities: None,
+            resume_token: None,
             manifest: ModuleManifest::builder("standalone-consumer", "1.0.0").build(),
             protocol_ver: PROTOCOL_VERSION,
             control_ops: None,

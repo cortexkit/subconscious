@@ -27,6 +27,7 @@ pub enum ScriptedControlAction {
     Reply(Box<ClientControlResponse>),
     Error(subc_protocol::ErrorBody),
     NeverReply,
+    Close,
 }
 
 impl ScriptedDaemon {
@@ -128,6 +129,7 @@ impl ScriptedDaemon {
                                 stream.flush().await.expect("scripted response flushes");
                             }
                             ScriptedControlAction::NeverReply => pending::<()>().await,
+                            ScriptedControlAction::Close => return,
                             ScriptedControlAction::Error(error) => {
                                 let response = Frame::build_with_version(
                                     request_frame.header.ver,

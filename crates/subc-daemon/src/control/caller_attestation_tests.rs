@@ -117,6 +117,8 @@ fn tool_manifest(module_id: &str, provides: &[&str], denies: &[&str]) -> ModuleM
 
 fn hello_frame(manifest: ModuleManifest) -> Frame {
     let hello = subc_protocol::ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest,
         protocol_ver: PROTOCOL_VERSION,
         control_ops: None,
@@ -820,6 +822,8 @@ async fn nonce_hello(rig: &Rig, module_id: &str, declarations: serde_json::Value
     let mut manifest = tool_manifest(module_id, &[], &[]);
     manifest.provider_declarations = Some(serde_json::from_value(declarations).unwrap());
     let hello = subc_protocol::ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest,
         protocol_ver: PROTOCOL_VERSION,
         control_ops: None,

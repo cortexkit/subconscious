@@ -248,6 +248,8 @@ mod dual_path_tests {
             0,
             1,
             serde_json::to_vec(&subc_protocol::ModuleHelloBody {
+                module_capabilities: None,
+                resume_token: None,
                 manifest: subc_protocol::manifest::ModuleManifest::builder("ckbus", "1.0.0")
                     .build(),
                 protocol_ver: subc_protocol::PROTOCOL_VERSION,

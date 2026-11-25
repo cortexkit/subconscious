@@ -550,6 +550,7 @@ impl RuntimeOwner {
     pub(crate) async fn apply_control_edits(
         self: &Arc<Self>,
         digest: Digest,
+        settings: Option<crate::control::upgrade_in_place::SettingsPermit>,
     ) -> Result<Option<u64>> {
         let witness = self
             .on_blocking({
@@ -590,7 +591,10 @@ impl RuntimeOwner {
             .await?;
         let Some(witness) = witness else {
             return self
-                .on_blocking(move |owner| owner.apply_unstamped_edits(&digest))
+                .on_blocking(move |owner| {
+                    let _settings = settings;
+                    owner.apply_unstamped_edits(&digest)
+                })
                 .await;
         };
         let scopes = witness
@@ -620,7 +624,7 @@ impl RuntimeOwner {
                     .clone()
                     .into_intent(0)
                     .ok_or_else(capture_plan::changed)?;
-                let job = owner.submit_project_write(&revisions, intent)?;
+                let job = owner.submit_project_write(&revisions, intent, settings)?;
                 state.gate.expire_plan(&digest);
                 state.plan_deadlines.remove(&digest);
                 state.retained_plan_files.remove(&digest);
@@ -640,6 +644,7 @@ impl RuntimeOwner {
         &self,
         revisions: &BTreeMap<String, RegistryRevision>,
         intent: crate::config_store::ProjectWriteBackIntent,
+        settings: Option<crate::control::upgrade_in_place::SettingsPermit>,
     ) -> Result<crate::config_gate::root_io::RootIoJob<Result<()>>> {
         let pool = self.capturer.projects.root_io().ok_or_else(|| {
             GateError::new("config_unavailable", "registry root I/O is unavailable")
@@ -650,6 +655,7 @@ impl RuntimeOwner {
         revision.submit_write(
             pool,
             intent,
+            settings,
             #[cfg(test)]
             self.project_write_hook.lock().unwrap().clone(),
         )
@@ -659,6 +665,7 @@ impl RuntimeOwner {
         self: &Arc<Self>,
         generation: u64,
         authority: super::CaptureApply,
+        settings: Option<crate::control::upgrade_in_place::SettingsPermit>,
     ) {
         let Ok(paths) = self
             .on_blocking(move |owner| {
@@ -679,6 +686,7 @@ impl RuntimeOwner {
         let revisions = Arc::new(authority.revisions);
         for path in paths {
             let revisions = revisions.clone();
+            let settings = settings.clone();
             let job = self
                 .on_blocking({
                     let path = path.clone();
@@ -692,7 +700,7 @@ impl RuntimeOwner {
                             .filter(|intent| intent.generation == generation);
                         intent
                             .cloned()
-                            .map(|intent| owner.submit_project_write(&revisions, intent))
+                            .map(|intent| owner.submit_project_write(&revisions, intent, settings))
                             .transpose()
                     }
                 })
@@ -704,6 +712,10 @@ impl RuntimeOwner {
                         .await;
                 }
             }
+        }
+        #[cfg(test)]
+        if let Some(waiter) = self.project_write_waiter_done.lock().unwrap().take() {
+            let _ = waiter.send(());
         }
     }
 

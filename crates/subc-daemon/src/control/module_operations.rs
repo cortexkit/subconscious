@@ -1,4 +1,5 @@
 use super::*;
+use crate::supervise::resume_hello::{self, HelloToken, PreparedAck, ResumeAttempt};
 
 /// Module-originated ops the daemon answers but does not advertise in
 /// `HELLO_ACK`. Empty today; an op is served from here while the feature it
@@ -120,6 +121,111 @@ impl ControlHandler {
         prefix_binding: Option<claims::ClaimBinding>,
         channel_spawn: Option<Arc<crate::supervise::RegistrationSpawn>>,
     ) -> Result<Vec<Frame>, RouterError> {
+        let hello = serde_json::from_slice::<serde_json::Value>(&frame.body);
+        let Some(value) = hello
+            .as_ref()
+            .ok()
+            .filter(|value| resume_hello::has_resume_token(value))
+        else {
+            return self.register_hello(
+                connection_id,
+                sink,
+                frame,
+                wait_for_gate,
+                prefix_binding,
+                channel_spawn,
+                hello,
+                None,
+            );
+        };
+        let refusal = || {
+            control_error_frame(&frame, resume_hello::REFUSED, resume_hello::REFUSAL_MESSAGE)
+                .map(|error| vec![error])
+        };
+        if prefix_binding.is_some() || channel_spawn.is_some() {
+            return refusal();
+        }
+        let Some(resume) = self
+            .resume_peer(connection_id)
+            .and_then(|pid| self.supervisor.pending_adoptions.verify(value, pid).ok())
+        else {
+            return refusal();
+        };
+        let reply = self.register_hello(
+            connection_id,
+            sink,
+            frame.clone(),
+            wait_for_gate,
+            None,
+            None,
+            hello,
+            Some(resume),
+        );
+        match reply {
+            Ok(replies)
+                if replies
+                    .iter()
+                    .all(|reply| reply.header.ty != FrameType::Error) =>
+            {
+                Ok(replies)
+            }
+            _ => refusal(),
+        }
+    }
+
+    fn resume_peer(&self, connection: ConnectionId) -> Option<u32> {
+        if !cfg!(any(target_os = "macos", target_os = "linux"))
+            || !self
+                .local_connections
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains(&connection)
+        {
+            return None;
+        }
+        self.captured_peers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&connection)
+            .and_then(|capture| capture.observed_pid())
+    }
+
+    pub(super) async fn wait_for_resume_preparation(
+        &self,
+        connection: ConnectionId,
+        hello: &serde_json::Value,
+    ) {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if let Some(pid) = self.resume_peer(connection) {
+            self.supervisor
+                .pending_adoptions
+                .wait_preparing(hello, pid)
+                .await;
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let _ = (connection, hello);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_hello(
+        &self,
+        connection_id: ConnectionId,
+        sink: Option<crate::FrameSink>,
+        frame: Frame,
+        wait_for_gate: bool,
+        prefix_binding: Option<claims::ClaimBinding>,
+        channel_spawn: Option<Arc<crate::supervise::RegistrationSpawn>>,
+        hello_value: Result<serde_json::Value, serde_json::Error>,
+        resume: Option<ResumeAttempt>,
+    ) -> Result<Vec<Frame>, RouterError> {
+        let resuming = resume.is_some();
+        let check_spawn = |spawn: &crate::supervise::RegistrationSpawn| {
+            if resuming {
+                spawn.verdict()
+            } else {
+                spawn.check()
+            }
+        };
         let primary_sink = channel_spawn.as_ref().and_then(|_| sink.clone());
         #[cfg(test)]
         if prefix_binding.is_some() {
@@ -177,10 +283,10 @@ impl ControlHandler {
             sink: sink.clone(),
         };
         if let Some(spawn) = &channel_spawn {
-            let value = serde_json::from_slice::<serde_json::Value>(&frame.body).ok();
             if let Err(code) = spawn.admit_hello(
-                value
+                hello_value
                     .as_ref()
+                    .ok()
                     .and_then(|value| value["manifest"]["module_id"].as_str()),
             ) {
                 return Ok(vec![control_error_frame(
@@ -190,6 +296,10 @@ impl ControlHandler {
                 )?]);
             }
         }
+        // A resume uses the adopted launch's checks, without the inherited
+        // channel's retire-on-refusal lifetime.
+        let channel_spawn =
+            channel_spawn.or_else(|| resume.as_ref().map(|resume| resume.spawn.clone()));
         debug!(
             connection_id = connection_id.get(),
             corr = frame.header.corr,
@@ -210,7 +320,7 @@ impl ControlHandler {
                 "connection is already registered as a module",
             )?]);
         }
-        let hello_value = match serde_json::from_slice::<serde_json::Value>(&frame.body) {
+        let hello_value = match hello_value {
             Ok(value) => value,
             Err(err) => {
                 return Ok(vec![control_error_frame(
@@ -242,7 +352,7 @@ impl ControlHandler {
             if recovering
                 && channel_spawn.as_ref().is_none_or(|spawn| {
                     !self.supervisor.has_live_verified_channel_binding(spawn)
-                        || spawn.check().is_err()
+                        || check_spawn(spawn).is_err()
                 })
                 && !(channel_spawn.is_none()
                     && hello_value
@@ -389,7 +499,7 @@ impl ControlHandler {
                 .unwrap_or("<unknown>");
             warn!(module_id, %reason, "dropping confirm_operations from HELLO");
         }
-        let hello = match serde_json::from_value::<ModuleHelloBody>(hello_value) {
+        let hello = match <ModuleHelloBody as serde::Deserialize>::deserialize(&hello_value) {
             Ok(hello) => hello,
             Err(err) => {
                 return Ok(vec![control_error_frame(
@@ -462,6 +572,19 @@ impl ControlHandler {
             hold.wait();
         }
         let module = &hello.manifest.module_id;
+        if !resuming
+            && !self.supervisor.adoption_hello_allowed(
+                module,
+                channel_spawn.as_ref(),
+                hello.launch_nonce.as_deref(),
+            )
+        {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "reserved_module",
+                "module is pending adoption",
+            )?]);
+        }
         let required = self
             .config_runtime
             .as_ref()
@@ -479,7 +602,8 @@ impl ControlHandler {
         // RuntimeOwner::module_is_gated's all-id recovery gate.
         if recovering
             && channel_spawn.as_ref().is_none_or(|spawn| {
-                !self.supervisor.has_live_verified_channel_binding(spawn) || spawn.check().is_err()
+                !self.supervisor.has_live_verified_channel_binding(spawn)
+                    || check_spawn(spawn).is_err()
             })
             && !(channel_spawn.is_none()
                 && hello.launch_nonce.as_deref().is_some_and(|nonce| {
@@ -511,7 +635,7 @@ impl ControlHandler {
             )?]);
         }
         if let Some(spawn) = &channel_spawn {
-            if let Err(code) = spawn.check() {
+            if let Err(code) = check_spawn(spawn) {
                 return Ok(vec![control_error_frame(
                     &frame,
                     code,
@@ -712,9 +836,45 @@ impl ControlHandler {
             );
         let control_ops = effective_module_control_ops(hello.control_ops);
         let prefix_submodule = verification.prefix_owner.is_some();
-        // Built before anything is registered so an encoding failure leaves no
-        // registry or forwarding state behind.
-        let hello_ack = self.build_hello_ack(&frame, negotiated_ver, &hello.manifest.module_id)?;
+        let nonce_spawn = (!prefix_submodule && channel_spawn.is_none())
+            .then(|| {
+                hello
+                    .launch_nonce
+                    .as_deref()
+                    .and_then(|nonce| self.supervisor.nonce_hello_spawn(module, nonce))
+            })
+            .flatten();
+        let token = match channel_spawn
+            .as_ref()
+            .or(nonce_spawn.as_ref())
+            .map(|spawn| {
+                HelloToken::new(
+                    spawn,
+                    connection_id,
+                    resume,
+                    sink.clone(),
+                    self.config_runtime.as_deref(),
+                    &hello_value,
+                    nonce_spawn.as_ref().and(hello.launch_nonce.as_deref()),
+                )
+            })
+            .transpose()
+        {
+            Ok(token) => token.flatten(),
+            Err(code) => {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    code,
+                    "module token registration refused",
+                )?])
+            }
+        };
+        // Encoding precedes insertion; minting waits for duplicate, publication,
+        // and ACK egress checks below.
+        let hello_ack = PreparedAck::prepare(
+            |token| self.build_hello_ack_with_token(&frame, negotiated_ver, module, token),
+            token,
+        )?;
         #[cfg(test)]
         struct PublicationFinished(Arc<std::sync::Barrier>);
         #[cfg(test)]
@@ -786,10 +946,7 @@ impl ControlHandler {
         // none of the spawn's routes.
         let hello_authority = match (&channel_spawn, &prefix_binding) {
             (Some(spawn), _) => Some(spawn.authority.clone()),
-            (None, None) => hello.launch_nonce.as_deref().and_then(|nonce| {
-                self.supervisor
-                    .spawned_consumer_record(&hello.manifest.module_id, nonce)
-            }),
+            (None, None) => nonce_spawn.as_ref().map(|spawn| spawn.authority.clone()),
             (None, Some(_)) => None,
         }
         .map(|record| HelloAuthority {
@@ -951,7 +1108,11 @@ impl ControlHandler {
                 } else {
                     // No sink means no forwarding endpoint, so nothing can be routed
                     // ahead of the ack; it goes out as the reply.
-                    reply.push(hello_ack);
+                    reply.push(
+                        hello_ack
+                            .finish()
+                            .map_err(ForwardingError::HelloRegistrationRefused)?,
+                    );
                 }
                 #[cfg(test)]
                 self.hold_between_ack_and_publication();
@@ -1045,7 +1206,9 @@ impl ControlHandler {
             if let Some(sink) = primary_sink {
                 spawn.bind_primary_sink(sink);
             }
-            spawn.hello_accepted();
+            if !resuming {
+                spawn.hello_accepted();
+            }
         } else if !prefix_submodule {
             self.supervisor
                 .retire_unused_registration_channel(&registration.manifest.module_id, false);
@@ -1094,7 +1257,7 @@ impl ControlHandler {
         manifest: ModuleManifest,
         negotiated_ver: u8,
         control_ops: Vec<String>,
-        hello_ack: Frame,
+        hello_ack: PreparedAck<'_>,
         hello_authority: Option<&HelloAuthority>,
         differing_declarations: &mut ProviderDeclarations,
         #[cfg(windows)] launch_nonce: Option<&str>,
@@ -1143,7 +1306,7 @@ impl ControlHandler {
         manifest: ModuleManifest,
         negotiated_ver: u8,
         control_ops: Vec<String>,
-        hello_ack: Frame,
+        hello_ack: PreparedAck<'_>,
         hello_authority: Option<&HelloAuthority>,
         differing_declarations: &mut ProviderDeclarations,
         #[cfg(windows)] launch_nonce: Option<&str>,
@@ -1212,7 +1375,11 @@ impl ControlHandler {
                         hello_ack,
                     )?;
                 } else {
-                    reply.push(hello_ack);
+                    reply.push(
+                        hello_ack
+                            .finish()
+                            .map_err(ForwardingError::HelloRegistrationRefused)?,
+                    );
                 }
                 #[cfg(test)]
                 self.hold_between_ack_and_publication();
@@ -1304,13 +1471,25 @@ impl ControlHandler {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn build_hello_ack(
         &self,
         frame: &Frame,
         negotiated_ver: u8,
         module_id: &str,
     ) -> Result<Frame, RouterError> {
+        self.build_hello_ack_with_token(frame, negotiated_ver, module_id, None)
+    }
+
+    fn build_hello_ack_with_token(
+        &self,
+        frame: &Frame,
+        negotiated_ver: u8,
+        module_id: &str,
+        resume_token: Option<&str>,
+    ) -> Result<Frame, RouterError> {
         let ack = ModuleHelloAckBody {
+            resume_token: resume_token.map(str::to_owned),
             negotiated_ver,
             subc_ops: module_subc_ops(),
             subc_capabilities: self.capabilities_with_settings(),

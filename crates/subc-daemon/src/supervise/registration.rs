@@ -59,6 +59,8 @@ pub(crate) struct RegistrationSpawn {
     /// This launch's authority record, created with it. It dies in the same
     /// retirement step that ends the channel and voids the claims.
     pub(crate) authority: Arc<crate::spawn_authority::SpawnAuthorityRecord>,
+    pub(crate) resume_token_record: std::sync::OnceLock<crate::child_roster::ResumeTokenRecord>,
+    pub(crate) resume_witnesses: Mutex<Option<resume_hello::ResumeWitnesses>>,
     pub(super) role: SpawnRole,
     hello_seen: AtomicBool,
     registered: AtomicBool,
@@ -80,6 +82,10 @@ pub(crate) struct RegistrationSpawn {
 }
 
 impl RegistrationSpawn {
+    #[cfg(all(test, unix))]
+    pub(super) fn set_wire_deadline_for_test(&self, deadline: Instant) {
+        let _ = self.deadline.set(deadline);
+    }
     #[cfg(all(test, unix))]
     pub(crate) fn set_content_probe_for_test(&self, probe: content_binding::ContentProbe) {
         self.binding.as_ref().unwrap().set_content_probe(probe);
@@ -111,7 +117,6 @@ impl RegistrationSpawn {
         binding: Option<ProgramBindingPublication>,
         requires_binding: bool,
     ) -> Arc<Self> {
-        let (launch, _) = tokio::sync::watch::channel(LaunchState::Pending);
         let binding_key = binding
             .as_ref()
             .map(|binding| binding.channel_key())
@@ -120,6 +125,59 @@ impl RegistrationSpawn {
         // that registers and opens routes before cutover attests the same
         // number it keeps after promotion.
         let (incarnation, generation) = handle.spawn_events.allocate_generation(module);
+        Self::create(
+            handle,
+            module,
+            role,
+            binding,
+            requires_binding,
+            binding_key,
+            incarnation,
+            generation,
+        )
+    }
+
+    /// Rebuild an unregistered launch from its validated binding key and
+    /// generation. Only `supervise::live_upgrade` imports generations; new
+    /// spawns allocate their own.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn adopted_from_handover(
+        handle: &SupervisorHandle,
+        module: &str,
+        role: SpawnRole,
+        binding: Option<ProgramBindingPublication>,
+        binding_key: program_binding::ProgramBindingKey,
+        generation: u64,
+    ) -> Arc<Self> {
+        handle
+            .spawn_events
+            .reserve_adopted_generation(module, generation);
+        let incarnation = binding_key.incarnation.clone();
+        let required = binding.is_some();
+        Self::create(
+            handle,
+            module,
+            role,
+            binding,
+            required,
+            binding_key,
+            incarnation,
+            generation,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create(
+        handle: &SupervisorHandle,
+        module: &str,
+        role: SpawnRole,
+        binding: Option<ProgramBindingPublication>,
+        requires_binding: bool,
+        binding_key: program_binding::ProgramBindingKey,
+        incarnation: String,
+        generation: u64,
+    ) -> Arc<Self> {
+        let (launch, _) = tokio::sync::watch::channel(LaunchState::Pending);
         let spawn = Arc::new(Self {
             incarnation: binding_key.incarnation.clone(),
             binding_key,
@@ -130,6 +188,8 @@ impl RegistrationSpawn {
                 generation,
                 module,
             ),
+            resume_token_record: Default::default(),
+            resume_witnesses: Default::default(),
             role,
             hello_seen: AtomicBool::new(false),
             registered: AtomicBool::new(false),
@@ -364,7 +424,7 @@ impl RegistrationSpawn {
         Ok(())
     }
 
-    fn verdict(&self) -> Result<(), &'static str> {
+    pub(crate) fn verdict(&self) -> Result<(), &'static str> {
         self.check_state()?;
         if self
             .binding
@@ -499,6 +559,9 @@ impl SupervisorHandle {
         module_id: &str,
         presented: &str,
     ) -> NonceAttestation {
+        if let Some(record) = self.resumed_nonce_consumer(module_id, presented) {
+            return NonceAttestation::Spawn(record);
+        }
         let recorded = self
             .nonce_launches
             .lock()
@@ -522,18 +585,22 @@ impl SupervisorHandle {
         }
     }
 
-    /// The authority record of the launch whose nonce `presented` is, when it
-    /// still attests `module_id` exactly as `spawned_consumer_authorized`
-    /// decides. `None` for an unknown, superseded or gated nonce.
-    pub(crate) fn spawned_consumer_record(
+    /// Resolve only a nonce minted for the current ordinary launch or swap
+    /// candidate. A carried nonce hash is consumer identity, not HELLO authority.
+    pub(crate) fn nonce_hello_spawn(
         &self,
         module_id: &str,
-        presented: &str,
-    ) -> Option<Arc<crate::spawn_authority::SpawnAuthorityRecord>> {
-        match self.attest_spawned_consumer(module_id, presented) {
-            NonceAttestation::Spawn(record) => Some(record),
-            NonceAttestation::Unrecorded | NonceAttestation::Refused => None,
-        }
+        nonce: &str,
+    ) -> Option<Arc<RegistrationSpawn>> {
+        let spawn = self
+            .nonce_launches
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(nonce)
+            .filter(|(module, _)| module == module_id)
+            .and_then(|(_, spawn)| spawn.upgrade())?;
+        self.spawned_consumer_authorized(module_id, nonce)
+            .then_some(spawn)
     }
 
     pub(crate) fn retire_unused_registration_channel(&self, module: &str, candidate: bool) {

@@ -69,8 +69,13 @@ async fn serve_peer(
     // A second module served by the same process leaves that source field unset,
     // even when its HELLO uses the owner's environment-delivered nonce.
     manifest.provenance = Some(build_provenance(None, None, None).unwrap());
-    let (handle, serving) = serve_with_handle(path, manifest, Hook).await.unwrap();
-    assert!(!handle.shared.registration.active.load(Ordering::Acquire));
+    let (handle, serving) = ServeOptions::default()
+        .with_live_upgrade(true)
+        .serve_with_handle(path, manifest, Hook)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!handle.shared().registration.active.load(Ordering::Acquire));
     (handle, tokio::spawn(serving))
 }
 
@@ -135,6 +140,8 @@ async fn custom_loop(scenario: &str, path: &Path) {
             FrameType::Hello,
             HELLO_CORR,
             ModuleHelloBody {
+                module_capabilities: None,
+                resume_token: None,
                 manifest: ModuleManifest::builder("channel-worker", "1.0.0")
                     .registration_channel(true)
                     .build(),
@@ -540,6 +547,10 @@ async fn register_peer(
     let hello: ModuleHelloBody = serde_json::from_slice(&frame.body).unwrap();
     assert_eq!(hello.manifest.module_id, module_id);
     assert_eq!(hello.launch_nonce.as_deref(), nonce);
+    assert!(
+        hello.module_capabilities.is_none(),
+        "an extra registration declared live upgrade"
+    );
     assert_eq!(
         hello.manifest.provenance.unwrap().launch_nonce_source,
         None,
@@ -550,6 +561,7 @@ async fn register_peer(
         FrameType::HelloAck,
         HELLO_CORR,
         ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: vec![
                 "catalog.update".into(),
@@ -746,6 +758,7 @@ async fn run(scenario: &'static str, test: &str) {
         FrameType::HelloAck,
         HELLO_CORR,
         ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: vec!["claim.mint".into()],
             subc_capabilities: vec![],
@@ -1056,3 +1069,362 @@ contract_test!(
     channel_hello_reports_legacy_nonce_source_without_sending_nonce,
     "provenance"
 );
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn live_upgrade_registration_channel_reconnects_then_exits_on_refusal() {
+    use subc_transport::connection_file::LocalEndpoint;
+    use tokio::net::UnixListener;
+
+    struct Reconnecting;
+    #[async_trait]
+    impl ModuleHandler for Reconnecting {
+        async fn handle(&self, _: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+            HandlerOutcome::Response(body)
+        }
+        async fn on_reconnected(
+            &self,
+            _: &ModuleHandle,
+            _: Option<Result<ScopeSyncReply, ScopeCallError>>,
+        ) {
+            // This uses the process-wide claim minter installed at initial
+            // adoption, not one created for the replacement connection.
+            let owner = OWNER
+                .get()
+                .expect("registration owner should remain installed");
+            let claim = mint_claim(owner.as_ref(), ClaimPurpose::Helper)
+                .await
+                .unwrap();
+            assert_eq!(claim, Claim::new("resumed-claim"));
+            println!("RESUMED");
+            let _ = mint_claim(owner.as_ref(), ClaimPurpose::SelfConnection).await;
+        }
+        async fn on_connection_end(&self, end: ConnectionEnd) {
+            println!("HOOK_{}", end.as_str());
+        }
+    }
+
+    if let Some(path) =
+        env::var_os("SUBC_SDK_CHANNEL_TEST_PATH").filter(|_| env::var_os(ROLE).is_some())
+    {
+        ServeOptions::default()
+            .with_live_upgrade(true)
+            .serve_with(
+                Path::new(&path),
+                ModuleManifest::builder("channel-worker", "1")
+                    .registration_channel(true)
+                    .build(),
+                Reconnecting,
+            )
+            .await
+            .unwrap();
+        panic!("registration serve returned instead of exiting");
+    }
+    let temp = cortexkit_test_support::ScratchDir::new("sdk-upgrade");
+    let path = temp.path().join("connection.json");
+    let socket = temp.path().join("resume.sock");
+    let endpoint = LocalEndpoint::Unix {
+        path: socket.clone(),
+    };
+    let mut info = ConnectionInfo {
+        schema: SCHEMA_VERSION,
+        wire_version: None,
+        endpoints: vec![Endpoint {
+            host: "127.0.0.1".into(),
+            port: 1,
+        }],
+        key: vec![0x32; 32],
+        daemon_id: [0x49; 16],
+        pid: std::process::id(),
+        daemon_ver: "1".into(),
+    };
+    connection_file::write_atomic_with_local_endpoint(&path, &info, Some(&endpoint)).unwrap();
+    let mut command = command(
+        "registration::registration_contract::live_upgrade_registration_channel_reconnects_then_exits_on_refusal",
+        "module",
+        &path,
+    );
+    command
+        .env(os::DAEMON_PID_ENV, std::process::id().to_string())
+        .env("XDG_DATA_HOME", temp.path().join("data"))
+        .env("XDG_RUNTIME_DIR", temp.path().join("runtime"))
+        .env("XDG_CONFIG_HOME", temp.path().join("config"));
+    let (mut registration, mut child) = inherited_channel(&mut command);
+    auth(&mut registration, &info).await;
+    let hello = receive(&mut registration).await;
+    assert_upgrade_hello(&hello, None);
+    send_upgrade_ack(&mut registration, "initial-test-token").await;
+    send_upgrade_notice(&mut registration).await;
+    drop(registration);
+
+    // Make at least one attempt find no socket. Then let the old connection
+    // file's HMAC fail before publishing the replacement image's key.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(child.try_wait().unwrap().is_none());
+    let listener = UnixListener::bind(&socket).unwrap();
+    let (mut stale, _) = timeout(BUDGET, listener.accept()).await.unwrap().unwrap();
+    info.key = vec![0x78; 32];
+    // This accepted socket already read the old key. Publish the new one
+    // before rejecting its proof, so even an immediate retry reads it.
+    connection_file::write_atomic_with_local_endpoint(&path, &info, Some(&endpoint)).unwrap();
+    assert!(authenticate_server(
+        &mut stale,
+        &info.key,
+        &info.daemon_id,
+        &info.daemon_ver,
+        BUDGET
+    )
+    .await
+    .is_err());
+    drop(stale);
+
+    let (mut old_image, _) = timeout(BUDGET, listener.accept()).await.unwrap().unwrap();
+    auth(&mut old_image, &info).await;
+    assert_upgrade_hello(&receive(&mut old_image).await, Some("initial-test-token"));
+    send(
+        &mut old_image,
+        FrameType::Error,
+        HELLO_CORR,
+        ErrorBody::new(
+            error_codes::LOCAL_ENDPOINT_CLIENTS_ONLY,
+            "not serving resume yet",
+        ),
+    )
+    .await;
+    drop(old_image);
+
+    let (mut resumed, _) = timeout(BUDGET, listener.accept()).await.unwrap().unwrap();
+    auth(&mut resumed, &info).await;
+    assert_upgrade_hello(&receive(&mut resumed).await, Some("initial-test-token"));
+    send_upgrade_ack(&mut resumed, "rotated-test-token").await;
+    let mint_frame = receive(&mut resumed).await;
+    assert_eq!(mint_frame.header.ty, FrameType::Request);
+    let request: ClaimMintRequest = serde_json::from_slice(&mint_frame.body).unwrap();
+    assert_eq!(request.purpose, ClaimPurpose::Helper);
+    send(
+        &mut resumed,
+        FrameType::Response,
+        mint_frame.header.corr,
+        ClaimMintReply::new(Claim::new("resumed-claim"), 0),
+    )
+    .await;
+    let after_hook = receive(&mut resumed).await;
+    let request: ClaimMintRequest = serde_json::from_slice(&after_hook.body).unwrap();
+    assert_eq!(request.purpose, ClaimPurpose::SelfConnection);
+    send(
+        &mut resumed,
+        FrameType::Response,
+        after_hook.header.corr,
+        ClaimMintReply::new(Claim::new("resumed-self-claim"), 0),
+    )
+    .await;
+    let ping = Frame::build(FrameType::Ping, control_flags(), 0, 0, 13, vec![]).unwrap();
+    write_frame(&mut resumed, &ping).await.unwrap();
+    assert_eq!(receive(&mut resumed).await.header.ty, FrameType::Pong);
+    send_upgrade_notice(&mut resumed).await;
+    drop(resumed);
+
+    let (mut refused, _) = timeout(BUDGET, listener.accept()).await.unwrap().unwrap();
+    auth(&mut refused, &info).await;
+    assert_upgrade_hello(&receive(&mut refused).await, Some("rotated-test-token"));
+    send(
+        &mut refused,
+        FrameType::Error,
+        HELLO_CORR,
+        ErrorBody::new(error_codes::RESUME_REFUSED, "no pending adoption"),
+    )
+    .await;
+    let output = assert_child_exit(&mut child, 1).await;
+    assert_eq!(output.matches("RESUMED").count(), 1, "{output}");
+    assert_eq!(output.matches("HOOK_").count(), 1, "{output}");
+    assert!(output.contains("HOOK_eof"), "{output}");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn assert_upgrade_hello(frame: &Frame, token: Option<&str>) {
+    assert_eq!(frame.header.ty, FrameType::Hello);
+    let hello: ModuleHelloBody = serde_json::from_slice(&frame.body).unwrap();
+    assert_eq!(hello.manifest.module_id, "channel-worker");
+    assert_eq!(
+        hello.module_capabilities.as_deref(),
+        Some(&["live-upgrade/v1".to_owned()][..])
+    );
+    assert!(hello.launch_nonce.is_none());
+    assert_eq!(hello.resume_token.as_deref(), token);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn send_upgrade_ack<S: AsyncWrite + Unpin>(stream: &mut S, token: &str) {
+    send(
+        stream,
+        FrameType::HelloAck,
+        HELLO_CORR,
+        ModuleHelloAckBody {
+            negotiated_ver: PROTOCOL_VERSION,
+            subc_ops: vec!["claim.mint".into(), "catalog.update".into()],
+            subc_capabilities: vec![],
+            machine_id: None,
+            storage: None,
+            resume_token: Some(token.into()),
+        },
+    )
+    .await;
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn send_upgrade_notice<S: AsyncWrite + Unpin>(stream: &mut S) {
+    let reconnect_by_ms =
+        (SystemTime::now().duration_since(UNIX_EPOCH).unwrap() + BUDGET).as_millis() as u64;
+    send(
+        stream,
+        FrameType::Push,
+        0,
+        json!({"op":"module.upgrading","reconnect_by_ms":reconnect_by_ms}),
+    )
+    .await;
+    let goodbye = Frame::build(FrameType::Goodbye, control_flags(), 0, 0, 0, Vec::new()).unwrap();
+    write_frame(stream, &goodbye).await.unwrap();
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn live_upgrade_nonce_primary_claim_binds_new_consumer() {
+    use subc_transport::connection_file::LocalEndpoint;
+    use tokio::net::UnixListener;
+
+    struct NonceOwner(PathBuf);
+    #[async_trait]
+    impl ModuleHandler for NonceOwner {
+        async fn handle(&self, _: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+            HandlerOutcome::Response(body)
+        }
+        async fn on_reconnected(
+            &self,
+            handle: &ModuleHandle,
+            _: Option<Result<ScopeSyncReply, ScopeCallError>>,
+        ) {
+            let consumer = handle.consumer_local(&self.0, options()).await.unwrap();
+            query(&consumer).await;
+            println!("CLAIM_BOUND");
+            let _ = handle.catalog_update(vec![]).await;
+        }
+    }
+
+    if env::var_os(ROLE).is_some() {
+        let path = PathBuf::from(env::var_os("SUBC_SDK_CHANNEL_TEST_PATH").unwrap());
+        assert!(!bound());
+        ServeOptions::default()
+            .with_live_upgrade(true)
+            .serve_with(
+                &path,
+                ModuleManifest::builder("channel-worker", "1").build(),
+                NonceOwner(path.clone()),
+            )
+            .await
+            .unwrap();
+        return;
+    }
+    let temp = cortexkit_test_support::ScratchDir::new("nonce-upgrade");
+    let path = temp.path().join("connection.json");
+    let socket = temp.path().join("local.sock");
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local = UnixListener::bind(&socket).unwrap();
+    let info = ConnectionInfo {
+        schema: SCHEMA_VERSION,
+        wire_version: None,
+        endpoints: vec![Endpoint {
+            host: "127.0.0.1".into(),
+            port: tcp.local_addr().unwrap().port(),
+        }],
+        key: vec![0x67; 32],
+        daemon_id: [0x40; 16],
+        pid: std::process::id(),
+        daemon_ver: "1".into(),
+    };
+    connection_file::write_atomic_with_local_endpoint(
+        &path,
+        &info,
+        Some(&LocalEndpoint::Unix { path: socket }),
+    )
+    .unwrap();
+    let mut child = command(
+        "registration::registration_contract::live_upgrade_nonce_primary_claim_binds_new_consumer",
+        "module",
+        &path,
+    )
+    .env_remove(os::REGISTRATION_FD_ENV)
+    .env_remove(os::REGISTRATION_PIPE_ENV)
+    .env_remove(os::DAEMON_PID_ENV)
+    .env("SUBC_LAUNCH_NONCE", "legacy-test-nonce")
+    .env("XDG_DATA_HOME", temp.path().join("data"))
+    .env("XDG_RUNTIME_DIR", temp.path().join("runtime"))
+    .env("XDG_CONFIG_HOME", temp.path().join("config"))
+    .spawn()
+    .unwrap();
+
+    let (mut old, _) = timeout(BUDGET, tcp.accept()).await.unwrap().unwrap();
+    auth(&mut old, &info).await;
+    let frame = receive(&mut old).await;
+    assert_eq!(frame.header.ty, FrameType::Hello);
+    let hello: ModuleHelloBody = serde_json::from_slice(&frame.body).unwrap();
+    assert_eq!(
+        hello.module_capabilities,
+        Some(vec!["live-upgrade/v1".into()])
+    );
+    assert_eq!(hello.launch_nonce.as_deref(), Some("legacy-test-nonce"));
+    assert!(hello.resume_token.is_none());
+    send_upgrade_ack(&mut old, "nonce-test-resume-token").await;
+    send_upgrade_notice(&mut old).await;
+    drop(old);
+
+    let (mut primary, _) = timeout(BUDGET, local.accept()).await.unwrap().unwrap();
+    auth(&mut primary, &info).await;
+    assert_upgrade_hello(
+        &receive(&mut primary).await,
+        Some("nonce-test-resume-token"),
+    );
+    send_upgrade_ack(&mut primary, "nonce-test-rotated-token").await;
+    let (mut consumer, _) = timeout(BUDGET, local.accept()).await.unwrap().unwrap();
+    auth(&mut consumer, &info).await;
+    let mint = receive(&mut primary).await;
+    assert_eq!(mint.header.ty, FrameType::Request);
+    let request: ClaimMintRequest = serde_json::from_slice(&mint.body).unwrap();
+    assert_eq!(request.purpose, ClaimPurpose::SelfConnection);
+    let claim = Claim::new("claim-from-resumed-nonce-primary");
+    send(
+        &mut primary,
+        FrameType::Response,
+        mint.header.corr,
+        ClaimMintReply::new(claim.clone(), 0),
+    )
+    .await;
+    let presentation = receive(&mut consumer).await;
+    assert_eq!(presentation.header.ty, FrameType::Request);
+    let presented: ClaimPresentRequest = serde_json::from_slice(&presentation.body).unwrap();
+    assert_eq!(presented.claim, claim);
+    send(
+        &mut consumer,
+        FrameType::Response,
+        presentation.header.corr,
+        ClaimPresentReply::new(),
+    )
+    .await;
+    let query = receive(&mut consumer).await;
+    let query_body: Value = serde_json::from_slice(&query.body).unwrap();
+    assert_eq!(query_body["op"], "activity.query");
+    assert!(query_body.get("consumer_identity").is_none());
+    send(&mut consumer, FrameType::Response, query.header.corr,
+        json!({"op":"activity.query","entries":[],"cursor":null,"head":{"daemon_incarnation":"new","seq":0}})).await;
+    let marker = receive(&mut primary).await;
+    let marker_body: Value = serde_json::from_slice(&marker.body).unwrap();
+    assert_eq!(marker_body["op"], "catalog.update");
+    send(
+        &mut primary,
+        FrameType::Response,
+        marker.header.corr,
+        json!({"op":"catalog.update"}),
+    )
+    .await;
+    drop(primary);
+    assert!(assert_child(&mut child).await.contains("CLAIM_BOUND"));
+}

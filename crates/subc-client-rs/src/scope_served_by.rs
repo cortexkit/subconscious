@@ -16,8 +16,11 @@ impl ModuleHandle {
         scope_epoch: u64,
         module_id: String,
     ) -> Result<ScopeServedByReply, ScopeCallError> {
-        if !self
-            .shared
+        let shared = self.shared();
+        shared
+            .check_upgrade_fence()
+            .map_err(ScopeCallError::from_control_error)?;
+        if !shared
             .daemon_capabilities
             .iter()
             .any(|cap| cap == SCOPE_SERVED_BY_CAPABILITY)
@@ -33,7 +36,7 @@ impl ModuleHandle {
         ))
         .map_err(|err| ScopeCallError::Protocol(err.to_string()))?;
         let (corr, writer, rx) = {
-            let mut inner = self.shared.lock_inner();
+            let mut inner = shared.lock_inner();
             if inner.closed {
                 return Err(ScopeCallError::ConnectionClosed);
             }
@@ -48,11 +51,11 @@ impl ModuleHandle {
             (corr, writer, rx)
         };
         let _guard = ServedByWaiter {
-            handle: self.clone(),
+            shared: shared.clone(),
             corr,
         };
         let frame = Frame::build_with_version(
-            self.shared.negotiated_ver,
+            shared.negotiated_ver,
             FrameType::Request,
             crate::control_flags(),
             0,
@@ -62,10 +65,10 @@ impl ModuleHandle {
         )
         .map_err(|err| ScopeCallError::Protocol(err.to_string()))?;
         let reply = tokio::time::timeout(CATALOG_UPDATE_TIMEOUT, async {
-            writer
-                .send(frame)
+            shared
+                .queue_request(&writer, frame)
                 .await
-                .map_err(|_| ScopeCallError::ConnectionClosed)?;
+                .map_err(ScopeCallError::from_control_error)?;
             rx.await.map_err(|_| ScopeCallError::ConnectionClosed)
         })
         .await
@@ -89,13 +92,12 @@ impl ModuleHandle {
 }
 
 struct ServedByWaiter {
-    handle: ModuleHandle,
+    shared: std::sync::Arc<crate::ModuleHandleShared>,
     corr: u64,
 }
 impl Drop for ServedByWaiter {
     fn drop(&mut self) {
-        self.handle
-            .shared
+        self.shared
             .lock_inner()
             .pending_scope_served_by
             .remove(&self.corr);

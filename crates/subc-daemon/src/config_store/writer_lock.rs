@@ -46,6 +46,22 @@ pub struct StoreWriterLock {
 }
 
 impl StoreWriterLock {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn from_inherited(file: File) -> Self {
+        Self { file }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn inherited_layout(
+        root: &Path,
+    ) -> Result<(super::StoreRoot, PathBuf), WriterLockError> {
+        writer_layout(root, verify_directory)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn file(&self) -> &File {
+        &self.file
+    }
     /// Canonicalize the owned parent and lock a sibling without creating the
     /// store root. This preserves the store's read-only startup contract.
     pub fn acquire(root: &Path) -> Result<(super::StoreRoot, Self), WriterLockError> {
@@ -53,29 +69,7 @@ impl StoreWriterLock {
             root: root.into(),
             source,
         };
-        let leaf = match root.components().next_back() {
-            Some(Component::Normal(leaf)) if root.is_absolute() => leaf,
-            _ => {
-                return Err(invalid(io::Error::other(
-                    "store root must have an absolute ordinary name",
-                )))
-            }
-        };
-        let parent = root
-            .parent()
-            .ok_or_else(|| invalid(io::Error::other("store root has no parent")))?;
-        ensure_parent(parent).map_err(invalid)?;
-        let parent = fs::canonicalize(parent).map_err(invalid)?;
-        verify_directory(&parent).map_err(invalid)?;
-        let canonical_root = parent.join(leaf);
-        match fs::symlink_metadata(&canonical_root) {
-            Ok(_) => verify_directory(&canonical_root).map_err(invalid)?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(invalid(error)),
-        }
-        let mut name = leaf.to_os_string();
-        name.push(".lock");
-        let path = parent.join(name);
+        let (canonical_root, path) = writer_layout(root, ensure_parent)?;
         let file = match create_lock(&path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -89,14 +83,49 @@ impl StoreWriterLock {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
                 return Err(WriterLockError::Busy {
-                    root: canonical_root,
+                    root: canonical_root.path().to_path_buf(),
                 })
             }
             Err(TryLockError::Error(error)) => return Err(invalid(error)),
         }
-        let root = super::StoreRoot::from_service_definition(canonical_root).map_err(invalid)?;
-        Ok((root, Self { file }))
+        Ok((canonical_root, Self { file }))
     }
+}
+
+fn writer_layout(
+    root: &Path,
+    check_parent: impl FnOnce(&Path) -> io::Result<()>,
+) -> Result<(super::StoreRoot, PathBuf), WriterLockError> {
+    let invalid = |source| WriterLockError::Invalid {
+        root: root.into(),
+        source,
+    };
+    let leaf = match root.components().next_back() {
+        Some(Component::Normal(leaf)) if root.is_absolute() => leaf,
+        _ => {
+            return Err(invalid(io::Error::other(
+                "store root must have an absolute ordinary name",
+            )))
+        }
+    };
+    let parent = root
+        .parent()
+        .ok_or_else(|| invalid(io::Error::other("store root has no parent")))?;
+    check_parent(parent).map_err(invalid)?;
+    let parent = fs::canonicalize(parent).map_err(invalid)?;
+    verify_directory(&parent).map_err(invalid)?;
+    let canonical_root = parent.join(leaf);
+    match fs::symlink_metadata(&canonical_root) {
+        Ok(_) => verify_directory(&canonical_root).map_err(invalid)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(invalid(error)),
+    }
+    let mut name = leaf.to_os_string();
+    name.push(".lock");
+    Ok((
+        super::StoreRoot::from_service_definition(canonical_root).map_err(invalid)?,
+        parent.join(name),
+    ))
 }
 
 impl Drop for StoreWriterLock {

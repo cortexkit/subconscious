@@ -149,6 +149,9 @@ export {
   type RichUiDescriptor,
   machineIdFromHelloAck,
   type ModuleHelloAckBody,
+  type ModuleHelloBody,
+  type ReconnectOutcome,
+  type ResumeScopeSync,
   type ObservabilityKind,
   type ObservabilitySurfaceInput,
   type PipelineAppliesToInput,
@@ -168,6 +171,14 @@ export {
   type TrustTier,
   type VaultGrantInput,
 } from "./provider.js";
+export {
+  LIVE_UPGRADE_CAPABILITY,
+  RESUME_REFUSED,
+  type ModuleUpgrading,
+  type ResumeRefusedBody,
+  type UpgradeFailedBody,
+  type DaemonUpgradeReloadingBody,
+} from "./live-upgrade.js";
 export type { CallerAttestation, CallerClaim, CallerOrigin, ProviderDeclarations, RouteOpenTarget } from "./attestation.js";
 export { ACCEPTS_CLOSE_REASONS, CAPABILITY_PROBE_TIMEOUT } from "./client.js";
 export { prepareHelperClaim } from "./registration-channel.js";

@@ -19,6 +19,8 @@ pub(super) struct LiveProgramBinding {
     registration: std::sync::Weak<RegistrationSpawn>,
     launch: Mutex<ProgramLaunch>,
     process: subc_os::Process,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    adopted: Option<std::sync::Weak<live_upgrade::VerifiedChild>>,
     start: u64,
     owner: Arc<crate::config_gate::runtime::RuntimeOwner>,
     base: subc_config::Digest,
@@ -56,6 +58,8 @@ impl LiveProgramBinding {
                 .unwrap_or_default(),
             launch: Mutex::new(launch),
             process: subc_os::Process::open(child.pid).ok()??,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            adopted: child.child.verified_adoptee().map(Arc::downgrade),
             start: child.process_start_time?,
             owner,
             base,
@@ -268,6 +272,13 @@ impl LiveProgramBinding {
         Ok(())
     }
     fn kill_container(&self) {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(verified) = &self.adopted {
+            if let Some(verified) = verified.upgrade() {
+                let _ = verified.signal(rustix::process::Signal::KILL);
+            }
+            return;
+        }
         if self
             .process
             .observe()
@@ -293,5 +304,10 @@ impl LiveProgramBinding {
             }
         }
         let _ = self.process.signal(subc_os::Signal::Kill);
+    }
+
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    pub(super) fn kill_for_test(&self) {
+        self.kill_container();
     }
 }

@@ -731,6 +731,16 @@ pub(crate) struct LineFramer {
 }
 
 impl LineFramer {
+    #[cfg(unix)]
+    pub(crate) fn from_tail(pending: Vec<u8>) -> Self {
+        Self { pending }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn tail(&self) -> &[u8] {
+        &self.pending
+    }
+
     pub(crate) fn push(&mut self, chunk: &[u8], mut emit: impl FnMut(&[u8], bool)) {
         let pending = &mut self.pending;
         let mut scanned_upto = pending.len();

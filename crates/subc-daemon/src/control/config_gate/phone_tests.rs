@@ -1414,6 +1414,8 @@ async fn origins_hello_files_one_phone_card_and_publishes_approved_entries() {
         0,
         10,
         serde_json::to_vec(&subc_protocol::ModuleHelloBody {
+            module_capabilities: None,
+            resume_token: None,
             manifest,
             protocol_ver: subc_protocol::PROTOCOL_VERSION,
             control_ops: None,

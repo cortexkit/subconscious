@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
 //! Recovery after a daemon crash must verify individual members of its recorded

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Pins of what piped `ck` prints today, byte for byte, for `health`,
 //! `module list`, `module restart`, `module rescan --dry-run`, `activity`
 //! and `daemon`, plain and `--json`: stdout, stderr and the exit code.
@@ -355,9 +357,31 @@ const RULES: &[Rule] = &[
     Rule {
         name: "build_ids",
         text: no_text,
-        json_keys: &["build_git_sha", "build_lock_digest", "digest"],
+        json_keys: &[
+            "build_git_sha",
+            "build_lock_digest",
+            "digest",
+            "executable_sha256",
+        ],
         json_kind: string,
         pins: &[],
+    },
+    // The nested identity uses null when the executable has no embedded commit.
+    Rule {
+        name: "build_ids",
+        text: no_text,
+        json_keys: &["build_git_sha"],
+        json_kind: Value::is_null,
+        pins: &["daemon.json"],
+    },
+    // Keep the identity fields in the pin without tying them to a build location
+    // or to the current version of the executable.
+    Rule {
+        name: "daemon_image",
+        text: no_text,
+        json_keys: &["core_version", "executable"],
+        json_kind: string,
+        pins: &["daemon.json"],
     },
     // The daemon's channel-zero call counts for its last minute: how many
     // requests `ck` and the kit made, by whom and when, differ on every run.

@@ -149,6 +149,7 @@ async fn accept_and_ack_with_ops(
     assert_eq!(hello.header.ty, FrameType::Hello);
     let manifest = serde_json::from_slice(&hello.body).unwrap();
     let ack = ModuleHelloAckBody {
+        resume_token: None,
         negotiated_ver: PROTOCOL_VERSION,
         subc_ops,
         subc_capabilities: Vec::new(),

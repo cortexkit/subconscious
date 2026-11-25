@@ -476,6 +476,8 @@ async fn malformed_registered_body() {
     let h = Harness::start("approve").await;
     let mut module = h.raw().await;
     let hello = subc_protocol::ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest: inline_module_manifest("operator-raw", &["operator"]),
         protocol_ver: subc_protocol::PROTOCOL_VERSION,
         control_ops: None,

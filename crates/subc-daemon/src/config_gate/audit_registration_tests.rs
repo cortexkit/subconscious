@@ -199,6 +199,8 @@ async fn legacy() -> Legacy {
     let router = Arc::new(crate::Router::with_control_handler(handler.clone()));
     let mut primary = Net::new(router.clone()).await;
     let hello = subc_protocol::ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest: subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build(),
         protocol_ver: subc_protocol::PROTOCOL_VERSION,
         control_ops: None,

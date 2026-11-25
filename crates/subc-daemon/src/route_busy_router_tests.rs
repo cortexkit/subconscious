@@ -35,6 +35,89 @@ fn busy_router_request(rig: &BusyRouterRig, corr: u64, watch: bool) -> Frame {
     frame
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn cancel_after_fence_cannot_claim_an_already_forwarded_request_was_not_sent() {
+    let mut rig = busy_router_rig(true);
+    busy_router_receive(&mut rig.client_rx).await;
+    rig.router.route_for_connection(&rig.client, busy_router_request(&rig, 111, false)).await.unwrap();
+    assert_eq!(busy_router_receive(&mut rig.module_rx).await.header.corr, 111);
+    rig.router.forwarding().set_upgrade_admission(crate::control::upgrade_in_place::Admission::Fenced);
+    let cancel = route_frame(FrameType::Cancel, rig.pending.client_channel, rig.pending.client_epoch, 111);
+    rig.router.route_for_connection(&rig.client, cancel).await.expect("the fence must silently drop CANCEL");
+    assert!(rig.client_rx.try_recv().is_err());
+    assert!(rig.module_rx.try_recv().is_err());
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn legacy_drain_reuses_one_subscription_and_wakes_without_returned_credit() {
+    use crate::control::upgrade_in_place::Admission;
+    let mut rig = busy_router_rig(false);
+    let forwarding = rig.router.forwarding();
+    busy_router_receive(&mut rig.client_rx).await;
+    for corr in 1..=32 {
+        rig.router.route_for_connection(&rig.client, busy_router_request(&rig, corr, false)).await.unwrap();
+        assert_eq!(busy_router_receive(&mut rig.module_rx).await.header.corr, corr);
+    }
+    let before = forwarding.upgrade_admission.subscriptions_for_test();
+    for corr in [33, 34, 35] {
+        rig.router.route_for_connection(&rig.client, busy_router_request(&rig, corr, false)).await.unwrap();
+    }
+    rig.router.route_for_connection(&rig.module, route_frame(FrameType::Response, rig.pending.module_channel, rig.pending.module_epoch, 1)).await.unwrap();
+    assert_eq!(busy_router_receive(&mut rig.client_rx).await.header.corr, 1);
+    assert_eq!(busy_router_receive(&mut rig.module_rx).await.header.corr, 33);
+    assert!(rig.module_rx.try_recv().is_err());
+    forwarding.set_upgrade_admission(Admission::Fenced);
+    // The module sends no more replies that could return a request credit.
+    for corr in [34, 35] {
+        let reply = busy_router_receive(&mut rig.client_rx).await;
+        assert_eq!(reply.header.corr, corr);
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&reply.body).unwrap()["code"], "module_reloading");
+    }
+    assert!(rig.module_rx.try_recv().is_err());
+    assert_eq!(forwarding.upgrade_admission.subscriptions_for_test() - before, 1, "one phase receiver lasts for the whole drain");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn upgrade_fence_refuses_credit_waiter_and_reopens_on_unwind() {
+    use crate::control::upgrade_in_place::Admission;
+
+    let mut rig = busy_router_rig(false);
+    busy_router_receive(&mut rig.client_rx).await;
+    for corr in 1..=32 {
+        rig.router.route_for_connection(&rig.client, busy_router_request(&rig, corr, false)).await.unwrap();
+        assert_eq!(busy_router_receive(&mut rig.module_rx).await.header.corr, corr);
+    }
+    rig.router.route_for_connection(&rig.client, busy_router_request(&rig, 33, false)).await.unwrap();
+    assert!(rig.module_rx.try_recv().is_err());
+
+    let forwarding = rig.router.forwarding();
+    forwarding.set_upgrade_admission(Admission::Fenced);
+    rig.router.route_for_connection(&rig.module, route_frame(FrameType::Response, rig.pending.module_channel, rig.pending.module_epoch, 1)).await.unwrap();
+    let mut saw_refusal = false;
+    for _ in 0..2 {
+        let reply = busy_router_receive(&mut rig.client_rx).await;
+        if reply.header.ty == FrameType::Error {
+            assert_eq!(reply.header.corr, 33);
+            let body: ErrorBody = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(body.code, "module_reloading");
+            assert_eq!(body.detail.unwrap()["reason"], "daemon_upgrade");
+            saw_refusal = true;
+        } else {
+            assert_eq!(reply.header.corr, 1);
+        }
+    }
+    assert!(saw_refusal);
+    assert!(rig.module_rx.try_recv().is_err());
+
+    forwarding.set_upgrade_admission(Admission::Open);
+    rig.router.route_for_connection(&rig.client, busy_router_request(&rig, 34, false)).await.unwrap();
+    assert_eq!(busy_router_receive(&mut rig.module_rx).await.header.corr, 34);
+    assert!(rig.module_rx.try_recv().is_err());
+}
+
 async fn busy_router_receive(rx: &mut mpsc::Receiver<OutboundFrame>) -> Frame {
     tokio::time::timeout(Duration::from_secs(1), rx.recv())
         .await

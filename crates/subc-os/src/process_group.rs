@@ -111,8 +111,111 @@ pub fn pids() -> io::Result<Vec<u32>> {
     ))
 }
 
+/// Return every process in `group`, or an error if a complete scan could not
+/// be read. Callers use this as containment evidence, so a partial list is
+/// never a successful empty result.
+pub fn members(group: u32) -> io::Result<Vec<u32>> {
+    if group <= 1 || i32::try_from(group).is_err() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid process-group ID",
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    let result = members_linux(group);
+    #[cfg(target_os = "macos")]
+    let result = list_pids_macos(PROC_PGRP_ONLY, group);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let result = Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "process-group membership listing is unavailable",
+    ));
+    let mut members = result?;
+    members.sort_unstable();
+    Ok(members)
+}
+
 fn gone(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+}
+
+#[cfg(target_os = "linux")]
+fn members_linux(group: u32) -> io::Result<Vec<u32>> {
+    let mut pids = Vec::new();
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        if let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        {
+            pids.push(pid);
+        }
+    }
+    members_from_procfs(group, pids, |path| std::fs::read_to_string(path))
+}
+
+/// Read each listed process's `stat` and keep the members of `group`.
+///
+/// A process that exits after `/proc` was listed loses its entry before we
+/// read it. It belongs to no group any more, so it is skipped: a reaped
+/// process cannot be a member, and a zombie keeps its entry until it is
+/// reaped. Any other read error fails the whole scan, because callers use an
+/// empty result as proof that the group is empty.
+#[cfg(target_os = "linux")]
+fn members_from_procfs(
+    group: u32,
+    pids: impl IntoIterator<Item = u32>,
+    read: impl Fn(&std::path::Path) -> io::Result<String>,
+) -> io::Result<Vec<u32>> {
+    let mut stats = Vec::new();
+    for pid in pids {
+        let path = std::path::PathBuf::from(format!("/proc/{pid}/stat"));
+        match read(&path) {
+            Ok(stat) => stats.push((pid, stat)),
+            Err(error) if gone(&error) => {}
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "could not read {} for a complete process-group scan: {error}",
+                        path.display()
+                    ),
+                ))
+            }
+        }
+    }
+    members_from_stats(group, stats)
+}
+
+#[cfg(target_os = "linux")]
+fn members_from_stats(
+    group: u32,
+    stats: impl IntoIterator<Item = (u32, String)>,
+) -> io::Result<Vec<u32>> {
+    let mut members = Vec::new();
+    for (pid, stat) in stats {
+        let (_, fields) = stat.rsplit_once(") ").ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid /proc/{pid}/stat in process-group scan"),
+            )
+        })?;
+        let fields: Vec<_> = fields.split_whitespace().collect();
+        let member_group = fields
+            .get(2)
+            .and_then(|field| field.parse::<u32>().ok())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid /proc/{pid}/stat process-group field"),
+                )
+            })?;
+        if member_group == group {
+            members.push(pid);
+        }
+    }
+    Ok(members)
 }
 
 #[cfg(target_os = "linux")]
@@ -227,15 +330,22 @@ fn inspect_macos(pid: u32) -> io::Result<Option<Identity>> {
     }))
 }
 
+// libproc.h's selectors are not exported by the libc crate.
 #[cfg(target_os = "macos")]
-fn pids_macos() -> io::Result<Vec<u32>> {
-    // libproc.h's all-processes selector is not exported by the libc crate.
-    const PROC_ALL_PIDS: u32 = 1;
+const PROC_ALL_PIDS: u32 = 1;
+#[cfg(target_os = "macos")]
+const PROC_PGRP_ONLY: u32 = 2;
+
+#[cfg(target_os = "macos")]
+fn list_pids_macos(selector: u32, value: u32) -> io::Result<Vec<u32>> {
     // SAFETY: a null, zero-sized output buffer asks libproc for its size only.
     #[allow(unsafe_code)]
-    let needed = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
-    if needed <= 0 {
+    let needed = unsafe { libc::proc_listpids(selector, value, std::ptr::null_mut(), 0) };
+    if needed < 0 {
         return Err(io::Error::last_os_error());
+    }
+    if needed == 0 {
+        return Ok(Vec::new());
     }
     let mut count = needed as usize / std::mem::size_of::<libc::pid_t>() + 64;
     for _ in 0..4 {
@@ -244,16 +354,19 @@ fn pids_macos() -> io::Result<Vec<u32>> {
             .map_err(|_| io::Error::other("process list exceeds libproc's buffer limit"))?;
         // SAFETY: the allocation is aligned for pid_t and has `size` bytes.
         #[allow(unsafe_code)]
-        let read = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, pids.as_mut_ptr().cast(), size) };
-        if read <= 0 {
+        let read = unsafe { libc::proc_listpids(selector, value, pids.as_mut_ptr().cast(), size) };
+        if read < 0 {
             return Err(io::Error::last_os_error());
+        }
+        if read == 0 {
+            return Ok(Vec::new());
         }
         if read < size {
             pids.truncate(read as usize / std::mem::size_of::<libc::pid_t>());
             return Ok(pids
                 .into_iter()
                 .filter_map(|pid| u32::try_from(pid).ok())
-                .filter(|pid| *pid > 1)
+                .filter(|pid| *pid > 0)
                 .collect());
         }
         count *= 2;
@@ -262,6 +375,14 @@ fn pids_macos() -> io::Result<Vec<u32>> {
         io::ErrorKind::WouldBlock,
         "process list kept growing during inspection",
     ))
+}
+
+#[cfg(target_os = "macos")]
+fn pids_macos() -> io::Result<Vec<u32>> {
+    Ok(list_pids_macos(PROC_ALL_PIDS, 0)?
+        .into_iter()
+        .filter(|pid| *pid > 1)
+        .collect())
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
@@ -359,6 +480,47 @@ mod tests {
         assert_matches_ps(child.id());
         assert!(child.wait().unwrap().success());
         assert_eq!(inspect(child.id()).unwrap(), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn group_scan_rejects_a_malformed_entry_instead_of_returning_a_partial_list() {
+        let stats = [
+            (42, "42 (leader) S 1 42".to_owned()),
+            (99, "not a procfs stat".to_owned()),
+        ];
+        assert_eq!(
+            members_from_stats(42, stats).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn group_scan_skips_a_process_that_exits_mid_scan_and_fails_on_other_errors() {
+        let read = |path: &std::path::Path| match path.to_str().unwrap() {
+            "/proc/42/stat" => Ok("42 (leader) S 1 42".to_owned()),
+            "/proc/43/stat" => Err(io::Error::from(io::ErrorKind::NotFound)),
+            _ => Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+        };
+        assert_eq!(members_from_procfs(42, [42, 43], read).unwrap(), [42]);
+        assert_eq!(
+            members_from_procfs(42, [42, 43, 44], read)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn process_group_members_include_the_owned_group_leader() {
+        let mut child = Command::new("sleep")
+            .arg("2")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        assert_eq!(members(child.id()).unwrap(), [child.id()]);
+        assert!(child.wait().unwrap().success());
     }
 
     #[cfg(target_os = "linux")]

@@ -118,6 +118,10 @@ pub struct RuntimeOwner {
     settings_attempts_changed: tokio::sync::Notify,
     settings_request_order: std::sync::atomic::AtomicU64,
     phone_withdrawal_changed: tokio::sync::Notify,
+    #[cfg(test)]
+    project_write_waiter_done: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    #[cfg(test)]
+    trusted_review_connection_for_test: std::sync::Mutex<Option<crate::ConnectionId>>,
     startup_overrides: Vec<String>,
     module_gates: Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
     delivery_changed: std::sync::Arc<tokio::sync::Notify>,
@@ -150,6 +154,26 @@ pub struct RuntimeOwner {
     prepare_capture_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(all(test, unix))]
     approval_claim_pause: Mutex<Option<ApprovalClaimPause>>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl RuntimeOwner {
+    pub(crate) fn upgrade_blocker(&self) -> Option<&'static str> {
+        let Ok(state) = self.inner.try_lock() else {
+            return Some("settings");
+        };
+        if state
+            .store
+            .loaded_admission_state()
+            .1
+            .daemon
+            .restart
+            .is_some()
+        {
+            return Some("shutdown");
+        }
+        (!state.gate.attempts.is_empty()).then_some("settings")
+    }
 }
 
 /// An in-memory cutover transaction. It is borrowed only for synchronous
@@ -1164,6 +1188,10 @@ impl RuntimeOwner {
             settings_attempts_changed: tokio::sync::Notify::new(),
             settings_request_order: std::sync::atomic::AtomicU64::new(1),
             phone_withdrawal_changed: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            project_write_waiter_done: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            trusted_review_connection_for_test: std::sync::Mutex::new(None),
             startup_overrides: status_inputs::present_overrides(|name| {
                 std::env::var_os(name).is_some()
             }),
@@ -2893,6 +2921,11 @@ impl RuntimeOwner {
     pub(crate) fn set_os_prompt_policy_for_tests(&self) {
         self.os_prompt_policy
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_trusted_review_connection_for_test(&self, id: crate::ConnectionId) -> bool {
+        *self.trusted_review_connection_for_test.lock().unwrap() == Some(id)
     }
 
     #[cfg(any(test, feature = "test-support"))]

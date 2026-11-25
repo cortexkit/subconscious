@@ -10,8 +10,8 @@ use std::{
 use subc_core::doctor::{self, rescue, DoctorOptions, DoctorReport, ReportFile, Severity};
 use subc_daemon::daemon_config;
 
+use super::super::CkError;
 use super::{write_full_report, FullReport, LocalLogs, Options};
-use crate::CkError;
 
 #[derive(Debug, PartialEq, Eq)]
 enum Mode {

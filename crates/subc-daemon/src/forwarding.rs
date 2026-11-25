@@ -190,6 +190,7 @@ pub(crate) struct RouteAuthority {
 
 #[path = "forwarding_capability_fence.rs"]
 mod capability_fence;
+mod registration;
 use capability_fence::refuse_acked_bind_locked;
 pub(crate) use capability_fence::CapabilityFence;
 
@@ -708,13 +709,14 @@ struct ModuleConnection {
     verified_prefix_owner: Option<String>,
 }
 
-pub(crate) struct ModuleHelloAck {
-    pub(crate) frame: Frame,
+pub(crate) struct ModuleHelloAck<'a> {
+    pub(crate) frame: crate::supervise::resume_hello::PreparedAck<'a>,
     pub(crate) verified_prefix_owner: Option<String>,
 }
 
 #[derive(Debug, Default)]
 struct ForwardingInner {
+    upgrade_fenced: bool,
     operator_confirms: Arc<crate::operator_confirm::OperatorConfirms>,
     daemon_draining: bool,
     /// Whether forwarding reached quiescence during daemon shutdown, for each
@@ -810,11 +812,16 @@ impl fmt::Display for CloseReason {
     }
 }
 
-pub(crate) type ConnectionCloseReceiver = oneshot::Receiver<CloseReason>;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use upgrade::CutoverCount;
+use upgrade::{close_channel, ConnectionCloseSender};
+pub(crate) use upgrade::{ConnectionCloseReceiver, CutoverTask, CutoverTasks};
 
 /// Dynamic forwarding state shared by the control plane and data-plane router.
 #[derive(Debug, Default)]
 pub struct ForwardingTable {
+    pub(crate) upgrade_refusals: crate::control::upgrade_in_place::RefusalFlushes,
+    pub(crate) upgrade_admission: crate::control::upgrade_in_place::AdmissionGate,
     #[cfg(all(test, target_os = "linux"))]
     route_commit_pause: Mutex<Option<RouteCommitPause>>,
     #[cfg(all(test, target_os = "linux"))]
@@ -827,7 +834,7 @@ pub struct ForwardingTable {
     frame_drop_warnings: Mutex<HashMap<ConnectionId, ChannelDropWarnings>>,
     #[cfg(feature = "test-support")]
     route_closing_hold: Mutex<Option<oneshot::Receiver<()>>>,
-    close_registry: Mutex<HashMap<ConnectionId, oneshot::Sender<CloseReason>>>,
+    close_registry: Mutex<HashMap<ConnectionId, ConnectionCloseSender>>,
     counters: DaemonCounters,
     /// Per-target-module bind-relay breaker state. It lives here, beside the
     /// module connections it describes, because this is where a module
@@ -1233,7 +1240,7 @@ impl ForwardingTable {
         &self,
         connection_id: ConnectionId,
     ) -> ConnectionCloseReceiver {
-        let (sender, receiver) = oneshot::channel();
+        let (sender, receiver) = close_channel();
         let replaced = self
             .lock_close_registry()
             .insert(connection_id, sender)
@@ -1269,12 +1276,10 @@ impl ForwardingTable {
     /// whatever is left.
     #[cfg(unix)]
     pub(crate) fn close_all_connections(&self, reason: &CloseReason) -> usize {
-        let senders: Vec<_> = self.lock_close_registry().drain().collect();
-        let count = senders.len();
-        for (_, sender) in senders {
-            let _ = sender.send(reason.clone());
-        }
-        count
+        self.lock_close_registry()
+            .values_mut()
+            .map(|entry| usize::from(entry.send(reason.clone())))
+            .sum()
     }
 
     /// Every registered module connection, whichever slot it occupies (active,
@@ -1313,14 +1318,16 @@ impl ForwardingTable {
         connection_id: ConnectionId,
         reason: CloseReason,
     ) -> bool {
-        let sender = self.lock_close_registry().remove(&connection_id);
-        if let Some(sender) = sender {
+        let requested = self
+            .lock_close_registry()
+            .get_mut(&connection_id)
+            .is_some_and(|sender| sender.send(reason.clone()));
+        if requested {
             debug!(
                 connection_id = connection_id.get(),
                 close_reason = %reason,
                 "requesting connection close"
             );
-            let _ = sender.send(reason);
             true
         } else {
             debug!(
@@ -1369,7 +1376,7 @@ impl ForwardingTable {
         negotiated_ver: u8,
         concurrency: Concurrency,
         sink: FrameSink,
-        hello_ack: ModuleHelloAck,
+        hello_ack: ModuleHelloAck<'_>,
     ) -> Result<ModuleEndpointId, ForwardingError> {
         self.register_module_connection_inner(
             connection_id,
@@ -1388,19 +1395,18 @@ impl ForwardingTable {
         negotiated_ver: u8,
         concurrency: Concurrency,
         sink: FrameSink,
-        hello_ack: Option<ModuleHelloAck>,
+        hello_ack: Option<ModuleHelloAck<'_>>,
     ) -> Result<ModuleEndpointId, ForwardingError> {
-        let mut inner = self.write_inner()?;
-        if inner.daemon_draining || inner.closing_connections.contains(&connection_id) {
-            return Err(ForwardingError::ConnectionClosing { connection_id });
-        }
-        check_module_connection_role_locked(&inner, connection_id)?;
-        // Every refusal check has passed and nothing has been mutated yet, so
-        // a failed enqueue leaves the table exactly as it was.
         let verified_prefix_owner = hello_ack
             .as_ref()
             .and_then(|hello| hello.verified_prefix_owner.clone());
-        enqueue_hello_ack_locked(&sink, connection_id, hello_ack.map(|hello| hello.frame))?;
+        let mut inner = self.register_ack(
+            &sink,
+            connection_id,
+            hello_ack.map(|hello| hello.frame),
+            |_| Ok(()),
+        )?;
+        self.fence_new_module_sink(&sink);
 
         inner.next_generation = inner.next_generation.checked_add(1).unwrap_or(1);
         let endpoint = ModuleEndpointId {
@@ -1495,7 +1501,7 @@ impl ForwardingTable {
         negotiated_ver: u8,
         concurrency: Concurrency,
         sink: FrameSink,
-        hello_ack: Frame,
+        hello_ack: crate::supervise::resume_hello::PreparedAck<'_>,
     ) -> Result<ModuleEndpointId, ForwardingError> {
         self.register_candidate_module_connection_inner(
             connection_id,
@@ -1514,19 +1520,17 @@ impl ForwardingTable {
         negotiated_ver: u8,
         concurrency: Concurrency,
         sink: FrameSink,
-        hello_ack: Option<Frame>,
+        hello_ack: Option<crate::supervise::resume_hello::PreparedAck<'_>>,
     ) -> Result<ModuleEndpointId, ForwardingError> {
-        let mut inner = self.write_inner()?;
-        if inner.daemon_draining || inner.closing_connections.contains(&connection_id) {
-            return Err(ForwardingError::ConnectionClosing { connection_id });
-        }
-        check_module_connection_role_locked(&inner, connection_id)?;
-        if inner.candidates_by_id.contains_key(&module_id) {
-            return Err(ForwardingError::CandidateSlotOccupied { module_id });
-        }
-        // As in `register_module_connection_inner`: after every refusal check,
-        // before any mutation.
-        enqueue_hello_ack_locked(&sink, connection_id, hello_ack)?;
+        let mut inner = self.register_ack(&sink, connection_id, hello_ack, |inner| {
+            if inner.candidates_by_id.contains_key(&module_id) {
+                return Err(ForwardingError::CandidateSlotOccupied {
+                    module_id: module_id.clone(),
+                });
+            }
+            Ok(())
+        })?;
+        self.fence_new_module_sink(&sink);
 
         inner.next_generation = inner.next_generation.checked_add(1).unwrap_or(1);
         let endpoint = ModuleEndpointId {
@@ -2614,6 +2618,9 @@ impl ForwardingTable {
         subscription: bool,
     ) -> Result<RequestAdmission, ForwardingError> {
         let inner = self.read_inner()?;
+        if inner.upgrade_fenced {
+            return Ok(RequestAdmission::DaemonUpgrade);
+        }
         let key = ClientRouteKey {
             connection_id: route.client_connection_id,
             channel: route.client_channel,
@@ -3818,9 +3825,7 @@ impl ForwardingTable {
             .map_err(|_| ForwardingError::Poisoned)
     }
 
-    fn lock_close_registry(
-        &self,
-    ) -> MutexGuard<'_, HashMap<ConnectionId, oneshot::Sender<CloseReason>>> {
+    fn lock_close_registry(&self) -> MutexGuard<'_, HashMap<ConnectionId, ConnectionCloseSender>> {
         self.close_registry
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -4380,22 +4385,6 @@ fn abandoned_route_target(
     })
 }
 
-/// Queue a registering module's HELLO_ACK on its sink. Called with the
-/// forwarding write lock held, before the endpoint is inserted, which is what
-/// puts the ack ahead of any `route.bind` or control RPC routed to the module.
-/// `try_send` never waits, so holding the lock across it is safe.
-fn enqueue_hello_ack_locked(
-    sink: &FrameSink,
-    connection_id: ConnectionId,
-    hello_ack: Option<Frame>,
-) -> Result<(), ForwardingError> {
-    let Some(hello_ack) = hello_ack else {
-        return Ok(());
-    };
-    sink.try_send(hello_ack)
-        .map_err(|_| ForwardingError::ModuleEgressUnavailable { connection_id })
-}
-
 fn remove_module_connection_locked(
     inner: &mut ForwardingInner,
     endpoint: ModuleEndpointId,
@@ -4608,6 +4597,8 @@ struct ChannelFlowState {
 
 #[path = "forwarding_refused_streams.rs"]
 mod refused_streams;
+#[path = "forwarding_upgrade.rs"]
+mod upgrade;
 #[path = "forwarding_waiting_requests.rs"]
 mod waiting_requests;
 pub(crate) use waiting_requests::LegacyArrival;
@@ -4830,6 +4821,7 @@ pub(crate) struct ChannelFlowClosed;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RequestAdmission {
+    DaemonUpgrade,
     Admitted,
     Busy(subc_protocol::RouteBusyDetail),
     ModuleReloading,
@@ -4895,6 +4887,7 @@ pub enum ForwardingError {
     ModuleEgressUnavailable {
         connection_id: ConnectionId,
     },
+    HelloRegistrationRefused(&'static str),
     /// A capability-fenced bind's admitted target registration was replaced
     /// before the bind was reserved.
     TargetRegistrationChanged(String),
@@ -4950,6 +4943,7 @@ impl fmt::Display for ForwardingError {
                 f,
                 "module_id '{module_id}' already has a swap candidate registered"
             ),
+            Self::HelloRegistrationRefused(code) => write!(f, "module registration refused: {code}"),
             Self::ModuleEgressUnavailable { connection_id } => write!(
                 f,
                 "module connection {} egress is unavailable; HELLO_ACK could not be queued",
@@ -5039,7 +5033,7 @@ mod tests {
                 Concurrency::ModuleManaged,
                 FrameSink::new(closed_tx),
                 ModuleHelloAck {
-                    frame: test_hello_ack(1),
+                    frame: test_hello_ack(1).into(),
                     verified_prefix_owner: None
                 },
             ),
@@ -5060,7 +5054,7 @@ mod tests {
                 Concurrency::ModuleManaged,
                 full_sink.clone(),
                 ModuleHelloAck {
-                    frame: test_hello_ack(2),
+                    frame: test_hello_ack(2).into(),
                     verified_prefix_owner: None
                 },
             ),
@@ -5075,7 +5069,7 @@ mod tests {
                 2,
                 Concurrency::ModuleManaged,
                 full_sink,
-                test_hello_ack(3),
+                test_hello_ack(3).into(),
             ),
             Err(ForwardingError::ModuleEgressUnavailable {
                 connection_id: full
@@ -5119,7 +5113,7 @@ mod tests {
                 Concurrency::ModuleManaged,
                 FrameSink::new(active_tx),
                 ModuleHelloAck {
-                    frame: test_hello_ack(11),
+                    frame: test_hello_ack(11).into(),
                     verified_prefix_owner: None,
                 },
             )
@@ -5132,7 +5126,7 @@ mod tests {
                 2,
                 Concurrency::ModuleManaged,
                 FrameSink::new(candidate_tx),
-                test_hello_ack(12),
+                test_hello_ack(12).into(),
             )
             .unwrap();
 

@@ -21,7 +21,7 @@ pub(super) const BUILTIN_DOMAINS: &[&str] = &[
 ];
 
 const TOP_HELP_BASE: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  setup     plan and apply the managed CortexKit installation\n  upgrade   plan managed component upgrades\n  config    status, plan, apply, stamp, unstamp, history, rollback, place-program\n  module    supervised modules: list, status, resources, profile, stderr, terminals, restart, stop, start, rescan, release\n  catalog   what is registered on the wire (not the supervised roster)
-  routes    live consumers for one module or the whole daemon\n  provenance daemon-attested and module-declared build/process facts\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, connection info, offline triage, and CI lint
+  routes    live consumers for one module or the whole daemon\n  provenance daemon-attested and module-declared build/process facts\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    inspect, triage, lint, or upgrade the daemon in place
   doctor    diagnose the stack, even when the daemon is down
   machine   this machine's id: show it, or adopt a restored one
   activity  consequential agent and module events

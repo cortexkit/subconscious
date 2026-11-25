@@ -36,8 +36,17 @@ use crate::{
 };
 use std::sync::Arc;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::control::upgrade_in_place::UpgradeStartup;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod resume;
 #[cfg(windows)]
 mod windows_connection_copy;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use resume::{ResumeBootstrap, HANDOVER_VERSIONS};
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub const HANDOVER_VERSIONS: &[u32] = &[];
 
 pub const DEFAULT_SUBC_PORT: u16 = 8757;
 pub const SUBC_PORT_ENV: &str = "SUBC_PORT";
@@ -192,9 +201,57 @@ pub struct BootstrapConfig {
     /// directory. The shipped binary supplies `<run dir>/live-children.json`.
     live_children_path: Option<PathBuf>,
     privacy_trampoline: Option<PathBuf>,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    upgrade_binary: Option<UpgradeBinary>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone)]
+struct UpgradeBinary {
+    image: Result<Arc<fs::File>, Arc<io::Error>>,
+    core_version: String,
+    build_git_sha: Option<String>,
+    #[cfg(feature = "test-support")]
+    test_hooks: bool,
 }
 
 impl BootstrapConfig {
+    /// Register the service executable's build identity and an image handle
+    /// opened at process entry, before an upgrade can replace its pathname.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn with_upgrade_binary(
+        mut self,
+        image: io::Result<fs::File>,
+        core_version: &str,
+        build_git_sha: Option<&str>,
+    ) -> Self {
+        self.upgrade_binary = Some(UpgradeBinary {
+            image: image.map(Arc::new).map_err(Arc::new),
+            core_version: core_version.into(),
+            build_git_sha: build_git_sha.map(str::to_owned),
+            #[cfg(feature = "test-support")]
+            test_hooks: false,
+        });
+        self
+    }
+
+    #[doc(hidden)]
+    #[cfg(all(
+        feature = "test-support",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    pub fn with_upgrade_test_hooks(mut self) -> Self {
+        if let Some(binary) = &mut self.upgrade_binary {
+            binary.test_hooks = true;
+        }
+        self
+    }
+    /// The service-configured store root, if any.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn config_store_root(&self) -> Option<&Path> {
+        self.config_store_root.as_deref()
+    }
+
     pub fn with_config_store_root(mut self, root: PathBuf) -> Result<Self, BootstrapError> {
         crate::config_store::StoreRoot::from_service_definition(root.clone())
             .map_err(|e| BootstrapError::ConfigStore(e.to_string()))?;
@@ -260,6 +317,8 @@ impl BootstrapConfig {
             local_listener: LocalListenerConfig { socket_dir: None },
             live_children_path: None,
             privacy_trampoline: None,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            upgrade_binary: None,
         }
     }
 
@@ -673,10 +732,9 @@ pub struct BoundDaemon {
     /// keeps no live-children record, and so has no run directory to own.
     run_dir_lock: Option<crate::run_dir_lock::RunDirLock>,
     /// The singleton start lock, kept when binding deferred publishing the
-    /// connection file. It stays held until the daemon has verified it is serving
-    /// and written the connection file, so a second daemon starting meanwhile
-    /// cannot claim the singleton too. `None` when the connection
-    /// file was already written at bind time.
+    /// connection file. The service keeps this advisory lock until it exits or
+    /// passes the same locked descriptor to a replacement image. `None` when
+    /// the low-level binding API already wrote the connection file.
     publication_lock: Option<StartLock>,
 }
 
@@ -799,17 +857,51 @@ mod config_test_seam {
 /// (they measured 236 daemon lines with the subscriber installed, 0 with the
 /// call commented out) -- otherwise the fix is itself unverified.
 pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapError> {
-    let Some(start_lock) = singleton_start_lock(&config).await? else {
-        info!("subc daemon already running");
-        return Ok(());
+    run_with_config_inner(
+        config,
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        None,
+    )
+    .await
+}
+
+async fn run_with_config_inner(
+    config: BootstrapConfig,
+    #[cfg(any(target_os = "linux", target_os = "macos"))] inherited: Option<resume::Inherited>,
+) -> Result<(), BootstrapError> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let (inherited_start, inherited_run, inherited_store, resume) = inherited
+        .map(|boot| {
+            (
+                Some(boot.start),
+                Some(boot.run),
+                boot.store,
+                Some(boot.resume),
+            )
+        })
+        .unwrap_or_default();
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let (inherited_start, inherited_run, inherited_store) = (None, None, None);
+    let start_lock = match inherited_start {
+        Some(lock) => lock,
+        None => {
+            let Some(lock) = singleton_start_lock(&config).await? else {
+                info!("subc daemon already running");
+                return Ok(());
+            };
+            lock
+        }
     };
     let (config, opened_store, start_lock) = tokio::task::spawn_blocking(move || {
         let mut opened_store = config
             .config_store_root
             .as_ref()
             .map(|root| {
-                let (root, lock) = crate::config_store::StoreWriterLock::acquire(root)
-                    .map_err(|e| BootstrapError::ConfigStore(e.to_string()))?;
+                let (root, lock) = match inherited_store {
+                    Some(inherited) => inherited,
+                    None => crate::config_store::StoreWriterLock::acquire(root)
+                        .map_err(|e| BootstrapError::ConfigStore(e.to_string()))?,
+                };
                 #[cfg(all(test, feature = "test-support"))]
                 let store = if let Some(factory) = config.test_store_factory {
                     crate::config_store::testing::TestSupport::new(root.path().to_path_buf(), None)
@@ -862,9 +954,49 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
     let terminal_journal_path = config.terminal_journal_path.clone();
     let live_children_path = config.live_children_path.clone();
     let privacy_trampoline = config.privacy_trampoline.clone();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let upgrade =
+        if let (Some(binary), Some(executable)) = (&config.upgrade_binary, &privacy_trampoline) {
+            match &binary.image {
+                Ok(image) => {
+                    #[cfg(feature = "test-support")]
+                    let hooks = if binary.test_hooks {
+                        crate::control::upgrade_in_place::Hooks::for_test_binary()
+                    } else {
+                        Default::default()
+                    };
+                    #[cfg(not(feature = "test-support"))]
+                    let hooks = Default::default();
+                    let boot = crate::control::upgrade_in_place::BootImage::capture(
+                        executable.clone(),
+                        image.clone(),
+                        binary.core_version.clone(),
+                        binary.build_git_sha.clone(),
+                        resume.as_ref().map(resume::Resume::verified_digest),
+                        &hooks,
+                    )
+                    .await;
+                    Some(UpgradeStartup {
+                        boot,
+                        required: crate::supervise::handover::required_lock_roles(&config),
+                        hooks,
+                    })
+                }
+                Err(error) => {
+                    warn!(%error, "in-place upgrade disabled: could not open running executable");
+                    None
+                }
+            }
+        } else {
+            None
+        };
     #[cfg(all(test, feature = "test-support"))]
     let test_control = config.test_control;
-    match ensure_singleton_with_start_lock(config, false, start_lock).await? {
+    let outcome = match inherited_run {
+        Some(run_dir) => bind_under_locks(config, false, start_lock, Some(run_dir)).await?,
+        None => ensure_singleton_with_start_lock(config, false, start_lock).await?,
+    };
+    match outcome {
         Outcome::AlreadyRunning => {
             info!("subc daemon already running");
             Ok(())
@@ -894,6 +1026,10 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
                 terminal_journal_path,
                 live_children_path,
                 privacy_trampoline,
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                upgrade,
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                resume,
                 #[cfg(all(test, feature = "test-support"))]
                 test_control,
                 #[cfg(feature = "test-support")]
@@ -964,6 +1100,8 @@ fn load_bootstrap_authority(
         local_listener: config.local_listener,
         live_children_path: config.live_children_path,
         privacy_trampoline: config.privacy_trampoline,
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        upgrade_binary: config.upgrade_binary,
         #[cfg(feature = "test-support")]
         shutdown_intent_window: config.shutdown_intent_window,
         #[cfg(feature = "test-support")]
@@ -1143,7 +1281,7 @@ pub async fn run_with_daemon_config_path(
 
 #[allow(clippy::too_many_arguments)]
 async fn serve_bound_daemon(
-    bound: BoundDaemon,
+    mut bound: BoundDaemon,
     forwarding: Arc<ForwardingTable>,
     configured_modules: Vec<ConfiguredModule>,
     storage_config: Option<daemon_config::StorageConfig>,
@@ -1165,6 +1303,8 @@ async fn serve_bound_daemon(
     terminal_journal_path: Option<PathBuf>,
     live_children_path: Option<PathBuf>,
     privacy_trampoline: Option<PathBuf>,
+    #[cfg(any(target_os = "linux", target_os = "macos"))] upgrade: Option<UpgradeStartup>,
+    #[cfg(any(target_os = "linux", target_os = "macos"))] resume: Option<resume::Resume>,
     #[cfg(all(test, feature = "test-support"))] test_control: Option<
         fn(ControlHandler) -> ControlHandler,
     >,
@@ -1185,6 +1325,22 @@ async fn serve_bound_daemon(
         warn!(%error, "module launches disabled: Windows root job setup failed");
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let resuming = resume.is_some();
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let resuming = false;
+    #[cfg(all(
+        feature = "test-support",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    let local_listener_gate = upgrade
+        .as_ref()
+        .filter(|startup| resuming && startup.hooks.pause_local_listener)
+        .map(|_| {
+            bound
+                .connection_file_path
+                .with_file_name("resume-local-listener.test.sock")
+        });
     info!(
         connection_file = %bound.connection_file_path.display(),
         connection_file_source = %bound.connection_file_source,
@@ -1192,7 +1348,8 @@ async fn serve_bound_daemon(
         endpoints = ?bound.connection_info.endpoints,
         configured_modules = configured_modules.len(),
         machine_id = bound.machine_id.as_ref().map(|id| id.as_str()).unwrap_or("none"),
-        "subc daemon starting"
+        "{}",
+        if resuming { "subc daemon resuming" } else { "subc daemon starting" }
     );
 
     // Before anything can spawn a module (the configured modules below, or a
@@ -1205,13 +1362,31 @@ async fn serve_bound_daemon(
     // keyed on the connection file, which can live in a different runtime
     // directory from the run directory.) The lock stays held until this
     // function returns, which is when the daemon exits.
-    let run_dir_lock = bound.run_dir_lock;
-    let publication_lock = bound.publication_lock;
+    let run_dir_lock = bound.run_dir_lock.take();
+    let mut publication_lock = bound.publication_lock.take();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let adoption = resume
+        .map(|resume| {
+            if bound.local_listener.is_none() {
+                return Err(BootstrapError::Resume(io::Error::other(
+                    "resume requires a local listener",
+                )));
+            }
+            resume.reconcile(run_dir_lock.as_ref().expect("resume holds the run lock"))
+        })
+        .transpose()?;
+    let no_protected = crate::live_children::AdoptedPids::none();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let protected = adoption
+        .as_ref()
+        .map_or(&no_protected, |adoption| &adoption.protected);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let protected = &no_protected;
     if let Some(owner) = &run_dir_lock {
         #[cfg(target_os = "linux")]
         crate::live_children::sweep_orphans_with_placement(
             owner,
-            &crate::live_children::AdoptedPids::none(),
+            protected,
             crate::live_children::SweepBounds::default(),
             cgroup_placement.as_ref(),
         )
@@ -1219,7 +1394,7 @@ async fn serve_bound_daemon(
         #[cfg(not(target_os = "linux"))]
         crate::live_children::sweep_orphans(
             owner,
-            &crate::live_children::AdoptedPids::none(),
+            protected,
             crate::live_children::SweepBounds::default(),
         )
         .await;
@@ -1228,10 +1403,22 @@ async fn serve_bound_daemon(
     let registry = Arc::new(Registry::default());
     let process_liveness = Arc::new(SupervisorProcessLiveness::new());
     let supervisor_handle = SupervisorHandle::new();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Some(adoption) = &adoption {
+        adoption.begin_report(&supervisor_handle);
+    }
     let _host_health_task = AbortOnDrop::new(supervisor_handle.spawn_host_health_monitor());
     #[cfg(feature = "test-support")]
     supervisor_handle.set_shutdown_intent_window(shutdown_intent_window);
     let connected_clients = ConnectedClients::new();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let store_writer = opened_store.as_ref().and_then(|(_, lock)| {
+        crate::control::upgrade_in_place::witness(
+            crate::supervise::handover::LockRole::StoreWriter,
+            lock.file(),
+        )
+        .ok()
+    });
     let daemon_incarnation = format!(
         "{:032x}",
         u128::from_be_bytes(bound.connection_info.daemon_id)
@@ -1357,6 +1544,8 @@ async fn serve_bound_daemon(
         None => supervisor,
     };
     let supervisor = match live_children_path {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        Some(path) if adoption.is_some() => supervisor.with_resume_roster(path, protected),
         Some(path) => supervisor.with_live_children_record(path),
         None => supervisor,
     };
@@ -1379,7 +1568,7 @@ async fn serve_bound_daemon(
     let mut control = ControlHandler::with_forwarding(Arc::clone(&registry), forwarding)
         .with_daemon_version(bound.connection_info.daemon_ver.clone())
         .with_process_liveness(process_liveness)
-        .with_supervisor(supervisor_handle)
+        .with_supervisor(supervisor_handle.clone())
         // The same flag `begin_daemon_shutdown` sets below, so requirement
         // changes while modules exit during the shutdown log at INFO.
         .with_daemon_shutdown_flag(supervisor.daemon_shutdown_flag())
@@ -1444,6 +1633,23 @@ async fn serve_bound_daemon(
     } else {
         control
     };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let (control, upgrade_runtime, _run_dir_lock) = match (upgrade, run_dir_lock) {
+        (Some(startup), Some(run_dir)) if bound.local_listener.is_some() => {
+            let mut control = control;
+            let runtime = Arc::new(crate::control::upgrade_in_place::Runtime::new(
+                startup.boot,
+                startup.required,
+                run_dir,
+                store_writer,
+                supervisor.retained_children(),
+                startup.hooks,
+            ));
+            control.upgrade = Some(runtime.clone());
+            (control, Some(runtime), None)
+        }
+        (_, run_dir_lock) => (control, None, run_dir_lock),
+    };
     let control = Arc::new(control);
     let router = Arc::new(Router::with_control_handler(Arc::clone(&control)));
     let auth = ServerAuth::new(
@@ -1457,10 +1663,16 @@ async fn serve_bound_daemon(
     // ones. Registration creates status handles but neither starts monitors
     // nor launches processes: children need the published file for `--subc`.
     let mut registered_modules = Vec::with_capacity(configured_modules.len());
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let mut registered_cohort = BTreeMap::new();
     for configured in configured_modules {
         let enabled = configured.enabled;
         let health = configured.health.clone();
         let module_id = configured.module_id.clone();
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let cohort_enabled = adoption
+            .as_ref()
+            .and_then(|plan| plan.enabled(&module_id, enabled));
         let registered = match supervisor.register_configured_with_health(
             configured.module_spec(),
             enabled,
@@ -1475,7 +1687,6 @@ async fn serve_bound_daemon(
                 continue;
             }
         };
-        registered_modules.push(registered);
         // A relaxed threshold can silently outlive the temporary allowance
         // that required it, so report the extra tolerance on every boot.
         let default_threshold = HealthConfig::default().failure_threshold;
@@ -1489,41 +1700,104 @@ async fn serve_bound_daemon(
             );
         }
         info!(module_id = %module_id, enabled, "configured module registered");
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(effective) = cohort_enabled {
+            registered_cohort.insert(module_id, (registered, effective));
+            continue;
+        }
+        registered_modules.push(registered);
     }
     control.refresh_capability_requirements();
 
+    let publish = |lock| {
+        publish_connection_file(
+            &bound.connection_file_path,
+            #[cfg(windows)]
+            bound.connection_file_copy.as_deref(),
+            &bound.connection_info,
+            bound.local_endpoint.as_ref(),
+            lock,
+        )
+    };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let preparations = adoption
+        .as_ref()
+        .map(|plan| plan.stage_preparations(&supervisor_handle, &registered_cohort))
+        .transpose()?
+        .unwrap_or_default();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let (resumed_listener, local_ready) = adoption
+        .as_ref()
+        .map(|plan| {
+            let (ready, wait) = tokio::sync::oneshot::channel();
+            (Some((plan.monotonic_ns, ready)), Some(wait))
+        })
+        .unwrap_or_default();
+
     // The local endpoint is served beside TCP and answers the same handshake.
-    // It serves clients only, which the server enforces per connection.
-    let local_serve_task = bound.local_listener.map(|local_listener| {
-        AbortOnDrop::new(tokio::spawn(serve_local_listener(
-            local_listener,
-            Arc::clone(&router),
-            auth.clone(),
-        )))
+    // Only a carried child with a valid resume HELLO can register on it.
+    let local_serve_task = bound.local_listener.map(|listener| {
+        let router = router.clone();
+        let auth = auth.clone();
+        AbortOnDrop::new(tokio::spawn(async move {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            if let Some((sample, ready)) = resumed_listener {
+                #[cfg(feature = "test-support")]
+                if let Some(path) = local_listener_gate {
+                    if let Err(error) =
+                        crate::control::upgrade_in_place::wait_at_gate(&path, 1).await
+                    {
+                        warn!(%error, "could not wait at the resume local listener test gate");
+                    }
+                }
+                return crate::server::serve_resumed_local_listener(
+                    listener,
+                    router,
+                    auth,
+                    move || {
+                        resume::log_accept(sample);
+                        let _ = ready.send(());
+                    },
+                )
+                .await;
+            }
+            serve_local_listener(listener, router, auth).await
+        }))
     });
+    let mut serve_task =
+        AbortOnDrop::new(tokio::spawn(serve_listeners(bound.listeners, router, auth)));
     // On Unix the task is dropped below to stop accepting at shutdown. Windows
     // leaves it to the process exit; naming it keeps the binding uniform.
     #[cfg(windows)]
     let _local_serve_task = local_serve_task;
-    let mut serve_task =
-        AbortOnDrop::new(tokio::spawn(serve_listeners(bound.listeners, router, auth)));
+    // The connection file promises clients can authenticate immediately, even
+    // while individual modules are still preparing to resume.
     verify_serving(&bound.connection_info).await?;
-    // A published endpoint promises that authentication can complete now.
-    // Orphan cleanup and control-plane construction can take longer than an
-    // existing-daemon probe's deadline, so finish both before discovery.
-    // The write fsyncs, so it runs on tokio's blocking pool (see
-    // `publish_connection_file`). The singleton lock travels with it and comes
-    // back only once the file is in place.
-    let (published, publication_lock) = publish_connection_file(
-        &bound.connection_file_path,
-        #[cfg(windows)]
-        bound.connection_file_copy.as_deref(),
-        &bound.connection_info,
-        bound.local_endpoint.as_ref(),
-        publication_lock,
-    )
-    .await;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Some(ready) = local_ready {
+        timeout(PROBE_AUTH_DEADLINE, ready)
+            .await
+            .map_err(|_| BootstrapError::StartupNotServing)?
+            .map_err(|_| BootstrapError::StartupNotServing)?;
+    }
+    let (published, lock) = publish(publication_lock.take()).await;
     published?;
+    publication_lock = lock.flatten();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let planned = if let Some(adoption) = adoption {
+        if let Some(runtime) = &upgrade_runtime {
+            if let Some(lock) = publication_lock.take() {
+                runtime.retain_publication(lock);
+            }
+        }
+        // A child being adopted may exit during installation and need a
+        // replacement. Do not start these preparations before publishing.
+        adoption
+            .install(&supervisor, registered_cohort, preparations)
+            .await?
+    } else {
+        Vec::new()
+    };
     // Serving and discoverable: a daemon booted from a restart intent records
     // readiness, which makes that generation the daemon's active one. Without
     // this record the next start treats the warm-up as failed.
@@ -1534,6 +1808,7 @@ async fn serve_bound_daemon(
     }
     #[cfg(test)]
     startup_publication_hook::run(&bound.connection_file_path).await;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     drop(publication_lock);
     let _clock_step_task = AbortOnDrop::new(crate::watchdog::spawn_clock_step_monitor());
     // Off the startup path: it runs `systemctl`, and only ever logs.
@@ -1550,6 +1825,15 @@ async fn serve_bound_daemon(
         .spawn(),
     );
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    for (module, registered, enabled) in planned {
+        if let Err(error) = supervisor
+            .start_planned_after_upgrade(&module, registered, enabled)
+            .await
+        {
+            error!(module_id = %module, %error, "failed to start a planned upgrade replacement");
+        }
+    }
     for registered in registered_modules {
         match supervisor
             .start_registered_configured_async(registered, None, true)
@@ -1572,6 +1856,12 @@ async fn serve_bound_daemon(
         .spawn_pending_settings_worker()
         .map(AbortOnDrop::new);
     control.spawn_resource_sampler();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Some(runtime) = &upgrade_runtime {
+        if let Some(lock) = publication_lock.take() {
+            runtime.retain_publication(lock);
+        }
+    }
 
     #[cfg(unix)]
     {
@@ -1580,6 +1870,10 @@ async fn serve_bound_daemon(
                 return result.map_err(BootstrapError::ServeJoin)?.map_err(BootstrapError::Serve);
             }
             _ = terminate.recv() => {}
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(runtime) = &upgrade_runtime {
+            runtime.shutdown().await;
         }
         // First, before the notice, the drain, or any connection close: from
         // here on a module exit is recorded as `daemon_shutdown` and never
@@ -1707,7 +2001,10 @@ async fn singleton_start_lock(
             })?;
         }
     }
-    let lock = StartLock::acquire(path).await?;
+    let lock = match StartLock::acquire(path).await {
+        Err(BootstrapError::StartLockBusy { .. }) if stable_peer(path).await? => return Ok(None),
+        result => result?,
+    };
 
     // Re-probe after acquiring the start lock so a peer that won the race between
     // our first failed probe and the lock acquisition is observed instead of
@@ -1723,6 +2020,29 @@ async fn ensure_singleton_with_start_lock(
     publish: bool,
     lock: StartLock,
 ) -> Result<Outcome, BootstrapError> {
+    // The held start lock and its peer check only rule out a daemon using this
+    // connection file. A daemon started with another runtime directory but
+    // the same data home shares the run directory while passing both, so the
+    // run directory needs its own owner: refuse at once if a live daemon holds
+    // it, before anything below reads or writes run or data-home state.
+    let run_dir_lock = config
+        .live_children_path
+        .as_deref()
+        .map(crate::run_dir_lock::RunDirLock::acquire)
+        .transpose()?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Some(owner) = &run_dir_lock {
+        resume::discard_leftover(owner);
+    }
+    bind_under_locks(config, publish, lock, run_dir_lock).await
+}
+
+async fn bind_under_locks(
+    config: BootstrapConfig,
+    publish: bool,
+    lock: StartLock,
+    run_dir_lock: Option<crate::run_dir_lock::RunDirLock>,
+) -> Result<Outcome, BootstrapError> {
     #[cfg(windows)]
     let copy_path = windows_connection_copy::resolve(&config);
     let path = config.connection_file_path;
@@ -1734,17 +2054,6 @@ async fn ensure_singleton_with_start_lock(
             "using the system temporary directory for the daemon connection file"
         );
     }
-    // The held start lock and its peer check only rule out a daemon using this
-    // connection file. A daemon started with another runtime directory but
-    // the same data home shares the run directory while passing both, so the
-    // run directory needs its own owner: refuse at once if a live daemon holds
-    // it, before anything below reads or writes run or data-home state.
-    let run_dir_lock = config
-        .live_children_path
-        .as_deref()
-        .map(crate::run_dir_lock::RunDirLock::acquire)
-        .transpose()?;
-
     remove_stale_connection_file_if_present(&path)?;
     #[cfg(windows)]
     let copy_path = windows_connection_copy::reclaim(&path, copy_path).await;
@@ -2274,8 +2583,8 @@ impl<T> Drop for AbortOnDrop<T> {
 }
 
 #[derive(Debug)]
-struct StartLock {
-    // Keep the locked file handle alive for the duration of bootstrap.
+pub(crate) struct StartLock {
+    // Service boots keep the file holding the startup lock open for handover.
     _file: fs::File,
 }
 
@@ -2283,7 +2592,7 @@ impl Drop for StartLock {
     fn drop(&mut self) {
         // Closing alone leaves the lock held if a concurrent fork inherited
         // the open file description and has not exec'd yet. Unlock explicitly
-        // so a restart can reclaim the singleton as soon as bootstrap ends.
+        // so another daemon can start as soon as this owner releases the lock.
         if let Err(error) = FileExt::unlock(&self._file) {
             tracing::warn!(%error, "failed to release the singleton start lock");
         }
@@ -2291,6 +2600,10 @@ impl Drop for StartLock {
 }
 
 impl StartLock {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn file(&self) -> &fs::File {
+        &self._file
+    }
     async fn acquire(connection_file_path: &Path) -> Result<Self, BootstrapError> {
         let path = start_lock_path(connection_file_path);
         for _ in 0..START_LOCK_RETRIES {
@@ -2312,6 +2625,44 @@ impl StartLock {
             attempts: START_LOCK_RETRIES,
         })
     }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) async fn upgrade_runtime_for_test(
+    root: &Path,
+    supervisor: &Supervisor,
+    executable: PathBuf,
+) -> Arc<crate::control::upgrade_in_place::Runtime> {
+    use crate::control::upgrade_in_place::{BootImage, Runtime};
+
+    let config = BootstrapConfig::new(root.join("connection.json"), 0);
+    let run = crate::run_dir_lock::RunDirLock::acquire(&root.join("live-children.json")).unwrap();
+    let publication = StartLock::acquire(&config.connection_file_path)
+        .await
+        .unwrap();
+    #[cfg(target_os = "linux")]
+    let image = fs::File::open("/proc/self/exe").unwrap();
+    #[cfg(target_os = "macos")]
+    let image = fs::File::open(&executable).unwrap();
+    let boot = BootImage::capture(
+        executable,
+        Arc::new(image),
+        "test".into(),
+        None,
+        None,
+        &Default::default(),
+    )
+    .await
+    .with_fixture_probe(root.join("must-not-exec"));
+    boot.wait_for_digest().await.expect("fixture image hash");
+    let runtime = Arc::new(Runtime::for_settings_cutover_test(
+        boot,
+        crate::supervise::handover::required_lock_roles(&config),
+        run,
+        supervisor.retained_children(),
+    ));
+    runtime.retain_publication(publication);
+    runtime
 }
 
 pub(crate) fn open_owner_only_lock(path: &Path) -> io::Result<fs::File> {
@@ -2344,6 +2695,8 @@ fn start_lock_path(connection_file_path: &Path) -> PathBuf {
 #[non_exhaustive]
 pub enum BootstrapError {
     ConfigStore(String),
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    Resume(io::Error),
     /// The bound server could not authenticate its own readiness probe.
     StartupNotServing,
     #[cfg(unix)]
@@ -2416,6 +2769,8 @@ impl fmt::Display for BootstrapError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ConfigStore(error) => write!(f, "configuration store startup refused: {error}"),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Self::Resume(error) => write!(f, "daemon handover refused: {error}"),
             Self::StartupNotServing => write!(f, "bound daemon did not authenticate its readiness probe; connection file was not published"),
             #[cfg(unix)]
             Self::Signal(error) => write!(f, "failed to register SIGTERM handler: {error}"),
@@ -2496,6 +2851,8 @@ impl Error for BootstrapError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::ConfigStore(_) => None,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Self::Resume(source) => Some(source),
             Self::StartupNotServing => None,
             #[cfg(unix)]
             Self::Signal(source) => Some(source),
@@ -3306,6 +3663,31 @@ mod tests {
         let second = ensure_singleton(&path, 0).await.unwrap();
         assert!(matches!(second, Outcome::AlreadyRunning));
 
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn held_publication_lock_with_live_daemon_is_already_running() {
+        let (_dir, path) = temp_connection_file_path("live-publication-lock");
+        let config = BootstrapConfig::new(&path, 0);
+        let mut bound = expect_bound(ensure_singleton_inner(config.clone(), false).await.unwrap());
+        let publication = bound.publication_lock.take().unwrap();
+        let info = bound.connection_info.clone();
+        let server = start_server(bound);
+
+        // The peer was not yet published at the contender's first probe. It
+        // must find the live peer after losing the lock to the first boot.
+        let (contender, ()) = tokio::join!(ensure_singleton_inner(config, false), async {
+            sleep(START_LOCK_RETRY_DELAY * 2).await;
+            write_atomic(&path, &info).unwrap();
+        });
+        assert!(matches!(contender.unwrap(), Outcome::AlreadyRunning));
+        assert!(matches!(
+            FileExt::try_lock(&open_owner_only_lock(&start_lock_path(&path)).unwrap()),
+            Err(TryLockError::WouldBlock)
+        ));
+        drop(publication);
         server.abort();
         let _ = server.await;
     }

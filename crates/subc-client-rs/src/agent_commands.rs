@@ -63,7 +63,14 @@ impl ModuleHandle {
         finished: Vec<AgentCommandFinished>,
         known: Option<Vec<AgentCommandRoot>>,
     ) -> Result<(), AgentCommandsError> {
-        if !self.shared.supports_agent_commands {
+        let shared = self.shared();
+        shared.check_upgrade_fence().map_err(|err| match err {
+            crate::CatalogUpdateError::Rejected(body) => {
+                AgentCommandsError::Refused(Box::new(body))
+            }
+            _ => AgentCommandsError::ConnectionClosed,
+        })?;
+        if !shared.supports_agent_commands {
             return Err(AgentCommandsError::Unsupported);
         }
         let body = serde_json::to_vec(&ModuleControlRequestFromModule::AgentCommands {
@@ -73,7 +80,7 @@ impl ModuleHandle {
         })
         .map_err(|err| AgentCommandsError::Protocol(err.to_string()))?;
         let (corr, writer, rx) = {
-            let mut inner = self.shared.lock_inner();
+            let mut inner = shared.lock_inner();
             if inner.closed {
                 return Err(AgentCommandsError::ConnectionClosed);
             }
@@ -88,11 +95,11 @@ impl ModuleHandle {
             (corr, writer, rx)
         };
         let _guard = Waiter {
-            handle: self.clone(),
+            shared: shared.clone(),
             corr,
         };
         let frame = Frame::build_with_version(
-            self.shared.negotiated_ver,
+            shared.negotiated_ver,
             FrameType::Request,
             crate::control_flags(),
             0,
@@ -102,10 +109,15 @@ impl ModuleHandle {
         )
         .map_err(|err| AgentCommandsError::Protocol(err.to_string()))?;
         let reply = tokio::time::timeout(crate::CATALOG_UPDATE_TIMEOUT, async {
-            writer
-                .send(frame)
+            shared
+                .queue_request(&writer, frame)
                 .await
-                .map_err(|_| AgentCommandsError::ConnectionClosed)?;
+                .map_err(|err| match err {
+                    crate::CatalogUpdateError::Rejected(body) => {
+                        AgentCommandsError::Refused(Box::new(body))
+                    }
+                    _ => AgentCommandsError::ConnectionClosed,
+                })?;
             rx.await.map_err(|_| AgentCommandsError::ConnectionClosed)
         })
         .await
@@ -139,13 +151,12 @@ impl ModuleHandle {
 }
 
 struct Waiter {
-    handle: ModuleHandle,
+    shared: std::sync::Arc<crate::ModuleHandleShared>,
     corr: u64,
 }
 impl Drop for Waiter {
     fn drop(&mut self) {
-        self.handle
-            .shared
+        self.shared
             .lock_inner()
             .pending_agent_commands
             .remove(&self.corr);
@@ -181,6 +192,7 @@ mod tests {
     fn handle(supported: bool) -> (ModuleHandle, mpsc::Receiver<Frame>) {
         let (writer, receiver) = mpsc::channel(4);
         let ack = ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: if supported {
                 vec!["supervisor.agent_commands".into()]
@@ -273,7 +285,11 @@ mod tests {
                 !handle.is_closed(),
                 "a refused declaration must not tear down the serving connection"
             );
-            assert!(handle.shared.lock_inner().pending_agent_commands.is_empty());
+            assert!(handle
+                .shared()
+                .lock_inner()
+                .pending_agent_commands
+                .is_empty());
         }
     }
 }

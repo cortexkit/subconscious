@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 // These tests need Darwin's real responsibility ledger, not a mock of spawn.
 // Keep each test's name visible (ignored) on other systems.
 

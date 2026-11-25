@@ -946,6 +946,8 @@ fn config_recovery_fixture() {
 async fn module_fixture(root: &Path) {
     let mut stream = tcp(root).await;
     let hello = subc_protocol::ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest: subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build(),
         protocol_ver: subc_protocol::PROTOCOL_VERSION,
         control_ops: Some(vec!["config.review".into()]),
@@ -1403,6 +1405,8 @@ async fn config_recovery_spawned_stamped_exit_installs_reserved_capabilities_bef
         must_never_reach: vec![],
     });
     let hello = subc_protocol::ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest,
         protocol_ver: subc_protocol::PROTOCOL_VERSION,
         control_ops: None,

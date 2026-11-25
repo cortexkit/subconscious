@@ -338,7 +338,7 @@ impl ModuleHarness {
     fn assert_own_route(&self, route: RouteHandle) {
         assert_eq!(
             route.connection_token(),
-            self.served.handle.shared.connection_token,
+            self.served.handle.shared().connection_token,
             "route belongs to another connection"
         );
     }

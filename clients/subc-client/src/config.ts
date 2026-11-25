@@ -181,6 +181,7 @@ export interface ModuleConfigTransport {
   capabilities(): readonly string[];
   epoch(): number;
   request(body: object): Promise<unknown>;
+  checkSendAllowed?(): void;
 }
 
 const layers = new Set(["default", "user", "workspace", "project"]);
@@ -252,6 +253,7 @@ interface ConfigTuple {
   lastView?: ConfigView;
   report?: { epoch: number; request: ConfigAppliedRequest };
   timer?: ReturnType<typeof setTimeout>;
+  reapply?: boolean;
 }
 
 /** Provider-owned config lifecycle. Refreshes serialize so hints cannot race an apply/ACK. */
@@ -262,6 +264,7 @@ export class ModuleConfig {
   private declaredEpoch = 0;
   private tail: Promise<void> = Promise.resolve();
   private stopped = false;
+  private upgradePaused = false;
   private readonly retryMs: number;
 
   constructor(private readonly transport: ModuleConfigTransport, private readonly options: ModuleConfigOptions) {
@@ -276,6 +279,8 @@ export class ModuleConfig {
   /** Queue a refresh; the returned promise does not confirm activation.
    * Named refresh errors go to onProjectError if supplied; delivery statuses still go to onState. */
   refresh(projectId?: string): Promise<void> {
+    try { this.transport.checkSendAllowed?.(); }
+    catch (error) { return Promise.reject(error); }
     if (projectId !== undefined && !this.transport.capabilities().includes("config.gate")) return Promise.resolve();
     const epoch = this.transport.epoch();
     const queued = projectId === undefined ? undefined : this.queued.get(projectId);
@@ -284,7 +289,7 @@ export class ModuleConfig {
       // Once a refresh starts, hints can queue one follow-up for this project.
       if (projectId !== undefined && this.queued.get(projectId)?.done === done) this.queued.delete(projectId);
       return this.synchronize(epoch, projectId);
-    }).catch((error) => this.error(error, projectId));
+    }).catch((error) => { if (this.live(epoch)) this.error(error, projectId); });
     this.tail = done;
     if (projectId !== undefined) this.queued.set(projectId, { epoch, done });
     return done;
@@ -293,6 +298,23 @@ export class ModuleConfig {
   close(): void {
     this.stopped = true;
     for (const tuple of this.tuples.values()) clearTimeout(tuple.timer);
+  }
+
+  /** @internal Retire the old session without waiting for its application callbacks. */
+  pauseForUpgrade(): void {
+    this.upgradePaused = true;
+    this.tail = Promise.resolve();
+    this.queued.clear();
+    for (const tuple of this.tuples.values()) {
+      clearTimeout(tuple.timer);
+      tuple.report = undefined;
+      tuple.reapply = true;
+    }
+  }
+
+  /** @internal The new connection has queued its resume scope sync, if any. */
+  resumeAfterUpgrade(): void {
+    this.upgradePaused = false;
   }
 
   private tuple(projectId?: string): ConfigTuple {
@@ -322,7 +344,7 @@ export class ModuleConfig {
     return this.options.review(immutable(request as unknown as ConfigReviewRequest));
   }
 
-  private live(epoch: number): boolean { return !this.stopped && epoch === this.transport.epoch(); }
+  private live(epoch: number): boolean { return !this.stopped && !this.upgradePaused && epoch === this.transport.epoch(); }
 
   private async synchronize(epoch: number, projectId?: string): Promise<void> {
     if (!this.live(epoch)) return;
@@ -387,7 +409,7 @@ export class ModuleConfig {
       }
       if (target.status === "failed") { this.publish(tuple, { state: "failed", view: tuple.lastView, reasons: [] }); return; }
       if (target.status === "pending" && target.attempt === undefined) throw new Error("config delivery has no attempt");
-      if (JSON.stringify(target) === JSON.stringify(tuple.lastView)) {
+      if (!tuple.reapply && JSON.stringify(target) === JSON.stringify(tuple.lastView)) {
         const state = this.getState(projectId)?.state;
         if (state === "config_gated" || state === "unknown") {
           this.publish(tuple, { state: target.status as "unstamped" | "pending" | "active", view: target });
@@ -396,6 +418,7 @@ export class ModuleConfig {
       }
       const result = await this.options.apply(target);
       if (!this.live(epoch)) return;
+      tuple.reapply = false;
       if (result.result === "ack") tuple.lastView = target;
       if (target.status === "unstamped") {
         this.publish(tuple, result.result === "ack" ? { state: "unstamped", view: target }
@@ -437,7 +460,9 @@ export class ModuleConfig {
     } else if (code === "not_delivery_target" || code === "anchor_pending") {
       this.publish(tuple, { state: code, refusal, view: tuple.lastView });
       if (code === "anchor_pending" && tuple.report && this.live(epoch)) {
-        tuple.timer = setTimeout(() => { if (this.live(epoch)) void this.refresh(tuple.projectId); }, this.retryMs);
+        tuple.timer = setTimeout(() => {
+          if (this.live(epoch)) void this.refresh(tuple.projectId).catch(() => undefined);
+        }, this.retryMs);
         tuple.timer.unref?.();
       }
     } else {

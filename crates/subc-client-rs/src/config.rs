@@ -189,14 +189,30 @@ impl ModuleHandle {
     /// This does not check project support before sending `config.get`; use
     /// [`Self::daemon_supports`] to check capabilities advertised in HELLO_ACK.
     pub fn refresh_project_config(&self, project_id: impl Into<String>) -> bool {
-        let session = &self.shared.config;
+        self.enqueue_config_refresh(Some(project_id.into()))
+    }
+
+    /// Queue a refresh of the module's default config view. Returns `false`
+    /// if config is unavailable or the connection is fenced for a daemon upgrade.
+    pub fn refresh_config(&self) -> bool {
+        self.enqueue_config_refresh(None)
+    }
+
+    fn enqueue_config_refresh(&self, project_id: Option<String>) -> bool {
+        let shared = self.shared();
+        let session = &shared.config;
+        let state = shared.lock_inner();
         if session.declaration.get().is_none()
-            || self.is_closed()
-            || !self.daemon_supports(CONFIG_GATE_CAPABILITY)
+            || state.closed
+            || state.upgrade.fenced()
+            || !shared
+                .daemon_capabilities
+                .iter()
+                .any(|capability| capability == CONFIG_GATE_CAPABILITY)
         {
             return false;
         }
-        session.enqueue_refresh(Some(project_id.into()));
+        session.enqueue_refresh(project_id);
         true
     }
 }
@@ -206,13 +222,13 @@ pub(crate) fn start<H: ModuleHandler>(
     handler: Arc<H>,
     dispatcher: &RequestDispatcher,
 ) {
-    let Some(declaration) = handle.shared.config.declaration.get().cloned() else {
+    let shared = handle.shared();
+    let Some(declaration) = shared.config.declaration.get().cloned() else {
         return;
     };
-    let session_handle = handle.clone();
     dispatcher.spawn(async move {
         tokio::select! {
-            () = session_handle.shared.config.stop.cancelled() => {},
+            () = shared.config.stop.cancelled() => {},
             () = run(handle, handler, declaration) => {},
         }
     });
@@ -223,6 +239,7 @@ async fn run<H: ModuleHandler>(
     handler: Arc<H>,
     declaration: ConfigDeclareRequest,
 ) {
+    let shared = handle.shared();
     if !handle.daemon_supports(CONFIG_GATE_CAPABILITY) {
         handler.config_files().await;
         return;
@@ -236,10 +253,9 @@ async fn run<H: ModuleHandler>(
         Err(error) => delivery.error(&*handler, None, error).await,
     }
     loop {
-        handle.shared.config.changed.notified().await;
+        shared.config.changed.notified().await;
         let projects = std::mem::take(
-            &mut *handle
-                .shared
+            &mut *shared
                 .config
                 .projects
                 .lock()
@@ -259,11 +275,13 @@ pub(crate) fn changed(frame: &Frame, handle: &ModuleHandle) -> bool {
     if !is_op(frame, CONFIG_CHANGED_OP) {
         return false;
     }
-    if handle.shared.config.declaration.get().is_some()
+    let shared = handle.shared();
+    if shared.config.declaration.get().is_some()
+        && !shared.lock_inner().upgrade.fenced()
         && handle.daemon_supports(CONFIG_GATE_CAPABILITY)
     {
         match serde_json::from_slice::<ConfigChanged>(&frame.body) {
-            Ok(hint) => handle.shared.config.enqueue_refresh(hint.project_id),
+            Ok(hint) => shared.config.enqueue_refresh(hint.project_id),
             Err(error) => tracing::warn!(%error, "ignoring malformed config.changed"),
         }
     }
@@ -294,7 +312,7 @@ pub(crate) fn review<H: ModuleHandler>(
     }
     let frame = frame.clone();
     let egress = egress.clone();
-    let opted_in = handle.shared.config.declaration.get().is_some()
+    let opted_in = handle.shared().config.declaration.get().is_some()
         && handle.daemon_supports(CONFIG_GATE_CAPABILITY);
     let failure = dispatcher.clone();
     dispatcher.spawn(async move {
@@ -595,10 +613,14 @@ async fn call(
     request: &impl Serialize,
     op: &str,
 ) -> Result<serde_json::Value, ConfigError> {
+    let shared = handle.shared();
     let body =
         serde_json::to_vec(request).map_err(|error| ConfigError::Protocol(error.to_string()))?;
     let (corr, writer, rx) = {
-        let mut inner = handle.shared.lock_inner();
+        let mut inner = shared.lock_inner();
+        if inner.upgrade.fenced() {
+            return Err(ConfigError::Refused(crate::live_upgrade::upgrade_refusal()));
+        }
         let writer = inner.writer.clone().ok_or(ConfigError::ConnectionClosed)?;
         let corr =
             crate::next_module_control_corr(&mut inner).ok_or(ConfigError::ConnectionClosed)?;
@@ -607,11 +629,11 @@ async fn call(
         (corr, writer, rx)
     };
     let _guard = Waiter {
-        handle: handle.clone(),
+        shared: shared.clone(),
         corr,
     };
     let frame = Frame::build_with_version(
-        handle.shared.negotiated_ver,
+        shared.negotiated_ver,
         FrameType::Request,
         crate::control_flags(),
         0,
@@ -621,10 +643,13 @@ async fn call(
     )
     .map_err(|error| ConfigError::Protocol(error.to_string()))?;
     let reply = tokio::time::timeout(CATALOG_UPDATE_TIMEOUT, async {
-        writer
-            .send(frame)
+        shared
+            .queue_request(&writer, frame)
             .await
-            .map_err(|_| ConfigError::ConnectionClosed)?;
+            .map_err(|err| match err {
+                crate::CatalogUpdateError::Rejected(body) => ConfigError::Refused(body),
+                _ => ConfigError::ConnectionClosed,
+            })?;
         rx.await.map_err(|_| ConfigError::ConnectionClosed)
     })
     .await
@@ -643,13 +668,12 @@ async fn call(
     Ok(body)
 }
 struct Waiter {
-    handle: ModuleHandle,
+    shared: Arc<crate::ModuleHandleShared>,
     corr: u64,
 }
 impl Drop for Waiter {
     fn drop(&mut self) {
-        self.handle
-            .shared
+        self.shared
             .lock_inner()
             .pending_config_calls
             .remove(&self.corr);

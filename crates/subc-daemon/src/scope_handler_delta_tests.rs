@@ -45,6 +45,46 @@ fn run_scope() -> ScopeRecord {
 }
 
 #[tokio::test]
+async fn scope_ended_logs_owner_changes_and_route_counts() {
+    for (operation, cause) in [
+        ("omit", "omitted"),
+        ("sync_replace", "new_epoch"),
+        ("apply_replace", "new_epoch"),
+        ("apply_end", "ended"),
+    ] {
+        let mut rig = rig().await;
+        rig.sync(vec![session(1), head("kept", 1)]).await;
+        let mut route = rig
+            .bound(Some(AFT), PLEXUS, Some(rig_selector("s", Some(1))))
+            .await;
+        let (output, guard) = crate::router::test_log::log_capture(tracing::Level::INFO);
+        match operation {
+            "omit" => rig.sync(vec![head("kept", 1)]).await,
+            "sync_replace" => rig.sync(vec![session(2), head("kept", 1)]).await,
+            "apply_replace" => {
+                apply_call(&rig, 2, vec![session(2)], vec![]).await;
+            }
+            "apply_end" => {
+                apply_call(&rig, 2, vec![], vec![ScopeEnd::new("s", 1)]).await;
+            }
+            _ => unreachable!(),
+        }
+        drop(guard);
+        assert_eq!(route.closed_reason(), RouteCloseReason::ScopeEnded);
+        let logs = crate::router::test_log::captured_logs(&output);
+        let lines: Vec<_> = logs.lines().filter(|line| line.contains("scope ended")).collect();
+        assert_eq!(lines.len(), 1, "{operation}: {logs}");
+        let line = lines[0];
+        assert!(line.contains(&format!("owner={OWNER}")), "{line}");
+        assert!(line.contains("scope_ref=s"), "{line}");
+        assert!(line.contains("scope_epoch=1"), "{line}");
+        assert!(line.contains(&format!("cause=\"{cause}\"")), "{line}");
+        assert!(line.contains("routes_closed=1"), "{line}");
+        assert!(logs.find("scope change accepted") < logs.find("scope ended"), "{logs}");
+    }
+}
+
+#[tokio::test]
 async fn handler_sweep_ends_routes_and_child_links_without_owner_calls() {
     for connected in [false, true] {
         let mut rig = rig().await;

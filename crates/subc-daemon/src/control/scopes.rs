@@ -193,6 +193,25 @@ impl ControlHandler {
                     routes_closed = drained.len(),
                     "scope change accepted"
                 );
+                let mut route_counts = std::collections::HashMap::new();
+                for route in &drained {
+                    *route_counts
+                        .entry((
+                            route.scope.owner.as_str(),
+                            route.scope.scope_ref.as_str(),
+                            route.scope.tag.scope_epoch,
+                        ))
+                        .or_insert(0usize) += 1;
+                }
+                for (scope, cause) in &applied.owner_ended {
+                    let routes_closed = route_counts
+                        .get(&(owner.as_str(), scope.scope_ref.as_str(), scope.scope_epoch))
+                        .copied()
+                        .unwrap_or(0);
+                    info!(owner = %owner, scope_ref = %scope.scope_ref,
+                        scope_epoch = scope.scope_epoch, cause = cause.as_str(),
+                        routes_closed, "scope ended");
+                }
                 // An accepted scope change can still refuse individual records, and the
                 // owner is the only party that sees the reply. Name them here so
                 // an operator can tell a refused session from a missing one

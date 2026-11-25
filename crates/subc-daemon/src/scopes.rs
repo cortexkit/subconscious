@@ -583,6 +583,7 @@ pub(crate) struct SyncApplied {
     pub(crate) results: Vec<ScopeRecordResult>,
     pub(crate) end_results: Vec<ScopeEndResult>,
     pub(crate) ended: Vec<ScopeEnded>,
+    pub(crate) owner_ended: Vec<(ScopeEnded, EndCause)>,
     pub(crate) tag_changes: Vec<ScopeTagChange>,
     pub(crate) expired: Vec<ScopeExpired>,
 }
@@ -674,9 +675,22 @@ struct SyncAuthority {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EndCause {
+pub(crate) enum EndCause {
     Expired,
-    OwnerEnded,
+    Omitted,
+    NewEpoch,
+    Ended,
+}
+
+impl EndCause {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Expired => "expired",
+            Self::Omitted => "omitted",
+            Self::NewEpoch => "new_epoch",
+            Self::Ended => "ended",
+        }
+    }
 }
 
 /// Ended `(ref, scope_epoch)` pairs and their causes for this daemon incarnation,
@@ -1374,18 +1388,28 @@ impl ScopeTable {
 
         // Commit the staged owner's state only after every whole-call check.
         let old = std::mem::take(&mut state.live);
+        let mut owner_ended = Vec::new();
         for (scope_ref, held) in &old {
             let replaced = next
                 .get(scope_ref)
                 .is_none_or(|record| record.scope_epoch != held.record.scope_epoch);
             if replaced {
+                let cause = if next.contains_key(scope_ref) {
+                    EndCause::NewEpoch
+                } else if end.is_some() {
+                    EndCause::Ended
+                } else {
+                    EndCause::Omitted
+                };
                 state
                     .tombstones
-                    .insert(scope_ref, held.record.scope_epoch, EndCause::OwnerEnded);
-                ended.push(ScopeEnded {
+                    .insert(scope_ref, held.record.scope_epoch, cause);
+                let entry = ScopeEnded {
                     scope_ref: scope_ref.clone(),
                     scope_epoch: held.record.scope_epoch,
-                });
+                };
+                ended.push(entry.clone());
+                owner_ended.push((entry, cause));
             }
         }
         for (scope_ref, record) in next {
@@ -1505,6 +1529,7 @@ impl ScopeTable {
             results,
             end_results,
             ended,
+            owner_ended,
             tag_changes,
             expired,
         })

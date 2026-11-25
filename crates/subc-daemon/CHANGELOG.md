@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.52.1
+
+- Log each scope ended by an accepted sync or apply, including its cause and route count.
+
 ## 0.52.0
 
 - Present project settings refusals as sentences without redundant module and project prefixes.

@@ -192,6 +192,92 @@ pub fn capture_unix_peer_credentials(socket: &impl std::os::fd::AsFd) -> Capture
     capture_unix_peer(socket)
 }
 
+/// Capture the authorization peer and, separately, the kernel PID for route
+/// diagnostics. The diagnostic PID alone must not be used to recognize an
+/// operator app or make any trust decision.
+#[cfg(unix)]
+pub fn capture_unix_peer_with_diagnostic_pid(
+    socket: &impl std::os::fd::AsFd,
+) -> (CapturedPeer, Option<u32>) {
+    #[cfg(target_os = "linux")]
+    {
+        let (peer, diagnostic_pid) = linux::observe_with_pid(
+            socket.as_fd(),
+            ForcedFailures::default(),
+            linux::pidfd_alive,
+        );
+        (peer.into(), diagnostic_pid)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use std::os::fd::AsRawFd;
+        (
+            capture_unix_peer_credentials(socket),
+            unix_peer_pid(socket.as_fd().as_raw_fd()),
+        )
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn unix_peer_pid(socket: std::os::fd::RawFd) -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    return linux::peer_pid(socket);
+    #[cfg(target_os = "macos")]
+    return macos::peer_pid(socket);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = socket;
+        None
+    }
+}
+
+/// Diagnostic identity for the process that opened a local endpoint. The
+/// PID and name are advisory and must never be used for authorization.
+#[derive(Debug, Clone)]
+pub struct DiagnosticProcess {
+    pid: u32,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    start: Option<u64>,
+    #[cfg(windows)]
+    process: Option<std::sync::Arc<std::os::windows::io::OwnedHandle>>,
+}
+
+impl DiagnosticProcess {
+    /// Capture process identity at accept so a later name lookup can reject
+    /// a process that reused the opener's PID.
+    pub fn capture(pid: u32) -> Self {
+        Self {
+            pid,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            start: crate::start_time(pid),
+            #[cfg(windows)]
+            process: windows::open_diagnostic_process(pid).map(std::sync::Arc::new),
+        }
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// Read the current short name, if the opener is still alive and readable.
+    pub fn short_name(&self) -> Option<String> {
+        #[cfg(target_os = "linux")]
+        let name = {
+            let bytes = std::fs::read(format!("/proc/{}/comm", self.pid)).ok()?;
+            String::from_utf8_lossy(bytes.strip_suffix(b"\n").unwrap_or(&bytes)).into_owned()
+        };
+        #[cfg(target_os = "macos")]
+        let name = crate::process_tree::program_name(self.pid);
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        return (!name.is_empty() && self.start? == crate::start_time(self.pid)?).then_some(name);
+        #[cfg(windows)]
+        return windows::process_name(self.process.as_deref()?);
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        None
+    }
+}
+
 /// Read failures a test can force, to show how each one shapes the result
 /// without needing a platform that actually fails that read.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -243,6 +329,20 @@ fn unix_peer(socket: std::os::fd::BorrowedFd<'_>, forced: ForcedFailures) -> Obs
 #[cfg(windows)]
 pub fn observe_pipe_client(pipe: &impl std::os::windows::io::AsHandle) -> ObservedPeer {
     windows::observe(pipe.as_handle(), ForcedFailures::default())
+}
+
+/// Refuse non-local clients before observing the peer of a connected pipe.
+/// The returned diagnostic PID must not be used to recognize an operator app
+/// or make any trust decision.
+#[cfg(windows)]
+pub fn capture_pipe_client_with_diagnostic_pid(
+    pipe: &impl std::os::windows::io::AsRawHandle,
+) -> std::io::Result<(CapturedPeer, u32)> {
+    let pid = crate::named_pipe::local_client_pid(pipe.as_raw_handle())?;
+    Ok((
+        windows::observe_local_process(pid, ForcedFailures::default()).into(),
+        pid,
+    ))
 }
 
 /// [`observe_pipe_client`] with read failures forced, for tests.

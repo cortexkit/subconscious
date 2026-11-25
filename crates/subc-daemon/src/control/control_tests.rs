@@ -49,6 +49,10 @@ async fn route_busy_wait_attribution_resolves_targets_instead_of_trusting_select
 mod peer_manifest {
     include!("../peer_manifest_tests.rs");
 }
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod route_opener {
+    include!("route_opener_tests.rs");
+}
 mod catalog_declarations {
     include!("catalog_tests.rs");
 }
@@ -3963,6 +3967,7 @@ async fn supervisor_routes_serializes_live_draining_bindings_from_the_real_handl
     .await;
 
     let (direct_ctx, mut direct_rx) = route_ctx(ConnectionId::new(102));
+    handler.record_route_opener(direct_ctx.connection_id, RouteOpenerConnection::Tcp);
     let direct_handler = handler.clone();
     let direct_open = tokio::spawn(async move {
         direct_handler
@@ -3985,6 +3990,7 @@ async fn supervisor_routes_serializes_live_draining_bindings_from_the_real_handl
     let _ = direct_rx.recv().await.unwrap();
 
     let (reserved_ctx, mut reserved_rx) = route_ctx(ConnectionId::new(103));
+    handler.record_route_opener(reserved_ctx.connection_id, RouteOpenerConnection::Tcp);
     let reserved_handler = handler.clone();
     let reserved_open = tokio::spawn(async move {
         reserved_handler

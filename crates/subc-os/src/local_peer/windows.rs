@@ -3,7 +3,6 @@
 use super::{ForcedFailures, ObservedPeer, PeerObservation, PeerUser};
 use std::{
     ffi::OsString,
-    mem::size_of_val,
     os::windows::{
         ffi::OsStringExt,
         io::{AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle},
@@ -12,28 +11,25 @@ use std::{
     ptr::null_mut,
 };
 use windows_sys::Win32::{
-    Foundation::{GetLastError, LocalFree, ERROR_PIPE_LOCAL},
+    Foundation::{LocalFree, WAIT_TIMEOUT},
     Security::{
         Authorization::ConvertSidToStringSidW, GetTokenInformation, TokenUser, TOKEN_QUERY,
         TOKEN_USER,
     },
-    System::{
-        Pipes::{GetNamedPipeClientComputerNameW, GetNamedPipeClientProcessId},
-        Threading::{
-            OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
-            PROCESS_QUERY_LIMITED_INFORMATION,
-        },
+    System::Threading::{
+        OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, WaitForSingleObject,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
     },
 };
 
 pub(super) fn observe(pipe: BorrowedHandle<'_>, forced: ForcedFailures) -> ObservedPeer {
-    // A pid reported for a client on another machine names no local process.
-    if !local_client(pipe) {
-        return ObservedPeer::Unobserved;
-    }
-    let Some(pid) = client_pid(pipe) else {
+    let Ok(pid) = crate::named_pipe::local_client_pid(pipe.as_raw_handle()) else {
         return ObservedPeer::Unobserved;
     };
+    observe_local_process(pid, forced)
+}
+
+pub(super) fn observe_local_process(pid: u32, forced: ForcedFailures) -> ObservedPeer {
     let Some(process) = open_process(pid) else {
         return ObservedPeer::Unobserved;
     };
@@ -49,35 +45,14 @@ pub(super) fn observe(pipe: BorrowedHandle<'_>, forced: ForcedFailures) -> Obser
     })
 }
 
-/// Windows answers a client computer-name query on a pipe whose client is on
-/// this machine with `ERROR_PIPE_LOCAL`. Anything else, success included, is
-/// treated as a remote or unknown client.
-fn local_client(pipe: BorrowedHandle<'_>) -> bool {
-    let mut name = [0u16; 256];
-    // SAFETY: name is writable for the byte length passed; the pipe handle is
-    // borrowed for the call.
-    let named = unsafe {
-        GetNamedPipeClientComputerNameW(
-            pipe.as_raw_handle(),
-            name.as_mut_ptr(),
-            size_of_val(&name) as u32,
-        )
-    };
-    // SAFETY: reads this thread's last-error value, set by the call above.
-    named == 0 && unsafe { GetLastError() } == ERROR_PIPE_LOCAL
-}
-
-fn client_pid(pipe: BorrowedHandle<'_>) -> Option<u32> {
-    let mut pid = 0;
-    // SAFETY: pid is a writable u32; the pipe handle is borrowed for the call.
-    let ok = unsafe { GetNamedPipeClientProcessId(pipe.as_raw_handle(), &mut pid) } != 0;
-    (ok && pid != 0).then_some(pid)
-}
-
 fn open_process(pid: u32) -> Option<OwnedHandle> {
+    open_process_with_rights(pid, PROCESS_QUERY_LIMITED_INFORMATION)
+}
+
+fn open_process_with_rights(pid: u32, rights: u32) -> Option<OwnedHandle> {
     // SAFETY: scalar arguments; the result is a new handle or null. Only the
-    // rights needed to read the token user and image name are requested.
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    // query and optional wait rights are requested.
+    let handle = unsafe { OpenProcess(rights, 0, pid) };
     // SAFETY: a non-null OpenProcess result is a handle owned here alone.
     (!handle.is_null()).then(|| unsafe { OwnedHandle::from_raw_handle(handle) })
 }
@@ -148,4 +123,16 @@ fn executable(process: &OwnedHandle) -> Option<PathBuf> {
         return None;
     }
     Some(PathBuf::from(OsString::from_wide(&path[..length as usize])))
+}
+
+pub(super) fn open_diagnostic_process(pid: u32) -> Option<OwnedHandle> {
+    open_process_with_rights(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE)
+}
+
+pub(super) fn process_name(process: &OwnedHandle) -> Option<String> {
+    let image = executable(process)?;
+    // SAFETY: the borrowed process handle has synchronize rights. A zero
+    // timeout probes liveness without waiting; an exited handle is signaled.
+    let alive = unsafe { WaitForSingleObject(process.as_raw_handle(), 0) } == WAIT_TIMEOUT;
+    alive.then_some(image.file_name()?.to_string_lossy().into_owned())
 }

@@ -1014,6 +1014,28 @@ pub struct SupervisorRoute {
     /// never as not-draining.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drain_reason: Option<RouteCloseReason>,
+    /// The connection that opened the route, when the daemon recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opener: Option<SupervisorRouteOpener>,
+}
+
+/// Diagnostic information about a route's opening connection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SupervisorRouteOpener {
+    pub connection_id: u64,
+    pub transport: SupervisorRouteTransport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+}
+
+/// Transport used by the opening connection.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisorRouteTransport {
+    Local,
+    Tcp,
 }
 
 /// Source-tagged provenance for one supervised module.

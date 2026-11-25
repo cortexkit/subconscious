@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.42.7
+
+- Decode optional route opener details while accepting older `supervisor.routes` replies.
+
 ## 0.42.6
 
 - Decode optional `layer` and `path` on project settings file diagnostics.

@@ -441,44 +441,7 @@ mod unix {
     }
 
     pub(super) fn peer_pid(fd: RawFd) -> Option<u32> {
-        #[cfg(target_os = "linux")]
-        {
-            // SAFETY: SO_PEERCRED fills a ucred of the declared size.
-            let mut cred: libc::ucred = unsafe { zeroed() };
-            let mut len = size_of::<libc::ucred>() as libc::socklen_t;
-            let ok = unsafe {
-                libc::getsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_PEERCRED,
-                    (&mut cred as *mut libc::ucred).cast(),
-                    &mut len,
-                )
-            } == 0;
-            (ok && len as usize == size_of::<libc::ucred>() && cred.pid > 0)
-                .then_some(cred.pid as u32)
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let mut pid: libc::pid_t = 0;
-            let mut len = size_of::<libc::pid_t>() as libc::socklen_t;
-            // SAFETY: LOCAL_PEERPID fills a pid_t of the declared size.
-            let ok = unsafe {
-                libc::getsockopt(
-                    fd,
-                    libc::SOL_LOCAL,
-                    libc::LOCAL_PEERPID,
-                    (&mut pid as *mut libc::pid_t).cast(),
-                    &mut len,
-                )
-            } == 0;
-            (ok && len as usize == size_of::<libc::pid_t>() && pid > 0).then_some(pid as u32)
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        {
-            let _ = fd;
-            None
-        }
+        crate::local_peer::unix_peer_pid(fd)
     }
 
     pub(super) fn adopt(value: &OsStr, daemon: u32) -> Decision {

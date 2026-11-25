@@ -688,6 +688,7 @@ impl ControlHandler {
         frame: Frame,
         module_id: Option<String>,
     ) -> Result<Vec<Frame>, RouterError> {
+        let mut openers = HashMap::new();
         let modules = self
             .forwarding
             .route_census(module_id.as_deref())
@@ -715,6 +716,10 @@ impl ControlHandler {
                             .unwrap_or(u64::MAX),
                         draining: route.draining,
                         drain_reason: route.drain_reason,
+                        opener: openers
+                            .entry(route.goodbye_target.connection_id)
+                            .or_insert_with_key(|connection| self.route_opener(*connection))
+                            .clone(),
                     })
                     .collect(),
             })
@@ -725,6 +730,32 @@ impl ControlHandler {
             &response,
             "ClientControlResponse::SupervisorRoutes",
         )?])
+    }
+
+    fn route_opener(
+        &self,
+        connection: ConnectionId,
+    ) -> Option<subc_control::SupervisorRouteOpener> {
+        use subc_control::{SupervisorRouteOpener, SupervisorRouteTransport};
+
+        // Several routes may share a connection. Resolve its name once per
+        // reply, outside the lock, so other connections can open and close.
+        let opener = self
+            .route_openers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&connection)
+            .cloned()?;
+        let (transport, process) = match opener {
+            RouteOpenerConnection::Local(process) => (SupervisorRouteTransport::Local, process),
+            RouteOpenerConnection::Tcp => (SupervisorRouteTransport::Tcp, None),
+        };
+        Some(SupervisorRouteOpener {
+            connection_id: connection.get(),
+            transport,
+            pid: process.as_ref().map(|process| process.pid()),
+            command: process.and_then(|process| process.short_name()),
+        })
     }
 
     fn running_registration_method(

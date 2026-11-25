@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.21.49
+
+- Show the opener for each route in `ck routes` plain and JSON output.
+- Require subc-daemon 0.50.57, subc-control 0.42.7 and subc-os 0.1.52.
+
 ## 0.21.48
 
 - Test doctor module-state mapping independently of RPC worker deadlines.

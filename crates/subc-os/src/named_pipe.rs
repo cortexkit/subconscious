@@ -49,15 +49,18 @@ pub fn owner_only_security() -> io::Result<()> {
 /// reading anything from the connection.
 #[cfg(windows)]
 pub fn reject_remote_client(pipe: &impl std::os::windows::io::AsRawHandle) -> io::Result<()> {
-    windows::reject_remote_client(pipe.as_raw_handle())
+    reject_remote_client_raw(pipe.as_raw_handle())
 }
 
 /// [`reject_remote_client`] for a caller that already holds the raw handle,
 /// such as tokio's `NamedPipeServer`, whose `AsRawHandle` is not public.
 #[cfg(windows)]
 pub fn reject_remote_client_raw(handle: std::os::windows::raw::HANDLE) -> io::Result<()> {
-    windows::reject_remote_client(handle)
+    windows::local_client_pid(handle).map(|_| ())
 }
+
+#[cfg(windows)]
+pub(crate) use windows::local_client_pid;
 
 /// Create one end of `pipe_name`, the daemon's local listener end on Windows:
 /// overlapped, byte mode, remote clients refused, and with an owner-only DACL.

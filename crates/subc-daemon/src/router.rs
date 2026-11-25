@@ -1038,6 +1038,14 @@ impl Router {
         self.control.record_local_connection(connection);
     }
 
+    pub(crate) fn record_route_opener(
+        &self,
+        connection: ConnectionId,
+        opener: crate::control::RouteOpenerConnection,
+    ) {
+        self.control.record_route_opener(connection, opener);
+    }
+
     /// Reserve an `activity.subscribe` correlation before the reader hands the
     /// request to a task; hold the result for the task's lifetime.
     pub(crate) fn reserve_activity_subscription(

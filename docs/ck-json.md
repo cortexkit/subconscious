@@ -249,7 +249,12 @@ same acknowledgement enrichment as the exempt actions, but with a schema.
 `routes [<module>]`: `{schema, op:"supervisor.routes", modules:[route_module]}`.
 Each `route_module` is `{module_id:string,routes:[route]}`. A `route` is
 `{consumer:{kind:"reserved",module_id:string}|{kind:"direct",connection_id:number},
-age_ms:number,draining:boolean,drain_reason?:string}`.
+age_ms:number,draining:boolean,drain_reason?:string,
+opener?:{connection_id:number,transport:"local"|"tcp",pid?:number,command?:string}}`.
+The optional `opener` describes the connection independently of the consumer's
+kind. TCP openers do not carry a PID or command. The plain view shows the
+available information in the `opener` column, for example
+`local pid 4821 (session-worker)`.
 
 ### `ck.catalog/v1`
 

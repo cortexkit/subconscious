@@ -493,11 +493,13 @@ async fn serve_unix_local(
             }
             Err(source) => return Err(local_accept_error(&path, source)),
         };
-        let peer = subc_os::local_peer::capture_unix_peer_credentials(&stream);
+        let (peer, diagnostic_pid) =
+            subc_os::local_peer::capture_unix_peer_with_diagnostic_pid(&stream);
+        let opener = diagnostic_pid.map(subc_os::local_peer::DiagnosticProcess::capture);
         let router = Arc::clone(&router);
         let auth = auth.clone();
         tokio::spawn(async move {
-            let _ = handle_accepted_local_connection(stream, router, auth, peer).await;
+            let _ = handle_accepted_local_connection(stream, router, auth, peer, opener).await;
         });
     }
 }
@@ -556,13 +558,19 @@ async fn serve_pipe_local(
         let auth = auth.clone();
         // Refuse network clients before observing a process or reading a byte.
         // The pipe's PIPE_REJECT_REMOTE_CLIENTS flag is the first gate.
-        if let Err(error) = subc_os::named_pipe::reject_remote_client(&server) {
-            warn!(%error, "refused a non-local named-pipe client on the local endpoint");
-            continue;
-        }
-        let peer = subc_os::local_peer::observe_pipe_client(&server).into();
+        let (peer, diagnostic_pid) =
+            match subc_os::local_peer::capture_pipe_client_with_diagnostic_pid(&server) {
+                Ok(capture) => capture,
+                Err(error) => {
+                    warn!(%error, "refused a non-local named-pipe client on the local endpoint");
+                    continue;
+                }
+            };
+        let opener = Some(subc_os::local_peer::DiagnosticProcess::capture(
+            diagnostic_pid,
+        ));
         tokio::spawn(async move {
-            let _ = handle_accepted_local_connection(server, router, auth, peer).await;
+            let _ = handle_accepted_local_connection(server, router, auth, peer, opener).await;
         });
     }
 }
@@ -586,12 +594,14 @@ async fn handle_accepted_local_connection<S>(
     router: Arc<Router>,
     auth: ServerAuth,
     peer: subc_os::local_peer::CapturedPeer,
+    opener: Option<subc_os::local_peer::DiagnosticProcess>,
 ) -> Result<(), ConnectionError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let result =
-        handle_connection_with_peer(stream, router, auth, LocalOrigin::Local, Some(peer)).await;
+        handle_connection_with_peer(stream, router, auth, LocalOrigin::Local, Some(peer), opener)
+            .await;
     if let Err(error) = &result {
         debug!(error = %error, "local-endpoint connection ended");
     }
@@ -708,7 +718,7 @@ pub(crate) async fn handle_connection_with_origin<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    handle_connection_with_peer(stream, router, auth, origin, None).await
+    handle_connection_with_peer(stream, router, auth, origin, None, None).await
 }
 
 fn clone_tcp_socket(stream: &tokio::net::TcpStream) -> io::Result<std::net::TcpStream> {
@@ -741,6 +751,7 @@ async fn handle_connection_with_peer<S>(
     auth: ServerAuth,
     origin: LocalOrigin,
     peer: Option<subc_os::local_peer::CapturedPeer>,
+    opener: Option<subc_os::local_peer::DiagnosticProcess>,
 ) -> Result<(), ConnectionError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -836,8 +847,14 @@ where
         spawn.bind(connection_id);
     }
     router.record_caller_endpoints(connection_id, endpoints);
-    if matches!(origin, LocalOrigin::Local) {
-        router.record_local_connection(connection_id);
+    use crate::control::RouteOpenerConnection;
+    match &origin {
+        LocalOrigin::Local => {
+            router.record_local_connection(connection_id);
+            router.record_route_opener(connection_id, RouteOpenerConnection::Local(opener));
+        }
+        LocalOrigin::Tcp => router.record_route_opener(connection_id, RouteOpenerConnection::Tcp),
+        LocalOrigin::RegistrationChannel(_) => {}
     }
     if let Some(peer) = peer {
         router.record_captured_peer(connection_id, peer);

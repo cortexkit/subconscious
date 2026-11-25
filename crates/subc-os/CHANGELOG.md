@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.52
+
+- Add local-peer PID and live process-name diagnostics without changing what establishes peer trust.
+
 ## 0.1.51
 
 - On Windows, verify that a placement file or directory is owned by the current

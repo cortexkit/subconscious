@@ -234,6 +234,22 @@ pub(super) fn capture_credentials(socket: BorrowedFd<'_>, forced: ForcedFailures
     }
 }
 
+pub(super) fn peer_pid(socket: std::os::fd::RawFd) -> Option<u32> {
+    let mut pid: libc::pid_t = 0;
+    let mut len = size_of::<libc::pid_t>() as libc::socklen_t;
+    // SAFETY: LOCAL_PEERPID fills a pid_t of the declared size.
+    let ok = unsafe {
+        libc::getsockopt(
+            socket,
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut len,
+        )
+    } == 0;
+    (ok && len as usize == size_of::<libc::pid_t>() && pid > 0).then_some(pid as u32)
+}
+
 pub(super) fn observe_code(peer: &CapturedPeer, forced: ForcedFailures) -> ObservedPeer {
     let (Some(token), ObservedPeer::Observed(mut observation)) =
         (peer.token, peer.observation.clone())

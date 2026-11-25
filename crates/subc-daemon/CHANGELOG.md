@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.50.57
+
+- Report the connection and available process details that opened each route in `supervisor.routes`.
+
 ## 0.50.56
 
 - On a planned daemon shutdown, wait up to 500 ms for the shutdown marker to

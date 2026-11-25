@@ -10,7 +10,11 @@
             "kind": "direct"
           },
           "drain_reason": "reload",
-          "draining": true
+          "draining": true,
+          "opener": {
+            "connection_id": 102,
+            "transport": "tcp"
+          }
         },
         {
           "age_ms": 0,
@@ -19,7 +23,11 @@
             "module_id": "fed"
           },
           "drain_reason": "reload",
-          "draining": true
+          "draining": true,
+          "opener": {
+            "connection_id": 103,
+            "transport": "tcp"
+          }
         }
       ]
     }

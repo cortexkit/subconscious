@@ -200,6 +200,13 @@ type AsyncTestPause = (
     tokio::sync::oneshot::Receiver<()>,
 );
 
+/// Accept-time diagnostics, kept apart from peer observations used for trust.
+#[derive(Clone)]
+pub(crate) enum RouteOpenerConnection {
+    Local(Option<subc_os::local_peer::DiagnosticProcess>),
+    Tcp,
+}
+
 /// Real channel-0 control handler for subc itself.
 #[derive(Clone)]
 pub struct ControlHandler {
@@ -293,6 +300,7 @@ pub struct ControlHandler {
     /// The local and peer address of each accepted TCP client connection, read
     /// from the daemon's own socket, so a privileged request can name its caller.
     caller_endpoints: Arc<Mutex<HashMap<ConnectionId, (SocketAddr, SocketAddr)>>>,
+    route_openers: Arc<Mutex<HashMap<ConnectionId, RouteOpenerConnection>>>,
     build_class_warned: Arc<Mutex<HashSet<ConnectionId>>>,
     observed_peers: Arc<Mutex<HashMap<ConnectionId, ObservedPeer>>>,
     captured_peers: Arc<Mutex<HashMap<ConnectionId, Arc<peer_identity::PeerCapture>>>>,
@@ -509,6 +517,7 @@ impl ControlHandler {
             federated_scope_owner: crate::daemon_config::default_federated_scope_owner(),
             privileged_operator_prompt: PrivilegedOperatorPrompt::default(),
             caller_endpoints: Arc::new(Mutex::new(HashMap::new())),
+            route_openers: Arc::new(Mutex::new(HashMap::new())),
             build_class_warned: Arc::new(Mutex::new(HashSet::new())),
             observed_peers: Arc::new(Mutex::new(HashMap::new())),
             captured_peers: Arc::new(Mutex::new(HashMap::new())),
@@ -799,6 +808,17 @@ impl ControlHandler {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .insert(connection);
+    }
+
+    pub(crate) fn record_route_opener(
+        &self,
+        connection: ConnectionId,
+        opener: RouteOpenerConnection,
+    ) {
+        self.route_openers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(connection, opener);
     }
 
     // Keep the connection-level delivery decision shared with route.bind. The
@@ -1475,6 +1495,10 @@ impl ControlHandler {
             .unwrap_or_else(|p| p.into_inner())
             .remove(&connection_id);
         self.caller_endpoints
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&connection_id);
+        self.route_openers
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(&connection_id);

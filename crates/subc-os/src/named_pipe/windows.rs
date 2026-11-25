@@ -242,7 +242,7 @@ pub(super) fn current_user_sid_string() -> io::Result<String> {
 
 /// Refuse a client that reached the pipe over SMB: a local client has no
 /// computer name, and reports `ERROR_PIPE_LOCAL` instead.
-pub(super) fn reject_remote_client(raw: std::os::windows::raw::HANDLE) -> io::Result<()> {
+pub(crate) fn local_client_pid(raw: std::os::windows::raw::HANDLE) -> io::Result<u32> {
     let mut computer = [0u16; 256];
     // SAFETY: raw is a connected pipe server handle; the buffer is writable for
     // the byte length passed with it.
@@ -274,7 +274,7 @@ pub(super) fn reject_remote_client(raw: std::os::windows::raw::HANDLE) -> io::Re
             "named-pipe client process is unknown, so it cannot be a local process",
         ));
     }
-    Ok(())
+    Ok(pid)
 }
 
 /// Render SID bytes as the familiar `S-1-<authority>-<subauthorities>` form.

@@ -38,6 +38,8 @@ mod inline_views;
 mod log_tail;
 mod policy_root_cli;
 mod response_budget;
+mod routes_cli;
+use routes_cli::supervisor_routes;
 mod stack_cli;
 mod window_cli;
 use ck_help::{is_builtin_domain, top_help, BUILTIN_DOMAINS};
@@ -404,7 +406,7 @@ const MODULE_HELP: &str = "ck module — inspect and control supervised modules\
 
 const CATALOG_HELP: &str = "ck catalog — what is registered with the daemon right now\n\nusage: ck [--json] catalog [<module-id>]\n\n  ck catalog         every module registered on the wire\n  ck catalog <id>    one module, exit 1 if it is not registered\n\nThis is the REGISTRY, not the supervisor roster: a module that connected and\nregistered itself appears here even though the daemon did not spawn it, so\n'ck module list' will not show it. Harnesses waiting for a module to come up\nshould poll this.";
 
-const ROUTES_HELP: &str = "ck routes — inspect live route consumers\n\nusage: ck [--json] routes [<module-id>]\n\n  ck routes          live consumers for every connected module\n  ck routes <id>     live consumers for one connected module";
+const ROUTES_HELP: &str = "ck routes — inspect live route consumers and openers\n\nusage: ck [--json] routes [<module-id>]\n\n  ck routes          live routes for every connected module\n  ck routes <id>     live routes for one connected module";
 
 const PROVENANCE_HELP: &str = "ck provenance — inspect source-tagged module provenance\n\nusage: ck [--json] [--verbose] provenance <module-id>\n\n  ck provenance <id>  daemon-attested process facts beside module declarations";
 
@@ -3423,79 +3425,6 @@ fn catalog_readiness_text(entry: &CatalogEntry) -> String {
         Some(reason) => format!("not ready ({})", humanize_identifier(&reason.reason)),
         None => "not ready".to_string(),
     }
-}
-
-async fn supervisor_routes(
-    client: &mut CkClient,
-    module_id: Option<&str>,
-    json_output: JsonOutput,
-) -> Result<(), CkError> {
-    let response = client
-        .rpc_value(ClientControlRequest::SupervisorRoutes {
-            module_id: module_id.map(str::to_owned),
-        })
-        .await?;
-    if json_output.enabled {
-        json_output.print(&response)?;
-        return Ok(());
-    }
-
-    let mut rows = Vec::new();
-    for module in modules_array(&response) {
-        let module_id = display_field(module, "module_id");
-        for route in module
-            .get("routes")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            let consumer = match route.get("consumer").and_then(Value::as_object) {
-                Some(consumer)
-                    if consumer.get("kind").and_then(Value::as_str) == Some("reserved") =>
-                {
-                    consumer
-                        .get("module_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("reserved")
-                        .to_string()
-                }
-                Some(consumer) => format!(
-                    "direct ({})",
-                    consumer
-                        .get("connection_id")
-                        .and_then(Value::as_u64)
-                        .map(|id| format!("connection {id}"))
-                        .unwrap_or_else(|| "connection unknown".to_string())
-                ),
-                None => "direct (connection unknown)".to_string(),
-            };
-            let age = route
-                .get("age_ms")
-                .and_then(Value::as_u64)
-                .map(|age| format_duration(Duration::from_millis(age)))
-                .unwrap_or_else(|| "-".to_string());
-            let state = if route
-                .get("draining")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
-                match route.get("drain_reason").and_then(Value::as_str) {
-                    Some(reason) => format!("draining ({})", humanize_identifier(reason)),
-                    None => "draining".to_string(),
-                }
-            } else {
-                "live".to_string()
-            };
-            rows.push(vec![module_id.clone(), consumer, age, state]);
-        }
-    }
-
-    if rows.is_empty() {
-        println!("no live routes");
-    } else {
-        print_table(&["module", "consumer", "age", "state"], rows);
-    }
-    Ok(())
 }
 
 async fn provenance(

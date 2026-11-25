@@ -14,8 +14,9 @@ use subc_control::{
     StagedGeneration, StderrCaptureState, StderrTail, StderrTailEntry, SupervisorDaemonProvenance,
     SupervisorEntry, SupervisorHealthEntry, SupervisorHealthStatus, SupervisorModuleProvenance,
     SupervisorObservedProcess, SupervisorRescanResult, SupervisorRoute, SupervisorRouteConsumer,
-    SupervisorRouteModule, APP_NOT_INSTALLED, APP_OPEN_DISABLED, APP_OPEN_ERROR_CODES,
-    APP_OPEN_NOT_USED, APP_UNKNOWN, APP_VERIFICATION_FAILED,
+    SupervisorRouteModule, SupervisorRouteOpener, SupervisorRouteTransport, APP_NOT_INSTALLED,
+    APP_OPEN_DISABLED, APP_OPEN_ERROR_CODES, APP_OPEN_NOT_USED, APP_UNKNOWN,
+    APP_VERIFICATION_FAILED,
 };
 use subc_protocol::{
     manifest::{
@@ -918,17 +919,19 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                 modules: vec![SupervisorRouteModule {
                     module_id: "target".to_string(),
                     routes: vec![
-                        // Mirrors the REAL-HANDLER-generated golden exactly (the
-                        // census golden's authoritative producer is the handler
-                        // test in subc-core control.rs; this fixture must agree
-                        // byte-for-byte or the two tests fight over the file).
-                        // The old-daemon absent-reason wire is pinned separately
-                        // below in a decode-tolerance test, not in this golden.
+                        // Match the daemon control handler's route census
+                        // test, which checks the same golden against a live reply.
                         SupervisorRoute {
                             consumer: SupervisorRouteConsumer::Direct { connection_id: 102 },
                             age_ms: 0,
                             draining: true,
                             drain_reason: Some(RouteCloseReason::Reload),
+                            opener: Some(SupervisorRouteOpener {
+                                connection_id: 102,
+                                transport: SupervisorRouteTransport::Tcp,
+                                pid: None,
+                                command: None,
+                            }),
                         },
                         SupervisorRoute {
                             consumer: SupervisorRouteConsumer::Reserved {
@@ -937,6 +940,12 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
                             age_ms: 0,
                             draining: true,
                             drain_reason: Some(RouteCloseReason::Reload),
+                            opener: Some(SupervisorRouteOpener {
+                                connection_id: 103,
+                                transport: SupervisorRouteTransport::Tcp,
+                                pid: None,
+                                command: None,
+                            }),
                         },
                     ],
                 }],
@@ -1666,12 +1675,21 @@ fn a_census_route_without_a_drain_reason_still_decodes() {
     let route: SupervisorRoute = serde_json::from_str(old_wire).expect("old census wire decodes");
     assert!(route.draining);
     assert_eq!(route.drain_reason, None);
+    assert_eq!(route.opener, None);
     // And absence round-trips: a None reason must not appear on the wire, so a
     // new consumer relaying an old daemon's census cannot invent the field.
     let reserialized = serde_json::to_string(&route).expect("serializes");
     assert!(
         !reserialized.contains("drain_reason"),
         "absent reason must stay absent: {reserialized}"
+    );
+    assert!(!reserialized.contains("opener"));
+
+    let mut future_wire: serde_json::Value = serde_json::from_str(old_wire).unwrap();
+    future_wire["future_field"] = serde_json::json!(true);
+    assert_eq!(
+        serde_json::from_value::<SupervisorRoute>(future_wire).unwrap(),
+        route
     );
 }
 

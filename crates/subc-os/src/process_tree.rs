@@ -853,7 +853,7 @@ fn entries() -> io::Result<Vec<Entry>> {
 }
 
 #[cfg(target_os = "macos")]
-fn program_name(pid: u32) -> String {
+pub(crate) fn program_name(pid: u32) -> String {
     #[allow(unsafe_code)]
     unsafe extern "C" {
         fn proc_name(pid: libc::c_int, buffer: *mut std::ffi::c_void, size: u32) -> libc::c_int;

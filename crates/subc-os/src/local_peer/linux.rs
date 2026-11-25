@@ -3,7 +3,7 @@
 use super::{ForcedFailures, ObservedPeer, PeerObservation, PeerUser};
 use std::{
     mem::size_of,
-    os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
+    os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
     path::PathBuf,
 };
 
@@ -20,17 +20,25 @@ pub(super) fn observe_checking(
     forced: ForcedFailures,
     alive: impl FnOnce(&OwnedFd) -> bool,
 ) -> ObservedPeer {
+    observe_with_pid(socket, forced, alive).0
+}
+
+pub(super) fn observe_with_pid(
+    socket: BorrowedFd<'_>,
+    forced: ForcedFailures,
+    alive: impl FnOnce(&OwnedFd) -> bool,
+) -> (ObservedPeer, Option<u32>) {
     // Both values were recorded by the kernel when the peer connected. The
     // pidfd pins that process, so a later exe read can be checked against it.
     let Some(pidfd) = peer_pidfd(socket).filter(|_| !forced.peer_pidfd) else {
-        return ObservedPeer::Unobserved;
+        return (ObservedPeer::Unobserved, peer_pid(socket.as_raw_fd()));
     };
-    let Some(credentials) = peer_credentials(socket).filter(|_| !forced.user) else {
-        return ObservedPeer::Unobserved;
+    let Some(credentials) = peer_credentials(socket.as_raw_fd()).filter(|_| !forced.user) else {
+        return (ObservedPeer::Unobserved, None);
     };
     // A negative pid never names a process.
     let Ok(pid) = u32::try_from(credentials.pid) else {
-        return ObservedPeer::Unobserved;
+        return (ObservedPeer::Unobserved, None);
     };
     let exe = (!forced.exe)
         .then(|| executable(pid))
@@ -38,12 +46,21 @@ pub(super) fn observe_checking(
         // Read first, then check: if the peer has exited, its pid may already
         // name another process, whose executable the read may have returned.
         .filter(|_| alive(&pidfd));
-    ObservedPeer::Observed(PeerObservation {
-        user: PeerUser::Uid(credentials.uid),
-        pid,
-        exe,
-        signing_id: None,
-    })
+    (
+        ObservedPeer::Observed(PeerObservation {
+            user: PeerUser::Uid(credentials.uid),
+            pid,
+            exe,
+            signing_id: None,
+        }),
+        (pid != 0).then_some(pid),
+    )
+}
+
+pub(super) fn peer_pid(socket: RawFd) -> Option<u32> {
+    u32::try_from(peer_credentials(socket)?.pid)
+        .ok()
+        .filter(|pid| *pid != 0)
 }
 
 /// The peer's pidfd, or `None` when the kernel lacks `SO_PEERPIDFD` (before
@@ -70,7 +87,7 @@ fn peer_pidfd(socket: BorrowedFd<'_>) -> Option<OwnedFd> {
     Some(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-fn peer_credentials(socket: BorrowedFd<'_>) -> Option<libc::ucred> {
+fn peer_credentials(socket: RawFd) -> Option<libc::ucred> {
     let mut credentials = libc::ucred {
         pid: 0,
         uid: 0,
@@ -78,10 +95,10 @@ fn peer_credentials(socket: BorrowedFd<'_>) -> Option<libc::ucred> {
     };
     let mut length = size_of::<libc::ucred>() as libc::socklen_t;
     // SAFETY: credentials and length are live, writable and sized for the
-    // ucred this option returns; the socket descriptor is borrowed.
+    // ucred this option returns. An invalid descriptor returns an error.
     let status = unsafe {
         libc::getsockopt(
-            socket.as_raw_fd(),
+            socket,
             libc::SOL_SOCKET,
             libc::SO_PEERCRED,
             (&mut credentials as *mut libc::ucred).cast(),

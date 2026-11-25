@@ -334,6 +334,13 @@ struct UnanchoredAck {
 pub(crate) type IoThreads =
     std::sync::Arc<std::sync::Mutex<Vec<(&'static str, std::thread::ThreadId)>>>;
 
+#[derive(PartialEq, Eq)]
+struct IntegrityFingerprint {
+    store: Option<disk::Fingerprint>,
+    #[cfg(feature = "test-support")]
+    anchor: Option<disk::Fingerprint>,
+}
+
 /// One instance per daemon, serialized by its gate lock. No method reads live
 /// configuration files. Diagnostic snapshots are validated and redacted; approved
 /// delivery bytes may contain vault reference names, never literal secret values.
@@ -344,6 +351,7 @@ pub struct ConfigStore {
     state: StoreState,
     publication_sequence: u64,
     expected_digest: Option<[u8; 32]>,
+    last_integrity_poll: Option<(IntegrityFingerprint, tokio::time::Instant)>,
     pending_anchor: Option<(StoreAnchor, bool)>,
     pending_prior_anchor: Option<AnchorState>,
     warnings: Vec<String>,
@@ -444,6 +452,7 @@ impl ConfigStore {
             state: StoreState::Unstamped,
             publication_sequence: 0,
             expected_digest: None,
+            last_integrity_poll: None,
             pending_anchor: None,
             pending_prior_anchor: None,
             warnings: Vec::new(),
@@ -665,6 +674,41 @@ impl ConfigStore {
             _ => Ok(()),
         }
     }
+    pub(crate) fn poll_integrity(&mut self) {
+        // File changes are checked on the settings poller's 2 s cadence. The
+        // native keychain item has no file fingerprint, so verify it at least
+        // every 5 min even when all watched files stay unchanged.
+        const FULL_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+        let now = tokio::time::Instant::now();
+        let fingerprint = self.integrity_fingerprint().ok();
+        if self.degraded_key.is_none()
+            && self.usable().is_ok()
+            && self.last_integrity_poll.as_ref().is_some_and(|(last, at)| {
+                fingerprint.as_ref() == Some(last) && now.duration_since(*at) < FULL_CHECK_INTERVAL
+            })
+        {
+            return;
+        }
+        // Cache the fingerprint taken before verification, so a change while
+        // verification is in progress cannot hide from the next poll.
+        self.last_integrity_poll = if self.check().is_ok() && self.degraded_key.is_none() {
+            fingerprint.map(|files| (files, now))
+        } else {
+            None
+        };
+    }
+
+    fn integrity_fingerprint(&self) -> io::Result<IntegrityFingerprint> {
+        Ok(IntegrityFingerprint {
+            store: disk::fingerprint(&self.path())?,
+            #[cfg(feature = "test-support")]
+            anchor: match self.hooks.as_ref().and_then(testing::TestSupport::key_file) {
+                Some(path) => disk::fingerprint(path)?,
+                None => None,
+            },
+        })
+    }
+
     /// Re-check before every authority use, including after delivery writes.
     pub fn check(&mut self) -> Result<(), StoreError> {
         self.usable()?;

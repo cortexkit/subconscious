@@ -1159,14 +1159,11 @@ impl ControlHandler {
                     self.record_control_usage(ctx.connection_id, &probe.op);
                 }
                 let claim_present = op.as_ref().is_some_and(|probe| probe.op == "claim.present");
-                if let Some(refusal) = self
-                    .recovery_request_refusal(
-                        ctx,
-                        &frame,
-                        op.as_ref().map(|probe| probe.op.as_str()),
-                    )
-                    .await?
-                {
+                if let Some(refusal) = self.recovery_request_refusal(
+                    ctx,
+                    &frame,
+                    op.as_ref().map(|probe| probe.op.as_str()),
+                )? {
                     if claim_present {
                         self.reclaim_presented_expiry(&frame);
                         return self

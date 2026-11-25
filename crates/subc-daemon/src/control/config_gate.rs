@@ -756,7 +756,7 @@ impl ControlHandler {
                 Ok(ConfigControlResponse::ProgramPlaced { generation })
             }
             ConfigControlRequest::Status {} => {
-                let snapshot = runtime.polled_snapshot()?;
+                let snapshot = runtime.observed_snapshot()?;
                 let mut status = runtime.polled_status_from(snapshot.clone()).await?;
                 let phone = self
                     .config_phone_surface_checked(false, Some(&snapshot))

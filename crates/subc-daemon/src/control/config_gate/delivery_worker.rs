@@ -73,10 +73,9 @@ impl ControlHandler {
         let handler = Arc::downgrade(self);
         let projects = owner.project_settings_enabled();
         Some(tokio::spawn(async move {
+            let mut settings = JoinSet::new();
+            settings.spawn(poll_settings(handler.clone(), projects));
             let mut tasks = JoinSet::new();
-            if projects {
-                tasks.spawn(poll_project_membership(handler.clone()));
-            }
             let mut wakes = HashMap::<ConnectionId, Arc<Notify>>::new();
             let recording = Arc::new(std::sync::Mutex::new(HashSet::<String>::new()));
             let mut restarting = HashSet::<(String, u64)>::new();
@@ -331,6 +330,11 @@ impl ControlHandler {
                     }
                 });
                 tokio::select! {
+                    result = settings.join_next(), if !settings.is_empty() => {
+                        if let Some(Err(error)) = result {
+                            warn!(%error, "settings poller stopped");
+                        }
+                    },
                     _ = changed.notified(), if listen_for_changes => {
                         #[cfg(test)]
                         report_delivery_wake(&handler, "notification");
@@ -425,7 +429,7 @@ async fn config_recovery_exit_retry_backoff_caps_and_does_not_postpone_on_owner_
     assert_eq!(retry.next, Some(start + Duration::from_secs(185)));
 }
 
-async fn poll_project_membership(handler: std::sync::Weak<ControlHandler>) {
+async fn poll_settings(handler: std::sync::Weak<ControlHandler>, projects: bool) {
     use crate::config_gate::runtime::{
         unstamped::USER_FILE_POLL_INTERVAL, unstamped_projects::UnstampedProjectHint,
     };
@@ -434,13 +438,27 @@ async fn poll_project_membership(handler: std::sync::Weak<ControlHandler>) {
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let (hints, mut ready) = tokio::sync::mpsc::unbounded_channel::<UnstampedProjectHint>();
     let mut tasks = JoinSet::new();
+    let mut membership = JoinSet::new();
     loop {
         tokio::select! {
             _ = poll.tick() => {
                 let Some(control) = handler.upgrade() else { break };
                 let Some(owner) = &control.config_runtime else { break };
-                let _ = owner.refresh_project_membership().await;
-                let owner = owner.clone();
+                let _ = owner.on_blocking(|owner| owner.poll_store_integrity()).await;
+                if projects && membership.is_empty() {
+                    let owner = owner.clone();
+                    // A slow registry RPC must not postpone the next integrity tick.
+                    membership.spawn(async move {
+                        let _ = owner.refresh_project_membership().await;
+                        owner
+                    });
+                }
+            }
+            Some(result) = membership.join_next(), if !membership.is_empty() => {
+                let Ok(owner) = result else {
+                    warn!("project membership task stopped");
+                    continue;
+                };
                 let hints = hints.clone();
                 // A root in a previous pass can still be running. The pool
                 // keeps its reservation while later ticks observe other roots.

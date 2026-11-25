@@ -18,6 +18,8 @@ mod key_access;
 mod plan_rows;
 #[path = "policy_root_tests.rs"]
 mod policy_root;
+#[path = "route_recovery_tests.rs"]
+mod route_recovery;
 #[path = "status_placement_tests.rs"]
 mod status_placement;
 
@@ -141,6 +143,7 @@ async fn config_recovery_allowlist_precedes_probed_and_legacy_ops() {
     rig.stamp(&owner);
     let store = rig.path.join("store").join(crate::config_store::STORE_FILE);
     std::fs::write(&store, b"tampered").unwrap();
+    owner.poll_store_integrity().unwrap();
     let handler = crate::ControlHandler::new(std::sync::Arc::new(crate::Registry::default()))
         .with_config_runtime(owner.clone())
         .with_privileged_operator_prompt(crate::daemon_config::PrivilegedOperatorPrompt::Enforce);
@@ -179,6 +182,10 @@ async fn config_recovery_allowlist_precedes_probed_and_legacy_ops() {
         let reply = handler.handle_control_frame(&ctx, frame).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&reply[0].body).unwrap();
         assert_eq!(body["code"], "config_gated", "{op}: {body}");
+        assert_eq!(
+            body["message"], "configuration store is in recovery",
+            "{op}: {body}"
+        );
         assert_eq!(std::fs::read(&store).unwrap(), b"tampered", "{op}");
     }
     assert_eq!(owner.status().unwrap().state, "store_unverified");

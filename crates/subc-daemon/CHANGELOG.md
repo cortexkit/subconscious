@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.50.61
+
+- Open routes without waiting for configuration approvals or other writes to release the configuration owner. Recovery refusals use the last published configuration state.
+
 ## 0.50.60
 
 - Attest which vault keys an opening module's approved settings name when binding a route to the vault.

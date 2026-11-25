@@ -57,7 +57,7 @@ impl ControlHandler {
         self.recovery_exit_test_quiet_retry = quiet_retry;
         self
     }
-    pub(in crate::control) async fn recovery_request_refusal(
+    pub(in crate::control) fn recovery_request_refusal(
         &self,
         ctx: &RouteCtx,
         frame: &Frame,
@@ -68,16 +68,13 @@ impl ControlHandler {
         if matches!(op, Some("supervisor.list" | "config.status")) {
             return Ok(None);
         }
-        let Some(owner) = self.config_runtime.clone() else {
+        let Some(owner) = self.config_runtime.as_ref() else {
             return Ok(None);
         };
         let recovering = if op == Some("catalog.list") {
             owner.is_recovering()
         } else {
-            owner
-                .on_blocking(|owner| owner.check_recovery())
-                .await
-                .unwrap_or(true)
+            owner.refuses_control_in_recovery()
         };
         if !recovering {
             return Ok(None);

@@ -48,6 +48,11 @@ jobs:
           fi
           echo "Publishing ${CRATE} v${VERSION}"
 
+      - name: Check public API compatibility with crates.io
+        env:
+          CRATE: ${{ inputs.crate }}
+        run: bash scripts/release/check-published-crate-semver.sh --crate "$CRATE"
+
       # Idempotent: a retag or a repeated bump run treats "already exists" as
       # success instead of failing after the registry accepted the crate.
       #

@@ -144,6 +144,44 @@ check_case never-published-404 \
   "subc-control $(manifest_version subc-control)" 0 \
   bash "$detector" --registry-json-dir "$never_published"
 
+semver_registry="$test_root/semver-registry"
+mkdir -p "$semver_registry"
+cat >"$semver_registry/subc-protocol.json" <<'JSON'
+{"crate":{"max_version":"0.2.0"},"versions":[{"num":"0.1.0"},{"num":"0.2.0"}]}
+JSON
+check_case semver-tagged-crate "subc-protocol $(manifest_version subc-protocol) 0.2.0" 0 \
+  bash "$detector" --semver-candidates --crate subc-protocol --registry-json-dir "$semver_registry"
+check_case semver-first-release '' 0 \
+  bash "$detector" --semver-candidates --registry-json-dir "$never_published"
+check_case semver-already-published '' 0 \
+  bash "$detector" --semver-candidates --crate subc-protocol --registry-json-dir "$all_current"
+
+base_repo="$test_root/base-repo"
+mkdir -p "$base_repo/scripts/release"
+cp "$detector" "$base_repo/scripts/release/"
+for manifest in "$repo_root"/crates/*/Cargo.toml; do
+  relative="${manifest#"$repo_root/"}"
+  mkdir -p "$base_repo/$(dirname "$relative")"
+  cp "$manifest" "$base_repo/$relative"
+done
+printf '[package]\nversion = "0.2.0"\n' >"$base_repo/crates/subc-protocol/Cargo.toml"
+git -C "$base_repo" init -q &&
+  git -C "$base_repo" add crates &&
+  git -C "$base_repo" -c user.name='Fixture' -c user.email='fixture@example.com' \
+    -c commit.gpgsign=false commit -qm 'Base versions' || exit 1
+cp "$repo_root/crates/subc-protocol/Cargo.toml" "$base_repo/crates/subc-protocol/Cargo.toml"
+# This crate changed, but its version did not. No registry fixture is provided for it.
+printf '\n# Changed since the base commit\n' >>"$base_repo/crates/subc-control/Cargo.toml"
+check_case semver-only-bumped-since-base "subc-protocol $(manifest_version subc-protocol) 0.2.0" 0 \
+  bash "$base_repo/scripts/release/unpublished-wire-crates.sh" --semver-candidates --base HEAD \
+  --registry-json-dir "$semver_registry"
+
+empty_registry="$test_root/empty-registry"
+mkdir -p "$empty_registry"
+touch "$empty_registry/subc-protocol.json"
+check_case semver-empty-registry-response '' 2 \
+  bash "$detector" --semver-candidates --crate subc-protocol --registry-json-dir "$empty_registry"
+
 stub_dir="$test_root/stubs"
 mkdir -p "$stub_dir"
 cat >"$stub_dir/curl" <<'STUB'

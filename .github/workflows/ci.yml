@@ -136,6 +136,34 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  published-crate-semver:
+    name: Published crate semver
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check bumped crates against crates.io
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [[ "$GITHUB_REF" != refs/heads/master ]]; then
+            # Non-master pushes check all changes since the merge base with master.
+            base=$(git merge-base origin/master HEAD)
+          elif [[ -n "$BEFORE" && "$BEFORE" != 0000000000000000000000000000000000000000 ]]; then
+            if ! git cat-file -e "${BEFORE}^{commit}"; then
+              git fetch origin "$BEFORE"
+            fi
+            base="$BEFORE"
+          else
+            # With no previous master tip, check all versions absent from crates.io.
+            bash scripts/release/check-published-crate-semver.sh
+            exit
+          fi
+          bash scripts/release/check-published-crate-semver.sh --base "$base"
+
   nats-engine:
     name: Embedded NATS engine
     runs-on: ubuntu-latest

@@ -5,9 +5,12 @@ finished=
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 registry_json_dir="${SUBC_REGISTRY_JSON_DIR:-}"
 registry_api_url="${SUBC_CRATES_IO_API_URL:-https://crates.io/api/v1/crates}"
+semver_candidates=0
+base=
+only_crate=
 
 usage() {
-  echo "usage: $0 [--registry-json-dir <dir>]" >&2
+  echo "usage: $0 [--registry-json-dir <dir>] [--semver-candidates [--base <commit> | --crate <name>]]" >&2
 }
 
 while (($# > 0)); do
@@ -18,6 +21,21 @@ while (($# > 0)); do
         exit 2
       fi
       registry_json_dir="$2"
+      shift 2
+      ;;
+    --semver-candidates)
+      semver_candidates=1
+      shift
+      ;;
+    --base|--crate)
+      if (($# < 2)) || [[ -z "$2" ]]; then
+        usage
+        exit 2
+      fi
+      case "$1" in
+        --base) base="$2" ;;
+        --crate) only_crate="$2" ;;
+      esac
       shift 2
       ;;
     -h|--help)
@@ -33,6 +51,14 @@ while (($# > 0)); do
   esac
 done
 
+if [[ -n "$base$only_crate" ]] && (( ! semver_candidates )); then
+  usage
+  exit 2
+fi
+if [[ -n "$base" && -n "$only_crate" ]]; then
+  usage
+  exit 2
+fi
 if [[ -n "$registry_json_dir" && ! -d "$registry_json_dir" ]]; then
   echo "refusal: registry JSON directory does not exist: $registry_json_dir" >&2
   exit 2
@@ -55,6 +81,22 @@ wire_crates=(
   subc-daemon
   cortexkit-bus-testkit
 )
+if [[ -n "$only_crate" ]]; then
+  # The tag-triggered workflow supplies an explicit package name to publish-crate.yml.
+  if [[ ! "$only_crate" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_-]*$ ]]; then
+    echo "refusal: invalid crate name '$only_crate'" >&2
+    exit 2
+  fi
+  wire_crates=("$only_crate")
+fi
+if [[ -n "$base" ]]; then
+  base=$(git -C "$repo_root" rev-parse --verify --end-of-options "${base}^{commit}")
+fi
+
+manifest_version() {
+  awk -F'"' '!found && /^version[[:space:]]*=/ { print $2; found=1 }' "$@"
+}
+
 unpublished=()
 tmp_dir=$(mktemp -d)
 finish() {
@@ -69,11 +111,24 @@ finish() {
 trap finish EXIT
 
 for crate in "${wire_crates[@]}"; do # nonempty-array: literal published crate list
-  manifest="$repo_root/crates/$crate/Cargo.toml"
-  version=$(awk -F'"' '/^version[[:space:]]*=/ { print $2; exit }' "$manifest")
+  manifest="crates/$crate/Cargo.toml"
+  version=$(manifest_version "$repo_root/$manifest")
   if [[ -z "$version" ]]; then
     echo "refusal: could not read $crate version from $manifest" >&2
     exit 2
+  fi
+  if [[ -n "$base" ]]; then
+    base_entry=$(git -C "$repo_root" ls-tree "$base" -- "$manifest")
+    if [[ -n "$base_entry" ]]; then
+      base_version=$(git -C "$repo_root" show "$base:$manifest" | manifest_version)
+      if [[ -z "$base_version" ]]; then
+        echo "refusal: could not read $crate version at $base" >&2
+        exit 2
+      fi
+      if [[ "$version" == "$base_version" ]]; then
+        continue
+      fi
+    fi
   fi
 
   response="$tmp_dir/$crate.json"
@@ -103,7 +158,11 @@ for crate in "${wire_crates[@]}"; do # nonempty-array: literal published crate l
 
   case "$status" in
     404)
-      unpublished+=("$crate $version")
+      if ((semver_candidates)); then
+        echo "Skipping $crate $version: no crates.io baseline (HTTP 404)" >&2
+      else
+        unpublished+=("$crate $version")
+      fi
       continue
       ;;
     200) ;;
@@ -113,20 +172,27 @@ for crate in "${wire_crates[@]}"; do # nonempty-array: literal published crate l
       ;;
   esac
 
-  if ! present=$(jq -r --arg version "$version" '
+  if ! registry_state=$(jq -er --arg version "$version" '
     if ((.crate.max_version | type) != "string")
+      or (.crate.max_version == "")
       or ((.versions | type) != "array")
       or any(.versions[]; (.num | type) != "string")
     then error("malformed crates.io response")
-    else (.crate.max_version == $version) or any(.versions[]; .num == $version)
+    else [((.crate.max_version == $version) or any(.versions[]; .num == $version)),
+          .crate.max_version] | @tsv
     end
   ' "$response"); then
     echo "refusal: invalid registry response for $crate" >&2
     exit 2
   fi
 
+  read -r present baseline <<< "$registry_state"
   if [[ "$present" != "true" ]]; then
-    unpublished+=("$crate $version")
+    if ((semver_candidates)); then
+      unpublished+=("$crate $version $baseline")
+    else
+      unpublished+=("$crate $version")
+    fi
   fi
 done
 

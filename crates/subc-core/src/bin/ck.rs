@@ -5327,7 +5327,7 @@ fn print_module_table(modules: &[Value], verbose: bool, inline: bool) {
                     inline_views::status_cell(
                         module,
                         &if enabled_drift_marker(module).is_empty() {
-                            display_field(module, "state")
+                            inline_views::module_state_label(module)
                         } else {
                             module_status_text(module)
                         },
@@ -5959,7 +5959,7 @@ fn module_runtime_status_text(module: &Value) -> String {
         "running" if module.get("live").and_then(Value::as_bool) == Some(false) => {
             "starting".to_string()
         }
-        other => humanize_identifier(other),
+        other => inline_views::runtime_state_label(module, other),
     }
 }
 
@@ -8348,6 +8348,19 @@ mod tests {
             ),
             "running"
         );
+    }
+
+    #[test]
+    fn module_list_accepting_drain_status_labels() {
+        for (flag, expected) in [(None, "draining"), (Some(true), "draining (accepting)")] {
+            let mut module = serde_json::json!({"state":"draining", "enabled":true, "live":false});
+            if let Some(flag) = flag {
+                module["accepting_drain"] = serde_json::json!(flag);
+            }
+            // Both the default status and verbose state use the same label.
+            assert_eq!(module_status_text(&module), expected);
+            assert_eq!(super::inline_views::module_state_label(&module), expected);
+        }
     }
 
     #[test]

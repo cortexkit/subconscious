@@ -461,6 +461,11 @@ impl ControlHandler {
                         .as_deref()
                         == Some("undeclared")
                 });
+            let accepting_drain = status.state == crate::supervise::ModuleState::Draining
+                && self
+                    .forwarding
+                    .module_is_accepting_drain(&status.module_id)
+                    .map_err(RouterError::Forwarding)?;
             // Keep the retired policy field on the wire for one release so
             // existing status consumers still receive the platform policy.
             let mut entry = SupervisorEntry::new(
@@ -494,6 +499,7 @@ impl ControlHandler {
             .with_restart_max_backoff_ms(Some(status.restart_max_backoff.as_millis() as u64))
             .with_resources(resources);
             entry.pending = pending;
+            entry.accepting_drain = accepting_drain.then_some(true);
             modules.push(entry);
         }
         for module in &mut modules {

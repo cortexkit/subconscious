@@ -5,6 +5,9 @@ fn version_exits_before_config_engine_or_daemon_access() {
         .output()
         .unwrap();
     assert!(output.status.success(), "{:?}", output);
-    assert_eq!(output.stdout, b"ck-nats-server 0.1.2\n");
+    assert_eq!(
+        output.stdout,
+        format!("ck-nats-server {}\n", env!("CARGO_PKG_VERSION")).into_bytes()
+    );
     assert!(output.stderr.is_empty());
 }

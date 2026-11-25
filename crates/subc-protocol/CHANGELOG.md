@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.37.11
+
+- Add the accepting-drain capability, notice and `module.drain_ready` request and acknowledgement bodies.
+
 ## 0.37.10
 
 - Run the pinned published-decoder compatibility test outside the workspace so

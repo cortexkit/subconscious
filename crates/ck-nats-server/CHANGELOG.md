@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.3
+
+- Move to subc-client-rs 0.42.
+
 ## 0.1.2
 
 - Require subc-client-rs 0.41.2.

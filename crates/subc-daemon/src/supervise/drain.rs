@@ -12,6 +12,10 @@ use super::*;
 /// where a stuck request will never settle).
 pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Once the module is ready, let ordinary RPCs finish without keeping callers
+/// locked out for another long-work budget.
+const ACCEPTING_DRAIN_IN_FLIGHT_WINDOW: Duration = Duration::from_secs(5);
+
 /// How long a drain waits after one busy-gauge probe completes before it asks
 /// again.
 ///
@@ -28,7 +32,7 @@ const DRAIN_BUSY_REPROBE_INTERVAL: Duration = Duration::from_millis(250);
 impl SupervisedChild {
     pub(super) fn group_drain_budget(&self, budget: Duration, _notice: StopNotice) -> Duration {
         #[cfg(unix)]
-        if self.child.plain_group.is_some() && _notice != StopNotice::SentOverConnection {
+        if self.child.plain_group.is_some() && !_notice.sent_over_connection() {
             return budget.min(plain_group::TERM_GRACE);
         }
         budget
@@ -116,6 +120,7 @@ impl Supervisor {
                         deadline_ms,
                         &target,
                         true,
+                        false,
                     )
                     .await,
                 )
@@ -841,11 +846,21 @@ async fn send_module_draining(
     deadline_ms: u64,
     target: &ModuleDrainTarget,
     _wait_for_flush: bool,
+    accepting: bool,
 ) -> bool {
-    let body = match serde_json::to_vec(&ModuleControlCommand::Draining {
-        reason,
-        deadline_ms,
-    }) {
+    let body = if accepting {
+        serde_json::to_vec(&subc_protocol::session::AcceptingDrainCommand::Draining {
+            reason,
+            deadline_ms,
+            accepting: true,
+        })
+    } else {
+        serde_json::to_vec(&ModuleControlCommand::Draining {
+            reason,
+            deadline_ms,
+        })
+    };
+    let body = match body {
         Ok(body) => body,
         Err(err) => {
             warn!(
@@ -1049,6 +1064,10 @@ pub(super) enum StopNotice {
     /// The module was sent `module.draining` and a module GOODBYE over its own
     /// registered connection, and stops itself.
     SentOverConnection,
+    /// Accepting restart or reload; the long-work budget was already spent.
+    AcceptingDrain { sent_over_connection: bool },
+    /// Daemon shutdown took over an accepting drain and will stop the child.
+    DaemonShutdown,
     /// The forwarding drain found no registered connection for the module: a
     /// subc child spawned moments ago that has not sent HELLO yet, or a
     /// `protocol: "none"` child, which never registers.
@@ -1057,6 +1076,18 @@ pub(super) enum StopNotice {
     /// no forwarding table, or the caller stops the child without a forwarding
     /// drain.
     NotSent,
+}
+
+impl StopNotice {
+    fn sent_over_connection(self) -> bool {
+        matches!(
+            self,
+            Self::SentOverConnection
+                | Self::AcceptingDrain {
+                    sent_over_connection: true
+                }
+        )
+    }
 }
 
 pub(super) async fn begin_forwarding_drain(
@@ -1159,36 +1190,10 @@ pub(super) async fn begin_forwarding_drain_with(
     debug_assert_ne!(reason, RouteCloseReason::Crash);
     let terminal = matches!(reason, RouteCloseReason::Disable);
     let drain_started_at = Instant::now();
-    let drain_deadline = drain_started_at + drain_timeout;
+    let mut drain_deadline = drain_started_at + drain_timeout;
     let deadline_ms =
         unix_ms_now().saturating_add(u64::try_from(drain_timeout.as_millis()).unwrap_or(u64::MAX));
-    let busy_gauges = match scope {
-        DrainScope::Active => declared_busy_gauges(registry, &spec.module_id)?,
-        DrainScope::Endpoint(endpoint) => {
-            declared_busy_gauges_for_connection(registry, endpoint.connection_id)?
-        }
-    };
-
-    // Admission gate first: route.open/commit and route REQUEST admission are closed
-    // before the first quiescence check, so the outstanding count can only fall.
-    let gate_started = Instant::now();
-    let drain_target = match scope {
-        DrainScope::Active => forwarding.begin_module_drain(&spec.module_id, reason),
-        DrainScope::Endpoint(endpoint) => forwarding.begin_endpoint_drain(endpoint, reason),
-    }
-    .map_err(SuperviseError::Forwarding)?;
-    // The instant admission closed, and how long taking the forwarding write
-    // lock to close it took. The timeout line reports only the quiescence
-    // wait, so without this a drain that started late looked like one that
-    // started on time.
-    info!(
-        module_id = %spec.module_id,
-        ?reason,
-        gate_ms = u64::try_from(gate_started.elapsed().as_millis()).unwrap_or(u64::MAX),
-        connected = drain_target.is_some(),
-        "module drain began; route admission closed"
-    );
-    if scope == DrainScope::Active {
+    let set_draining = || {
         update_snapshot(snapshot, Some(&spec.module_id), |state| {
             state.state = ModuleState::Draining;
             state.draining_to_replace =
@@ -1196,7 +1201,96 @@ pub(super) async fn begin_forwarding_drain_with(
             if let Some(enabled) = enabled {
                 state.enabled = enabled;
             }
-        })?;
+        })
+    };
+
+    let mut accepting_drain = None;
+    if scope == DrainScope::Active
+        && !drain_timeout.is_zero()
+        && matches!(reason, RouteCloseReason::Restart | RouteCloseReason::Reload)
+    {
+        let registration = registry
+            .get_module(&spec.module_id)
+            .map_err(SuperviseError::Registry)?;
+        if let Some(registration) = registration.filter(|entry| {
+            entry.manifest.capabilities.as_ref().is_some_and(|caps| {
+                caps.provides
+                    .iter()
+                    .any(|cap| cap == subc_protocol::session::ACCEPTING_DRAIN_CAPABILITY)
+            })
+        }) {
+            accepting_drain = forwarding
+                .begin_accepting_drain(&spec.module_id, registration.connection_id, reason)
+                .map_err(SuperviseError::Forwarding)?;
+        }
+    }
+    let accepting = accepting_drain.is_some();
+    let busy_gauges = if accepting {
+        Vec::new()
+    } else {
+        match scope {
+            DrainScope::Active => declared_busy_gauges(registry, &spec.module_id)?,
+            DrainScope::Endpoint(endpoint) => {
+                declared_busy_gauges_for_connection(registry, endpoint.connection_id)?
+            }
+        }
+    };
+
+    if let Some((target, phase_ended)) = &mut accepting_drain {
+        set_draining()?;
+        info!(module_id = %spec.module_id, budget_ms = drain_timeout.as_millis() as u64, "module accepting drain began");
+        send_module_draining(&spec.module_id, reason, deadline_ms, target, false, true).await;
+        let _ = tokio::time::timeout_at(drain_deadline, phase_ended.wait_for(|ended| *ended)).await;
+    }
+
+    // Admission gate first: route.open/commit and route REQUEST admission are closed
+    // before the first quiescence check, so the outstanding count can only fall.
+    let gate_started = Instant::now();
+    let drain_target = if let Some((target, _)) = accepting_drain {
+        let finished = forwarding
+            .finish_accepting_drain(target.endpoint)
+            .map_err(SuperviseError::Forwarding)?;
+        let (target, signalled) = match finished {
+            crate::forwarding::AcceptingDrainFinish::Ready { target, signalled } => {
+                (target, signalled)
+            }
+            crate::forwarding::AcceptingDrainFinish::Disconnected => {
+                info!(module_id = %spec.module_id, elapsed_ms = drain_started_at.elapsed().as_millis() as u64, "module accepting drain lost its connection");
+                return Ok(StopNotice::AcceptingDrain {
+                    sent_over_connection: false,
+                });
+            }
+            crate::forwarding::AcceptingDrainFinish::DaemonShutdown => {
+                info!(module_id = %spec.module_id, "daemon shutdown took over the module accepting drain");
+                return Ok(StopNotice::DaemonShutdown);
+            }
+        };
+        let cause = if signalled { "drain_ready" } else { "budget" };
+        info!(module_id = %spec.module_id, cause, elapsed_ms = drain_started_at.elapsed().as_millis() as u64, "module accepting drain ready");
+        drain_deadline = Instant::now() + ACCEPTING_DRAIN_IN_FLIGHT_WINDOW;
+        Some(target)
+    } else {
+        match scope {
+            DrainScope::Active => forwarding.begin_module_drain(&spec.module_id, reason),
+            DrainScope::Endpoint(endpoint) => forwarding.begin_endpoint_drain(endpoint, reason),
+        }
+        .map_err(SuperviseError::Forwarding)?
+    };
+    if accepting {
+        info!(module_id = %spec.module_id, ?reason, "module accepting drain closed route admission");
+    } else {
+        // Report time spent taking the gate lock separately from the wait for
+        // requests already dispatched.
+        info!(
+            module_id = %spec.module_id,
+            ?reason,
+            gate_ms = u64::try_from(gate_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            connected = drain_target.is_some(),
+            "module drain began; route admission closed"
+        );
+    }
+    if scope == DrainScope::Active && !accepting {
+        set_draining()?;
     }
 
     let Some(target) = drain_target.as_ref() else {
@@ -1211,7 +1305,9 @@ pub(super) async fn begin_forwarding_drain_with(
             .is_some()
     });
     {
-        send_module_draining(&spec.module_id, reason, deadline_ms, target, false).await;
+        if !accepting {
+            send_module_draining(&spec.module_id, reason, deadline_ms, target, false, false).await;
+        }
         #[cfg(feature = "test-support")]
         forwarding.wait_before_route_closing_for_test().await;
         let routes = forwarding
@@ -1235,6 +1331,7 @@ pub(super) async fn begin_forwarding_drain_with(
         // coming; leaving early without `closed` strands it waiting forever, since
         // `closing` carries no timeout of its own.
         let mut gauge_trace = DrainGaugeTrace::new(&busy_gauges);
+        let in_flight_wait_started = Instant::now();
         let wait_result = wait_for_forwarding_quiescence(
             forwarding,
             &spec.module_id,
@@ -1247,6 +1344,9 @@ pub(super) async fn begin_forwarding_drain_with(
         )
         .await;
         let drained = drained_after_quiescence_wait(&wait_result);
+        if accepting {
+            info!(module_id = %spec.module_id, elapsed_ms = in_flight_wait_started.elapsed().as_millis() as u64, drained, "module accepting drain in-flight wait finished");
+        }
         if let Err(err) = &wait_result {
             error!(
                 module_id = %spec.module_id,
@@ -1261,7 +1361,11 @@ pub(super) async fn begin_forwarding_drain_with(
                 .unwrap_or_default();
             warn_drain_timed_out(
                 &spec.module_id,
-                drain_timeout,
+                if accepting {
+                    ACCEPTING_DRAIN_IN_FLIGHT_WINDOW
+                } else {
+                    drain_timeout
+                },
                 reason,
                 &holdouts,
                 &gauge_trace,
@@ -1321,7 +1425,13 @@ pub(super) async fn begin_forwarding_drain_with(
         );
     }
 
-    Ok(StopNotice::SentOverConnection)
+    Ok(if accepting {
+        StopNotice::AcceptingDrain {
+            sent_over_connection: true,
+        }
+    } else {
+        StopNotice::SentOverConnection
+    })
 }
 
 pub(super) fn control_flags() -> Flags {
@@ -1513,7 +1623,7 @@ async fn drain_child_to_state_inner(
     // in front of SIGKILL -- and the not-yet-registered child is the worst
     // case, because it registers into a module that is already draining,
     // is never told, and is killed while healthy.
-    if stop_notice != StopNotice::SentOverConnection {
+    if !stop_notice.sent_over_connection() {
         if protocol == ModuleProtocol::Subc && stop_notice == StopNotice::NoConnection {
             info!(
                 module_id,
@@ -1525,8 +1635,24 @@ async fn drain_child_to_state_inner(
         request_graceful_stop(module_id, child);
     }
 
+    let accepting = matches!(stop_notice, StopNotice::AcceptingDrain { .. });
+    let drain_timeout = if accepting {
+        DEFAULT_DRAIN_TIMEOUT
+    } else {
+        drain_timeout
+    };
     let drain_timeout = child.group_drain_budget(drain_timeout, stop_notice);
-    let exit_report = match timeout(drain_timeout, child.wait()).await {
+    let exit_wait_started = Instant::now();
+    let waited = timeout(drain_timeout, child.wait()).await;
+    if accepting {
+        info!(
+            module_id,
+            elapsed_ms = exit_wait_started.elapsed().as_millis() as u64,
+            timed_out = waited.is_err(),
+            "module accepting drain graceful-exit wait finished"
+        );
+    }
+    let exit_report = match waited {
         Ok(Ok(status)) => classify_reaped_child_exit(snapshot, child, &status),
         Ok(Err(source)) => {
             fail_after_wait_error(

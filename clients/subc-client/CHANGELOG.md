@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.27.3
+
+- Add a per-notice `accepting` argument to the module-side `onDraining` hook and `SubcProvider.drainReady()` to signal that a negotiated accepting drain can finish.
+
 ## 0.27.2
 
 - Fall back to a normal restart on daemon upgrade when an older SDK copy

@@ -2951,6 +2951,9 @@ pub struct SupervisorEntry {
     pub waiting_for_previous_pid: Option<u32>,
     pub module_id: String,
     pub state: String,
+    /// Present and true while a draining module still admits routes and requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepting_drain: Option<bool>,
     /// Why admission was refused. This is an open string: readers must not
     /// match exhaustively. `registration_channel_unsupported` means the gated
     /// module lacks its support declaration, not a crash to restart.
@@ -3139,6 +3142,7 @@ impl SupervisorEntry {
             admission_refused: None,
             next_retry_at_ms: None,
             waiting_for_previous_pid: None,
+            accepting_drain: None,
             enabled,
             configured_enabled: None,
             live,

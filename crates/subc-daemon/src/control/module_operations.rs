@@ -1521,6 +1521,37 @@ impl ControlHandler {
 }
 
 impl ControlHandler {
+    pub(super) fn handle_module_drain_ready(
+        &self,
+        connection_id: ConnectionId,
+        frame: Frame,
+    ) -> Result<Vec<Frame>, RouterError> {
+        use subc_protocol::session::ModuleDrainReady;
+
+        let body = match serde_json::from_slice::<ModuleDrainReady>(&frame.body) {
+            Ok(body) => body,
+            Err(err) => {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    "invalid_control_body",
+                    format!("malformed module.drain_ready body: {err}"),
+                )?]);
+            }
+        };
+        let ack = control_response_body_frame(&frame, &body, "ModuleDrainReady")?;
+        if self
+            .forwarding
+            .mark_accepting_drain_ready(connection_id, ack)?
+        {
+            return Ok(Vec::new());
+        }
+        Ok(vec![control_error_frame(
+            &frame,
+            error_codes::INVALID_REQUEST,
+            "this module connection has no accepting drain",
+        )?])
+    }
+
     pub(super) fn handle_module_control_request(
         &self,
         connection_id: ConnectionId,

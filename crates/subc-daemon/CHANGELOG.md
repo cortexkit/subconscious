@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.53.0
+
+- Add accepting restart and reload drains for opted-in modules, with `module.drain_ready` and a bounded post-ready route wait.
+
 ## 0.52.3
 
 - Warn once when a module has not sent a terminal 30 seconds after a forwarded CANCEL. Report the number of such requests still holding credit in `server.describe` as `stalled_cancels`; request and watch credit release is unchanged.

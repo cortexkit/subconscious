@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.42.0
+
+- Expose the accepting marker through `ModuleHandler::on_draining_notice` and add `ModuleHandle::drain_ready`.
+- Minor release: moves to subc-control 0.43, whose types this crate exposes, so a client pinned to subc-control 0.42 must move both together.
+
 ## 0.41.16
 
 - Require subc-control 0.42.10 for the new `unstamped` field on settings plan views.

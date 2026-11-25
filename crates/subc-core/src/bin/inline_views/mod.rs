@@ -29,6 +29,20 @@ fn glyph(status: Status) -> String {
     )
 }
 
+fn accepting_drain_label(module: &Value, state: &str) -> Option<&'static str> {
+    (state == "draining" && module.get("accepting_drain").and_then(Value::as_bool) == Some(true))
+        .then_some("draining (accepting)")
+}
+
+pub(super) fn module_state_label(module: &Value) -> String {
+    let state = display_field(module, "state");
+    accepting_drain_label(module, &state).map_or(state, str::to_owned)
+}
+
+pub(super) fn runtime_state_label(module: &Value, state: &str) -> String {
+    accepting_drain_label(module, state).map_or_else(|| humanize_identifier(state), str::to_owned)
+}
+
 pub(super) fn status_cell(module: &Value, word: &str, inline: bool) -> String {
     let word = terminal_safe_string(word);
     if inline {

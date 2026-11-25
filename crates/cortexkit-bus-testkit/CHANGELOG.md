@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.9.5
+
+- Raise the dependency floors for the accepting-drain release.
+
 ## 0.9.4
 
 - Require subc-client-rs 0.41.2 and subc-control 0.42.0 for the settings release.

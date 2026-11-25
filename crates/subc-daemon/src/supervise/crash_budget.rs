@@ -371,6 +371,9 @@ pub(super) async fn budgeted_restart_child(
         RouteCloseReason::Restart,
     )
     .await?;
+    if stop_notice == StopNotice::DaemonShutdown {
+        return Ok(());
+    }
     drain_optional_child(
         &spec.module_id,
         spec.protocol,

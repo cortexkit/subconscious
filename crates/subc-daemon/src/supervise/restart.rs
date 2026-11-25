@@ -157,6 +157,9 @@ pub(super) async fn restart_child_with_budget_policy(
         drain_timeout,
     )
     .await?;
+    if stop_notice == StopNotice::DaemonShutdown {
+        return Ok(());
+    }
 
     if child.is_some() {
         drain_optional_child(
@@ -228,6 +231,11 @@ pub(super) async fn reload_child(
         RouteCloseReason::Reload,
     )
     .await?;
+    if stop_notice == StopNotice::DaemonShutdown {
+        return Err(SuperviseError::CommandClosed {
+            module_id: spec.module_id.clone(),
+        });
+    }
 
     if child.is_some() {
         drain_optional_child(

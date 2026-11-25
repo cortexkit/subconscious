@@ -188,9 +188,13 @@ pub(crate) struct RouteAuthority {
     pub(crate) capability_fence: Option<CapabilityFence>,
 }
 
+mod accepting_drain;
 #[path = "forwarding_capability_fence.rs"]
 mod capability_fence;
 mod registration;
+
+use accepting_drain::AcceptingDrain;
+pub(crate) use accepting_drain::AcceptingDrainFinish;
 use capability_fence::refuse_acked_bind_locked;
 pub(crate) use capability_fence::CapabilityFence;
 
@@ -746,6 +750,7 @@ struct ForwardingInner {
     /// value serves the census ("draining because restart"); membership alone
     /// still answers every admission-gate check.
     draining_endpoints: HashMap<ModuleEndpointId, RouteCloseReason>,
+    accepting_drains: HashMap<ModuleEndpointId, AcceptingDrain>,
     closing_connections: HashSet<ConnectionId>,
     /// Pending binds check spawn liveness without keeping the spawn alive.
     spawn_connections: HashMap<ConnectionId, std::sync::Weak<crate::supervise::RegistrationSpawn>>,
@@ -2919,6 +2924,7 @@ impl ForwardingTable {
                 .draining_endpoints
                 .insert(endpoint, RouteCloseReason::Restart);
         }
+        accepting_drain::wake_accepting_drains_for_shutdown_locked(&inner);
         Ok(modules)
     }
 
@@ -4393,6 +4399,7 @@ fn remove_module_connection_locked(
     // cannot replace module_closed with route_closed.
     inner.operator_confirms.module_closed(endpoint);
     inner.draining_endpoints.remove(&endpoint);
+    inner.accepting_drains.remove(&endpoint);
     inner.daemon_drain_results.remove(&endpoint);
     let module_id = inner.module_id_by_endpoint.remove(&endpoint);
     if let Some(module_id) = module_id.as_ref() {

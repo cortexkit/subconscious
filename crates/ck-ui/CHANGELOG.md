@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.9.8
+
+- Raise the dependency floors for the accepting-drain release.
+
 ## 0.9.7
 
 - Show a module as stopping after confirmation and ignore further Start or Stop

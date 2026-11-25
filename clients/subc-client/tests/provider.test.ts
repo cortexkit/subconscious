@@ -2266,6 +2266,7 @@ async function withDrainPeer(
   onDraining: NonNullable<SubcProviderConnectOptions["onDraining"]>,
   run: (provider: SubcProvider, socket: Socket, reader: SocketReader) => Promise<void>,
   options: Partial<Pick<SubcProviderConnectOptions, "handler" | "onBound">> = {},
+  capabilities: readonly string[] = [],
 ): Promise<void> {
   const server = await listenFakeServer();
   const dir = trackedTempDir("subc-provider-drain-");
@@ -2279,7 +2280,7 @@ async function withDrainPeer(
         await authenticateFakeServer(reader, connected, deadline);
         const hello = await readFrame(reader, deadline);
         await writeFrame(connected, buildFrame(FrameType.HelloAck, CONTROL_FLAGS, 0, 0, hello.header.corr, encodeJson({
-          negotiated_ver: PROTOCOL_VERSION, subc_ops: [], subc_capabilities: [],
+          negotiated_ver: PROTOCOL_VERSION, subc_ops: [], subc_capabilities: capabilities,
         })), deadline);
         resolve(reader);
       })().catch(reject);
@@ -2304,3 +2305,24 @@ async function withDrainPeer(
     server.server.close();
   }
 }
+
+test("accepting drain is reported per notice and sends a channel-0 readiness request", async () => {
+  const accepting: boolean[] = [];
+  await withDrainPeer((_reason, _deadline, accepts) => { accepting.push(accepts); }, async (provider, socket, reader) => {
+    const deadline = Date.now() + 1_000;
+    await writeFrame(socket, buildFrame(FrameType.Push, CONTROL_FLAGS, 0, 0, 0n, encodeJson({
+      op: "module.draining", reason: "restart", deadline_ms: deadline, accepting: true,
+    })), deadline);
+    await expectDrainPong(socket, reader);
+    const ready = provider.drainReady();
+    const request = await readFrame(reader, deadline);
+    expect(request.header.ty).toBe(FrameType.Request);
+    expect(request.header.channel).toBe(0);
+    expect(parseJson(request.body)).toEqual({ op: "module.drain_ready" });
+    await writeFrame(socket, buildFrame(FrameType.Response, CONTROL_FLAGS, 0, 0, request.header.corr, request.body), deadline);
+    await ready;
+    await writeFrame(socket, drainPush("restart", deadline), deadline);
+    await expectDrainPong(socket, reader);
+    expect(accepting).toEqual([true, false]);
+  }, {}, ["accepting-drain/v1"]);
+});

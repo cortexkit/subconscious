@@ -66,6 +66,7 @@ pub(super) const REGISTRATION_OPERATIONS: &[&str] = &[
     subc_protocol::policy_root::ROTATE_OP,
     "supervisor.agent_commands",
     subc_control::SCOPE_SERVED_BY_OP,
+    subc_protocol::session::MODULE_DRAIN_READY_OP,
 ];
 
 /// Whose authority an activity read carries, taken from the connection

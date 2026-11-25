@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.13.5
+
+- Raise the dependency floors for the accepting-drain release.
+
 ## 0.13.4
 
 - Require subc-daemon 0.52.0.

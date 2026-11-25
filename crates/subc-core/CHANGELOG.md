@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.21.59
+
+- Show the accepting drain phase in `ck module list` without changing the supervisor state string.
+
 ## 0.21.58
 
 - Require subc-daemon 0.52.0.

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.43.0
+
+- Add optional `accepting_drain` to `supervisor.list` entries, keeping `state: "draining"` during both drain phases.
+
 ## 0.42.10
 
 - Add an `unstamped` boolean to settings plan views without changing the plan digest.

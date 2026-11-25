@@ -1500,32 +1500,40 @@ impl ControlHandler {
         if let Some(process_liveness) = self.process_liveness.as_ref().filter(|process_liveness| {
             process_liveness.process_live(&target_module_id) == Some(false)
         }) {
-            // A module the supervisor is restarting or reloading can still hold
-            // a registration: the old process before its connection closes, or
-            // a new one that registered while the supervisor was draining. The
-            // forwarding table does not see that as draining, but the consumer
-            // should still be told to retry soon, exactly as for the drain
-            // above, rather than that the target is unavailable.
-            if process_liveness.process_replacing(&target_module_id) {
+            // The supervisor reports Draining for both phases; only the short,
+            // refusing phase makes an otherwise live endpoint unroutable.
+            if !self
+                .forwarding
+                .module_is_accepting_drain(&target_module_id)
+                .map_err(RouterError::Forwarding)?
+            {
+                // A module the supervisor is restarting or reloading can still hold
+                // a registration: the old process before its connection closes, or
+                // a new one that registered while the supervisor was draining. The
+                // forwarding table does not see that as draining, but the consumer
+                // should still be told to retry soon, exactly as for the drain
+                // above, rather than that the target is unavailable.
+                if process_liveness.process_replacing(&target_module_id) {
+                    return Ok(vec![self.route_open_refusal_frame(
+                        ctx,
+                        &caller,
+                        &frame,
+                        &target_module_id,
+                        "reloading",
+                        "module_reloading",
+                        format!("module_id '{target_module_id}' is reloading"),
+                    )?]);
+                }
                 return Ok(vec![self.route_open_refusal_frame(
                     ctx,
                     &caller,
                     &frame,
                     &target_module_id,
-                    "reloading",
-                    "module_reloading",
-                    format!("module_id '{target_module_id}' is reloading"),
+                    "supervisor_not_live",
+                    "target_unavailable",
+                    format!("module_id '{target_module_id}' is not live"),
                 )?]);
             }
-            return Ok(vec![self.route_open_refusal_frame(
-                ctx,
-                &caller,
-                &frame,
-                &target_module_id,
-                "supervisor_not_live",
-                "target_unavailable",
-                format!("module_id '{target_module_id}' is not live"),
-            )?]);
         }
 
         if !self

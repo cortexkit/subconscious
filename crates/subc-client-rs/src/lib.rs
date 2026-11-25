@@ -508,6 +508,122 @@ pub struct ModuleHandle {
     generations: Arc<live_upgrade::Generations>,
 }
 
+/// A daemon `module.draining` notice, including whether requests still arrive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DrainNotice {
+    pub reason: RouteCloseReason,
+    pub deadline: SystemTime,
+    /// Admission is still open. Persist accepted work before answering it.
+    pub accepting: bool,
+}
+
+/// Why the daemon could not acknowledge `module.drain_ready`.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum DrainReadyError {
+    Unsupported,
+    Refused(Box<ErrorBody>),
+    ConnectionClosed,
+    Timeout,
+    Protocol(String),
+}
+
+impl fmt::Display for DrainReadyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unsupported => f.write_str("daemon does not support accepting drains"),
+            Self::Refused(body) => {
+                write!(f, "drain ready refused: {} ({})", body.message, body.code)
+            }
+            Self::ConnectionClosed => {
+                f.write_str("connection closed before drain ready acknowledgement")
+            }
+            Self::Timeout => f.write_str("drain ready acknowledgement timed out"),
+            Self::Protocol(message) => write!(f, "invalid drain ready reply: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for DrainReadyError {}
+
+impl ModuleHandle {
+    /// After an accepting drain notice, tell the daemon there is no long work
+    /// left. The daemon will close admission and begin restarting this module.
+    /// Nothing is sent if the daemon did not negotiate accepting drains.
+    pub async fn drain_ready(&self) -> Result<(), DrainReadyError> {
+        use subc_protocol::session::{ModuleDrainReady, ACCEPTING_DRAIN_CAPABILITY};
+
+        let shared = self.shared();
+        if !shared
+            .daemon_capabilities
+            .iter()
+            .any(|cap| cap == ACCEPTING_DRAIN_CAPABILITY)
+        {
+            return Err(DrainReadyError::Unsupported);
+        }
+        let body = serde_json::to_vec(&ModuleDrainReady::Ready {})
+            .map_err(|err| DrainReadyError::Protocol(err.to_string()))?;
+        let (corr, writer, rx) = {
+            let mut inner = shared.lock_inner();
+            if inner.closed {
+                return Err(DrainReadyError::ConnectionClosed);
+            }
+            let writer = inner
+                .writer
+                .clone()
+                .ok_or(DrainReadyError::ConnectionClosed)?;
+            let corr =
+                next_module_control_corr(&mut inner).ok_or(DrainReadyError::ConnectionClosed)?;
+            let (tx, rx) = oneshot::channel();
+            inner.pending_drain_ready.insert(corr, tx);
+            (corr, writer, rx)
+        };
+        struct Waiter<'a>(&'a ModuleHandleShared, u64);
+        impl Drop for Waiter<'_> {
+            fn drop(&mut self) {
+                self.0.lock_inner().pending_drain_ready.remove(&self.1);
+            }
+        }
+        let _waiter = Waiter(&shared, corr);
+        let frame = Frame::build_with_version(
+            shared.negotiated_ver,
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            corr,
+            body,
+        )
+        .map_err(|err| DrainReadyError::Protocol(err.to_string()))?;
+        let reply = timeout(CATALOG_UPDATE_TIMEOUT, async {
+            shared
+                .queue_request(&writer, frame)
+                .await
+                .map_err(|err| match err {
+                    CatalogUpdateError::Rejected(body) => DrainReadyError::Refused(Box::new(body)),
+                    _ => DrainReadyError::ConnectionClosed,
+                })?;
+            rx.await.map_err(|_| DrainReadyError::ConnectionClosed)
+        })
+        .await
+        .map_err(|_| DrainReadyError::Timeout)??;
+        match reply.header.ty {
+            FrameType::Response => serde_json::from_slice::<ModuleDrainReady>(&reply.body)
+                .map(|_| ())
+                .map_err(|err| DrainReadyError::Protocol(err.to_string())),
+            FrameType::Error => {
+                let body = serde_json::from_slice(&reply.body)
+                    .map_err(|err| DrainReadyError::Protocol(err.to_string()))?;
+                Err(DrainReadyError::Refused(Box::new(body)))
+            }
+            ty => Err(DrainReadyError::Protocol(format!(
+                "unexpected terminal frame: {ty:?}"
+            ))),
+        }
+    }
+}
+
 struct ModuleHandleShared {
     registration: registration::Session,
     negotiated_ver: u8,
@@ -549,6 +665,7 @@ struct ModuleHandleState {
     pending_scope_served_by: HashMap<u64, oneshot::Sender<Frame>>,
     pending_config_calls: HashMap<u64, oneshot::Sender<Frame>>,
     pending_agent_commands: HashMap<u64, oneshot::Sender<Frame>>,
+    pending_drain_ready: HashMap<u64, oneshot::Sender<Frame>>,
     current_provides: Option<Vec<ProviderRole>>,
     catalog_changes: VecDeque<CatalogChange>,
     upgrade: live_upgrade::UpgradeState,
@@ -673,6 +790,7 @@ impl ModuleHandleShared {
                 pending_scope_served_by: HashMap::new(),
                 pending_config_calls: HashMap::new(),
                 pending_agent_commands: HashMap::new(),
+                pending_drain_ready: HashMap::new(),
                 current_provides: None,
                 catalog_changes: VecDeque::new(),
                 upgrade: live_upgrade::UpgradeState::default(),
@@ -1456,6 +1574,14 @@ impl ModuleHandle {
         let Some(frame) = self.handle_control_stream_frame(frame) else {
             return true;
         };
+        if let Some(reply) = shared
+            .lock_inner()
+            .pending_drain_ready
+            .remove(&frame.header.corr)
+        {
+            let _ = reply.send(frame);
+            return true;
+        }
         let claim_reply = shared
             .lock_inner()
             .pending_claim_calls
@@ -1688,6 +1814,7 @@ impl ModuleHandleShared {
             inner.pending_operator_confirms.clear();
             inner.pending_activity_records.clear();
             inner.pending_scope_served_by.clear();
+            inner.pending_drain_ready.clear();
             inner.pending_config_calls.clear();
             inner.pending_agent_commands.clear();
             inner.pending_claim_calls.clear();
@@ -1982,15 +2109,16 @@ impl Error for ScopeCallError {}
 ///
 /// # Stopping cleanly: drains
 ///
-/// Before the daemon stops a module (restart, reload, disable, swap, or its own
-/// shutdown) it closes route admission, tells the module with
-/// [`ModuleHandler::on_draining`], waits for the module's in-flight requests to
-/// finish, and only then sends GOODBYE and closes the connection. The wait ends
-/// at the drain deadline whether or not the work is done.
+/// Before stopping a module, the daemon sends a drain notice, closes route
+/// admission, and waits for in-flight requests before sending GOODBYE. In an
+/// ordinary drain admission closes before the notice. An opted-in restart or
+/// reload may instead send a [`DrainNotice`] with `accepting: true`. Admission
+/// then stays open until [`ModuleHandle::drain_ready`] or the deadline. Persist
+/// work accepted in that phase before answering it.
 ///
 /// Requests the daemon forwarded are counted by the daemon itself. Work it
 /// cannot see (a job a request started in the background, a batch being
-/// flushed) holds the drain open only if the module says so. The module does
+/// flushed) holds an ordinary drain open only if the module says so. The module does
 /// that with a counter it reports in its health answer (a "health gauge"),
 /// and a manifest entry telling the daemon that the counter means "busy": a
 /// `Busy` self-signal anchored to those health gauges. Declare it, and report those
@@ -2232,9 +2360,9 @@ pub trait ModuleHandler: Send + Sync + 'static {
 
     /// The daemon has started draining this module: it will stop it for
     /// `reason` (a restart, reload, disable, or the daemon's own shutdown), and
-    /// has already stopped admitting new routes to it. Stop taking new work
-    /// here and finish or hand off what is in flight; see the trait docs for
-    /// how to keep the drain open while background work finishes.
+    /// usually has already stopped admitting new routes to it. Modules that
+    /// opt in to accepting drains should implement [`Self::on_draining_notice`]
+    /// instead, to distinguish the two kinds of notice.
     ///
     /// `deadline` is the wall-clock time by which the module must be done. It
     /// is "no later than", never a grant of that much time: the daemon enforces
@@ -2248,6 +2376,12 @@ pub trait ModuleHandler: Send + Sync + 'static {
     /// [`ModuleHandler::on_connection_end`]). Connection teardown aborts hooks
     /// that have not finished within the drain budget.
     async fn on_draining(&self, _reason: RouteCloseReason, _deadline: SystemTime) {}
+
+    /// Like [`Self::on_draining`], with the per-notice route admission state.
+    /// The default forwards to `on_draining` for existing handlers.
+    async fn on_draining_notice(&self, notice: DrainNotice) {
+        self.on_draining(notice.reason, notice.deadline).await;
+    }
 
     /// The connection ended orderly: a daemon GOODBYE is a planned stop, EOF
     /// or Reset means the daemon went away without one, and `Closed` is a
@@ -3080,8 +3214,17 @@ fn handle_control_push<H>(
         }) => {
             let started = spawn_draining_hook(
                 handler,
-                sdk_route_close_reason(reason),
-                drain_deadline(deadline_ms),
+                DrainNotice {
+                    reason: sdk_route_close_reason(reason),
+                    deadline: drain_deadline(deadline_ms),
+                    accepting: matches!(
+                        serde_json::from_slice(&frame.body),
+                        Ok(subc_protocol::session::AcceptingDrainCommand::Draining {
+                            accepting: true,
+                            ..
+                        })
+                    ),
+                },
                 dispatcher,
             );
             dispatcher
@@ -3112,13 +3255,12 @@ fn handle_control_push<H>(
     }
 }
 
-/// Run `on_draining` on its own task, so a slow hook cannot stall the frame
+/// Run the drain hook on its own task, so a slow hook cannot stall the frame
 /// reader. The returned receiver resolves once the hook has been polled for
 /// the first time, i.e. has run up to its first await.
 fn spawn_draining_hook<H>(
     handler: Arc<H>,
-    reason: RouteCloseReason,
-    deadline: SystemTime,
+    notice: DrainNotice,
     dispatcher: &RequestDispatcher,
 ) -> oneshot::Receiver<()>
 where
@@ -3126,7 +3268,7 @@ where
 {
     let (started_tx, started_rx) = oneshot::channel();
     dispatcher.spawn(async move {
-        let mut hook = handler.on_draining(reason, deadline);
+        let mut hook = handler.on_draining_notice(notice);
         let mut started_tx = Some(started_tx);
         std::future::poll_fn(|cx| {
             let poll = hook.as_mut().poll(cx);
@@ -4176,6 +4318,50 @@ mod tests {
             ),
             rx,
         )
+    }
+
+    #[tokio::test]
+    async fn accepting_drain_ready_requires_negotiation_and_uses_channel_zero() {
+        let (legacy, mut silent) = test_module_handle(&[]);
+        assert!(matches!(
+            legacy.drain_ready().await,
+            Err(DrainReadyError::Unsupported)
+        ));
+        assert!(silent.try_recv().is_err());
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let handle = ModuleHandle::new(
+            &ModuleHelloAckBody {
+                resume_token: None,
+                negotiated_ver: PROTOCOL_VERSION,
+                subc_ops: vec!["module.drain_ready".into()],
+                subc_capabilities: vec!["accepting-drain/v1".into()],
+                storage: None,
+                machine_id: None,
+            },
+            tx,
+            1,
+            CancellationToken::new(),
+            tokio::runtime::Handle::current(),
+        );
+        let (result, ()) = tokio::join!(handle.drain_ready(), async {
+            let request = rx.recv().await.unwrap();
+            assert_eq!(
+                (
+                    request.header.ty,
+                    request.header.channel,
+                    request.header.epoch
+                ),
+                (FrameType::Request, 0, 0)
+            );
+            assert_eq!(request.body, br#"{"op":"module.drain_ready"}"#);
+            assert!(handle.handle_control_reply(control_reply(
+                FrameType::Response,
+                request.header.corr,
+                request.body
+            )));
+        });
+        result.unwrap();
     }
 
     #[test]
@@ -6178,6 +6364,39 @@ mod module_close_tests {
             })
             .unwrap(),
         )
+    }
+
+    #[tokio::test]
+    async fn accepting_drain_notice_exposes_the_marker_only_on_that_notice() {
+        struct Recorder(Arc<Mutex<Vec<bool>>>);
+
+        #[async_trait]
+        impl ModuleHandler for Recorder {
+            async fn handle(&self, _ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+                HandlerOutcome::Response(body)
+            }
+
+            async fn on_draining_notice(&self, notice: DrainNotice) {
+                self.0.lock().unwrap().push(notice.accepting);
+            }
+        }
+
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let mut served = serve_against_stand_in(Recorder(recorded.clone())).await;
+        send(&mut served.daemon, control_push(br#"{"op":"module.draining","reason":"restart","deadline_ms":1000,"accepting":true}"#)).await;
+        ping_is_answered(&mut served, 90).await;
+        send(
+            &mut served.daemon,
+            draining_push(subc_protocol::RouteCloseReason::Restart, 1000),
+        )
+        .await;
+        send(&mut served.daemon, goodbye()).await;
+        timeout(Duration::from_secs(5), &mut served.serve)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(*recorded.lock().unwrap(), [true, false]);
     }
 
     /// Send a channel-0 PING and require the PONG, proving the frame reader

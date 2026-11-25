@@ -387,3 +387,513 @@ async fn restart_queued_before_replacement_spawn_keeps_the_new_child() {
         "a satisfied restart must not schedule another spawn"
     );
 }
+
+mod accepting_drain {
+    use super::*;
+    use crate::{
+        router::{OutboundFrame, RouteCtx},
+        ControlHandler, Router,
+    };
+    use serde_json::json;
+    use subc_protocol::{Flags, Frame, FrameType, ModuleHelloAckBody, PROTOCOL_VERSION};
+
+    const ID: &str = "accepting-drain-test";
+    const LONG_BUDGET: Duration = Duration::from_secs(600);
+
+    struct Rig {
+        spec: ModuleSpec,
+        runtime: SupervisorRuntimeConfig,
+        registry: Arc<Registry>,
+        snapshot: SharedSnapshot,
+        forwarding: Arc<ForwardingTable>,
+        router: Router,
+        module: RouteCtx,
+        module_rx: mpsc::Receiver<OutboundFrame>,
+        client: RouteCtx,
+        client_rx: mpsc::Receiver<OutboundFrame>,
+    }
+
+    fn connection(id: u64) -> (RouteCtx, mpsc::Receiver<OutboundFrame>) {
+        let (tx, rx) = mpsc::channel(16);
+        (
+            RouteCtx {
+                connection_id: ConnectionId::new(id),
+                egress: FrameSink::new(tx),
+            },
+            rx,
+        )
+    }
+
+    fn frame(ty: FrameType, corr: u64, body: Value) -> Frame {
+        Frame::build(ty, Flags(0), 0, 0, corr, serde_json::to_vec(&body).unwrap()).unwrap()
+    }
+
+    fn body(frame: &Frame) -> Value {
+        serde_json::from_slice(&frame.body).unwrap()
+    }
+
+    async fn next(rx: &mut mpsc::Receiver<OutboundFrame>) -> Frame {
+        timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .frame
+    }
+
+    fn open(corr: u64) -> Frame {
+        frame(
+            FrameType::Request,
+            corr,
+            json!({
+                "op":"route.open", "target":{"kind":"tool_provider", "module_id":ID},
+                "identity":{"harness":"test", "session":"accepting-drain"}
+            }),
+        )
+    }
+
+    impl Rig {
+        async fn new(opted_in: bool) -> Self {
+            let registry = Arc::new(Registry::default());
+            let forwarding = Arc::new(ForwardingTable::default());
+            let liveness = Arc::new(SupervisorProcessLiveness::new());
+            let runtime = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+                .with_forwarding(forwarding.clone())
+                .runtime_config();
+            let spec = ModuleSpec {
+                module_id: ID.into(),
+                ..serving_spec(std::path::Path::new("."), ModuleProtocol::Subc)
+            };
+            let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+            update_snapshot(&snapshot, Some(ID), |state| {
+                state.state = ModuleState::Running;
+                state.enabled = true;
+                state.process_alive = true;
+            })
+            .unwrap();
+            liveness.track(ID.into(), snapshot.clone());
+            let control = ControlHandler::with_forwarding(registry.clone(), forwarding.clone())
+                .with_process_liveness(liveness.clone());
+            let router = Router::with_control_handler(Arc::new(control));
+            let (module, mut module_rx) = connection(101);
+            let (client, client_rx) = connection(102);
+            let mut manifest = subc_protocol::manifest::ModuleManifest::builder(ID, "1.0.0")
+                .protocol_ver(PROTOCOL_VERSION)
+                .build();
+            manifest.provides = vec![subc_protocol::manifest::ProviderRole::ToolProvider {
+                tools: vec![],
+                identity_scope: vec![],
+                concurrency: subc_protocol::manifest::Concurrency::ModuleManaged,
+                emits_push: true,
+                sub_supervises: false,
+            }];
+            if opted_in {
+                manifest.capabilities = Some(
+                    serde_json::from_value(json!({"provides":["accepting-drain/v1"]})).unwrap(),
+                );
+            }
+            router
+                .route_for_connection(
+                    &module,
+                    frame(
+                        FrameType::Hello,
+                        1,
+                        json!({
+                        "protocol_ver": PROTOCOL_VERSION, "manifest":manifest
+                        }),
+                    ),
+                )
+                .await
+                .unwrap();
+            let ack = next(&mut module_rx).await;
+            assert_eq!(ack.header.ty, FrameType::HelloAck, "{:?}", body(&ack));
+            let ack: ModuleHelloAckBody = serde_json::from_slice(&ack.body).unwrap();
+            assert!(ack
+                .subc_capabilities
+                .iter()
+                .any(|cap| cap == "accepting-drain/v1"));
+            assert!(ack.subc_ops.iter().any(|op| op == "module.drain_ready"));
+            Self {
+                spec,
+                runtime,
+                registry,
+                snapshot,
+                forwarding,
+                router,
+                module,
+                module_rx,
+                client,
+                client_rx,
+            }
+        }
+
+        fn drain(&self, budget: Duration) -> tokio::task::JoinHandle<StopNotice> {
+            let spec = self.spec.clone();
+            let runtime = self.runtime.clone();
+            let registry = self.registry.clone();
+            let snapshot = self.snapshot.clone();
+            tokio::spawn(async move {
+                begin_forwarding_drain_with_timeout(
+                    &spec,
+                    &runtime,
+                    &registry,
+                    &snapshot,
+                    None,
+                    RouteCloseReason::Restart,
+                    budget,
+                )
+                .await
+                .unwrap()
+            })
+        }
+
+        async fn ready(&self, sender: &RouteCtx, corr: u64) {
+            self.router
+                .route_for_connection(
+                    sender,
+                    frame(FrameType::Request, corr, json!({"op":"module.drain_ready"})),
+                )
+                .await
+                .unwrap();
+        }
+
+        async fn bind(&mut self, corr: u64) -> (u16, u32) {
+            let (open_result, ()) = tokio::join!(
+                self.router.route_for_connection(&self.client, open(corr)),
+                async {
+                    let bind = next(&mut self.module_rx).await;
+                    assert_eq!(body(&bind)["op"], "route.bind");
+                    self.router
+                        .route_for_connection(
+                            &self.module,
+                            frame(
+                                FrameType::Response,
+                                bind.header.corr,
+                                json!({"op":"route.bind"}),
+                            ),
+                        )
+                        .await
+                        .unwrap();
+                }
+            );
+            open_result.unwrap();
+            let opened = next(&mut self.client_rx).await;
+            assert_eq!(opened.header.ty, FrameType::Response, "{:?}", body(&opened));
+            let opened = body(&opened);
+            (
+                opened["route_channel"].as_u64().unwrap() as u16,
+                opened["route_epoch"].as_u64().unwrap() as u32,
+            )
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn accepting_drain_admits_new_routes_and_requests_until_ready_then_closes() {
+        let mut rig = Rig::new(true).await;
+        let drain = rig.drain(LONG_BUDGET);
+        let notice = next(&mut rig.module_rx).await;
+        assert_eq!(body(&notice)["op"], "module.draining");
+        assert_eq!(body(&notice)["accepting"], true);
+        assert_eq!(
+            lock_snapshot(&rig.snapshot).unwrap().state,
+            ModuleState::Draining
+        );
+        assert!(rig.forwarding.module_is_accepting_drain(ID).unwrap());
+
+        rig.ready(&rig.client, 2).await;
+        assert_eq!(
+            body(&next(&mut rig.client_rx).await)["code"],
+            "not_registered"
+        );
+        let (channel, epoch) = rig.bind(3).await;
+        let request = |corr| {
+            Frame::build(
+                FrameType::Request,
+                Flags(0),
+                channel,
+                epoch,
+                corr,
+                b"work".to_vec(),
+            )
+            .unwrap()
+        };
+        rig.router
+            .route_for_connection(&rig.client, request(4))
+            .await
+            .unwrap();
+        let held = next(&mut rig.module_rx).await;
+        assert_eq!(held.body, b"work");
+
+        rig.ready(&rig.module, 5).await;
+        rig.ready(&rig.module, 6).await;
+        for corr in [5, 6] {
+            let ack = next(&mut rig.module_rx).await;
+            assert_eq!(ack.header.ty, FrameType::Response);
+            assert_eq!(ack.header.corr, corr);
+            assert_eq!(body(&ack), json!({"op":"module.drain_ready"}));
+        }
+        assert!(!rig.forwarding.module_is_accepting_drain(ID).unwrap());
+        let closing = next(&mut rig.client_rx).await;
+        assert_eq!(body(&closing)["op"], "route.closing");
+        rig.router
+            .route_for_connection(&rig.client, open(7))
+            .await
+            .unwrap();
+        assert_eq!(
+            body(&next(&mut rig.client_rx).await)["code"],
+            "module_reloading"
+        );
+        let refused = rig
+            .router
+            .route_for_connection(&rig.client, request(8))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(refused, crate::router::RouterError::RouteError { code, .. } if code == "module_reloading")
+        );
+        assert!(rig.module_rx.try_recv().is_err());
+
+        let response = Frame::build(
+            FrameType::Response,
+            held.header.flags,
+            held.header.channel,
+            held.header.epoch,
+            held.header.corr,
+            b"finished".to_vec(),
+        )
+        .unwrap();
+        rig.router
+            .route_for_connection(&rig.module, response)
+            .await
+            .unwrap();
+        assert_eq!(next(&mut rig.client_rx).await.body, b"finished");
+        let closed = next(&mut rig.client_rx).await;
+        assert_eq!(body(&closed)["op"], "route.closed");
+        assert_eq!(body(&closed)["drained"], true);
+        assert_eq!(
+            drain.await.unwrap(),
+            StopNotice::AcceptingDrain {
+                sent_over_connection: true
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn accepting_drain_budget_expiry_closes_admission() {
+        let mut rig = Rig::new(true).await;
+        let started = Instant::now();
+        let drain = rig.drain(LONG_BUDGET);
+        assert_eq!(body(&next(&mut rig.module_rx).await)["accepting"], true);
+        let (channel, epoch) = rig.bind(2).await;
+        let held = Frame::build(
+            FrameType::Request,
+            Flags(0),
+            channel,
+            epoch,
+            3,
+            b"held".to_vec(),
+        )
+        .unwrap();
+        rig.router
+            .route_for_connection(&rig.client, held)
+            .await
+            .unwrap();
+        assert_eq!(next(&mut rig.module_rx).await.body, b"held");
+        tokio::time::advance(LONG_BUDGET - Duration::from_secs(1)).await;
+        assert!(rig.forwarding.module_is_accepting_drain(ID).unwrap());
+        assert!(!drain.is_finished());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(body(&next(&mut rig.client_rx).await)["op"], "route.closing");
+        assert_eq!(started.elapsed(), LONG_BUDGET);
+        assert!(!rig.forwarding.module_is_accepting_drain(ID).unwrap());
+        tokio::time::advance(Duration::from_secs(4)).await;
+        assert!(rig.client_rx.try_recv().is_err());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let closed = body(&next(&mut rig.client_rx).await);
+        assert_eq!(closed["op"], "route.closed");
+        assert_eq!(closed["drained"], false);
+        assert_eq!(
+            drain.await.unwrap(),
+            StopNotice::AcceptingDrain {
+                sent_over_connection: true
+            }
+        );
+        assert_eq!(started.elapsed(), LONG_BUDGET + Duration::from_secs(5));
+        let goodbye = loop {
+            let frame = next(&mut rig.module_rx).await;
+            if frame.header.channel == 0 {
+                break frame;
+            }
+        };
+        assert_eq!(
+            (goodbye.header.ty, goodbye.header.channel),
+            (FrameType::Goodbye, 0)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn accepting_drain_disconnect_does_not_wait_for_the_budget() {
+        let mut rig = Rig::new(true).await;
+        let started = Instant::now();
+        let drain = rig.drain(LONG_BUDGET);
+        assert_eq!(body(&next(&mut rig.module_rx).await)["accepting"], true);
+        rig.forwarding
+            .cleanup_connection(rig.module.connection_id)
+            .unwrap();
+        rig.registry
+            .deregister_connection(rig.module.connection_id)
+            .unwrap();
+        assert_eq!(
+            drain.await.unwrap(),
+            StopNotice::AcceptingDrain {
+                sent_over_connection: false
+            }
+        );
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert!(!rig.forwarding.module_is_accepting_drain(ID).unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn accepting_drain_hands_teardown_to_daemon_shutdown_without_waiting() {
+        let mut rig = Rig::new(true).await;
+        let started = Instant::now();
+        let restart = tokio::spawn({
+            let spec = rig.spec.clone();
+            let runtime = rig.runtime.clone();
+            let registry = rig.registry.clone();
+            let snapshot = rig.snapshot.clone();
+            async move {
+                super::super::restart::restart_child(
+                    &spec,
+                    &runtime,
+                    &registry,
+                    &SupervisorProcessLiveness::new(),
+                    &snapshot,
+                    &mut None,
+                    LONG_BUDGET,
+                )
+                .await
+            }
+        });
+        assert_eq!(body(&next(&mut rig.module_rx).await)["accepting"], true);
+        let endpoint = rig.forwarding.active_module_endpoint(ID).unwrap().unwrap();
+        assert_eq!(
+            rig.forwarding.begin_daemon_drain().unwrap(),
+            vec![(ID.into(), endpoint)]
+        );
+        restart.await.unwrap().unwrap();
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert!(rig.registry.get_module(ID).unwrap().is_some());
+        assert!(
+            rig.module_rx.try_recv().is_err(),
+            "only shutdown sends the GOODBYE"
+        );
+        assert!(!lock_snapshot(&rig.snapshot).unwrap().respawn_pending);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn accepting_drain_ready_outside_a_drain_is_refused_without_changing_admission() {
+        let mut rig = Rig::new(true).await;
+        rig.ready(&rig.module, 2).await;
+        let refusal = next(&mut rig.module_rx).await;
+        assert_eq!(refusal.header.ty, FrameType::Error);
+        assert_eq!(body(&refusal)["code"], "invalid_request");
+        assert_eq!(
+            lock_snapshot(&rig.snapshot).unwrap().state,
+            ModuleState::Running
+        );
+        rig.bind(3).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn accepting_drain_now_and_legacy_drains_never_open_the_accepting_phase() {
+        for (opted_in, budget) in [(true, Duration::ZERO), (false, LONG_BUDGET)] {
+            let mut rig = Rig::new(opted_in).await;
+            let (channel, _) = rig.bind(2).await;
+            let started = Instant::now();
+            let drain = rig.drain(budget);
+            let notice = next(&mut rig.module_rx).await;
+            assert_eq!(body(&notice)["op"], "module.draining");
+            assert!(body(&notice).get("accepting").is_none());
+            assert!(!rig.forwarding.module_is_accepting_drain(ID).unwrap());
+            assert_eq!(body(&next(&mut rig.client_rx).await)["op"], "route.closing");
+            let closed = next(&mut rig.client_rx).await;
+            assert_eq!(body(&closed)["op"], "route.closed");
+            assert_eq!(body(&closed)["channels"], json!([channel]));
+            assert_eq!(drain.await.unwrap(), StopNotice::SentOverConnection);
+            assert_eq!(started.elapsed(), Duration::ZERO);
+        }
+    }
+
+    #[tokio::test]
+    async fn accepting_drain_ready_restarts_the_supervised_child() {
+        let mut rig = Rig::new(true).await;
+        let home = cortexkit_test_support::ScratchDir::new("accepting-drain-restart");
+        let spec = ModuleSpec {
+            module_id: ID.into(),
+            ..serving_spec(home.path(), ModuleProtocol::Subc)
+        };
+        let policy = RestartPolicy::new(3, Duration::ZERO);
+        let supervisor = Supervisor::new_for_test(rig.registry.clone(), policy)
+            .with_forwarding(rig.forwarding.clone());
+        let module = supervisor
+            .supervise_configured_with_health(
+                spec,
+                true,
+                HealthConfig::default(),
+                Some(LONG_BUDGET.as_millis() as u64),
+                policy,
+            )
+            .unwrap();
+        let before = module.status().unwrap();
+        let pid = rustix::process::Pid::from_raw(before.pid.unwrap() as i32).unwrap();
+        let restart = tokio::spawn({
+            let module = module.clone();
+            async move { module.restart(Some(60_000)).await }
+        });
+        let notice = next(&mut rig.module_rx).await;
+        assert_eq!(body(&notice)["accepting"], true);
+        let remaining_ms = body(&notice)["deadline_ms"]
+            .as_u64()
+            .unwrap()
+            .saturating_sub(unix_ms_now());
+        assert!(
+            (50_000..=60_000).contains(&remaining_ms),
+            "restart override sets the accepting budget: {remaining_ms}"
+        );
+        rig.ready(&rig.module, 2).await;
+        assert_eq!(
+            next(&mut rig.module_rx).await.header.ty,
+            FrameType::Response
+        );
+        assert_eq!(next(&mut rig.module_rx).await.header.ty, FrameType::Goodbye);
+        // Stand in for the module closing its registration and then exiting.
+        rig.forwarding
+            .cleanup_connection(rig.module.connection_id)
+            .unwrap();
+        rig.registry
+            .deregister_connection(rig.module.connection_id)
+            .unwrap();
+        rustix::process::kill_process(pid, rustix::process::Signal::TERM).unwrap();
+        timeout(Duration::from_secs(10), restart)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let after = timeout(Duration::from_secs(10), async {
+            loop {
+                let status = module.status().unwrap();
+                if status.spawn_generation > before.spawn_generation
+                    && status.state == ModuleState::Running
+                {
+                    break status;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(after.spawn_generation, before.spawn_generation + 1);
+        assert_ne!(after.pid, before.pid);
+        module.stop().await.unwrap();
+    }
+}

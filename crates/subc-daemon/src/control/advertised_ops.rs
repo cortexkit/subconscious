@@ -60,6 +60,7 @@ pub(super) const MODULE_TO_SUBC_CONTROL_OPS: &[&str] = &[
     "claim.present",
     MODULE_TO_SUBC_OP_CATALOG_UPDATE,
     MODULE_TO_SUBC_OP_CATALOG_UPDATE_ROLE_DECLARATIONS,
+    subc_protocol::session::MODULE_DRAIN_READY_OP,
     "supervisor.live_roots",
     "supervisor.agent_commands",
     SCOPE_SYNC_OP,

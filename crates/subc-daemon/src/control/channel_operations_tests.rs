@@ -568,6 +568,7 @@ const MODULE_TO_DAEMON_OPERATIONS: &[(&str, bool)] = &[
     ("scope.served_by", true),
     ("policy_root.get", true),
     ("policy_root.rotate", true),
+    ("module.drain_ready", true),
     // Connection setup, and reads a module makes as a client.
     ("claim.present", false),
     ("activity.query", false),

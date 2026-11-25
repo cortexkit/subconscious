@@ -604,7 +604,7 @@ informational: restart and reload reasons still classify as `MayReopen`.
 | `health.check` | Request | Ask the module for its health. Reply: `status` (`ok`, `degraded`, `failing`), optional `detail` and `metrics`. Sent only to modules that declared the op in HELLO `control_ops`. |
 | `config.review` | Request | Review a candidate settings tuple against its approved view. The daemon checks the returned fields before including the tuple in a plan. |
 | `projects.enumerate` | Request | Read Entorhinal's authoritative project/workspace registry for configuration planning and membership refresh. Requires the nonce-verified reserved `entorhinal` principal, readiness and HELLO `control_ops` opt-in. |
-| `module.draining` | Command | Tell the module its routes are draining, with `reason` and an absolute wall-clock `deadline_ms`. Treat the deadline as "no later than". |
+| `module.draining` | Command | Tell the module its routes are draining, with `reason` and an absolute wall-clock `deadline_ms`. Treat the deadline as "no later than". `accepting: true` means this restart or reload still admits routes and requests until `module.drain_ready` or the deadline; absent means admission closes now as before. |
 
 What a module does with these is in [`module-surface.md`](module-surface.md).
 
@@ -674,6 +674,7 @@ to a module that lists it.
 | Op | Kind | Purpose |
 | --- | --- | --- |
 | `route.status` | Push | Report a status string for one of the module's routes, read back by `route.poll`. |
+| `module.drain_ready` | Request | On channel 0, `{"op":"module.drain_ready"}` ends the module's accepting phase. The daemon echoes the op on success, including repeats during the same drain, or replies `invalid_request` if this connection has no accepting drain. |
 | `catalog.update` | Request | Replace the module's `provides` roles, optionally its capability declaration, and optionally its readiness, without re-registering. Test: `catalog_update_refreshes_catalog_without_disrupting_bound_routes` (`crates/subc-core/tests/catalog_update.rs`). |
 | `catalog.update_role_declarations` | Request | Replace the module's complete `role_declarations` map, or clear it with `{}`, without changing provider roles, capabilities or readiness. Served since daemon 0.44.9. |
  | `supervisor.live_roots` | Request | Count live and pending routes per canonical project root, also including the workdir of each bound scoped route. A route contributes once when both paths match. |
@@ -831,6 +832,7 @@ only in `server.describe`.
 | `scope-workdir/v1` | Scope records accept optional `workdir` and `project_id`, fixed per epoch and not authority-gated. Binds carry them only to targets whose manifest `capabilities.provides` declares this capability; older targets' bind bytes stay unchanged. Scoped activity entries include them, and bound scoped workdirs contribute to live roots alongside bind roots. See [`scopes.md`](scopes.md) for validation and epoch refusal codes. |
 | `route-role-versions/v1` | `route.open` accepts `role_versions` and copies it to the bind. |
 | `catalog-events/v1` | `catalog.list` carries each module's declared `events`, so an entry without them means the module declares none. |
+| `accepting-drain/v1` | Modules declaring it in `manifest.capabilities.provides` can keep accepting work while preparing for restart or reload. During that phase `supervisor.list` keeps `state: "draining"` and includes `accepting_drain: true`; the field is omitted otherwise. |
 | `scope-bind-proof/v1` | Scope records may carry `bind_proof_sha256`, and scoped opens must present the proof. |
 | `scope-bind-proof/v2` | Bind proofs are required only from non-attested openers; reserved modules are exempt. Advertised alongside v1. |
 | `scope-replace-if-idle/v1` | Scope records may request atomic idle-only epoch/proof replacement; scoped opens may hold connection presence across route closures. |

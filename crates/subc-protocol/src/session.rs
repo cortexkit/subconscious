@@ -161,6 +161,33 @@ pub enum ModuleControlCommand {
 /// Opt-in to staying alive and reconnecting across an in-place daemon upgrade.
 pub const LIVE_UPGRADE_CAPABILITY: &str = "live-upgrade/v1";
 
+/// Opt-in to keeping route admission open during a module restart's long-work phase.
+pub const ACCEPTING_DRAIN_CAPABILITY: &str = "accepting-drain/v1";
+
+/// Module-to-daemon channel-0 request and acknowledgement op.
+pub const MODULE_DRAIN_READY_OP: &str = "module.drain_ready";
+
+/// Empty request and acknowledgement body for `module.drain_ready`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "op", deny_unknown_fields)]
+pub enum ModuleDrainReady {
+    #[serde(rename = "module.drain_ready")]
+    Ready {},
+}
+
+/// `module.draining` with the accepting-phase marker, sent only to opted-in modules.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "op")]
+pub enum AcceptingDrainCommand {
+    #[serde(rename = "module.draining")]
+    Draining {
+        reason: RouteCloseReason,
+        /// Absolute Unix-millisecond ceiling for the accepting phase.
+        deadline_ms: u64,
+        accepting: bool,
+    },
+}
+
 /// Module-to-subc channel-0 response body.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "op")]
@@ -607,6 +634,44 @@ fn is_role_version(version: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn accepting_drain_wire_bodies_are_additive() {
+        let wire = br#"{"op":"module.drain_ready"}"#;
+        assert_eq!(
+            serde_json::to_vec(&ModuleDrainReady::Ready {}).unwrap(),
+            wire
+        );
+        assert_eq!(
+            serde_json::from_slice::<ModuleDrainReady>(wire).unwrap(),
+            ModuleDrainReady::Ready {}
+        );
+        assert!(serde_json::from_slice::<ModuleDrainReady>(
+            br#"{"op":"module.drain_ready","module_id":"other"}"#
+        )
+        .is_err());
+        let accepting = AcceptingDrainCommand::Draining {
+            reason: RouteCloseReason::Restart,
+            deadline_ms: 1000,
+            accepting: true,
+        };
+        let notice = serde_json::to_vec(&accepting).unwrap();
+        assert_eq!(
+            notice,
+            br#"{"op":"module.draining","reason":"restart","deadline_ms":1000,"accepting":true}"#
+        );
+        let legacy = ModuleControlCommand::Draining {
+            reason: RouteCloseReason::Restart,
+            deadline_ms: 1000,
+        };
+        assert_eq!(
+            serde_json::from_slice::<ModuleControlCommand>(&notice).unwrap(),
+            legacy
+        );
+        assert_eq!(
+            serde_json::to_vec(&legacy).unwrap(),
+            br#"{"op":"module.draining","reason":"restart","deadline_ms":1000}"#
+        );
+    }
     #[test]
     fn catalog_update_role_declarations_wire_round_trip() {
         for declarations in [

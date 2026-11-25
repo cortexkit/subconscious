@@ -340,21 +340,22 @@ export interface SubcProviderConnectOptions {
   onBound?: (handle: RouteHandle) => void | Promise<void>;
   onRouteGone?: (handle: RouteHandle) => void | Promise<void>;
   /**
-   * The daemon has stopped admitting routes and is draining the module. Stop
-   * taking new work and finish or hand off work in flight. Called once per
+   * The daemon is draining the module. Normally it has stopped admitting routes.
+   * When `accepting` is true, work still arrives: persist it before answering,
+   * and call `drainReady()` when the long work has finished. Called once per
    * notice, independently of the frame reader; throws and rejections are contained.
    * GOODBYE and connection-end reporting wait at most 2 s for hooks to start,
    * not for them to finish. Hooks may still be running after serving ends.
    * The wall-clock deadline is "no later than", never a grant of time: the
    * daemon enforces its own monotonic ceiling, which can expire earlier.
    *
-   * Background work the daemon cannot see holds a drain open only when the
+   * Background work the daemon cannot see holds a non-accepting drain open only when the
    * manifest declares a Busy self-signal anchored to health gauges. Report
    * those gauges above zero in health metrics until that work finishes. During
    * draining the daemon waits for every declared gauge to reach zero (a missing
    * gauge counts as busy), or for its deadline. A pending hook alone is not busy.
    */
-  onDraining?: (reason: RouteCloseReason, deadline: Date) => void | Promise<void>;
+  onDraining?: (reason: RouteCloseReason, deadline: Date, accepting: boolean) => void | Promise<void>;
   /** Opt a supervised Linux or macOS provider into announced daemon upgrades.
    * Every SDK copy in a process shares one registration owner. If an older copy created it without the
    * `rebind` and `unbind` methods a resume needs, opt-in is turned off and the daemon restarts the module instead. */
@@ -411,7 +412,7 @@ interface NormalizedSubcProviderConnectOptions {
   /** Runs only after an accepted bind ack is queued and the handle is installed. */
   onBound?: (handle: RouteHandle) => void | Promise<void>;
   onRouteGone?: (handle: RouteHandle) => void | Promise<void>;
-  onDraining?: (reason: RouteCloseReason, deadline: Date) => void | Promise<void>;
+  onDraining?: (reason: RouteCloseReason, deadline: Date, accepting: boolean) => void | Promise<void>;
   liveUpgrade: boolean;
   resumeScopeSync?: SubcProviderConnectOptions["resumeScopeSync"];
   onReconnected?: SubcProviderConnectOptions["onReconnected"];
@@ -662,7 +663,7 @@ export class SubcProvider {
     this.config = opts.config ? new ModuleConfig({
       capabilities: () => this.subcCapabilities,
       epoch: () => this.currentEpoch(),
-      request: (body) => this.configControl(body),
+      request: (body) => this.controlCall(body),
       checkSendAllowed: () => this.checkUpgradeFence(),
     }, opts.config) : undefined;
     this.storage = ack.storage;
@@ -746,7 +747,15 @@ export class SubcProvider {
     }
   }
 
-  private async configControl(body: object): Promise<unknown> {
+  /** Tell the daemon an accepting drain is ready to close admission and restart. */
+  async drainReady(): Promise<void> {
+    if (!this.subcCapabilities.includes("accepting-drain/v1")) {
+      throw new SubcProviderError("accepting drains are not supported by the daemon", "not_supported", "not_sent");
+    }
+    await this.controlCall({ op: "module.drain_ready" });
+  }
+
+  private async controlCall(body: object): Promise<unknown> {
     this.checkUpgradeFence();
     if (this.closedErr) throw this.closedErr;
     if (this.reconnecting) throw new SubcProviderError("provider is reconnecting", "connection_lost", "not_sent");
@@ -870,7 +879,7 @@ export class SubcProvider {
     const provider = new SubcProvider(opened.sock, opened.conn, normalized, opened.ack);
     const owner = registrationOwner();
     if (normalized.registrationChannel) {
-      owner.bind((body) => provider.configControl(body), () => provider.checkUpgradeFence());
+      owner.bind((body) => provider.controlCall(body), () => provider.checkUpgradeFence());
       void provider.closed.then(() => {
         owner.broker?.close();
         if (!provider.locallyClosed) {
@@ -1049,7 +1058,7 @@ export class SubcProvider {
   }
 
   private handleControlPush(frame: Frame, control: ControlPushState): void {
-    let body: { op?: unknown; reason?: unknown; deadline_ms?: unknown; project_id?: unknown; reconnect_by_ms?: unknown };
+    let body: { op?: unknown; reason?: unknown; deadline_ms?: unknown; project_id?: unknown; reconnect_by_ms?: unknown; accepting?: unknown };
     try {
       body = JSON.parse(Buffer.from(frame.body).toString("utf8"));
       if (body?.op === "module.upgrading") {
@@ -1084,7 +1093,7 @@ export class SubcProvider {
     // for its completion on the reader. JavaScript hooks must not block synchronously.
     void Promise.resolve().then(() => {
       try {
-        const result = this.opts.onDraining?.(parseRouteCloseReason(body.reason), deadline);
+        const result = this.opts.onDraining?.(parseRouteCloseReason(body.reason), deadline, body.accepting === true);
         void Promise.resolve(result).catch((error) => {
           console.warn("SubcProvider draining callback failed", error);
         });
@@ -1562,7 +1571,7 @@ export class SubcProvider {
       }
       const epoch = this.replaceConnection(opened);
       this.requestGate = new AsyncPermitPool(DEFAULT_PROVIDER_HANDLER_CAPACITY);
-      owner.rebind((body) => this.configControl(body), () => this.checkUpgradeFence());
+      owner.rebind((body) => this.controlCall(body), () => this.checkUpgradeFence());
       this.resumedRegistrationOwner = owner;
 
       let outcome: Promise<ReconnectOutcome> = Promise.resolve(undefined);

@@ -333,6 +333,20 @@ module declares the capability.
   `drain_timeout_ms` (default 30 s) for in-flight requests to finish. It then
   sends `route.closed` to clients and a `GOODBYE` per route and for the module
   itself. An idle module is not kept waiting.
+- **Accepting drain.** A module can list `accepting-drain/v1` in the manifest's
+  `capabilities.provides`. A daemon supporting it advertises the same token in
+  `HELLO_ACK.subc_capabilities`. On an accepting restart or reload,
+  `module.draining` includes `accepting: true`: new routes and requests keep
+  arriving, but the module should finish long work rather than start more. The
+  module must persist any work it accepts before answering and run it after
+  restart. Do not opt in if that guarantee cannot be made. When long work is
+  done, send `module.drain_ready` on the registered channel-0 connection. The
+  daemon also proceeds when `deadline_ms` expires. The deadline uses
+  `drain_timeout_ms` unless the operator supplies `ck module restart --drain-ms`.
+  Admission then closes and requests already dispatched have up to five seconds
+  to finish. If `accepting` is absent, admission closes immediately as before;
+  that includes daemon shutdown, older daemons and `ck module restart --now`.
+  A daemon shutdown takes over any accepting drain already in progress.
 - **Stop.** A registered module is expected to exit on its own after the
   module `GOODBYE`; the daemon sends it no signal, because a signal would race
   that stop. A `protocol: "none"` module, or a module that has not registered,

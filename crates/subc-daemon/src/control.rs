@@ -510,6 +510,7 @@ impl ControlHandler {
                 subc_protocol::scope::SCOPE_SERVED_BY_CAPABILITY.to_string(),
                 subc_control::ACTIVITY_LEDGER_CAPABILITY.to_string(),
                 subc_protocol::ROUTE_CLOSE_REASONS_CAPABILITY.to_string(),
+                subc_protocol::session::ACCEPTING_DRAIN_CAPABILITY.to_string(),
             ]),
             route_bind_relay_timeout: DEFAULT_ROUTE_BIND_RELAY_TIMEOUT,
             route_bind_relay_timeouts: BTreeMap::new(),
@@ -1313,6 +1314,11 @@ impl ControlHandler {
                             "unsupported_control_frame",
                             "module-originated channel-0 REQUEST is not supported",
                         )?]);
+                    }
+                    if op.as_ref().is_some_and(|probe| {
+                        probe.op == subc_protocol::session::MODULE_DRAIN_READY_OP
+                    }) {
+                        return self.handle_module_drain_ready(ctx.connection_id, frame);
                     }
                     let request = match parse_module_control_request_from_module(&frame.body) {
                         Ok(request) => request,

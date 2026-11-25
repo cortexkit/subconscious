@@ -97,6 +97,44 @@ async fn terminal_module_list_at_100_columns_keeps_columns_and_colors_status_gly
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_module_list_accepting_drain_has_a_distinct_label() {
+    let mut accepting = SupervisorEntry::new(
+        "runner",
+        "draining",
+        true,
+        false,
+        SupervisorHealthStatus::Unknown,
+    );
+    accepting.accepting_drain = Some(true);
+    let value = serde_json::to_value(ClientControlResponse::SupervisorList {
+        generation: 1,
+        modules: vec![accepting],
+        daemon: None,
+        agent_commands: None,
+    })
+    .unwrap();
+    let mut daemon = ScriptedDaemon::start(
+        "inline-accepting-drain",
+        vec![reply(ClientControlRequest::SupervisorList {}, value)],
+    )
+    .await;
+    let mut command = ck_command();
+    command
+        .arg("--subc")
+        .arg(&daemon.connection_file_path)
+        .args(["module", "list"]);
+    let parser = terminal(&command);
+    assert_eq!(
+        parser.screen().contents(),
+        concat!(
+            "module  status                  health   reload \n",
+            "runner  ◐ draining (accepting)  unknown  unknown",
+        )
+    );
+    daemon.assert_complete().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn terminal_json_wins_over_both_inline_views() {
     for (args, request, response) in [
         (

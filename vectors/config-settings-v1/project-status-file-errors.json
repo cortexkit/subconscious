@@ -11,7 +11,7 @@
         {
           "code": "bound_violated",
           "layer": "project",
-          "message": "a/A: /limit",
+          "message": "/limit is not valid here (bound_violated)",
           "module_id": "a",
           "path": "/home/example/repos/private/.cortexkit/a.jsonc",
           "project_id": "A",

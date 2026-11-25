@@ -135,7 +135,7 @@ impl std::fmt::Display for RootCheckFailure {
 }
 
 impl RootCheckFailure {
-    fn error(&self, project: &str, path: &Path, rechecking: bool) -> GateError {
+    fn error(&self, rechecking: bool) -> GateError {
         use subc_os::OpenRegularError;
         let code = match self {
             Self::InvalidPath => "layer_root_invalid",
@@ -155,7 +155,7 @@ impl RootCheckFailure {
         if rechecking && code.starts_with("layer_") {
             return changed();
         }
-        GateError::new(code, format!("{project}: root {}: {self}", path.display()))
+        GateError::new(code, self.to_string())
     }
 }
 
@@ -499,21 +499,16 @@ impl RegistryRevision {
         self.opened = Arc::new(observed);
     }
 
-    fn opened_root(
-        &self,
-        project: &str,
-        root: &RegistryRoot,
-        rechecking: bool,
-    ) -> Result<&OpenedRoot> {
+    fn opened_root(&self, root: &RegistryRoot, rechecking: bool) -> Result<&OpenedRoot> {
         let opened = self
             .opened
             .get(&root.path)
             .ok_or_else(|| layer_unavailable("registry root was not captured"))?
             .as_ref()
             .as_ref()
-            .map_err(|error| error.error(project, &root.path, rechecking))?;
+            .map_err(|error| error.error(rechecking))?;
         if root.file_id.as_ref() != Some(&opened.id) {
-            return Err(RootCheckFailure::IdentityMismatch.error(project, &root.path, rechecking));
+            return Err(RootCheckFailure::IdentityMismatch.error(rechecking));
         }
         Ok(opened)
     }
@@ -533,7 +528,7 @@ impl RegistryRevision {
     /// Borrow a retained root and its layer observation for a registered project.
     pub fn layer_location(&self, id: &str, root: &Path) -> Result<(&File, &LayerLocation)> {
         let opened = self.layer_root(id, root)?;
-        Ok((&opened.handle, location(opened, id, root)?))
+        Ok((&opened.handle, location(opened)?))
     }
 
     pub(super) fn observed_layer_file(
@@ -545,7 +540,7 @@ impl RegistryRevision {
     ) -> Result<Option<Vec<u8>>> {
         use subc_protocol::config::ConfigLayer;
         let opened = self.layer_root(id, root)?;
-        let location = location(opened, id, root).map_err(|error| {
+        let location = location(opened).map_err(|error| {
             // Root and registry failures have no resolved file. Attribute only
             // an error from reading the settings location in the retained root.
             if opened.layer.as_ref().is_some_and(|layer| layer.is_err()) {
@@ -571,7 +566,7 @@ impl RegistryRevision {
         }
         let mut opened = None;
         for record in project.roots().filter(|record| record.path == root) {
-            opened = Some(self.opened_root(id, record, false)?);
+            opened = Some(self.opened_root(record, false)?);
         }
         opened.ok_or_else(|| {
             GateError::new(
@@ -588,8 +583,8 @@ impl RegistryRevision {
             return Err(error.clone());
         }
         let input = |root: &RegistryRoot| -> Result<_> {
-            let opened = self.opened_root(id, root, false)?;
-            Ok(location(opened, id, &root.path)?.file.as_ref())
+            let opened = self.opened_root(root, false)?;
+            Ok(location(opened)?.file.as_ref())
         };
         let mut project_layer = None;
         for root in &project.project_roots {
@@ -681,19 +676,19 @@ impl RegistryRevision {
                 return Err(error.clone());
             }
             for root in project.roots() {
-                let opened = current.opened_root(id, root, true)?;
+                let opened = current.opened_root(root, true)?;
                 if !scope.paths.contains(&layer_path(&root.path, &self.module)) {
                     continue;
                 }
-                let previous = self.opened_root(id, root, true)?;
-                let now = location(opened, id, &root.path).map_err(|error| {
+                let previous = self.opened_root(root, true)?;
+                let now = location(opened).map_err(|error| {
                     if error.code.starts_with("layer_") {
                         changed()
                     } else {
                         error
                     }
                 })?;
-                if !location(previous, id, &root.path)?.same_identity(now) {
+                if !location(previous)?.same_identity(now) {
                     return Err(changed());
                 }
             }
@@ -702,18 +697,13 @@ impl RegistryRevision {
     }
 }
 
-fn location<'a>(opened: &'a OpenedRoot, project: &str, root: &Path) -> Result<&'a LayerLocation> {
+fn location(opened: &OpenedRoot) -> Result<&LayerLocation> {
     opened
         .layer
         .as_ref()
         .ok_or_else(|| layer_unavailable("registry layer was not captured"))?
         .as_ref()
-        .map_err(|error| {
-            GateError::new(
-                &error.code,
-                format!("{project}: root {}: {}", root.display(), error.detail),
-            )
-        })
+        .map_err(|error| GateError::new(&error.code, &error.detail))
 }
 
 fn parse_id(text: Option<&str>) -> Result<Option<RegistryFileId>> {

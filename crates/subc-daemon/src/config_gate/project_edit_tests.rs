@@ -883,7 +883,10 @@ async fn project_edit_unstamped_refuses_invalid_or_unreadable_affected_tuple() {
     assert_eq!(view.refusals.len(), 1);
     assert_eq!(view.refusals[0].project_id.as_deref(), Some("B"));
     assert_eq!(view.refusals[0].code, "layer_not_regular");
-    assert!(view.refusals[0].message.contains(b.to_str().unwrap()));
+    assert_eq!(
+        view.refusals[0].message,
+        "entry does not have the requested file type"
+    );
     assert_eq!(std::fs::read(&workspace).unwrap(), br#"{"limit":4}"#);
 }
 

@@ -335,7 +335,7 @@ impl ModuleRoots {
                 }
                 let old = approved.get(&path).and_then(|layer| layer.bytes.as_deref());
                 let record = |bytes: &[u8]| -> Result<_> {
-                    schema.record_layer(Layer::Workspace, bytes, module, &project.project_id)?;
+                    schema.record_layer(Layer::Workspace, bytes, module)?;
                     super::capture::parse_layer(bytes)
                 };
                 let before = old
@@ -749,7 +749,7 @@ pub(super) fn build_review(
             } else {
                 Layer::Project
             };
-            schema.record_layer(kind, bytes, module, project)
+            schema.record_layer(kind, bytes, module)
         })
         .collect::<Result<Vec<_>>>()?;
     let reviewed = schema.review_tuple(

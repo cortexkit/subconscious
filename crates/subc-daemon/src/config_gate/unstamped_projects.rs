@@ -581,7 +581,6 @@ pub(super) fn live_view(
                     kind,
                     layer.bytes.as_deref().expect("only present project layers"),
                     module,
-                    project,
                 )
                 .map_err(|error| {
                     error

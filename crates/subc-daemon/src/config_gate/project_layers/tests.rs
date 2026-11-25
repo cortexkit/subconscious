@@ -31,15 +31,11 @@ fn project_layers_refuse_expansions_without_echoing_literals_or_keys() {
         for literal in ["{env:EXPANSION_SECRET}", "{file:EXPANSION_SECRET}"] {
             let input = json!({literal: [literal]});
             let error = schema
-                .record_layer(
-                    layer,
-                    &serde_json::to_vec(&input).unwrap(),
-                    "module",
-                    "project",
-                )
+                .record_layer(layer, &serde_json::to_vec(&input).unwrap(), "module")
                 .err()
                 .unwrap();
             assert_eq!(error.code, "value_invalid");
+            assert_eq!(error.detail, "configuration expansions are not supported");
             assert!(!error.to_string().contains("EXPANSION_SECRET"));
         }
     }
@@ -49,16 +45,23 @@ fn project_layers_refuse_expansions_without_echoing_literals_or_keys() {
 fn project_layers_restrict_named_and_pattern_credential_sections_before_review() {
     let schema = schema();
     for layer in [Layer::Workspace, Layer::Project] {
-        for input in [
-            br#"{"s":{"label":"sibling"}}"#.as_slice(),
-            br#"{"s":{"nested":{"credential":{"vault_ref":"private-reference"}}}}"#,
-            br#"{"env-prod":{"label":"dynamic sibling"}}"#,
+        for (input, message) in [
+            (
+                br#"{"s":{"label":"sibling"}}"#.as_slice(),
+                "s can be set only in the user settings file",
+            ),
+            (
+                br#"{"s":{"nested":{"credential":{"vault_ref":"private-reference"}}}}"#.as_slice(),
+                "s can be set only in the user settings file",
+            ),
+            (
+                br#"{"env-prod":{"label":"dynamic sibling"}}"#.as_slice(),
+                "credentials can be set only in the user settings file",
+            ),
         ] {
-            let error = schema
-                .record_layer(layer, input, "module", "p")
-                .err()
-                .unwrap();
+            let error = schema.record_layer(layer, input, "module").err().unwrap();
             assert_eq!(error.code, "credential_layer_unsupported");
+            assert_eq!(error.detail, message);
             assert!(!error.detail.contains("private-reference"));
         }
         let allowed = schema
@@ -66,7 +69,6 @@ fn project_layers_restrict_named_and_pattern_credential_sections_before_review()
                 layer,
                 br#"{ /* comment */ "limit":5, "env-public":"allowed", }"#,
                 "module",
-                "p",
             )
             .unwrap();
         assert_eq!(allowed.recorded, json!({"limit":5,"env-public":"allowed"}));
@@ -89,12 +91,12 @@ fn project_layers_refuse_non_live_base_or_candidate_sources_but_allow_user_sourc
         .unwrap();
     for (field, layer) in [("next", Layer::Workspace), ("route", Layer::Project)] {
         let bytes = serde_json::to_vec(&json!({field: 2})).unwrap();
-        let layer_value = schema.record_layer(layer, &bytes, "module", "p").unwrap();
+        let layer_value = schema.record_layer(layer, &bytes, "module").unwrap();
         let error = schema
             .review_tuple("module", "p", Some(user.clone()), &[layer_value], None)
             .unwrap_err();
         assert_eq!(error.code, "project_apply_kind_unsupported");
-        assert!(error.detail.contains(&format!("/{field}")));
+        assert_eq!(error.detail, format!("/{field} can't be set in a project or workspace file, because changing it restarts the module or reconnects its routes"));
         let base = ConfigView::new(
             1,
             json!({field: 2}),
@@ -102,15 +104,45 @@ fn project_layers_refuse_non_live_base_or_candidate_sources_but_allow_user_sourc
             vec![],
             ConfigStatus::Active,
         );
-        let error = refuse_project_apply_kinds(
-            "module",
-            "p",
-            Some((schema.schema(), &base)),
-            schema.schema(),
-            &inherited,
-        )
-        .unwrap_err();
+        let error =
+            refuse_project_apply_kinds(Some((schema.schema(), &base)), schema.schema(), &inherited)
+                .unwrap_err();
         assert_eq!(error.code, "project_apply_kind_unsupported");
-        assert!(error.detail.contains(&format!("/{field}")));
+        assert_eq!(error.detail, format!("/{field} can't be set in a project or workspace file, because changing it restarts the module or reconnects its routes"));
+    }
+}
+
+#[test]
+fn project_layers_refusal_names_setting_and_code_without_identity_prefix() {
+    let schema = schema();
+    let layer = schema
+        .record_layer(Layer::Project, br#"{"limit":"wrong"}"#, "module")
+        .unwrap();
+    let error = schema
+        .review_tuple("module", "project", None, &[layer], None)
+        .unwrap_err();
+    assert_eq!(error.code, "value_invalid");
+    assert_eq!(error.detail, "/limit is not valid here (value_invalid)");
+}
+
+#[test]
+fn project_layers_forbidden_field_names_its_file_kind() {
+    let schema = ProjectLayerSchema::new(Schema::new(json!({
+        "$schema":"https://json-schema.org/draft/2020-12/schema", "type":"object", "unevaluatedProperties":false,
+        "x-ck-layers":["user","workspace","project"], "x-ck-apply":"live",
+        "properties":{"limit":{"type":"integer", "description":"Limit", "default":0, "x-ck-layers":["user"]}}
+    })).unwrap());
+    for (layer, file_kind) in [(Layer::Workspace, "workspace"), (Layer::Project, "project")] {
+        let layer = schema
+            .record_layer(layer, br#"{"limit":1}"#, "module")
+            .unwrap();
+        let error = schema
+            .review_tuple("module", "project", None, &[layer], None)
+            .unwrap_err();
+        assert_eq!(error.code, "layer_forbidden");
+        assert_eq!(
+            error.detail,
+            format!("/limit can't be set in {file_kind} files")
+        );
     }
 }

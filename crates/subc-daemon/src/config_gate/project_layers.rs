@@ -60,7 +60,6 @@ impl ProjectLayerSchema {
         layer: Layer,
         bytes: &[u8],
         module: &str,
-        project: &str,
     ) -> Result<RecordedProjectLayer> {
         if !matches!(layer, Layer::Workspace | Layer::Project) {
             return Err(GateError::new(
@@ -71,18 +70,13 @@ impl ProjectLayerSchema {
         let value = capture::parse_layer(bytes)?;
         capture::refuse_expansions(&value, module, "").map_err(|error| {
             // The guard's path can include arbitrary JSON keys from the file.
-            GateError::new(
-                &error.code,
-                format!("{module}/{project}: configuration expansions are not supported"),
-            )
+            GateError::new(&error.code, "configuration expansions are not supported")
         })?;
-        let recorded = self.schema.record(&value).map_err(|_| {
-            GateError::new(
-                "value_invalid",
-                format!("{module}/{project}: configuration could not be recorded"),
-            )
-        })?;
-        self.check_credentials(module, project, &value)?;
+        let recorded = self
+            .schema
+            .record(&value)
+            .map_err(|_| GateError::new("value_invalid", "configuration could not be recorded"))?;
+        self.check_credentials(&value)?;
         Ok(RecordedProjectLayer {
             input: LayerValue::new(layer, value),
             recorded,
@@ -103,7 +97,7 @@ impl ProjectLayerSchema {
             .map(|value| LayerValue::new(Layer::User, value))
             .collect();
         for layer in layers {
-            self.check_credentials(module, project, &layer.input.value)
+            self.check_credentials(&layer.input.value)
                 .map_err(|error| error.at_settings_layer(layer.input.layer))?;
             inputs.push(layer.input.clone());
         }
@@ -115,12 +109,14 @@ impl ProjectLayerSchema {
             )
             .map_err(|attributed| {
                 let refusal = attributed.refusal;
-                let file_layer = match (refusal.code, refusal.path.as_str(), attributed.layer) {
-                    (RefusalCode::LayerForbidden, "", Some(Layer::Workspace)) => Some("workspace"),
-                    (RefusalCode::LayerForbidden, "", Some(Layer::Project)) => Some("project"),
+                let file_layer = match (refusal.code, attributed.layer) {
+                    (RefusalCode::LayerForbidden, Some(Layer::Workspace)) => Some("workspace"),
+                    (RefusalCode::LayerForbidden, Some(Layer::Project)) => Some("project"),
                     _ => None,
                 };
-                let detail = if let Some(layer) = file_layer {
+                let detail = if let Some(layer) = file_layer.filter(|_| !refusal.path.is_empty()) {
+                    format!("{} can't be set in {layer} files", refusal.path)
+                } else if let Some(layer) = file_layer {
                     let reason = match self.schema.normalized()["x-ck-layers"]
                         .as_array()
                         .map(Vec::as_slice)
@@ -128,9 +124,17 @@ impl ProjectLayerSchema {
                         Some([only]) if only == "user" => "its settings are user-only",
                         _ => "its schema does not allow that layer",
                     };
-                    format!("{module}/{project}: {module} takes no settings from {layer} files ({reason})")
+                    format!("{module} takes no settings from {layer} files ({reason})")
                 } else {
-                    format!("{module}/{project}: {}", refusal.path)
+                    let setting = if refusal.path.is_empty() {
+                        "configuration"
+                    } else {
+                        &refusal.path
+                    };
+                    format!(
+                        "{setting} is not valid here ({})",
+                        capture::refusal_code(refusal.code)
+                    )
                 };
                 let error = GateError::new(capture::refusal_code(refusal.code), detail);
                 match attributed.layer {
@@ -138,11 +142,11 @@ impl ProjectLayerSchema {
                     None => error,
                 }
             })?;
-        refuse_project_apply_kinds(module, project, base, &self.schema, &reviewed)?;
+        refuse_project_apply_kinds(base, &self.schema, &reviewed)?;
         Ok(reviewed)
     }
 
-    fn check_credentials(&self, module: &str, project: &str, value: &Value) -> Result<()> {
+    fn check_credentials(&self, value: &Value) -> Result<()> {
         if let Some(section) = self
             .user_only_sections
             .iter()
@@ -150,7 +154,7 @@ impl ProjectLayerSchema {
         {
             return Err(GateError::new(
                 "credential_layer_unsupported",
-                format!("{module}/{project}: section {section} is user-layer only"),
+                format!("{section} can be set only in the user settings file"),
             ));
         }
         if value.as_object().is_some_and(|fields| {
@@ -162,7 +166,7 @@ impl ProjectLayerSchema {
         }) {
             return Err(GateError::new(
                 "credential_layer_unsupported",
-                format!("{module}/{project}: credential sections are user-layer only"),
+                "credentials can be set only in the user settings file",
             ));
         }
         Ok(())
@@ -226,8 +230,6 @@ fn contains_credential(schema: &Value) -> bool {
 /// Project layers cannot change a module's next supervision settings or
 /// rebind its routes. The user tuple still controls both for inherited values.
 pub fn refuse_project_apply_kinds(
-    module: &str,
-    project: &str,
     base: Option<(&Schema, &ConfigView)>,
     candidate_schema: &Schema,
     candidate: &ReviewedTuple,
@@ -244,7 +246,7 @@ pub fn refuse_project_apply_kinds(
             ) {
                 return Err(GateError::new(
                     "project_apply_kind_unsupported",
-                    format!("{module}/{project}: {path}"),
+                    format!("{path} can't be set in a project or workspace file, because changing it restarts the module or reconnects its routes"),
                 )
                 .at_settings_layer(layer));
             }

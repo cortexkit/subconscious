@@ -283,7 +283,7 @@ async fn project_settings_status_reports_fresh_file_errors_without_owner_lock() 
         invalid["status"]["file_errors"],
         json!([{
             "module_id":"a", "project_id":"A", "workspace_id":"W",
-            "code":"bound_violated", "message":"a/A: /limit", "layer":"project", "path":file
+            "code":"bound_violated", "message":"/limit is not valid here (bound_violated)", "layer":"project", "path":file
         }])
     );
     assert!(invalid["status"].get("file_errors_incomplete").is_none());
@@ -322,7 +322,7 @@ async fn project_settings_status_attributes_forbidden_workspace_field() {
     let expected = ["A", "B"].map(|project| {
         json!({
             "module_id":"a", "project_id":project, "workspace_id":"W",
-            "code":"layer_forbidden", "message":format!("a/{project}: /consumers"),
+            "code":"layer_forbidden", "message":"/consumers can't be set in workspace files",
             "layer":"workspace", "path":workspace
         })
     });
@@ -356,12 +356,12 @@ async fn project_settings_status_explains_forbidden_files_for_user_only_module()
         json!([
             {
                 "module_id":"a", "project_id":"A", "code":"layer_forbidden",
-                "message":"a/A: a takes no settings from project files (its settings are user-only)",
+                "message":"a takes no settings from project files (its settings are user-only)",
                 "layer":"project", "path":project
             },
             {
                 "module_id":"a", "project_id":"B", "workspace_id":"W", "code":"layer_forbidden",
-                "message":"a/B: a takes no settings from workspace files (its settings are user-only)",
+                "message":"a takes no settings from workspace files (its settings are user-only)",
                 "layer":"workspace", "path":workspace
             }
         ])
@@ -523,7 +523,7 @@ async fn project_settings_status_keeps_completed_rows_when_a_root_stalls() {
         status["file_errors"],
         json!([{
             "module_id":"a", "project_id":"fast", "workspace_id":"W",
-            "code":"bound_violated", "message":"a/fast: /limit",
+            "code":"bound_violated", "message":"/limit is not valid here (bound_violated)",
             "layer":"project", "path":fast_file
         }])
     );

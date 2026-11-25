@@ -3,7 +3,7 @@
     "op": "config.plan",
     "view": {
       "base_revision": 1,
-      "digest": "sha256:708b7917c70dd8cc9719823c785691fe4a31f25e468a194ca757ef33c85a42f1",
+      "digest": "sha256:cbb9416b3c1be9640657ba9dc83547d089675dca86e190ee5cfa128a69843567",
       "plan": {
         "active_generations": {
           "{\"module\":\"a\",\"project\":null}": 1
@@ -20,7 +20,7 @@
             "edit_refusals": [
               {
                 "code": "layer_symlink",
-                "message": "symlink: root /home/example/repos/symlink: entry is a symlink or reparse point",
+                "message": "entry is a symlink or reparse point",
                 "module_id": "a",
                 "path": "/limit",
                 "project_id": "symlink",
@@ -28,7 +28,7 @@
               },
               {
                 "code": "layer_not_regular",
-                "message": "directory: root /home/example/repos/directory: entry does not have the requested file type",
+                "message": "entry does not have the requested file type",
                 "module_id": "a",
                 "path": "/limit",
                 "project_id": "directory",
@@ -36,7 +36,7 @@
               },
               {
                 "code": "layer_hardlinked",
-                "message": "hardlink: root /home/example/repos/hardlink: entry is not a singly linked file",
+                "message": "entry is not a singly linked file",
                 "module_id": "a",
                 "path": "/limit",
                 "project_id": "hardlink",
@@ -44,7 +44,7 @@
               },
               {
                 "code": "layer_too_large",
-                "message": "large: root /home/example/repos/large: configuration document exceeds the 1 MiB JSONC limit",
+                "message": "configuration document exceeds the 1 MiB JSONC limit",
                 "module_id": "a",
                 "path": "/limit",
                 "project_id": "large",
@@ -310,7 +310,7 @@
       "refusals": [
         {
           "code": "layer_symlink",
-          "message": "symlink: root /home/example/repos/symlink: entry is a symlink or reparse point",
+          "message": "entry is a symlink or reparse point",
           "module_id": "a",
           "path": "/limit",
           "project_id": "symlink",
@@ -318,7 +318,7 @@
         },
         {
           "code": "layer_not_regular",
-          "message": "directory: root /home/example/repos/directory: entry does not have the requested file type",
+          "message": "entry does not have the requested file type",
           "module_id": "a",
           "path": "/limit",
           "project_id": "directory",
@@ -326,7 +326,7 @@
         },
         {
           "code": "layer_hardlinked",
-          "message": "hardlink: root /home/example/repos/hardlink: entry is not a singly linked file",
+          "message": "entry is not a singly linked file",
           "module_id": "a",
           "path": "/limit",
           "project_id": "hardlink",
@@ -334,7 +334,7 @@
         },
         {
           "code": "layer_too_large",
-          "message": "large: root /home/example/repos/large: configuration document exceeds the 1 MiB JSONC limit",
+          "message": "configuration document exceeds the 1 MiB JSONC limit",
           "module_id": "a",
           "path": "/limit",
           "project_id": "large",

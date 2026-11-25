@@ -3,7 +3,7 @@
     "op": "config.plan",
     "view": {
       "base_revision": 0,
-      "digest": "sha256:043233c0210924114e2ec2a71dc525436f6eb88dd737cda85f4a98a060208092",
+      "digest": "sha256:4680fd07cfa336d43e6d97554f25ebddc19187d5b9529888eba4fff8517a0f1b",
       "plan": {
         "active_generations": {},
         "base_generation": 0,
@@ -14,7 +14,7 @@
             "project_refusals": [
               {
                 "code": "project_apply_kind_unsupported",
-                "message": "a/A: /limit",
+                "message": "/limit can't be set in a project or workspace file, because changing it restarts the module or reconnects its routes",
                 "module_id": "a",
                 "path": "",
                 "project_id": "A",
@@ -43,7 +43,7 @@
       "refusals": [
         {
           "code": "project_apply_kind_unsupported",
-          "message": "a/A: /limit",
+          "message": "/limit can't be set in a project or workspace file, because changing it restarts the module or reconnects its routes",
           "module_id": "a",
           "path": "",
           "project_id": "A",

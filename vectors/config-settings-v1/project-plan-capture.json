@@ -376,7 +376,7 @@
       "skipped": [
         {
           "code": "config_unavailable",
-          "message": "B: root /home/example/repos/missing: root open refused: input open failed: No such file or directory (os error 2)",
+          "message": "root open refused: input open failed: No such file or directory (os error 2)",
           "module_id": "a",
           "path": "",
           "project_id": "B"

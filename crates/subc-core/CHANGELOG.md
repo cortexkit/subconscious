@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.21.58
+
+- Require subc-daemon 0.52.0.
+
 ## 0.21.57
 
 - Require subc-daemon 0.51.0.

@@ -5,7 +5,7 @@
   "file_error": {
     "code": "bound_violated",
     "layer": "project",
-    "message": "a/B: /limit",
+    "message": "/limit is not valid here (bound_violated)",
     "path": "/home/example/repos/private/.cortexkit/a.jsonc"
   },
   "module_id": "a",

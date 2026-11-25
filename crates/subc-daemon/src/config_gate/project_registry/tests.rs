@@ -191,12 +191,15 @@ async fn registry_identity_absent_malformed_mismatched_and_incarnation_only() {
     assert_eq!(error.code, "config_unavailable");
     assert!(error.detail.contains("project"));
     reply.workspaces[0].file_id = Some(file_id(&dir));
-    for bad in ["broken", "unix:0:0"] {
+    for (bad, expected) in [
+        ("broken", "invalid registry fileId"),
+        ("unix:0:0", "root fileId changed"),
+    ] {
         reply.projects[0].root_records.as_mut().unwrap()[0].file_id = Some(bad.into());
         let revision = snapshot(&reply).await.unwrap();
         let error = revision.project_layers("project").err().unwrap();
         assert_eq!(error.code, "config_unavailable");
-        assert!(error.detail.contains("project"));
+        assert!(error.detail.contains(expected));
     }
     let record = &mut reply.projects[0].root_records.as_mut().unwrap()[0];
     record.file_id = None;
@@ -475,7 +478,10 @@ async fn registry_root_outcomes_keep_healthy_and_refused_roots_distinct() {
     assert!(revision.layer_location("project", &dir).is_ok());
     let project = revision.project_layers("project").err().unwrap();
     assert_eq!(project.code, "config_unavailable");
-    assert!(project.detail.contains(blocked.to_str().unwrap()));
+    assert_eq!(
+        project.detail,
+        "config_unavailable: registry-root I/O already outstanding for this root"
+    );
     release.send(()).unwrap();
 }
 
@@ -628,6 +634,16 @@ async fn registry_layer_path_safety_refusals_stay_per_project() {
         } else {
             let error = layers.err().unwrap();
             assert_eq!(error.code, code, "{name}: {error}");
+            match name {
+                "linked-root" => assert_eq!(
+                    error.detail,
+                    "root open refused: input leaf is a symlink or reparse point"
+                ),
+                "linked-component" | "linked-leaf" => {
+                    assert_eq!(error.detail, "entry is a symlink or reparse point")
+                }
+                _ => {}
+            }
         }
     }
 }

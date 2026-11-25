@@ -11,7 +11,7 @@
         {
           "code": "layer_forbidden",
           "layer": "workspace",
-          "message": "a/A: /consumers",
+          "message": "/consumers can't be set in workspace files",
           "module_id": "a",
           "path": "/home/example/repos/workspace/.cortexkit/a.jsonc",
           "project_id": "A",
@@ -20,7 +20,7 @@
         {
           "code": "layer_forbidden",
           "layer": "workspace",
-          "message": "a/B: /consumers",
+          "message": "/consumers can't be set in workspace files",
           "module_id": "a",
           "path": "/home/example/repos/workspace/.cortexkit/a.jsonc",
           "project_id": "B",

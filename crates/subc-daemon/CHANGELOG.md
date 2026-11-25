@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.52.0
+
+- Present project settings refusals as sentences without redundant module and project prefixes.
+- Minor release: `config_gate::project_layers` `record_layer` and `refuse_project_apply_kinds` no longer take the
+  module and project ids, which they only put into messages.
+
 ## 0.51.0
 
 - Minor release: the public enums `PrivilegedOperation`, `SuperviseError`, `ForwardingError`

@@ -4,15 +4,18 @@
 
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use subc_client_rs::{
-    BindDecision, HandlerOutcome, ModuleHandler, RequestCtx, RouteBindRequest, RouteHandle,
+    config::ConfigView, BindDecision, HandlerOutcome, ModuleHandler, RequestCtx, RouteBindRequest,
+    RouteHandle,
 };
 use subc_protocol::{
+    config::ConfigDeclareRequest,
     manifest::{
         ManagementOperation, ManagementOperationKind, ModuleManifest, OperationDelivery,
         ProviderRole,
@@ -65,15 +68,17 @@ pub fn advertise(mut manifest: ModuleManifest) -> ModuleManifest {
 pub struct LeafHandler<H> {
     inner: H,
     area: Arc<LeafArea>,
+    module_id: String,
     handoff: Option<Arc<crate::federation::handoff::Health>>,
     principals: Mutex<HashMap<RouteKey, Option<Principal>>>,
 }
 
 impl<H> LeafHandler<H> {
-    pub fn new(inner: H, area: Arc<LeafArea>) -> Self {
+    pub fn new(inner: H, area: Arc<LeafArea>, module_id: String) -> Self {
         Self {
             inner,
             area,
+            module_id,
             handoff: None,
             principals: Mutex::new(HashMap::new()),
         }
@@ -180,6 +185,30 @@ async fn serve_watch(area: &LeafArea, ctx: &RequestCtx) -> HandlerOutcome {
 
 #[async_trait]
 impl<H: ModuleHandler> ModuleHandler for LeafHandler<H> {
+    fn config_declaration(&self) -> Option<ConfigDeclareRequest> {
+        // The daemon requires a path under the user's configuration directory
+        // even for an empty schema. This file is normally absent, and ck-bus
+        // never opens it.
+        let user_file = PathBuf::from(cortexkit_store_types::resolve_config_home())
+            .join("cortexkit")
+            .join(format!("{}.jsonc", self.module_id));
+        Some(ConfigDeclareRequest::new(
+            json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "title": "Message bus",
+                "type": "object",
+                "properties": {},
+                "unevaluatedProperties": false,
+            }),
+            user_file.to_string_lossy(),
+            vec![],
+        ))
+    }
+
+    async fn config_apply(&self, _view: ConfigView) -> Result<(), Vec<String>> {
+        Ok(())
+    }
+
     async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
         let principal = self
             .principals()

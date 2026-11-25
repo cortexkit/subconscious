@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.13.2
+
+- Declare that Message bus has no settings in the desktop Settings list.
+
 ## 0.13.1
 
 - Require cortexkit-bus-naming 0.5.10. Reserve named census consumer creation for the bus credential while preserving participant KV watches.

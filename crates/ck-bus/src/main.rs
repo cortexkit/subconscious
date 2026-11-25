@@ -225,6 +225,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let handler = federation::leaf::handler::LeafHandler::new(
         federation::hub::handler::HubHandler::new(wired.handler, hub),
         leaf,
+        module_id.clone(),
     )
     .with_handoff_health(handoff);
     dead_letter::consumer::wire(

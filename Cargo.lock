@@ -527,7 +527,7 @@ dependencies = [
 
 [[package]]
 name = "ck-bus"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -564,7 +564,7 @@ dependencies = [
 
 [[package]]
 name = "ck-inspect"
-version = "0.5.8"
+version = "0.5.9"
 dependencies = [
  "async-trait",
  "ck-inspect",
@@ -3238,7 +3238,7 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.50.57"
+version = "0.50.58"
 dependencies = [
  "base64",
  "cortexkit-log",

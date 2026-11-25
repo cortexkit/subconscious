@@ -1,0 +1,12 @@
+{
+  "module_id": "sample-empty",
+  "op": "config.schema",
+  "schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {},
+    "title": "Sample module without settings",
+    "type": "object",
+    "unevaluatedProperties": false
+  },
+  "schema_digest": "sha256:15f5fab3a35123dee376f813033134d171103f1e8421298ac3320e8f3dccbffd"
+}

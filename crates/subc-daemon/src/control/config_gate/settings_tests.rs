@@ -1196,6 +1196,41 @@ async fn config_settings_vectors_match_real_handler_bytes() {
         samples.push((format!("{name}.request.json"), body));
         samples.push((format!("{name}.reply.json"), reply));
     }
+    let empty_rig = SettingsRig::new();
+    empty_rig
+        .owner
+        .declare(
+            ConnectionId::new(14),
+            "sample-empty",
+            subc_protocol::config::ConfigDeclareRequest::new(
+                json!({
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "title": "Sample module without settings",
+                    "type": "object",
+                    "properties": {},
+                    "unevaluatedProperties": false,
+                }),
+                empty_rig
+                    .root
+                    .join("cortexkit/sample-empty.jsonc")
+                    .to_string_lossy(),
+                vec![],
+            ),
+            true,
+        )
+        .unwrap();
+    let reply = self::handler(&empty_rig)
+        .handle_control_frame(
+            &ctx,
+            request(json!({"op":"config.schema","module_id":"sample-empty"})),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply[0].header.ty, FrameType::Response);
+    let reply: Value = serde_json::from_slice(&reply[0].body).unwrap();
+    assert_eq!(reply["schema"]["properties"], json!({}));
+    samples.push(("schema-empty.reply.json".into(), reply));
+
     let (modules, watch) = bad_number_rows().await;
     samples.push(("modules.declaration-error.reply.json".into(), modules));
     samples.push(("watch.declaration-error.resync.json".into(), watch));

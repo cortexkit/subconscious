@@ -13,6 +13,7 @@ invented. The credential reference is a reference, never a secret.
 | `modules.declaration-error.reply.json` | Healthy settings row beside a stored declaration that cannot be encoded |
 | `schema.request.json` | Read the sample module's schema |
 | `schema.reply.json` | Normalized admitted schema and digest |
+| `schema-empty.reply.json` | A declared module with no settings fields |
 | `schema-setup.request.json` | Read the invented setup module's schema |
 | `schema-setup.reply.json` | Two sections carrying unchanged `x-ck-setup` annotations |
 | `schema-flexible.request.json` | Read the invented module whose fields keep existing shapes |

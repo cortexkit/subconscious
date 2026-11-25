@@ -15,18 +15,19 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 use subc_client_rs::{
-    BindDecision, ConsumerOptions, HandlerOutcome, ModuleHandler, RequestCtx, RouteBindRequest,
-    SubcConsumer, SupervisorListResponse,
+    config::ConfigView, BindDecision, ConsumerOptions, HandlerOutcome, ModuleHandler, RequestCtx,
+    RouteBindRequest, SubcConsumer, SupervisorListResponse,
 };
 use subc_control::{
     ChildResourceUnavailableReason, ChildResourceUsage, DaemonResources, LiveSpawn,
 };
 use subc_protocol::{
+    config::ConfigDeclareRequest,
     manifest::{
         CapabilityDeclarations, Concurrency, ManagementOperation, ManagementOperationKind,
         ModuleManifest, ProviderRole,
@@ -434,6 +435,30 @@ impl Inspect {
 
 #[async_trait]
 impl ModuleHandler for Inspect {
+    fn config_declaration(&self) -> Option<ConfigDeclareRequest> {
+        // The daemon requires a path under the user's configuration directory
+        // even for an empty schema. This file is normally absent, and
+        // ck-inspect never opens it.
+        let user_file = PathBuf::from(cortexkit_store_types::resolve_config_home())
+            .join("cortexkit")
+            .join("inspect.jsonc");
+        Some(ConfigDeclareRequest::new(
+            json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "title": "Process inspection",
+                "type": "object",
+                "properties": {},
+                "unevaluatedProperties": false,
+            }),
+            user_file.to_string_lossy(),
+            vec![],
+        ))
+    }
+
+    async fn config_apply(&self, _view: ConfigView) -> Result<(), Vec<String>> {
+        Ok(())
+    }
+
     async fn on_bind(&self, req: &RouteBindRequest) -> BindDecision {
         if admitted(req) {
             BindDecision::accept()

@@ -549,6 +549,23 @@ fn admission_refuses_missing_or_unverified_principal() {
     assert!(!admitted(&bind(None, None)));
     assert!(!admitted(&bind(Some(Principal::Unverified), None)));
 }
+
+#[test]
+fn settings_declaration_is_empty_and_valid() {
+    let handler = Inspect {
+        roster: Arc::new(OnceLock::new()),
+        sampler: Arc::new(OsSampler),
+        bounds: Bounds::new(),
+    };
+    let declaration = handler
+        .config_declaration()
+        .expect("the served handler declares that it has no settings");
+    assert_eq!(declaration.schema["title"], "Process inspection");
+    assert_eq!(declaration.schema["properties"], json!({}));
+    subc_client_rs::config::Schema::new(declaration.schema)
+        .expect("the settings schema must be valid");
+}
+
 #[test]
 fn manifest_is_query_only_and_flow_capable_without_tools() {
     let value = serde_json::to_value(manifest()).unwrap();

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.9
+
+- Declare that Process inspection has no settings in the desktop Settings list.
+
 ## 0.5.8
 
 - Include the daemon's own process counters in `module.resources` as `subc`,

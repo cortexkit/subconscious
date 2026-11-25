@@ -761,10 +761,23 @@ impl ModuleHandler for Inner {
     }
 }
 
+#[test]
+fn settings_declaration_is_empty_and_valid() {
+    let fixture = Fixture::new();
+    let handler = LeafHandler::new(Inner, fixture.area.clone(), "ckbus".into());
+    let declaration = handler
+        .config_declaration()
+        .expect("the served handler declares that it has no settings");
+    assert_eq!(declaration.schema["title"], "Message bus");
+    assert_eq!(declaration.schema["properties"], json!({}));
+    subc_client_rs::config::Schema::new(declaration.schema)
+        .expect("the settings schema must be valid");
+}
+
 #[tokio::test]
 async fn health_gains_fed_entries_and_keeps_everything_else() {
     let fixture = Fixture::new();
-    let handler = LeafHandler::new(Inner, fixture.area.clone());
+    let handler = LeafHandler::new(Inner, fixture.area.clone(), "ckbus".into());
     let report = handler.health().await;
     assert_eq!(report.status, HealthStatus::Failing);
     assert_eq!(report.detail.as_deref(), Some("Message bus is down."));

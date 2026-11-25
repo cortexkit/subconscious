@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.50.58
+
+- Add a byte-checked `config.schema` example for a declared module with no settings fields.
+
 ## 0.50.57
 
 - Report the connection and available process details that opened each route in `supervisor.routes`.

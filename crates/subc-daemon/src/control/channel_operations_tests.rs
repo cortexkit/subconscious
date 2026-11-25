@@ -47,14 +47,25 @@ fn ok(reply: &Frame) -> Value {
 /// Send one request and return its answer, skipping frames the daemon sends
 /// the connection on its own, such as route binds and the drain notice.
 async fn ask(net: &mut Net, body: impl Serialize) -> Frame {
+    ask_for(net, body, "the frame").await
+}
+
+async fn ask_for(net: &mut Net, body: impl Serialize, step: &str) -> Frame {
     net.send(request(body)).await;
-    answer(net).await
+    answer_for(net, step).await
 }
 
 /// The answer to the request already sent with [`CORR`].
 async fn answer(net: &mut Net) -> Frame {
+    answer_for(net, "the frame").await
+}
+
+async fn answer_for(net: &mut Net, step: &str) -> Frame {
     loop {
-        let frame = net.recv().await.expect("the connection must answer");
+        let frame = net
+            .recv_for(step)
+            .await
+            .unwrap_or_else(|| panic!("connection closed before replying to {step}"));
         if frame.header.corr == CORR
             && frame.header.channel == 0
             && matches!(frame.header.ty, FrameType::Response | FrameType::Error)
@@ -849,12 +860,42 @@ async fn channel_operations_busy_launch_record_is_retryable_for_the_serving_spaw
         })
     });
     wait_locked.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert_eq!(code(&ask(&mut net, sync_request(1)).await), "busy");
-    assert_eq!(code(&ask(&mut net, &agents).await), "busy");
+    assert_eq!(
+        code(
+            &ask_for(
+                &mut net,
+                sync_request(1),
+                "scope.sync while the launch record is held"
+            )
+            .await
+        ),
+        "busy"
+    );
+    assert_eq!(
+        code(
+            &ask_for(
+                &mut net,
+                &agents,
+                "supervisor.agent_commands while the launch record is held"
+            )
+            .await
+        ),
+        "busy"
+    );
     release.send(()).unwrap();
     holder.join().unwrap();
-    ok(&ask(&mut net, sync_request(1)).await);
-    ok(&ask(&mut net, &agents).await);
+    ok(&ask_for(
+        &mut net,
+        sync_request(1),
+        "scope.sync after releasing the launch record",
+    )
+    .await);
+    ok(&ask_for(
+        &mut net,
+        &agents,
+        "supervisor.agent_commands after releasing the launch record",
+    )
+    .await);
 }
 
 #[test]

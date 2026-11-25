@@ -1118,6 +1118,10 @@ pub(crate) mod tests {
         }
 
         pub(crate) async fn recv(&mut self) -> Option<Frame> {
+            self.recv_for("the frame").await
+        }
+
+        pub(crate) async fn recv_for(&mut self, step: &str) -> Option<Frame> {
             // Generous on purpose: this waits for a reply that must arrive, and a loaded CI
             // runner has taken longer than 2 s to schedule the server task. Tests that a reply
             // does not come use `assert_no_reply`, which keeps its own short window.
@@ -1126,7 +1130,7 @@ pub(crate) mod tests {
                 subc_transport::read_frame(&mut self.client),
             )
             .await
-            .expect("server must settle the frame")
+            .unwrap_or_else(|error| panic!("server must settle {step}: {error:?}"))
             .unwrap()
         }
 
@@ -1149,10 +1153,14 @@ pub(crate) mod tests {
         }
 
         pub(crate) async fn call(&mut self, frame: Frame) -> Frame {
-            subc_transport::write_frame(&mut self.client, &frame)
+            self.call_for(frame, "the frame").await
+        }
+
+        async fn call_for(&mut self, frame: Frame, step: &str) -> Frame {
+            self.send(frame).await;
+            self.recv_for(step)
                 .await
-                .unwrap();
-            self.recv().await.expect("server reply")
+                .unwrap_or_else(|| panic!("connection closed before replying to {step}"))
         }
 
         pub(crate) async fn pipeline(&mut self, frames: &[Frame]) {
@@ -1624,7 +1632,13 @@ pub(crate) mod tests {
         );
         let mut net = Net::new(rig.router.clone()).await;
         let ping = Frame::build(FrameType::Ping, control_flags(), 0, 0, 2, Vec::new()).unwrap();
-        assert_eq!(net.call(ping).await.header.ty, FrameType::Pong);
+        assert_eq!(
+            net.call_for(ping, "the initial network Ping")
+                .await
+                .header
+                .ty,
+            FrameType::Pong
+        );
         let connection = net.connection_id(&rig.handler);
         spawn.bind(connection);
         if register {
@@ -1637,7 +1651,7 @@ pub(crate) mod tests {
                 launch_nonce: None,
             };
             let reply = net
-                .call(
+                .call_for(
                     Frame::build(
                         FrameType::Hello,
                         control_flags(),
@@ -1647,6 +1661,7 @@ pub(crate) mod tests {
                         serde_json::to_vec(&hello).unwrap(),
                     )
                     .unwrap(),
+                    "the network registration HELLO",
                 )
                 .await;
             assert_eq!(

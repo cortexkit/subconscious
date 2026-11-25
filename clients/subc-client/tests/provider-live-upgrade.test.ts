@@ -1,4 +1,4 @@
-import { expect, spyOn, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { fileURLToPath } from "node:url";
 import {
   FrameType, LIVE_UPGRADE_CAPABILITY, SocketClosedError, StaleRouteHandleError, SubcProvider,
@@ -11,6 +11,13 @@ import { authenticate, deferred, frame, json, notice, readHello, UpgradePeer } f
 const token = "A".repeat(43);
 const rotated = "E".repeat(43);
 const unixTest = process.platform === "darwin" || process.platform === "linux" ? test : test.skip;
+let restoreClock: (() => void) | undefined;
+function restoreUpgradeClock() {
+  restoreClock?.();
+  restoreClock = undefined;
+}
+// Bun can stop waiting for a timed-out test before its async finally runs.
+afterEach(restoreUpgradeClock);
 
 async function connect(peer: UpgradePeer, options: Partial<SubcProviderConnectOptions> = {}) {
   const opening = SubcProvider.connect({ connectionFile: peer.connectionFile, manifest: peer.manifest,
@@ -50,6 +57,7 @@ unixTest("resumes after missing socket, stale auth and legacy refusal, with scop
   let retries = 0;
   let now = 0;
   const clock = spyOn(performance, "now").mockImplementation(() => now);
+  restoreClock = () => clock.mockRestore();
   let oldApplyCount = 0;
   const view: ConfigView = { generation: 1, status: "active", effective: {}, layers: [], sources: {} };
   const config: ModuleConfigOptions = {
@@ -160,7 +168,7 @@ unixTest("resumes after missing socket, stale auth and legacy refusal, with scop
     expect(peer.tcp.count).toBe(1);
     await peer.write(resumed, peer.ack(1n, { resume_token: rotated, storage: { path: "new storage" }, machine_id: "a".repeat(32),
       subc_ops: ["scope.sync", "claim.mint"], subc_capabilities: ["config.gate"] }), frame(FrameType.Ping, 91n));
-    expect(await scopeStarted.promise).toBe(provider);
+    expect(await whileResuming(scopeStarted.promise)).toBe(provider);
     expect(provider.currentEpoch()).toBe(2);
     expect(provider.storage).toEqual({ path: "new storage" });
     expect(provider.machineId).toBe("a".repeat(32));
@@ -210,7 +218,7 @@ unixTest("resumes after missing socket, stale auth and legacy refusal, with scop
     expect(finalSignal.aborted).toBe(true);
     expect(peer.tcp.count).toBe(1);
   } finally {
-    clock.mockRestore();
+    restoreUpgradeClock();
     finishHandler.resolve(); finishBind.resolve(); sendScope.resolve(); applied.resolve();
     finishOldApply.resolve(); finishFinalHandler.resolve();
     await provider?.close();
@@ -241,6 +249,31 @@ for (const code of ["resume_refused", "unknown_future_refusal", "duplicate_modul
     } finally { await provider?.close(); await peer.stop(); }
   });
 }
+
+unixTest("resume ends serving without dialing if the shared registration owner cannot resume", async () => {
+  const peer = await UpgradePeer.start();
+  const ownerKey = Symbol.for("@cortexkit/subc-client.registration-owner/v1");
+  const globals = globalThis as typeof globalThis & { [ownerKey]?: unknown };
+  const original = registrationOwner();
+  let provider: SubcProvider | undefined;
+  let attempts = 0;
+  try {
+    const old = await connect(peer, {
+      onConnectionState: (event) => { if (event.state === "reconnecting") attempts++; },
+    });
+    provider = old.provider;
+    expect(old.hello.module_capabilities).toEqual([LIVE_UPGRADE_CAPABILITY]);
+    globals[ownerKey] = {}; // Model an older owner appearing after HELLO advertised support.
+    await peer.write(old.socket, notice(), frame(FrameType.Goodbye));
+    await provider.closed;
+    expect(attempts).toBe(0);
+    expect(peer.unix.count).toBe(0);
+  } finally {
+    globals[ownerKey] = original;
+    await provider?.close();
+    await peer.stop();
+  }
+});
 
 unixTest("the announced deadline closes a connection still waiting for HELLO_ACK", async () => {
   const peer = await UpgradePeer.start();

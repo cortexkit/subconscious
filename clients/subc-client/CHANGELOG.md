@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.27.2
+
+- Fall back to a normal restart on daemon upgrade when an older SDK copy
+  created the process-wide registration owner, which then lacks the methods a
+  resume needs. The provider logs the reason once per process and continues to
+  register normally.
+
 ## 0.27.1
 
 - Export `ConfigPlanView`, including the store's stamp state at plan creation

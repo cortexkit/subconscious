@@ -68,6 +68,7 @@ const DEFAULT_RESTORED_DEBOUNCE_MS = 250;
 const DEFAULT_PROVIDER_HANDLER_CAPACITY = 64;
 const DRAINING_HOOK_START_LIMIT_MS = 2_000;
 const HEALTH_CHECK_OP = "health.check";
+const legacyRegistrationOwnerWarning = Symbol.for("@cortexkit/subc-client.legacy-registration-owner-warning");
 export const HELLO_CORR = 1n;
 
 export type TrustTier = "first_party" | "reviewed" | "untrusted";
@@ -354,7 +355,9 @@ export interface SubcProviderConnectOptions {
    * gauge counts as busy), or for its deadline. A pending hook alone is not busy.
    */
   onDraining?: (reason: RouteCloseReason, deadline: Date) => void | Promise<void>;
-  /** Opt a supervised Linux or macOS provider into announced daemon upgrades. */
+  /** Opt a supervised Linux or macOS provider into announced daemon upgrades.
+   * Every SDK copy in a process shares one registration owner. If an older copy created it without the
+   * `rebind` and `unbind` methods a resume needs, opt-in is turned off and the daemon restarts the module instead. */
   liveUpgrade?: boolean;
   /** Return the full scope set to send first after resume. Outbound calls are still fenced here. */
   resumeScopeSync?: (provider: SubcProvider) => Promise<ResumeScopeSync | undefined>;
@@ -624,7 +627,7 @@ export class SubcProvider {
   #resumeToken: string | undefined;
   private upgradeDeadline: number | undefined;
   private upgradeStop: AbortController | undefined;
-  private resumed = false;
+  private resumedRegistrationOwner?: ReturnType<typeof registrationOwner>;
   private retiredData?: Set<AbortController>;
   private generation = 1;
   private connectionEpoch = 1;
@@ -1535,6 +1538,8 @@ export class SubcProvider {
 
   private async resumeUpgrade(deadline: number, token: string, stop: AbortController, generation: number): Promise<void> {
     try {
+      const owner = registrationOwner();
+      if (!registrationOwnerSupportsResume(owner)) throw new Error("registration owner does not support resume");
       const hello = buildHelloFrame(this.opts, token);
       const opened = await untilResumeDeadline(deadline, stop.signal, async (signal) => {
         for (let attempt = 1; ; attempt++) {
@@ -1557,8 +1562,8 @@ export class SubcProvider {
       }
       const epoch = this.replaceConnection(opened);
       this.requestGate = new AsyncPermitPool(DEFAULT_PROVIDER_HANDLER_CAPACITY);
-      registrationOwner().rebind((body) => this.configControl(body), () => this.checkUpgradeFence());
-      this.resumed = true;
+      owner.rebind((body) => this.configControl(body), () => this.checkUpgradeFence());
+      this.resumedRegistrationOwner = owner;
 
       let outcome: Promise<ReconnectOutcome> = Promise.resolve(undefined);
       try {
@@ -1629,7 +1634,7 @@ export class SubcProvider {
 
   private handleUnexpectedDrop(sock: SubcSocket, generation: number, cause: Error): void {
     if (this.closeStarted || this.sock !== sock || this.generation !== generation) return;
-    if (!this.opts.reconnectOnDrop || this.resumed || this.upgradeDeadline !== undefined) {
+    if (!this.opts.reconnectOnDrop || this.resumedRegistrationOwner || this.upgradeDeadline !== undefined) {
       // Serving ends with the connection: resolve `closed` so the module can
       // exit instead of re-registering behind its supervisor's back.
       this.failFatal(cause);
@@ -1850,7 +1855,7 @@ export class SubcProvider {
     this.config?.close();
     this.upgradeStop?.abort();
     this.#resumeToken = undefined;
-    if (this.resumed) registrationOwner().unbind();
+    this.resumedRegistrationOwner?.unbind();
     if (!this.closedErr) this.closedErr = err;
     this.closeStarted = true;
     this.cancelRestoredDebounce();
@@ -1890,6 +1895,18 @@ function nonEmpty(value: string | undefined): string | undefined {
   return value && value.length > 0 ? value : undefined;
 }
 
+function registrationOwnerSupportsResume(owner: ReturnType<typeof registrationOwner>): boolean {
+  // SDK copies share one registration owner even when they come from different releases.
+  return typeof owner.rebind === "function" && typeof owner.unbind === "function";
+}
+
+function warnLegacyRegistrationOwner(): void {
+  const globals = globalThis as typeof globalThis & { [legacyRegistrationOwnerWarning]?: boolean };
+  if (globals[legacyRegistrationOwnerWarning]) return;
+  globals[legacyRegistrationOwnerWarning] = true;
+  console.warn("SubcProvider live upgrade disabled: an older SDK copy owns the registration channel");
+}
+
 async function normalizeProviderConnectOptions(opts: SubcProviderConnectOptions): Promise<NormalizedSubcProviderConnectOptions> {
   if (opts.config?.anchorRetryMs !== undefined && (!Number.isInteger(opts.config.anchorRetryMs)
     || opts.config.anchorRetryMs < 1 || opts.config.anchorRetryMs > 30000)) throw new Error("anchorRetryMs must be 1..30000");
@@ -1922,6 +1939,12 @@ async function normalizeProviderConnectOptions(opts: SubcProviderConnectOptions)
   const launchNonce = nonEmpty(opts.launchNonce ?? envLaunchNonce);
   // Every provider in a launched process keeps the no-reconnect default.
   const supervised = owner.supervised || !launchIdentity || (envModuleId !== undefined && envLaunchNonce !== undefined);
+  let liveUpgrade = opts.liveUpgrade === true && launchIdentity && (registrationChannel || launchNonce !== undefined)
+    && (process.platform === "linux" || process.platform === "darwin");
+  if (liveUpgrade && !registrationOwnerSupportsResume(owner)) {
+    warnLegacyRegistrationOwner();
+    liveUpgrade = false;
+  }
   return {
     connectionFile: opts.connectionFile,
     manifest: opts.manifest,
@@ -1934,8 +1957,7 @@ async function normalizeProviderConnectOptions(opts: SubcProviderConnectOptions)
     onBound: opts.onBound,
     onRouteGone: opts.onRouteGone,
     onDraining: opts.onDraining,
-    liveUpgrade: opts.liveUpgrade === true && launchIdentity && (registrationChannel || launchNonce !== undefined)
-      && (process.platform === "linux" || process.platform === "darwin"),
+    liveUpgrade,
     resumeScopeSync: opts.resumeScopeSync,
     onReconnected: opts.onReconnected,
     reconnectBackoff: opts.reconnectBackoff ?? DEFAULT_RECONNECT_BACKOFF,

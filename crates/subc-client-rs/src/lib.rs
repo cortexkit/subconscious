@@ -2459,6 +2459,11 @@ pub struct RequestCtx {
     binary_reply: Arc<AtomicBool>,
     request_flags: Flags,
     request_body: Arc<[u8]>,
+    /// True until the terminal frame is queued. [`RequestCtx::push`] checks and
+    /// sends under this lock, and the terminal path clears it under the same
+    /// lock, so no push can reach the wire after the call's last frame even
+    /// when another task holds a clone of this context.
+    open: Arc<tokio::sync::Mutex<bool>>,
 }
 
 impl RequestCtx {
@@ -2510,6 +2515,23 @@ impl RequestCtx {
     /// the request is cancelled or its route is gone, late emits are dropped.
     pub async fn emit(&self, body: Vec<u8>) -> Result<(), SubcModuleError> {
         self.emit_with_admission(body, None).await
+    }
+
+    /// Send a Push on this request's `(channel, corr)` without ending the call.
+    ///
+    /// This is how a provider sends tool-provider call keepalives
+    /// (`{"kind":"keepalive"}`) or progress while the call runs: a consumer
+    /// resets its silence timer on any Push carrying the call's correlation.
+    /// Unlike [`RequestCtx::emit`], which drops late frames silently, this
+    /// refuses with [`SubcModuleError::RequestEnded`] once the request was
+    /// cancelled or its terminal frame was queued, so a keepalive loop knows
+    /// to stop.
+    pub async fn push(&self, body: Vec<u8>) -> Result<(), SubcModuleError> {
+        let open = self.open.lock().await;
+        if !*open || self.cancelled.is_cancelled() {
+            return Err(SubcModuleError::RequestEnded);
+        }
+        self.send_frame(FrameType::Push, data_flags(), body).await
     }
 
     /// Emit StreamData with an explicit admission class. `None` means NORMAL.
@@ -3329,6 +3351,7 @@ where
         binary_reply: Arc::new(AtomicBool::new(false)),
         request_flags: frame.header.flags,
         request_body: Arc::from(frame.body.as_slice()),
+        open: Arc::new(tokio::sync::Mutex::new(true)),
     };
     let body = frame.body;
     let in_flight = Arc::clone(&dispatcher.in_flight);
@@ -3466,6 +3489,9 @@ async fn send_handler_outcome(
     ctx: &RequestCtx,
     outcome: HandlerOutcome,
 ) -> Result<(), SubcModuleError> {
+    // Held until the terminal frame is queued; see `RequestCtx::open`.
+    let mut open = ctx.open.lock().await;
+    *open = false;
     match outcome {
         HandlerOutcome::Response(body) => {
             let flags = Flags::new(
@@ -4113,6 +4139,9 @@ pub enum SubcModuleError {
     /// The descriptor named for the launch nonce could not be read. HELLO is
     /// not sent without it, and the environment copy is not tried instead.
     LaunchNonce(launch_nonce::LaunchNonceError),
+    /// [`RequestCtx::push`] after the request was cancelled or answered.
+    /// Nothing was sent.
+    RequestEnded,
 }
 
 impl fmt::Display for SubcModuleError {
@@ -4178,6 +4207,7 @@ impl fmt::Display for SubcModuleError {
                 body.code, body.message
             ),
             Self::LaunchNonce(err) => write!(f, "launch nonce unavailable: {err}"),
+            Self::RequestEnded => write!(f, "request already cancelled or answered"),
         }
     }
 }
@@ -4208,7 +4238,8 @@ impl Error for SubcModuleError {
             | Self::InFlightPoisoned
             | Self::ConnectionClosedBeforeHelloAck
             | Self::UnexpectedHelloAck { .. }
-            | Self::HelloRejected { .. } => None,
+            | Self::HelloRejected { .. }
+            | Self::RequestEnded => None,
         }
     }
 }
@@ -5693,6 +5724,7 @@ mod tests {
             binary_reply: Arc::new(AtomicBool::new(false)),
             request_flags: Flags::new(false, Priority::Interactive, false),
             request_body: Arc::from([]),
+            open: Arc::new(tokio::sync::Mutex::new(true)),
         };
         assert!(module_handle.remove_route(handle).unwrap());
 
@@ -5708,6 +5740,79 @@ mod tests {
         assert!(matches!(
             result,
             Err(SubcModuleError::StaleRouteHandle(stale)) if stale == handle
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn push_rides_the_call_correlation_until_the_terminal_frame() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let (module_handle, _unused_rx) = test_module_handle(&[]);
+        let handle = RouteHandle::new(7, 1, 1);
+        module_handle.install_route(handle).unwrap();
+        let ctx = RequestCtx {
+            handle,
+            corr: 9,
+            ver: PROTOCOL_VERSION,
+            egress: tx,
+            module_handle: module_handle.clone(),
+            cancelled: CancellationToken::new(),
+            binary_reply: Arc::new(AtomicBool::new(false)),
+            request_flags: Flags::new(false, Priority::Interactive, false),
+            request_body: Arc::from([]),
+            open: Arc::new(tokio::sync::Mutex::new(true)),
+        };
+        // A keepalive loop usually runs on its own task with a clone.
+        let keepalive = ctx.clone();
+
+        keepalive
+            .push(br#"{"kind":"keepalive"}"#.to_vec())
+            .await
+            .unwrap();
+        let push = rx.try_recv().unwrap();
+        assert_eq!(push.header.ty, FrameType::Push);
+        assert_eq!(
+            (push.header.channel, push.header.epoch, push.header.corr),
+            (7, 1, 9)
+        );
+        assert_eq!(push.body, br#"{"kind":"keepalive"}"#);
+
+        send_handler_outcome(&ctx, HandlerOutcome::Response(b"{}".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(rx.try_recv().unwrap().header.ty, FrameType::Response);
+
+        assert!(matches!(
+            keepalive.push(b"{}".to_vec()).await,
+            Err(SubcModuleError::RequestEnded)
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn push_is_refused_once_the_request_is_cancelled() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let (module_handle, _unused_rx) = test_module_handle(&[]);
+        let handle = RouteHandle::new(7, 1, 1);
+        module_handle.install_route(handle).unwrap();
+        let cancelled = CancellationToken::new();
+        let ctx = RequestCtx {
+            handle,
+            corr: 9,
+            ver: PROTOCOL_VERSION,
+            egress: tx,
+            module_handle,
+            cancelled: cancelled.clone(),
+            binary_reply: Arc::new(AtomicBool::new(false)),
+            request_flags: Flags::new(false, Priority::Interactive, false),
+            request_body: Arc::from([]),
+            open: Arc::new(tokio::sync::Mutex::new(true)),
+        };
+        cancelled.cancel();
+
+        assert!(matches!(
+            ctx.push(b"{}".to_vec()).await,
+            Err(SubcModuleError::RequestEnded)
         ));
         assert!(rx.try_recv().is_err());
     }

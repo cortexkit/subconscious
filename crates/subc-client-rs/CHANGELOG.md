@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.42.1
+
+- Add `RequestCtx::push`, which sends a Push on the request's correlation without ending the call, for tool-provider call keepalives. It refuses with the new `SubcModuleError::RequestEnded` once the request was cancelled or its terminal frame was queued.
+
 ## 0.42.0
 
 - Expose the accepting marker through `ModuleHandler::on_draining_notice` and add `ModuleHandle::drain_ready`.

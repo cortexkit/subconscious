@@ -356,7 +356,8 @@
           "project_id": "rootless",
           "workspace_id": "W"
         }
-      ]
+      ],
+      "unstamped": false
     }
   },
   "request": {

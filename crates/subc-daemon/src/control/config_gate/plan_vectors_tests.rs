@@ -59,6 +59,7 @@ fn normalized_view(view: ConfigPlanView, root: &str) -> ConfigPlanView {
     .unwrap();
     plan.daemon_incarnation = "example-daemon".into();
     let mut normalized = ConfigPlanView::new(plan).unwrap();
+    normalized.unstamped = view.unstamped;
     normalized.refusals = view.refusals;
     normalized.settings_file_change = view.settings_file_change.map(|change| {
         serde_json::from_value(normalize_capture(
@@ -141,6 +142,7 @@ async fn config_plan_vectors_match_real_handler_bytes() {
     handler.config_review_test_reply = Some(ConfigReviewReply::new(vec![field], vec![]));
     let request = json!({"op":"config.plan","base_generations":{"demo":0},"edits":[{"module_id":"demo","layer":"user","path":"/limit","set":4}]});
     let reply = call(&handler, &ctx, request.clone()).await;
+    assert_eq!(reply["view"]["unstamped"], true);
     let actual: ConfigPlanView = serde_json::from_value(reply["view"].clone()).unwrap();
     assert!(
         reply["view"].get("refusals").is_none(),
@@ -160,6 +162,7 @@ async fn config_plan_vectors_match_real_handler_bytes() {
         json!({"op":"config.plan_get","digest":actual.digest}),
     )
     .await;
+    assert_eq!(get["view"]["unstamped"], reply["view"]["unstamped"]);
     let fetched: ConfigPlanView = serde_json::from_value(get["view"].clone()).unwrap();
     assert_eq!(fetched, actual);
     cases.insert("plan-get.json", json!({"request":{"op":"config.plan_get","digest":normalized.digest},"reply":{"op":"config.plan_get","view":normalized}}));
@@ -339,6 +342,8 @@ async fn config_plan_vectors_match_real_handler_bytes() {
             .review_config_plan(runtime.clone(), prepared)
             .await
             .unwrap();
+        assert!(!actual.unstamped);
+        assert!(actual.plan.changeset.apply_plan.get("edit_plan").is_none());
         let normalized = normalized_view(actual.clone(), root.to_str().unwrap());
         if !edit_again {
             runtime
@@ -375,6 +380,7 @@ async fn config_plan_vectors_match_real_handler_bytes() {
                 json!({"op":"config.plan_get","digest":actual.digest}),
             )
             .await;
+            assert_eq!(fetched["view"]["unstamped"], false);
             assert_eq!(
                 fetched["view"]["settings_file_change"],
                 json!(actual.settings_file_change)

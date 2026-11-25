@@ -39,6 +39,7 @@
         }
       ],
       "label": "A settings file changed"
-    }
+    },
+    "unstamped": false
   }
 }

@@ -283,7 +283,8 @@
           "module_id": "demo",
           "path": "/limit"
         }
-      ]
+      ],
+      "unstamped": true
     }
   },
   "request": {

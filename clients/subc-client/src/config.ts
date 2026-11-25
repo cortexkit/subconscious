@@ -60,6 +60,27 @@ export interface ConfigSettingsFileChange {
   }>;
 }
 
+export interface ConfigPlanView {
+  digest: string;
+  base_revision: number;
+  plan: unknown;
+  /** Display-only file grouping, outside the plan digest. */
+  settings_file_change?: ConfigSettingsFileChange;
+  /** Whether the store was unstamped when the plan was made. Absent means "not stated". */
+  unstamped?: boolean;
+  refusals?: ConfigPlanRefusal[];
+  skipped?: ConfigPlanRefusal[];
+}
+
+export interface ConfigPlanRefusal {
+  module_id: string;
+  project_id?: string;
+  workspace_id?: string;
+  path: string;
+  code: string;
+  message: string;
+}
+
 export interface ConfigRevertRequest {
   op: "config.revert";
   digest: string;

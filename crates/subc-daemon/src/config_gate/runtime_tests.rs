@@ -802,6 +802,7 @@ fn config_pending_settings_unstamp_hides_and_clears_worker_status() {
     let plan = owner
         .finish_plan(owner.prepare(PlanKind::Unstamp).unwrap(), daemon_review)
         .unwrap();
+    assert!(!plan.unstamped);
     owner
         .desktop_view_delivered(ConnectionId::new(7), &plan)
         .unwrap();

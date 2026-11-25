@@ -1295,8 +1295,9 @@ async fn capture_plan_rollout_off_preserves_user_plan_and_get_bytes() {
     let view = wire["view"].as_object().unwrap();
     assert_eq!(
         view.keys().map(String::as_str).collect::<Vec<_>>(),
-        ["base_revision", "digest", "plan"]
+        ["base_revision", "digest", "plan", "unstamped"]
     );
+    assert_eq!(view["unstamped"], false);
     assert!(wire["view"]["plan"]["changeset"]["apply_plan"]
         .get("tuple_targets")
         .is_none());

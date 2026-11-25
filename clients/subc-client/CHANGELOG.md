@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.27.1
+
+- Export `ConfigPlanView`, including the store's stamp state at plan creation
+  when stated by the daemon.
+
 ## 0.27.0
 
 - Supervised providers on Linux and macOS can opt into in-place daemon upgrades

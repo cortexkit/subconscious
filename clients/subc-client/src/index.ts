@@ -102,7 +102,8 @@ export {
   type ConfigReviewRequest, type ConfigReviewReply, type ConfigFieldChange, type ConfigRecordedValue,
   type ConfigGetReply, type ConfigDeclarationPending, type ConfigAppliedRequest, type ConfigRefusal,
   type ConfigFileError, type ConfigWatchFileErrorRow, type ConfigStatusFileError,
-  type ConfigPendingSettingsStatus, type ConfigSettingsFileChange, type ConfigRevertRequest, type ConfigRevertReply, type ConfigRevertFile,
+  type ConfigPendingSettingsStatus, type ConfigSettingsFileChange, type ConfigPlanView, type ConfigPlanRefusal,
+  type ConfigRevertRequest, type ConfigRevertReply, type ConfigRevertFile,
   type ConfigAvailability, type ModuleConfigState, type ModuleConfigOptions,
 } from "./config.js";
 export type {

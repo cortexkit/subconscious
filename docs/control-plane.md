@@ -264,6 +264,13 @@ not new variants of the legacy exhaustive client control enums:
 | `config.history` | Retained generations and summaries of pruned history. |
 | `config.revert` | Restores the files a pending file-capture plan covers to their approved bytes, skipping any file edited since review. Unlike the other operations in this table, it is listed in `subc_ops`, so a client can tell whether the daemon serves it. |
 
+Every returned plan view includes `unstamped`, a boolean that is true exactly
+when the store was unstamped at plan creation. `config.plan_get` returns the
+same value stored with the pending view. An absent `unstamped` member in an
+older reply means "not stated", not `false`. Like the optional display-only
+`settings_file_change` grouping, `unstamped` is outside the canonical plan and
+does not enter its approval digest.
+
 An edit path may name a declared map entry or a field within it, but not an
 array item; discriminated unions can be set or removed as whole values.
 

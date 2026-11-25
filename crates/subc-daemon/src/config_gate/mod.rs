@@ -690,6 +690,7 @@ impl ConfigGate {
         plan.active_generations = active;
         targets::checked(&plan)?;
         let mut view = ConfigPlanView::new(plan).map_err(GateError::invalid)?;
+        view.unstamped = status.state == StoreState::Unstamped;
         if let Some(edit) = &edits {
             view.refusals = edit.refusals.clone();
         }

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.41.16
+
+- Require subc-control 0.42.10 for the new `unstamped` field on settings plan views.
+
 ## 0.41.15
 
 - Add opt-in live daemon upgrades for supervised primary modules on Linux and

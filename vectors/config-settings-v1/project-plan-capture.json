@@ -381,7 +381,8 @@
           "path": "",
           "project_id": "B"
         }
-      ]
+      ],
+      "unstamped": false
     }
   },
   "request": {

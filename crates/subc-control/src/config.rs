@@ -347,6 +347,11 @@ pub struct ConfigPlanView {
     /// `config.plan_get` but not covered by the approval digest or sent to consent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings_file_change: Option<ConfigSettingsFileChange>,
+    /// Whether the store was unstamped when the plan was made. This is outside
+    /// the plan digest. An absent wire member means "not stated", even though
+    /// older replies deserialize with the default `false`.
+    #[serde(default)]
+    pub unstamped: bool,
     pub base_revision: u64,
     pub plan: Plan,
     /// Every entry prevents applying the plan.
@@ -381,6 +386,7 @@ impl ConfigPlanView {
             refusals: Vec::new(),
             skipped: Vec::new(),
             settings_file_change: None,
+            unstamped: false,
         })
     }
 }
@@ -644,7 +650,7 @@ mod tests {
         );
     }
     #[test]
-    fn config_wire_existing_bodies_remain_byte_identical() {
+    fn config_wire_bodies_match_expected_bytes() {
         const DIGEST: &str =
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         for wire in [
@@ -700,12 +706,12 @@ mod tests {
             "config.rollback",
         ] {
             assert_wire_bytes::<ConfigControlResponse>(&format!(
-                r#"{{"op":"{op}","view":{{"digest":"{DIGEST}","base_revision":7,"plan":{plan}}}}}"#
+                r#"{{"op":"{op}","view":{{"digest":"{DIGEST}","unstamped":false,"base_revision":7,"plan":{plan}}}}}"#
             ));
         }
         let refusal = r#"{"module_id":"demo","path":"/limit","code":"value_invalid","message":"invalid limit"}"#;
         assert_wire_bytes::<ConfigControlResponse>(&format!(
-            r#"{{"op":"config.plan","view":{{"digest":"{DIGEST}","base_revision":7,"plan":{plan},"refusals":[{refusal}]}}}}"#
+            r#"{{"op":"config.plan","view":{{"digest":"{DIGEST}","unstamped":false,"base_revision":7,"plan":{plan},"refusals":[{refusal}]}}}}"#
         ));
         assert_wire_bytes::<ConfigWatchResponse>(&format!(
             r#"{{"op":"config.watch","event":"resync","modules":[{row}],"stamped":true}}"#
@@ -764,6 +770,31 @@ mod tests {
         assert_wire_bytes::<ConfigWatchResponse>(
             r#"{"op":"config.watch","event":"resync","modules":[{"module_id":"demo","project_id":"p","workspace_id":"w","gated":true,"status":"adopted"}],"stamped":true}"#,
         );
+    }
+
+    #[test]
+    fn config_wire_plan_view_unstamped_does_not_change_the_plan_digest() {
+        let plan = Plan::new(7, 3, "daemon", Default::default(), Default::default());
+        let digest = plan.digest().unwrap();
+        let mut view = ConfigPlanView::new(plan).unwrap();
+        assert_eq!(serde_json::to_value(&view).unwrap()["unstamped"], false);
+
+        view.unstamped = true;
+        let mut wire = serde_json::to_value(&view).unwrap();
+        assert_eq!(wire["unstamped"], true);
+        assert_eq!(
+            serde_json::from_value::<ConfigPlanView>(wire.clone()).unwrap(),
+            view
+        );
+
+        wire.as_object_mut().unwrap().remove("unstamped");
+        let legacy: ConfigPlanView = serde_json::from_value(wire).unwrap();
+        assert!(!legacy.unstamped);
+        assert_eq!(legacy.plan, view.plan);
+        assert_eq!(legacy.plan.digest().unwrap(), digest);
+        assert_eq!(view.plan.digest().unwrap(), digest);
+        assert_eq!(legacy.digest, digest);
+        assert_eq!(view.digest, digest);
     }
 
     #[test]
@@ -1094,11 +1125,13 @@ mod tests {
     }
 
     #[test]
-    fn config_wire_empty_refusals_preserve_legacy_view_bytes() {
+    fn config_wire_empty_refusals_are_omitted_and_legacy_views_decode() {
         let plan = Plan::new(7, 3, "daemon", Default::default(), Default::default());
         let view = ConfigPlanView::new(plan.clone()).unwrap();
         let legacy = json!({"digest":plan.digest().unwrap(),"base_revision":7,"plan":plan});
-        assert_eq!(serde_json::to_value(&view).unwrap(), legacy);
+        let mut expected = legacy.clone();
+        expected["unstamped"] = json!(false);
+        assert_eq!(serde_json::to_value(&view).unwrap(), expected);
         assert_eq!(
             serde_json::from_value::<ConfigPlanView>(legacy).unwrap(),
             view

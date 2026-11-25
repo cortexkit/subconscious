@@ -168,6 +168,7 @@ fn config_plan_rows_stamp_records_running_values_without_a_transition() {
         .unwrap();
     assert_eq!(running.active.unwrap().generation, 0);
     let view = plan(&owner, PlanKind::Stamp);
+    assert!(view.unstamped);
     assert_eq!(
         view.plan.changeset.apply_plan["module_transitions"],
         json!({})
@@ -410,6 +411,7 @@ fn config_plan_rows_every_store_difference_has_a_visible_row() {
             );
         }
         if case == "rollback" {
+            assert!(!view.unstamped);
             let old_program = format!("program:{}", rig.path.join("program").display());
             assert!(view.plan.changeset.launch_manifests["a"]
                 .get(old_program)

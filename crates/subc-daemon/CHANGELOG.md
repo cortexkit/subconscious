@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.50.64
+
+- Report the store's stamp state at plan creation on settings plan views,
+  including pending views returned by `config.plan_get`. Require subc-control 0.42.10.
+
 ## 0.50.63
 
 - Add the privileged in-place upgrade operation on Linux and macOS. Verify

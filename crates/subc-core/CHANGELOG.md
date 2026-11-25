@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.21.54
+
+- Require subc-daemon 0.50.64, subc-control 0.42.10 and subc-client-rs 0.41.16
+  for settings plan views that report whether the store was unstamped.
+
 ## 0.21.53
 
 - Add `ck daemon upgrade --in-place` to replace a running Linux or macOS

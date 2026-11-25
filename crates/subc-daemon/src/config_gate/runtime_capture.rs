@@ -193,12 +193,14 @@ impl RuntimeOwner {
             return Ok(None);
         };
         let state = self.lock()?;
+        let (store_state, body) = state.store.loaded_admission_state();
         let mut view = projects.refused_view(
             &state.gate.incarnation,
             prepared.base_revision,
-            state.store.loaded_admission_state().1.last_generation,
+            body.last_generation,
             prepared.read_set.clone(),
         )?;
+        view.unstamped = store_state == StoreState::Unstamped;
         if let Some(edit) = &prepared.edits {
             view.refusals.extend(edit.refusals.clone());
         }

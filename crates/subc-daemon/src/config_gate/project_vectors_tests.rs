@@ -319,6 +319,7 @@ async fn field_refusals() -> Vec<Sample> {
     ] {
         let request = edits(0, vec![edit]);
         let reply = client.call(&request, FrameType::Response).await;
+        assert_eq!(reply["view"]["unstamped"], true);
         assert_eq!(reply["view"]["refusals"][0]["code"], code);
         assert_eq!(reply["view"]["refusals"][0]["project_id"], "A");
         samples.push((name, plan_sample(&rig, request, reply)));
@@ -357,6 +358,7 @@ async fn capture_and_delivery_samples() -> Vec<Sample> {
     client.handler.config_review_test_reply = Some(reply(review));
     let request = json!({"op":"config.plan"});
     let payload = client.call(&request, FrameType::Response).await;
+    assert_eq!(payload["view"]["unstamped"], false);
     assert!(payload["view"].get("refusals").is_none());
     assert_eq!(payload["view"]["skipped"][0]["project_id"], "B");
     assert_eq!(payload["view"]["skipped"][0]["code"], "config_unavailable");

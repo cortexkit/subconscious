@@ -550,7 +550,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-client-rs",
- "subc-control 0.42.9",
+ "subc-control 0.42.10",
  "subc-daemon",
  "subc-jsonc",
  "subc-protocol 0.37.9",
@@ -574,7 +574,7 @@ dependencies = [
  "serde",
  "serde_json",
  "subc-client-rs",
- "subc-control 0.42.9",
+ "subc-control 0.42.10",
  "subc-os",
  "subc-protocol 0.37.9",
  "tempfile",
@@ -611,7 +611,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-client-rs",
- "subc-control 0.42.9",
+ "subc-control 0.42.10",
  "subc-jsonc",
  "subc-os",
  "subc-protocol 0.37.9",
@@ -776,7 +776,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-client-rs",
- "subc-control 0.42.9",
+ "subc-control 0.42.10",
  "subc-os",
  "subc-protocol 0.37.9",
  "subc-transport",
@@ -3146,7 +3146,7 @@ dependencies = [
 
 [[package]]
 name = "subc-client-rs"
-version = "0.41.15"
+version = "0.41.16"
 dependencies = [
  "async-trait",
  "cortexkit-paths",
@@ -3156,7 +3156,7 @@ dependencies = [
  "sha2",
  "socket2",
  "subc-config 0.1.12",
- "subc-control 0.42.9",
+ "subc-control 0.42.10",
  "subc-os",
  "subc-protocol 0.37.9",
  "subc-transport",
@@ -3203,7 +3203,7 @@ dependencies = [
 
 [[package]]
 name = "subc-control"
-version = "0.42.9"
+version = "0.42.10"
 dependencies = [
  "serde",
  "serde_json",
@@ -3213,7 +3213,7 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.21.53"
+version = "0.21.54"
 dependencies = [
  "async-trait",
  "base64",
@@ -3233,7 +3233,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-client-rs",
- "subc-control 0.42.9",
+ "subc-control 0.42.10",
  "subc-core",
  "subc-daemon",
  "subc-jsonc",
@@ -3251,7 +3251,7 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.50.63"
+version = "0.50.64"
 dependencies = [
  "base64",
  "cortexkit-log",
@@ -3274,7 +3274,7 @@ dependencies = [
  "subc-cgroup",
  "subc-config 0.1.12",
  "subc-control 0.35.0",
- "subc-control 0.42.9",
+ "subc-control 0.42.10",
  "subc-jobobject",
  "subc-jsonc",
  "subc-os",
@@ -3332,7 +3332,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-client-rs",
- "subc-control 0.42.9",
+ "subc-control 0.42.10",
  "subc-daemon",
  "subc-jsonc",
  "subc-os",

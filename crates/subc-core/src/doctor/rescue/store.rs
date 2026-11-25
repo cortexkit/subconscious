@@ -14,6 +14,16 @@ pub(super) struct Lease<T> {
     pub lock: File,
 }
 
+struct InstallLock(File);
+
+impl Drop for InstallLock {
+    fn drop(&mut self) {
+        // A concurrent fork can keep the descriptor open until exec, even with
+        // close-on-exec set. Release the lock when the install is done.
+        let _ = self.0.unlock();
+    }
+}
+
 pub(super) struct Store {
     folder: Directory,
     pin: &'static str,
@@ -89,7 +99,7 @@ impl Store {
         Ok(Lease { value, lock })
     }
 
-    fn install_lock(&self, host: &impl Host) -> Result<File, String> {
+    fn install_lock(&self, host: &impl Host) -> Result<InstallLock, String> {
         let lock = lock_file(&self.folder, ".lock")?;
         let path = self.folder.path().join(".lock");
         match lock.try_lock() {
@@ -100,7 +110,7 @@ impl Store {
             }
             Err(TryLockError::Error(error)) => return at(&path, Err(error)),
         }
-        Ok(lock)
+        Ok(InstallLock(lock))
     }
 
     fn entries(&self, host: &impl Host) -> Vec<fs::DirEntry> {
@@ -176,5 +186,56 @@ impl Store {
             }
         }
         Ok(prunable)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::{
+        io::{Read, Write},
+        os::fd::AsRawFd,
+        process::Command,
+        thread,
+    };
+
+    use cortexkit_test_support::ScratchDir;
+    use subc_os::fork_exec_test::{flags_are_close_on_exec, pause_before_exec};
+
+    use super::{super::host::System, *};
+
+    #[test]
+    fn install_unlocks_while_a_concurrent_fork_is_still_before_exec() {
+        let scratch = ScratchDir::new("rescue-install-lock");
+        let folder = Directory::root(scratch.path(), "node", true)
+            .unwrap()
+            .unwrap();
+        let store = Store::new(folder, pins::NODE_VERSION);
+        let install = store.install_lock(&System).unwrap();
+        let next = lock_file(&store.folder, ".lock").unwrap();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exit 0"]);
+        let (mut ready, mut release) =
+            pause_before_exec(&mut command, install.0.as_raw_fd()).unwrap();
+        let spawn = thread::spawn(move || command.status());
+
+        let mut observation = [0; 8];
+        let observed = ready.read_exact(&mut observation);
+        let before_drop = next.try_lock();
+        drop(install);
+        let after_drop = next.try_lock();
+
+        // Release and reap the paused child before asserting the lock results.
+        let released = release.write_all(&[1]);
+        let status = spawn.join().unwrap().unwrap();
+        observed.unwrap();
+        released.unwrap();
+        assert!(status.success());
+        let pid = i32::from_ne_bytes(observation[..4].try_into().unwrap());
+        let flags = i32::from_ne_bytes(observation[4..].try_into().unwrap());
+        assert!(flags_are_close_on_exec(flags));
+        assert!(matches!(before_drop, Err(TryLockError::WouldBlock)));
+        after_drop.unwrap_or_else(|error| {
+            panic!("paused child {pid} retained the install lock: {error:?}")
+        });
     }
 }

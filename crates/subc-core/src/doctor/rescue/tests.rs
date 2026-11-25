@@ -243,8 +243,11 @@ impl Host for Fake {
                                 .open_managed(&["tools", tool], false)
                                 .open_lock(".lock")
                                 .unwrap();
-                            lock.try_lock()
-                                .expect("sign-in does not hold either install lock");
+                            lock.try_lock().unwrap_or_else(|error| {
+                                panic!("sign-in must not hold the {tool} install lock: {error:?}")
+                            });
+                            // A concurrent fork must not extend the probe's lock lifetime.
+                            lock.unlock().unwrap();
                         }
                     }
                 }

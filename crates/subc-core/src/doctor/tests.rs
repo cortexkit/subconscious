@@ -33,7 +33,7 @@ use crate::{
 use super::{
     host::{read_windows, ConnectionFence, DoctorDaemon, RpcError, RpcResult},
     module_checks,
-    run::{now_ms, run_with, Limits},
+    run::{now_ms, run_with, Limits, Pass},
     stack_checks::{cpu_delta, resources, Binary},
     window_checks::WindowRow,
 };
@@ -1464,7 +1464,6 @@ fn all_module_states_are_mapped_without_inventing_health_for_future_states() {
             0,
         ),
     ] {
-        let mut host = Fixture::new("doctor-module-state");
         let mut row = module("sample", state);
         if matches!(state, "stopped" | "disabled") {
             row.enabled = false;
@@ -1474,27 +1473,32 @@ fn all_module_states_are_mapped_without_inventing_health_for_future_states() {
             row.last_probe_ms = Some(42);
             row.live = false;
         }
-        host.set_daemon(FakeDaemon {
-            modules: vec![row],
-            ..FakeDaemon::default()
-        });
-        let result = execute(host);
-        assert_eq!(result.exit_code, exit);
-        let findings = result
-            .document
-            .findings
-            .iter()
-            .filter(|f| f.layer == Layer::Module)
-            .collect::<Vec<_>>();
-        assert_eq!(findings.len(), usize::from(code.is_some()));
+        // Classify completed data: slow RPC workers must not affect how a state maps.
+        let tail = LogTailRecord::empty("sample", TailSource::StderrTail, TailStatus::Captured);
+        let mut pass = Pass::default();
+        pass.findings
+            .extend(module_checks::classify(&row, None, None, &tail, 0));
+        let result = pass.report(None, None, None);
+        assert_eq!(result.exit_code, exit, "state={state}: {:?}", ids(&result));
+        let findings = &result.document.findings;
+        assert_eq!(findings.len(), usize::from(code.is_some()), "state={state}");
         if let Some(code) = code {
             assert_eq!(
-                (&*findings[0].id, findings[0].severity, &*findings[0].owner),
-                (code, severity, "sample")
+                (
+                    &*findings[0].id,
+                    findings[0].layer,
+                    findings[0].severity,
+                    &*findings[0].owner
+                ),
+                (code, Layer::Module, severity, "sample"),
+                "state={state}"
             );
-            assert_eq!(findings[0].evidence["state"], state);
+            assert_eq!(findings[0].evidence["state"], state, "state={state}");
             if state == "future_state" {
-                assert!(findings[0].summary.contains("\"future_state\""));
+                assert!(
+                    findings[0].summary.contains("\"future_state\""),
+                    "state={state}"
+                );
             }
         }
     }

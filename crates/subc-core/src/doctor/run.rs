@@ -89,7 +89,7 @@ pub(super) struct Pass {
 }
 
 impl Pass {
-    fn report(
+    pub(super) fn report(
         self,
         connection_override: Option<PathBuf>,
         fix: Option<super::FixReport>,

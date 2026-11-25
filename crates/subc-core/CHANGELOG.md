@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.21.48
+
+- Test doctor module-state mapping independently of RPC worker deadlines.
+- Wait for the installer crash marker or child exit instead of timing out slow publication.
+- Release rescue installer locks before sign-in even if a concurrent fork inherited a descriptor.
+
 ## 0.21.47
 
 - Expose the mapping from managed program names to daemon supervisor IDs through

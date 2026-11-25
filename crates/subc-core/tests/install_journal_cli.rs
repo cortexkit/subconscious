@@ -6,8 +6,8 @@ mod common;
 use cortexkit_test_support::ScratchDir;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::process::{Command, Output};
+use std::time::Duration;
 
 struct Fixture {
     root: ScratchDir,
@@ -57,24 +57,35 @@ impl Fixture {
         command
     }
 
-    fn kill(&self, mut command: Command, point: &str) {
+    fn kill(&self, mut command: Command, point: &str) -> Result<(), String> {
+        // Log to a file so a full output pipe cannot stop the child before the marker.
+        let log_path = self.root.path().join("crash-child.log");
+        let log = fs::File::create(&log_path).unwrap();
         let mut child = command
             .env("CK_TEST_INSTALL_CRASH_POINT", point)
             .env("CK_TEST_INSTALL_CRASH_MARKER", &self.marker)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
             .spawn()
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while !self.marker.exists() && Instant::now() < deadline {
-            if child.try_wait().unwrap().is_some() {
-                unexpected(child, point);
+        // Publication and its disk syncs can be slow, but the hook waits for the kill.
+        while !self.marker.exists() {
+            if let Some(status) = child.try_wait().unwrap() {
+                let log = fs::read(log_path)
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                    .unwrap_or_else(|error| format!("could not read child log: {error}"));
+                return Err(format!(
+                    "child exited before reaching crash point {point:?}: {status}\n{log}"
+                ));
             }
             std::thread::sleep(Duration::from_millis(20));
         }
         child.kill().unwrap();
-        assert!(!child.wait().unwrap().success());
-        assert_eq!(fs::read_to_string(&self.marker).unwrap(), point);
+        assert!(!child.wait().unwrap().success(), "crash point {point:?}");
+        let marker = fs::read_to_string(&self.marker)
+            .map_err(|error| format!("could not read marker for crash point {point:?}: {error}"))?;
+        assert_eq!(marker, point, "crash point {point:?}");
+        Ok(())
     }
 
     fn data(&self) -> PathBuf {
@@ -99,15 +110,6 @@ fn binary() -> &'static str {
     }
 }
 
-fn unexpected(child: Child, point: &str) -> ! {
-    let output = child.wait_with_output().unwrap();
-    panic!(
-        "bootstrap stopped before {point}: {:?}\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
-    )
-}
-
 fn ok(output: Output) {
     assert!(
         output.status.success(),
@@ -118,9 +120,23 @@ fn ok(output: Output) {
 }
 
 #[test]
+fn bootstrap_exit_before_marker_names_the_crash_point() {
+    let fixture = Fixture::new();
+    let mut command = fixture.command(&fixture.extracted);
+    command.arg("--version");
+    let error = fixture.kill(command, "bootstrap-act").unwrap_err();
+    assert!(
+        error.starts_with("child exited before reaching crash point \"bootstrap-act\":"),
+        "{error}"
+    );
+}
+
+#[test]
 fn bootstrap_kill_after_write_ahead_is_recovered_by_the_verified_temporary_ck() {
     let fixture = Fixture::new();
-    fixture.kill(fixture.install(), "bootstrap-write-ahead");
+    fixture
+        .kill(fixture.install(), "bootstrap-write-ahead")
+        .unwrap();
     assert!(fixture.journal().is_file());
     assert!(!fixture.public().exists());
     assert!(!fixture.manifest().exists());
@@ -138,7 +154,9 @@ fn a_bootstrap_killed_before_replacing_existing_ck_does_not_report_a_false_succe
     let fixture = Fixture::new();
     let old = b"pre-journal ck";
     seed_managed_public(&fixture, old);
-    fixture.kill(fixture.install(), "bootstrap-write-ahead");
+    fixture
+        .kill(fixture.install(), "bootstrap-write-ahead")
+        .unwrap();
     assert_eq!(fs::read(fixture.public()).unwrap(), old);
     ok(fixture.install().output().unwrap());
     assert!(
@@ -172,7 +190,7 @@ fn seed_managed_public(fixture: &Fixture, before: &[u8]) {
 #[test]
 fn bootstrap_kill_after_publication_finishes_handover_when_setup_starts() {
     let fixture = Fixture::new();
-    fixture.kill(fixture.install(), "bootstrap-act");
+    fixture.kill(fixture.install(), "bootstrap-act").unwrap();
     assert!(fixture.public().is_file());
     assert!(!fixture.manifest().exists());
     // An invalid local release URL makes setup stop after recovery, without
@@ -289,7 +307,9 @@ fn verified_helper_rolls_back_and_retries_a_handover_killed_in_the_rename_gap() 
     )
     .unwrap();
 
-    fixture.kill(fixture.install(), "windows-replacement-gap");
+    fixture
+        .kill(fixture.install(), "windows-replacement-gap")
+        .unwrap();
     assert!(!fixture.public().exists());
     ok(fixture.install().output().unwrap());
     assert_eq!(

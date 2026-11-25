@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.50.66
+
+- Synchronize the upgrade test fixture with the receipt stall and final executable
+  hash so it can test pathname replacement before and during verification.
+
 ## 0.50.65
 
 - Answer `server.describe` without waiting for the boot executable hash, so

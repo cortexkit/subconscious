@@ -626,7 +626,8 @@ mod unix {
         write_failure: std::sync::atomic::AtomicBool,
         #[cfg(feature = "test-support")]
         corrupt_hmac: bool,
-        stall_receipt: Option<PathBuf>,
+        #[cfg(feature = "test-support")]
+        receipt_gate: Option<PathBuf>,
         notice_failure: Option<String>,
         #[cfg(feature = "test-support")]
         freeze_gate: Option<PathBuf>,
@@ -1089,13 +1090,21 @@ mod unix {
                         Err(error) => return (Stage::HandoverWrite, io::Error::other(error)),
                     };
                     progress.receipt_attempted = true;
+                    // The fixture finishes its pathname change and disconnect
+                    // before the real receipt timer starts.
+                    #[cfg(feature = "test-support")]
+                    if let Some(gate) = &self.hooks.receipt_gate {
+                        if let Err(error) = fixture_tests::wait_at_gate(gate, 1).await {
+                            return (Stage::HandoverWrite, error);
+                        }
+                    }
                     let mut shutdown = self.shutdown.subscribe();
                     tokio::select! {
                         biased;
                         _ = shutdown.wait_for(|set| *set) => return (Stage::HandoverWrite, interrupted()),
                         _ = tokio::time::timeout(REPLY_TIMEOUT, async {
-                            if let Some(marker) = &self.hooks.stall_receipt {
-                                let _ = tokio::fs::write(marker, b"receipt reached").await;
+                            #[cfg(feature = "test-support")]
+                            if self.hooks.receipt_gate.is_some() {
                                 std::future::pending::<()>().await;
                             }
                             let _ = egress.send_flushed(reply).await;
@@ -1140,11 +1149,7 @@ mod unix {
                             &path,
                             document,
                             &candidate.file,
-                            self.hooks
-                                .write_failure
-                                .swap(false, std::sync::atomic::Ordering::Relaxed),
-                            #[cfg(feature = "test-support")]
-                            self.hooks.corrupt_hmac,
+                            &self.hooks,
                         )
                     };
                     if tokio::runtime::Handle::current().runtime_flavor()
@@ -1599,7 +1604,15 @@ mod unix {
     }
 
     fn hash_candidate(file: &File) -> io::Result<(ImageStamp, HexBytes<32>)> {
+        hash_candidate_after_stamp(file, || Ok(()))
+    }
+
+    fn hash_candidate_after_stamp(
+        file: &File,
+        after_stamp: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<(ImageStamp, HexBytes<32>)> {
         let stamp = ImageStamp::read(file)?;
+        after_stamp()?;
         let digest = hash_file(file)?;
         if ImageStamp::read(file)? != stamp {
             return Err(io::Error::other("candidate changed while hashing"));
@@ -1788,11 +1801,13 @@ mod unix {
             path: &Path,
             mut document: Handover,
             candidate: &File,
-            fail_write: bool,
-            #[cfg(feature = "test-support")] corrupt_hmac: bool,
+            hooks: &Hooks,
         ) -> (Stage, io::Error) {
             let mut write = || -> io::Result<HandoverFile> {
-                if fail_write {
+                if hooks
+                    .write_failure
+                    .swap(false, std::sync::atomic::Ordering::Relaxed)
+                {
                     return Err(io::Error::other("injected handover write failure"));
                 }
                 let mut file = OpenOptions::new()
@@ -1804,7 +1819,7 @@ mod unix {
                 document.monotonic_ns = child_spawn::monotonic_ns()?;
                 let bytes = handover::encode(&document, &self.key).map_err(io::Error::other)?;
                 #[cfg(feature = "test-support")]
-                let bytes = if corrupt_hmac {
+                let bytes = if hooks.corrupt_hmac {
                     let mut bytes = bytes;
                     let tag = bytes
                         .iter()
@@ -1864,7 +1879,15 @@ mod unix {
                     // catch such a change earlier without rereading the image;
                     // only this digest proves the bytes we exec are the ones
                     // the operator approved.
-                    let (stamp, digest) = hash_candidate(candidate)?;
+                    let (stamp, digest) = hash_candidate_after_stamp(candidate, || {
+                        // Pause after the first metadata sample so the fixture
+                        // can verify that a change during hashing is refused.
+                        #[cfg(feature = "test-support")]
+                        if let Some(gate) = &hooks.receipt_gate {
+                            fixture_tests::wait_at_gate_blocking(gate, 2)?;
+                        }
+                        Ok(())
+                    })?;
                     #[cfg(target_os = "linux")]
                     let _ = (boot, stamp);
                     #[cfg(target_os = "macos")]

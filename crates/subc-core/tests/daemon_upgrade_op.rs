@@ -121,7 +121,7 @@ impl Daemon {
         if let Some((key, value)) = hook {
             if matches!(
                 key,
-                "SUBC_TEST_UPGRADE_RECEIPT_WAIT_MARKER" | "SUBC_TEST_UPGRADE_FREEZE_GATE"
+                "SUBC_TEST_UPGRADE_RECEIPT_GATE" | "SUBC_TEST_UPGRADE_FREEZE_GATE"
             ) {
                 launch.env(key, root.join(value));
             } else if real_resume && key == "SUBC_TEST_UPGRADE_EXEC_PATH" {
@@ -1030,41 +1030,95 @@ async fn handover_write_and_exec_failure_resume_the_original_listeners() {
     }
 }
 
+async fn boot_with_receipt_gate() -> (Daemon, tokio::net::UnixListener) {
+    let daemon = Daemon::boot(Some(("SUBC_TEST_UPGRADE_RECEIPT_GATE", "receipt-gate"))).await;
+    let gate = tokio::net::UnixListener::bind(daemon.root.join("receipt-gate")).unwrap();
+    (daemon, gate)
+}
+
+async fn receipt_checkpoint(
+    gate: &tokio::net::UnixListener,
+    expected: u8,
+) -> tokio::net::UnixStream {
+    use tokio::io::AsyncReadExt;
+
+    timeout(UPGRADE_WAIT, async {
+        let (mut stream, _) = gate.accept().await.unwrap();
+        assert_eq!(stream.read_u8().await.unwrap(), expected);
+        stream
+    })
+    .await
+    .unwrap_or_else(|_| panic!("upgrade did not reach receipt checkpoint {expected}"))
+}
+
+#[cfg(target_os = "linux")]
+fn stage_racing_placement(daemon: &Daemon) -> PathBuf {
+    let next = daemon.root.join("racing-placement");
+    copy_executable(&common::ckdev_subc(), &next);
+    next
+}
+
 #[tokio::test]
 async fn stalled_receipt_and_caller_disconnect_do_not_cancel_exec() {
-    let mut daemon = Daemon::boot(Some((
-        "SUBC_TEST_UPGRADE_RECEIPT_WAIT_MARKER",
-        "waiting-receipt",
-    )))
-    .await;
+    use tokio::io::AsyncWriteExt;
+
+    let (mut daemon, gate) = boot_with_receipt_gate().await;
     let checksum = daemon.stage_compatible();
     #[cfg(target_os = "linux")]
-    let next = {
-        let next = daemon.root.join("racing-placement");
-        copy_executable(&common::ckdev_subc(), &next);
-        next
-    };
+    let next = stage_racing_placement(&daemon);
     let caller = daemon
         .issue(json!({"op":"daemon.upgrade_in_place", "executable_sha256": checksum}))
         .await
         .unwrap();
-    timeout(UPGRADE_WAIT, async {
-        while !daemon.root.join("waiting-receipt").exists() {
-            sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("upgrade reached the receipt writer");
+    let mut receipt = receipt_checkpoint(&gate, 1).await;
     assert!(daemon.socket().exists());
+    // Replacing the path before the final hash leaves the verified descriptor
+    // valid; replacing it during the hash would change its sampled metadata.
     #[cfg(target_os = "linux")]
     fs::rename(next, &daemon.executable).unwrap();
     drop(caller);
+    receipt.write_u8(0).await.unwrap();
+    receipt_checkpoint(&gate, 2)
+        .await
+        .write_u8(0)
+        .await
+        .unwrap();
     assert!(timeout(UPGRADE_WAIT, daemon.process.wait())
         .await
-        .unwrap()
+        .unwrap_or_else(|_| panic!("replacement did not exit: {}", daemon_logs(&daemon.root)))
         .unwrap()
         .success());
     assert!(daemon.root.join("replacement").is_file());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn candidate_path_replaced_during_final_hash_refuses_exec() {
+    use tokio::io::AsyncWriteExt;
+
+    let (daemon, gate) = boot_with_receipt_gate().await;
+    let checksum = daemon.stage_compatible();
+    let next = stage_racing_placement(&daemon);
+    let _caller = daemon
+        .issue(json!({"op":"daemon.upgrade_in_place", "executable_sha256": checksum}))
+        .await
+        .unwrap();
+    receipt_checkpoint(&gate, 1)
+        .await
+        .write_u8(0)
+        .await
+        .unwrap();
+    let mut rehash = receipt_checkpoint(&gate, 2).await;
+    fs::rename(next, &daemon.executable).unwrap();
+    rehash.write_u8(0).await.unwrap();
+
+    let failed = daemon.last_upgrade().await;
+    assert_eq!(failed["outcome"], "failed", "{failed}");
+    assert_eq!(failed["stage"], "rehash", "{failed}");
+    assert!(daemon_logs(&daemon.root).contains("candidate changed while hashing"));
+    assert!(!daemon.handover().exists());
+    assert!(!daemon.root.join("replacement").exists());
+    daemon.assert_local_serving().await;
 }
 
 #[tokio::test]

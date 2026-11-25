@@ -17,8 +17,7 @@ impl Hooks {
                 .is_some()
                 .into(),
             corrupt_hmac: std::env::var_os("SUBC_TEST_UPGRADE_CORRUPT_HMAC").is_some(),
-            stall_receipt: std::env::var_os("SUBC_TEST_UPGRADE_RECEIPT_WAIT_MARKER")
-                .map(PathBuf::from),
+            receipt_gate: std::env::var_os("SUBC_TEST_UPGRADE_RECEIPT_GATE").map(PathBuf::from),
             notice_failure: std::env::var("SUBC_TEST_UPGRADE_NOTICE_FAILURE").ok(),
             refusal_writer_gate: freeze_gate.clone().map(Arc::new),
             freeze_gate,
@@ -37,4 +36,14 @@ pub(crate) async fn wait_at_gate(path: &Path, phase: u8) -> io::Result<()> {
         Ok(())
     })
     .await?
+}
+
+pub(crate) fn wait_at_gate_blocking(path: &Path, phase: u8) -> io::Result<()> {
+    use std::io::{Read, Write};
+
+    let mut stream = std::os::unix::net::UnixStream::connect(path)?;
+    stream.set_read_timeout(Some(Duration::from_secs(20)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(20)))?;
+    stream.write_all(&[phase])?;
+    stream.read_exact(&mut [0])
 }

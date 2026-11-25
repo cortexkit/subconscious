@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.21.56
+
+- Require subc-daemon 0.50.66 for synchronized in-place upgrade tests.
+
 ## 0.21.55
 
 - Briefly retry `ck daemon upgrade --in-place`'s initial identity lookup while

@@ -20,6 +20,8 @@ const OPEN_CORR: u64 = 41;
 
 #[path = "first_party_mark_tests.rs"]
 mod first_party_mark;
+#[path = "settings_credentials_tests.rs"]
+mod settings_credentials;
 
 #[tokio::test]
 async fn origins_widening_fences_routes_and_pending_binds() {

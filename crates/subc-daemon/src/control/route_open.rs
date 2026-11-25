@@ -1933,6 +1933,16 @@ impl ControlHandler {
             }
         }
 
+        // Use the admitted scope before compatibility removes fields from the bind.
+        let caller_attestation = self.caller_for_target(
+            caller_capture.as_ref(),
+            relay_capabilities,
+            &target_module_id,
+            &principal,
+            scope_stamp
+                .as_ref()
+                .and_then(|stamp| stamp.project_id.as_deref()),
+        );
         // Older readers may reject unknown fields. Select optional fields from
         // the captured endpoint's declaration, including on unscoped binds.
         if scope_stamp
@@ -2049,11 +2059,7 @@ impl ControlHandler {
                         })
                     }),
             )
-            .with_caller(caller_for_target(
-                caller_capture.as_ref(),
-                relay_capabilities,
-                &target_module_id,
-            ))
+            .with_caller(caller_attestation)
             .with_peer_build(
                 (production_peer_build
                     && relay_capabilities.is_some_and(|caps| {

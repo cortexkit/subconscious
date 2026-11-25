@@ -192,7 +192,16 @@ on `RouteBindRequest.peer`:
   app under its platform policy. It records recognition, not permission to act
   on the person's behalf.
 - `caller` requires `caller-attestation/v1`. An absent or incomplete attestation
-  establishes no first-party mark.
+  does not establish the opener as first-party. On binds to the vault, the
+  daemon also stamps `caller.settings_credentials` for a reserved module opener
+  when settings approval is switched on (the configuration store has been
+  stamped with `config.stamp`, see [control-plane.md](control-plane.md)). `refs` contains the sorted, unique
+  `vault_ref` strings from values marked `x-ck-kind: credential_ref` in the
+  opener's approved effective settings, including any layers for the stamped
+  project scope. Without an approved project view, the daemon uses the
+  module's approved user view. `generation` is the revision those values came from.
+  An empty `refs` list means those settings name no keys; omission means the
+  daemon is not attesting to any settings, not that the opener names no keys.
 - `peer_build` requires `peer-build/v1` in the captured target manifest. The
   daemon sends only `"production"`, only when the opener is `reserved:callosum`
   and its phone session's build claim was exactly `production`. Other openers,

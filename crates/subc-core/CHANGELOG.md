@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.21.50
+
+- Require subc-daemon 0.50.58.
+
 ## 0.21.49
 
 - Show the opener for each route in `ck routes` plain and JSON output.

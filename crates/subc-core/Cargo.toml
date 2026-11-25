@@ -1,6 +1,6 @@
 [package]
 name = "subc-core"
-version = "0.21.49"
+version = "0.21.50"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -78,7 +78,7 @@ required-features = ["bench-harness"]
 # The full-screen app `ck` opens with no arguments in a terminal, and the
 # health-metric rule `ck health` shares with it.
 ck-ui = { path = "../ck-ui", version = "0.9.7" }
-subc-daemon = { path = "../subc-daemon", version = "0.50.57" }
+subc-daemon = { path = "../subc-daemon", version = "0.50.60" }
 cortexkit-log = { version = "0.3.3" }
 cortexkit-paths = "0.1.1"
 base64 = "0.22"

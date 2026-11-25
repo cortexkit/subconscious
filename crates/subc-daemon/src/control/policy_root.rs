@@ -5,7 +5,7 @@ use subc_control::config::ConfigControlResponse;
 use subc_control::policy_root::{RECOVER_OP, SET_OP};
 use subc_protocol::policy_root::{GET_OP, ROTATE_OP};
 
-const VAULT: &str = "claustrum";
+pub(super) const VAULT: &str = "claustrum";
 
 pub(super) fn is_op(op: &str) -> bool {
     matches!(op, GET_OP | ROTATE_OP | SET_OP | RECOVER_OP)

@@ -160,7 +160,7 @@ mod config_advertisement_tests;
 mod config_gate;
 #[path = "operator_apps/connection.rs"]
 mod peer_identity;
-use caller_attestation::{caller_for_target, scope_acts_for_another};
+use caller_attestation::scope_acts_for_another;
 mod activity_reservations;
 #[cfg(all(test, unix, feature = "test-support"))]
 #[path = "control/caller_attestation_tests.rs"]

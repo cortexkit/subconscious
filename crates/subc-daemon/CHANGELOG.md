@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.50.60
+
+- Attest which vault keys an opening module's approved settings name when binding a route to the vault.
+
 ## 0.50.59
 
 - Tests only: run the Windows agent CPU stop fixtures without a console and

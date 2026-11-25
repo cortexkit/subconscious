@@ -527,7 +527,7 @@ impl SettingsSnapshot {
     }
 }
 
-fn schema(declaration: &ConfigDeclareRequest) -> Result<Schema> {
+pub(super) fn schema(declaration: &ConfigDeclareRequest) -> Result<Schema> {
     Schema::new(declaration.schema.clone())
         .map_err(|_| GateError::new("schema_invalid", "admitted schema is invalid"))
 }
@@ -540,7 +540,7 @@ fn schema_with_digest(declaration: &ConfigDeclareRequest) -> Result<(Schema, Dig
     Ok((schema, digest))
 }
 
-fn approved_entry<'a>(body: &'a StoreBody, module: &str) -> Option<&'a HistoryEntry> {
+pub(super) fn approved_entry<'a>(body: &'a StoreBody, module: &str) -> Option<&'a HistoryEntry> {
     body.generations.values().rev().find(|entry| {
         !matches!(
             entry.kind,

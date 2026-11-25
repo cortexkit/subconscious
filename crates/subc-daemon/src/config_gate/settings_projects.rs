@@ -25,14 +25,20 @@ fn key(module: &str, project: &str) -> Tuple {
     }
 }
 
-fn approved_project<'a>(body: &'a StoreBody, tuple: &Tuple) -> Option<&'a HistoryEntry> {
+pub(in crate::config_gate::runtime) fn approved_project<'a>(
+    body: &'a StoreBody,
+    tuple: &Tuple,
+) -> Option<&'a HistoryEntry> {
     body.generations
         .values()
         .rev()
         .find(|entry| entry.tuples.contains(tuple))
 }
 
-fn project_view<'a>(entry: &'a HistoryEntry, tuple: &Tuple) -> Option<&'a ConfigView> {
+pub(in crate::config_gate::runtime) fn project_view<'a>(
+    entry: &'a HistoryEntry,
+    tuple: &Tuple,
+) -> Option<&'a ConfigView> {
     entry
         .delivery
         .as_ref()?

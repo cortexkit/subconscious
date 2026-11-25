@@ -49,22 +49,34 @@ impl ConsumerAttestation {
     }
 }
 
-/// The `caller` key for a bind toward `target_module`, a target with
-/// `capabilities`: present only for a supervised opener and only toward a
-/// target declaring `caller-attestation/v1`.
-pub(super) fn caller_for_target(
-    caller: Option<&CallerCapture>,
-    capabilities: Option<&CapabilityDeclarations>,
-    target_module: &str,
-) -> Option<CallerAttestation> {
-    let declared = capabilities.is_some_and(|caps| {
-        caps.provides
-            .iter()
-            .any(|cap| cap == CALLER_ATTESTATION_CAPABILITY)
-    });
-    caller
-        .filter(|_| declared)
-        .and_then(|caller| caller.attestation(target_module))
+impl ControlHandler {
+    /// Attest the opener's captured daemon launch only to targets that declare
+    /// `caller-attestation/v1`.
+    pub(super) fn caller_for_target(
+        &self,
+        caller: Option<&CallerCapture>,
+        capabilities: Option<&CapabilityDeclarations>,
+        target_module: &str,
+        principal: &Principal,
+        project: Option<&str>,
+    ) -> Option<CallerAttestation> {
+        let declared = capabilities.is_some_and(|caps| {
+            caps.provides
+                .iter()
+                .any(|cap| cap == CALLER_ATTESTATION_CAPABILITY)
+        });
+        let mut caller = caller.filter(|_| declared)?.attestation(target_module)?;
+        if target_module == super::policy_root::VAULT {
+            if let (Principal::Reserved { module_id }, Some(runtime)) =
+                (principal, &self.config_runtime)
+            {
+                if let Some(credentials) = runtime.settings_credentials(module_id, project) {
+                    caller = caller.with_settings_credentials(credentials);
+                }
+            }
+        }
+        Some(caller)
+    }
 }
 
 /// Whether a route admitted under `stamp` acts for someone other than the

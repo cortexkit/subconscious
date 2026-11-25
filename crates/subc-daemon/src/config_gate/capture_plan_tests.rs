@@ -265,6 +265,75 @@ impl CaptureRig {
     }
 }
 
+#[cfg(all(unix, feature = "test-support"))]
+pub(crate) struct RouteSettingsRig(CaptureRig);
+
+#[cfg(all(unix, feature = "test-support"))]
+impl RouteSettingsRig {
+    pub(crate) const MODULE: &str = "a";
+
+    pub(crate) fn new(projects: bool, amend: impl FnOnce(&mut serde_json::Value)) -> Self {
+        Self(CaptureRig::with_declaration(
+            projects,
+            RootIoPool::new().unwrap(),
+            false,
+            |declaration| amend(&mut declaration.schema),
+        ))
+    }
+
+    pub(crate) fn owner(&self) -> &Arc<RuntimeOwner> {
+        &self.0.owner
+    }
+
+    pub(crate) fn write_user(&self, value: serde_json::Value) {
+        std::fs::write(&self.0.rig.declaration.user_file, value.to_string()).unwrap();
+    }
+
+    pub(crate) fn stamp(&self) -> u64 {
+        let generation = self.0.rig.stamp(self.owner());
+        self.owner()
+            .lock()
+            .unwrap()
+            .store
+            .record_delivery(&tuple(None), generation, true)
+            .unwrap();
+        generation
+    }
+
+    pub(crate) fn write_project(&self, id: &str, value: serde_json::Value) -> PathBuf {
+        let project = root(&self.0.project_scratch, "route-project");
+        let path = root(&project, ".cortexkit").join("a.jsonc");
+        std::fs::write(path, value.to_string()).unwrap();
+        self.0
+            .set_projects(vec![member(id, Some("W"), &[&project])]);
+        project
+    }
+
+    pub(crate) async fn approve_projects(&self) -> u64 {
+        let plan = finish(self.owner(), self.0.prepare().await.unwrap());
+        self.0.apply(&plan).await.unwrap()
+    }
+
+    pub(crate) fn begin_user_approval(&self) -> u64 {
+        let owner = self.owner();
+        let plan = owner
+            .finish_plan(owner.prepare(PlanKind::Change).unwrap(), daemon_review)
+            .unwrap();
+        self.0.begin(&plan).unwrap()
+    }
+
+    pub(crate) fn finish_user_approval(owner: &RuntimeOwner, attempt: u64) -> u64 {
+        owner
+            .finish_approval(
+                attempt,
+                &Rig::facts(),
+                ApprovalReply::Presence(super::super::super::PresenceDecision::InteractiveApproval),
+                2,
+            )
+            .unwrap()
+    }
+}
+
 #[path = "project_edit_tests.rs"]
 mod project_edit_tests;
 #[path = "project_settings_tests.rs"]

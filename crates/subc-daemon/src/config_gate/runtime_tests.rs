@@ -5,7 +5,7 @@ use serde_json::json;
 use subc_protocol::config::ConfigGetRequest;
 
 #[path = "capture_plan_tests.rs"]
-mod capture_plan;
+pub(super) mod capture_plan;
 #[path = "daemon_readers_tests.rs"]
 mod daemon_readers;
 #[path = "declaration_fallback_tests.rs"]

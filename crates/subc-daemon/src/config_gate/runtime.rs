@@ -657,16 +657,26 @@ impl<'a> OwnerGuard<'a> {
         // Project committed or invalidated authority before releasing its owner.
         // Parse changed generations outside the cheap reader lock, then publish
         // only the Arc; list polling never waits for store or keychain work.
-        let previous = self
+        let (previous_daemon, previous_credentials) = self
             .owner
             .published
             .read()
-            .map(|view| view.approved_daemon.clone())
-            .unwrap_or(ApprovedDaemonView::Unavailable);
+            .map(|view| {
+                (
+                    view.approved_daemon.clone(),
+                    view.settings_credentials.clone(),
+                )
+            })
+            .unwrap_or((ApprovedDaemonView::Unavailable, None));
         let approved_daemon = ApprovedDaemonView::from_store(
             &self.state.store,
             self.state.recovery_exit_hold,
-            &previous,
+            &previous_daemon,
+        );
+        let settings_credentials = published::ApprovedSettingsCredentials::from_store(
+            &self.state.store,
+            self.state.recovery_exit_hold,
+            previous_credentials.as_ref(),
         );
         // Volatile holds follow the same lifetime as their durable records.
         // Approving another program identity retires the previous identity's
@@ -704,6 +714,7 @@ impl<'a> OwnerGuard<'a> {
                 approved_daemon,
                 projection,
                 settings: Some(settings),
+                settings_credentials,
             });
             if settings_changed {
                 self.owner
@@ -843,6 +854,8 @@ pub struct ApprovedRollbackProgram {
 #[cfg(test)]
 #[path = "runtime_tests.rs"]
 mod tests;
+#[cfg(all(test, unix, feature = "test-support"))]
+pub(crate) use tests::capture_plan::RouteSettingsRig;
 
 #[cfg(test)]
 #[path = "commit_pause.rs"]
@@ -978,6 +991,8 @@ impl RuntimeOwner {
         let admission = admission::AdmissionCache::from_store(&store);
         let approved_daemon =
             ApprovedDaemonView::from_store(&store, false, &ApprovedDaemonView::Unavailable);
+        let settings_credentials =
+            published::ApprovedSettingsCredentials::from_store(&store, false, None);
         let reconciled_entries = match &approved_daemon {
             ApprovedDaemonView::Approved { config, .. } => config
                 .modules
@@ -991,6 +1006,7 @@ impl RuntimeOwner {
             approved_daemon,
             projection: polled::Projection::default(),
             settings: None,
+            settings_credentials,
         }));
         let delivery_changed = std::sync::Arc::new(tokio::sync::Notify::new());
         let owner = Self {

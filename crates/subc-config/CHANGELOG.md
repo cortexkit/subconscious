@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.12
+
+- Expose the vault references named by credential fields in an approved effective settings value.
+
 ## 0.1.11
 
 - Name the schema rule a refused value broke in the new `Refusal::rule` field

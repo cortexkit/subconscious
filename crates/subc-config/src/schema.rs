@@ -260,6 +260,21 @@ impl Schema {
         })?;
         Ok(ReviewedTuple::new(effective, sources))
     }
+    /// Finds the vault reference IDs named by credential fields in an approved
+    /// effective value. The same ID can appear more than once.
+    pub fn credential_refs<'a>(&self, value: &'a Value) -> Vec<&'a str> {
+        let mut refs = Vec::new();
+        if !schema_contains_credential(&self.normalized) {
+            return refs;
+        }
+        visit_credentials(&self.normalized, value, &mut |value| {
+            if let Some(reference) = vault_reference(value) {
+                refs.push(reference);
+            }
+        });
+        refs
+    }
+
     /// The only schema-aware value projection intended for durable views and
     /// refusal records. Call before recording even invalid credential literals.
     pub fn record(&self, value: &Value) -> Result<Value, crate::CanonicalError> {
@@ -285,12 +300,16 @@ fn is_opaque(s: &Value) -> bool {
 
 /// References contain opaque ids, not secret material, paths or env expansions.
 pub fn is_vault_reference(value: &Value) -> bool {
+    vault_reference(value).is_some()
+}
+
+fn vault_reference(value: &Value) -> Option<&str> {
     value
         .as_object()
         .filter(|o| o.len() == 1)
         .and_then(|o| o.get("vault_ref"))
         .and_then(Value::as_str)
-        .is_some_and(|s| {
+        .filter(|s| {
             !s.is_empty() && s.len() <= 256 && s.bytes().all(|b| (0x21..=0x7e).contains(&b))
         })
 }
@@ -1310,23 +1329,29 @@ fn mark_empty_sources(
 }
 
 fn collect_credentials(s: &Value, value: &Value, out: &mut BTreeSet<Digest>) {
+    visit_credentials(s, value, &mut |credential| {
+        if let Ok(d) = digest(PURPOSE_VALUE, credential) {
+            out.insert(d);
+        }
+    });
+}
+
+fn visit_credentials<'a>(s: &Value, value: &'a Value, visit: &mut impl FnMut(&'a Value)) {
     if is_opaque(s) {
         return;
     }
     let s = variant(s, value).unwrap_or(s);
     if credential(s) {
-        if let Ok(d) = digest(PURPOSE_VALUE, value) {
-            out.insert(d);
-        }
+        visit(value);
     } else if let Some(o) = value.as_object() {
         for (key, v) in o {
             if let Some(child) = child_schema(s, key) {
-                collect_credentials(child, v, out);
+                visit_credentials(child, v, visit);
             }
         }
     } else if let Some(a) = value.as_array() {
         for v in a {
-            collect_credentials(&s["items"], v, out);
+            visit_credentials(&s["items"], v, visit);
         }
     }
 }
@@ -2034,6 +2059,44 @@ mod tests {
                 .effective,
             json!({"map":{"key_a":1},"choice":{"kind":"a","number":2}})
         );
+    }
+
+    #[test]
+    fn credential_refs_follow_maps_arrays_and_selected_variants_but_not_opaque_json() {
+        let mut credential = credential_field();
+        credential["x-ck-required"] = json!(false);
+        let mut array = field("array", json!([]));
+        array["items"] = object(json!({"key":credential}));
+        let mut plain = field("string", json!("plain"));
+        plain["const"] = json!("plain");
+        let mut vault = field("string", json!("vault"));
+        vault["const"] = json!("vault");
+        let mut plain = object(json!({"kind":plain}));
+        plain["required"] = json!(["kind"]);
+        let mut vault = object(json!({"kind":vault,"key":credential}));
+        vault["required"] = json!(["kind"]);
+        let s = schema(json!({
+            "map":{"type":"object","unevaluatedProperties":false,"patternProperties":{"^group-":array}},
+            "choice":{"oneOf":[plain,vault],"default":{"kind":"plain"}},
+            "opaque":{"type":"object","default":{"vault_ref":"not-a-credential"},
+                "description":"Opaque data", "x-ck-kind":"json", "x-ck-apply":"live",
+                "x-ck-layers":["user"]}
+        }));
+        let reviewed = s
+            .review_tuple(
+                &[LayerValue::new(
+                    Layer::User,
+                    json!({
+                        "map":{"group-one":[{"key":{"vault_ref":"array-key"}}, {}]},
+                        "choice":{"kind":"vault","key":{"vault_ref":"variant-key"}}
+                    }),
+                )],
+                &context(),
+            )
+            .unwrap();
+        let mut refs = s.credential_refs(&reviewed.effective);
+        refs.sort_unstable();
+        assert_eq!(refs, ["array-key", "variant-key"]);
     }
 
     #[test]

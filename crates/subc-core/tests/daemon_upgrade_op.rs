@@ -330,7 +330,13 @@ async fn cold_boot_publishes_discovery_while_identity_hash_is_held() {
     })
     .await
     .expect("discovery must be published while hashing is paused");
-    let (kind, describe) = daemon.call(json!({"op": "server.describe"})).await.unwrap();
+    let (kind, describe) = timeout(
+        Duration::from_secs(1),
+        daemon.call(json!({"op": "server.describe"})),
+    )
+    .await
+    .expect("describe must answer without waiting for the held boot hash")
+    .unwrap();
     assert_eq!(kind, FrameType::Response);
     assert!(describe["counters"].get("daemon_identity").is_none());
 
@@ -348,6 +354,7 @@ async fn cold_boot_publishes_discovery_while_identity_hash_is_held() {
                 assert_eq!(id["executable_sha256"], expected);
                 break;
             }
+            sleep(Duration::from_millis(20)).await;
         }
     })
     .await
@@ -386,7 +393,7 @@ fn daemon_logs(root: &ShortRoot) -> String {
 }
 
 #[cfg(target_os = "linux")]
-fn assert_owned_files_in_scratch(daemon: &Daemon) {
+fn assert_owned_files_in_scratch(daemon: &Daemon, module_image: Option<&Path>) {
     let pid = daemon.process.id().unwrap();
     let mut paths = Vec::new();
     for entry in fs::read_dir(format!("/proc/{pid}/fd")).unwrap().flatten() {
@@ -394,11 +401,11 @@ fn assert_owned_files_in_scratch(daemon: &Daemon) {
             paths.push(target);
         }
     }
-    assert_scratch_paths(daemon, &paths);
+    assert_scratch_paths(daemon, &paths, module_image);
 }
 
 #[cfg(target_os = "macos")]
-fn assert_owned_files_in_scratch(daemon: &Daemon) {
+fn assert_owned_files_in_scratch(daemon: &Daemon, module_image: Option<&Path>) {
     let pid = daemon.process.id().unwrap().to_string();
     let output = std::process::Command::new("/usr/sbin/lsof")
         .args(["-nP", "-p", &pid, "-Fnf"])
@@ -416,16 +423,21 @@ fn assert_owned_files_in_scratch(daemon: &Daemon) {
             }
         }
     }
-    assert_scratch_paths(daemon, &paths);
+    assert_scratch_paths(daemon, &paths, module_image);
 }
 
-fn assert_scratch_paths(daemon: &Daemon, paths: &[PathBuf]) {
+fn assert_scratch_paths(daemon: &Daemon, paths: &[PathBuf], module_image: Option<&Path>) {
     let root = fs::canonicalize(daemon.root.path()).unwrap();
+    // The supervisor can still have the configured executable open to compare
+    // it with the running image after the module announces registration.
+    let module_image = module_image.map(|path| fs::canonicalize(path).unwrap());
     for target in paths {
         if target.is_absolute() && target != Path::new("/dev/null") {
             let canonical = fs::canonicalize(target).unwrap_or_else(|_| target.clone());
             assert!(
-                canonical.starts_with(&root) || target.starts_with(daemon.root.path()),
+                canonical.starts_with(&root)
+                    || target.starts_with(daemon.root.path())
+                    || module_image.as_ref() == Some(&canonical),
                 "daemon fd outside scratch root: {target:?}"
             );
         }
@@ -693,7 +705,10 @@ async fn real_resume_republishes_and_keeps_the_registered_child_reachable() {
         .unwrap();
     assert_eq!(reply, b"after the exec");
     assert!(daemon_logs(&daemon.root).contains("resume_accept_ms"));
-    assert_owned_files_in_scratch(&daemon);
+    assert_owned_files_in_scratch(
+        &daemon,
+        Some(Path::new(env!("CARGO_BIN_EXE_channel-module-rs"))),
+    );
 }
 
 #[tokio::test]
@@ -731,7 +746,10 @@ async fn invalid_target_image_cold_boots_without_adopting_the_child() {
         rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive),
         Err(rustix::io::Errno::WOULDBLOCK),
     );
-    assert_owned_files_in_scratch(&daemon);
+    assert_owned_files_in_scratch(
+        &daemon,
+        Some(Path::new(env!("CARGO_BIN_EXE_channel-module-rs"))),
+    );
 }
 
 #[tokio::test]
@@ -748,7 +766,7 @@ async fn cold_cleanup_requires_the_run_directory_lock() {
     assert!(String::from_utf8_lossy(&result.stderr).contains("run directory lock"));
     assert_eq!(fs::read(owner.handover()).unwrap(), b"leftover handover");
     assert!(!contender_connection.exists());
-    assert_owned_files_in_scratch(&owner);
+    assert_owned_files_in_scratch(&owner, None);
 
     let pid =
         rustix::process::Pid::from_raw(owner.process.id().unwrap().try_into().unwrap()).unwrap();

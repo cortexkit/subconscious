@@ -1849,13 +1849,9 @@ impl ControlHandler {
             ClientControlRequest::DaemonShutdownIntent { intent } => {
                 self.daemon_restart_intent(frame, intent).await
             }
-            ClientControlRequest::ServerDescribe {} => {
-                #[cfg(any(target_os = "macos", target_os = "linux"))]
-                if let Some(upgrade) = &self.upgrade {
-                    upgrade.wait_for_identity().await;
-                }
-                self.handle_server_describe(frame)
-            }
+            // Clients probe capabilities here before opening routes. A cold
+            // boot hash is optional metadata, not a prerequisite to serving.
+            ClientControlRequest::ServerDescribe {} => self.handle_server_describe(frame),
             ClientControlRequest::PolicyRoot(_)
             | ClientControlRequest::PolicyRootSet(_)
             | ClientControlRequest::PolicyRootRecover(_) => {

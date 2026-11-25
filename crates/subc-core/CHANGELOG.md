@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.21.55
+
+- Briefly retry `ck daemon upgrade --in-place`'s initial identity lookup while
+  a cold-booted daemon hashes its executable. Require subc-daemon 0.50.65.
+
 ## 0.21.54
 
 - Require subc-daemon 0.50.64, subc-control 0.42.10 and subc-client-rs 0.41.16

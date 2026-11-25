@@ -45,6 +45,7 @@ pub(super) fn parse_daemon(tail: &[OsString]) -> Result<Command, CkError> {
     }
 }
 
+const BOOT_IDENTITY_WAIT: Duration = Duration::from_secs(2);
 const REPLY_WAIT: Duration = Duration::from_secs(120);
 const POLL_WAIT: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -206,16 +207,31 @@ fn unix_ms() -> u64 {
 }
 
 pub(super) async fn run(mut client: CkClient, json: JsonOutput) -> Result<(), CkError> {
-    let described = client
-        .rpc_value(ClientControlRequest::ServerDescribe {})
-        .await?;
-    let counters = &described["counters"];
-    let Some(identity) = read::<Identity>(&counters["daemon_identity"]) else {
-        return Report::new(client.info.pid, None)
-            .refuse(upgrade_in_place::UPGRADE_IN_PLACE_UNSUPPORTED)
-            .print(json);
+    let initial = time::timeout(BOOT_IDENTITY_WAIT, async {
+        loop {
+            let described = client
+                .rpc_value(ClientControlRequest::ServerDescribe {})
+                .await?;
+            let counters = &described["counters"];
+            if let Some(identity) = read::<Identity>(&counters["daemon_identity"]) {
+                let prior = counters["last_upgrade"]["attempt_id"]
+                    .as_str()
+                    .map(str::to_owned);
+                break Ok::<_, CkError>((identity, prior));
+            }
+            time::sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await;
+    let (identity, prior) = match initial {
+        Ok(described) => described?,
+        Err(_) => {
+            return Report::new(client.info.pid, None)
+                .refuse("daemon_identity_unavailable")
+                .print(json);
+        }
     };
-    let prior = counters["last_upgrade"]["attempt_id"].as_str();
+    let prior = prior.as_deref();
     let mut report = Report::new(identity.pid, Some(identity.build));
     let Ok(executable_sha256) = checksum(&identity.executable) else {
         return report

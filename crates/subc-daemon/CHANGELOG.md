@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.50.65
+
+- Answer `server.describe` without waiting for the boot executable hash, so
+  client route opens are not blocked by upgrade identity discovery.
+
 ## 0.50.64
 
 - Report the store's stamp state at plan creation on settings plan views,

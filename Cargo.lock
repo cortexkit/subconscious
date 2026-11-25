@@ -3213,7 +3213,7 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.21.54"
+version = "0.21.55"
 dependencies = [
  "async-trait",
  "base64",
@@ -3251,7 +3251,7 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.50.64"
+version = "0.50.65"
 dependencies = [
  "base64",
  "cortexkit-log",

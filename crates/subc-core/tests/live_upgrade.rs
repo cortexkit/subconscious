@@ -583,7 +583,9 @@ async fn live_upgrade_carries_a_handler_and_restarts_both_kinds_of_module_twice(
 
 mod cli {
     use super::*;
-    use common::scripted_daemon::{ScriptedControlAction, ScriptedControlStep, ScriptedDaemon};
+    use common::scripted_daemon::{
+        ScriptedControlAction, ScriptedControlStep, ScriptedDaemon, ScriptedDescribeDaemon,
+    };
     use sha2::{Digest, Sha256};
     use subc_protocol::ErrorBody;
 
@@ -618,32 +620,40 @@ mod cli {
         }
 
         async fn output(&self, daemon: &mut ScriptedDaemon, code: i32) -> Value {
+            let result = self.output_at(&daemon.connection_file_path, code).await;
+            daemon.assert_complete().await;
+            result
+        }
+
+        async fn output_at(&self, connection: &Path, code: i32) -> Value {
             let ck = common::ckdev_ck();
             let output = timeout(
                 WAIT,
                 isolated(ck, self.root.path())
                     .arg("--subc")
-                    .arg(&daemon.connection_file_path)
+                    .arg(connection)
                     .args(["daemon", "upgrade", "--in-place", "--json"])
                     .output(),
             )
             .await
             .unwrap()
             .unwrap();
-            let result = report(output, code);
-            daemon.assert_complete().await;
-            result
+            report(output, code)
         }
     }
 
     fn describe(counters: Value) -> ScriptedControlStep {
         response(
             ClientControlRequest::ServerDescribe {},
-            json!({
-                "op":"server.describe", "protocol_ver":subc_protocol::PROTOCOL_VERSION, "subc_ops":[],
-                "capabilities":[], "connected_clients":1, "counters":counters,
-            }),
+            describe_body(counters),
         )
+    }
+
+    fn describe_body(counters: Value) -> Value {
+        json!({
+            "op":"server.describe", "protocol_ver":subc_protocol::PROTOCOL_VERSION, "subc_ops":[],
+            "capabilities":[], "connected_clients":1, "counters":counters,
+        })
     }
 
     fn response(expected: ClientControlRequest, body: Value) -> ScriptedControlStep {
@@ -656,13 +666,40 @@ mod cli {
     #[tokio::test]
     async fn live_upgrade_without_identity_refuses_before_sending_the_op() {
         let stub = Stub::new();
-        let mut daemon =
-            ScriptedDaemon::start("upgrade-no-identity", vec![describe(json!({}))]).await;
-        let result = stub.output(&mut daemon, 3).await;
+        let daemon = ScriptedDescribeDaemon::start(
+            "upgrade-no-identity",
+            common::TEST_DAEMON_VER,
+            describe_body(json!({})),
+        )
+        .await;
+        let result = stub.output_at(&daemon.connection_file_path, 3).await;
         assert_eq!(result["outcome"], "refused");
-        assert_eq!(result["reason"], "upgrade_in_place_unsupported");
+        assert_eq!(result["reason"], "daemon_identity_unavailable");
         assert_eq!(result["daemon_pid"], std::process::id());
         assert_eq!(result["build"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn live_upgrade_retries_the_initial_identity_lookup_before_sending_the_op() {
+        let stub = Stub::new();
+        let mut daemon = ScriptedDaemon::start(
+            "upgrade-identity-ready-on-retry",
+            vec![
+                describe(json!({})),
+                stub.describe(Value::Null),
+                ScriptedControlStep {
+                    expected: stub.ask.clone(),
+                    action: ScriptedControlAction::Error(ErrorBody::new(
+                        "operator_declined",
+                        "test operator declined the request",
+                    )),
+                },
+            ],
+        )
+        .await;
+        let result = stub.output(&mut daemon, 3).await;
+        assert_eq!(result["outcome"], "refused");
+        assert_eq!(result["reason"], "operator_declined");
     }
 
     #[tokio::test]

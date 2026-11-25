@@ -25,8 +25,9 @@ Usage: scripts/gate.sh {fast|lint|test|swift|ts|all} [check]
          Build subc-core helper binaries first, then one whole-workspace
          --all-targets --locked --no-fail-fast test invocation for every crate
          but the daemon, the daemon's own targets with its dev approval
-         surface, workspace doc tests, and CK alpha's setup, CLI and Unix inode selections with their
-         nonzero-test guards. Independent checks still run after a failure.
+         surface, published wire compatibility tests, workspace doc tests,
+         and CK alpha's setup, CLI and Unix inode selections with their nonzero-test
+         guards. Independent checks still run after a failure.
          Requires CI's nats-server v2.15.0 on PATH (not a stand-in).
   swift  macOS + Xcode only: swift package resolve and swift test, plus generic
          iOS and macOS 13.0 xcodebuild builds with signing disabled.
@@ -62,7 +63,7 @@ CI adapters (optional [check], for the existing job boundaries and conditions):
         citations, file-size, core-unsafe, unbound, vectors, vector <vectors/name/>, shellcheck,
         installer, shell-tests
   lint: workspace, release, alpha, windows, windows-release
-  test: workspace, workspace-without-daemon, daemon, docs, alpha-setup,
+  test: workspace, workspace-without-daemon, daemon, published-wire-compat, docs, alpha-setup,
         alpha-cli, alpha-inode
   swift: test, ios, macos
   ts: subc-client, store, log, private-files, typecheck <pkg>, unit <pkg>, live
@@ -289,6 +290,7 @@ test_check() {
         step 'Daemon unit tests (test-support, release features)' cargo test -p subc-daemon --lib --locked --no-fail-fast --features test-support
         step 'Workspace scratch fence wrapper' bash scripts/checks/test-scratch-fence.sh
       fi ;;
+    published-wire-compat) step 'Published wire decoder compatibility' cargo test --manifest-path crates/published-wire-compat/Cargo.toml --target-dir target/published-wire-compat --locked ;;
     docs) step 'Workspace doctests' cargo test --workspace --doc --locked ;;
     alpha-setup) step 'Alpha setup selection (nonzero tests)' alpha_logged 'test result: ok\. [1-9][0-9]* passed;' cargo test -p subc-core --lib --locked setup:: ;;
     alpha-cli) step 'Alpha CLI update-check contract' cargo test -p subc-core --test ck_cli --locked -v ;;
@@ -412,7 +414,7 @@ case "$STAGE" in
       if [ "$(uname -s)" != Linux ]; then echo 'The test stage runs on Linux only; use a Linux machine with many cores.' >&2; exit 2; fi
       scratch
       git status --porcelain | sort > "$SCRATCH/tree-before.txt"
-      collect workspace docs alpha-setup alpha-cli alpha-inode
+      collect workspace published-wire-compat docs alpha-setup alpha-cli alpha-inode
     fi ;;
   swift)
     CURRENT_STEP='macOS/Xcode prerequisite'

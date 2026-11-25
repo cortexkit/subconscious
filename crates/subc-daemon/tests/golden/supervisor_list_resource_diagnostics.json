@@ -1,0 +1,92 @@
+{
+  "agent_commands": [
+    {
+      "bound": "lower",
+      "cpu_last_hour": {
+        "bound": "lower",
+        "covered_ms": 0,
+        "cpu_ms": 0
+      },
+      "cpu_ms": 0,
+      "groups": [
+        {
+          "bound": "lower",
+          "count": 1,
+          "cpu_ms": 0,
+          "memory_bytes": 0,
+          "name": "ckdev-resource-helper"
+        }
+      ],
+      "measured_at_ms": 0,
+      "memory_bytes": 0,
+      "module_id": "resource-module",
+      "process_count": 1
+    }
+  ],
+  "daemon": {
+    "cpu_last_hour": {
+      "covered_ms": 0,
+      "cpu_ms": 0
+    },
+    "measured_at_ms": 0,
+    "pid": 0,
+    "resources": {
+      "cpu_system_ms": 0,
+      "cpu_user_ms": 0,
+      "memory_bytes": 0,
+      "memory_kind": "resident_set",
+      "status": "measured"
+    },
+    "start_time_ms": 0,
+    "version": "9.8.7-resource-test"
+  },
+  "generation": 1,
+  "modules": [
+    {
+      "cpu_last_hour": {
+        "bound": "lower",
+        "covered_ms": 0,
+        "cpu_ms": 0
+      },
+      "drain_timeout_ms": 30000,
+      "enabled": true,
+      "health": "unknown",
+      "last_probe_ms": null,
+      "launch_nonce_env": false,
+      "lifetime_restarts": 0,
+      "live": true,
+      "max_restarts": 3,
+      "module_id": "resource-module",
+      "protocol": "subc",
+      "resources": {
+        "cpu_system_ms": 0,
+        "cpu_user_ms": 0,
+        "memory_bytes": 0,
+        "memory_kind": "resident_set",
+        "status": "measured"
+      },
+      "restart_backoff_ms": 100,
+      "restart_count": 0,
+      "restart_max_backoff_ms": 30000,
+      "restart_window_secs": 600,
+      "spawn_generation": 1,
+      "state": "running",
+      "tree": {
+        "bound": "lower",
+        "cpu_ms": 0,
+        "groups": [],
+        "measured_at_ms": 0,
+        "memory_bytes": 0,
+        "memory_kind": "resident_set",
+        "own": {
+          "bound": "lower",
+          "cpu_ms": 0,
+          "memory_bytes": 0
+        },
+        "process_count": 1,
+        "source": "process_tree"
+      }
+    }
+  ],
+  "op": "supervisor.list"
+}

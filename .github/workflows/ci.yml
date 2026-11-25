@@ -305,6 +305,10 @@ jobs:
         timeout-minutes: 90
         run: bash scripts/gate.sh test ${{ matrix.os == 'windows' && 'workspace-without-daemon' || 'workspace' }}
 
+      - name: Published wire decoder compatibility
+        if: ${{ !cancelled() }}
+        run: bash scripts/gate.sh test published-wire-compat
+
       # Root can create cgroup v2 directories under /sys/fs/cgroup; require these tests so they cannot skip in CI.
       - name: Kernel cgroup tests
         if: ${{ !cancelled() && matrix.os == 'ubuntu' }}

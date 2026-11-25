@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.15
+
+- Require subc-daemon 0.51.0.
+
 ## 0.2.14
 
 - Give every gateway setting a short title, so Settings shows labels instead of raw keys.

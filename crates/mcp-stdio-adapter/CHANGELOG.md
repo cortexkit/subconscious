@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.8.9
+
+- Require subc-daemon 0.51.0.
+
 ## 0.8.8
 
 - Give every server setting a short title, so Settings shows labels instead of raw keys.

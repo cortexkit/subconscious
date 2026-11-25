@@ -1,7 +1,11 @@
 [workspace]
 resolver = "2"
-# Embeds CPython and needs an extracted CPython archive to build; it is its own workspace.
-exclude = ["clients/script-runner-python"]
+exclude = [
+    # Embeds CPython and needs an extracted CPython archive to build.
+    "clients/script-runner-python",
+    # Keep exact registry decoder pins out of the lockfile used for publishing.
+    "crates/published-wire-compat",
+]
 members = [
     "clients/subc-registration-native",
     "crates/subc-protocol",

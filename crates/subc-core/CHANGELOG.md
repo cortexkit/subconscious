@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.21.57
+
+- Require subc-daemon 0.51.0.
+
 ## 0.21.56
 
 - Require subc-daemon 0.50.66 for synchronized in-place upgrade tests.

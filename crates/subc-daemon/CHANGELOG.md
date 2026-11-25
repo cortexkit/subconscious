@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.51.0
+
+- Minor release: the public enums `PrivilegedOperation`, `SuperviseError`, `ForwardingError`
+  and `RouterError` gained variants and `BootstrapConfig` is no longer unwind-safe (in-place upgrade,
+  first published here), which a patch must not change.
+
+- Check published control decoder compatibility outside the workspace, using
+  a golden response verified by the daemon's live supervisor list test.
+- Require subc-protocol 0.37.10.
+
 ## 0.50.66
 
 - Synchronize the upgrade test fixture with the receipt stall and final executable

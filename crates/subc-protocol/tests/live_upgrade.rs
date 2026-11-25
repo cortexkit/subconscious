@@ -9,6 +9,8 @@ use subc_protocol::{
 };
 
 const TEST_TOKEN: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+const BASELINE_HELLO: &str = include_str!("golden/module_hello_body_live_upgrade_baseline.json");
+const BASELINE_ACK: &str = include_str!("golden/module_hello_ack_body_live_upgrade_baseline.json");
 const CAPABILITIES: &str = include_str!("golden/module_hello_body_with_module_capabilities.json");
 const RESUME_HELLO: &str = include_str!("golden/module_hello_body_with_resume_token.json");
 const RESUME_ACK: &str = include_str!("golden/module_hello_ack_body_with_resume_token.json");
@@ -36,10 +38,15 @@ fn ack() -> ModuleHelloAckBody {
     }
 }
 
+#[track_caller]
 fn assert_wire<T: Debug + PartialEq + Serialize + DeserializeOwned>(body: T, golden: &str) {
-    let wire = golden.trim_end().as_bytes();
-    assert_eq!(serde_json::to_vec(&body).unwrap(), wire);
-    assert_eq!(serde_json::from_slice::<T>(wire).unwrap(), body);
+    let wire = golden.strip_suffix('\n').unwrap_or(golden);
+    assert_eq!(
+        serde_json::to_string(&body).unwrap(),
+        wire,
+        "wire encoding changed; regenerate the golden file in tests/golden/ if intentional"
+    );
+    assert_eq!(serde_json::from_str::<T>(wire).unwrap(), body);
 }
 
 #[test]
@@ -78,35 +85,17 @@ fn live_upgrade_hello_matches_golden_bytes() {
 }
 
 #[test]
-fn live_upgrade_hello_and_ack_keep_their_old_bytes_and_readers() {
-    use subc_protocol_published::{ModuleHelloAckBody as OldAck, ModuleHelloBody as OldHello};
-
-    let baseline_hello: OldHello = serde_json::from_str(CAPABILITIES).unwrap();
-    assert_eq!(baseline_hello.manifest.module_id, "upgrade-worker");
-    let hello_bytes = serde_json::to_vec(&baseline_hello).unwrap();
-    let baseline_resume_hello: OldHello = serde_json::from_str(RESUME_HELLO).unwrap();
-    assert_eq!(
-        serde_json::to_vec(&baseline_resume_hello).unwrap(),
-        hello_bytes
-    );
-    assert_eq!(serde_json::to_vec(&hello()).unwrap(), hello_bytes);
-    assert_eq!(
-        serde_json::from_slice::<ModuleHelloBody>(&hello_bytes).unwrap(),
-        hello()
-    );
+fn live_upgrade_hello_and_ack_keep_their_baseline_bytes() {
+    assert_wire(hello(), BASELINE_HELLO);
+    assert_wire(ack(), BASELINE_ACK);
     let empty = ModuleHelloBody {
         module_capabilities: Some(vec![]),
         ..hello()
     };
-    assert_eq!(serde_json::to_vec(&empty).unwrap(), hello_bytes);
-
-    let baseline_ack: OldAck = serde_json::from_str(RESUME_ACK).unwrap();
-    assert_eq!(baseline_ack.negotiated_ver, PROTOCOL_VERSION);
-    let ack_bytes = serde_json::to_vec(&baseline_ack).unwrap();
-    assert_eq!(serde_json::to_vec(&ack()).unwrap(), ack_bytes);
     assert_eq!(
-        serde_json::from_slice::<ModuleHelloAckBody>(&ack_bytes).unwrap(),
-        ack()
+        serde_json::to_string(&empty).unwrap(),
+        BASELINE_HELLO.strip_suffix('\n').unwrap_or(BASELINE_HELLO),
+        "empty capabilities must have the same wire bytes as omitted capabilities"
     );
 }
 

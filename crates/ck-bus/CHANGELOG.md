@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.13.3
+
+- Require subc-daemon 0.51.0.
+
 ## 0.13.2
 
 - Declare that Message bus has no settings in the desktop Settings list.

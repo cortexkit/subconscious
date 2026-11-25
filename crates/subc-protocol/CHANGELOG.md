@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.37.10
+
+- Run the pinned published-decoder compatibility test outside the workspace so
+  the older decoder cannot override registry dependency selection at packaging.
+
 ## 0.37.9
 
 - Define `module.upgrading`, `live-upgrade/v1`, the optional HELLO and HELLO_ACK

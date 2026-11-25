@@ -327,7 +327,7 @@ impl ControlHandler {
         let publication = self
             .config_runtime
             .as_ref()
-            .and_then(|owner| owner.polled_snapshot().ok());
+            .and_then(|owner| owner.observed_snapshot().ok());
         let approved = publication
             .as_ref()
             .map(|view| view.approved_daemon.clone())
@@ -919,7 +919,7 @@ impl ControlHandler {
         let publication = self
             .config_runtime
             .as_ref()
-            .and_then(|owner| owner.polled_snapshot().ok());
+            .and_then(|owner| owner.observed_snapshot().ok());
         let generation = self
             .registry
             .generation()

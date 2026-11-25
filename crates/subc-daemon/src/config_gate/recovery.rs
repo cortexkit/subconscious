@@ -78,17 +78,37 @@ impl RuntimeOwner {
             .unwrap_or(true)
     }
 
-    /// Called off the async runtime before control dispatch; no snapshot or
-    /// proposal is needed to discover that the store has changed. The store is
-    /// checked on every call; the views are republished only if it changed.
+    pub(crate) fn refuses_control_in_recovery(&self) -> bool {
+        self.polled_snapshot()
+            .map(|snapshot| snapshot.refuses_control_in_recovery)
+            .unwrap_or(true)
+    }
+
+    /// Verify the store off the request path. A changed store is published
+    /// along with the other configuration views before the owner is released.
     pub(crate) fn check_recovery(&self) -> Result<bool> {
         let mut state = self.lock()?;
         let _ = state.store_read(ConfigStore::check);
-        Ok(state.recovery_exit_hold
-            || matches!(
-                state.store.loaded_admission_state().0,
-                StoreState::StoreMissing | StoreState::StoreUnverified
-            ))
+        Ok(Published::control_recovery(
+            &state.store,
+            state.recovery_exit_hold,
+        ))
+    }
+
+    pub(crate) fn poll_store_integrity(&self) -> Result<()> {
+        crate::forwarding::assert_forwarding_unlocked("the configuration owner's state");
+        let mut state = self.inner.lock().map_err(|_| {
+            GateError::new("config_unavailable", "configuration owner lock is poisoned")
+        })?;
+        let before = store_witness(&state.store);
+        state.store.poll_integrity();
+        if store_witness(&state.store) != before {
+            // An unchanged fingerprint needs no owner maintenance. An observed
+            // transition must publish before this same mutex guard is released.
+            let mut guard = OwnerGuard::new(state, self);
+            guard.changed = true;
+        }
+        Ok(())
     }
 
     pub(crate) fn authority_exit_configuration(

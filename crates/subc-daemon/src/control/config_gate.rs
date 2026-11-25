@@ -442,7 +442,9 @@ impl ControlHandler {
                     })
                     .await;
                 }
-                Ok(vec![config_error_frame(&frame, error)?])
+                Ok(vec![
+                    self.config_request_error_frame(&frame, op, true, error)?
+                ])
             }
         }
     }
@@ -618,6 +620,7 @@ impl ControlHandler {
         &self,
         ctx: &RouteCtx,
         frame: Frame,
+        op: &str,
     ) -> Result<Vec<Frame>, RouterError> {
         let request = match serde_json::from_slice::<ConfigControlRequest>(&frame.body) {
             Ok(request) => request,
@@ -659,7 +662,9 @@ impl ControlHandler {
                 &response,
                 "ConfigControlResponse",
             )?]),
-            Err(error) => Ok(vec![config_error_frame(&frame, error)?]),
+            Err(error) => Ok(vec![
+                self.config_request_error_frame(&frame, op, false, error)?
+            ]),
         }
     }
 
@@ -756,7 +761,7 @@ impl ControlHandler {
                 Ok(ConfigControlResponse::ProgramPlaced { generation })
             }
             ConfigControlRequest::Status {} => {
-                let snapshot = runtime.polled_snapshot()?;
+                let snapshot = runtime.observed_snapshot()?;
                 let mut status = runtime.polled_status_from(snapshot.clone()).await?;
                 let phone = self
                     .config_phone_surface_checked(false, Some(&snapshot))

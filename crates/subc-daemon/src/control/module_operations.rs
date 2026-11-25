@@ -235,7 +235,7 @@ impl ControlHandler {
             let recovering = self
                 .config_runtime
                 .as_ref()
-                .is_some_and(|owner| owner.check_recovery().unwrap_or(true));
+                .is_some_and(|owner| owner.refuses_control_in_recovery());
             // Defence in depth: RuntimeOwner::module_is_gated in
             // config_gate/admission.rs already gates every id during recovery.
             // A registration channel still never uses the nonce fallback.

@@ -734,8 +734,7 @@ impl ControlHandler {
             }
         }
         if self
-            .recovery_request_refusal(ctx, frame, Some("claim.mint"))
-            .await?
+            .recovery_request_refusal(ctx, frame, Some("claim.mint"))?
             .is_some()
         {
             return self.claim_refusal(frame, "config_gated");
@@ -980,7 +979,6 @@ impl ControlHandler {
         }
         if self
             .recovery_request_refusal(ctx, frame, Some("claim.present"))
-            .await
             .map_err(|_| "config_gated")?
             .is_some()
         {

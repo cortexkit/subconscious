@@ -2,7 +2,7 @@ use super::*;
 use crate::config_store::TestStoreKey;
 use subc_os::config_keychain::KeychainError;
 
-fn owner(rig: &Rig, key: &TestStoreKey) -> RuntimeOwner {
+pub(super) fn owner(rig: &Rig, key: &TestStoreKey) -> RuntimeOwner {
     RuntimeOwner::new(
         "key-access".into(),
         ConfigStore::open_sealed_for_tests(

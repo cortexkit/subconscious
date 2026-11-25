@@ -127,7 +127,14 @@ impl ControlHandler {
             .await
         {
             Ok(initial) => initial,
-            Err(error) => return Ok(vec![config_error_frame(&frame, error)?]),
+            Err(error) => {
+                return Ok(vec![self.config_request_error_frame(
+                    &frame,
+                    "config.watch",
+                    false,
+                    error,
+                )?]);
+            }
         };
         let mut file_grace = SettingsFileGrace::default();
         let mut latest = initial.0.clone();
@@ -144,7 +151,14 @@ impl ControlHandler {
                 .await
             {
                 Ok(rows) => rows,
-                Err(error) => return Ok(vec![config_error_frame(&frame, error)?]),
+                Err(error) => {
+                    return Ok(vec![self.config_request_error_frame(
+                        &frame,
+                        "config.watch",
+                        false,
+                        error,
+                    )?]);
+                }
             };
             latest = initial.0.clone();
             file_grace.settle(&[], &mut initial.0, tokio::time::Instant::now());
@@ -262,7 +276,9 @@ impl ControlHandler {
                         continue;
                     }
                     Err(error) => {
-                        if let Ok(error) = config_error_frame(&frame, error) {
+                        if let Ok(error) =
+                            handler.config_request_error_frame(&frame, "config.watch", false, error)
+                        {
                             let _ = sink.send(error).await;
                         }
                         return;

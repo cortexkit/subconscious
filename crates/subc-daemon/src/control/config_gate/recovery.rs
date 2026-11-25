@@ -1,5 +1,28 @@
 use super::*;
 
+fn recovery_allows_request(op: Option<&str>, running_module: bool) -> bool {
+    matches!(
+        op,
+        Some(
+            "server.describe"
+                | "supervisor.list"
+                | "daemon.shutdown_intent"
+                | "config.status"
+                | "config.unstamp"
+                | "config.stamp"
+                | "config.apply"
+                | "app.open"
+                | "activity.query"
+                | "activity.subscribe"
+                | "connection.describe"
+        )
+    ) || (running_module && matches!(op, Some("activity.record" | "config.get")))
+}
+
+fn recovery_refusal_frame(frame: &Frame) -> Result<Frame, RouterError> {
+    control_error_frame(frame, "config_gated", "configuration store is in recovery")
+}
+
 impl ControlHandler {
     #[cfg(all(test, feature = "test-support", unix))]
     pub(crate) fn with_recovery_exit_completed_hook_for_test(mut self, hook: fn(u64)) -> Self {
@@ -57,7 +80,7 @@ impl ControlHandler {
         self.recovery_exit_test_quiet_retry = quiet_retry;
         self
     }
-    pub(in crate::control) async fn recovery_request_refusal(
+    pub(in crate::control) fn recovery_request_refusal(
         &self,
         ctx: &RouteCtx,
         frame: &Frame,
@@ -68,16 +91,13 @@ impl ControlHandler {
         if matches!(op, Some("supervisor.list" | "config.status")) {
             return Ok(None);
         }
-        let Some(owner) = self.config_runtime.clone() else {
+        let Some(owner) = self.config_runtime.as_ref() else {
             return Ok(None);
         };
         let recovering = if op == Some("catalog.list") {
             owner.is_recovering()
         } else {
-            owner
-                .on_blocking(|owner| owner.check_recovery())
-                .await
-                .unwrap_or(true)
+            owner.refuses_control_in_recovery()
         };
         if !recovering {
             return Ok(None);
@@ -87,26 +107,37 @@ impl ControlHandler {
             .get_module_by_connection(ctx.connection_id)
             .map_err(|error| RouterError::backend(0, frame.header.corr, error.to_string()))?
             .is_some();
-        let allowed = matches!(
-            op,
-            Some(
-                "server.describe"
-                    | "supervisor.list"
-                    | "daemon.shutdown_intent"
-                    | "config.status"
-                    | "config.unstamp"
-                    | "config.stamp"
-                    | "config.apply"
-                    | "app.open"
-                    | "activity.query"
-                    | "activity.subscribe"
-                    | "connection.describe"
-            )
-        ) || (running_module && matches!(op, Some("activity.record" | "config.get")));
-        if allowed {
+        if recovery_allows_request(op, running_module) {
             return Ok(None);
         }
-        control_error_frame(frame, "config_gated", "configuration store is in recovery").map(Some)
+        recovery_refusal_frame(frame).map(Some)
+    }
+
+    pub(super) fn config_request_error_frame(
+        &self,
+        frame: &Frame,
+        op: &str,
+        running_module: bool,
+        error: GateError,
+    ) -> Result<Frame, RouterError> {
+        if !recovery_allows_request(Some(op), running_module) {
+            let store_unusable = match error.code.as_str() {
+                "store_tampered" | "store_missing" => true,
+                // A write can fail to obtain a key and return store_unverified
+                // without invalidating authority. Only translate this error if
+                // the owner actually published recovery before releasing the lock.
+                "store_unverified" => self
+                    .config_runtime
+                    .as_ref()
+                    .is_some_and(|owner| owner.refuses_control_in_recovery()),
+                _ => false,
+            };
+            if store_unusable {
+                warn!(op, %error, "configuration request found the store in recovery");
+                return recovery_refusal_frame(frame);
+            }
+        }
+        config_error_frame(frame, error)
     }
 
     pub(in crate::control) async fn reconcile_authority_exit(

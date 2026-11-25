@@ -712,6 +712,10 @@ impl<'a> OwnerGuard<'a> {
             *cache = std::sync::Arc::new(Published {
                 admission: next,
                 approved_daemon,
+                refuses_control_in_recovery: Published::control_recovery(
+                    &self.state.store,
+                    self.state.recovery_exit_hold,
+                ),
                 projection,
                 settings: Some(settings),
                 settings_credentials,
@@ -1004,6 +1008,7 @@ impl RuntimeOwner {
         let published = std::sync::RwLock::new(std::sync::Arc::new(Published {
             admission,
             approved_daemon,
+            refuses_control_in_recovery: Published::control_recovery(&store, false),
             projection: polled::Projection::default(),
             settings: None,
             settings_credentials,

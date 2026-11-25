@@ -16,6 +16,10 @@ pub struct TestSupport {
     deny_key: bool,
 }
 impl TestSupport {
+    pub(super) fn key_file(&self) -> Option<&Path> {
+        self.key_file.as_deref()
+    }
+
     pub fn new(root: PathBuf, key_file: Option<PathBuf>) -> io::Result<Self> {
         authorize(&std::env::current_exe()?)?;
         StoreRoot::from_service_definition(root.clone())?;

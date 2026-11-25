@@ -3341,7 +3341,7 @@ async fn config_recovery_dead_child_retires_channel_without_legacy_fallback() {
 }
 
 #[tokio::test]
-async fn config_recovery_direct_hello_rechecks_store_instead_of_trusting_cached_state() {
+async fn config_recovery_direct_hello_refuses_from_the_published_state() {
     let rig = rig();
     let owner = Arc::new(rig.owner("fresh-direct-hello"));
     rig.stamp(&owner);
@@ -3350,6 +3350,7 @@ async fn config_recovery_direct_hello_rechecks_store_instead_of_trusting_cached_
         b"tampered",
     )
     .unwrap();
+    owner.poll_store_integrity().unwrap();
     let registry = Arc::new(crate::Registry::default());
     let handler = crate::ControlHandler::new(registry.clone()).with_config_runtime(owner);
     let hello = subc_protocol::ModuleHelloBody {
@@ -3370,9 +3371,11 @@ async fn config_recovery_direct_hello_rechecks_store_instead_of_trusting_cached_
     let reply = handler
         .handle_control(ConnectionId::new(446), frame)
         .unwrap();
+    let refusal: serde_json::Value = serde_json::from_slice(&reply[0].body).unwrap();
+    assert_eq!(refusal["code"], "config_gated");
     assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&reply[0].body).unwrap()["code"],
-        "config_gated"
+        refusal["message"],
+        "recovery admits only previously bound supervised launches"
     );
     assert!(registry.get_module("unconfigured").unwrap().is_none());
 }

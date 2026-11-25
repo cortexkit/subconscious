@@ -26,6 +26,56 @@ use super::STORE_BYTE_LIMIT;
 #[path = "disk_tests.rs"]
 mod tests;
 
+#[derive(PartialEq, Eq)]
+pub(super) struct Fingerprint {
+    identity: subc_os::RetainedFileIdentity,
+    length: u64,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    changed: (i64, i64),
+}
+
+pub(super) fn fingerprint(path: &Path) -> io::Result<Option<Fingerprint>> {
+    #[cfg(unix)]
+    let (metadata, identity) = {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_file() => metadata,
+            Ok(_) => return Err(io::Error::other("store input is not a regular file")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let identity = subc_os::RetainedFileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
+        (metadata, identity)
+    };
+    #[cfg(windows)]
+    let (metadata, identity) = {
+        let file = match subc_os::open_regular_nofollow(path) {
+            Ok(file) => file,
+            Err(subc_os::OpenRegularError::Io(error))
+                if error.kind() == io::ErrorKind::NotFound =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(io::Error::other(error)),
+        };
+        (file.metadata()?, subc_os::retained_file_identity(&file)?)
+    };
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    Ok(Some(Fingerprint {
+        identity,
+        length: metadata.len(),
+        modified: metadata.modified()?,
+        #[cfg(unix)]
+        changed: (metadata.ctime(), metadata.ctime_nsec()),
+    }))
+}
+
 pub(super) fn read(path: &Path) -> io::Result<Option<Vec<u8>>> {
     let mut file = match subc_os::open_regular_nofollow(path) {
         Ok(file) => file,

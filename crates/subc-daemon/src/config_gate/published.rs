@@ -6,6 +6,7 @@ use subc_protocol::peer::SettingsCredentials;
 pub(crate) struct Published {
     pub(super) admission: admission::AdmissionCache,
     pub(crate) approved_daemon: ApprovedDaemonView,
+    pub(crate) refuses_control_in_recovery: bool,
     pub(super) projection: polled::Projection,
     pub(super) settings: Option<settings::SettingsVersion>,
     pub(super) settings_credentials: Option<Arc<ApprovedSettingsCredentials>>,
@@ -84,6 +85,17 @@ impl ApprovedSettingsCredentials {
 }
 
 impl Published {
+    pub(super) fn control_recovery(store: &ConfigStore, recovery_exit_hold: bool) -> bool {
+        // Module admission also fails closed if it cannot decode the approved
+        // module configuration. Control recovery uses only the store state
+        // and the hold while the supervisor reconciles that configuration.
+        recovery_exit_hold
+            || matches!(
+                store.loaded_admission_state().0,
+                StoreState::StoreMissing | StoreState::StoreUnverified
+            )
+    }
+
     pub(crate) fn registration_declaration(&self, module: &str) -> Option<String> {
         self.admission
             .registration_declarations()?
@@ -108,7 +120,7 @@ impl RuntimeOwner {
         module: &str,
         project: Option<&str>,
     ) -> Option<SettingsCredentials> {
-        self.polled_snapshot()
+        self.observed_snapshot()
             .ok()?
             .settings_credentials
             .as_ref()?
@@ -121,18 +133,28 @@ impl RuntimeOwner {
         *self.polled_capture_hook.lock().unwrap() = Some(Box::new(hook));
     }
 
-    pub(crate) fn polled_snapshot(&self) -> Result<std::sync::Arc<Published>> {
+    // Tests pause the consumer of a published view, not the earlier recovery
+    // gate that every request passes through.
+    pub(crate) fn observed_snapshot(&self) -> Result<Arc<Published>> {
         #[cfg(test)]
         self.polled_capture_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let snapshot = self.polled_snapshot()?;
+        #[cfg(test)]
+        if let Some(hook) = self.polled_capture_hook.lock().unwrap().take() {
+            hook();
+        }
+        Ok(snapshot)
+    }
+
+    pub(crate) fn polled_snapshot(&self) -> Result<Arc<Published>> {
         if self.inner.is_poisoned() {
             return Err(GateError::new(
                 "config_unavailable",
                 "configuration owner lock is poisoned",
             ));
         }
-        let snapshot = self
-            .published
+        self.published
             .read()
             .map(|value| value.clone())
             .map_err(|_| {
@@ -140,11 +162,6 @@ impl RuntimeOwner {
                     "config_unavailable",
                     "configuration publication is unavailable",
                 )
-            })?;
-        #[cfg(test)]
-        if let Some(hook) = self.polled_capture_hook.lock().unwrap().take() {
-            hook();
-        }
-        Ok(snapshot)
+            })
     }
 }

@@ -1159,14 +1159,11 @@ impl ControlHandler {
                     self.record_control_usage(ctx.connection_id, &probe.op);
                 }
                 let claim_present = op.as_ref().is_some_and(|probe| probe.op == "claim.present");
-                if let Some(refusal) = self
-                    .recovery_request_refusal(
-                        ctx,
-                        &frame,
-                        op.as_ref().map(|probe| probe.op.as_str()),
-                    )
-                    .await?
-                {
+                if let Some(refusal) = self.recovery_request_refusal(
+                    ctx,
+                    &frame,
+                    op.as_ref().map(|probe| probe.op.as_str()),
+                )? {
                     if claim_present {
                         self.reclaim_presented_expiry(&frame);
                         return self
@@ -1223,11 +1220,11 @@ impl ControlHandler {
                         .handle_module_config_request(ctx, frame, &probe.op)
                         .await;
                 }
-                if op
+                if let Some(probe) = op
                     .as_ref()
-                    .is_some_and(|probe| config_gate::is_config_op(&probe.op))
+                    .filter(|probe| config_gate::is_config_op(&probe.op))
                 {
-                    return self.handle_config_gate_request(ctx, frame).await;
+                    return self.handle_config_gate_request(ctx, frame, &probe.op).await;
                 }
                 if op
                     .as_ref()

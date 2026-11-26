@@ -94,8 +94,8 @@ Fields:
   entry holds 1 to 16 targets; an empty list is refused by name. Bare entries are for runners
   that carry a whole session to arbitrary tools (Broca, `subc-mcp`); every other carrier should
   be targeted. For example AFT on a delegating head is `{principal: "reserved:aft", targets:
-  ["plexus", "prefrontal-core"]}`, and a provider that only files asks with Prefrontal is
-  targeted at `prefrontal-core`. A module whose questions travel back on the route it was called
+  ["plexus", "prefrontal"]}`, and a provider that only files asks with Prefrontal is
+  targeted at `prefrontal`. A module whose questions travel back on the route it was called
   on (Cerebellum) is not listed at all. Being a carrier grants nothing on the provider side:
   what a provider does for the session is still decided by the stamp on its own inbound route.
 - `attributes`, settable only by the owner, anything else refused by name:

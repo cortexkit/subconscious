@@ -39,6 +39,10 @@ impl<F: Fn(&str) -> bool> Prompter for Prompt<F> {
     fn confirm(&self, module: &str, _: &cortexkit_doctor::Finding) -> bool {
         self.0(module)
     }
+
+    fn confirm_deep_stop(&self, module: &str) -> bool {
+        self.0(module)
+    }
 }
 
 struct NoTerminal;
@@ -134,6 +138,15 @@ impl Rig {
     }
 
     fn run_with_options(&self, options: DoctorOptions, prompter: &dyn Prompter) -> ProgramRun {
+        self.run_mode(options, prompter, cortexkit_doctor::Mode::Quick)
+    }
+
+    fn run_mode(
+        &self,
+        options: DoctorOptions,
+        prompter: &dyn Prompter,
+        mode: cortexkit_doctor::Mode,
+    ) -> ProgramRun {
         run_with_programs_on(
             self.host.clone(),
             options,
@@ -141,6 +154,8 @@ impl Rig {
                 prompter,
                 interrupt: &self.interrupt,
                 operator_budget: Duration::from_millis(750),
+                mode,
+                full_feedback: mode == cortexkit_doctor::Mode::Full,
             },
             Arc::new(FakeLogs::default()),
             &short_limits(),
@@ -1153,6 +1168,36 @@ fn stop_accepts_a_drain_that_exceeds_the_ordinary_read_deadline() {
 }
 
 #[test]
+fn doctor_full_restores_the_module_after_a_timeout() {
+    let mut rig = Rig::new();
+    rig.config.limits.full_check = Duration::from_secs(1);
+    rig.config.limits.term_to_kill = Duration::from_millis(10);
+    rig.program("slow", json!({
+        "full": "findings", "finding": "store.in_use", "full_retry": "sleep", "record_stages": true,
+    }));
+    rig.write_config();
+    let running = entry("slow", true, "running");
+    rig.script(
+        [
+            Ok(vec![running.clone()]),
+            Ok(vec![running]),
+            Ok(vec![entry("slow", false, "stopped")]),
+        ],
+        |_, _, _| Ok(true),
+    );
+
+    let run = rig.run_mode(
+        DoctorOptions::default(),
+        &Prompt(|_: &str| true),
+        cortexkit_doctor::Mode::Full,
+    );
+    let rows = run.run.document.modules.unwrap();
+    assert_eq!(rows[0].outcome, ModuleOutcome::TimedOut);
+    assert_eq!(rows[0].mode, Some(ModuleCheckMode::Full));
+    assert_eq!(actions(&rig.host.daemon), [LIST, LIST, STOP, LIST, START]);
+}
+
+#[test]
 fn shared_conformance_checks_the_fixture_output_and_read_only_check() {
     struct Adapter {
         program: PathBuf,
@@ -1165,7 +1210,7 @@ fn shared_conformance_checks_the_fixture_output_and_read_only_check() {
         fn seed(&mut self, data: &Path, _: &Path) -> std::io::Result<()> {
             let root = data.join("doctor-fixture");
             fs::create_dir(&root)?;
-            fs::write(root.join("fixture.json"), b"{}")
+            fs::write(root.join("fixture.json"), br#"{"full":"findings"}"#)
         }
     }
     let mut rig = Rig::new();
@@ -1174,6 +1219,7 @@ fn shared_conformance_checks_the_fixture_output_and_read_only_check() {
     for expected in [
         "output.valid",
         "check.read_only",
+        "check.full",
         "manifest.valid",
         "manifest.digest",
     ] {

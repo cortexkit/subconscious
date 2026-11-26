@@ -24,6 +24,7 @@ pub(super) fn listen(interrupt: Arc<Interrupt>, terminal: Arc<Terminal>, fail_si
     // The synchronous doctor runs on the main thread; the runtime polls these
     // streams on its workers until the process exits.
     tokio::spawn(async move {
+        let mut reported_check_wait = false;
         loop {
             let (delivery, kind) = tokio::select! {
                 delivery = int.recv() => (delivery, sigint),
@@ -35,11 +36,22 @@ pub(super) fn listen(interrupt: Arc<Interrupt>, terminal: Arc<Terminal>, fail_si
             let Some(wait) = interrupt.on_signal(kind.as_raw_value()) else {
                 process::exit(128 + kind.as_raw_value());
             };
-            let message = format!(
-                "\nInterrupted; waiting for {} (up to {:.1} s remaining).\n",
-                wait.operation,
-                wait.remaining.as_secs_f64()
-            );
+            let message = if wait.restart_after_check {
+                if reported_check_wait {
+                    continue;
+                }
+                reported_check_wait = true;
+                format!(
+                    "\nInterrupted. The module will restart as soon as its check stops (up to {:.1} s remaining).\n",
+                    wait.remaining.as_secs_f64()
+                )
+            } else {
+                format!(
+                    "\nInterrupted; waiting for {} (up to {:.1} s remaining).\n",
+                    wait.operation,
+                    wait.remaining.as_secs_f64()
+                )
+            };
             if terminal.write(&message).is_err() {
                 eprint!("{message}");
             }

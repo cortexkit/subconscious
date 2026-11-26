@@ -5,7 +5,7 @@ use std::{
     io::{self, Write},
     path::PathBuf,
     process, thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use cortexkit_doctor::{
@@ -18,6 +18,9 @@ use serde::Deserialize;
 #[serde(default)]
 struct Scenario {
     check: String,
+    full: Option<String>,
+    full_retry: Option<String>,
+    wait_stage: Option<String>,
     fix: String,
     manifest: String,
     needs_stop: bool,
@@ -40,6 +43,9 @@ impl Default for Scenario {
     fn default() -> Self {
         Self {
             check: "findings".into(),
+            full: None,
+            full_retry: None,
+            wait_stage: None,
             fix: "fixed".into(),
             manifest: "valid".into(),
             needs_stop: false,
@@ -71,26 +77,47 @@ fn main() {
     let args = env::args().skip(1).collect::<Vec<_>>();
     let args = args.iter().map(String::as_str).collect::<Vec<_>>();
     let fixed = marker.exists();
+    let stage_path = |stage: &str, event: &str| root.join(format!("{name}.{stage}.{event}"));
     let stage = match args.as_slice() {
         ["doctor", "check", "--json"] if fixed => "recheck",
         ["doctor", "check", "--json"] => "check",
+        ["doctor", "check", "--full", "--json"] if scenario.full.is_some() => {
+            if scenario.full_retry.is_some() && stage_path("full", "finished").exists() {
+                "full-retry"
+            } else {
+                "full"
+            }
+        }
+        ["doctor", "fix", _, "--digest", _, "--full"] => "fix-full",
         ["doctor", "fix", ..] => "fix",
         ["doctor", "manifest"] => "manifest",
         _ => process::exit(2),
     };
     let record_stage = |event: &str| {
         if scenario.record_stages {
-            fs::write(
-                root.join(format!("{name}.{stage}.{event}")),
-                process::id().to_string(),
-            )
-            .unwrap();
+            fs::write(stage_path(stage, event), process::id().to_string()).unwrap();
         }
     };
     record_stage("started");
+    if scenario.wait_stage.as_deref() == Some(stage) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !stage_path(stage, "release").exists() {
+            assert!(Instant::now() < deadline, "fixture stage was not released");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
     match args.as_slice() {
-        ["doctor", "check", "--json"] => check(&scenario, fixed),
-        ["doctor", "fix", id, "--digest", digest] => {
+        ["doctor", "check", "--json"] => check(&scenario, &scenario.check, fixed),
+        ["doctor", "check", "--full", "--json"] => {
+            let check_kind = if stage == "full-retry" {
+                scenario.full_retry.as_deref().unwrap()
+            } else {
+                scenario.full.as_deref().unwrap()
+            };
+            check(&scenario, check_kind, fixed);
+        }
+        ["doctor", "fix", id, "--digest", digest]
+        | ["doctor", "fix", id, "--digest", digest, "--full"] => {
             if scenario.record_fix || scenario.clean_after_fix {
                 fs::write(&marker, b"fix called\n").unwrap();
             }
@@ -145,9 +172,9 @@ fn finding(scenario: &Scenario) -> Finding {
     .unwrap()
 }
 
-fn check(scenario: &Scenario, fixed: bool) {
+fn check(scenario: &Scenario, check_kind: &str, fixed: bool) {
     thread::sleep(Duration::from_millis(scenario.check_sleep_ms));
-    match scenario.check.as_str() {
+    match check_kind {
         "findings" if !(fixed && scenario.clean_after_fix) => {
             emit(CheckOutput::new(vec![finding(scenario)]).unwrap())
         }

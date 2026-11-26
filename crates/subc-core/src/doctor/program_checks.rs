@@ -10,6 +10,14 @@ use subc_control::ModuleProtocol;
 use subc_daemon::daemon_config::{self, DaemonConfigError};
 
 use super::{Finding, Interrupt, Layer, ModuleCheck, ModuleOutcome, Severity};
+use cortexkit_doctor::Mode;
+
+#[cfg(unix)]
+use {
+    super::{program_fixes::Daemon, ModuleCheckMode, ModuleFixSkip, Programs},
+    cortexkit_doctor::{runner, RunError},
+    std::{collections::BTreeSet, sync::mpsc, thread, time::Duration},
+};
 
 /// A program and its validated check document, bound to the observed file.
 #[derive(Debug)]
@@ -18,6 +26,7 @@ pub struct CheckedProgram {
     pub path: PathBuf,
     pub identity: subc_os::FileIdentity,
     pub check: cortexkit_doctor::CheckOutput,
+    pub mode: Mode,
 }
 
 impl CheckedProgram {
@@ -87,6 +96,7 @@ pub(super) fn check_all(
     override_path: Option<&Path>,
     interrupt: &Interrupt,
     start: Instant,
+    #[cfg(unix)] full: Option<FullChecks<'_>>,
 ) -> ProgramChecks {
     let mut pass = ProgramChecks::default();
     if override_path.is_some() {
@@ -154,23 +164,38 @@ pub(super) fn check_all(
         #[cfg(not(test))]
         let identity_lookup = subc_os::file_identity;
         let options = config.runner.clone().with_limits(config.limits);
-        for (id, path, result) in pool_until(
-            jobs,
-            cutoff,
-            |(id, path)| {
-                let result = check_one(
+        if let Some(mut full) = full {
+            for (id, path) in jobs {
+                let (job, mode, fallback) = full.check(
+                    &id,
                     &path,
-                    interrupt,
                     &options,
                     config.limits,
-                    cutoff,
                     identity_lookup,
+                    &mut pass.findings,
                 );
-                (id, path, result)
-            },
-            |(id, path)| (id, path, Job::NotStarted),
-        ) {
-            record(&mut pass, id, path, result);
+                let mode = job.ran().then_some(mode);
+                record(&mut pass, id, path, job, mode, fallback);
+            }
+        } else {
+            for (id, path, result) in pool_until(
+                jobs,
+                cutoff,
+                |(id, path)| {
+                    let result = check_one(
+                        &path,
+                        interrupt,
+                        &options,
+                        config.limits,
+                        Some(cutoff),
+                        identity_lookup,
+                    );
+                    (id, path, result)
+                },
+                |(id, path)| (id, path, Job::NotStarted),
+            ) {
+                record(&mut pass, id, path, result, None, false);
+            }
         }
     }
     #[cfg(not(unix))]
@@ -200,6 +225,7 @@ fn row(id: String, outcome: ModuleOutcome, detail: Option<String>) -> ModuleChec
         outcome,
         findings: 0,
         detail,
+        mode: None,
     }
 }
 
@@ -275,12 +301,33 @@ enum Job {
 }
 
 #[cfg(unix)]
+impl Job {
+    fn ran(&self) -> bool {
+        !matches!(
+            self,
+            Self::NotStarted | Self::Failed(RunError::LaunchFailed(_) | RunError::HomeRelative)
+        )
+    }
+
+    fn from_result(
+        identity: Option<subc_os::FileIdentity>,
+        result: Result<cortexkit_doctor::CheckOutput, RunError>,
+    ) -> Self {
+        match (identity, result) {
+            (Some(identity), Ok(output)) => Self::Checked(identity, output),
+            (None, Ok(_)) => Self::IdentityUnavailable,
+            (_, Err(error)) => Self::Failed(error),
+        }
+    }
+}
+
+#[cfg(unix)]
 fn check_one(
     path: &Path,
     interrupt: &Interrupt,
     options: &cortexkit_doctor::runner::Options,
     limits: cortexkit_doctor::runner::Limits,
-    cutoff: Instant,
+    cutoff: Option<Instant>,
     identity_lookup: impl FnOnce(&Path) -> Option<subc_os::FileIdentity>,
 ) -> Job {
     if interrupt.signal().is_some() {
@@ -289,7 +336,7 @@ fn check_one(
     // Keep the pre-launch identity so repairs and issue reports can detect a
     // replaced program. The runner, not the identity lookup, diagnoses launch failures.
     let identity = identity_lookup(path);
-    if Instant::now() > cutoff {
+    if cutoff.is_some_and(|cutoff| Instant::now() > cutoff) {
         return Job::NotStarted;
     }
     let Some(_guard) = interrupt.protect(
@@ -298,11 +345,131 @@ fn check_one(
     ) else {
         return Job::NotStarted;
     };
-    match (identity, cortexkit_doctor::runner::check(path, options)) {
-        (Some(identity), Ok(output)) => Job::Checked(identity, output),
-        (None, Ok(_)) => Job::IdentityUnavailable,
-        (_, Err(error)) => Job::Failed(error),
+    Job::from_result(identity, runner::check(path, Mode::Quick, options))
+}
+
+#[cfg(unix)]
+pub(super) struct FullChecks<'a> {
+    pub programs: &'a Programs<'a>,
+    pub daemon: Daemon<'a>,
+    pub asked: &'a mut BTreeSet<String>,
+}
+
+#[cfg(unix)]
+impl FullChecks<'_> {
+    fn check(
+        &mut self,
+        id: &str,
+        path: &Path,
+        options: &runner::Options,
+        limits: runner::Limits,
+        identity_lookup: fn(&Path) -> Option<subc_os::FileIdentity>,
+        warnings: &mut Vec<Finding>,
+    ) -> (Job, Mode, bool) {
+        let programs = self.programs;
+        let interrupt = programs.interrupt;
+        let identity = identity_lookup(path);
+        let deadline =
+            || Instant::now() + limits.full_check + limits.term_to_kill.max(limits.exit_grace);
+        let mut job = if let Some(_guard) = interrupt.protect("a full module check", deadline()) {
+            Job::from_result(
+                identity,
+                wait_for_full_check(programs, id, path, options, limits.full_check),
+            )
+        } else {
+            Job::NotStarted
+        };
+        let store_in_use = matches!(&job, Job::Checked(_, check) if check.findings().iter().any(|finding| finding.id().as_str() == "store.in_use"));
+        if store_in_use
+            && programs.full_feedback
+            && programs.prompter.interactive()
+            && !interrupt.setup_failed()
+            && interrupt.signal().is_none()
+            && !self.asked.contains(id)
+        {
+            if let Some(entry) = self
+                .daemon
+                .entry(id)
+                .filter(|entry| entry.enabled && entry.live)
+            {
+                self.asked.insert(id.to_owned());
+                if programs.prompter.confirm_deep_stop(id) && identity_lookup(path) == identity {
+                    let (retry, _) =
+                        self.daemon
+                            .with_stopped(programs, id, Some(&entry), warnings, |owned| {
+                                if identity_lookup(path) != identity {
+                                    return Err(ModuleFixSkip::ProgramChanged);
+                                }
+                                let _guard;
+                                if let Some(guard) = owned {
+                                    guard.wait_for_stopped_check(deadline());
+                                } else {
+                                    _guard = interrupt
+                                        .protect("a full module check", deadline())
+                                        .ok_or(ModuleFixSkip::Interrupted)?;
+                                }
+                                if interrupt.signal().is_some() {
+                                    return Err(ModuleFixSkip::Interrupted);
+                                }
+                                Ok(Job::from_result(
+                                    identity,
+                                    wait_for_full_check(
+                                        programs,
+                                        id,
+                                        path,
+                                        options,
+                                        limits.full_check,
+                                    ),
+                                ))
+                            });
+                    if let Ok(retry) = retry {
+                        job = retry;
+                    }
+                }
+            }
+        }
+        if matches!(job, Job::Failed(RunError::NoDoctor)) && interrupt.signal().is_none() {
+            let quick = check_one(path, interrupt, options, limits, None, identity_lookup);
+            if !matches!(quick, Job::NotStarted) {
+                return (quick, Mode::Quick, true);
+            }
+        }
+        (job, Mode::Full, false)
     }
+}
+
+#[cfg(unix)]
+fn wait_for_full_check(
+    programs: &Programs<'_>,
+    id: &str,
+    path: &Path,
+    options: &runner::Options,
+    limit: Duration,
+) -> Result<cortexkit_doctor::CheckOutput, RunError> {
+    if !programs.full_feedback {
+        return runner::check(path, Mode::Full, options);
+    }
+    // Only progress output runs alongside the check. Wait for the runner to
+    // clean up the check process before starting the next operation.
+    let start = Instant::now();
+    thread::scope(|scope| {
+        let (send, receive) = mpsc::sync_channel(1);
+        scope.spawn(move || {
+            let _ = send.send(runner::check(path, Mode::Full, options));
+        });
+        loop {
+            if programs.interrupt.signal().is_none() {
+                programs
+                    .prompter
+                    .full_progress(id, start.elapsed().min(limit), limit);
+            }
+            match receive.recv_timeout(Duration::from_secs(1)) {
+                Ok(result) => return result,
+                Err(mpsc::RecvTimeoutError::Timeout) => (),
+                Err(mpsc::RecvTimeoutError::Disconnected) => panic!("full check worker panicked"),
+            }
+        }
+    })
 }
 
 #[cfg(unix)]
@@ -318,8 +485,24 @@ fn io_kind(kind: std::io::ErrorKind) -> &'static str {
 }
 
 #[cfg(unix)]
-fn record(pass: &mut ProgramChecks, id: String, path: PathBuf, job: Job) {
-    use cortexkit_doctor::{Crash, DecodeError, RunError};
+fn record(
+    pass: &mut ProgramChecks,
+    id: String,
+    path: PathBuf,
+    job: Job,
+    mode: Option<Mode>,
+    fallback: bool,
+) {
+    use cortexkit_doctor::{Crash, DecodeError};
+    let reported_mode = mode.map(|mode| match mode {
+        Mode::Quick => ModuleCheckMode::Quick,
+        Mode::Full => ModuleCheckMode::Full,
+    });
+    let detail_with_mode = |detail: Option<String>| match (fallback, detail) {
+        (true, Some(detail)) => Some(format!("full_not_supported; {detail}")),
+        (true, None) => Some("full_not_supported".into()),
+        (false, detail) => detail,
+    };
 
     let (outcome, detail, diagnostic_kind) = match job {
         Job::Checked(identity, check) => {
@@ -350,13 +533,15 @@ fn record(pass: &mut ProgramChecks, id: String, path: PathBuf, job: Job) {
                 id: id.clone(),
                 outcome,
                 findings: findings.len(),
-                detail: None,
+                detail: detail_with_mode(None),
+                mode: reported_mode,
             });
             pass.checked.push(CheckedProgram {
                 module_id: id,
                 path,
                 identity,
                 check,
+                mode: mode.unwrap_or(Mode::Quick),
             });
             return;
         }
@@ -423,5 +608,8 @@ fn record(pass: &mut ProgramChecks, id: String, path: PathBuf, job: Job) {
             json!({"detail": detail}),
         ));
     }
-    pass.modules.push(row(id, outcome, detail));
+    pass.modules.push(ModuleCheck {
+        mode: reported_mode,
+        ..row(id, outcome, detail_with_mode(detail))
+    });
 }

@@ -1,10 +1,12 @@
+#[cfg(unix)]
+use std::time::Duration;
 use std::{ffi::OsString, io::Write, sync::Arc};
 
 use serde::Serialize;
 use subc_core::doctor::{
     self, DoctorOptions, DoctorReport, DoctorRun, FixSkip, Interrupt, Layer, LogFallback,
-    LogFallbackRead, LogTail, LogTailRecord, ModuleFix, ModuleFixDecision, ModuleFixOutcome,
-    ModuleFixSkip, ModuleRestart, Programs, Prompter, ReportFile, Severity,
+    LogFallbackRead, LogTail, LogTailRecord, ModuleCheckMode, ModuleFix, ModuleFixDecision,
+    ModuleFixOutcome, ModuleFixSkip, ModuleRestart, Programs, Prompter, ReportFile, Severity,
 };
 
 use super::{log_tail, response_budget, Command};
@@ -22,12 +24,13 @@ include!("triage.rs");
 pub(super) const HELP: &str = "ck doctor — diagnose the stack, even when the daemon is down
 
 usage:
-  ck doctor [--json] [--report <file>] [--fix] [--subc <connection-file>]
+  ck doctor [--json] [--report <file>] [--full] [--fix] [--subc <connection-file>]
   ck doctor --issue [--report <file>]
   ck doctor --agent [--forget]
 
   --json           print one JSON document; for a completed run, stderr is used only if the report cannot be written
   --report <file>  save a private, unsanitized report with bounded log tails
+  --full           run deep checks one module at a time (up to 30 minutes each)
   --fix            attempt an offered window revert or ask to apply module fixes
   --issue          save sanitized module reports and ask before filing publicly (local, human mode only)
   --agent          open the standalone Pi rescue agent for the local stack
@@ -39,6 +42,7 @@ usage:
 pub(super) struct Options {
     report: Option<PathBuf>,
     fix: bool,
+    full: bool,
     issue: bool,
     pub(super) agent: bool,
     forget: bool,
@@ -66,6 +70,7 @@ pub(super) fn parse(
                 options.report = Some(path_value(&mut args, "--report")?);
             }
             Some("--fix") if !options.fix => options.fix = true,
+            Some("--full") if !options.full => options.full = true,
             Some("--issue") if !options.issue => options.issue = true,
             Some("--agent") if !options.agent => options.agent = true,
             Some("--forget") if !options.forget => options.forget = true,
@@ -221,6 +226,34 @@ impl Prompter for Terminal {
             false
         }
     }
+
+    #[cfg(unix)]
+    fn confirm_deep_stop(&self, module: &str) -> bool {
+        self.yes(&format!(
+            "Stop {module} for up to 30 minutes to finish its deep checks? Agents that use it wait until it is back. [y/N] "
+        ))
+    }
+
+    #[cfg(unix)]
+    fn full_progress(&self, module: &str, elapsed: Duration, limit: Duration) {
+        let elapsed = elapsed.as_secs();
+        let mins = elapsed / 60;
+        let seconds = elapsed % 60;
+        let elapsed = if mins == 0 {
+            format!("{seconds} s")
+        } else if seconds == 0 {
+            format!("{mins} min")
+        } else {
+            format!("{mins} min {seconds} s")
+        };
+        let line = format!(
+            "Checking {module} in full, {elapsed} of up to {} min\n",
+            limit.as_secs() / 60
+        );
+        if self.write(&line).is_err() {
+            let _ = io::stderr().write_all(line.as_bytes());
+        }
+    }
 }
 
 // The test executable can substitute a local GitHub API and simulate failed
@@ -239,6 +272,7 @@ pub(super) fn run(
     if options.issue {
         let conflict = [
             (options.fix, "--fix"),
+            (options.full, "--full"),
             (output.ckni, "ckni"),
             (output.enabled, "--json"),
             (options.agent, "--agent"),
@@ -253,6 +287,11 @@ pub(super) fn run(
         }
     }
     if options.agent || options.forget {
+        if options.full {
+            return Err(CkError::Usage(
+                "doctor --full cannot be used with --agent or --forget".into(),
+            ));
+        }
         return agent::run(&options, explicit_connection.is_some(), output.ckni);
     }
     let connection_override = explicit_connection.or_else(|| {
@@ -286,6 +325,12 @@ pub(super) fn run(
             prompter: terminal.as_ref(),
             interrupt: &interrupt,
             operator_budget: response_budget::operator(),
+            mode: if options.full {
+                cortexkit_doctor::Mode::Full
+            } else {
+                cortexkit_doctor::Mode::Quick
+            },
+            full_feedback: !output.enabled,
         },
         logs.clone(),
     );
@@ -419,6 +464,17 @@ fn write_human(
     if let Some(path) = &report.connection_override {
         writeln!(out, "Connection override: {}", path.display())?;
     }
+    let modules = report.modules.as_deref().unwrap_or_default();
+    for module in modules
+        .iter()
+        .filter(|row| row.mode == Some(ModuleCheckMode::Quick))
+    {
+        writeln!(
+            out,
+            "{}: full checks are not supported by its helper; ran the quick check instead.",
+            module.id
+        )?;
+    }
     let mut current_heading = None;
     for finding in &report.findings {
         let program_owner = (finding.layer == Layer::ModuleProgram).then_some(&finding.owner);
@@ -459,7 +515,11 @@ fn write_human(
                     cortexkit_doctor::FixClass::Safe | cortexkit_doctor::FixClass::Risky
                 ) {
                     if let Some(first) = fix.plan().and_then(|plan| plan.steps().first()) {
-                        writeln!(out, "    {first} (run `ck doctor --fix` to apply)")?;
+                        let full = modules.iter().any(|module| {
+                            module.id == finding.owner && module.mode == Some(ModuleCheckMode::Full)
+                        });
+                        let flag = if full { " --full" } else { "" };
+                        writeln!(out, "    {first} (run `ck doctor{flag} --fix` to apply)")?;
                     }
                 }
             }

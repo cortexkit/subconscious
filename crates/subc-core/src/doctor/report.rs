@@ -77,6 +77,16 @@ pub struct ModuleCheck {
     pub outcome: ModuleOutcome,
     pub findings: usize,
     pub detail: Option<String>,
+    /// The check that ran, reported only when full checks were requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<ModuleCheckMode>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModuleCheckMode {
+    Quick,
+    Full,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]

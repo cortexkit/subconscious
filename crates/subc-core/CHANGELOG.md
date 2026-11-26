@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.23.0
+
+- Add `ck doctor --full` via cortexkit-doctor 0.3.0. Full module checks run one
+  at a time, report which mode ran, and can stop and restart a module with consent.
+
 ## 0.22.3
 
 - Use subc-daemon 0.53.3, which delivers Windows launch nonces only by pipe.

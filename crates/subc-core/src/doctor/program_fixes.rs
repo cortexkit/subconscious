@@ -10,6 +10,10 @@ use std::{
 pub trait Prompter {
     fn interactive(&self) -> bool;
     fn confirm(&self, module: &str, finding: &cortexkit_doctor::Finding) -> bool;
+    fn confirm_deep_stop(&self, _module: &str) -> bool {
+        false
+    }
+    fn full_progress(&self, _module: &str, _elapsed: Duration, _limit: Duration) {}
 }
 
 /// Runtime inputs for a program-enabled doctor run.
@@ -17,6 +21,9 @@ pub struct Programs<'a> {
     pub prompter: &'a dyn Prompter,
     pub interrupt: &'a Interrupt,
     pub operator_budget: Duration,
+    pub mode: cortexkit_doctor::Mode,
+    /// Human output can show progress and ask about stopping a module for a check.
+    pub full_feedback: bool,
 }
 
 /// Protection shared with the caller's signal listener. It installs no handlers.
@@ -35,6 +42,7 @@ struct InterruptState {
 struct Wait {
     operation: &'static str,
     deadline: Instant,
+    restart_after_check: bool,
 }
 
 /// What the signal listener can tell the person after latching a signal.
@@ -42,6 +50,7 @@ struct Wait {
 pub struct WaitStatus {
     pub operation: &'static str,
     pub remaining: Duration,
+    pub restart_after_check: bool,
 }
 
 impl Interrupt {
@@ -61,10 +70,12 @@ impl Interrupt {
             Some(wait) => WaitStatus {
                 operation: wait.operation,
                 remaining: wait.deadline.saturating_duration_since(Instant::now()),
+                restart_after_check: wait.restart_after_check,
             },
             _ => WaitStatus {
                 operation: "the report",
                 remaining: Duration::ZERO,
+                restart_after_check: false,
             },
         })
     }
@@ -91,6 +102,7 @@ impl Interrupt {
             Wait {
                 operation,
                 deadline,
+                restart_after_check: false,
             },
         );
         Some(Guard {
@@ -100,7 +112,7 @@ impl Interrupt {
     }
 
     #[cfg(unix)]
-    fn setup_failed(&self) -> bool {
+    pub(super) fn setup_failed(&self) -> bool {
         self.0.lock().unwrap().setup_failed
     }
 }
@@ -114,12 +126,23 @@ pub struct Guard<'a> {
 impl Guard<'_> {
     #[cfg(unix)]
     fn update(&self, operation: &'static str, deadline: Instant) {
+        self.set_wait(operation, deadline, false);
+    }
+
+    #[cfg(unix)]
+    pub(super) fn wait_for_stopped_check(&self, deadline: Instant) {
+        self.set_wait("a full module check", deadline, true);
+    }
+
+    #[cfg(unix)]
+    fn set_wait(&self, operation: &'static str, deadline: Instant, restart_after_check: bool) {
         let mut state = self.interrupt.0.lock().unwrap();
         state.guards.insert(
             self.id,
             Wait {
                 operation,
                 deadline,
+                restart_after_check,
             },
         );
     }
@@ -223,11 +246,7 @@ mod unix {
         config: &ProgramConfig,
         checked: &[CheckedProgram],
     ) -> Repairs {
-        let mut daemon = Daemon {
-            host,
-            current: daemon,
-            rpc_budget,
-        };
+        let mut daemon = Daemon::new(host, daemon, rpc_budget);
         let mut repairs = Repairs::default();
         let options = config.runner.clone().with_limits(config.limits);
         for (program, finding) in offered(checked) {
@@ -296,77 +315,38 @@ mod unix {
         let plan = fix
             .plan()
             .expect("a validated safe or risky fix has a plan");
-        let mut owned = None;
-        let mut skip = None;
-        if fix.needs_stop() {
-            if let Some(entry) = daemon.entry(id).filter(|entry| entry.enabled) {
-                let budget = mutation_budget(&entry, programs.operator_budget);
-                let deadline = Instant::now() + budget;
-                let Some(guard) = programs
-                    .interrupt
-                    .protect("a module stop or operator approval", deadline)
-                else {
-                    return Some(ModuleFixSkip::Interrupted);
-                };
-                let (owns_stop, may_fix) = daemon.stop(id, deadline, &guard, programs);
-                if owns_stop {
-                    owned = Some((guard, budget));
-                }
-                if !may_fix {
-                    skip = Some(ModuleFixSkip::StopFailed);
-                }
-            }
-        }
-
-        if programs.interrupt.signal().is_some() {
-            skip = Some(ModuleFixSkip::Interrupted);
-        } else if skip.is_none() {
+        let entry = fix.needs_stop().then(|| daemon.entry(id)).flatten();
+        let (result, restart) = daemon.with_stopped(programs, id, entry.as_ref(), warnings, |_| {
             let deadline = Instant::now()
-                + limits.fix_timeout(plan.timeout_ms())
+                + limits.fix_timeout(plan.timeout_ms(), program.mode)
                 + limits.term_to_kill.max(limits.exit_grace);
             if !program.unchanged() {
-                skip = Some(ModuleFixSkip::ProgramChanged);
-            } else if let Some(_guard) = programs.interrupt.protect("a module fix", deadline) {
-                row.decision = ModuleFixDecision::Applied;
-                let result = runner::fix(
-                    &program.path,
-                    finding.id(),
-                    plan.digest(),
-                    plan.timeout_ms(),
-                    options,
-                );
-                // The runner gives the fix the foreground terminal for its own
-                // consent prompt. The terminal's interrupt then reaches the fix,
-                // not ck. Latch it here before releasing the guard.
-                if let Err(RunError::Crashed(Crash::Signal(signal))) = &result {
-                    if *signal == Signal::INT.as_raw() || *signal == Signal::QUIT.as_raw() {
-                        programs.interrupt.on_signal(*signal);
-                    }
-                }
-                row.result = Some(fix_result(result));
-            } else {
-                skip = Some(ModuleFixSkip::Interrupted);
+                return Err(ModuleFixSkip::ProgramChanged);
             }
-        }
-
-        if let Some((guard, budget)) = owned {
-            let deadline = Instant::now() + budget;
-            guard.update("a module start or operator approval", deadline);
-            row.restart = Some(match daemon.start(id, deadline, &guard) {
-                Ok(()) => ModuleRestart::Enabled,
-                Err(error) => {
-                    warnings.push(diagnostic(
-                        "restart_failed",
-                        Some(id),
-                        Severity::Warning,
-                        "Could not restore the module's enabled state",
-                        json!({"error": error}),
-                    ));
-                    ModuleRestart::Failed
+            let Some(_guard) = programs.interrupt.protect("a module fix", deadline) else {
+                return Err(ModuleFixSkip::Interrupted);
+            };
+            row.decision = ModuleFixDecision::Applied;
+            let result = runner::fix(
+                &program.path,
+                finding.id(),
+                plan.digest(),
+                plan.timeout_ms(),
+                program.mode,
+                options,
+            );
+            // The terminal sends its interrupt to the foreground fix process,
+            // so the doctor CLI must latch the signal from the fix's exit status.
+            if let Err(RunError::Crashed(Crash::Signal(signal))) = &result {
+                if *signal == Signal::INT.as_raw() || *signal == Signal::QUIT.as_raw() {
+                    programs.interrupt.on_signal(*signal);
                 }
-            });
-        }
-        skip
+            }
+            row.result = Some(fix_result(result));
+            Ok(())
+        });
+        row.restart = restart;
+        result.err()
     }
 
     fn fix_result(
@@ -400,13 +380,78 @@ mod unix {
             .saturating_add(operator)
     }
 
-    struct Daemon<'a> {
+    pub(in crate::doctor) struct Daemon<'a> {
         host: &'a Arc<dyn DoctorHost>,
         current: Option<Arc<dyn DoctorDaemon>>,
         rpc_budget: Duration,
     }
 
-    impl Daemon<'_> {
+    impl<'a> Daemon<'a> {
+        pub(in crate::doctor) fn new(
+            host: &'a Arc<dyn DoctorHost>,
+            current: Option<Arc<dyn DoctorDaemon>>,
+            rpc_budget: Duration,
+        ) -> Self {
+            Self {
+                host,
+                current,
+                rpc_budget,
+            }
+        }
+
+        /// Restore an owned stop before returning, even if the action fails or a signal arrives.
+        pub(in crate::doctor) fn with_stopped<T>(
+            &mut self,
+            programs: &Programs<'_>,
+            id: &str,
+            entry: Option<&SupervisorEntry>,
+            warnings: &mut Vec<Finding>,
+            action: impl FnOnce(Option<&Guard<'_>>) -> Result<T, ModuleFixSkip>,
+        ) -> (Result<T, ModuleFixSkip>, Option<ModuleRestart>) {
+            let mut owned = None;
+            let mut may_run = true;
+            if let Some(entry) = entry.filter(|entry| entry.enabled) {
+                let budget = mutation_budget(entry, programs.operator_budget);
+                let deadline = Instant::now() + budget;
+                let Some(guard) = programs
+                    .interrupt
+                    .protect("a module stop or operator approval", deadline)
+                else {
+                    return (Err(ModuleFixSkip::Interrupted), None);
+                };
+                let (owns_stop, stopped) = self.stop(id, deadline, &guard, programs);
+                may_run = stopped;
+                if owns_stop {
+                    owned = Some((guard, budget));
+                }
+            }
+            let result = if programs.interrupt.signal().is_some() {
+                Err(ModuleFixSkip::Interrupted)
+            } else if !may_run {
+                Err(ModuleFixSkip::StopFailed)
+            } else {
+                action(owned.as_ref().map(|(guard, _)| guard))
+            };
+            let restart = owned.map(|(guard, budget)| {
+                let deadline = Instant::now() + budget;
+                guard.update("a module start or operator approval", deadline);
+                match self.start(id, deadline, &guard) {
+                    Ok(()) => ModuleRestart::Enabled,
+                    Err(error) => {
+                        warnings.push(diagnostic(
+                            "restart_failed",
+                            Some(id),
+                            Severity::Warning,
+                            "Could not restore the module's enabled state",
+                            json!({"error": error}),
+                        ));
+                        ModuleRestart::Failed
+                    }
+                }
+            });
+            (result, restart)
+        }
+
         fn replace(&mut self, guard: Option<&Guard<'_>>, cutoff: Option<Instant>) {
             self.current = None;
             let deadline = Instant::now() + RECONNECT_LIMIT;
@@ -438,7 +483,7 @@ mod unix {
                 .find(|entry| entry.module_id == id)
         }
 
-        fn entry(&mut self, id: &str) -> Option<SupervisorEntry> {
+        pub(in crate::doctor) fn entry(&mut self, id: &str) -> Option<SupervisorEntry> {
             self.list_entry(id, Instant::now() + self.rpc_budget, None)
         }
 

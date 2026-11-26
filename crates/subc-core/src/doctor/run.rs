@@ -8,6 +8,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(unix)]
+use cortexkit_doctor::Mode;
 use serde_json::json;
 
 use crate::stack::MarkerState;
@@ -64,7 +66,7 @@ pub fn run_with_programs(
     let options = effective_options(options);
     let host = SystemHost::default();
     #[cfg(unix)]
-    let host = if options.fix {
+    let host = if options.fix || (programs.mode == Mode::Full && programs.full_feedback) {
         // The SDK's connection-wide timeout must not cut off a long drain or
         // operator prompt. The host still bounds each call by its own deadline.
         let call_timeout = Duration::from_millis(u64::MAX)
@@ -141,18 +143,46 @@ pub(super) fn run_with_programs_on(
         };
         return pass.program_report(path, None, Some(2));
     }
+    #[cfg(unix)]
+    let asked = std::cell::RefCell::new(std::collections::BTreeSet::new());
     let check = || {
+        #[cfg(unix)]
+        if programs.mode == Mode::Full {
+            let mut pass = pass(&host, &logs, path.clone(), limits, true);
+            let checks = program_checks::check_all(
+                config,
+                path.as_deref(),
+                programs.interrupt,
+                Instant::now(),
+                Some(program_checks::FullChecks {
+                    programs: &programs,
+                    daemon: super::program_fixes::Daemon::new(
+                        &host,
+                        pass.daemon.clone(),
+                        limits.rpc,
+                    ),
+                    asked: &mut asked.borrow_mut(),
+                }),
+            );
+            pass.add_program_checks(checks);
+            return pass;
+        }
         thread::scope(|scope| {
             let start = Instant::now();
             let override_path = path.as_deref();
             let interrupt = programs.interrupt;
-            let checks = scope
-                .spawn(move || program_checks::check_all(config, override_path, interrupt, start));
+            let checks = scope.spawn(move || {
+                program_checks::check_all(
+                    config,
+                    override_path,
+                    interrupt,
+                    start,
+                    #[cfg(unix)]
+                    None,
+                )
+            });
             let mut pass = pass(&host, &logs, path.clone(), limits, options.fix);
-            let mut checks = checks.join().expect("program check worker panicked");
-            pass.findings.append(&mut checks.findings);
-            Finding::sort(&mut pass.findings);
-            pass.programs = Some(checks);
+            pass.add_program_checks(checks.join().expect("program check worker panicked"));
             pass
         })
     };
@@ -243,6 +273,12 @@ pub(super) struct Pass {
 }
 
 impl Pass {
+    fn add_program_checks(&mut self, mut checks: ProgramChecks) {
+        self.findings.append(&mut checks.findings);
+        Finding::sort(&mut self.findings);
+        self.programs = Some(checks);
+    }
+
     #[cfg(unix)]
     fn checked(&self) -> &[CheckedProgram] {
         self.programs

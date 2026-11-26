@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 const CK: &str = env!("CARGO_BIN_EXE_ck-under-test");
 const FIXTURE: &str = env!("CARGO_BIN_EXE_doctor-module-fixture");
 const FIX_PROMPT: &str = "Apply this fix? [y/N]";
+const DEEP_STOP_PROMPT: &str = "Stop blocked for up to 30 minutes to finish its deep checks? Agents that use it wait until it is back.";
 const TITLE_PROMPT: &str = "Issue title (required):";
 const DESCRIPTION_PROMPT: &str = "Issue description (optional):";
 const ISSUE_PROMPT: &str = "File this report as a public issue";
@@ -1250,6 +1251,221 @@ fn supervisor_row(id: &str, state: &str, live: bool) -> subc_control::Supervisor
         subc_control::SupervisorHealthStatus::Unknown,
     )
     .with_drain_timeout_ms(Some(200))
+}
+
+#[test]
+fn doctor_full_json_reports_the_mode_that_ran_without_stopping() {
+    let mut rig = Rig::new();
+    let old = rig.program("old", json!({"check": "clean"}));
+    let blocked = rig.program(
+        "blocked",
+        json!({"full": "findings", "finding": "store.in_use"}),
+    );
+    rig.entries.insert(
+        "skipped".into(),
+        json!({"program": old, "protocol": "none"}),
+    );
+    let daemon = WireDaemon::start(
+        &rig,
+        Some(supervisor_row("blocked", "running", true)),
+        StartReply::Ack,
+    );
+    let (stdout, dialogue) = Tty::start(&rig.command(&["doctor", "--full", "--json"])).finish(1);
+    let report: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(report["schema"], "ck.doctor.report/v1");
+    assert_eq!(
+        report["modules"],
+        json!([
+            {"id":"blocked","outcome":"findings","findings":1,"detail":null,"mode":"full"},
+            {"id":"old","outcome":"clean","findings":0,"detail":"full_not_supported","mode":"quick"},
+            {"id":"skipped","outcome":"not_asked","findings":0,"detail":"protocol_none"},
+        ])
+    );
+    assert!(report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["id"] == "store.in_use"));
+    assert!(!dialogue.contains(DEEP_STOP_PROMPT), "{dialogue}");
+    assert!(daemon.enabled_calls().is_empty());
+    assert!(rig.stage(&old, "check.finished").is_file());
+    assert!(!rig.stage(&blocked, "check.started").exists());
+}
+
+#[test]
+fn doctor_full_noninteractive_never_stops() {
+    let mut rig = Rig::new();
+    rig.program(
+        "blocked",
+        json!({"full": "findings", "finding": "store.in_use"}),
+    );
+    let daemon = WireDaemon::start(
+        &rig,
+        Some(supervisor_row("blocked", "running", true)),
+        StartReply::Ack,
+    );
+    let output = rig.output(&["doctor", "--full"]);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output.stderr));
+    assert!(text(&output.stdout).contains("store.in_use [blocked]"));
+    assert!(!text(&output.stderr).contains(DEEP_STOP_PROMPT));
+    assert!(daemon.enabled_calls().is_empty());
+}
+
+#[test]
+fn doctor_full_runs_one_at_a_time_and_uses_the_check_mode_for_fixes() {
+    let mut rig = Rig::new();
+    let first = rig.program(
+        "a",
+        json!({"full": "findings", "wait_stage": "full", "clean_after_fix": true}),
+    );
+    let later = rig.program("b", json!({"clean_after_fix": true}));
+    let quick = rig.output(&["doctor", "--json"]);
+    assert_eq!(quick.status.code(), Some(1), "{}", text(&quick.stderr));
+    let quick: Value = serde_json::from_slice(&quick.stdout).unwrap();
+    assert_eq!(
+        quick["modules"],
+        json!([
+            {"id":"a","outcome":"findings","findings":1,"detail":null},
+            {"id":"b","outcome":"findings","findings":1,"detail":null},
+        ])
+    );
+    assert!(rig.stage(&first, "check.finished").is_file());
+    assert!(!rig.stage(&first, "full.started").exists());
+    fs::remove_file(rig.stage(&later, "check.started")).unwrap();
+
+    let mut tty = Tty::start(&rig.command(&["doctor", "--full", "--fix"]));
+    rig.pid(&first, "full.started");
+    tty.expect("of up to 30 min", 2);
+    let dialogue = tty.read_terminal();
+    let mut progress = dialogue
+        .lines()
+        .filter(|line| line.starts_with("Checking a in full, "));
+    assert_ne!(progress.next().unwrap(), progress.next().unwrap());
+    assert!(!rig.stage(&later, "check.started").exists());
+    fs::write(rig.stage(&first, "full.release"), []).unwrap();
+    tty.expect(FIX_PROMPT, 1);
+    tty.send("y\n");
+    tty.expect(FIX_PROMPT, 2);
+    tty.send("y\n");
+    let (stdout, _) = tty.finish(1);
+    assert!(stdout.contains("full checks are not supported"), "{stdout}");
+    assert!(rig.stage(&first, "fix-full.finished").is_file());
+    assert!(!rig.stage(&first, "fix.started").exists());
+    assert!(rig.stage(&later, "fix.finished").is_file());
+    assert!(!rig.stage(&later, "fix-full.started").exists());
+}
+
+#[test]
+fn doctor_full_restores_after_success_failure_and_ctrl_c() {
+    for (retry, interrupt) in [("clean", false), ("crash", false), ("clean", true)] {
+        let mut rig = Rig::new();
+        let program = rig.program(
+            "blocked",
+            json!({
+                "full": "findings", "finding": "store.in_use", "full_retry": retry,
+                "wait_stage": "full-retry",
+            }),
+        );
+        let later = rig.program("later", json!({"full": "clean"}));
+        let daemon = WireDaemon::start(
+            &rig,
+            Some(supervisor_row("blocked", "running", true)),
+            StartReply::Ack,
+        );
+        let mut tty = Tty::start(&rig.command(&["doctor", "--full"]));
+        tty.expect(DEEP_STOP_PROMPT, 1);
+        assert!(daemon.enabled_calls().is_empty());
+        tty.send("y\n");
+        let pid = rig.pid(&program, "full-retry.started");
+        assert_eq!(daemon.enabled_calls(), [false]);
+        if interrupt {
+            assert_eq!(tty.foreground(), Some(tty.pid()));
+            tty.send("\x03");
+            tty.expect("The module will restart as soon as its check stops", 1);
+            tty.send("\x03");
+            assert_eq!(daemon.enabled_calls(), [false]);
+        }
+        fs::write(rig.stage(&program, "full-retry.release"), []).unwrap();
+        let (stdout, dialogue) = tty.finish(if interrupt { 130 } else { 1 });
+        assert_eq!(daemon.enabled_calls(), [false, true]);
+        assert_eq!(dialogue.matches(DEEP_STOP_PROMPT).count(), 1);
+        assert!(!stdout.contains("store.in_use [blocked]"), "{stdout}");
+        assert_eq!(
+            stdout.contains("module_program.crashed [blocked]"),
+            retry == "crash",
+            "{stdout}"
+        );
+        assert_eq!(rig.stage(&later, "full.started").exists(), !interrupt);
+        assert!(!rig.stage(&program, "check.started").exists());
+        if interrupt {
+            assert_eq!(
+                dialogue
+                    .matches("The module will restart as soon as its check stops")
+                    .count(),
+                1
+            );
+            assert!(dialogue.contains("up to "), "{dialogue}");
+        }
+        assert_gone(pid);
+    }
+}
+
+#[test]
+fn doctor_full_decline_keeps_store_in_use() {
+    let mut rig = Rig::new();
+    let program = rig.program(
+        "blocked",
+        json!({"full": "findings", "finding": "store.in_use"}),
+    );
+    let daemon = WireDaemon::start(
+        &rig,
+        Some(supervisor_row("blocked", "running", true)),
+        StartReply::Ack,
+    );
+    let mut tty = Tty::start(&rig.command(&["doctor", "--full"]));
+    tty.expect(DEEP_STOP_PROMPT, 1);
+    tty.send("n\n");
+    let (stdout, dialogue) = tty.finish(1);
+    assert_eq!(dialogue.matches(DEEP_STOP_PROMPT).count(), 1);
+    assert!(stdout.contains("store.in_use [blocked]"), "{stdout}");
+    assert!(!rig.stage(&program, "full-retry.started").exists());
+    assert!(daemon.enabled_calls().is_empty());
+}
+
+#[test]
+fn doctor_full_does_not_ask_again_when_rechecking_after_fix() {
+    let mut rig = Rig::new();
+    let program = rig.program(
+        "blocked",
+        json!({"full": "findings", "finding": "store.in_use"}),
+    );
+    let daemon = WireDaemon::start(
+        &rig,
+        Some(supervisor_row("blocked", "running", true)),
+        StartReply::Ack,
+    );
+    let mut tty = Tty::start(&rig.command(&["doctor", "--full", "--fix"]));
+    tty.expect(DEEP_STOP_PROMPT, 1);
+    tty.send("n\n");
+    tty.expect(FIX_PROMPT, 1);
+    tty.send("y\n");
+    let (stdout, dialogue) = tty.finish(1);
+    assert_eq!(dialogue.matches(DEEP_STOP_PROMPT).count(), 1);
+    assert_eq!(dialogue.matches("Checking blocked in full, 0 s").count(), 2);
+    assert!(stdout.contains("store.in_use [blocked]"), "{stdout}");
+    assert!(rig.stage(&program, "fix-full.finished").is_file());
+    assert!(daemon.enabled_calls().is_empty());
+}
+
+#[test]
+fn doctor_full_help_names_the_flag_and_limit() {
+    let output = Rig::new().output(&["doctor", "--help"]);
+    assert!(output.status.success());
+    let stdout = text(&output.stdout);
+    assert!(stdout.lines().any(|line| line
+        == "  ck doctor [--json] [--report <file>] [--full] [--fix] [--subc <connection-file>]"));
+    assert!(stdout.lines().any(|line| line
+        == "  --full           run deep checks one module at a time (up to 30 minutes each)"));
 }
 
 #[test]

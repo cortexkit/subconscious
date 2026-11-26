@@ -1,0 +1,49 @@
+{
+  "epoch": 7,
+  "identity": {
+    "harness": "fed-phone:0123456789abcdef0123456789abcdef",
+    "session": "phone-session-7"
+  },
+  "op": "route.bind",
+  "principal": {
+    "kind": "reserved",
+    "module_id": "callosum"
+  },
+  "route_channel": 42,
+  "scope": {
+    "attributes": {
+      "federated": {
+        "pairing_id": "pairing:phone-7",
+        "peer_class": "phone",
+        "peer_fingerprint": "0123456789abcdef0123456789abcdef",
+        "peer_name": "Example Phone",
+        "remote_claim": {
+          "agent_id": "remote-agent",
+          "agent_name": "Remote Agent",
+          "kind": "agent"
+        }
+      }
+    },
+    "kind": "federated",
+    "owner": {
+      "kind": "reserved",
+      "module_id": "callosum"
+    },
+    "owner_authorized": false,
+    "parent": {
+      "owner": {
+        "kind": "reserved",
+        "module_id": "callosum"
+      },
+      "ref": "fed-base:0123456789abcdef0123456789abcdef:pairing:phone-7",
+      "scope_epoch": 7
+    },
+    "parent_state": "linked",
+    "ref": "fed-call:0123456789abcdef0123456789abcdef:pairing:phone-7",
+    "scope_epoch": 8
+  },
+  "target": {
+    "kind": "tool_provider",
+    "module_id": "colliculus"
+  }
+}

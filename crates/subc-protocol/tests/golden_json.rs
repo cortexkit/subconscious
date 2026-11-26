@@ -16,9 +16,10 @@ use subc_protocol::{
         SelfSignalKind, SignalAnchor, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
     },
     scope::{
-        ParentState, ScopeAttributes, ScopeCarrier, ScopeEnd, ScopeEndOutcome, ScopeEndResult,
-        ScopeEnded, ScopeKind, ScopeParent, ScopeRecord, ScopeRecordOutcome, ScopeRecordResult,
-        ScopeStamp, ScopeStatus,
+        FederatedAttributes, FederatedPeerClass, ParentState, RemoteClaim, ScopeAttributes,
+        ScopeCarrier, ScopeEnd, ScopeEndOutcome, ScopeEndResult, ScopeEnded, ScopeKind,
+        ScopeParent, ScopeRecord, ScopeRecordOutcome, ScopeRecordResult, ScopeStamp, ScopeStatus,
+        SCOPE_FEDERATED_CAPABILITY,
     },
     session::{
         HealthStatus, ModuleControlCommand, ModuleControlPush, ModuleControlRequest,
@@ -620,6 +621,74 @@ fn route_bind_peer_keys_match_golden_json_and_round_trip() {
     assert!(
         encode_route_bind(&ModuleControlRequest::HealthCheck {}, &RouteBindPeer::new()).is_err()
     );
+}
+
+/// A target declaring `scope-federated/v1` receives the pairing facts in the
+/// scope stamp while the daemon-verified route principal remains Callosum.
+#[test]
+fn federated_scope_route_binds_match_golden_json_and_round_trip() {
+    assert_eq!(SCOPE_FEDERATED_CAPABILITY, "scope-federated/v1");
+    for (name, claim) in [
+        (
+            "module_control_request_route_bind_with_federated_scope",
+            None,
+        ),
+        (
+            "module_control_request_route_bind_with_federated_scope_agent_claim",
+            Some(RemoteClaim::agent("remote-agent").with_agent_name("Remote Agent")),
+        ),
+    ] {
+        let has_claim = claim.is_some();
+        let bind = module_control_request_with_federated_scope(claim);
+        let actual = assert_route_bind_golden(name, &bind, &RouteBindPeer::new());
+        assert_eq!(
+            actual["principal"],
+            serde_json::json!({"kind": "reserved", "module_id": "callosum"})
+        );
+        assert_eq!(actual["target"]["module_id"], "colliculus");
+        assert_eq!(actual["scope"]["parent_state"], "linked");
+        assert_eq!(actual["scope"]["owner_authorized"], false);
+        let federated = &actual["scope"]["attributes"]["federated"];
+        assert_eq!(federated["peer_class"], "phone");
+        assert_eq!(federated.get("remote_claim").is_some(), has_claim);
+    }
+}
+
+/// Compares the encoded bind with the golden file as JSON values, like the
+/// other goldens here: object key order follows serde_json's map feature,
+/// which the whole-workspace test build may switch to insertion order.
+fn assert_route_bind_golden(
+    name: &str,
+    bind: &ModuleControlRequest,
+    peer: &RouteBindPeer,
+) -> Value {
+    let encoded = encode_route_bind(bind, peer).unwrap();
+    let actual: Value = serde_json::from_slice(&encoded).unwrap();
+    let path = golden_path(name);
+    if std::env::var_os("UPDATE_GOLDEN").is_some() {
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string_pretty(&actual).unwrap()),
+        )
+        .unwrap();
+    }
+    let expected: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        actual, expected,
+        "golden JSON drift for {name}; rerun with UPDATE_GOLDEN=1 only after reviewing the wire change"
+    );
+
+    // A target decodes the same body as the exhaustive bind and as the extra
+    // peer view. The federated facts themselves are in the bind's ScopeStamp.
+    let decoded_bind: ModuleControlRequest = serde_json::from_value(expected.clone()).unwrap();
+    assert_eq!(&decoded_bind, bind);
+    let decoded_peer: RouteBindPeer = serde_json::from_value(expected).unwrap();
+    assert_eq!(&decoded_peer, peer);
+    assert_eq!(
+        encode_route_bind(&decoded_bind, &decoded_peer).unwrap(),
+        encoded
+    );
+    actual
 }
 
 #[test]
@@ -1681,6 +1750,54 @@ fn module_control_request_with_scope() -> ModuleControlRequest {
                     .with_delegates(true),
             )
             .with_owner_authorized(true),
+        ),
+        call_mode: None,
+    }
+}
+
+fn module_control_request_with_federated_scope(
+    remote_claim: Option<RemoteClaim>,
+) -> ModuleControlRequest {
+    const FINGERPRINT: &str = "0123456789abcdef0123456789abcdef";
+    const PAIRING_ID: &str = "pairing:phone-7";
+    let callosum = || Principal::Reserved {
+        module_id: "callosum".to_string(),
+    };
+    let federated = FederatedAttributes::new(
+        FederatedPeerClass::Phone,
+        FINGERPRINT.to_string(),
+        PAIRING_ID.to_string(),
+        "Example Phone".to_string(),
+    )
+    .with_remote_claim(remote_claim);
+    federated.validate().unwrap();
+
+    ModuleControlRequest::RouteBind {
+        route_channel: 42,
+        epoch: 7,
+        target: RouteTarget::ToolProvider {
+            module_id: "colliculus".to_string(),
+        },
+        identity: BindIdentity::new(format!("fed-phone:{FINGERPRINT}"), "phone-session-7"),
+        principal: Some(callosum()),
+        consumer_capabilities: None,
+        role_versions: None,
+        admission_facts: None,
+        scope: Some(
+            ScopeStamp::new(
+                callosum(),
+                format!("fed-call:{FINGERPRINT}:{PAIRING_ID}"),
+                8,
+                ScopeKind::Federated,
+            )
+            .with_parent(Some(ScopeParent::new(
+                callosum(),
+                format!("fed-base:{FINGERPRINT}:{PAIRING_ID}"),
+                7,
+            )))
+            .with_parent_state(Some(ParentState::Linked))
+            .with_attributes(ScopeAttributes::new().with_federated(Some(federated)))
+            .with_owner_authorized(false),
         ),
         call_mode: None,
     }

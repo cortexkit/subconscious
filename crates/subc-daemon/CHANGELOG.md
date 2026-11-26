@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.52.2
+
+- Test-only: pause the settings integrity poller during slow-retry recovery tests so it cannot delay retry admission.
+
 ## 0.52.1
 
 - Log each scope ended by an accepted sync or apply, including its cause and route count.

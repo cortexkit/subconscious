@@ -148,23 +148,29 @@ async fn recovery_slow_retry_roundtrip(
     let before = module.status().unwrap();
     let deadline = module.retry_deadline_for_test();
     let (idle, mut idles) = tokio::sync::mpsc::unbounded_channel();
+    let (settings_idle, mut settings_idles) = tokio::sync::mpsc::unbounded_channel();
     let handler = Arc::new(
         crate::ControlHandler::with_forwarding(registry, forwarding)
             .with_supervisor(handle)
             .with_config_runtime(owner.clone())
-            .with_delivery_idle_for_test(idle),
+            .with_delivery_idle_for_test(idle)
+            .with_settings_poll_idle_for_test(settings_idle),
     );
     let worker = handler.spawn_config_delivery_worker().unwrap();
-    let mut resume_worker = None;
     wait_for("recovery worker completed its owner check and hold", || {
-        resume_worker = idles.try_recv().ok();
-        resume_worker.is_some()
+        !idles.is_empty()
     })
     .await;
-    // A wake is not an idle boundary: a blocking owner check can still be in
-    // flight. Keep the worker paused after its real recovery hold has replied.
-    // Otherwise the retry may legitimately defer for 100 ms while this fixture
-    // freezes the clock waiting for a direct park.
+    let resume_worker = idles.try_recv().unwrap();
+    // The coordinator's idle signal does not stop the separate integrity poller.
+    // A clock jump would wake it alongside the retry; if it takes the owner lock
+    // first, admission defers for 100 ms while the test waits for the retry to
+    // park without advancing time again.
+    wait_for("settings poll released the owner lock", || {
+        !settings_idles.is_empty()
+    })
+    .await;
+    let resume_settings = settings_idles.try_recv().unwrap();
     module.config_exit_hold().await.unwrap();
     if refused_before_retry {
         assert!(matches!(
@@ -236,9 +242,13 @@ async fn recovery_slow_retry_roundtrip(
     assert_eq!(after.lifetime_restarts, before.lifetime_restarts);
     assert_eq!(after.restart_count, 0);
     assert!(module.next_retry_at_ms().unwrap().is_none());
+    assert!(
+        !resume_settings.is_closed(),
+        "settings poll must stay paused"
+    );
     worker.abort();
     let _ = worker.await;
-    drop(resume_worker);
+    drop((resume_worker, resume_settings));
     if release_after_park {
         // A hold notification from the daemon must not make this parked retry
         // count as a new attempt requested by the operator.

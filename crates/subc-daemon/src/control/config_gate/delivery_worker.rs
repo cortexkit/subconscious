@@ -55,6 +55,15 @@ impl ControlHandler {
         self.config_delivery_test_idle = Some(idle);
         self
     }
+    /// Pause the independent settings poller after its integrity check releases the owner lock.
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_settings_poll_idle_for_test(
+        mut self,
+        idle: tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>,
+    ) -> Self {
+        self.settings_poll_test_idle = Some(idle);
+        self
+    }
     #[cfg(all(test, unix))]
     pub(crate) async fn record_config_exit_for_test(
         self: &Arc<Self>,
@@ -445,6 +454,13 @@ async fn poll_settings(handler: std::sync::Weak<ControlHandler>, projects: bool)
                 let Some(control) = handler.upgrade() else { break };
                 let Some(owner) = &control.config_runtime else { break };
                 let _ = owner.on_blocking(|owner| owner.poll_store_integrity()).await;
+                #[cfg(all(test, unix))]
+                if let Some(idle) = &control.settings_poll_test_idle {
+                    let (resume, released) = tokio::sync::oneshot::channel();
+                    if idle.send(resume).is_err() || released.await.is_err() {
+                        return;
+                    }
+                }
                 if projects && membership.is_empty() {
                     let owner = owner.clone();
                     // A slow registry RPC must not postpone the next integrity tick.

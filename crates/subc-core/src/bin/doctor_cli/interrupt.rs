@@ -41,10 +41,7 @@ pub(super) fn listen(interrupt: Arc<Interrupt>, terminal: Arc<Terminal>, fail_si
                     continue;
                 }
                 reported_check_wait = true;
-                format!(
-                    "\nInterrupted. The module will restart as soon as its check stops (up to {:.1} s remaining).\n",
-                    wait.remaining.as_secs_f64()
-                )
+                "\nInterrupted. Cancelling the full check before restarting the module.\n".into()
             } else {
                 format!(
                     "\nInterrupted; waiting for {} (up to {:.1} s remaining).\n",

@@ -374,7 +374,7 @@ impl FullChecks<'_> {
         let mut job = if let Some(_guard) = interrupt.protect("a full module check", deadline()) {
             Job::from_result(
                 identity,
-                wait_for_full_check(programs, id, path, options, limits.full_check),
+                wait_for_full_check(programs, id, path, options, limits.full_check, None),
             )
         } else {
             Job::NotStarted
@@ -401,13 +401,14 @@ impl FullChecks<'_> {
                                     return Err(ModuleFixSkip::ProgramChanged);
                                 }
                                 let _guard;
-                                if let Some(guard) = owned {
-                                    guard.wait_for_stopped_check(deadline());
+                                let cancel = if let Some(guard) = owned {
+                                    Some(guard.wait_for_stopped_check(deadline()))
                                 } else {
                                     _guard = interrupt
                                         .protect("a full module check", deadline())
                                         .ok_or(ModuleFixSkip::Interrupted)?;
-                                }
+                                    None
+                                };
                                 if interrupt.signal().is_some() {
                                     return Err(ModuleFixSkip::Interrupted);
                                 }
@@ -419,6 +420,7 @@ impl FullChecks<'_> {
                                         path,
                                         options,
                                         limits.full_check,
+                                        cancel.as_ref(),
                                     ),
                                 ))
                             });
@@ -445,17 +447,23 @@ fn wait_for_full_check(
     path: &Path,
     options: &runner::Options,
     limit: Duration,
+    cancel: Option<&runner::Cancel>,
 ) -> Result<cortexkit_doctor::CheckOutput, RunError> {
+    let run = || match cancel {
+        Some(cancel) => runner::check_cancellable(path, Mode::Full, options, cancel),
+        None => runner::check(path, Mode::Full, options),
+    };
     if !programs.full_feedback {
-        return runner::check(path, Mode::Full, options);
+        return run();
     }
-    // Only progress output runs alongside the check. Wait for the runner to
-    // clean up the check process before starting the next operation.
+    // The runner reaps the module's check process before returning, including after
+    // `check_cancellable` was cancelled.
+    // Never restart the module while its full check could still be running.
     let start = Instant::now();
     thread::scope(|scope| {
         let (send, receive) = mpsc::sync_channel(1);
         scope.spawn(move || {
-            let _ = send.send(runner::check(path, Mode::Full, options));
+            let _ = send.send(run());
         });
         loop {
             if programs.interrupt.signal().is_none() {
@@ -546,6 +554,7 @@ fn record(
             return;
         }
         Job::Failed(RunError::NoDoctor) => (ModuleOutcome::NoChecks, None, None),
+        Job::Failed(RunError::Cancelled) => (ModuleOutcome::Interrupted, None, None),
         // The child ran, but output we can't tie to a file identity is unusable.
         Job::IdentityUnavailable => (
             ModuleOutcome::InvalidOutput,

@@ -467,6 +467,12 @@ fn write_human(
     let modules = report.modules.as_deref().unwrap_or_default();
     for module in modules
         .iter()
+        .filter(|row| row.outcome == doctor::ModuleOutcome::Interrupted)
+    {
+        writeln!(out, "{}: full check interrupted.", module.id)?;
+    }
+    for module in modules
+        .iter()
         .filter(|row| row.mode == Some(ModuleCheckMode::Quick))
     {
         writeln!(

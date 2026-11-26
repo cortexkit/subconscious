@@ -802,9 +802,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-doctor"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f2de5896733426dec822dab02a4effd9681c6360257d50ec09158866a5bbc6e"
+checksum = "95196e710482160592f3a889195aebc026a98de300e72f9e5bc2023263c0219d"
 dependencies = [
  "cortexkit-log",
  "cortexkit-store-types",
@@ -820,9 +820,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-doctor-conformance"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "397102e571271e99864b732931e0091d84914ea231c7639e05421693da50c0cf"
+checksum = "d67908a436fbc0ded1c498f135cb6c640196805bd9cebe4b70248d2be0702d51"
 dependencies = [
  "cortexkit-doctor",
  "rustix",
@@ -3233,7 +3233,7 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.23.0"
+version = "0.23.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

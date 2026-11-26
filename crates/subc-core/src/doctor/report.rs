@@ -98,6 +98,7 @@ pub enum ModuleOutcome {
     SpawnFailed,
     Crashed,
     TimedOut,
+    Interrupted,
     InvalidOutput,
     NotStarted,
     NotAsked,

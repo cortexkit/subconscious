@@ -302,7 +302,8 @@ impl Tty {
             }
             assert!(
                 Instant::now() < deadline,
-                "did not see {count} x {needle:?}: {dialogue}"
+                "did not see {count} x {needle:?}\nterminal:\n{dialogue}\nstdout:\n{}",
+                fs::read_to_string(&self.stdout).unwrap_or_default(),
             );
             thread::sleep(Duration::from_millis(10));
         }
@@ -1356,8 +1357,8 @@ fn doctor_full_runs_one_at_a_time_and_uses_the_check_mode_for_fixes() {
 }
 
 #[test]
-fn doctor_full_restores_after_success_failure_and_ctrl_c() {
-    for (retry, interrupt) in [("clean", false), ("crash", false), ("clean", true)] {
+fn doctor_full_restores_after_success_and_failure() {
+    for retry in ["clean", "crash"] {
         let mut rig = Rig::new();
         let program = rig.program(
             "blocked",
@@ -1378,15 +1379,8 @@ fn doctor_full_restores_after_success_failure_and_ctrl_c() {
         tty.send("y\n");
         let pid = rig.pid(&program, "full-retry.started");
         assert_eq!(daemon.enabled_calls(), [false]);
-        if interrupt {
-            assert_eq!(tty.foreground(), Some(tty.pid()));
-            tty.send("\x03");
-            tty.expect("The module will restart as soon as its check stops", 1);
-            tty.send("\x03");
-            assert_eq!(daemon.enabled_calls(), [false]);
-        }
         fs::write(rig.stage(&program, "full-retry.release"), []).unwrap();
-        let (stdout, dialogue) = tty.finish(if interrupt { 130 } else { 1 });
+        let (stdout, dialogue) = tty.finish(1);
         assert_eq!(daemon.enabled_calls(), [false, true]);
         assert_eq!(dialogue.matches(DEEP_STOP_PROMPT).count(), 1);
         assert!(!stdout.contains("store.in_use [blocked]"), "{stdout}");
@@ -1395,19 +1389,72 @@ fn doctor_full_restores_after_success_failure_and_ctrl_c() {
             retry == "crash",
             "{stdout}"
         );
-        assert_eq!(rig.stage(&later, "full.started").exists(), !interrupt);
+        assert!(rig.stage(&later, "full.started").exists());
         assert!(!rig.stage(&program, "check.started").exists());
-        if interrupt {
-            assert_eq!(
-                dialogue
-                    .matches("The module will restart as soon as its check stops")
-                    .count(),
-                1
-            );
-            assert!(dialogue.contains("up to "), "{dialogue}");
-        }
         assert_gone(pid);
     }
+}
+
+#[test]
+fn doctor_full_ctrl_c_cancels_the_stopped_check_and_restarts_promptly() {
+    let mut rig = Rig::new();
+    let program = rig.program(
+        "blocked",
+        json!({"full": "findings", "finding": "store.in_use", "full_retry": "sleep"}),
+    );
+    let later = rig.program("later", json!({"full": "clean"}));
+    let daemon = WireDaemon::start(
+        &rig,
+        Some(supervisor_row("blocked", "running", true)),
+        StartReply::Ack,
+    );
+    let report_path = rig.root.join("report.json");
+    let mut tty = Tty::start(&rig.command(&["doctor", "--full", "--report", "report.json"]));
+    tty.expect(DEEP_STOP_PROMPT, 1);
+    tty.send("y\n");
+    let pid = rig.pid(&program, "full-retry.started");
+    assert_eq!(daemon.enabled_calls(), [false]);
+    assert_eq!(tty.foreground(), Some(tty.pid()));
+
+    // The helper sleeps for a minute. The bound allows the runner's two-second
+    // TERM-to-KILL grace period, but does not allow waiting for the helper to finish.
+    let deadline = Instant::now() + Duration::from_secs(6);
+    tty.send("\x03");
+    while daemon.enabled_calls() != [false, true] && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let restarted_promptly = daemon.enabled_calls() == [false, true];
+    if !restarted_promptly {
+        // A build that doesn't cancel the check on Ctrl-C leaves ck running; end the
+        // ck process this test started so the failure doesn't leave it behind.
+        let _ = kill_process(pid, Signal::TERM);
+    }
+    let (stdout, dialogue) = tty.finish(130);
+    assert!(
+        restarted_promptly,
+        "Ctrl-C did not restart the module within 6 s: {dialogue}"
+    );
+    assert_eq!(daemon.enabled_calls(), [false, true]);
+    assert!(dialogue.contains("Cancelling the full check"), "{dialogue}");
+    assert!(
+        stdout.contains("blocked: full check interrupted."),
+        "{stdout}"
+    );
+    assert_eq!(dialogue.matches(DEEP_STOP_PROMPT).count(), 1);
+    let report = document(&report_path);
+    assert_eq!(
+        report["modules"][0],
+        json!({
+            "id": "blocked", "outcome": "interrupted", "mode": "full", "findings": 0, "detail": null,
+        })
+    );
+    assert!(!report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["owner"] == "blocked" && row["layer"] == "module_program"));
+    assert!(!rig.stage(&later, "full.started").exists());
+    assert_gone(pid);
 }
 
 #[test]

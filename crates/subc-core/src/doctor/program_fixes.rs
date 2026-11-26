@@ -6,6 +6,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(unix)]
+use cortexkit_doctor::runner::Cancel;
+
 /// The caller's terminal dialogue. An unreadable answer counts as no.
 pub trait Prompter {
     fn interactive(&self) -> bool;
@@ -38,11 +41,24 @@ struct InterruptState {
     guards: BTreeMap<u64, Wait>,
 }
 
-#[derive(Clone, Copy)]
 struct Wait {
     operation: &'static str,
     deadline: Instant,
-    restart_after_check: bool,
+    #[cfg(unix)]
+    stopped_check: Option<Cancel>,
+}
+
+impl Wait {
+    fn restart_after_check(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.stopped_check.is_some()
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
 }
 
 /// What the signal listener can tell the person after latching a signal.
@@ -58,26 +74,32 @@ impl Interrupt {
     /// to exit immediately; a latched signal is never replaced or cleared.
     pub fn on_signal(&self, signal: i32) -> Option<WaitStatus> {
         let mut state = self.0.lock().unwrap();
-        let active = state
-            .guards
-            .values()
-            .max_by_key(|wait| wait.deadline)
-            .copied();
-        if state.signal.is_none() {
-            state.signal = active.map(|_| signal);
+        if state.signal.is_none() && !state.guards.is_empty() {
+            state.signal = Some(signal);
+            #[cfg(unix)]
+            for cancel in state
+                .guards
+                .values()
+                .filter_map(|wait| wait.stopped_check.as_ref())
+            {
+                cancel.cancel();
+            }
         }
-        state.signal.map(|_| match active {
-            Some(wait) => WaitStatus {
-                operation: wait.operation,
-                remaining: wait.deadline.saturating_duration_since(Instant::now()),
-                restart_after_check: wait.restart_after_check,
+        state.signal?;
+        Some(
+            match state.guards.values().max_by_key(|wait| wait.deadline) {
+                Some(wait) => WaitStatus {
+                    operation: wait.operation,
+                    remaining: wait.deadline.saturating_duration_since(Instant::now()),
+                    restart_after_check: wait.restart_after_check(),
+                },
+                _ => WaitStatus {
+                    operation: "the report",
+                    remaining: Duration::ZERO,
+                    restart_after_check: false,
+                },
             },
-            _ => WaitStatus {
-                operation: "the report",
-                remaining: Duration::ZERO,
-                restart_after_check: false,
-            },
-        })
+        )
     }
 
     pub fn signal(&self) -> Option<i32> {
@@ -102,7 +124,8 @@ impl Interrupt {
             Wait {
                 operation,
                 deadline,
-                restart_after_check: false,
+                #[cfg(unix)]
+                stopped_check: None,
             },
         );
         Some(Guard {
@@ -126,23 +149,32 @@ pub struct Guard<'a> {
 impl Guard<'_> {
     #[cfg(unix)]
     fn update(&self, operation: &'static str, deadline: Instant) {
-        self.set_wait(operation, deadline, false);
+        self.set_wait(operation, deadline, None);
     }
 
     #[cfg(unix)]
-    pub(super) fn wait_for_stopped_check(&self, deadline: Instant) {
-        self.set_wait("a full module check", deadline, true);
+    pub(super) fn wait_for_stopped_check(&self, deadline: Instant) -> Cancel {
+        let cancel = Cancel::new();
+        self.set_wait("a full module check", deadline, Some(cancel.clone()));
+        cancel
     }
 
     #[cfg(unix)]
-    fn set_wait(&self, operation: &'static str, deadline: Instant, restart_after_check: bool) {
+    fn set_wait(&self, operation: &'static str, deadline: Instant, stopped_check: Option<Cancel>) {
         let mut state = self.interrupt.0.lock().unwrap();
+        // If Ctrl-C arrived while ck was stopping the module, cancel the full check now,
+        // before the runner can launch it.
+        if state.signal.is_some() {
+            if let Some(cancel) = &stopped_check {
+                cancel.cancel();
+            }
+        }
         state.guards.insert(
             self.id,
             Wait {
                 operation,
                 deadline,
-                restart_after_check,
+                stopped_check,
             },
         );
     }

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.23.1
+
+- Cancel a stopped module's full doctor check on Ctrl-C and restart the module
+  after the check process is reaped, without waiting for the check's deadline.
+
 ## 0.23.0
 
 - Add `ck doctor --full` via cortexkit-doctor 0.3.0. Full module checks run one

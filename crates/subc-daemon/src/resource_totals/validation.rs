@@ -577,7 +577,7 @@ mod tests {
         assert_eq!(module.finish_key(stepped, &live), Some(root));
         assert_eq!(module.finish_key(root, &live), Some(root));
         let reused = sample(6);
-        assert_eq!(module.finish_key(root, &reused), None);
+        assert_eq!(module.finish_key(root, &reused), Some(root));
         assert_eq!(module.finish_key(stepped, &reused), None);
         let unreadable =
             ProcessTable::from_test_members(2, 1_002_110, vec![], vec![(root.pid, None, None)]);

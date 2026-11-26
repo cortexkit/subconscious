@@ -101,6 +101,41 @@ const CPU_IDENTITY_LIMIT: usize = 1_024;
 mod stopped_group_tests {
     use super::*;
 
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn finish_matches_a_pinned_exit_even_when_the_snapshot_is_unreadable() {
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/D", "/C", "more"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let process = Arc::new(subc_os::Process::open(pid).unwrap().unwrap());
+        let native_start = process.observe().unwrap().start_time;
+        let root = AgentCommandRoot {
+            pid,
+            start_time_ms: subc_os::process_start_time_ms(pid).unwrap(),
+        };
+        let mut module = Module::default();
+        module.roots.insert(
+            root,
+            Command {
+                native_start,
+                process: Some(process),
+                ..Command::default()
+            },
+        );
+        // A process can be enumerated before it exits, then be unreadable when sampled.
+        let unreadable =
+            ProcessTable::from_test_members(1, now_ms(), vec![], vec![(pid, None, None)]);
+        let before_exit = module.finish_key(root, &unreadable);
+        drop(child.stdin.take());
+        assert!(child.wait().unwrap().success());
+        assert_eq!(before_exit, None);
+        assert_eq!(module.finish_key(root, &unreadable), Some(root));
+    }
+
     #[test]
     fn wall_clock_rollback_keeps_a_declared_live_root() {
         struct Child(std::process::Child);

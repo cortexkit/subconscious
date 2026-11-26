@@ -719,6 +719,15 @@ mod unix {
             let _ = self.running.subscribe().wait_for(Option::is_none).await;
         }
 
+        #[cfg(all(
+            test,
+            feature = "test-support",
+            any(target_os = "linux", target_os = "macos")
+        ))]
+        pub(crate) async fn wait_for_settings_idle(&self) {
+            drop(self.settings.write().await);
+        }
+
         pub(super) fn settings_operation(&self) -> Result<OwnedRwLockReadGuard<()>, ErrorBody> {
             self.settings
                 .clone()

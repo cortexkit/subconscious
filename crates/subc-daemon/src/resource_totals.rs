@@ -1841,15 +1841,31 @@ impl Module {
                 pid: root.pid,
                 start_time_ms: member.start_time_ms,
             };
-            return self.roots.iter().find_map(|(key, command)| {
+            if let Some(key) = self.roots.iter().find_map(|(key, command)| {
                 (key.pid == root.pid
                     && command.native_start == member.start_time
                     && (same_epoch(*key, root) || same_epoch(fresh, root)))
                 .then_some(*key)
-            });
+            }) {
+                return Some(key);
+            }
         }
-        if table.identity_alive(root.pid, 0) == Some(false) {
-            return self.trusted_key(root);
+        // A gone or reused PID can only match the originally recorded start time.
+        let key = self.trusted_key(root)?;
+        let command = &self.roots[&key];
+        if table.identity_alive(root.pid, command.native_start) == Some(false) {
+            return Some(key);
+        }
+        #[cfg(windows)]
+        // The table may list a process that exited before it could be sampled.
+        // Its retained process handle can confirm exit even when the table cannot.
+        if command.root_exited
+            || command
+                .process
+                .as_ref()
+                .is_some_and(|process| process.wait_for_exit(Duration::ZERO).ok() == Some(true))
+        {
+            return Some(key);
         }
         None
     }

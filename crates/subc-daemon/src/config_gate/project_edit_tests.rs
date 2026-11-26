@@ -565,17 +565,13 @@ async fn stalled_project_write_keeps_upgrade_out_after_waiter_expires() {
     );
     let (entered, reached) = tokio::sync::oneshot::channel();
     let entered = Mutex::new(Some(entered));
-    let (published, wrote) = tokio::sync::oneshot::channel();
+    let (published, publication_seen) = tokio::sync::oneshot::channel();
     let published_file = Mutex::new(Some(published));
     let (release, hold) = std::sync::mpsc::channel();
     let hold = Mutex::new(hold);
     *rig.owner.project_write_hook.lock().unwrap() = Some(Arc::new(move |published| {
         if !published {
             entered.lock().unwrap().take().unwrap().send(()).unwrap();
-            hold.lock()
-                .unwrap()
-                .recv_timeout(Duration::from_secs(10))
-                .unwrap();
         } else {
             published_file
                 .lock()
@@ -585,6 +581,10 @@ async fn stalled_project_write_keeps_upgrade_out_after_waiter_expires() {
                 .send(())
                 .unwrap();
         }
+        hold.lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
         Ok(())
     }));
     let daemon = root(&rig.project_scratch, "upgrade-daemon");
@@ -658,6 +658,17 @@ async fn stalled_project_write_keeps_upgrade_out_after_waiter_expires() {
             .unwrap()
             .unwrap()
     }
+    fn assert_settings_busy(reply: crate::Frame) {
+        assert_eq!(
+            reply.header.ty,
+            subc_protocol::FrameType::Error,
+            "the upgrade must not begin while the settings writer is blocked: {}",
+            String::from_utf8_lossy(&reply.body)
+        );
+        let refused: subc_protocol::ErrorBody = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(refused.code, "upgrade_busy");
+        assert_eq!(refused.detail.unwrap()["reason"], "settings");
+    }
     crate::write_frame(
         &mut client,
         &request(
@@ -697,21 +708,14 @@ async fn stalled_project_write_keeps_upgrade_out_after_waiter_expires() {
         .await
         .unwrap()
         .unwrap();
-    let upgrade = request(
-        12,
-        serde_json::json!({"op":"daemon.upgrade_in_place","executable_sha256":checksum}),
-    );
-    crate::write_frame(&mut client, &upgrade).await.unwrap();
-    let reply = response(&mut client).await;
-    assert_eq!(
-        reply.header.ty,
-        subc_protocol::FrameType::Error,
-        "the upgrade must not begin while publication is blocked: {}",
-        String::from_utf8_lossy(&reply.body)
-    );
-    let refused: subc_protocol::ErrorBody = serde_json::from_slice(&reply.body).unwrap();
-    assert_eq!(refused.code, "upgrade_busy");
-    assert_eq!(refused.detail.unwrap()["reason"], "settings");
+    let upgrade = |corr| {
+        request(
+            corr,
+            serde_json::json!({"op":"daemon.upgrade_in_place","executable_sha256":checksum}),
+        )
+    };
+    crate::write_frame(&mut client, &upgrade(12)).await.unwrap();
+    assert_settings_busy(response(&mut client).await);
     assert!(rig.registry.pool.health().unwrap().charged_workers > 0);
     assert!(!path.exists());
     assert_eq!(
@@ -720,7 +724,7 @@ async fn stalled_project_write_keeps_upgrade_out_after_waiter_expires() {
         "the busy upgrade must not start stopping the child"
     );
     release.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(5), wrote)
+    tokio::time::timeout(Duration::from_secs(5), publication_seen)
         .await
         .unwrap()
         .unwrap();
@@ -729,15 +733,14 @@ async fn stalled_project_write_keeps_upgrade_out_after_waiter_expires() {
             ["limit"],
         4
     );
-    crate::write_frame(
-        &mut client,
-        &request(
-            13,
-            serde_json::json!({"op":"daemon.upgrade_in_place","executable_sha256":checksum}),
-        ),
-    )
-    .await
-    .unwrap();
+    // Publication is visible before the worker verifies it and drops its settings permit.
+    crate::write_frame(&mut client, &upgrade(13)).await.unwrap();
+    assert_settings_busy(response(&mut client).await);
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), runtime.wait_for_settings_idle())
+        .await
+        .unwrap();
+    crate::write_frame(&mut client, &upgrade(14)).await.unwrap();
     let receipt = response(&mut client).await;
     assert_eq!(
         receipt.header.ty,

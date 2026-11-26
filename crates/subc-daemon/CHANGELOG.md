@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.53.2
+
+- Accept a command's recorded finish after PID reuse or when a pinned Windows
+  handle confirms exit despite an unreadable process snapshot.
+- Test-only: wait for the settings permit to release before retrying an upgrade
+  after a stalled project write.
+
 ## 0.53.1
 
 - Keep agent-command attribution and daemon CPU history stable across Linux

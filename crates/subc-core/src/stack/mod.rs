@@ -288,14 +288,18 @@ impl LockedStack<'_> {
                 .list(DAEMON_REQUEST_BOUND)
                 .and_then(|list| list.daemon)
                 .is_some_and(|daemon| {
-                    let reading = ProcessReading::Alive(daemon.start_time_ms);
+                    let reading = host.bind_daemon(daemon.pid, daemon.start_time_ms);
+                    let ProcessReading::Alive(native) = reading else {
+                        return false;
+                    };
                     expected.is_some()
-                        && host.daemon_process(daemon.pid) == reading
                         && subc_os::Process::open(daemon.pid)
                             .ok()
                             .flatten()
                             .and_then(|process| process.observe())
-                            .is_some_and(|process| process.executable == expected)
+                            .is_some_and(|process| {
+                                process.start_time == native && process.executable == expected
+                            })
                         && host.daemon_process(daemon.pid) == reading
                         && job.pid.is_none_or(|pid| pid == daemon.pid)
                 });
@@ -412,6 +416,10 @@ impl LockedStack<'_> {
         let mut result = StackResult::default();
         let mut children = Vec::new();
         snapshot_roster(host, &mut children, &mut result);
+        let daemon = daemon.map(|daemon| {
+            let bound = host.bind_daemon(daemon.pid, daemon.start_time_ms);
+            (daemon, bound)
+        });
         if budget.remaining().is_zero() {
             return StackResult::refused("deadline passed before stopping the stack");
         }
@@ -445,12 +453,14 @@ impl LockedStack<'_> {
         }
 
         let daemon_budget = budget.slice(DAEMON_STOP_BOUND);
-        if let Some(daemon) = daemon {
+        if let Some((daemon, bound)) = daemon {
             loop {
-                let gone = match host.daemon_process(daemon.pid) {
-                    ProcessReading::Gone => true,
-                    ProcessReading::Alive(start) => start != daemon.start_time_ms,
-                    ProcessReading::Unreadable => false,
+                let gone = match (bound, host.daemon_process(daemon.pid)) {
+                    (ProcessReading::Gone, _) | (_, ProcessReading::Gone) => true,
+                    (ProcessReading::Alive(before), ProcessReading::Alive(after)) => {
+                        before != after
+                    }
+                    _ => false,
                 };
                 if gone {
                     break;

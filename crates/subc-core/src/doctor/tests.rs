@@ -54,6 +54,8 @@ struct Fixture {
     process: Option<ProcessEntry>,
     start_reads: AtomicUsize,
     process_changed: bool,
+    epoch_step: bool,
+    sampled_cpu: std::sync::atomic::AtomicBool,
     cpu_gate: Option<Arc<Gate>>,
     install_gate: Option<Arc<Gate>>,
     disk_gate: Option<Arc<Gate>>,
@@ -95,6 +97,8 @@ impl Fixture {
             process: None,
             start_reads: AtomicUsize::new(0),
             process_changed: false,
+            epoch_step: false,
+            sampled_cpu: std::sync::atomic::AtomicBool::new(false),
             cpu_gate: None,
             install_gate: None,
             disk_gate: None,
@@ -226,8 +230,12 @@ impl DoctorHost for Fixture {
     }
 
     fn process_start_time_ms(&self, _: u32) -> Option<u64> {
+        Some(42 + 2_000 * u64::from(self.epoch_step && self.sampled_cpu.load(Ordering::Relaxed)))
+    }
+
+    fn process_start_time(&self, _: u32) -> Option<u64> {
         let read = self.start_reads.fetch_add(1, Ordering::Relaxed);
-        Some(42 + u64::from(self.process_changed && read != 0))
+        Some(123 + u64::from(self.process_changed && read >= 2))
     }
 
     fn resource_usage(&self, _: u32) -> Option<ResourceUsage> {
@@ -235,6 +243,7 @@ impl DoctorHost for Fixture {
     }
 
     fn wait_for_cpu_sample(&self) {
+        self.sampled_cpu.store(true, Ordering::Relaxed);
         if let Some(gate) = &self.cpu_gate {
             gate.wait();
         }
@@ -856,6 +865,20 @@ fn cpu_does_not_measure_a_changed_pid_or_absent_row() {
         finding(&result, "daemon.resources").evidence["reason"],
         "no resource row"
     );
+}
+
+#[test]
+fn cpu_measures_the_same_birth_after_an_epoch_step() {
+    let mut host = Fixture::new("doctor-cpu-clock-step");
+    host.epoch_step = true;
+    host.set_daemon(FakeDaemon {
+        resource_row: true,
+        ..FakeDaemon::default()
+    });
+    let result = execute(host);
+    let evidence = &finding(&result, "daemon.resources").evidence;
+    assert_eq!(evidence["reason"], Value::Null);
+    assert_eq!(evidence["cpu_ms"], 0);
 }
 
 #[test]

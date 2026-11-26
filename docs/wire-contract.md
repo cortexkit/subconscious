@@ -155,12 +155,16 @@ connection stays open. The request body is:
 
 `started` and `finished` are required arrays; `known` is optional and replaces
 the module's complete live root set. Start times come from
-`subc_os::process_start_time_ms`: milliseconds since the Unix epoch, compared
-within that platform's kernel timestamp resolution. A started root must still
-be live with that identity and must be a direct child of the module at the
-check. Invalid roots are ignored independently and logged once per identity;
-they do not refuse the batch. Starts whose ownership snapshot is incomplete,
-or whose validation exceeds its deadline or contention budget,
+`subc_os::process_start_time_ms`: milliseconds since the Unix epoch. Senders
+should keep using the first start time they recorded for a root, including
+when reporting its finish. For an already accepted live root the daemon
+matches its native birth and accepts a timestamp within the platform's kernel
+timestamp resolution of either the recorded or current epoch projection.
+For an exited root only the recorded timestamp is available. A started root
+must still be live with that identity and must be a direct child of the
+module at the check. Invalid roots are ignored independently and logged once
+per identity; they do not refuse the batch. Starts whose ownership snapshot is
+incomplete, or whose validation exceeds its deadline or contention budget,
 remain pending for up to 60 seconds, count toward root capacity, and begin
 prospective attribution only when validated by a later observation. `known` only
 re-confirms identities already

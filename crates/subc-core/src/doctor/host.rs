@@ -47,6 +47,7 @@ pub(crate) trait DoctorHost: Send + Sync + 'static {
     fn manager(&self) -> (Result<Job, String>, MarkerState);
     fn process_entry(&self, pid: u32) -> Option<ProcessEntry>;
     fn process_start_time_ms(&self, pid: u32) -> Option<u64>;
+    fn process_start_time(&self, pid: u32) -> Option<u64>;
     fn resource_usage(&self, pid: u32) -> Option<ResourceUsage>;
     fn wait_for_cpu_sample(&self) {
         thread::sleep(Duration::from_secs(3));
@@ -175,6 +176,10 @@ impl DoctorHost for SystemHost {
 
     fn process_start_time_ms(&self, pid: u32) -> Option<u64> {
         subc_os::process_start_time_ms(pid)
+    }
+
+    fn process_start_time(&self, pid: u32) -> Option<u64> {
+        subc_os::start_time(pid)
     }
 
     fn resource_usage(&self, pid: u32) -> Option<ResourceUsage> {

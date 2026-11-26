@@ -270,6 +270,8 @@ struct FakeHost {
     rosters: VecDeque<Result<Option<LiveChildrenRoster>, RecordReadError>>,
     roster_path: Option<PathBuf>,
     processes: BTreeMap<u32, ProcessReading>,
+    daemon_reads: VecDeque<ProcessReading>,
+    daemon_epochs: VecDeque<u64>,
     image_reasons: BTreeMap<u32, SurvivorReason>,
     reads: Vec<&'static str>,
 }
@@ -307,10 +309,22 @@ impl Host for FakeHost {
     }
     fn daemon_process(&mut self, pid: u32) -> ProcessReading {
         self.reads.push("daemon identity");
-        self.processes
-            .get(&pid)
-            .copied()
-            .unwrap_or(ProcessReading::Gone)
+        self.daemon_reads.pop_front().unwrap_or_else(|| {
+            self.processes
+                .get(&pid)
+                .copied()
+                .unwrap_or(ProcessReading::Gone)
+        })
+    }
+    fn daemon_epoch(&mut self, pid: u32) -> Option<u64> {
+        self.daemon_epochs.pop_front().or_else(|| {
+            self.list
+                .as_ref()?
+                .daemon
+                .as_ref()
+                .filter(|row| row.pid == pid)
+                .map(|row| row.start_time_ms)
+        })
     }
     fn executable(&mut self, child: &LiveChild) -> Option<SurvivorReason> {
         self.image_reasons.get(&child.pid).copied()
@@ -476,6 +490,29 @@ fn stop_waits_for_daemon_then_both_rosters_without_signalling() {
 }
 
 #[test]
+fn stop_does_not_count_a_daemon_gone_after_its_epoch_moves() {
+    let fixture = Fixture::new(RuntimePlatform::Linux);
+    let clock = FakeClock::default();
+    let mut runner = fixture.runner(&clock);
+    let mut host = FakeHost {
+        list: Some(list(Vec::new())),
+        processes: BTreeMap::from([(42, ProcessReading::Alive(123))]),
+        // Raw start ticks are fixed; the projected boot time advances by two seconds.
+        daemon_epochs: VecDeque::from([1234, 3234]),
+        ..FakeHost::default()
+    };
+    let result = fixture.lock("ck stack stop").stop_inner(
+        Budget::new(&clock, Duration::from_secs(61)),
+        StopIntent::Stop,
+        &mut host,
+        &mut runner,
+    );
+    assert!(result.daemon_past_bound);
+    assert_eq!(result.exit, 1);
+    assert_eq!(host.daemon_epoch(42), Some(3234));
+}
+
+#[test]
 fn stop_reports_roster_errors_but_still_marks_a_stopped_manager() {
     for platform in PLATFORMS {
         for (data, expected) in [
@@ -569,6 +606,9 @@ fn stop_checks_daemon_fallback_final_manager_and_pid_reuse() {
                 ..FakeHost::default()
             };
             if let Some(reading) = daemon_reading {
+                // Bind the listed birth before the manager stop, then inspect
+                // the PID again after it has departed or been reused.
+                host.daemon_reads = VecDeque::from([ProcessReading::Alive(100); 2]);
                 host.processes.insert(42, reading);
             }
             let result = fixture.lock("ck stack stop").stop_inner(

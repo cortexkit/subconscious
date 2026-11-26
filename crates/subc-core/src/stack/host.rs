@@ -23,6 +23,21 @@ pub(super) trait Host {
     fn configured(&mut self) -> Result<BTreeMap<String, bool>, String>;
     fn process(&mut self, pid: u32) -> ProcessReading;
     fn daemon_process(&mut self, pid: u32) -> ProcessReading;
+    fn daemon_epoch(&mut self, pid: u32) -> Option<u64>;
+    fn bind_daemon(&mut self, pid: u32, reported_epoch: u64) -> ProcessReading {
+        let reading = self.daemon_process(pid);
+        let ProcessReading::Alive(native) = reading else {
+            return reading;
+        };
+        let epoch = self.daemon_epoch(pid);
+        match self.daemon_process(pid) {
+            ProcessReading::Gone => ProcessReading::Gone,
+            ProcessReading::Alive(after) if after == native && epoch == Some(reported_epoch) => {
+                reading
+            }
+            _ => ProcessReading::Unreadable,
+        }
+    }
     fn executable(&mut self, child: &LiveChild) -> Option<SurvivorReason>;
     fn same_boot(&mut self, child: &LiveChild) -> Option<bool>;
     fn container_empty(&mut self, child: &LiveChild) -> bool;
@@ -102,18 +117,11 @@ impl Host for SystemHost<'_> {
     }
 
     fn daemon_process(&mut self, pid: u32) -> ProcessReading {
-        let reading = process(pid);
-        let ProcessReading::Alive(native) = reading else {
-            return reading;
-        };
-        let millis = subc_os::process_start_time_ms(pid);
-        match process(pid) {
-            ProcessReading::Gone => ProcessReading::Gone,
-            ProcessReading::Alive(after) if after == native => {
-                millis.map_or(ProcessReading::Unreadable, ProcessReading::Alive)
-            }
-            _ => ProcessReading::Unreadable,
-        }
+        process(pid)
+    }
+
+    fn daemon_epoch(&mut self, pid: u32) -> Option<u64> {
+        subc_os::process_start_time_ms(pid)
     }
 
     fn executable(&mut self, child: &LiveChild) -> Option<SurvivorReason> {

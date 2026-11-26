@@ -1,6 +1,6 @@
 [package]
 name = "subc-os"
-version = "0.1.54"
+version = "0.1.55"
 edition = "2021"
 license = "MIT"
 publish = true
@@ -39,7 +39,7 @@ subc-os = { path = ".", features = ["test-support"] }
 libc = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-rustix = { version = "1", default-features = false, features = ["event", "fs", "param", "process", "std"] }
+rustix = { version = "1", default-features = false, features = ["event", "fs", "param", "process", "std", "time"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 rustix = { version = "1", default-features = false, features = ["fs", "process", "std"] }

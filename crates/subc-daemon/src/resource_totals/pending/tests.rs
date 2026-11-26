@@ -140,6 +140,31 @@ impl Fixture {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn pending_root_can_be_matched_after_a_clock_step() {
+    let mut fixture = Fixture::new();
+    let original = fixture.root;
+    let incomplete = fixture.table(1, Some(10), true);
+    fixture.declare(original, incomplete);
+    fixture.root.start_time_ms += 2_000;
+    let stepped = fixture.root;
+    let after = fixture.table(2, Some(10), false);
+    assert_eq!(
+        fixture.module.pending_key_in(stepped, &after),
+        Some(original)
+    );
+    assert_eq!(
+        fixture.module.pending_key_in(original, &after),
+        Some(original)
+    );
+
+    fixture.native_start += 1;
+    let reused = fixture.table(3, Some(10), false);
+    assert_eq!(fixture.module.pending_key_in(original, &reused), None);
+    assert_eq!(fixture.module.pending_key_in(stepped, &reused), None);
+}
+
+#[test]
 fn incomplete_start_is_accepted_later_and_only_credits_post_acceptance_cpu() {
     let mut fixture = Fixture::new();
     let incomplete = fixture.table(1, Some(10), true);

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.55
+
+- Expose a process-table birth baseline that uses boot-relative ticks on Linux,
+  so birth ordering is unaffected by wall-clock steps.
+
 ## 0.1.54
 
 - Expose the child-creation lock and direct Unix exec support. Restore

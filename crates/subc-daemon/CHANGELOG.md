@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.53.1
+
+- Keep agent-command attribution and daemon CPU history stable across Linux
+  wall-clock steps without changing reported timestamp formats.
+
 ## 0.53.0
 
 - Add accepting restart and reload drains for opted-in modules, with `module.drain_ready` and a bounded post-ready route wait.

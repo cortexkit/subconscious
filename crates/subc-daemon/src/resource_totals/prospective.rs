@@ -6,10 +6,38 @@ use cpu_ledger::Member;
 #[path = "prospective/property.rs"]
 mod property;
 
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn clock_step_does_not_turn_an_old_process_into_a_post_baseline_birth() {
+    let baseline = ProcessTable::with_test_wall_clock(
+        std::time::UNIX_EPOCH + Duration::from_millis(1_000_500),
+        || ProcessTable::read_for(&BTreeSet::new()).unwrap(),
+    );
+    let mut process = subc_os::ProcessMember {
+        pid: 20,
+        parent_pid: 0,
+        session_id: None,
+        start_time: 1,
+        start_time_ms: 1_000_010,
+        name: "worker".into(),
+        resources: None,
+        own_cpu_ms: Some(10),
+        reaped_cpu_ms: Some(0),
+    };
+    assert!(
+        !members(&baseline, &[process.clone()], baseline.birth_baseline()).unwrap()[0]
+            .new_since_baseline
+    );
+    process.start_time_ms += 2_000;
+    assert!(
+        !members(&baseline, &[process], baseline.birth_baseline()).unwrap()[0].new_since_baseline
+    );
+}
+
 fn members(
     table: &ProcessTable,
     source: &[subc_os::ProcessMember],
-    baseline: u64,
+    baseline: subc_os::BirthBaseline,
 ) -> Option<Vec<Member>> {
     source
         .iter()
@@ -22,8 +50,7 @@ fn members(
                     .map(|parent| (parent.pid, parent.start_time)),
                 own_ms: member.own_cpu_ms?,
                 reaped_ms: member.reaped_cpu_ms?,
-                new_since_baseline: member.start_time_ms
-                    > baseline.saturating_add(subc_os::process_start_time_precision_ms()),
+                new_since_baseline: baseline.precedes(member.start_time, member.start_time_ms),
             })
         })
         .collect()
@@ -65,7 +92,7 @@ impl Command {
         if live.is_empty() {
             return;
         }
-        let Some(observed) = members(table, &live, table.observed_at_ms()) else {
+        let Some(observed) = members(table, &live, table.birth_baseline()) else {
             return;
         };
         let alive = table
@@ -88,7 +115,7 @@ impl Command {
         }
         self.acceptance_cpu = ProcessTable::sum(live).map(|usage| usage.cpu_ms);
         self.measured = true;
-        self.baseline_at_ms = table.observed_at_ms();
+        self.birth_baseline = table.birth_baseline();
         self.last_cpu_sequence = table.revision();
     }
 }
@@ -198,9 +225,11 @@ impl Module {
                         .cloned()
                 })
                 .collect::<Option<_>>()?;
-            scope_increments =
-                self.cpu_floor
-                    .observe(table.revision(), members(table, &observed, 0)?, &alive);
+            scope_increments = self.cpu_floor.observe(
+                table.revision(),
+                members(table, &observed, Default::default())?,
+                &alive,
+            );
             self.cpu_floor.total()
         } else {
             tree.as_ref()?.0.cpu_ms
@@ -222,7 +251,7 @@ impl Module {
             #[cfg(not(windows))]
             let live = command.live_members(*root, table)?;
             if !command.measured && !live.is_empty() {
-                command.baseline_at_ms = table.observed_at_ms();
+                command.birth_baseline = table.birth_baseline();
                 command.funding_sequence = table.revision();
                 command.acceptance_cpu = ProcessTable::sum(live.clone()).map(|usage| usage.cpu_ms);
             }
@@ -242,7 +271,7 @@ impl Module {
                 }
             }
             #[cfg(not(windows))]
-            let observed = members(table, &live, command.baseline_at_ms)?;
+            let observed = members(table, &live, command.birth_baseline)?;
             #[cfg(windows)]
             let observed: Vec<_> = command
                 .pinned_cpu
@@ -261,10 +290,9 @@ impl Module {
                         own_ms: (*cpu)?,
                         reaped_ms: 0,
                         new_since_baseline: current.is_some_and(|member| {
-                            member.start_time_ms
-                                > command
-                                    .baseline_at_ms
-                                    .saturating_add(subc_os::process_start_time_precision_ms())
+                            command
+                                .birth_baseline
+                                .precedes(member.start_time, member.start_time_ms)
                         }),
                     })
                 })
@@ -363,10 +391,9 @@ impl Module {
                             && (previously_inside
                                 || live.iter().any(|member| {
                                     (member.pid, member.start_time) == identity
-                                        && member.start_time_ms
-                                            > command.baseline_at_ms.saturating_add(
-                                                subc_os::process_start_time_precision_ms(),
-                                            )
+                                        && command
+                                            .birth_baseline
+                                            .precedes(member.start_time, member.start_time_ms)
                                 })),
                     });
                 }

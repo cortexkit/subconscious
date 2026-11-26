@@ -71,8 +71,47 @@ pub struct ProcessTable {
     unreadable: BTreeMap<u32, (Option<u32>, Option<u32>)>,
     revision: u64,
     observed_at_ms: u64,
+    #[cfg(target_os = "linux")]
+    started_at_ticks: Option<u64>,
     started_at: Option<std::time::Instant>,
     focus: Option<std::sync::Arc<Focus>>,
+}
+
+/// The birth-time cutoff captured at the start of a process-table walk.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BirthBaseline {
+    epoch_ms: u64,
+    #[cfg(target_os = "linux")]
+    ticks: Option<u64>,
+}
+
+impl BirthBaseline {
+    /// Whether a member was born after this cutoff, allowing for timestamp
+    /// resolution. On Linux, both sides use `CLOCK_BOOTTIME` start ticks;
+    /// other platforms compare the member's fixed epoch birth to the cutoff.
+    pub fn precedes(
+        self,
+        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] native: u64,
+        epoch_ms: u64,
+    ) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Some(ticks) = self.ticks {
+            return native > ticks.saturating_add(1);
+        }
+        epoch_ms
+            > self
+                .epoch_ms
+                .saturating_add(crate::process_start_time_precision_ms())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn boot_ticks() -> u64 {
+    let elapsed = rustix::time::clock_gettime(rustix::time::ClockId::Boottime);
+    let hz = rustix::param::clock_ticks_per_second().max(1);
+    (elapsed.tv_sec as u64).saturating_mul(hz).saturating_add(
+        (u128::from(elapsed.tv_nsec as u64) * u128::from(hz) / 1_000_000_000) as u64,
+    )
 }
 
 /// The pids a narrowed walk examined, and every pid its listing contained.
@@ -120,6 +159,8 @@ impl ProcessTable {
                 .collect(),
             revision,
             observed_at_ms,
+            #[cfg(target_os = "linux")]
+            started_at_ticks: None,
             started_at: Some(std::time::Instant::now()),
             focus: None,
         }
@@ -207,6 +248,8 @@ impl ProcessTable {
         interest: Option<&BTreeSet<u32>>,
     ) -> io::Result<Self> {
         let (revision, observed_at_ms, started_at) = Self::begin();
+        #[cfg(target_os = "linux")]
+        let started_at_ticks = Some(boot_ticks());
         let entries = enumerate()?;
         let mut known = Known::default();
         let focus = interest.map(|interest| focus(&entries, interest, probe, &mut known));
@@ -299,6 +342,8 @@ impl ProcessTable {
             unreadable,
             revision,
             observed_at_ms,
+            #[cfg(target_os = "linux")]
+            started_at_ticks,
             started_at: Some(started_at),
             focus: focus.map(std::sync::Arc::new),
         })
@@ -451,6 +496,16 @@ impl ProcessTable {
     /// Wall-clock boundary before enumeration, for conservative birth checks.
     pub fn observed_at_ms(&self) -> u64 {
         self.observed_at_ms
+    }
+
+    /// Capture a reusable birth cutoff in this walk's clock domain (Linux
+    /// boot-relative start ticks, otherwise wall-clock epoch milliseconds).
+    pub fn birth_baseline(&self) -> BirthBaseline {
+        BirthBaseline {
+            epoch_ms: self.observed_at_ms,
+            #[cfg(target_os = "linux")]
+            ticks: self.started_at_ticks,
+        }
     }
 
     /// `None` means the PID was visible but its identity was unreadable, not that
@@ -1150,6 +1205,8 @@ mod tests {
             unreadable: BTreeMap::new(),
             revision: 1,
             observed_at_ms: 0,
+            #[cfg(target_os = "linux")]
+            started_at_ticks: None,
             started_at: None,
             focus: None,
         };

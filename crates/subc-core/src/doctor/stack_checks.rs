@@ -401,7 +401,10 @@ pub(super) fn sample_cpu(
     pid: u32,
     start_time_ms: u64,
 ) -> Result<CpuSample, &'static str> {
-    if host.process_start_time_ms(pid) != Some(start_time_ms) {
+    let native = host.process_start_time(pid).ok_or("process changed")?;
+    if host.process_start_time_ms(pid) != Some(start_time_ms)
+        || host.process_start_time(pid) != Some(native)
+    {
         return Err("process changed");
     }
     let start = Instant::now();
@@ -409,7 +412,7 @@ pub(super) fn sample_cpu(
     host.wait_for_cpu_sample();
     let second = host.resource_usage(pid);
     let elapsed = start.elapsed();
-    if host.process_start_time_ms(pid) != Some(start_time_ms) {
+    if host.process_start_time(pid) != Some(native) {
         return Err("process changed");
     }
     cpu_delta(first, second, elapsed).ok_or("process resources could not be read")

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.22.1
+
+- Keep stack daemon checks and doctor CPU samples bound to the same process
+  when Linux adjusts its wall clock.
+
 ## 0.22.0
 
 - Add module program checks and consented repairs to the doctor library.

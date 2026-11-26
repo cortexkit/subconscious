@@ -315,7 +315,7 @@ fn read_identity(pid: u32) -> IdentityRead {
 }
 
 mod process_tree;
-pub use process_tree::{ProcessGroup, ProcessMember, ProcessTable, TreeUsage};
+pub use process_tree::{BirthBaseline, ProcessGroup, ProcessMember, ProcessTable, TreeUsage};
 
 /// Kernel process creation time, in milliseconds since the Unix epoch.
 ///

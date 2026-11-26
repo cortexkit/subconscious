@@ -11,6 +11,39 @@ pub(super) struct PendingRoot {
     queued_at: Duration,
     declared_at: Instant,
     sequence: u64,
+    native_start: Option<u64>,
+}
+
+impl PendingRoot {
+    pub(super) fn matches(
+        &self,
+        key: AgentCommandRoot,
+        requested: AgentCommandRoot,
+        table: &ProcessTable,
+    ) -> bool {
+        if key.pid != requested.pid {
+            return false;
+        }
+        let Some(native) = self.native_start else {
+            return same_epoch(key, requested);
+        };
+        match table.process(key.pid) {
+            Some(member) => {
+                member.start_time == native
+                    && (same_epoch(key, requested)
+                        || same_epoch(
+                            AgentCommandRoot {
+                                pid: key.pid,
+                                start_time_ms: member.start_time_ms,
+                            },
+                            requested,
+                        ))
+            }
+            None => {
+                table.identity_alive(key.pid, native) == Some(false) && same_epoch(key, requested)
+            }
+        }
+    }
 }
 
 impl Module {
@@ -22,11 +55,20 @@ impl Module {
     }
 
     pub(super) fn pending_key(&self, root: AgentCommandRoot) -> Option<AgentCommandRoot> {
-        self.pending.keys().copied().find(|known| {
-            known.pid == root.pid
-                && known.start_time_ms.abs_diff(root.start_time_ms)
-                    < subc_os::process_start_time_precision_ms()
-        })
+        self.pending
+            .keys()
+            .copied()
+            .find(|known| same_epoch(*known, root))
+    }
+
+    pub(super) fn pending_key_in(
+        &self,
+        root: AgentCommandRoot,
+        table: &ProcessTable,
+    ) -> Option<AgentCommandRoot> {
+        self.pending
+            .iter()
+            .find_map(|(key, pending)| pending.matches(*key, root, table).then_some(*key))
     }
 
     /// Pending roots and the module processes that declared them.
@@ -48,8 +90,17 @@ impl Module {
         table: &ProcessTable,
         now: u64,
     ) -> Acceptance {
-        let already_pending = self.pending_key(root).is_some();
-        let result = self.pend_at(
+        let native = table.process(root.pid).and_then(|member| {
+            same_epoch(
+                root,
+                AgentCommandRoot {
+                    pid: root.pid,
+                    start_time_ms: member.start_time_ms,
+                },
+            )
+            .then_some(member.start_time)
+        });
+        self.pend_with_table(
             generation,
             self.pid.expect("declaration module pid"),
             root,
@@ -58,14 +109,8 @@ impl Module {
                 declared_at: Instant::now(),
             },
             now,
-        );
-        if !already_pending {
-            if let Some(key) = self.pending_key(root) {
-                let pending = self.pending.get_mut(&key).unwrap();
-                pending.sequence = pending.sequence.max(table.revision());
-            }
-        }
-        result
+            Some((table, native)),
+        )
     }
 
     pub(super) fn pend_at(
@@ -76,14 +121,40 @@ impl Module {
         arrival: DeclarationArrival,
         now: u64,
     ) -> Acceptance {
-        if let Some(key) = self.pending_key(root) {
-            let pending = &self.pending[&key];
+        self.pend_with_table(generation, module_pid, root, arrival, now, None)
+    }
+
+    fn pend_with_table(
+        &mut self,
+        generation: u128,
+        module_pid: u32,
+        root: AgentCommandRoot,
+        arrival: DeclarationArrival,
+        now: u64,
+        snapshot: Option<(&ProcessTable, Option<u64>)>,
+    ) -> Acceptance {
+        let key = if let Some((table, _)) = snapshot {
+            self.pending_key_in(root, table)
+        } else {
+            self.pending_key(root)
+        };
+        if let Some(key) = key {
+            let pending = self.pending.get_mut(&key).unwrap();
             if pending.generation == generation && pending.module_pid == module_pid {
+                pending.native_start = pending
+                    .native_start
+                    .or(snapshot.and_then(|(_, native)| native));
                 return Acceptance::default();
             }
             self.pending.remove(&key);
         }
-        if self.trusted_key(root).is_some()
+        if self.pending.contains_key(&root)
+            || snapshot
+                .map_or_else(
+                    || self.trusted_key(root),
+                    |(table, _)| self.finish_key(root, table),
+                )
+                .is_some()
             || self
                 .finished
                 .keys()
@@ -111,7 +182,10 @@ impl Module {
                 module_pid,
                 queued_at: arrival.queued_at,
                 declared_at: arrival.declared_at,
-                sequence: self.table_revision,
+                sequence: snapshot.map_or(self.table_revision, |(table, _)| {
+                    self.table_revision.max(table.revision())
+                }),
+                native_start: snapshot.and_then(|(_, native)| native),
             },
         );
         Acceptance::default()
@@ -159,7 +233,12 @@ impl Module {
             {
                 validation::Validation::Exited
             } else {
-                validation::validate_root(pending.module_pid, target, root, table, None)
+                let trusted = pending
+                    .native_start
+                    .into_iter()
+                    .map(|start| (root, start))
+                    .collect();
+                validation::validate_root(pending.module_pid, target, root, table, &trusted)
             };
             let verified = match result {
                 validation::Validation::Exited => {

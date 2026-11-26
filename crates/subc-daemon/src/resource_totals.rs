@@ -191,7 +191,7 @@ struct Command {
     attribution_stopped: bool,
     rebaseline: bool,
     cpu_floor: cpu_ledger::Ledger,
-    baseline_at_ms: u64,
+    birth_baseline: subc_os::BirthBaseline,
     counter_before: u64,
     previous_inside: BTreeSet<(u32, u64)>,
     #[cfg(windows)]
@@ -243,9 +243,9 @@ pub(crate) struct PreparedCommit {
     module: Module,
     rejected: Vec<AgentCommandRoot>,
     exited_before_admission: Vec<AgentCommandRoot>,
-    recovered: Vec<AgentCommandRoot>,
+    recovered: Vec<(AgentCommandRoot, Option<u64>)>,
     complete_recovery: Option<u64>,
-    lost: Vec<AgentCommandRoot>,
+    lost: Vec<(AgentCommandRoot, Option<u64>)>,
     roots_full: bool,
     omitted_overflow: bool,
 }
@@ -261,7 +261,8 @@ pub(crate) struct Committed {
 struct Application {
     rejected: Vec<AgentCommandRoot>,
     exited_before_admission: Vec<AgentCommandRoot>,
-    lost: Vec<AgentCommandRoot>,
+    lost: Vec<(AgentCommandRoot, Option<u64>)>,
+    recovered: Vec<(AgentCommandRoot, Option<u64>)>,
     roots_full: bool,
     full_resync: bool,
     omitted_overflow: bool,
@@ -326,8 +327,9 @@ impl Tracker {
                 lost.push(root);
             }
         }
-        let recovered = declaration_loss::recover(module, started, None);
-        declaration_loss::commit(&module.declaration_loss, &recovered, None, &lost);
+        // Queuing does not read the kernel's process birth value. A matching
+        // wire timestamp alone cannot restore attribution coverage.
+        module.declaration_loss.mark(&lost);
         state.revision = state.revision.wrapping_add(1);
         self.wake.notify_one();
         Some(Committed {
@@ -607,8 +609,6 @@ impl Tracker {
             trusted
         };
         module.declaration_loss = losses;
-        let started = batch.started.clone();
-        let known = batch.known.clone();
         let prepared = validation::prepare_snapshot(
             module_pid,
             target,
@@ -624,7 +624,7 @@ impl Tracker {
             receipt,
             first_pass,
         );
-        let recovered = declaration_loss::recover(&module, &started, known.as_deref());
+        let recovered = applied.recovered;
         Some(PreparedCommit {
             expected_revision,
             module,
@@ -766,16 +766,23 @@ impl Tracker {
             }
         }
         for (root, verified) in prepared.started {
-            if let Some(key) = module.pending_key(root) {
+            if let Some(key) = module.pending_key_in(root, &prepared.table) {
                 module.pending.remove(&key);
             }
+            if let Some(verified) = &verified {
+                applied.recovered.extend([
+                    (root, Some(verified.native_start)),
+                    (verified.root, Some(verified.native_start)),
+                ]);
+            }
+            let native = verified.as_ref().map(|proof| proof.native_start);
             let result = module.accept_checked(generation, root, verified, &prepared.table, now);
             if result.log_rejected {
                 applied.rejected.push(root);
             }
             if result.full {
                 applied.roots_full = true;
-                applied.lost.push(root);
+                applied.lost.push((root, native));
             }
         }
         for root in prepared.pending {
@@ -785,14 +792,17 @@ impl Tracker {
             }
             if result.full {
                 applied.roots_full = true;
-                applied.lost.push(root);
+                applied.lost.push((root, None));
             }
         }
         for finished in &prepared.finished {
-            if let Some(key) = module.pending_key(AgentCommandRoot {
-                pid: finished.pid,
-                start_time_ms: finished.start_time_ms,
-            }) {
+            if let Some(key) = module.pending_key_in(
+                AgentCommandRoot {
+                    pid: finished.pid,
+                    start_time_ms: finished.start_time_ms,
+                },
+                &prepared.table,
+            ) {
                 module.pending.remove(&key);
             }
         }
@@ -815,10 +825,13 @@ impl Tracker {
                 .copied()
                 .collect();
             stopping.extend(prepared.finished.iter().filter_map(|finished| {
-                module.trusted_key(AgentCommandRoot {
-                    pid: finished.pid,
-                    start_time_ms: finished.start_time_ms,
-                })
+                module.finish_key(
+                    AgentCommandRoot {
+                        pid: finished.pid,
+                        start_time_ms: finished.start_time_ms,
+                    },
+                    &prepared.table,
+                )
             }));
             module.refresh_windows_for_receipt(
                 &prepared.table,
@@ -871,22 +884,23 @@ impl Tracker {
             module.observation_before,
         );
         for root in prepared.finished {
-            module.finish_at_observation(
+            if let Some(key) = module.finish_key(
                 AgentCommandRoot {
                     pid: root.pid,
                     start_time_ms: root.start_time_ms,
                 },
-                root.cpu_ms,
-                now,
-                prepared.finish_until,
-            );
+                &prepared.table,
+            ) {
+                module.finish_at_observation(key, root.cpu_ms, now, prepared.finish_until);
+            }
         }
         if let Some(known) = prepared.known {
-            module.pending.retain(|pending, _| {
-                known.iter().any(|(root, _)| {
-                    root.pid == pending.pid
-                        && root.start_time_ms.abs_diff(pending.start_time_ms)
-                            < subc_os::process_start_time_precision_ms()
+            module.pending.retain(|key, pending| {
+                known.iter().any(|(root, verified)| {
+                    pending.matches(*key, *root, &prepared.table)
+                        || verified.as_ref().is_some_and(|verified| {
+                            pending.matches(*key, verified.root, &prepared.table)
+                        })
                 })
             });
             let mut required: BTreeSet<_> = module
@@ -919,7 +933,7 @@ impl Tracker {
             // Check overlaps before replacing the accepted set: removing old
             // roots first would conceal an overlapping ancestor in the resync.
             for (root, verified) in known {
-                if module.pending_key(root).is_some() {
+                if module.pending_key_in(root, &prepared.table).is_some() {
                     continue;
                 }
                 // A start can also appear in the same batch's known list.
@@ -933,6 +947,13 @@ impl Tracker {
                 {
                     continue;
                 }
+                if let Some(verified) = &verified {
+                    applied.recovered.extend([
+                        (root, Some(verified.native_start)),
+                        (verified.root, Some(verified.native_start)),
+                    ]);
+                }
+                let native = verified.as_ref().map(|proof| proof.native_start);
                 let result =
                     module.accept_checked(generation, root, verified, &prepared.table, now);
                 if result.log_rejected {
@@ -940,14 +961,12 @@ impl Tracker {
                 }
                 if result.full {
                     applied.roots_full = true;
-                    applied.lost.push(root);
+                    applied.lost.push((root, native));
                 }
             }
             applied.full_resync = verified_known
                 && required.is_subset(&wanted)
-                && wanted
-                    .iter()
-                    .all(|root| module.trusted_key(*root).is_some());
+                && wanted.iter().all(|root| module.roots.contains_key(root));
             let removed: Vec<_> = module
                 .roots
                 .keys()
@@ -967,8 +986,8 @@ impl Tracker {
                         })
                     })
                     .flatten();
-                if omitted.is_some() {
-                    applied.lost.push(root);
+                if let Some(proof) = &omitted {
+                    applied.lost.push((root, Some(proof.native_start)));
                 }
                 module.finish_at(root, None, now);
                 if let Some(proof) = omitted {
@@ -980,6 +999,12 @@ impl Tracker {
                 }
             }
         }
+        applied.recovered.retain(|(root, native)| {
+            module
+                .roots
+                .iter()
+                .any(|(key, command)| key.pid == root.pid && Some(command.native_start) == *native)
+        });
         // Render the changed live set and any bounded finish transfer without
         // reading or charging the same physical CPU a second time.
         module.rerender(
@@ -1490,24 +1515,15 @@ impl Tracker {
         if any_agents_unknown && !any_agents_known {
             readings.agent_commands = None;
         }
-        if let Some((start_time_ms, resources)) = own {
-            if sample {
-                if let subc_control::ChildResourceUsage::Measured(usage) = &resources {
-                    state.daemon.record_observation(
-                        table.revision(),
-                        now,
-                        u128::from(start_time_ms),
-                        usage.cpu_user_ms.saturating_add(usage.cpu_system_ms),
-                    );
-                }
-            }
-            readings.daemon = Some(
-                DaemonResources::new(pid, start_time_ms, self.daemon_version.clone())
-                    .with_measured_at_ms(Some(now_ms()))
-                    .with_resources(Some(resources))
-                    .with_cpu_last_hour(state.daemon.last_hour_at(now)),
-            );
-        }
+        readings.daemon = own.map(|(epoch, resources)| {
+            daemon_reading(
+                &mut state.daemon,
+                DaemonResources::new(pid, epoch, self.daemon_version.clone()),
+                resources,
+                now,
+                sample.then_some(table.revision()),
+            )
+        });
         #[cfg(windows)]
         for module in state.modules.values_mut() {
             retired.append(&mut module.retired_handles);
@@ -1571,6 +1587,64 @@ fn trim_oldest(entries: &mut BTreeMap<AgentCommandRoot, u64>) {
         };
         entries.remove(&oldest);
     }
+}
+
+fn daemon_reading(
+    history: &mut History,
+    row: DaemonResources,
+    resources: subc_control::ChildResourceUsage,
+    now: u64,
+    sequence: Option<u64>,
+) -> DaemonResources {
+    if let (Some(sequence), subc_control::ChildResourceUsage::Measured(usage)) =
+        (sequence, &resources)
+    {
+        // This history only ever describes the running daemon, so it needs no
+        // birth key (0). The daemon's reported start time can't be the key: on
+        // Linux it is recomputed from the realtime clock and moves when that
+        // clock is corrected, which would restart the history.
+        history.record_observation(
+            sequence,
+            now,
+            0,
+            usage.cpu_user_ms.saturating_add(usage.cpu_system_ms),
+        );
+    }
+    row.with_measured_at_ms(Some(now_ms()))
+        .with_resources(Some(resources))
+        .with_cpu_last_hour(history.last_hour_at(now))
+}
+
+#[cfg(test)]
+#[test]
+fn daemon_cpu_history_counts_only_the_delta_after_birth_epoch_steps() {
+    use subc_control::{ChildMemoryKind, ChildResourceReading, ChildResourceUsage};
+
+    let mut history = History::default();
+    let mut read = |boot_epoch_ms: u64, cpu, now, sequence| {
+        daemon_reading(
+            &mut history,
+            DaemonResources::new(42, boot_epoch_ms + 50, "1.0.0"),
+            ChildResourceUsage::Measured(ChildResourceReading::new(
+                0,
+                ChildMemoryKind::ResidentSet,
+                cpu,
+                0,
+            )),
+            now,
+            Some(sequence),
+        )
+    };
+    let before = read(1_000_000, 10_000, 1_060_000, 1);
+    let after = read(1_002_000, 10_100, 1_122_000, 2);
+    assert_eq!(after.start_time_ms - before.start_time_ms, 2_000);
+    assert_eq!(after.cpu_last_hour.unwrap().cpu_ms, 100);
+}
+
+fn same_epoch(left: AgentCommandRoot, right: AgentCommandRoot) -> bool {
+    left.pid == right.pid
+        && left.start_time_ms.abs_diff(right.start_time_ms)
+            < subc_os::process_start_time_precision_ms()
 }
 
 impl Module {
@@ -1757,12 +1831,27 @@ impl Module {
     fn trusted_key(&self, root: AgentCommandRoot) -> Option<AgentCommandRoot> {
         self.roots
             .keys()
-            .find(|known| {
-                known.pid == root.pid
-                    && known.start_time_ms.abs_diff(root.start_time_ms)
-                        < subc_os::process_start_time_precision_ms()
-            })
             .copied()
+            .find(|known| same_epoch(*known, root))
+    }
+
+    fn finish_key(&self, root: AgentCommandRoot, table: &ProcessTable) -> Option<AgentCommandRoot> {
+        if let Some(member) = table.process(root.pid) {
+            let fresh = AgentCommandRoot {
+                pid: root.pid,
+                start_time_ms: member.start_time_ms,
+            };
+            return self.roots.iter().find_map(|(key, command)| {
+                (key.pid == root.pid
+                    && command.native_start == member.start_time
+                    && (same_epoch(*key, root) || same_epoch(fresh, root)))
+                .then_some(*key)
+            });
+        }
+        if table.identity_alive(root.pid, 0) == Some(false) {
+            return self.trusted_key(root);
+        }
+        None
     }
 
     #[cfg(test)]
@@ -1795,26 +1884,29 @@ impl Module {
             self.omitted
                 .iter()
                 .find(|(root, proof)| {
-                    root.pid == verified.root.pid
-                        && proof.native_start == verified.native_start
-                        && root.start_time_ms.abs_diff(verified.root.start_time_ms)
-                            < subc_os::process_start_time_precision_ms()
+                    root.pid == verified.root.pid && proof.native_start == verified.native_start
                 })
                 .map(|(root, _)| *root)
         });
-        if resume.is_none()
-            && (self.trusted_key(requested).is_some()
-                || self.finished_live.keys().any(|known| {
-                    known.pid == requested.pid
-                        && known.start_time_ms.abs_diff(requested.start_time_ms)
-                            < subc_os::process_start_time_precision_ms()
-                })
-                || self.finished.keys().any(|known| {
-                    known.pid == requested.pid
-                        && known.start_time_ms.abs_diff(requested.start_time_ms)
-                            < subc_os::process_start_time_precision_ms()
-                }))
-        {
+        let matches = |key: AgentCommandRoot, native| {
+            if let Some(verified) = &verified {
+                key.pid == requested.pid && native == verified.native_start
+            } else {
+                same_epoch(key, requested)
+            }
+        };
+        let duplicate =
+            self.roots
+                .iter()
+                .any(|(key, command)| matches(*key, command.native_start))
+                || self
+                    .finished_live
+                    .iter()
+                    .any(|(key, (native, _))| matches(*key, *native))
+                || self.finished.keys().any(|key| {
+                    !self.finished_live.contains_key(key) && same_epoch(*key, requested)
+                });
+        if resume.is_none() && duplicate {
             return Acceptance::default();
         }
         let retained = self.roots.len() + self.finished_live.len() + self.pending.len();
@@ -1823,15 +1915,16 @@ impl Module {
         }));
         let full = verified.is_some() && retained.saturating_sub(resumed) >= pending::ROOT_LIMIT;
         let verified = verified.filter(|_| !full).filter(|candidate| {
-            !self.roots.iter().any(|(root, command)| {
-                if resume == Some(*root) {
-                    return false;
-                }
-                let identities = table
-                    .tree_identities(root.pid, command.native_start, true)
-                    .unwrap_or_else(|| command.members.clone());
-                !candidate.members.is_disjoint(&identities)
-            })
+            (!self.roots.contains_key(&candidate.root) || resume == Some(candidate.root))
+                && !self.roots.iter().any(|(root, command)| {
+                    if resume == Some(*root) {
+                        return false;
+                    }
+                    let identities = table
+                        .tree_identities(root.pid, command.native_start, true)
+                        .unwrap_or_else(|| command.members.clone());
+                    !candidate.members.is_disjoint(&identities)
+                })
         });
         let Some(verified) = verified else {
             let first = self.rejected.insert(requested, now).is_none();
@@ -1866,7 +1959,7 @@ impl Module {
                 BTreeSet::from([(root.pid, verified.native_start)])
             },
             cpu_floor: cpu_ledger::Ledger::new(true),
-            baseline_at_ms: table.observed_at_ms(),
+            birth_baseline: table.birth_baseline(),
             counter_before: self.observation_before,
             previous_inside: if verified.inside {
                 verified.members.clone()
@@ -1963,9 +2056,9 @@ impl Module {
         arrival_sequence: u64,
     ) {
         self.finish_cpu.expire(self.clock.now());
-        let Some(root) = self.trusted_key(root) else {
+        if !self.roots.contains_key(&root) {
             return;
-        };
+        }
         self.omitted.remove(&root);
         self.last_readings = None;
         #[cfg(windows)]
@@ -2124,7 +2217,9 @@ impl Module {
 
     #[cfg(test)]
     fn finish(&mut self, root: AgentCommandRoot, reported: Option<u64>) {
-        self.finish_at(root, reported, now_ms());
+        if let Some(key) = self.trusted_key(root) {
+            self.finish_at(key, reported, now_ms());
+        }
     }
 }
 

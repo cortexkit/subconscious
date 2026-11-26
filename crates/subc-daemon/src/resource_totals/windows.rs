@@ -386,12 +386,8 @@ impl Command {
                 let before = || {
                     self.cpu_floor.own(identity).or_else(|| {
                         let born = (identity.1 / 10_000).checked_sub(11_644_473_600_000)?;
-                        (self.measured
-                            && born
-                                > self
-                                    .baseline_at_ms
-                                    .saturating_add(subc_os::process_start_time_precision_ms()))
-                        .then_some(0)
+                        (self.measured && self.birth_baseline.precedes(identity.1, born))
+                            .then_some(0)
                     })
                 };
                 let location = if process_tree {

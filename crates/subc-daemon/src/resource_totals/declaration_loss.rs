@@ -24,6 +24,7 @@ struct LossState {
 struct Lost {
     declared_at: Instant,
     gone_at: Option<Duration>,
+    native_start: Option<u64>,
 }
 
 impl Losses {
@@ -45,7 +46,12 @@ impl Losses {
         pids.extend(state.roots.keys().map(|root| root.pid));
     }
     pub(crate) fn mark(&self, roots: &[AgentCommandRoot]) {
-        if roots.is_empty() {
+        self.mark_identities(roots.iter().map(|root| (*root, None)));
+    }
+
+    fn mark_identities(&self, roots: impl IntoIterator<Item = (AgentCommandRoot, Option<u64>)>) {
+        let mut roots = roots.into_iter().peekable();
+        if roots.peek().is_none() {
             return;
         }
         let now = self.clock.now();
@@ -57,17 +63,19 @@ impl Losses {
                 .is_none_or(|gone| now.saturating_sub(gone) < LOST_WINDOW)
         });
         state.ever_lost = true;
-        for root in roots {
-            if state.roots.contains_key(root) {
+        for (root, native_start) in roots {
+            if let Some(loss) = state.roots.get_mut(&root) {
+                loss.native_start = loss.native_start.or(native_start);
                 continue;
             }
             state.uncertainty_revision = state.uncertainty_revision.saturating_add(1);
             if state.roots.len() < MAX_LOST_ROOTS {
                 state.roots.insert(
-                    *root,
+                    root,
                     Lost {
                         declared_at: Instant::now(),
                         gone_at: None,
+                        native_start,
                     },
                 );
             } else {
@@ -111,14 +119,20 @@ impl Losses {
         state.overflow != 0 && (state.overflow > state.recovered || state.overflow_at.active(now))
     }
 
-    fn reconcile(&self, accepted: &[AgentCommandRoot], complete: Option<u64>) {
+    fn reconcile_identities(
+        &self,
+        accepted: &[(AgentCommandRoot, Option<u64>)],
+        complete: Option<u64>,
+    ) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let mut repaired = false;
-        state.roots.retain(|root, _| {
-            let matched = accepted.iter().any(|accepted| {
-                accepted.pid == root.pid
-                    && accepted.start_time_ms.abs_diff(root.start_time_ms)
-                        < subc_os::process_start_time_precision_ms()
+        state.roots.retain(|root, loss| {
+            let matched = accepted.iter().any(|(accepted, native)| {
+                if let (Some(before), Some(after)) = (loss.native_start, *native) {
+                    root.pid == accepted.pid && before == after
+                } else {
+                    same_epoch(*accepted, *root)
+                }
             });
             repaired |= matched;
             !matched
@@ -137,15 +151,21 @@ impl Losses {
     }
 
     #[cfg(test)]
+    fn reconcile(&self, accepted: &[AgentCommandRoot], complete: Option<u64>) {
+        let accepted: Vec<_> = accepted.iter().map(|root| (*root, None)).collect();
+        self.reconcile_identities(&accepted, complete);
+    }
+
+    #[cfg(test)]
     fn observe_gone(&self, now: Duration, gone: impl Fn(AgentCommandRoot) -> Option<bool>) {
-        self.observe_after(now, None, gone);
+        self.observe_after(now, None, |root, _| gone(root));
     }
 
     fn observe_after(
         &self,
         now: Duration,
         began: Option<Instant>,
-        gone: impl Fn(AgentCommandRoot) -> Option<bool>,
+        gone: impl Fn(AgentCommandRoot, &mut Option<u64>) -> Option<bool>,
     ) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let mut changed = false;
@@ -154,7 +174,7 @@ impl Losses {
             if began.is_some_and(|began| began <= loss.declared_at) {
                 return true;
             }
-            match gone(*root) {
+            match gone(*root, &mut loss.native_start) {
                 Some(true) => {
                     changed |= loss.gone_at.is_none();
                     now.saturating_sub(*loss.gone_at.get_or_insert(now)) < LOST_WINDOW
@@ -173,15 +193,29 @@ impl Losses {
     }
 
     pub(super) fn observe(&self, table: &ProcessTable) {
-        self.observe_after(self.clock.now(), table.started_at(), |root| {
-            match table.process(root.pid) {
-                Some(process) => Some(
-                    process.start_time_ms.abs_diff(root.start_time_ms)
-                        >= subc_os::process_start_time_precision_ms(),
-                ),
+        self.observe_after(
+            self.clock.now(),
+            table.started_at(),
+            |root, native| match table.process(root.pid) {
+                Some(process) => {
+                    if let Some(native) = *native {
+                        return Some(native != process.start_time);
+                    }
+                    let matches = same_epoch(
+                        root,
+                        AgentCommandRoot {
+                            pid: process.pid,
+                            start_time_ms: process.start_time_ms,
+                        },
+                    );
+                    if matches {
+                        *native = Some(process.start_time);
+                    }
+                    Some(!matches)
+                }
                 None => (table.identity_alive(root.pid, 0) == Some(false)).then_some(true),
-            }
-        });
+            },
+        );
     }
 
     fn diagnostics(&self) -> serde_json::Value {
@@ -219,31 +253,14 @@ impl Tracker {
     }
 }
 
-pub(super) fn recover(
-    module: &Module,
-    started: &[AgentCommandRoot],
-    known: Option<&[AgentCommandRoot]>,
-) -> Vec<AgentCommandRoot> {
-    started
-        .iter()
-        .chain(known.into_iter().flatten())
-        .filter(|root| {
-            module
-                .trusted_key(**root)
-                .is_some_and(|key| module.roots.contains_key(&key))
-        })
-        .copied()
-        .collect()
-}
-
 pub(super) fn commit(
     losses: &Losses,
-    recovered: &[AgentCommandRoot],
+    recovered: &[(AgentCommandRoot, Option<u64>)],
     complete: Option<u64>,
-    lost: &[AgentCommandRoot],
+    lost: &[(AgentCommandRoot, Option<u64>)],
 ) {
-    losses.reconcile(recovered, complete);
-    losses.mark(lost);
+    losses.reconcile_identities(recovered, complete);
+    losses.mark_identities(lost.iter().copied());
 }
 
 #[cfg(test)]
@@ -254,6 +271,47 @@ mod tests {
             pid,
             start_time_ms: 1,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lost_identity_stays_live_and_can_be_recovered_after_its_epoch_steps() {
+        let loss = Losses::default();
+        let root = AgentCommandRoot {
+            pid: 20,
+            start_time_ms: 1_000_050,
+        };
+        let stepped = AgentCommandRoot {
+            start_time_ms: 1_002_050,
+            ..root
+        };
+        let table = |revision, epoch| {
+            ProcessTable::from_test_members(
+                revision,
+                epoch,
+                vec![subc_os::ProcessMember {
+                    pid: root.pid,
+                    parent_pid: 0,
+                    session_id: None,
+                    start_time: 5,
+                    start_time_ms: epoch,
+                    name: "worker".into(),
+                    resources: None,
+                    own_cpu_ms: None,
+                    reaped_cpu_ms: None,
+                }],
+                vec![],
+            )
+        };
+        loss.mark(&[root]);
+        loss.observe(&table(1, root.start_time_ms));
+        loss.observe(&table(2, stepped.start_time_ms));
+        assert!(loss.sample_uncertainty().1);
+        loss.reconcile_identities(&[(root, Some(6))], None);
+        assert!(loss.sample_uncertainty().1);
+        loss.reconcile_identities(&[(stepped, Some(5))], None);
+        assert!(!loss.sample_uncertainty().1);
+        assert_eq!(loss.diagnostics()["lost_identities"], 0);
     }
 
     #[test]
@@ -347,7 +405,7 @@ mod tests {
         let epoch = losses.epoch();
         let first = tracker.apply_prepared(&mut module, 1, empty(live.clone()));
         assert!(!first.full_resync);
-        assert_eq!(first.lost, vec![accepted]);
+        assert_eq!(first.lost, vec![(accepted, Some(member.start_time))]);
         commit(
             &losses,
             &[],

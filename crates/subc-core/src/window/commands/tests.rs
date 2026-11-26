@@ -1178,6 +1178,23 @@ fn earlier_boot_is_gone_even_when_pid_and_start_time_match() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn bound_daemon_owner_stays_live_when_its_epoch_moves() {
+    let native = 123;
+    let read = |btime: u64| (ProcessReading::Alive(native), btime * 1_000 + native * 10);
+    let (ProcessReading::Alive(bound), reported_epoch) = read(1_000) else {
+        unreachable!();
+    };
+    let daemon = identity(10, bound);
+    let (process, fresh_epoch) = read(1_002);
+    assert_eq!(fresh_epoch - reported_epoch, 2_000);
+    assert_eq!(
+        daemon.compare(Ok(&daemon.boot), || process),
+        Liveness::Alive
+    );
+}
+
 #[test]
 fn kept_cleanup_resumes_and_prompt_plan_is_pinned() {
     let mut rig = Rig::new("window-keep-interrupted");

@@ -373,7 +373,7 @@ dependencies = [
 
 [[package]]
 name = "subc-client-rs"
-version = "0.41.0"
+version = "0.43.0"
 dependencies = [
  "async-trait",
  "serde",
@@ -391,7 +391,7 @@ dependencies = [
 
 [[package]]
 name = "subc-config"
-version = "0.1.0"
+version = "0.1.12"
 dependencies = [
  "regex",
  "ryu",
@@ -402,7 +402,7 @@ dependencies = [
 
 [[package]]
 name = "subc-control"
-version = "0.40.2"
+version = "0.43.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -412,10 +412,11 @@ dependencies = [
 
 [[package]]
 name = "subc-os"
-version = "0.1.39"
+version = "0.1.55"
 dependencies = [
  "libc",
  "rustix",
+ "socket2",
  "tokio",
  "windows-sys",
  "zeroize",
@@ -423,7 +424,7 @@ dependencies = [
 
 [[package]]
 name = "subc-protocol"
-version = "0.37.1"
+version = "0.37.11"
 dependencies = [
  "base64",
  "serde",
@@ -433,7 +434,7 @@ dependencies = [
 
 [[package]]
 name = "subc-transport"
-version = "0.18.0"
+version = "0.18.2"
 dependencies = [
  "getrandom",
  "hmac",

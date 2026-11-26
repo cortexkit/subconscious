@@ -1040,6 +1040,8 @@ pub enum SubscriptionEnd {
     Response(Vec<u8>),
     StreamEnd,
     Error(ErrorBody),
+    /// An Error frame reported that the established route is no longer usable.
+    RouteDead(ErrorBody),
     RouteClosed {
         reason: RouteEndReason,
     },
@@ -1047,6 +1049,13 @@ pub enum SubscriptionEnd {
     Cancelled,
     /// The bounded event channel filled before the caller drained it.
     Backpressure,
+}
+
+impl SubscriptionEnd {
+    /// Whether an Error frame reported that the established route is no longer usable.
+    pub fn is_route_dead(&self) -> bool {
+        matches!(self, Self::RouteDead(_))
+    }
 }
 
 /// A live subscription to a provider event stream.
@@ -2269,7 +2278,9 @@ impl SubcConsumer {
                     busy_delay = (busy_delay * 2).min(Duration::from_secs(1));
                     self.shared.validate_current_handle(*handle)?;
                 }
-                TerminalFrame::Error { body, .. } => return Err(CallError::Module(body)),
+                TerminalFrame::Error { body, flags } => {
+                    return Err(CallError::from_established_route_error(flags, body));
+                }
             }
         }
     }
@@ -2760,7 +2771,9 @@ impl SubcConsumer {
                         NotSentCause::DaemonRefusedBeforeForward { code: body.code },
                     ));
                 }
-                Ok(TerminalFrame::Error { body, .. }) => return Err(CallError::Module(body)),
+                Ok(TerminalFrame::Error { body, flags }) => {
+                    return Err(CallError::from_established_route_error(flags, body));
+                }
                 Err(err)
                     if err.is_not_sent()
                         && Instant::now() < call_deadline
@@ -3165,6 +3178,8 @@ pub enum CallError {
     /// The target module handler returned an Error frame. Application-level rejections
     /// are returned as ordinary successful response bytes and do not produce this variant.
     Module(ErrorBody),
+    /// An Error frame reported that the established route is no longer usable.
+    RouteDead(Box<ErrorBody>),
     /// A subscription event receiver stopped keeping up with its bounded channel.
     ///
     /// The reader task must never await a slow consumer while it is dispatching frames
@@ -3184,6 +3199,12 @@ pub enum CallError {
 }
 
 impl CallError {
+    /// Whether an Error frame reported that the established route is no longer usable.
+    /// This classification does not establish whether an earlier attempt was delivered.
+    pub fn is_route_dead(&self) -> bool {
+        matches!(self, Self::RouteDead(_))
+    }
+
     /// A typed terminal scope bind-proof refusal, if the daemon returned one.
     pub fn scope_bind_proof_refusal(&self) -> Option<ScopeBindProofRefusal> {
         match self.route_open_refusal()?.code.as_str() {
@@ -3263,6 +3284,7 @@ impl CallError {
     pub fn code(&self) -> Option<&str> {
         match self {
             Self::Module(body) => Some(&body.code),
+            Self::RouteDead(body) => Some(&body.code),
             Self::DaemonTooOld { .. } => Some("daemon_too_old"),
             Self::CapabilityUnprovided { .. } => Some("capability_unprovided"),
             Self::CapabilityAmbiguous { .. } => Some("capability_ambiguous"),
@@ -3361,6 +3383,7 @@ impl fmt::Display for CallError {
             Self::NotSent(err) => write!(f, "request not sent: {err}"),
             Self::OutcomeUnknown(err) => write!(f, "request outcome unknown: {err}"),
             Self::Module(body) => write!(f, "module error {}: {}", body.code, body.message),
+            Self::RouteDead(body) => write!(f, "route dead {}: {}", body.code, body.message),
             Self::SubscriptionBackpressure(err) => {
                 write!(f, "subscription event channel backpressure: {err}")
             }
@@ -3393,6 +3416,7 @@ impl Error for CallError {
             | Self::OutcomeUnknown(err)
             | Self::SubscriptionBackpressure(err) => Some(err.as_ref()),
             Self::Module(_)
+            | Self::RouteDead(_)
             | Self::DaemonTooOld { .. }
             | Self::StaleRouteHandle(_)
             | Self::CapabilityUnprovided { .. }
@@ -5553,7 +5577,7 @@ impl Shared {
             }
             return;
         }
-        entry.settle_terminal(terminal);
+        entry.settle_terminal(key, terminal);
     }
 
     fn pending_accepted(&self, key: PendingKey) -> Option<bool> {
@@ -6513,6 +6537,11 @@ impl From<CallError> for SharedCallFailure {
                     route_reason: None,
                 }),
             },
+            error @ CallError::RouteDead(_) => CallError::outcome_unknown(
+                format!("unexpected established-route error during route.open: {error}"),
+                OutcomeUnknownCause::CompletionFailed,
+            )
+            .into(),
             CallError::SubscriptionBackpressure(err) => Self {
                 kind: FailureKind::OutcomeUnknown(OutcomeUnknownSource {
                     message: err.to_string(),
@@ -6645,39 +6674,6 @@ impl PendingEntry {
             mpsc::error::TrySendError::Full(_) => StreamDataDelivery::Full,
             mpsc::error::TrySendError::Closed(_) => StreamDataDelivery::Closed,
         })
-    }
-
-    fn settle_terminal(self, terminal: PendingTerminal) {
-        if let Some(retry) = &self.retry {
-            retry.position.stop.cancel();
-        }
-        match self.completion {
-            PendingCompletion::Unary(tx) => {
-                let _ = tx.send(PendingResult::Terminal(terminal));
-            }
-            PendingCompletion::Subscription { closed, ended, .. } => {
-                let (end, result) = match terminal {
-                    PendingTerminal::Response { body, .. } => {
-                        (SubscriptionEnd::Response(body), Ok(()))
-                    }
-                    PendingTerminal::StreamEnd => (SubscriptionEnd::StreamEnd, Ok(())),
-                    PendingTerminal::Error { body, flags } => {
-                        let err = if error_codes::is_route_busy_retryable(
-                            flags,
-                            &body.code,
-                            self.retry.is_some(),
-                        ) {
-                            busy_error(&body)
-                        } else {
-                            CallError::Module(body.clone())
-                        };
-                        (SubscriptionEnd::Error(body.clone()), Err(err))
-                    }
-                };
-                let _ = ended.send(Some(end));
-                let _ = closed.send(result);
-            }
-        }
     }
 
     fn settle_failure(self, reason: String) {
@@ -8476,6 +8472,31 @@ mod tests {
         assert_eq!(reply.await.unwrap(), b"reply");
         assert_eq!(sem.available_permits(), 1);
         consumer.close().await;
+    }
+
+    #[tokio::test]
+    async fn pending_reply_classifies_established_route_error() {
+        for (body, route_dead) in established_route_errors() {
+            let (shared, consumer, mut rx, handle, _) = reservation_stand_in(1, 1);
+            let reserved = consumer
+                .reserve(&handle, Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap();
+            let (_, reply) = reserved.send(
+                RequestBody::new(b"request".to_vec()).unwrap(),
+                CallOptions::default(),
+            );
+            let request = rx.recv().await.unwrap().frame;
+            assert!(dispatch_frame(&shared, 1, route_error(&request, &body, route_dead)).await);
+            let error = reply.await.unwrap_err();
+            assert_eq!(error.is_route_dead(), route_dead, "{error:?}");
+            assert_eq!(error.code(), Some(body.code.as_str()));
+            match error {
+                CallError::RouteDead(received) if route_dead => assert_eq!(*received, body),
+                CallError::Module(received) if !route_dead => assert_eq!(received, body),
+                other => panic!("unexpected call error: {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]
@@ -11213,6 +11234,86 @@ mod tests {
             body,
         )
         .unwrap()
+    }
+
+    fn established_route_errors() -> [(ErrorBody, bool); 3] {
+        [
+            (error_codes::STALE_ROUTE_EPOCH, true),
+            (error_codes::UNKNOWN_CHANNEL, true),
+            ("no_grant", false),
+        ]
+        .map(|(code, route_dead)| {
+            (
+                ErrorBody {
+                    code: code.into(),
+                    message: "request rejected".into(),
+                    detail: Some(serde_json::json!({"channel": 5})),
+                },
+                route_dead,
+            )
+        })
+    }
+
+    fn route_error(request: &Frame, body: &ErrorBody, daemon_origin: bool) -> Frame {
+        let mut frame =
+            watch_terminal(request, FrameType::Error, serde_json::to_vec(body).unwrap());
+        if daemon_origin {
+            frame.header.flags = frame.header.flags.with_daemon_origin();
+        }
+        frame
+    }
+
+    #[tokio::test]
+    async fn subscription_classifies_established_route_error() {
+        for (body, route_dead) in established_route_errors() {
+            let (consumer, _rx, mut subscription, request) = watch_subscribed().await;
+            assert!(
+                dispatch_frame(
+                    &consumer.shared,
+                    1,
+                    route_error(&request, &body, route_dead)
+                )
+                .await
+            );
+            let end = subscription.ended().await;
+            assert_eq!(end.is_route_dead(), route_dead, "{end:?}");
+            let error = subscription.closed().await.unwrap_err();
+            assert_eq!(error.is_route_dead(), route_dead, "{error:?}");
+            if route_dead {
+                assert_eq!(end, SubscriptionEnd::RouteDead(body.clone()));
+                assert!(matches!(error, CallError::RouteDead(received) if *received == body));
+            } else {
+                assert_eq!(end, SubscriptionEnd::Error(body.clone()));
+                assert!(matches!(error, CallError::Module(received) if received == body));
+            }
+        }
+
+        let (shared, _consumer, mut rx, _, _) = reservation_stand_in(1, 1);
+        let permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+        let mut subscription = shared
+            .send_subscription(SubscriptionSend {
+                expected_handle: None,
+                channel: 0,
+                epoch: 0,
+                body: b"watch".to_vec(),
+                priority: Priority::Interactive,
+                admission_class: AdmissionClass::Normal,
+                event_buffer: 1,
+                deadline: Instant::now() + Duration::from_secs(1),
+                permit: RoutePermit::legacy(permit),
+            })
+            .await
+            .unwrap();
+        let request = rx.recv().await.unwrap().frame;
+        let [(body, _), ..] = established_route_errors();
+        assert!(dispatch_frame(&shared, 1, route_error(&request, &body, true)).await);
+        assert_eq!(
+            subscription.ended().await,
+            SubscriptionEnd::Error(body.clone())
+        );
+        assert!(
+            matches!(subscription.closed().await, Err(CallError::Module(received)) if received == body)
+        );
     }
 
     #[tokio::test]

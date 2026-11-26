@@ -179,7 +179,9 @@ impl SubcConsumer {
                     {
                         Err(busy_error(&body))
                     }
-                    TerminalFrame::Error { body, .. } => Err(CallError::Module(body)),
+                    TerminalFrame::Error { body, flags } => {
+                        Err(CallError::from_established_route_error(flags, body))
+                    }
                 }
             }),
         };

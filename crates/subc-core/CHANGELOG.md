@@ -4,6 +4,7 @@
 
 - Use subc-daemon 0.53.3, which delivers Windows launch nonces only by pipe.
   The module status test checks that the environment copy is disabled.
+- Require subc-client-rs 0.43.0 and ck-ui 0.9.9.
 
 ## 0.22.2
 

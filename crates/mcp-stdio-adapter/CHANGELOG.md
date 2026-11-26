@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.8.12
+
+- Require subc-client-rs 0.43.0.
+
 ## 0.8.11
 
 - Raise the dependency floors for the accepting-drain release.

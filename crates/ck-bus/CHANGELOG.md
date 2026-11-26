@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.13.6
+
+- Require subc-client-rs 0.43.0 and cortexkit-bus-testkit 0.9.6.
+
 ## 0.13.5
 
 - Raise the dependency floors for the accepting-drain release.

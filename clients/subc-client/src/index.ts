@@ -6,6 +6,7 @@ export {
   UNKNOWN_CHANNEL,
   STALE_ROUTE_EPOCH,
   isEstablishedRouteDead,
+  isRouteDead,
   isRouteBusyRetryable,
   isRetryableRouteOpenCode,
   isRetryableRouteOpenRefusal,

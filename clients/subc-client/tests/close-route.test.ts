@@ -9,10 +9,12 @@ import {
   buildFrame,
   CLIENT_AUTH_DOMAIN,
   computeProof,
+  DAEMON_ORIGIN_FLAG,
   decodeHeader,
   encodeFrame,
   FrameType,
   HEADER_LEN,
+  isRouteDead,
   Priority,
   SubcClient,
   SubcCallError,
@@ -65,6 +67,7 @@ interface FakeState {
   lastDataRequest?: Frame;
   holdRouteOpenReplies?: boolean;
   heldRouteOpenReply?: Frame;
+  requestWindow?: number;
   nextChannel?: number;
 }
 
@@ -418,16 +421,46 @@ describe("request Error frames", () => {
   }
 });
 
+const establishedRouteErrors = [
+  ["stale_route_epoch", true],
+  ["unknown_channel", true],
+  ["no_grant", false],
+] as const;
+
+test("managed call classifies established-route ERROR", async () => {
+  const { client, daemon } = await connectClient();
+  daemon.state.holdRequests = true;
+  try {
+    let requests = 0;
+    for (const [code, routeDead] of establishedRouteErrors) {
+      const body = { code, message: "request rejected", detail: { operation: "call" } };
+      const error = rejectionOf(client.call("aft", "hold", {}));
+      for (let attempt = 0; attempt < (routeDead ? 2 : 1); attempt++) {
+        requests++;
+        await waitFor(() => daemon.state.dataRequests === requests, "call request received");
+        const { channel, epoch, corr } = daemon.state.lastDataRequest!.header;
+        const flags = buildFlags(false, Priority.Interactive, false) | (routeDead ? DAEMON_ORIGIN_FLAG : 0);
+        await daemon.send(buildFrame(FrameType.Error, flags, channel, epoch, corr, encodeJson(body)));
+      }
+      const result = await error;
+      if (!(result instanceof SubcCallError)) throw new Error(`unexpected call error: ${result}`);
+      expect(result).toMatchObject({ kind: "terminal", code, detail: body.detail });
+      expect(result.isRouteDead()).toBe(routeDead);
+    }
+  } finally { client.close(); }
+});
+
 describe("subscription ended", () => {
-  async function subscribed() {
+  async function subscribed(gated = false) {
     const { client, daemon } = await connectClient();
     daemon.state.holdRequests = true;
+    if (gated) daemon.state.requestWindow = 1;
     const handle = await client.routeOpen(TOOL_TARGET, IDENTITY);
     const subscription = client.subscribe(handle, { watch: true }, () => {});
     await waitFor(() => daemon.state.lastDataRequest !== undefined, "watch request received");
     const request = daemon.state.lastDataRequest!;
-    const terminal = (ty: FrameType, body: Uint8Array = new Uint8Array()) => buildFrame(
-      ty, buildFlags(false, Priority.Interactive, false),
+    const terminal = (ty: FrameType, body: Uint8Array = new Uint8Array(), daemonOrigin = false) => buildFrame(
+      ty, buildFlags(false, Priority.Interactive, false) | (daemonOrigin ? DAEMON_ORIGIN_FLAG : 0),
       request.header.channel, request.header.epoch, request.header.corr, body,
     );
     return { client, daemon, handle, subscription, terminal };
@@ -478,6 +511,26 @@ describe("subscription ended", () => {
       subscription.unsubscribe();
       expect(await subscription.ended).toEqual({ kind: "error", ...error });
     } finally { client.close(); }
+  });
+
+  test("subscription classifies established-route ERROR", async () => {
+    for (const gated of [false, true]) {
+      for (const [code, routeDead] of establishedRouteErrors) {
+        const { client, daemon, subscription, terminal } = await subscribed(gated);
+        const closed = rejectionOf(subscription.closed);
+        try {
+          const body = { code, message: "request rejected", detail: { operation: "watch" } };
+          await daemon.send(terminal(FrameType.Error, encodeJson(body), routeDead));
+          const end = await subscription.ended;
+          expect(end).toEqual({ kind: routeDead ? "route_dead" : "error", ...body });
+          expect(isRouteDead(end)).toBe(routeDead);
+          const error = await closed;
+          if (!(error instanceof SubcError)) throw new Error(`unexpected subscription error: ${error}`);
+          expect(error).toMatchObject(body);
+          expect(error.isRouteDead()).toBe(routeDead);
+        } finally { client.close(); }
+      }
+    }
   });
 
   test("subscription ended reports caller unsubscribe as cancelled and ignores a late terminal", async () => {
@@ -582,7 +635,9 @@ async function handleConnection(socket: Socket, state: FakeState): Promise<void>
         const channel = state.nextChannel!++;
         state.openedChannels.push(channel);
         if (state.routeOpenGate) await state.routeOpenGate;
-        const reply = responseFrame(frame, { op: "route.open", route_channel: channel, route_epoch: 1 });
+        const reply = responseFrame(frame, {
+          op: "route.open", route_channel: channel, route_epoch: 1, request_window: state.requestWindow,
+        });
         if (state.holdRouteOpenReplies) state.heldRouteOpenReply = reply;
         else await writeFrame(socket, reply, deadline);
       }

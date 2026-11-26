@@ -1,6 +1,6 @@
 [package]
 name = "subc-mcp"
-version = "0.2.17"
+version = "0.2.18"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -22,7 +22,7 @@ ryu-js = "1"
 rmcp = { version = "3.8", default-features = false, features = ["server", "transport-async-rw"] }
 cortexkit-paths = "0.1.1"
 cortexkit-store-types = "0.2.2"
-subc-client-rs = { path = "../subc-client-rs", version = "0.42.0" }
+subc-client-rs = { path = "../subc-client-rs", version = "0.43.0" }
 subc-control = { path = "../subc-control", version = "0.43.0" }
 subc-jsonc = { path = "../subc-jsonc", version = "0.1.5" }
 subc-os = { path = "../subc-os", version = "0.1.47" }

@@ -309,7 +309,7 @@ async fn retry_then_writer_timeout(
 }
 
 #[tokio::test(start_paused = true)]
-async fn final_marked_refusal_is_not_sent_but_unmarked_body_remains_module() {
+async fn final_refusal_preserves_non_delivery_proof_or_reports_the_terminal_error() {
     for code in [
         error_codes::MODULE_RELOADING,
         error_codes::UNKNOWN_CHANNEL,
@@ -343,10 +343,18 @@ async fn final_marked_refusal_is_not_sent_but_unmarked_body_remains_module() {
                             NotSentCause::DaemonRefusedBeforeForward { code: code.into() },
                             first_marked,
                         );
+                        assert!(!err.is_route_dead());
                     } else {
-                        let CallError::Module(body) = &err else {
-                            panic!("{err:?}");
+                        let route_dead = matches!(
+                            code,
+                            error_codes::UNKNOWN_CHANNEL | error_codes::STALE_ROUTE_EPOCH
+                        );
+                        let body = match &err {
+                            CallError::RouteDead(body) if route_dead => body.as_ref(),
+                            CallError::Module(body) if !route_dead => body,
+                            _ => panic!("{err:?}"),
                         };
+                        assert_eq!(err.is_route_dead(), route_dead);
                         assert_eq!(body.code, code);
                         assert_eq!(body.message, "refused");
                         assert_eq!(err.not_sent_cause(), None);

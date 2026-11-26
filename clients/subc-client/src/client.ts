@@ -378,6 +378,12 @@ export class SubcCallError extends Error {
     return this.cause instanceof SubcError ? this.cause.detail : undefined;
   }
 
+  /** Whether an Error frame reported that the established route is no longer usable. */
+  isRouteDead(): boolean {
+    return (this.cause instanceof SubcError || this.cause instanceof SubcCallError)
+      && this.cause.isRouteDead();
+  }
+
   /** Why the route ended. A reason never makes an in-flight call safe to resend. */
   get closeReason(): RouteEndReason | undefined {
     return this.cause instanceof SubcError || this.cause instanceof SubcCallError
@@ -405,9 +411,24 @@ export type SubscriptionEnd =
   | { kind: "response"; body: Uint8Array }
   | { kind: "stream_end" }
   | { kind: "error"; code: SubcError["code"]; message: string; detail?: unknown }
+  | { kind: "route_dead"; code: SubcError["code"]; message: string; detail?: unknown }
   | { kind: "route_closed"; reason: RouteEndReason }
   | { kind: "connection_lost" }
   | { kind: "cancelled" };
+
+/** Whether an Error frame reported that the subscription's route is no longer usable. */
+export function isRouteDead(end: SubscriptionEnd): boolean {
+  return end.kind === "route_dead";
+}
+
+function subscriptionErrorEnd(error: SubcError | SubcCallError): SubscriptionEnd {
+  return {
+    kind: error.isRouteDead() ? "route_dead" : "error",
+    code: error.code,
+    message: error.message,
+    detail: error.detail,
+  };
+}
 
 /**
  * A live subscription to a provider's event stream, riding a single held-open
@@ -440,11 +461,17 @@ export class SubcError extends Error {
   ) {
     super(message);
   }
+
+  /** Whether an Error frame reported that the established route is no longer usable. */
+  isRouteDead(): boolean {
+    return establishedRouteDeaths.has(this);
+  }
 }
 
-// The wire flags belong to the frame, not the public error API. Keep them with
-// that error across managed-call wrapping so Phase 2 can enforce origin here.
+// Keep wire flags on the original error so retry policy can use them after the
+// managed call wraps it, without exposing frame metadata to callers.
 const errorFrameFlags = new WeakMap<SubcError, number>();
+const establishedRouteDeaths = new WeakSet<SubcError>();
 
 function requireBinaryBody(body: unknown): Uint8Array {
   if (body instanceof Uint8Array) return body;
@@ -1165,8 +1192,7 @@ export class SubcClient {
     const ended = new Promise<SubscriptionEnd>((resolve) => { resolveEnded = resolve; });
     const endFailure = (err: Error, frame?: Frame): void => {
       if (frame?.header.ty === FrameType.Error) {
-        const error = err as SubcError;
-        resolveEnded({ kind: "error", code: error.code, message: error.message, detail: error.detail });
+        resolveEnded(subscriptionErrorEnd(err as SubcError));
       } else if (err instanceof SubcError && err.closeReason && err.closeReason !== "connection_lost") {
         resolveEnded({ kind: "route_closed", reason: err.closeReason });
       } else {
@@ -1519,7 +1545,7 @@ export class SubcClient {
         if (cancelled) return;
         if (error instanceof SubcError && error.closeReason) resolveEnded(error.closeReason === "connection_lost"
           ? { kind: "connection_lost" } : { kind: "route_closed", reason: error.closeReason });
-        else if (error instanceof SubcError || error instanceof SubcCallError) resolveEnded({ kind: "error", code: error.code, message: error.message, detail: error.detail });
+        else if (error instanceof SubcError || error instanceof SubcCallError) resolveEnded(subscriptionErrorEnd(error));
         else resolveEnded({ kind: "connection_lost" });
         rejectClosed(error);
       });
@@ -2493,6 +2519,9 @@ export class SubcClient {
       };
       const error = new SubcError(parsed.message ?? "subc error", parsed.code, parsed.detail);
       errorFrameFlags.set(error, frame.header.flags);
+      if (frame.header.channel !== 0 && isEstablishedRouteDead(frame.header.flags, error.code)) {
+        establishedRouteDeaths.add(error);
+      }
       return error;
     } catch {
       return new SubcError(Buffer.from(frame.body).toString("utf8") || "subc error");

@@ -1,7 +1,14 @@
 # Changelog
 
-## 0.42.2
+## 0.43.0
 
+- Use `CallError::is_route_dead()` and `SubscriptionEnd::is_route_dead()`
+  instead of passing absent flags to `is_established_route_dead`. Established-route
+  Error frames classified as route-dead now return `CallError::RouteDead(Box<ErrorBody>)`
+  or `SubscriptionEnd::RouteDead(ErrorBody)` with the original body, instead of
+  `CallError::Module` or `SubscriptionEnd::Error`.
+  Update exhaustive matches on `CallError` for the new variant. Existing retry,
+  eviction and proven-non-delivery (`NotSent`) behavior is unchanged.
 - The supervised Windows delivery test now requires a pipe nonce and verifies
   that the daemon did not put a copy in the module's environment. The reader
   still supports older daemons.

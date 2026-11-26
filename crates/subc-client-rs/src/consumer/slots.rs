@@ -129,6 +129,61 @@ pub(super) fn is_refusal_on_route(trusted: bool, flags: Flags, code: &str, opted
         || is_daemon_refusal_before_forward(trusted, flags, code)
 }
 
+impl CallError {
+    pub(super) fn from_established_route_error(flags: Flags, body: ErrorBody) -> Self {
+        if error_codes::is_established_route_dead(flags, &body.code) {
+            Self::RouteDead(Box::new(body))
+        } else {
+            Self::Module(body)
+        }
+    }
+}
+
+impl PendingEntry {
+    pub(super) fn settle_terminal(self, key: PendingKey, terminal: PendingTerminal) {
+        if let Some(retry) = &self.retry {
+            retry.position.stop.cancel();
+        }
+        match self.completion {
+            PendingCompletion::Unary(tx) => {
+                let _ = tx.send(PendingResult::Terminal(terminal));
+            }
+            PendingCompletion::Subscription { closed, ended, .. } => {
+                let (end, result) = match terminal {
+                    PendingTerminal::Response { body, .. } => {
+                        (SubscriptionEnd::Response(body), Ok(()))
+                    }
+                    PendingTerminal::StreamEnd => (SubscriptionEnd::StreamEnd, Ok(())),
+                    PendingTerminal::Error { body, flags } => {
+                        if error_codes::is_route_busy_retryable(
+                            flags,
+                            &body.code,
+                            self.retry.is_some(),
+                        ) {
+                            let err = busy_error(&body);
+                            (SubscriptionEnd::Error(body), Err(err))
+                        } else if key.channel != 0
+                            && error_codes::is_established_route_dead(flags, &body.code)
+                        {
+                            (
+                                SubscriptionEnd::RouteDead(body.clone()),
+                                Err(CallError::RouteDead(Box::new(body))),
+                            )
+                        } else {
+                            (
+                                SubscriptionEnd::Error(body.clone()),
+                                Err(CallError::Module(body)),
+                            )
+                        }
+                    }
+                };
+                let _ = ended.send(Some(end));
+                let _ = closed.send(result);
+            }
+        }
+    }
+}
+
 impl Shared {
     pub(super) async fn busy_backoff(
         &self,
@@ -164,7 +219,7 @@ impl Shared {
         }
         if Instant::now() >= retry.deadline {
             if let Some(entry) = self.lock_inner().remove_pending(&key) {
-                entry.settle_terminal(refusal);
+                entry.settle_terminal(key, refusal);
             }
             return;
         }

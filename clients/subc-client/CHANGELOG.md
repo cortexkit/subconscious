@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.28.0
+
+- Use `error.isRouteDead()` on `SubcError` and `SubcCallError`, and
+  `isRouteDead(end)` on subscription ends, instead of passing absent flags to
+  `isEstablishedRouteDead`. The client classifies established-route Error
+  frames using their envelope flags. Subscription ends now use `route_dead`
+  instead of `error` for that case, with the same code, message and detail.
+  Automatic eviction and retry are unchanged.
+
 ## 0.27.3
 
 - Add a per-notice `accepting` argument to the module-side `onDraining` hook and `SubcProvider.drainReady()` to signal that a negotiated accepting drain can finish.

@@ -550,6 +550,11 @@ established route, not by reopening it, and is not route-dead.
 and resend once". It is true for exactly `unknown_channel` and
 `stale_route_epoch`, the two codes the router emits before a frame reaches a
 module (`RouterError::to_error_frame` in `crates/subc-daemon/src/router.rs`).
+The SDKs classify established-route Error frames using their real envelope
+flags. SDK callers use `is_route_dead()` in Rust and `isRouteDead()` in
+TypeScript (the `isRouteDead(end)` helper for subscription ends); do not call
+the wire predicate with absent flags. A route-death verdict is not proof that
+an earlier attempt was never forwarded.
 Test: `established_route_dead_predicate_matches_the_decision_table` (`crates/subc-protocol/tests/golden_json.rs`).
 
 ### 5.3 Other daemon codes

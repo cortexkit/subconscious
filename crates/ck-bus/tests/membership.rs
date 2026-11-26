@@ -23,7 +23,7 @@
 //! `membership-contract-unpinned`.
 //!
 //! The daemon runs this executable twice as supervised modules, once as `participant`
-//! and once as `prefrontal-core` (see `harness::issuance`), so each reaches ck-bus with
+//! and once as `prefrontal` (see `harness::issuance`), so each reaches ck-bus with
 //! the principal the daemon stamps for a launch-nonce-attested route.
 
 #[allow(dead_code)]
@@ -149,7 +149,7 @@ fn ckbus_owned_durables_stay_off_the_agent_streams() {
         );
         if agent_streams.contains(&stream) {
             assert!(matches!(kind, StreamKind::Peer | StreamKind::Wake));
-            assert!(matches!(durable, "m_prefrontal" | "m_prefrontal-core"));
+            assert_eq!(durable, "m_prefrontal");
         }
     }
 
@@ -187,10 +187,10 @@ impl issuance::PlaneSource for NoPlane {
 }
 
 /// In process: the authorization check is the gate, not a side effect of an unready
-/// plane. Every other principal is refused by name; prefrontal-core gets past it and
+/// plane. Every other principal is refused by name; prefrontal gets past it and
 /// meets `ckbus_not_ready`.
 #[tokio::test]
-async fn only_prefrontal_core_passes_the_membership_gate() {
+async fn only_prefrontal_passes_the_membership_gate() {
     let membership = membership::Membership::new(Arc::new(NoPlane));
     let refused = [
         None,
@@ -200,7 +200,7 @@ async fn only_prefrontal_core_passes_the_membership_gate() {
             module_id: PARTICIPANT.to_string(),
         }),
         Some(Principal::Reserved {
-            module_id: "prefrontal-core-shadow".to_string(),
+            module_id: "prefrontal-shadow".to_string(),
         }),
     ];
     let prefrontal = Principal::Reserved {
@@ -256,66 +256,10 @@ fn issuance_picks_the_grant_by_attested_module() {
 }
 
 #[tokio::test]
-async fn both_reserved_prefrontal_ids_pass_the_membership_gate() {
-    let membership = membership::Membership::new(Arc::new(NoPlane));
-    for module_id in ["prefrontal", "prefrontal-core"] {
-        let principal = Principal::Reserved {
-            module_id: module_id.to_string(),
-        };
-        for (op, _) in membership::OPERATIONS {
-            let refusal = membership
-                .answer(Some(&principal), op, &json!({"agent_id": "agent_rename"}))
-                .await
-                .unwrap()
-                .expect_err("authorization succeeds but the plane is not ready");
-            assert_eq!(refusal.code, issuance::code::NOT_READY, "{module_id}: {op}");
-        }
-    }
-}
-
-#[test]
-fn both_prefrontal_ids_receive_shared_authority_and_own_delivery_resources() {
-    let names = grants::derive_account("box_renamegrants").unwrap();
-    let legacy = grants::issued_grant(&names, "prefrontal-core", "credential", &[]).unwrap();
-    let current = grants::issued_grant(&names, "prefrontal", "credential", &[]).unwrap();
-    assert_eq!(current.subscribe_allow(), legacy.subscribe_allow());
-    for (module, own, other, authority) in [
-        ("prefrontal", "PREFRONTAL", "PREFRONTAL_CORE", &current),
-        ("prefrontal-core", "PREFRONTAL_CORE", "PREFRONTAL", &legacy),
-    ] {
-        assert_eq!(authority.role(), grants::GrantRole::DeliveryAuthority);
-        let allows = authority.publish_allow();
-        assert!(allows.contains("$JS.API.CONSUMER.MSG.NEXT.CK_BOX_RENAMEGRANTS_EVENT.m_prefrontal"));
-        for plane in ["event", "live"] {
-            assert!(allows.contains(&format!("ck.box_renamegrants.{plane}.{module}.>")));
-        }
-        for stream in ["INBOX", "CORE_WORK", "ROOM"] {
-            let stem = format!("$JS.API.CONSUMER.MSG.NEXT.CK_BOX_RENAMEGRANTS_{stream}");
-            assert!(allows.contains(&format!("{stem}.m_{module}")));
-            let foreign = if module == "prefrontal" {
-                "prefrontal-core"
-            } else {
-                "prefrontal"
-            };
-            assert!(!allows.contains(&format!("{stem}.m_{foreign}")));
-        }
-        assert!(allows.contains(&format!("$KV.CK_BOX_RENAMEGRANTS_{own}_SESSION_LIVENESS.>")));
-        assert!(!allows
-            .iter()
-            .any(|subject| subject.contains(&format!("_{other}_SESSION_LIVENESS"))));
-    }
-}
-
-#[tokio::test]
 async fn prefrontal_lookalikes_receive_no_authority() {
-    let names = grants::derive_account("box_renamegrants").unwrap();
+    let names = grants::derive_account("box_lookalikegrants").unwrap();
     let membership = membership::Membership::new(Arc::new(NoPlane));
-    for module_id in [
-        "prefrontal-core2",
-        "prefrontalx",
-        "xprefrontal",
-        "prefrontal-cor",
-    ] {
+    for module_id in ["prefrontalx", "xprefrontal", "prefronta"] {
         let grant = grants::issued_grant(&names, module_id, "credential", &[]).unwrap();
         assert_eq!(grant.role(), grants::GrantRole::Participant, "{module_id}");
         assert_eq!(
@@ -327,7 +271,11 @@ async fn prefrontal_lookalikes_receive_no_authority() {
         };
         for (op, _) in membership::OPERATIONS {
             let refusal = membership
-                .answer(Some(&principal), op, &json!({"agent_id": "agent_rename"}))
+                .answer(
+                    Some(&principal),
+                    op,
+                    &json!({"agent_id": "agent_lookalike"}),
+                )
                 .await
                 .unwrap()
                 .expect_err("look-alikes are not authorities");
@@ -338,25 +286,17 @@ async fn prefrontal_lookalikes_receive_no_authority() {
             );
         }
     }
-    for module_id in ["prefrontal", "prefrontal-core"] {
-        for (op, _) in membership::OPERATIONS {
-            let refusal = membership
-                .answer(
-                    Some(&Principal::Direct),
-                    op,
-                    &json!({
-                        "module_id": module_id, "agent_id": "agent_rename"
-                    }),
-                )
-                .await
-                .unwrap()
-                .expect_err("a claimed id is not an attested principal");
-            assert_eq!(
-                refusal.code,
-                membership::code::CALLER_NOT_PERMITTED,
-                "{module_id}: {op}"
-            );
-        }
+    for (op, _) in membership::OPERATIONS {
+        let refusal = membership
+            .answer(
+                Some(&Principal::Direct),
+                op,
+                &json!({"module_id": PREFRONTAL, "agent_id": "agent_lookalike"}),
+            )
+            .await
+            .unwrap()
+            .expect_err("a claimed id is not an attested principal");
+        assert_eq!(refusal.code, membership::code::CALLER_NOT_PERMITTED, "{op}");
     }
 }
 
@@ -465,41 +405,40 @@ fn a_participant_publishes_only_its_own_module_events() {
     );
 }
 
-/// prefrontal-core's grant publishes on the ROOM binding and reads its one ROOM durable,
+/// prefrontal's grant publishes on the ROOM binding and reads its one ROOM durable,
 /// the one bootstrap creates, and no other consumer on ROOM.
 #[test]
-fn prefrontal_core_grant_carries_the_room_binding_and_its_room_durable() {
+fn prefrontal_grant_carries_the_room_binding_and_its_room_durable() {
     let names = grants::derive_account("box_membershiproom").unwrap();
     let user = nkeys::KeyPair::new_user().public_key();
-    let legacy = "prefrontal-core";
-    let authority = grants::issued_grant(&names, legacy, &user, &[]).unwrap();
+    let authority = grants::issued_grant(&names, PREFRONTAL, &user, &[]).unwrap();
     let room = &names.streams().room;
     for subject in [
         names.room_binding(),
-        format!("$JS.API.CONSUMER.MSG.NEXT.{room}.m_prefrontal-core"),
-        format!("$JS.API.CONSUMER.INFO.{room}.m_prefrontal-core"),
-        format!("$JS.ACK.{room}.m_prefrontal-core.>"),
-        names.event_publish_grant(legacy).unwrap(),
+        format!("$JS.API.CONSUMER.MSG.NEXT.{room}.m_prefrontal"),
+        format!("$JS.API.CONSUMER.INFO.{room}.m_prefrontal"),
+        format!("$JS.ACK.{room}.m_prefrontal.>"),
+        names.event_publish_grant(PREFRONTAL).unwrap(),
     ] {
         assert!(
             authority.publish_allow().contains(&subject),
-            "prefrontal-core's grant must carry {subject}"
+            "prefrontal's grant must carry {subject}"
         );
     }
     assert!(!publishes(
         &authority,
-        &format!("$JS.API.CONSUMER.MSG.NEXT.{room}.m_prefrontal")
+        &format!("$JS.API.CONSUMER.MSG.NEXT.{room}.m_other")
     ));
     assert!(!publishes(
         &authority,
-        &format!("$JS.API.CONSUMER.DURABLE.CREATE.{room}.m_prefrontal-core")
+        &format!("$JS.API.CONSUMER.DURABLE.CREATE.{room}.m_prefrontal")
     ));
-    // Both owners use the same ROOM filter; the live catalog selects the durable name.
     let planned = bootstrap::module_durables::planned(&names).unwrap();
     let on_room = planned
         .iter()
         .find(|durable| &durable.stream == room)
         .expect("bootstrap plans a ROOM durable");
+    assert_eq!(on_room.durable, "m_prefrontal");
     assert_eq!(on_room.filter_subjects, vec![names.room_binding()]);
 }
 
@@ -538,7 +477,7 @@ impl Live {
         jetstream::new(bus::box_client(&self.trust, &self.server, &self.account_public).await)
     }
 
-    /// Calls a membership op as the attested prefrontal-core, panicking on a refusal.
+    /// Calls a membership op as the attested prefrontal, panicking on a refusal.
     async fn prefrontal(&self, method: &str, params: Value) -> Value {
         relay_as(self.connection_file(), PREFRONTAL, true, method, params)
             .await
@@ -634,161 +573,6 @@ async fn register_module(run: &SignerRun, module_id: &str) {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn live_catalog_moves_delivery_readers_back_to_prefrontal_core() {
-    move_delivery_readers(false).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn delivery_reader_move_retries_without_another_catalog_event() {
-    move_delivery_readers(true).await;
-}
-
-async fn move_delivery_readers(with_refusal: bool) {
-    let _gate = harness::acceptance_gate().await;
-    harness::install_tracing();
-    let Some(live) = start(&["prefrontal"]).await else {
-        return;
-    };
-    let observer = live.observer().await;
-    let streams = live.names.streams();
-    let observer_ref = &observer;
-    let wait_owner = |module: &'static str| async move {
-        let durable = AccountNames::module_consumer_name(module).unwrap();
-        tokio::time::timeout(BOOT_LIMIT, async {
-            loop {
-                let mut exists = true;
-                for stream in [&streams.inbox, &streams.core_work, &streams.room] {
-                    exists &= observer_ref
-                        .get_consumer_from_stream::<pull::Config, _, _>(&durable, stream)
-                        .await
-                        .is_ok();
-                }
-                if exists {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("catalog never provisioned {durable}"));
-    };
-    wait_owner("prefrontal").await;
-    register_module(&live.run, "prefrontal-core").await;
-    assert!(!consumers_on(&observer, &streams.inbox)
-        .await
-        .contains("m_prefrontal-core"));
-    let info = consumer_info(&observer, &streams.inbox, "m_prefrontal").await;
-    let subject = info.config.filter_subjects[0].replace('*', "rollback");
-    stored_publish(&observer, subject.clone(), b"queued through rollback").await;
-    let inbox = observer.get_stream(&streams.inbox).await.unwrap();
-    let replace_old = |filters| {
-        let inbox = inbox.clone();
-        async move {
-            inbox.delete_consumer("m_prefrontal").await.unwrap();
-            inbox
-                .create_consumer(pull::Config {
-                    durable_name: Some("m_prefrontal".into()),
-                    ack_policy: jetstream::consumer::AckPolicy::Explicit,
-                    filter_subjects: filters,
-                    ..Default::default()
-                })
-                .await
-                .unwrap();
-        }
-    };
-    if with_refusal {
-        replace_old(vec![subject]).await;
-    }
-    let mut config: Value =
-        serde_json::from_slice(&fs::read(&live.run.config_file).unwrap()).unwrap();
-    config["modules"]["prefrontal"]["enabled"] = json!(false);
-    fs::write(
-        &live.run.config_file,
-        serde_json::to_vec_pretty(&config).unwrap(),
-    )
-    .unwrap();
-    let reload = control::rpc(
-        live.connection_file(),
-        ClientControlRequest::SupervisorRescan { preview: false },
-    )
-    .await;
-    assert!(
-        !matches!(reload, control::ControlReply::Error(_)),
-        "{reload:?}"
-    );
-    if with_refusal {
-        let failed = bus::wait_event(
-            live.run.root.path(),
-            "ckbus.bootstrap.delivery_reconcile_failed",
-            1,
-            BOOT_LIMIT,
-        )
-        .await;
-        assert!(failed["error"]
-            .as_str()
-            .unwrap()
-            .contains("unexpected workqueue filters"));
-        let catalog = SubcConsumer::connect(live.connection_file(), ConsumerOptions::default())
-            .await
-            .unwrap();
-        let generation = catalog.catalog_list().await.unwrap().generation;
-        replace_old(info.config.filter_subjects.clone()).await;
-        wait_owner("prefrontal-core").await;
-        assert_eq!(
-            catalog.catalog_list().await.unwrap().generation,
-            generation,
-            "no catalog event should trigger recovery"
-        );
-        catalog.close().await;
-    } else {
-        wait_owner("prefrontal-core").await;
-    }
-    let moves = bus::events(
-        live.run.root.path(),
-        "ckbus.bootstrap.delivery_durable_moved",
-    );
-    assert!(
-        moves.iter().any(|row| row["stream"] == streams.inbox
-            && row["from"] == "m_prefrontal"
-            && row["to"] == "m_prefrontal-core"
-            && row["pending"] == 1),
-        "{moves:?}"
-    );
-    let reader: jetstream::consumer::Consumer<pull::Config> = observer
-        .get_consumer_from_stream("m_prefrontal-core", &streams.inbox)
-        .await
-        .unwrap();
-    let delivery = reader
-        .fetch()
-        .max_messages(1)
-        .expires(Duration::from_secs(3))
-        .messages()
-        .await
-        .unwrap()
-        .next()
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(delivery.payload.as_ref(), b"queued through rollback");
-    delivery.double_ack().await.unwrap();
-    for stream in [&streams.inbox, &streams.core_work, &streams.room] {
-        assert!(!consumers_on(&observer, stream)
-            .await
-            .contains("m_prefrontal"));
-    }
-    relay_as(
-        live.connection_file(),
-        "prefrontal-core",
-        true,
-        membership::LIST_OP,
-        json!({}),
-    )
-    .await
-    .unwrap();
-    live.stop().await;
 }
 
 type CkbusReply = Result<Value, (String, String)>;
@@ -907,7 +691,7 @@ where
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn callers_other_than_prefrontal_core_are_refused_through_the_daemon() {
+async fn callers_other_than_prefrontal_are_refused_through_the_daemon() {
     let _gate = harness::acceptance_gate().await;
     harness::install_tracing();
     let Some(live) = start(&[PARTICIPANT, PREFRONTAL]).await else {
@@ -1447,7 +1231,7 @@ async fn a_credential_issued_before_a_bind_pulls_from_the_durable_bound_after() 
     let connection_file = live.connection_file().to_path_buf();
 
     // A Direct principal still gets no credential.
-    for claimed in [PARTICIPANT, "prefrontal", "prefrontal-core"] {
+    for claimed in [PARTICIPANT, PREFRONTAL] {
         let (code, message) = relay_as(
             &connection_file,
             PARTICIPANT,
@@ -1482,7 +1266,7 @@ async fn a_credential_issued_before_a_bind_pulls_from_the_durable_bound_after() 
         json!({}),
     )
     .await
-    .unwrap_or_else(|(code, message)| panic!("prefrontal-core credential: {code} {message}"));
+    .unwrap_or_else(|(code, message)| panic!("prefrontal credential: {code} {message}"));
     let participant_public = participant["credential_public"]
         .as_str()
         .unwrap()
@@ -1525,12 +1309,7 @@ async fn a_credential_issued_before_a_bind_pulls_from_the_durable_bound_after() 
         Some(format!("_INBOX.{authority_public}")),
     )
     .await
-    .unwrap_or_else(|error| {
-        panic!(
-            "prefrontal-core connect: {error}\n{}",
-            live.server.log_text()
-        )
-    });
+    .unwrap_or_else(|error| panic!("prefrontal connect: {error}\n{}", live.server.log_text()));
 
     // Now prefrontal binds an agent and delivers it a wake under its own credential.
     let agent = "agent_after_issue";

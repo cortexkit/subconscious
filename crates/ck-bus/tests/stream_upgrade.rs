@@ -30,9 +30,6 @@ mod harness;
 #[path = "../src/runtime/seams.rs"]
 mod runtime;
 
-#[path = "stream_upgrade/prefrontal_rename.rs"]
-mod prefrontal_rename;
-
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use async_nats::jetstream::{self, consumer::pull};
@@ -392,14 +389,6 @@ struct FiveStreamBox(Arc<dyn BoxPlane>);
 
 #[async_trait]
 impl BoxPlane for FiveStreamBox {
-    async fn delete_module_bucket(
-        &self,
-        _account: &AccountNames,
-        _owner: &str,
-        _name: &str,
-    ) -> Result<bool, PlaneError> {
-        Ok(false)
-    }
     async fn ensure_module_bucket(
         &self,
         _account: &AccountNames,
@@ -469,10 +458,6 @@ impl BoxPlane for FiveStreamBox {
         stream: &str,
         durable: &str,
     ) -> Result<Option<ConsumerState>, PlaneError> {
-        if durable == "m_prefrontal-core" {
-            // This wrapper models a build before delivery readers were provisioned.
-            return Ok(None);
-        }
         self.0.consumer_state(stream, durable).await
     }
     async fn delete_durable(&self, stream: &str, durable: &str) -> Result<bool, PlaneError> {
@@ -639,10 +624,7 @@ async fn stream_upgrade_keeps_old_room_wake_and_peer_messages_and_is_idempotent(
 
     // The current ck-bus boots on that plane.
     let broker = NatsBroker::new(server.url.clone(), credentials.clone());
-    let ready = boot_with(&machine_id, &config, &broker, &deps).await;
-    bootstrap::prefrontal_rename::reconcile(&ready, ["prefrontal"])
-        .await
-        .unwrap();
+    let _ready = boot_with(&machine_id, &config, &broker, &deps).await;
     for ((stream, _), earlier) in older.iter().zip(&before) {
         let mut expected = earlier.clone();
         let kind = match stream {
@@ -763,10 +745,7 @@ async fn stream_upgrade_keeps_old_room_wake_and_peer_messages_and_is_idempotent(
         durables_before.push(consumer_state(&js, stream, durable).await);
     }
     assert_eq!(durables_before[0].2, 1, "m_basal holds the event for basal");
-    let ready = boot_with(&machine_id, &config, &broker, &deps).await;
-    bootstrap::prefrontal_rename::reconcile(&ready, ["prefrontal"])
-        .await
-        .unwrap();
+    let _ready = boot_with(&machine_id, &config, &broker, &deps).await;
     for (stream, earlier) in all.iter().zip(&streams_before) {
         assert_eq!(
             &stream_state(&js, stream).await,
@@ -898,14 +877,6 @@ impl UpgradePlane {
         boot_with(&self.machine_id, &self.config, &self.broker, &self.deps).await
     }
 
-    async fn bootstrap_with_owner(&self, owner: &str) -> Ready {
-        let ready = self.bootstrap().await;
-        bootstrap::prefrontal_rename::reconcile(&ready, [owner])
-            .await
-            .unwrap();
-        ready
-    }
-
     async fn store_event(&self, module: &str, event: &str) -> u64 {
         self.js
             .publish(
@@ -958,6 +929,64 @@ impl UpgradePlane {
             "num_pending": info.num_pending,
         })
     }
+}
+
+#[tokio::test]
+async fn bootstrap_preserves_room_start_sequence_and_reconciles_mutable_settings() {
+    let _gate = harness::acceptance_gate().await;
+    let Some(plane) = UpgradePlane::start().await else {
+        return;
+    };
+    let room = &plane.names.streams().room;
+    let subject = plane.names.room_post("room_upgrade").unwrap();
+    for body in ["before the start sequence", "first delivery"] {
+        plane
+            .js
+            .publish(subject.clone(), body.into())
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+    }
+    let start = jetstream::consumer::DeliverPolicy::ByStartSequence { start_sequence: 2 };
+    let reader: jetstream::consumer::Consumer<pull::Config> = plane
+        .js
+        .create_consumer_on_stream(
+            pull::Config {
+                durable_name: Some("m_prefrontal".to_owned()),
+                filter_subject: plane.names.room_binding(),
+                deliver_policy: start,
+                ack_policy: jetstream::consumer::AckPolicy::Explicit,
+                ack_wait: Duration::from_secs(60),
+                ..Default::default()
+            },
+            room,
+        )
+        .await
+        .unwrap();
+    let message = reader
+        .fetch()
+        .max_messages(1)
+        .expires(Duration::from_secs(2))
+        .messages()
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(message.payload.as_ref(), b"first delivery");
+    message.double_ack().await.unwrap();
+    let before = reader.get_info().await.unwrap();
+    assert_eq!(before.ack_floor.stream_sequence, 2);
+
+    let _ready = plane.bootstrap().await;
+    let after = reader.get_info().await.unwrap();
+    assert_eq!(after.config.deliver_policy, before.config.deliver_policy);
+    assert_eq!(after.config.ack_wait, Duration::from_secs(30));
+    assert_eq!(after.created, before.created);
+    assert_eq!(after.ack_floor, before.ack_floor);
+    plane.server.stop().await;
 }
 
 #[tokio::test]
@@ -1237,7 +1266,7 @@ async fn prefrontal_event_grant_pulls_and_acks_seven_token_events_but_refuses_ot
     drop(plane.bootstrap().await);
     let credentials = plane.deps.credentials.clone();
     let user = credentials.custody.generate_user();
-    let grant = grants::issued_grant(&plane.names, "prefrontal-core", &user, &[]).unwrap();
+    let grant = grants::issued_grant(&plane.names, "prefrontal", &user, &[]).unwrap();
     let now = harness::signer::nats::unix_now();
     let jwt = sign_user_jwt(
         credentials.vault.as_ref(),
@@ -1279,7 +1308,7 @@ async fn prefrontal_event_grant_pulls_and_acks_seven_token_events_but_refuses_ot
     let consumer: jetstream::consumer::Consumer<pull::Config> = js
         .get_consumer_from_stream("m_prefrontal", &plane.names.streams().event)
         .await
-        .expect("prefrontal-core may inspect its event durable");
+        .expect("prefrontal may inspect its event durable");
     let message = consumer
         .fetch()
         .max_messages(1)
@@ -1372,59 +1401,49 @@ async fn only_the_named_authority_can_info_pull_and_ack_each_federation_reader()
     };
     drop(plane.bootstrap().await);
     let unrelated = plane.module_client("broca").await;
-    let current = plane.module_client("prefrontal").await;
-    let legacy = plane.module_client("prefrontal-core").await;
-    for (module, owner, other) in [
-        ("prefrontal", &current, &legacy),
-        ("prefrontal-core", &legacy, &current),
-    ] {
-        let durable = AccountNames::module_consumer_name(module).unwrap();
-        for stream in [&plane.names.streams().peer, &plane.names.streams().wake] {
-            for verb in ["INFO", "MSG.NEXT"] {
-                let subject = format!("$JS.API.CONSUMER.{verb}.{stream}.{durable}");
-                for refused in [&unrelated, other] {
-                    refused.publish(&subject, b"{}").await;
-                    refused.expect_denied(&subject).await;
-                }
-            }
-            let js = jetstream::new(owner.client.clone());
-            let reader: jetstream::consumer::Consumer<pull::Config> =
-                js.get_consumer_from_stream(&durable, stream).await.unwrap();
-            let info = reader.get_info().await.unwrap();
-            let filter = info
-                .config
-                .filter_subjects
-                .first()
-                .unwrap_or(&info.config.filter_subject);
-            let subject = filter.replace(['*', '>'], "probe");
-            plane
-                .js
-                .publish(subject, "handoff".into())
-                .await
-                .unwrap()
-                .await
-                .unwrap();
-            let delivered = reader
-                .fetch()
-                .max_messages(1)
-                .expires(Duration::from_secs(2))
-                .messages()
-                .await
-                .unwrap()
-                .next()
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(delivered.payload.as_ref(), b"handoff");
-            let ack = delivered.reply.as_ref().unwrap().as_str();
-            for refused in [&unrelated, other] {
-                refused.publish(ack, b"+ACK").await;
-                refused.expect_denied(ack).await;
-            }
-            delivered.double_ack().await.unwrap();
-            owner.expect_allowed(ack).await;
-            assert_eq!(reader.get_info().await.unwrap().num_ack_pending, 0);
+    let owner = plane.module_client("prefrontal").await;
+    let durable = "m_prefrontal";
+    let js = jetstream::new(owner.client.clone());
+    for stream in [&plane.names.streams().peer, &plane.names.streams().wake] {
+        for verb in ["INFO", "MSG.NEXT"] {
+            let subject = format!("$JS.API.CONSUMER.{verb}.{stream}.{durable}");
+            unrelated.publish(&subject, b"{}").await;
+            unrelated.expect_denied(&subject).await;
         }
+        let reader: jetstream::consumer::Consumer<pull::Config> =
+            js.get_consumer_from_stream(durable, stream).await.unwrap();
+        let info = reader.get_info().await.unwrap();
+        let filter = info
+            .config
+            .filter_subjects
+            .first()
+            .unwrap_or(&info.config.filter_subject);
+        let subject = filter.replace(['*', '>'], "probe");
+        plane
+            .js
+            .publish(subject, "handoff".into())
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+        let delivered = reader
+            .fetch()
+            .max_messages(1)
+            .expires(Duration::from_secs(2))
+            .messages()
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivered.payload.as_ref(), b"handoff");
+        let ack = delivered.reply.as_ref().unwrap().as_str();
+        unrelated.publish(ack, b"+ACK").await;
+        unrelated.expect_denied(ack).await;
+        delivered.double_ack().await.unwrap();
+        owner.expect_allowed(ack).await;
+        assert_eq!(reader.get_info().await.unwrap().num_ack_pending, 0);
     }
     plane.server.stop().await;
 }
@@ -1435,7 +1454,7 @@ async fn module_buckets_owner_put_delete_and_declared_reader_get_watch() {
     let Some(plane) = UpgradePlane::start().await else {
         return;
     };
-    drop(plane.bootstrap_with_owner("prefrontal").await);
+    drop(plane.bootstrap().await);
     // Exercise every declaration, including both participant and authority readers.
     for row in cortexkit_bus_naming::MODULE_BUCKETS {
         let bucket = plane.names.module_bucket_name(row.owner, row.name).unwrap();
@@ -1595,7 +1614,7 @@ async fn module_buckets_reconcile_limits_in_place_and_refuse_immutable_storage()
     let Some(plane) = UpgradePlane::start().await else {
         return;
     };
-    let ready = plane.bootstrap_with_owner("prefrontal").await;
+    let ready = plane.bootstrap().await;
     for row in cortexkit_bus_naming::MODULE_BUCKETS {
         let bucket = plane.names.module_bucket_name(row.owner, row.name).unwrap();
         let stream = format!("KV_{bucket}");

@@ -41,7 +41,6 @@ fn box_jwt_denies_inbound_federation_publishes_for_every_role() {
     for grant in [
         grants::issued_grant(&account, "other", user, &[]).unwrap(),
         grants::issued_grant(&account, "prefrontal", user, &[]).unwrap(),
-        grants::issued_grant(&account, "prefrontal-core", user, &[]).unwrap(),
         grants::issued_grant(&account, "basal", user, &[]).unwrap(),
         grants::bus_module_grant(&account, user).unwrap(),
         grants::system_account_grant(&account, user).unwrap(),
@@ -96,26 +95,22 @@ fn regenerate_local_permission_fixture() {
 }
 
 #[test]
-fn liveness_retirement_is_scoped_to_ckbus_and_the_two_owner_buckets() {
+fn liveness_bucket_has_no_stream_delete_grant() {
     let account = grants::derive_account("box_retiregrant").unwrap();
-    let bus = grants::bus_module_grant(&account, "credential").unwrap();
-    let old = "$JS.API.STREAM.DELETE.KV_CK_BOX_RETIREGRANT_PREFRONTAL_CORE_SESSION_LIVENESS";
-    let new = "$JS.API.STREAM.DELETE.KV_CK_BOX_RETIREGRANT_PREFRONTAL_SESSION_LIVENESS";
-    assert_eq!(
-        bus.publish_allow()
-            .iter()
-            .filter(|subject| subject.starts_with("$JS.API.STREAM.DELETE.KV_"))
-            .map(String::as_str)
-            .collect::<BTreeSet<_>>(),
-        [old, new].into()
-    );
-    for module in ["prefrontal", "prefrontal-core", "entorhinal", "other"] {
-        let grant = grants::issued_grant(&account, module, "credential", &[]).unwrap();
+    let delete = "$JS.API.STREAM.DELETE.KV_CK_BOX_RETIREGRANT_PREFRONTAL_SESSION_LIVENESS";
+    for grant in [
+        grants::bus_module_grant(&account, "credential").unwrap(),
+        grants::issued_grant(&account, "prefrontal", "credential", &[]).unwrap(),
+        grants::issued_grant(&account, "entorhinal", "credential", &[]).unwrap(),
+        grants::issued_grant(&account, "other", "credential", &[]).unwrap(),
+    ] {
         assert!(
-            !grant.publish_allow().iter().any(|pattern| [old, new]
+            !grant
+                .publish_allow()
                 .iter()
-                .any(|subject| subject_matches(pattern, subject))),
-            "{module}"
+                .any(|pattern| subject_matches(pattern, delete)),
+            "{:?}",
+            grant.role()
         );
     }
 }
@@ -294,7 +289,7 @@ fn golden_allows(golden: &str, principal: Principal, operation: Operation) -> BT
 fn reliable_delivery_grants_are_authority_only_and_scoped_to_its_durables() {
     let account = grants::derive_account("box_deliverygrants").unwrap();
     let participant = grants::issued_grant(&account, "runner-one", "credential", &[]).unwrap();
-    let authority = grants::issued_grant(&account, "prefrontal-core", "credential", &[]).unwrap();
+    let authority = grants::issued_grant(&account, "prefrontal", "credential", &[]).unwrap();
     let permits = |grant: &grants::Grant, subject: &str| {
         grant
             .publish_allow()
@@ -318,15 +313,15 @@ fn reliable_delivery_grants_are_authority_only_and_scoped_to_its_durables() {
     }
     for stream in ["INBOX", "CORE_WORK"] {
         for subject in [
-            format!("$JS.ACK.CK_BOX_DELIVERYGRANTS_{stream}.m_prefrontal-core.1"),
-            format!("$JS.API.CONSUMER.MSG.NEXT.CK_BOX_DELIVERYGRANTS_{stream}.m_prefrontal-core"),
-            format!("$JS.API.CONSUMER.INFO.CK_BOX_DELIVERYGRANTS_{stream}.m_prefrontal-core"),
+            format!("$JS.ACK.CK_BOX_DELIVERYGRANTS_{stream}.m_prefrontal.1"),
+            format!("$JS.API.CONSUMER.MSG.NEXT.CK_BOX_DELIVERYGRANTS_{stream}.m_prefrontal"),
+            format!("$JS.API.CONSUMER.INFO.CK_BOX_DELIVERYGRANTS_{stream}.m_prefrontal"),
         ] {
             assert!(permits(&authority, &subject), "{subject}");
             assert!(!permits(&participant, &subject), "{subject}");
             assert!(!permits(
                 &authority,
-                &subject.replace("m_prefrontal-core", "m_other")
+                &subject.replace("m_prefrontal", "m_other")
             ));
         }
         assert!(!permits(
@@ -380,7 +375,7 @@ fn a_participant_may_publish_only_its_own_live_hints() {
 fn live_subscriptions_preserve_event_reader_boundaries() {
     let account = grants::derive_account("box_livefixture").unwrap();
     let participant = grants::issued_grant(&account, "runner-one", "credential", &[]).unwrap();
-    let authority = grants::issued_grant(&account, "prefrontal-core", "credential", &[]).unwrap();
+    let authority = grants::issued_grant(&account, "prefrontal", "credential", &[]).unwrap();
     let flow = grants::issued_grant(&account, "basal", "credential", &[]).unwrap();
     let routing = grants::issued_grant(&account, "striatum", "credential", &[]).unwrap();
     for (grant, allowed, refused) in [
@@ -667,16 +662,12 @@ fn grant_generation_emits_each_role_set_from_the_pinned_literals() {
                 .as_object()
                 .expect("direction is an object");
             if direction == "pub" {
-                assert_eq!(lists.keys().collect::<Vec<_>>(), ["allow", "deny"]);
                 let mut denies = BTreeSet::from(["ck.box_goldenfixture.*.fed.>".to_owned()]);
-                let foreign: &[_] = match grant.role() {
-                    grants::GrantRole::Participant | grants::GrantRole::FlowEngine => {
-                        &["m_prefrontal", "m_prefrontal-core"]
-                    }
-                    grants::GrantRole::DeliveryAuthority => &["m_prefrontal-core"],
-                    _ => &[],
-                };
-                for reader in foreign {
+                if matches!(
+                    grant.role(),
+                    grants::GrantRole::Participant | grants::GrantRole::FlowEngine
+                ) {
+                    let reader = "m_prefrontal";
                     for stream in ["CK_BOX_GOLDENFIXTURE_PEER", "CK_BOX_GOLDENFIXTURE_WAKE"] {
                         denies.extend([
                             format!("$JS.API.CONSUMER.INFO.{stream}.{reader}"),
@@ -685,6 +676,7 @@ fn grant_generation_emits_each_role_set_from_the_pinned_literals() {
                         ]);
                     }
                 }
+                assert_eq!(lists.keys().collect::<Vec<_>>(), ["allow", "deny"]);
                 assert_eq!(lists["deny"], serde_json::json!(denies));
             } else {
                 assert_eq!(lists.keys().collect::<Vec<_>>(), ["allow"]);

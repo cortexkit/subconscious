@@ -1,7 +1,6 @@
 //! Agent durables (spec ruling R15): prefrontal owns where each agent resides, and it
 //! creates, removes and reads each agent's durables through ops on ck-bus's management
-//! surface. ck-bus accepts them only from `reserved:prefrontal` or
-//! `reserved:prefrontal-core`; any other caller,
+//! surface. ck-bus accepts them only from `reserved:prefrontal`; any other caller,
 //! a `Direct` one included, is refused `ckbus_caller_not_permitted`.
 //!
 //! An agent has one durable, `consumer_name(agent_id)` (`c_{agent_id}`), on each of the
@@ -61,7 +60,7 @@ pub const OPERATIONS: [(&str, bool); 4] = [
     (EFFECTS_PENDING_OP, false),
 ];
 
-/// The current authority id; admission also accepts the old id for rollback.
+/// The module id allowed to manage agent durables.
 pub const AUTHORIZED_MODULE: &str = crate::grants::DELIVERY_AUTHORITY_MODULE;
 
 pub mod code {
@@ -98,16 +97,11 @@ pub fn ckbus_owned_durables() -> impl Iterator<Item = (StreamKind, &'static str)
         (StreamKind::EffectDead, "c_ckbus_dead"),
         (StreamKind::DeliveryDead, "c_ckbus_dead"),
         (StreamKind::Inbox, "m_prefrontal"),
-        (StreamKind::Inbox, "m_prefrontal-core"),
         (StreamKind::CoreWork, "m_prefrontal"),
-        (StreamKind::CoreWork, "m_prefrontal-core"),
         (StreamKind::Event, "m_basal"),
         (StreamKind::Room, "m_prefrontal"),
-        (StreamKind::Room, "m_prefrontal-core"),
         (StreamKind::Wake, "m_prefrontal"),
-        (StreamKind::Wake, "m_prefrontal-core"),
         (StreamKind::Peer, "m_prefrontal"),
-        (StreamKind::Peer, "m_prefrontal-core"),
     ]
     .into_iter()
     .chain(
@@ -118,8 +112,7 @@ pub fn ckbus_owned_durables() -> impl Iterator<Item = (StreamKind, &'static str)
 }
 
 pub fn is_federation_reader(names: &AccountNames, stream: &str, durable: &str) -> bool {
-    (stream == names.streams().wake || stream == names.streams().peer)
-        && crate::grants::is_delivery_durable(durable)
+    (stream == names.streams().wake || stream == names.streams().peer) && durable == "m_prefrontal"
 }
 
 /// The literal names of the agent streams, as the naming crate lists them (the list its
@@ -302,19 +295,15 @@ impl Membership {
     }
 }
 
-/// Only an attested prefrontal route passes, under either rename spelling. The
+/// Only an attested prefrontal route passes. The
 /// principal is what the daemon stamped at bind time; request fields cannot attest it.
 pub fn authorize(principal: Option<&Principal>, method: &str) -> Result<(), Refusal> {
     match principal {
-        Some(Principal::Reserved { module_id })
-            if crate::grants::is_delivery_authority_module(module_id) =>
-        {
-            Ok(())
-        }
+        Some(Principal::Reserved { module_id }) if module_id == AUTHORIZED_MODULE => Ok(()),
         other => Err(Refusal::new(
             code::CALLER_NOT_PERMITTED,
             format!(
-                "{method} answers only reserved:{AUTHORIZED_MODULE} or reserved:prefrontal-core; this route arrived as {}",
+                "{method} answers only reserved:{AUTHORIZED_MODULE}; this route arrived as {}",
                 principal_label(other)
             ),
         )),

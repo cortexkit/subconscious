@@ -20,8 +20,8 @@ use cortexkit_bus_naming::{
     box_account_denies, bus_permissions, delivery_authority_permissions, flow_engine_consumer_spec,
     flow_engine_permissions, generate_permission_golden, live_hint_subscriptions,
     participant_permissions, system_permissions, validate_permission_file, AccountNames,
-    AllowEntry, DenyEntry, GoldenFixture, GrantError, ModuleBucket, NamingError, Operation,
-    Principal, MODULE_BUCKETS,
+    AllowEntry, DenyEntry, GoldenFixture, GrantError, NamingError, Operation, Principal,
+    MODULE_BUCKETS,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -192,11 +192,8 @@ impl Grant {
     ) -> Result<(), GrantRefusal> {
         // Agent consumers share these streams. Their whole-token wildcard also matches
         // the federation readers, so the JWT must exclude the exact foreign names.
-        for module in DELIVERY_AUTHORITY_MODULES
-            .into_iter()
-            .filter(|id| Some(*id) != owner)
-        {
-            let durable = AccountNames::module_consumer_name(module)?;
+        if owner != Some(DELIVERY_AUTHORITY_MODULE) {
+            let durable = AccountNames::module_consumer_name(DELIVERY_AUTHORITY_MODULE)?;
             for stream in [&account.streams().peer, &account.streams().wake] {
                 self.publish_deny.extend([
                     format!("$JS.API.CONSUMER.MSG.NEXT.{stream}.{durable}"),
@@ -299,52 +296,21 @@ pub fn participant_grant(
 /// Prefrontal's per-process grant: the participant set plus publish on each agent
 /// stream's own binding and on the ROOM binding, since it is the only producer of wakes,
 /// peer deliveries, effect intents and room posts, and pull, ack and info on its one
-/// ROOM durable for its own module id, which ck-bus creates when the catalog selects it.
+/// ROOM durable, which ck-bus creates at startup.
 pub fn delivery_authority_grant(
     account: &AccountNames,
     credential_public: &str,
     module_id: &str,
     bound_rooms: &[&str],
 ) -> Result<Grant, GrantRefusal> {
-    let shared_module = if is_delivery_authority_module(module_id) {
-        DELIVERY_AUTHORITY_MODULE
-    } else {
-        module_id
-    };
     let mut entries =
-        delivery_authority_permissions(account, credential_public, shared_module, bound_rooms)?;
+        delivery_authority_permissions(account, credential_public, module_id, bound_rooms)?;
     add_live_permissions(
         account,
-        shared_module,
+        module_id,
         GrantRole::DeliveryAuthority,
         &mut entries,
     )?;
-    if module_id != shared_module {
-        let old = AccountNames::module_consumer_name(shared_module)?;
-        let own = AccountNames::module_consumer_name(module_id)?;
-        for entry in &mut entries {
-            for plane in ["event", "live"] {
-                if entry.subject == format!("ck.{}.{plane}.{shared_module}.>", account.account()) {
-                    entry.subject = format!("ck.{}.{plane}.{module_id}.>", account.account());
-                }
-            }
-            // EVENT remains a shared cursor. Only the three legacy delivery readers move.
-            for stream in [
-                &account.streams().room,
-                &account.streams().inbox,
-                &account.streams().core_work,
-            ] {
-                for api in ["MSG.NEXT", "INFO"] {
-                    if entry.subject == format!("$JS.API.CONSUMER.{api}.{stream}.{old}") {
-                        entry.subject = format!("$JS.API.CONSUMER.{api}.{stream}.{own}");
-                    }
-                }
-                if entry.subject == format!("$JS.ACK.{stream}.{old}.>") {
-                    entry.subject = format!("$JS.ACK.{stream}.{own}.>");
-                }
-            }
-        }
-    }
     add_module_bucket_permissions(
         account,
         module_id,
@@ -382,12 +348,9 @@ fn add_module_bucket_permissions(
     role: GrantRole,
     entries: &mut Vec<AllowEntry>,
 ) -> Result<(), GrantRefusal> {
-    let legacy = liveness_bucket(LEGACY_DELIVERY_AUTHORITY_MODULE);
-    for bucket in MODULE_BUCKETS.iter().chain(legacy.iter()) {
+    for bucket in MODULE_BUCKETS {
         let owner = bucket.owner == module_id;
-        let reader = bucket.readers.contains(&module_id)
-            || (module_id == LEGACY_DELIVERY_AUTHORITY_MODULE
-                && bucket.readers.contains(&DELIVERY_AUTHORITY_MODULE));
+        let reader = bucket.readers.contains(&module_id);
         if !owner && !reader {
             continue;
         }
@@ -458,33 +421,6 @@ fn add_live_permissions(
 
 /// The delivery-authority module whose readers bootstrap provisions.
 pub const DELIVERY_AUTHORITY_MODULE: &str = "prefrontal";
-pub const LEGACY_DELIVERY_AUTHORITY_MODULE: &str = "prefrontal-core";
-pub const DELIVERY_AUTHORITY_MODULES: [&str; 2] =
-    [DELIVERY_AUTHORITY_MODULE, LEGACY_DELIVERY_AUTHORITY_MODULE];
-pub const LIVENESS_BUCKET: &str = "session-liveness";
-
-pub fn is_delivery_durable(name: &str) -> bool {
-    matches!(name, "m_prefrontal" | "m_prefrontal-core")
-}
-
-pub fn is_liveness_bucket(bucket: &ModuleBucket) -> bool {
-    bucket.owner == DELIVERY_AUTHORITY_MODULE && bucket.name == LIVENESS_BUCKET
-}
-
-pub fn liveness_bucket(owner: &'static str) -> Option<ModuleBucket> {
-    let mut bucket = *MODULE_BUCKETS
-        .iter()
-        .find(|bucket| is_liveness_bucket(bucket))?;
-    bucket.owner = owner;
-    Some(bucket)
-}
-
-/// Accept both attested module ids so the old process can resume after a rollback. The rename
-/// procedure stops the old process before starting the new one; they do not run
-/// concurrently. Callers must first require a daemon-attested reserved principal.
-pub fn is_delivery_authority_module(module_id: &str) -> bool {
-    DELIVERY_AUTHORITY_MODULES.contains(&module_id)
-}
 
 /// The module whose attested credential carries the flow-engine grant: basal runs flows
 /// and reads every module event through its event-stream durable.
@@ -494,7 +430,7 @@ pub const FLOW_ENGINE_MODULE: &str = "basal";
 /// makes agent access account-scoped, so a module's residence can change without a
 /// reissue.
 ///
-/// Both prefrontal ids get the delivery-authority grant, `basal` the flow-engine grant,
+/// `prefrontal` gets the delivery-authority grant, `basal` the flow-engine grant,
 /// and every other module the participant grant. `module_id` is the daemon-attested
 /// route principal, never a request field: it also decides which event subjects the
 /// credential may publish on.
@@ -505,7 +441,7 @@ pub fn issued_grant(
     bound_rooms: &[&str],
 ) -> Result<Grant, GrantRefusal> {
     match module_id {
-        id if is_delivery_authority_module(id) => {
+        DELIVERY_AUTHORITY_MODULE => {
             delivery_authority_grant(account, credential_public, module_id, bound_rooms)
         }
         FLOW_ENGINE_MODULE => flow_engine_grant(account, credential_public, module_id),
@@ -515,7 +451,7 @@ pub fn issued_grant(
 
 /// ck-bus's own box-account grant: census read and write, management of the nine
 /// streams and their consumers (the dead-letter durable and the module durables among
-/// them), EVENT direct get, deletion of the retired prefrontal-core liveness bucket,
+/// them), EVENT direct get,
 /// and the sentinel subjects (the periodic round trip ck-bus publishes through the
 /// server to decide whether the bus is up). No workload publish.
 pub fn bus_module_grant(
@@ -544,8 +480,7 @@ pub fn bus_module_grant(
             subject: format!("$JS.API.CONSUMER.NAMES.{stream}"),
         });
     }
-    let legacy = liveness_bucket(LEGACY_DELIVERY_AUTHORITY_MODULE);
-    for bucket in MODULE_BUCKETS.iter().chain(legacy.iter()) {
+    for bucket in MODULE_BUCKETS {
         let stream = format!(
             "KV_{}",
             account.module_bucket_name(bucket.owner, bucket.name)?
@@ -557,17 +492,6 @@ pub fn bus_module_grant(
                 subject: format!("$JS.API.STREAM.{verb}.{stream}"),
             });
         }
-    }
-    // Switching owners may retire either liveness bucket, never an unrelated store.
-    for owner in DELIVERY_AUTHORITY_MODULES {
-        entries.push(AllowEntry {
-            principal: Principal::Bus,
-            operation: Operation::Publish,
-            subject: format!(
-                "$JS.API.STREAM.DELETE.KV_{}",
-                account.module_bucket_name(owner, LIVENESS_BUCKET)?
-            ),
-        });
     }
     Grant::from_entries(GrantRole::BusModule, account, entries)
 }

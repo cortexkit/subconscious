@@ -632,7 +632,7 @@ Ownership of acts.
   credentials, so events made before the module first connects are kept:
   - `m_basal` on `CK_{ACCT}_EVENT`, filtered on `ck.{acct}.event.>`: the flow engine
     reads every module event through it;
-  - `m_<authority>` on `CK_{ACCT}_ROOM`, filtered on the local ROOM binding
+   - `m_prefrontal` on `CK_{ACCT}_ROOM`, filtered on the local ROOM binding
     `ck.{acct}.room.*.post`.
   - Every `EVENT_CONSUMERS` row on EVENT, using its explicit durable and filters.
     A module may own several rows: astrocyte owns `m_astrocyte`,
@@ -643,7 +643,7 @@ Ownership of acts.
     `m_{module}` or `m_{module}_{suffix}`. Each module receives pull, ack and info
     for every one of its rows, never another owner's rows. Naming 0.4 still
     includes `m_prefrontal-routing`, so bootstrap continues to provision it.
-  - INBOX and CORE_WORK each have the authority's command reader, and each
+   - INBOX and CORE_WORK each have the `m_prefrontal` command reader, and each
     dead-letter stream has the bus's `c_ckbus_dead` diagnostic reader, as declared
     by `delivery_consumer_specs`.
 

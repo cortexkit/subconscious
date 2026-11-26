@@ -288,15 +288,6 @@ pub trait BoxPlane: Send + Sync {
     ) -> Result<(), PlaneError> {
         Err(PlaneError::new("this plane cannot ensure module buckets"))
     }
-    /// Deletes a module bucket's backing stream, returning false if already absent.
-    async fn delete_module_bucket(
-        &self,
-        _account: &AccountNames,
-        _owner: &str,
-        _name: &str,
-    ) -> Result<bool, PlaneError> {
-        Err(PlaneError::new("this plane cannot delete module buckets"))
-    }
     async fn ensure_stream(&self, spec: &StreamSpec) -> Result<(), PlaneError>;
     async fn publish(&self, subject: &str, payload: Vec<u8>) -> Result<(), PlaneError>;
     /// A projection may checkpoint only after JetStream acknowledges storage.
@@ -339,18 +330,12 @@ pub trait BoxPlane: Send + Sync {
     async fn create_durable(&self, durable: &DurableConsumer) -> Result<(), PlaneError>;
     /// Reconciles a bootstrap-owned module durable without deleting its cursor. The
     /// broker refuses changes to immutable settings rather than resetting its ack floor.
-    async fn ensure_module_durable(&self, durable: &DurableConsumer) -> Result<(), PlaneError> {
-        self.create_durable(durable).await
-    }
-    /// Creates a replacement ROOM reader at the first sequence after its predecessor's ack floor.
-    async fn create_durable_from_sequence(
+    async fn ensure_module_durable(
         &self,
-        _durable: &DurableConsumer,
-        _start: u64,
+        _account: &AccountNames,
+        durable: &DurableConsumer,
     ) -> Result<(), PlaneError> {
-        Err(PlaneError::new(
-            "sequence-based durable creation is unavailable",
-        ))
+        self.create_durable(durable).await
     }
     /// One consumer's configuration and counters. `Ok(None)` is the server's own answer
     /// that the stream holds no consumer of that name; a read that fails is an `Err`.
@@ -407,7 +392,6 @@ pub struct ConsumerState {
     /// The server's names for the ack and deliver policies (`explicit`, `all`, ...).
     pub ack_policy: String,
     pub deliver_policy: String,
-    pub ack_floor_stream_sequence: Option<u64>,
     /// Messages matching the filter that the consumer has not delivered yet.
     pub num_pending: u64,
     /// Messages delivered and not yet acknowledged, which the server will redeliver
@@ -1098,12 +1082,35 @@ impl BoxPlane for NatsBox {
             })
     }
 
-    async fn ensure_module_durable(&self, durable: &DurableConsumer) -> Result<(), PlaneError> {
+    async fn ensure_module_durable(
+        &self,
+        account: &AccountNames,
+        durable: &DurableConsumer,
+    ) -> Result<(), PlaneError> {
+        let mut config = durable_config(durable);
+        if durable.stream == account.streams().room {
+            if let Some(mut reply) = self
+                .consumer_info(&durable.stream, &durable.durable)
+                .await?
+            {
+                // A ROOM reader may have been created to start at a given stream sequence, so it
+                // skips room posts that were already delivered before it existed.
+                // Reuse its immutable start policy while updating the mutable settings.
+                let existing: jetstream::consumer::pull::Config =
+                    serde_json::from_value(reply["config"].take()).map_err(|error| {
+                        PlaneError::new(format!(
+                            "read consumer config {} on {}: {error}",
+                            durable.durable, durable.stream
+                        ))
+                    })?;
+                config.deliver_policy = existing.deliver_policy;
+            }
+        }
         // JetStream's create-or-update is idempotent for identical settings. Mutable
         // settings (including filters) change in place; immutable ones return an error.
         // Never fall back to delete-and-create: a live module may already have acked.
         self.jetstream
-            .create_consumer_on_stream(durable_config(durable), durable.stream.as_str())
+            .create_consumer_on_stream(config, durable.stream.as_str())
             .await
             .map(|_| ())
             .map_err(|error| {
@@ -1121,47 +1128,21 @@ impl BoxPlane for NatsBox {
             })
     }
 
-    async fn create_durable_from_sequence(
-        &self,
-        durable: &DurableConsumer,
-        start: u64,
-    ) -> Result<(), PlaneError> {
-        let mut config = durable_config(durable);
-        config.deliver_policy = jetstream::consumer::DeliverPolicy::ByStartSequence {
-            start_sequence: start,
-        };
-        self.jetstream
-            .create_consumer_strict_on_stream(config, durable.stream.as_str())
-            .await
-            .map(|_| ())
-            .map_err(|error| {
-                PlaneError::new(format!(
-                    "create {} on {} at sequence {start}: {error}",
-                    durable.durable, durable.stream
-                ))
-            })
-    }
-
     async fn consumer_state(
         &self,
         stream: &str,
         durable: &str,
     ) -> Result<Option<ConsumerState>, PlaneError> {
-        let what = format!("consumer info {durable} on {stream}");
-        let reply = self
-            .api(
-                format!("CONSUMER.INFO.{stream}.{durable}"),
-                json!({}),
-                &what,
-            )
-            .await?;
-        if api_error_code(&reply) == Some(CONSUMER_NOT_FOUND) {
-            return Ok(None);
-        }
-        api_refusal(&reply, &what)?;
-        parse_consumer_state(&reply)
-            .map(Some)
-            .ok_or_else(|| PlaneError::new(format!("{what}: unreadable reply {reply}")))
+        self.consumer_info(stream, durable)
+            .await?
+            .map(|reply| {
+                parse_consumer_state(&reply).ok_or_else(|| {
+                    PlaneError::new(format!(
+                        "consumer info {durable} on {stream}: unreadable reply {reply}"
+                    ))
+                })
+            })
+            .transpose()
     }
 
     async fn delete_durable(&self, stream: &str, durable: &str) -> Result<bool, PlaneError> {
@@ -1174,26 +1155,6 @@ impl BoxPlane for NatsBox {
             )
             .await?;
         if api_error_code(&reply) == Some(CONSUMER_NOT_FOUND) {
-            return Ok(false);
-        }
-        api_refusal(&reply, &what)?;
-        Ok(true)
-    }
-
-    async fn delete_module_bucket(
-        &self,
-        account: &AccountNames,
-        owner: &str,
-        name: &str,
-    ) -> Result<bool, PlaneError> {
-        let bucket = account
-            .module_bucket_name(owner, name)
-            .map_err(|error| PlaneError::new(error.to_string()))?;
-        let what = format!("delete module bucket {owner}.{name} ({bucket})");
-        let reply = self
-            .api(format!("STREAM.DELETE.KV_{bucket}"), json!({}), &what)
-            .await?;
-        if api_error_code(&reply) == Some(STREAM_NOT_FOUND) {
             return Ok(false);
         }
         api_refusal(&reply, &what)?;
@@ -1300,13 +1261,32 @@ pub fn parse_consumer_state(reply: &Value) -> Option<ConsumerState> {
         },
         ack_policy: config["ack_policy"].as_str()?.to_string(),
         deliver_policy: config["deliver_policy"].as_str()?.to_string(),
-        ack_floor_stream_sequence: reply["ack_floor"]["stream_seq"].as_u64(),
         num_pending: reply["num_pending"].as_u64()?,
         num_ack_pending: reply["num_ack_pending"].as_u64()?,
     })
 }
 
 impl NatsBox {
+    async fn consumer_info(
+        &self,
+        stream: &str,
+        durable: &str,
+    ) -> Result<Option<Value>, PlaneError> {
+        let what = format!("consumer info {durable} on {stream}");
+        let reply = self
+            .api(
+                format!("CONSUMER.INFO.{stream}.{durable}"),
+                json!({}),
+                &what,
+            )
+            .await?;
+        if api_error_code(&reply) == Some(CONSUMER_NOT_FOUND) {
+            return Ok(None);
+        }
+        api_refusal(&reply, &what)?;
+        Ok(Some(reply))
+    }
+
     /// The census bucket. Binding to it reads the census stream's info, which the
     /// bus-module grant allows; the bucket itself is created by `ensure_census`.
     async fn census_store(&self, account: &AccountNames) -> Result<kv::Store, PlaneError> {

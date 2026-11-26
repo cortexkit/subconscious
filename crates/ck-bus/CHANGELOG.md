@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.13.7
+
+- Provision prefrontal's delivery readers and session-liveness bucket at startup, even if prefrontal has not registered yet. Only `reserved:prefrontal` may manage agent durables. ck-bus no longer moves delivery resources between module ids.
+- Require subc-daemon 0.53.3 for tests.
+
 ## 0.13.6
 
 - Require subc-client-rs 0.43.0 and cortexkit-bus-testkit 0.9.6.

@@ -12,7 +12,7 @@
 //!   is refused server-side on every workload publish (wake, peer delivery, effect
 //!   intent), on a consumer create on each of the four workload streams, on a census
 //!   write, on an unbound room, and on `$SYS` and sentinel subjects;
-//! - the delivery-authority user (prefrontal-core's grant) may publish wakes, peer
+//! - the delivery-authority user (prefrontal's grant) may publish wakes, peer
 //!   deliveries and effect intents for any agent, and is refused a consumer create, a
 //!   census write and `$SYS`;
 //! - the bus-module user may get, watch, put and delete the census and manage the six
@@ -564,7 +564,7 @@ async fn generated_grants_hold_on_a_live_server() {
             .unwrap(),
         format!("ck.{acct}.live.conf-other.step.finished.v1"),
         format!("ck.{acct}.live.basal.step.finished.v1"),
-        format!("ck.{acct}.live.prefrontal-core.step.finished.v1"),
+        format!("ck.{acct}.live.prefrontal.step.finished.v1"),
         "$SYS.REQ.CLAIMS.UPDATE".to_string(),
         names.sentinel_ping(),
     ];

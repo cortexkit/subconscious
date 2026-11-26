@@ -68,10 +68,10 @@ pub fn planned(names: &AccountNames) -> Result<Vec<DurableConsumer>, String> {
         })
         .collect::<Result<Vec<_>, String>>()?;
     let mut delivery = delivery_consumer_specs(names).map_err(|error| error.to_string())?;
-    for module in [DELIVERY_AUTHORITY_MODULE, "prefrontal-core"] {
-        delivery
-            .extend(federation_consumer_specs(names, module).map_err(|error| error.to_string())?);
-    }
+    delivery.extend(
+        federation_consumer_specs(names, DELIVERY_AUTHORITY_MODULE)
+            .map_err(|error| error.to_string())?,
+    );
     for spec in delivery {
         let AckPolicy::Explicit = spec.ack_policy;
         let DeliverPolicy::All = spec.deliver_policy;
@@ -121,8 +121,6 @@ pub async fn plan_output(
     ] {
         for durable in plane.consumer_names(stream).await? {
             if durable.starts_with("m_")
-                && !(super::prefrontal_rename::delivery_stream(names, stream)
-                    && crate::grants::is_delivery_durable(&durable))
                 && !desired
                     .iter()
                     .any(|row| row.stream == *stream && row.durable == durable)

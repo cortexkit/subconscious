@@ -51,7 +51,6 @@ pub mod federation_account;
 pub(crate) mod grant_changes;
 pub mod module_durables;
 pub mod plane;
-pub(crate) mod prefrontal_rename;
 pub mod store;
 
 use std::{
@@ -533,10 +532,7 @@ pub async fn boot(
             });
     validate_module_buckets(&names, MODULE_BUCKETS)
         .map_err(|error| Failure::stop(cause::STREAMS_UNAVAILABLE, error.to_string()))?;
-    for bucket in MODULE_BUCKETS
-        .iter()
-        .filter(|bucket| !crate::grants::is_liveness_bucket(bucket))
-    {
+    for bucket in MODULE_BUCKETS {
         box_plane
             .ensure_module_bucket(&names, bucket)
             .await
@@ -545,12 +541,11 @@ pub async fn boot(
     // Create or reconcile module readers before issuing credentials. Updates retain
     // their acknowledgement floors; an immutable configuration mismatch stops boot
     // rather than deleting a module's cursor.
-    let mut durables = module_durables::planned(&names)
+    let durables = module_durables::planned(&names)
         .map_err(|error| Failure::stop(cause::MODULE_DURABLES_UNAVAILABLE, error))?;
-    durables.retain(|row| !prefrontal_rename::delivery_stream(&names, &row.stream));
     for durable in &durables {
         box_plane
-            .ensure_module_durable(durable)
+            .ensure_module_durable(&names, durable)
             .await
             .map_err(|error| Failure::retry(cause::MODULE_DURABLES_UNAVAILABLE, error.message))?;
     }
@@ -902,13 +897,13 @@ impl Bootstrap {
         let (handle, serving) =
             subc_client_rs::serve_with_handle(&connection_file, manifest, handler).await?;
         let machine_id = handle.machine_id().cloned();
-        let running = tokio::spawn(self.run(machine_id, connection_file));
+        let running = tokio::spawn(self.run(machine_id));
         let served = serving.await;
         running.abort();
         served
     }
 
-    async fn run(self, machine_id: Option<MachineId>, connection_file: std::path::PathBuf) {
+    async fn run(self, machine_id: Option<MachineId>) {
         let config = BrokerConfig::from_env();
         let broker_url = config.as_ref().map(|config| config.url.clone()).ok();
         let broker = NatsBroker::new(
@@ -930,20 +925,6 @@ impl Bootstrap {
             match outcome {
                 Ok(ready) => {
                     let ready = Arc::new(ready);
-                    let (initial_tx, initial_rx) = tokio::sync::oneshot::channel();
-                    let follow = prefrontal_rename::follow(
-                        &connection_file,
-                        &ready,
-                        initial_tx,
-                        self.period,
-                    );
-                    tokio::pin!(follow);
-                    // Don't hold up other modules if the catalog or one delivery resource is
-                    // unavailable. Keep the same reconciliation future alive after the deadline.
-                    tokio::select! {
-                        _ = tokio::time::timeout(Duration::from_secs(2), initial_rx) => {},
-                        _ = &mut follow => unreachable!("catalog watcher reconnects until shutdown"),
-                    }
                     log_event(
                         "ckbus.bootstrap.ready",
                         json!({
@@ -960,9 +941,10 @@ impl Bootstrap {
                         acct: ready.account.acct.clone(),
                         account_public: ready.account.account_public.clone(),
                     });
-                    // The connections stay open for as long as the process serves.
-                    self.ready.send_replace(Some(ready.clone()));
-                    follow.await;
+                    // Keep the readiness channel and broker connections open for as long as this
+                    // task runs; the module's serve loop ends it at shutdown.
+                    self.ready.send_replace(Some(ready));
+                    std::future::pending::<()>().await;
                     return;
                 }
                 Err(failure) => {

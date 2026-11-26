@@ -295,7 +295,6 @@ pub(super) fn run(
             &terminal,
             &interrupt,
             logs.as_ref(),
-            &run.document,
             #[cfg(unix)]
             github_api,
         )

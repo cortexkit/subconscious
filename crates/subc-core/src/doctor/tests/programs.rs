@@ -284,6 +284,73 @@ fn classifications_keep_daemon_and_program_findings_separate() {
 }
 
 #[test]
+fn launch_and_usage_exit_classifications_use_runner_results() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut rig = Rig::new();
+    let interpreter = rig.host.scratch.join("missing-interpreter");
+    for (id, script, mode) in [
+        (
+            "exit-two-with-output",
+            "#!/bin/sh\nprintf 'check failed'; exit 2\n".to_owned(),
+            0o700,
+        ),
+        (
+            "missing-interpreter",
+            format!("#!{}\n", interpreter.display()),
+            0o700,
+        ),
+        ("not-executable", "#!/bin/sh\nexit 0\n".to_owned(), 0o600),
+    ] {
+        let path = rig.host.scratch.join(format!("program-{id}"));
+        fs::write(&path, script).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        rig.entries.insert(id.into(), json!({"program":path}));
+    }
+    rig.write_config();
+    let run = rig.run(false, &NoTerminal);
+    let doc = serde_json::to_value(&run.run.document).unwrap();
+    assert_eq!(
+        doc["modules"],
+        json!([
+            {"id":"exit-two-with-output","outcome":"crashed","findings":0,"detail":"exit:2"},
+            {"id":"missing-interpreter","outcome":"spawn_failed","findings":0,"detail":"not_found"},
+            {"id":"not-executable","outcome":"spawn_failed","findings":0,"detail":"permission_denied"},
+        ])
+    );
+}
+
+#[test]
+fn missing_identity_rejects_success_but_preserves_launch_errors() {
+    let mut rig = Rig::new();
+    rig.config.identity_lookup = |_| None;
+    rig.program("checked", json!({}));
+    rig.entries.insert(
+        "missing".into(),
+        json!({"program": rig.host.scratch.join("missing")}),
+    );
+    rig.write_config();
+
+    let run = rig.run(
+        true,
+        &Prompt(|_: &str| panic!("a check without a file identity must not offer a repair")),
+    );
+    let doc = serde_json::to_value(&run.run.document).unwrap();
+    assert_eq!(
+        doc["modules"],
+        json!([
+            {"id":"checked","outcome":"invalid_output","findings":0,"detail":"identity_unreadable"},
+            {"id":"missing","outcome":"spawn_failed","findings":0,"detail":"not_found"},
+        ])
+    );
+    let problem = finding(&run.run, "module_program.identity_unreadable");
+    assert!(problem.summary.contains("file identity could not be read"));
+    assert_eq!(problem.evidence["detail"], "identity_unreadable");
+    assert!(!ids(&run.run).contains(&"module.failed"));
+    assert!(run.checked.is_empty());
+}
+
+#[test]
 fn config_errors_and_override_do_not_run_programs() {
     let rig = Rig::new();
     assert!(rig.run(false, &NoTerminal).checked.is_empty());

@@ -1,6 +1,6 @@
 use std::io::{self, Write};
 
-use subc_core::doctor::{CheckedProgram, DoctorReport, Interrupt, LogFallback};
+use subc_core::doctor::{CheckedProgram, Interrupt, LogFallback};
 
 use super::Terminal;
 
@@ -14,6 +14,8 @@ struct Row {
     outcome: String,
     #[cfg(unix)]
     path: Option<std::path::PathBuf>,
+    #[cfg(unix)]
+    notice: Option<&'static str>,
     #[cfg(unix)]
     failed: bool,
 }
@@ -41,6 +43,9 @@ impl Rows {
                 write!(out, " [{}]", path.display())?;
             }
             writeln!(out)?;
+            if let Some(notice) = row.notice {
+                writeln!(out, "  {notice}")?;
+            }
         }
         Ok(())
     }
@@ -52,7 +57,6 @@ pub(super) fn file(
     _: &Terminal,
     _: &Interrupt,
     _: &dyn LogFallback,
-    _: &DoctorReport,
 ) -> Rows {
     Rows::default()
 }
@@ -72,7 +76,8 @@ mod unix {
     };
 
     use cortexkit_doctor::{
-        build_report, redact_secrets, runner, Manifest, ReportContext, ReportInput,
+        build_local_report, build_report, redact_secrets, runner, Manifest, ModuleId,
+        ReportContext, ReportInput,
     };
     use rustix::{
         fs::{fchmod, fstat, mkdirat, open, openat, unlinkat, AtFlags, Mode, OFlags},
@@ -108,7 +113,6 @@ mod unix {
         terminal: &Terminal,
         interrupt: &Interrupt,
         logs: &dyn LogFallback,
-        report: &DoctorReport,
         github_api: Option<OsString>,
     ) -> Rows {
         checked.retain(|program| !program.check.findings().is_empty());
@@ -124,7 +128,6 @@ mod unix {
             terminal,
             interrupt,
             logs,
-            report,
             github_api,
         };
         Rows(
@@ -151,6 +154,8 @@ mod unix {
         };
         match runner::manifest(&program.path, options) {
             Ok(manifest) => ManifestOutcome::Valid(manifest),
+            // A rejected repository (DecodeError::Repository) is an invalid
+            // manifest too. The local report contains the check, not the manifest error.
             Err(runner::RunError::InvalidOutput(_)) => ManifestOutcome::Invalid,
             Err(runner::RunError::TimedOut) => ManifestOutcome::Skipped("manifest_timed_out"),
             Err(runner::RunError::Crashed(_)) => ManifestOutcome::Skipped("manifest_crashed"),
@@ -159,41 +164,20 @@ mod unix {
         }
     }
 
-    fn save_invalid_manifest(
-        program: &CheckedProgram,
-        report: &DoctorReport,
-    ) -> io::Result<PathBuf> {
-        // The report builder requires a valid repository and log metadata. Until
-        // it supports local-only reports, keep only validated findings and a
-        // summary, without inventing any metadata or reading any log text.
-        fn redact_strings(value: &mut serde_json::Value) {
-            match value {
-                serde_json::Value::String(text) => *text = redact_secrets(text).into_owned(),
-                serde_json::Value::Array(items) => items.iter_mut().for_each(redact_strings),
-                serde_json::Value::Object(fields) => fields.values_mut().for_each(redact_strings),
-                _ => (),
-            }
-        }
-        let mut body = serde_json::json!({
-            "module": program.module_id,
-            "outcome": "manifest_invalid",
-            "message": "The module's manifest was invalid. This report is local only.",
-            "findings": program.check.findings(),
-            "stack": {"ok": report.ok, "daemon_answered": report.daemon_answered},
-        });
-        redact_strings(&mut body);
+    fn save_local(program: &CheckedProgram, module_id: &ModuleId) -> io::Result<PathBuf> {
         let data = setup::data_directory().map_err(io::Error::other)?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(io::Error::other)?;
-        save(&data, now.as_secs(), "json", &serde_json::to_vec(&body)?)
+        let ctx = report_context(&data, now)?;
+        let body = build_local_report(&ctx, module_id, &program.check).map_err(io::Error::other)?;
+        save(&data, now.as_secs(), "json", &body)
     }
 
     struct Flow<'a> {
         terminal: &'a Terminal,
         interrupt: &'a Interrupt,
         logs: &'a dyn LogFallback,
-        report: &'a DoctorReport,
         github_api: Option<OsString>,
     }
 
@@ -203,6 +187,7 @@ mod unix {
                 module: program.module_id.clone(),
                 outcome: "skipped interrupted".into(),
                 path: None,
+                notice: None,
                 failed: false,
             };
             if self.interrupt.signal().is_some() {
@@ -211,10 +196,18 @@ mod unix {
             let manifest = match manifest {
                 ManifestOutcome::Valid(manifest) => manifest,
                 ManifestOutcome::Invalid => {
-                    row.saved(
-                        save_invalid_manifest(program, self.report),
-                        "skipped manifest_invalid",
-                    );
+                    // Configured module IDs can contain characters such as colons
+                    // that the report format does not allow. Do not substitute an ID.
+                    let Ok(module_id) = program.module_id.parse() else {
+                        row.save_failed();
+                        row.notice = Some("The module ID is not valid for the report format.");
+                        return row;
+                    };
+                    row.saved(save_local(program, &module_id), "skipped manifest_invalid");
+                    if row.path.is_some() {
+                        row.notice =
+                            Some("The module's manifest was invalid. This report is local only.");
+                    }
                     return row;
                 }
                 ManifestOutcome::Skipped(reason) => {
@@ -347,11 +340,13 @@ mod unix {
                     self.outcome = outcome.into();
                     self.path = Some(path);
                 }
-                Err(_) => {
-                    self.outcome = "skipped save_failed".into();
-                    self.failed = true;
-                }
+                Err(_) => self.save_failed(),
             }
+        }
+
+        fn save_failed(&mut self) {
+            self.outcome = "skipped save_failed".into();
+            self.failed = true;
         }
     }
 
@@ -455,6 +450,19 @@ mod unix {
         encoded
     }
 
+    fn report_context(data: &Path, now: Duration) -> io::Result<ReportContext> {
+        let config = subc_daemon::daemon_config::default_config_path();
+        let mut key = [0; 32];
+        getrandom::fill(&mut key).map_err(|error| io::Error::other(error.to_string()))?;
+        Ok(ReportContext::new(
+            key,
+            now.as_millis() as i64,
+            data,
+            config.parent().unwrap_or(&config),
+            std::env::temp_dir(),
+        ))
+    }
+
     fn build_and_save(
         program: &CheckedProgram,
         manifest: &Manifest,
@@ -466,16 +474,7 @@ mod unix {
             .duration_since(UNIX_EPOCH)
             .map_err(io::Error::other)?;
         let data = setup::data_directory().map_err(io::Error::other)?;
-        let config = subc_daemon::daemon_config::default_config_path();
-        let mut key = [0; 32];
-        getrandom::fill(&mut key).map_err(|error| io::Error::other(error.to_string()))?;
-        let ctx = ReportContext::new(
-            key,
-            now.as_millis() as i64,
-            &data,
-            config.parent().unwrap_or(&config),
-            std::env::temp_dir(),
-        );
+        let ctx = report_context(&data, now)?;
         let log_tail = logs.tail(&program.module_id).tail.ok().flatten();
         let lines = log_tail
             .as_ref()

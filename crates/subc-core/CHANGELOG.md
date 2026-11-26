@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.22.2
+
+- Use cortexkit-doctor 0.2.0 for module launch diagnostics and sanitized local-only issue reports.
+
 ## 0.22.1
 
 - Keep stack daemon checks and doctor CPU samples bound to the same process

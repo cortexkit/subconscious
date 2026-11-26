@@ -794,21 +794,51 @@ fn doctor_issue_invalid_manifest_saves_local_report_without_raw_log_text() {
         stdout.contains("broken-manifest: skipped manifest_invalid ["),
         "{stdout}"
     );
+    assert!(
+        stdout.contains("The module's manifest was invalid. This report is local only."),
+        "{stdout}"
+    );
     assert!(!terminal.contains(TITLE_PROMPT));
     let paths = report_paths(&stdout);
     assert_eq!(paths.len(), 1);
+    assert_eq!(paths[0].parent().unwrap(), rig.reports());
     assert_eq!(paths[0].extension().unwrap(), "json");
+    assert_eq!(
+        fs::metadata(&paths[0]).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
     let body = fs::read_to_string(&paths[0]).unwrap();
-    assert!(
-        body.contains("manifest was invalid") && body.contains("local only"),
-        "{body}"
-    );
-    assert!(
-        body.contains("module.failed") && body.contains("daemon_answered"),
-        "{body}"
-    );
     assert!(!body.contains("RAW-LOG-CANARY"), "{body}");
-    assert!(document(&paths[0]).get("logs").is_none());
+    let note: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(note["schema"], "ck.doctor-report/v1");
+    assert_eq!(note["module_id"], "broken-manifest");
+    assert_eq!(note["check"]["outcome"], "ok");
+    assert_eq!(note["findings"][0]["id"], "module.failed");
+    assert!(note.get("repository").is_none());
+    assert_eq!(note["logs"], json!([]));
+    api.assert_requests(0);
+    assert!(!rig.root.join("gh.auth").exists());
+}
+
+#[test]
+fn doctor_issue_invalid_manifest_cannot_save_a_nonconforming_module_id() {
+    let mut rig = Rig::new();
+    rig.program("parent:child", json!({"manifest": "invalid_repository"}));
+    let api = FakeApi::public();
+    rig.gh(0, 0, false);
+    let tty = rig.issue_tty(&api);
+    let (stdout, terminal) = tty.finish(1);
+    assert!(stdout.contains("module.failed"), "{stdout}");
+    assert!(
+        stdout.contains("parent:child: skipped save_failed\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("The module ID is not valid for the report format."),
+        "{stdout}"
+    );
+    assert!(!terminal.contains(TITLE_PROMPT));
+    assert!(!rig.reports().exists());
     api.assert_requests(0);
     assert!(!rig.root.join("gh.auth").exists());
 }

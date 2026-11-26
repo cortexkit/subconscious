@@ -35,6 +35,8 @@ pub(super) struct ProgramConfig {
     pub limits: cortexkit_doctor::runner::Limits,
     #[cfg(all(test, unix))]
     pub admission: std::time::Duration,
+    #[cfg(all(test, unix))]
+    pub identity_lookup: fn(&Path) -> Option<subc_os::FileIdentity>,
 }
 
 impl Default for ProgramConfig {
@@ -47,6 +49,8 @@ impl Default for ProgramConfig {
             limits: cortexkit_doctor::runner::Limits::default(),
             #[cfg(all(test, unix))]
             admission: std::time::Duration::from_secs(11),
+            #[cfg(all(test, unix))]
+            identity_lookup: subc_os::file_identity,
         }
     }
 }
@@ -123,6 +127,7 @@ pub(super) fn check_all(
         } else if module.protocol == ModuleProtocol::None {
             Some("protocol_none")
         } else if cfg!(unix) && !module.program.is_absolute() {
+            // A relative path could resolve to a different program via PATH or the working directory.
             Some("program_not_absolute")
         } else {
             None
@@ -144,12 +149,23 @@ pub(super) fn check_all(
         let cutoff = start + config.admission;
         #[cfg(not(test))]
         let cutoff = start + std::time::Duration::from_secs(11);
+        #[cfg(test)]
+        let identity_lookup = config.identity_lookup;
+        #[cfg(not(test))]
+        let identity_lookup = subc_os::file_identity;
         let options = config.runner.clone().with_limits(config.limits);
         for (id, path, result) in pool_until(
             jobs,
             cutoff,
             |(id, path)| {
-                let result = check_one(&path, interrupt, &options, config.limits, cutoff);
+                let result = check_one(
+                    &path,
+                    interrupt,
+                    &options,
+                    config.limits,
+                    cutoff,
+                    identity_lookup,
+                );
                 (id, path, result)
             },
             |(id, path)| (id, path, Job::NotStarted),
@@ -253,7 +269,7 @@ fn pool_until<T: Send, R: Send>(
 #[cfg(unix)]
 enum Job {
     Checked(subc_os::FileIdentity, cortexkit_doctor::CheckOutput),
-    PreflightFailed(String),
+    IdentityUnavailable,
     Failed(cortexkit_doctor::RunError),
     NotStarted,
 }
@@ -265,25 +281,14 @@ fn check_one(
     options: &cortexkit_doctor::runner::Options,
     limits: cortexkit_doctor::runner::Limits,
     cutoff: Instant,
+    identity_lookup: impl FnOnce(&Path) -> Option<subc_os::FileIdentity>,
 ) -> Job {
-    use std::os::unix::fs::PermissionsExt;
-
     if interrupt.signal().is_some() {
         return Job::NotStarted;
     }
-    // The `cortexkit_doctor` runner discards the launch I/O error. Diagnose
-    // common path failures without spawning, but leave interpreter and exec
-    // errors to it.
-    match std::fs::metadata(path) {
-        Err(error) => return Job::PreflightFailed(io_kind(error.kind()).into()),
-        Ok(meta) if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 => {
-            return Job::PreflightFailed("permission_denied".into());
-        }
-        Ok(_) => (),
-    }
-    let Some(identity) = subc_os::file_identity(path) else {
-        return Job::Failed(cortexkit_doctor::RunError::LaunchFailed);
-    };
+    // Keep the pre-launch identity so repairs and issue reports can detect a
+    // replaced program. The runner, not the identity lookup, diagnoses launch failures.
+    let identity = identity_lookup(path);
     if Instant::now() > cutoff {
         return Job::NotStarted;
     }
@@ -293,9 +298,10 @@ fn check_one(
     ) else {
         return Job::NotStarted;
     };
-    match cortexkit_doctor::runner::check(path, options) {
-        Ok(output) => Job::Checked(identity, output),
-        Err(error) => Job::Failed(error),
+    match (identity, cortexkit_doctor::runner::check(path, options)) {
+        (Some(identity), Ok(output)) => Job::Checked(identity, output),
+        (None, Ok(_)) => Job::IdentityUnavailable,
+        (_, Err(error)) => Job::Failed(error),
     }
 }
 
@@ -354,14 +360,19 @@ fn record(pass: &mut ProgramChecks, id: String, path: PathBuf, job: Job) {
             });
             return;
         }
-        // The 0.1.0 runner only returns NoDoctor for manifest. A check's
-        // usage-error exit is the indicator that its subcommand is unknown.
-        Job::Failed(RunError::NoDoctor | RunError::Crashed(Crash::ExitCode(2))) => {
-            (ModuleOutcome::NoChecks, None, None)
-        }
-        Job::PreflightFailed(kind) => (
+        Job::Failed(RunError::NoDoctor) => (ModuleOutcome::NoChecks, None, None),
+        // The child ran, but output we can't tie to a file identity is unusable.
+        Job::IdentityUnavailable => (
+            ModuleOutcome::InvalidOutput,
+            Some("identity_unreadable".into()),
+            Some((
+                "identity_unreadable",
+                "The module program's file identity could not be read, so its results can't be trusted for repairs",
+            )),
+        ),
+        Job::Failed(RunError::LaunchFailed(kind)) => (
             ModuleOutcome::SpawnFailed,
-            Some(kind),
+            Some(io_kind(kind).into()),
             Some(("spawn_failed", "The module check could not launch")),
         ),
         Job::Failed(RunError::Crashed(status)) => (

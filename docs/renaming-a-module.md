@@ -360,7 +360,7 @@ symlink back into a rename for every consumer that hashes the resolved path
 
 Before any project folder rename, enumerate THREE store classes, not two:
 1. module-id-keyed stores (lease preseed rule, above);
-2. directory-scoped rows (opencode.db, prefrontal-core peers — the rename
+2. directory-scoped rows (opencode.db, prefrontal peers — the rename
    script rewrites these);
 3. CANONICALIZED-PATH-KEYED stores (broca WALs today; anything hashing a
    resolved root). The script cannot rewrite these — the owner must either

@@ -88,9 +88,9 @@
       "acquisition": "source",
       "lock_refresh": "manual"
     },
-    "prefrontal-core": {
+    "prefrontal": {
       "repo": "cortexkit/prefrontal",
-      "binary": "ck-prefrontal-core",
+      "binary": "ck-prefrontal",
       "acquisition": "source",
       "lock_refresh": "manual"
     },

@@ -23,7 +23,7 @@ Rust and TypeScript implementations test against `crates/subc-core/tests/fixture
 2026-09-19T07:59:01.882Z ERROR engram.scheduler: capture halted after 3 consecutive failures gen=192 class=dedup_map_unreadable
 2026-09-19T07:59:03.501Z DEBUG synapse.perf: job done model=qwen3-0.6b lane=decode tokens=12 ms=118
 2026-09-19T07:58:59.004Z WARN  aft.index: [root=/home/me/project] build fell back to full projection reason=journal_gap ms=4288
-2026-09-19T07:59:02.113Z INFO  prefrontal-core.wake: [agent=agent_ab64ea0873bbee0c session=opencode:ses_0758f6ce7ffeJ0A9sV8Qvema7d] delivered lane=notice ms=22
+2026-09-19T07:59:02.113Z INFO  prefrontal.wake: [agent=agent_ab64ea0873bbee0c session=opencode:ses_0758f6ce7ffeJ0A9sV8Qvema7d] delivered lane=notice ms=22
 2026-09-19T07:58:58.970Z INFO  subc.supervise: module reported non-ok health module_id=engram status=Degraded
 ```
 

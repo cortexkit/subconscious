@@ -27,10 +27,10 @@ Each participant may publish only on `ck.{acct}.live.<its module>.>`, just as fo
 its own event branch. Subscription authorization mirrors the existing event-reader
 durable filters from `cortexkit-bus-naming`, one for one, replacing only `event`
 with `live`. Basal's all-events reader gets `live.>`; named readers get only their
-existing modules and kinds, including prefrontal-core's narrow Basal and broad Broca
+existing modules and kinds, including prefrontal's narrow Basal and broad Broca
 filters. A participant without an event-reader durable gets no live subscription.
 A concrete module or `*` module subscription is allowed only when those filters
-cover it; prefrontal-core still cannot subscribe to broad `live.basal.>`.
+cover it; prefrontal still cannot subscribe to broad `live.basal.>`.
 
 No configured stream captures this root: ROOM, WAKE, PEER, EFFECT and EFFECT_DEAD
 bind their own branches, EVENT binds only `ck.{acct}.event.>`, and the census
@@ -436,7 +436,7 @@ Credentials (design D; foundation amendment `48c83a68e`, `0eb12229f`, `b9e827c69
     and `inbox_prefix: "ckdel.{box_id}.{module}"`. This user can access only its assigned
     hub streams: `magic-context` uses HUB_MEMORY, `prefrontal` uses HUB_ROOMS,
     `entorhinal` uses HUB_IDLOG and KV_residence, and `engram` uses OBJ_cuts. The legacy
-    `prefrontal-core` id can still use the room grant, with its own inbox prefix. These
+    `prefrontal-core` id could also use the room grant, with its own inbox prefix. These
     users cannot publish or subscribe on per-machine federation subjects.
   - `ckbus.hub_credential_renew` takes `credential_public`, like `ckbus.credential_renew`.
     Hub credentials have a separate `hub.{module}` census entry and follow the same
@@ -451,7 +451,7 @@ Credentials (design D; foundation amendment `48c83a68e`, `0eb12229f`, `b9e827c69
   - Every subc-wire spawn receives a nonce whether or not it is declared `reserved`, so
     a participant qualifies by presenting its consumer identity. No participant needs
     `reserved: true`.
-  - Participants at launch are ck-bus and prefrontal-core only; every other module joins
+  - Participants at launch are ck-bus and prefrontal only; every other module joins
     when its port lands.
 - Revocation is NATS state, never a vault delete. Three ordered steps, the
   foundation's four minus the dropped vault delete.
@@ -647,15 +647,15 @@ Ownership of acts.
     dead-letter stream has the bus's `c_ckbus_dead` diagnostic reader, as declared
     by `delivery_consumer_specs`.
 
-  The daemon catalog selects the owner of the ROOM, INBOX and CORE_WORK readers
-  and the session-liveness bucket. ck-bus follows catalog changes and moves these
-  resources only when exactly one of `prefrontal` and `prefrontal-core` is registered.
-  A work-queue move preserves outstanding messages and logs the old reader's pending
-  counts; the new ROOM reader starts after the old acknowledgement floor, so deliveries
-  beyond that floor can repeat. The new liveness bucket starts empty. With both or
-  neither registered, the existing resources are left alone. A catalog or migration
-  failure does not take the message bus down. EVENT and the federation-only PEER and
-  WAKE readers are not moved.
+  The daemon catalog selected the owner of the ROOM, INBOX and CORE_WORK readers
+  and the session-liveness bucket. ck-bus followed catalog changes and moved these
+  resources only when exactly one of `prefrontal` and `prefrontal-core` was registered.
+  A work-queue move preserved outstanding messages and logged the old reader's pending
+  counts; the new ROOM reader started after the old acknowledgement floor, so deliveries
+  beyond that floor could repeat. The new liveness bucket started empty. With both or
+  neither registered, the existing resources were left alone. A catalog or migration
+  failure did not take the message bus down. EVENT and the federation-only PEER and
+  WAKE readers were not moved.
 
   The command streams' limits come from naming's `shipped_streams`:
   - INBOX binds `ck.{acct}.inbox.{kind}.*.ready` for `head` and `worker`.
@@ -688,10 +688,10 @@ Ownership of acts.
 
   | Owner | Local bucket | Readers | Value cap | Total cap | TTL |
   | --- | --- | --- | --- | --- | --- |
-  | aft | status | prefrontal-core | 2,048 B | 2 MiB | 10 s |
+  | aft | status | prefrontal | 2,048 B | 2 MiB | 10 s |
   | astrocyte | multiplier | striatum | 8,192 B | 1 MiB | - |
   | astrocyte | read-marks | thalamus-harness | 256 B | 16 MiB | - |
-  | entorhinal | changes | prefrontal-core, plexus, magic-context | 512 B | 32 MiB | - |
+  | entorhinal | changes | prefrontal, plexus, magic-context | 512 B | 32 MiB | - |
   | Catalog-selected authority | session-liveness | entorhinal | 1,024 B | 16 MiB | - |
   | aft | views | occipital | 256 KiB | 32 MiB | - |
   | cerebellum | views | occipital | 256 KiB | 32 MiB | - |
@@ -1197,7 +1197,7 @@ Row contents.
     settings stay unchanged; the wire-config golden permits only those reviewed
     changes and omission of unset optional properties, not arbitrary differences.
     All nine message streams and the declared module durables then exist, and a
-    room post made before `m_prefrontal-core` existed is pending on it. A further
+    room post made before `m_prefrontal` existed is pending on it. A further
     boot preserves stream state and durable cursors. Separate cases in the same
     file check every declared module bucket, its watch cap and in-place cap updates.
   - A restart writes a new `own_users.json` and revokes the previous incarnation's box
@@ -1460,7 +1460,7 @@ The index summarizes normative requirements; where an index line and a section d
     pull, ack and info on any agent durable as above, the `effect_dead` publish, census
     read, and publish on its own module events, `ck.{acct}.event.{module_id}.>`, and on
     no other module's. No workload publish at all.
-  - delivery authority (`reserved:prefrontal` or `reserved:prefrontal-core`): the participant set plus
+  - delivery authority (`reserved:prefrontal`): the participant set plus
     publish on `ck.{acct}.wake.*.fire`, `ck.{acct}.peer.*.*.deliver`,
     `ck.{acct}.effect.*.*.intent` for every agent, and the ROOM binding
     `ck.{acct}.room.*.post` for every room, and pull, ack and info on the ROOM
@@ -1479,7 +1479,7 @@ The index summarizes normative requirements; where an index line and a section d
   agents, so a participant is never reissued when agents come or go: a credential
   issued before a bind pulls from the durable bound afterwards.
   Prefrontal owns residence. It creates, removes and reads each agent's durables through
-  ops on ck-bus's ManagementSurface, accepted only from `reserved:prefrontal-core`
+  ops on ck-bus's management interface (`ManagementSurface`), accepted only from `reserved:prefrontal`
   (anything else, `Direct` included, is refused with `ckbus_caller_not_permitted`), with
   every name taken from the naming crate:
   - `ckbus.agent_durable_bind {agent_id}` creates the three durables (pull, explicit

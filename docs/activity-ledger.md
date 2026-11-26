@@ -51,12 +51,12 @@ sends can set them; an unknown field refuses `activity_malformed`.
   tag the route was bound under. A route that isn't bound to the caller, a stale
   epoch, or a scope whose tag has changed since the route was bound refuses
   `activity_actor_unknown`.
-- **Under a scope the caller owns.** The scope owner (prefrontal-core today) cites
+- **Under a scope the caller owns.** The scope owner (prefrontal today) cites
   `on: {scope: {ref, epoch}}`. The daemon checks the caller is that scope's owner and
   that the scope passes the same liveness checks route admission uses: the owner is
   synced, the ref is live, the epoch is current and the deadline has not passed. It
   then stamps the scope owner and the scope's `agent_id`, `run_id` and `flow_id`. Any
-  failed check refuses `activity_actor_unknown`. This is how core records events
+  failed check refuses `activity_actor_unknown`. This is how prefrontal records events
   about an agent's work after the route that started it has closed.
 - **No citation.** The actor is the module itself, for system actions such as a
   scheduled cleanup.

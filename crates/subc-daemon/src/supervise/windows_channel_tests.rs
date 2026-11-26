@@ -333,11 +333,8 @@ fn check_environment(
             env(&command, subc_os::LAUNCH_NONCE_PIPE_ENV),
             Some(nonce.name().into())
         );
-        assert!(env(&command, SUBC_LAUNCH_NONCE_ENV).is_some());
-        assert_eq!(
-            env(&command, subc_os::LAUNCH_NONCE_PIPE_FALLBACK_ENV),
-            Some("env".into())
-        );
+        assert!(env(&command, SUBC_LAUNCH_NONCE_ENV).is_none());
+        assert!(env(&command, subc_os::LAUNCH_NONCE_PIPE_FALLBACK_ENV).is_none());
         assert_ne!(pipe.name(), nonce.name());
     }
 }

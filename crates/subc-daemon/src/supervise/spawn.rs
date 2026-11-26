@@ -1027,7 +1027,7 @@ type NonceHandoff = std::convert::Infallible;
 /// returned rather than installed here. The combined descriptor placement runs
 /// after the cgroup callback and placement barrier, so replacing slots 3-5
 /// cannot close a descriptor either callback still needs.
-/// Windows keeps SUBC_LAUNCH_NONCE as well until every module reads the named pipe.
+/// On Windows only the name of the PID-checked pipe goes into the environment.
 #[cfg(test)]
 fn apply_wire_spawn_args_for_role(
     command: &mut Command,
@@ -1147,13 +1147,12 @@ pub(super) fn apply_wire_spawn_args_for_admission(
         Some(handoff)
     };
     #[cfg(windows)]
-    let handoff = prepare_windows_nonce_pipe(command, spec, &nonce);
+    let handoff = Some(prepare_windows_nonce_pipe(
+        command, spec, &nonce, handle, role,
+    )?);
     #[cfg(not(any(unix, windows)))]
     let handoff = None;
-    // Older modules still read SUBC_LAUNCH_NONCE to register. Keep that copy
-    // until the daemon's per-spawn delivery records show that every running
-    // Windows module has read its secret from the named pipe.
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     command.env(SUBC_LAUNCH_NONCE_ENV, nonce);
     Ok(handoff)
 }
@@ -1214,57 +1213,60 @@ fn prepare_windows_nonce_pipe(
     command: &mut Command,
     spec: &ModuleSpec,
     nonce: &str,
-) -> Option<NonceHandoff> {
-    match subc_os::LaunchNoncePipeHandoff::new(nonce) {
-        Ok(handoff) => {
-            command.env(subc_os::LAUNCH_NONCE_PIPE_ENV, handoff.name());
-            // Let a failed pipe read use SUBC_LAUNCH_NONCE so the process can
-            // still register until every module reads the pipe. A reader without
-            // this variable set to env returns the pipe error instead of using
-            // an inherited or configured environment copy.
-            command.env(subc_os::LAUNCH_NONCE_PIPE_FALLBACK_ENV, "env");
-            Some(handoff)
-        }
-        Err(error) => {
-            warn!(module_id = %spec.module_id, %error, "could not prepare launch nonce pipe; retaining the environment handoff");
-            None
+    handle: Option<&SupervisorHandle>,
+    role: SpawnRole,
+) -> Result<NonceHandoff, SuperviseError> {
+    let handoff = subc_os::LaunchNoncePipeHandoff::new(nonce).map_err(|source| {
+        update_nonce_pipe_refusal(handle, spec, role, Some("launch_nonce_pipe_prepare_failed"));
+        windows_nonce_pipe_error(spec, "prepare", source)
+    })?;
+    command.env(subc_os::LAUNCH_NONCE_PIPE_ENV, handoff.name());
+    Ok(handoff)
+}
+
+#[cfg(windows)]
+fn update_nonce_pipe_refusal(
+    handle: Option<&SupervisorHandle>,
+    spec: &ModuleSpec,
+    role: SpawnRole,
+    refusal: Option<&'static str>,
+) {
+    // A failed candidate belongs to the swap operation, not to the incumbent.
+    if role == SpawnRole::Plain {
+        if let Some(module) = handle.and_then(|handle| handle.get(&spec.module_id)) {
+            if let Err(error) =
+                update_snapshot(&module.inner.snapshot, Some(&spec.module_id), |state| {
+                    state.nonce_pipe_refusal = refusal;
+                })
+            {
+                error!(module_id = %spec.module_id, %error, "could not record Windows launch nonce pipe status");
+            }
         }
     }
 }
 
 #[cfg(windows)]
-fn start_windows_nonce_pipe(
-    handoff: Option<NonceHandoff>,
-    pid: u32,
-    spec: &ModuleSpec,
-) -> Option<subc_os::LaunchNoncePipeDelivery> {
-    // Close an unread pipe after REGISTRY_RELEASE_TIMEOUT (one second), the
-    // same maximum wait used for registration during a reload. Older modules
-    // may register using SUBC_LAUNCH_NONCE without ever connecting to the pipe.
-    handoff.and_then(|handoff| match handoff.serve(pid, REGISTRY_RELEASE_TIMEOUT) {
-        Ok(delivery) => Some(delivery),
-        Err(error) => {
-            warn!(module_id = %spec.module_id, %error, "could not serve launch nonce pipe; retaining the environment handoff");
-            None
-        }
-    })
+fn windows_nonce_pipe_error(spec: &ModuleSpec, step: &str, source: io::Error) -> SuperviseError {
+    SuperviseError::Spawn {
+        program: spec.program.clone(),
+        source: io::Error::new(
+            source.kind(),
+            format!("could not {step} Windows launch nonce pipe: {source}"),
+        ),
+        cgroup_path: None,
+    }
 }
 
 pub(super) fn observed_launch_nonce_source(snapshot: &SupervisorSnapshot) -> Option<String> {
     #[cfg(windows)]
-    if snapshot.process_alive && snapshot.spawned_protocol == Some(ModuleProtocol::Subc) {
-        return Some(
-            if snapshot
-                .pipe_consumed
-                .as_ref()
-                .is_some_and(|consumed| consumed.get().is_some())
-            {
-                "pipe"
-            } else {
-                "env"
-            }
-            .to_owned(),
-        );
+    if snapshot.process_alive
+        && snapshot.spawned_protocol == Some(ModuleProtocol::Subc)
+        && snapshot
+            .pipe_consumed
+            .as_ref()
+            .is_some_and(|consumed| consumed.get().is_some())
+    {
+        return Some("pipe".to_owned());
     }
     let _ = snapshot;
     None
@@ -1498,6 +1500,8 @@ pub(super) struct PreparedChild {
     image_capture: subc_os::ExecutableCapture,
     #[cfg(windows)]
     nonce_handoff: Option<NonceHandoff>,
+    #[cfg(windows)]
+    role: SpawnRole,
     spawned_at: Instant,
     config_delivery: Option<crate::config_gate::runtime::DeliverySpawn>,
     delivery_registration: Option<config_delivery::RegistrationGuard>,
@@ -1848,6 +1852,8 @@ pub(super) fn prepare_child_in_slot(
     alternate_slot: bool,
     asynchronous: bool,
 ) -> Result<PreparedChild, SuperviseError> {
+    #[cfg(windows)]
+    update_nonce_pipe_refusal(handle, spec, role, None);
     require_program_search_path(spec)?;
     let spawn_admission = config_delivery
         .map(|delivery| delivery.prepare(spec))
@@ -2312,6 +2318,8 @@ pub(super) fn prepare_child_in_slot(
         image_capture,
         #[cfg(windows)]
         nonce_handoff,
+        #[cfg(windows)]
+        role,
         spawned_at,
         config_delivery,
         delivery_registration,
@@ -2397,6 +2405,8 @@ pub(super) fn launch_child_in_slot(
     let image_capture = prepared.image_capture;
     #[cfg(windows)]
     let nonce_handoff = prepared.nonce_handoff;
+    #[cfg(windows)]
+    let role = prepared.role;
     let spawned_at = prepared.spawned_at;
     let config_delivery = prepared.config_delivery;
     let delivery_registration = prepared.delivery_registration;
@@ -2510,8 +2520,6 @@ pub(super) fn launch_child_in_slot(
         && matches!(group_target, containment::GroupTarget::OwnLeader))
     .then(|| plain_group::PlainGroup::from_spawn(pid).map(Arc::new))
     .flatten();
-    #[cfg(windows)]
-    let nonce_delivery = start_windows_nonce_pipe(nonce_handoff, pid, spec);
     #[cfg(not(windows))]
     let process_start_time = admitted
         .as_ref()
@@ -2597,6 +2605,8 @@ pub(super) fn launch_child_in_slot(
         .and_then(|admitted| admitted.leader.take());
     #[cfg(not(unix))]
     let preadmitted: Option<crate::child_roster::RosterGuard> = None;
+    #[cfg(all(test, windows))]
+    spawn_record_tests::before_roster_admit(spec);
     let roster_guard = if let Some(guard) = preadmitted {
         Ok(guard)
     } else {
@@ -2791,7 +2801,7 @@ pub(super) fn launch_child_in_slot(
         child: containment::ProcessChild::plain(child, pid),
         exec: crate::activity::ExecOwner(exec),
         #[cfg(windows)]
-        nonce_delivery,
+        nonce_delivery: None,
         protocol: spec.protocol,
         #[cfg(target_os = "linux")]
         module_id: cgroup_name,
@@ -2859,10 +2869,30 @@ pub(super) fn launch_child_in_slot(
         admitted.disarm();
     }
     #[cfg(windows)]
-    if let Err(error) = resume_suspended_child(pid, spec) {
-        containment::terminate_blocking(&roster.containment);
-        let _ = supervised.child.start_kill();
-        return Err(error);
+    {
+        if let Some(handoff) = nonce_handoff {
+            // The pipe name was reserved before CreateProcessW, but service
+            // has a bounded lifetime. Do not spend any of that window on the
+            // durable admission work while the client cannot run.
+            match handoff.serve(pid, REGISTRY_RELEASE_TIMEOUT) {
+                Ok(delivery) => supervised.nonce_delivery = Some(delivery),
+                Err(source) => {
+                    supervised.child.reject();
+                    update_nonce_pipe_refusal(
+                        registration_handle.as_ref(),
+                        spec,
+                        role,
+                        Some("launch_nonce_pipe_serve_failed"),
+                    );
+                    return Err(windows_nonce_pipe_error(spec, "start serving", source));
+                }
+            }
+        }
+        if let Err(error) = resume_suspended_child(pid, spec) {
+            containment::terminate_blocking(&roster.containment);
+            let _ = supervised.child.start_kill();
+            return Err(error);
+        }
     }
     if binding_ready {
         // An unreadable initial image is not a definite mismatch. Keep the
@@ -3331,6 +3361,10 @@ pub(super) fn set_running(
     state.drain_disposition_detail = None;
     state.spawn_failure = None;
     state.admission_refused = None;
+    #[cfg(windows)]
+    {
+        state.nonce_pipe_refusal = None;
+    }
     state.config_hold_parked = false;
     state.config_hold_daemon_initiated = false;
     state.config_hold_approval = None;

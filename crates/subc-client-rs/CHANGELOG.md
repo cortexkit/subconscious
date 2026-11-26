@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.42.2
+
+- The supervised Windows delivery test now requires a pipe nonce and verifies
+  that the daemon did not put a copy in the module's environment. The reader
+  still supports older daemons.
+
 ## 0.42.1
 
 - Add `RequestCtx::push`, which sends a Push on the request's correlation without ending the call, for tool-provider call keepalives. It refuses with the new `SubcModuleError::RequestEnded` once the request was cancelled or its terminal frame was queued.

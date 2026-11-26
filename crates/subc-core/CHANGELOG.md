@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.22.3
+
+- Use subc-daemon 0.53.3, which delivers Windows launch nonces only by pipe.
+  The module status test checks that the environment copy is disabled.
+
 ## 0.22.2
 
 - Use cortexkit-doctor 0.2.0 for module launch diagnostics and sanitized local-only issue reports.

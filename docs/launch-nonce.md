@@ -47,19 +47,14 @@ checks that the connected process's PID equals the PID the daemon got when it sp
 so a replacement started beside a still-serving module gets its own pipe. The daemon records
 `pipe` as the source only after the client has read every byte.
 
-While some modules still read only the environment, the Windows daemon also keeps setting the
-environment copy (`SUBC_LAUNCH_NONCE`) and `SUBC_LAUNCH_NONCE_PIPE_FALLBACK=env`. That second
-variable lets a pipe reader fall back to the copy: when it is set and the copy is a non-empty
-string, a pipe read that fails, is incomplete, or returns bytes that differ from the copy uses the
-copy instead (cached as source `env`); a pipe value equal to the copy stays source `pipe`. Without
-the variable, a failed pipe read stays an error. Both variables are removed together once every
-module's reader uses the pipe. The accessor never changes the process environment (section 3), so
-a module that spawns children removes both from each child's environment itself.
-
-So the operator-authority rule's claim, that no other process running as the same user can read a
-module's nonce from its environment, holds on macOS and Linux only for now: there the daemon has
-not set `SUBC_LAUNCH_NONCE` since subc-daemon 0.28.0 (section 5), while on Windows the copy stays in
-each module's environment until it is removed.
+Since subc-daemon 0.53.3, the Windows daemon does not set `SUBC_LAUNCH_NONCE` or
+`SUBC_LAUNCH_NONCE_PIPE_FALLBACK` and strips inherited or configured values. It
+reserves the pipe name before creating the suspended child, then starts the one-second
+delivery window immediately before resuming the durably recorded child. If pipe setup
+fails, the daemon refuses the launch instead of supplying the secret in the environment.
+The accessor still honors the explicit fallback marker and a nonempty copy supplied
+by older daemons. A matching complete read reports `pipe`; otherwise the permitted
+copy reports `env`.
 
 `protocol: "none"` children get neither the pipe nor the variable, as today they get no nonce.
 
@@ -74,7 +69,7 @@ Cerebellum; Thalamus and Plexus use both):
   `WrongPipe`) and left untouched. Otherwise read `SUBC_LAUNCH_NONCE` (the rollout fallback).
 - On Windows, if `SUBC_LAUNCH_NONCE_PIPE` is set, connect to that named pipe and read it to the
   end. It uses `SUBC_LAUNCH_NONCE` instead only when `SUBC_LAUNCH_NONCE_PIPE_FALLBACK=env`
-  permits it, as section 2 describes; otherwise a failed pipe read is an error.
+  permits it for an older daemon, as section 2 describes; otherwise a failed pipe read is an error.
 - Cache the value and its source (`fd`, `pipe` or `env`) for the process's life, and return the cached
   value on every later call. **Every reader in a process must go through this one accessor**,
   including the SDK's route-open path. A second, independent read would not just find the
@@ -170,19 +165,19 @@ Readers migrate before environment removal; a live boundary is asserted only aft
 
 **Shipped in subc-daemon 0.28.0:** Unix supervised wire modules receive the nonce only
 through the pipe and `SUBC_LAUNCH_NONCE_FD`, including swap candidates.
-`SUBC_LAUNCH_NONCE` is absent even if inherited or configured in `env`. Windows
-modules receive the nonce over their per-process named pipe (since subc-daemon
-0.33.7, section 2). There the daemon still sets the environment copy and
-`SUBC_LAUNCH_NONCE_PIPE_FALLBACK=env`, which lets a reader use that copy, until every
-module's reader uses the pipe. Modules with `protocol: "none"` receive neither variable.
+**Shipped in subc-daemon 0.53.3:** Windows supervised wire modules no longer
+receive the environment copy alongside their per-process pipe. Upgrade modules
+that read only the environment before upgrading the daemon. The first Windows
+pipe readers shipped in subc-client-rs 0.27.2 and @cortexkit/subc-client 0.21.4.
+Modules with `protocol: "none"` receive neither a pipe nor a nonce on either platform.
 
 The per-module `launch_nonce_env` switch has been removed. Unknown module keys
 were already ignored by the config reader; for one release this retired key also
 logs a deprecation warning naming the module, regardless of its value. Existing
 entries still load, but operators should remove the key. It cannot re-enable the
-Unix environment copy and no longer makes a module pending reload. The status
-wire field remains for one release, reporting `false` on Unix and `true` on
-Windows for compatibility; it is not a measurement of the running environment.
+environment copy and no longer makes a module pending reload. The status wire
+field now reports `false` on Unix and Windows; it is not a measurement of the
+running environment.
 
 Deployment must relaunch every module and verify descriptor provenance, hardened-runtime signing, and absence of the Unix environment nonce for every running spawned process before asserting the operator-authority boundary; the Unix producer change alone does not establish it, and no config rollback switch remains.
 

@@ -6,9 +6,12 @@ use super::{
 use std::sync::{Arc, OnceLock};
 #[cfg(windows)]
 #[test]
-fn windows_wire_spawn_prepares_pipe_and_keeps_phase_one_env() {
+fn windows_wire_spawn_prepares_pipe_and_removes_nonce_env() {
     let spec = spec(Vec::new());
     let mut command = Command::new("unused");
+    command
+        .env(SUBC_LAUNCH_NONCE_ENV, "stale-nonce")
+        .env(subc_os::LAUNCH_NONCE_PIPE_FALLBACK_ENV, "env");
     let handoff = apply_wire_spawn_args(&mut command, &spec, None, None)
         .unwrap()
         .unwrap();
@@ -22,11 +25,11 @@ fn windows_wire_spawn_prepares_pipe_and_keeps_phase_one_env() {
     assert!(handoff.name().starts_with(r"\\.\pipe\subc-launch-"));
     assert!(command.as_std().get_envs().any(|(key, value)| key
         == OsStr::new(subc_os::LAUNCH_NONCE_PIPE_FALLBACK_ENV)
-        && value == Some(OsStr::new("env"))));
+        && value.is_none()));
     assert!(command
         .as_std()
         .get_envs()
-        .any(|(key, value)| key == OsStr::new(SUBC_LAUNCH_NONCE_ENV) && value.is_some()));
+        .any(|(key, value)| key == OsStr::new(SUBC_LAUNCH_NONCE_ENV) && value.is_none()));
 }
 
 #[cfg(windows)]
@@ -35,26 +38,17 @@ fn windows_source_reporting_tracks_consumption_and_resets_per_spawn() {
     let mut snapshot = SupervisorSnapshot::new(ModuleState::Running, true);
     snapshot.process_alive = true;
     snapshot.spawned_protocol = Some(ModuleProtocol::Subc);
-    assert_eq!(
-        observed_launch_nonce_source(&snapshot).as_deref(),
-        Some("env")
-    );
+    assert_eq!(observed_launch_nonce_source(&snapshot).as_deref(), None);
     let consumed = Arc::new(OnceLock::new());
     snapshot.pipe_consumed = Some(consumed.clone());
-    assert_eq!(
-        observed_launch_nonce_source(&snapshot).as_deref(),
-        Some("env")
-    );
+    assert_eq!(observed_launch_nonce_source(&snapshot).as_deref(), None);
     consumed.set(()).unwrap();
     assert_eq!(
         observed_launch_nonce_source(&snapshot).as_deref(),
         Some("pipe")
     );
     snapshot.pipe_consumed = Some(Arc::new(OnceLock::new()));
-    assert_eq!(
-        observed_launch_nonce_source(&snapshot).as_deref(),
-        Some("env")
-    );
+    assert_eq!(observed_launch_nonce_source(&snapshot).as_deref(), None);
     clear_current_process_facts(&mut snapshot);
     assert_eq!(observed_launch_nonce_source(&snapshot), None);
 }
@@ -274,8 +268,8 @@ fn protocol_none_spawn_carries_no_subc_argument_and_no_nonce() {
         wire.as_std()
             .get_envs()
             .any(|(key, value)| key == OsStr::new(SUBC_LAUNCH_NONCE_ENV) && value.is_some()),
-        !cfg!(unix),
-        "only Windows supplies the environment nonce"
+        !cfg!(any(unix, windows)),
+        "neither Unix nor Windows supplies the environment nonce"
     );
     assert!(handle.spawn_nonce(&wire_spec.module_id).is_some());
 }

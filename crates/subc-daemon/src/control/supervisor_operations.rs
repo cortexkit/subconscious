@@ -461,13 +461,20 @@ impl ControlHandler {
                         .as_deref()
                         == Some("undeclared")
                 });
+            #[cfg(windows)]
+            let admission_refused = admission_refused.or_else(|| {
+                (status.enabled && !status.process_alive)
+                    .then_some(status.nonce_pipe_refusal)
+                    .flatten()
+                    .map(str::to_owned)
+            });
             let accepting_drain = status.state == crate::supervise::ModuleState::Draining
                 && self
                     .forwarding
                     .module_is_accepting_drain(&status.module_id)
                     .map_err(RouterError::Forwarding)?;
-            // Keep the retired policy field on the wire for one release so
-            // existing status consumers still receive the platform policy.
+            // Keep the retired field for status consumers that display whether
+            // the daemon puts launch nonces in the environment.
             let mut entry = SupervisorEntry::new(
                 status.module_id,
                 status.state.to_string(),
@@ -479,7 +486,7 @@ impl ControlHandler {
             .with_script(script)
             .with_admission_refused(admission_refused)
             .with_next_retry_at_ms(next_retry_at_ms)
-            .with_launch_nonce_env(Some(!cfg!(unix)))
+            .with_launch_nonce_env(Some(!cfg!(any(unix, windows))))
             .with_launch_nonce_source(status.launch_nonce_source)
             .with_waiting_for_previous_pid(status.waiting_for_previous_pid)
             .with_protocol(status.protocol)

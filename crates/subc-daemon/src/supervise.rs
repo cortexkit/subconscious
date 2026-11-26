@@ -549,6 +549,8 @@ pub struct ExitReport {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModuleStatus {
     pub(crate) admission_refused: Option<String>,
+    #[cfg(windows)]
+    pub(crate) nonce_pipe_refusal: Option<&'static str>,
     pub(crate) legacy_registration_spawn: bool,
     pub(crate) registration_declaration: Option<String>,
     pub module_id: String,
@@ -560,7 +562,7 @@ pub struct ModuleStatus {
     /// Why the previous instance still prevents a new start.
     pub waiting_for_previous_detail: Option<String>,
     /// The daemon's Windows per-spawn record: `pipe` after the process it
-    /// spawned read all nonce bytes, otherwise `env` for the offered copy.
+    /// spawned read all nonce bytes, otherwise absent.
     /// List/status reports use this record, not the source the module sends
     /// in its registration message's manifest.provenance.launch_nonce_source.
     pub launch_nonce_source: Option<String>,
@@ -626,6 +628,8 @@ pub struct ModuleStatus {
 #[derive(Debug, Clone, PartialEq)]
 struct SupervisorSnapshot {
     admission_refused: Option<String>,
+    #[cfg(windows)]
+    nonce_pipe_refusal: Option<&'static str>,
     /// Distinguishes an admission-parked actor from an unrelated terminal exit.
     config_hold_parked: bool,
     /// Preserve daemon attribution for a paused start so a failing release can
@@ -751,6 +755,8 @@ impl SupervisorSnapshot {
     fn new(state: ModuleState, enabled: bool) -> Self {
         Self {
             admission_refused: None,
+            #[cfg(windows)]
+            nonce_pipe_refusal: None,
             config_hold_parked: false,
             config_hold_daemon_initiated: false,
             config_hold_approval: None,
@@ -1464,6 +1470,8 @@ impl SupervisedModule {
         Ok((
             ModuleStatus {
                 admission_refused: snapshot.admission_refused,
+                #[cfg(windows)]
+                nonce_pipe_refusal: snapshot.nonce_pipe_refusal,
                 legacy_registration_spawn: snapshot.legacy_registration_spawn,
                 registration_declaration: snapshot.registration_declaration.clone(),
                 stop_reason: snapshot.stop_reason,

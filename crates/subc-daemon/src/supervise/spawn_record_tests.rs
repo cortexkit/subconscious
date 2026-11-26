@@ -23,6 +23,19 @@ pub(super) fn after_create(child: &Child, _spec: &ModuleSpec) {
 }
 
 #[cfg(windows)]
+pub(super) fn before_roster_admit(spec: &ModuleSpec) {
+    if spec
+        .env
+        .iter()
+        .any(|(key, _)| key == "SUBC_TEST_NONCE_SOURCE_PATH")
+    {
+        // The child is still suspended. Hold it longer than the pipe's whole
+        // delivery window, just as a slow durable record write could.
+        std::thread::sleep(2 * REGISTRY_RELEASE_TIMEOUT);
+    }
+}
+
+#[cfg(windows)]
 pub(super) fn assignment_failpoint(spec: &ModuleSpec) -> io::Result<()> {
     if spec
         .env
@@ -115,6 +128,59 @@ fn windows_store_touch_fixture() {
     if let Some(path) = std::env::var_os("SUBC_TEST_STORE_TOUCH") {
         std::fs::write(path, b"module ran").unwrap();
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_nonce_source_fixture() {
+    let Some(path) = std::env::var_os("SUBC_TEST_NONCE_SOURCE_PATH") else {
+        return;
+    };
+    let path = PathBuf::from(path);
+    let source = subc_os::launch_nonce()
+        .map(|nonce| nonce.map(|nonce| nonce.source()))
+        .map_err(|error| error.to_string());
+    // Publish only the source, never the secret. Rename after the write so
+    // the parent cannot observe a partly written result.
+    let pending = path.with_extension("pending");
+    std::fs::write(&pending, format!("{source:?}")).unwrap();
+    std::fs::rename(pending, path).unwrap();
+    std::thread::park();
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_nonce_window_starts_after_suspended_admission() {
+    let home = cortexkit_test_support::ScratchDir::new("nonce-suspended-admission");
+    let result_path = home.join("nonce-source");
+    let mut spec = spec();
+    spec.protocol = ModuleProtocol::Subc;
+    spec.args[1] = "supervise::spawn_record_tests::windows_nonce_source_fixture".into();
+    spec.env.push((
+        "SUBC_TEST_NONCE_SOURCE_PATH".into(),
+        result_path.display().to_string(),
+    ));
+    let supervisor =
+        Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default())
+            .with_live_children_record(home.join("live-children.json"));
+    let module = supervisor.spawn(spec).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match std::fs::read_to_string(&result_path) {
+                Ok(source) => break source,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("cannot read fixture result: {error}"),
+            }
+        }
+    })
+    .await;
+    module.stop().await.unwrap();
+    assert_eq!(
+        result.expect("child did not report its nonce source"),
+        "Ok(Some(Pipe))"
+    );
 }
 
 #[cfg(windows)]

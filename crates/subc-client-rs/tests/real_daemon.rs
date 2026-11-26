@@ -1389,9 +1389,7 @@ async fn clean_subc_client_rs_serves_through_real_daemon() {
 /// The daemon hands a spawned module its launch nonce on descriptor 3, the
 /// module's SDK reads it there, and its HELLO carries it: the module is
 /// declared `reserved`, so the daemon admits it only with its exact spawn
-/// nonce, and its provenance reports that the nonce came from `fd`. The
-/// daemon still sets the environment copy too, which is why the source is
-/// what tells the two apart.
+/// nonce, and its provenance reports the transport the module actually read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_supervised_module_reads_its_launch_nonce_from_the_descriptor_and_hello_carries_it() {
     assert_supervised_launch_nonce_delivery().await;
@@ -1400,10 +1398,8 @@ async fn a_supervised_module_reads_its_launch_nonce_from_the_descriptor_and_hell
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn windows_phase_one_supervised_module_reports_pipe_in_daemon_and_hello() {
-    // A failed pipe read may use SUBC_LAUNCH_NONCE until every Windows module
-    // reads the pipe, so successful registration alone cannot prove delivery.
-    // Require both the module's registration-message source and the daemon's
-    // per-spawn delivery record to say pipe.
+    // Successful registration alone cannot prove nonce pipe delivery. Require
+    // both the module's HELLO source and the daemon's delivery record to say pipe.
     assert_supervised_launch_nonce_delivery().await;
 }
 
@@ -1480,7 +1476,11 @@ async fn assert_supervised_launch_nonce_delivery() {
     })
     .await;
     assert_eq!(started["source"], expected_source, "{started}");
-    assert_eq!(started["env_present"], !cfg!(unix), "{started}");
+    assert_eq!(
+        started["env_present"],
+        !cfg!(any(unix, windows)),
+        "{started}"
+    );
     assert_eq!(started["fd_env_present"], cfg!(unix), "{started}");
     wait_for_catalog_module(&daemon.connection_file, MODULE_ID, START_TIMEOUT).await;
 

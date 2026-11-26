@@ -549,13 +549,18 @@ are omitted when no window was resolved. Read `outcome`, not the message:
 - **Module**: required `module_id:string`, `state:string`,
   `enabled:boolean`, `live:boolean`, `protocol:"subc"|"none"`, `health:string`,
   and nullable `last_probe_ms:number|null`. Optional fields include
-  `waiting_for_previous_pid`, `next_retry_at_ms`, `configured_enabled`,
+   `waiting_for_previous_pid`, `next_retry_at_ms`, `configured_enabled`, `admission_refused`,
   `launch_nonce_env`, `launch_nonce_source`, `pending_reload`, `last_exit_code`,
   `last_exit_signal`, `last_exit_ms`, `last_exit_kind`, `restart_count`,
   `max_restarts`, `lifetime_restarts`, `spawn_generation`, `restart_window_secs`,
   `drain_timeout_ms`, `restart_backoff_ms`, `restart_max_backoff_ms`, `resources`.
   Counts, PIDs, milliseconds and seconds are numbers; enablement/nonce flags
-  are booleans. `pending_reload` and `resources` are described below.
+   are booleans. `pending_reload` and `resources` are described below.
+   `admission_refused` is an open reason string. `registration_channel_unsupported`
+   means a gated module lacks the required support declaration.
+   `launch_nonce_pipe_prepare_failed` means the daemon could not reserve the Windows
+   nonce pipe; `launch_nonce_pipe_serve_failed` means it could not start delivery
+   before resuming the suspended child. See the daemon log for the underlying error.
 - **Health**: `module_id:string`,
   `status:"ok"|"degraded"|"failing"|"unresponsive"|"unknown"`, optional
   `detail:string`, nullable `metrics:JSON|null`, `consecutive_failures:number`,

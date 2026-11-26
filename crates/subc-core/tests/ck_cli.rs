@@ -6599,7 +6599,10 @@ async fn module_status_names_the_protocol_and_refuses_to_render_live_as_a_boolea
     ));
     assert_eq!(status_json["module"]["protocol"], "none");
     assert_eq!(status_json["module"]["live"], true);
-    assert_eq!(status_json["module"]["launch_nonce_env"], !cfg!(unix));
+    assert_eq!(
+        status_json["module"]["launch_nonce_env"],
+        !cfg!(any(unix, windows))
+    );
 
     module.stop().await.unwrap();
 }
@@ -6842,7 +6845,7 @@ async fn module_status_renders_key_value_block_byte_for_byte() {
         rest,
         format!(
             "0 of 1 in 10m · drain 25 ms · restart backoff 10 ms to 30s\n  launch_nonce_env: {nonce_env}{nonce_source}\n  last exit: none\n  drain gauges: 0 drains with undeclared gauge\n  binary: {binary} ({image})\n  configured program: matches running process\n  running image: {image_verdict}\n  launch spec: matches running process\n",
-            nonce_env = !cfg!(unix),
+            nonce_env = !cfg!(any(unix, windows)),
             nonce_source = if cfg!(windows) { "\n  launch nonce source (daemon): pipe" } else { "" },
         )
     );

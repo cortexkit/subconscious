@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.53.3
+
+- Stop putting Windows module launch nonces in the environment. Start the
+  named-pipe delivery window just before resuming the admitted child so durable
+  recording cannot spend the child's time to connect. Refuse a launch if pipe
+  setup fails, and report the failing step in the module's status.
+
 ## 0.53.2
 
 - Accept a command's recorded finish after PID reuse or when a pinned Windows

@@ -72,9 +72,12 @@ fn normalized_view(view: ConfigPlanView, root: &str) -> ConfigPlanView {
     normalized
 }
 
+// `#[tokio::test]` runs the test future on the test thread's own 2 MiB stack,
+// and in an unoptimized build the control handler's future is large enough to
+// leave this test near that limit. Boxing each handler call puts its state on
+// the heap, as `tokio::spawn` does for the daemon's real connection tasks.
 async fn call(handler: &ControlHandler, ctx: &RouteCtx, body: Value) -> Value {
-    let replies = handler
-        .handle_control_frame(ctx, frame(body))
+    let replies = Box::pin(handler.handle_control_frame(ctx, frame(body)))
         .await
         .unwrap();
     assert_eq!(replies.len(), 1);
@@ -84,8 +87,7 @@ async fn call(handler: &ControlHandler, ctx: &RouteCtx, body: Value) -> Value {
 }
 
 async fn refused_call(handler: &ControlHandler, ctx: &RouteCtx, body: Value, code: &str) -> Value {
-    let replies = handler
-        .handle_control_frame(ctx, frame(body))
+    let replies = Box::pin(handler.handle_control_frame(ctx, frame(body)))
         .await
         .unwrap();
     assert_eq!(replies.len(), 1);
@@ -220,8 +222,7 @@ async fn config_plan_vectors_match_real_handler_bytes() {
         json!({"op":"config.plan","base_generations":{"demo":0}}),
         json!({"op":"config.plan","edits":[]}),
     ] {
-        let replies = handler
-            .handle_control_frame(&ctx, frame(body))
+        let replies = Box::pin(handler.handle_control_frame(&ctx, frame(body)))
             .await
             .unwrap();
         assert_eq!(replies[0].header.ty, FrameType::Error);

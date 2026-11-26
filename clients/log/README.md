@@ -1,5 +1,10 @@
 # @cortexkit/log
 
+> [!WARNING]
+> **Alpha.** @cortexkit/log is in early development and is not yet released for general use.
+> Breaking changes will happen between versions, including changes to its settings,
+> stored data and interfaces. Pin an exact version if you depend on it.
+
 The TypeScript fleet logger for harness-hosted CortexKit plugins and clients. It
 writes the canonical line format and the module-owned day segments specified in
 `docs/logging.md` (r2), and it is the twin of the Rust

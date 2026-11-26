@@ -1,5 +1,10 @@
 # ck-nats-engine
 
+> [!WARNING]
+> **Alpha.** ck-nats-engine is in early development and is not yet released for general use.
+> Breaking changes will happen between versions, including changes to its settings,
+> stored data and interfaces. Pin an exact version if you depend on it.
+
 Version 0.1.3 starts every leaf link with TLS, before any NATS `INFO` is sent.
 Both ends must support TLS-first. The hub's TLS 1.3 listener asks `ck-nats-server`
 to sign handshakes with Ed25519 over the engine's stdin/stdout channel.

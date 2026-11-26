@@ -1,5 +1,10 @@
 # Bun script runner
 
+> [!WARNING]
+> **Alpha.** Bun script runner is in early development and is not yet released for general use.
+> Breaking changes will happen between versions, including changes to its settings,
+> stored data and interfaces. Pin an exact version if you depend on it.
+
 `ck-script-runner-bun` evaluates one ESM bundle from an authenticated private pipe.
 It does not open the script's path at launch. The executable embeds Bun **1.4.4**
 and the platform's child-bound registration helper, exposed as `ck:registration`.

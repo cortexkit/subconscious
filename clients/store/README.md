@@ -1,5 +1,10 @@
 # @cortexkit/store
 
+> [!WARNING]
+> **Alpha.** @cortexkit/store is in early development and is not yet released for general use.
+> Breaking changes will happen between versions, including changes to its settings,
+> stored data and interfaces. Pin an exact version if you depend on it.
+
 TypeScript storage descriptor, derivation, and secret-path checks for CortexKit modules.
 It mirrors the serde shapes and deterministic naming helpers used by the Rust
 `cortexkit-store-types` contract so a TypeScript module reads the exact storage

@@ -1,5 +1,10 @@
 # subc-presence
 
+> [!WARNING]
+> **Alpha.** subc-presence is in early development and is not yet released for general use.
+> Breaking changes will happen between versions, including changes to its settings,
+> stored data and interfaces. Pin an exact version if you depend on it.
+
 An OS-binding leaf crate used by the daemon on macOS, Windows and Linux (the CLI
 also shares its Linux policy renderer). It denies unsafe code by default and
 enables it only on individual

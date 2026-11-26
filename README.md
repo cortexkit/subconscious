@@ -1,5 +1,10 @@
 # subconscious
 
+> [!WARNING]
+> **Alpha.** subconscious is in early development and is not yet released for general use.
+> Breaking changes will happen between versions, including changes to its settings,
+> stored data and interfaces. Pin an exact version if you depend on it.
+
 subconscious is the local router and supervisor every
 [CortexKit](https://github.com/cortexkit) module runs under. One daemon,
 `ck-subc`, runs per user account: it starts and supervises the modules, checks

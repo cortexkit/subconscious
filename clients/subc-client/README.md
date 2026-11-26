@@ -1,5 +1,10 @@
 # @cortexkit/subc-client
 
+> [!WARNING]
+> **Alpha.** @cortexkit/subc-client is in early development and is not yet released for general use.
+> Breaking changes will happen between versions, including changes to its settings,
+> stored data and interfaces. Pin an exact version if you depend on it.
+
 TypeScript client for the [subc](../../README.md) daemon. It speaks the same
 loopback-TCP transport by default, with an opt-in same-user local socket or pipe,
 wire-compatible **byte-for-byte** with `subc-transport` (the HMAC-SHA256

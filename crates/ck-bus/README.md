@@ -1,5 +1,10 @@
 # ck-bus
 
+> [!WARNING]
+> **Alpha.** ck-bus is in early development and is not yet released for general use.
+> Breaking changes will happen between versions, including changes to its settings,
+> stored data and interfaces. Pin an exact version if you depend on it.
+
 The supervised owner of the CortexKit NATS message plane (module id `ckbus`). The build
 specification is `docs/ck-bus.md`; keys and first boot follow
 `docs/nats-install-trust-chain.md`.

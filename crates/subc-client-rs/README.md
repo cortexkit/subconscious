@@ -1,5 +1,10 @@
 # subc-client-rs
 
+> [!WARNING]
+> **Alpha.** subc-client-rs is in early development and is not yet released for general use.
+> Breaking changes will happen between versions, including changes to its settings,
+> stored data and interfaces. Pin an exact version if you depend on it.
+
 Opt-in modules can use the `config` module's documented `ModuleHandler` hooks to
 declare, review and apply daemon-provided configuration. Its compile-checked
 counter sample shows the complete adoption in fewer than 60 lines. Gate refusals

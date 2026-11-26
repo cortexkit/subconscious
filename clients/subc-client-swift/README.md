@@ -1,5 +1,10 @@
 # SubcClient Swift package
 
+> [!WARNING]
+> **Alpha.** SubcClient Swift package is in early development and is not yet released for general use.
+> Breaking changes will happen between versions, including changes to its settings,
+> stored data and interfaces. Pin an exact version if you depend on it.
+
 Native client libraries for macOS 13+ and iOS 16+: `SubcClient` implements the
 outer wire protocol, `SubcFed` implements fed sessions, and
 `SubcChatAskSupport` provides shared surface models.

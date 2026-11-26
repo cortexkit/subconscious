@@ -1,5 +1,10 @@
 # @cortexkit/private-files
 
+> [!WARNING]
+> **Alpha.** @cortexkit/private-files is in early development and is not yet released for general use.
+> Breaking changes will happen between versions, including changes to its settings,
+> stored data and interfaces. Pin an exact version if you depend on it.
+
 Version 0.2.1; release tag prefix **`private-files@`** (for example, `private-files@0.2.1`). This standalone package lives in [`clients/private-files`](https://github.com/cortexkit/subconscious/tree/master/clients/private-files) in the subconscious repository.
 
 ## API

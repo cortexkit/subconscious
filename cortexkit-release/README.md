@@ -1,5 +1,10 @@
 # cortexkit-release
 
+> [!WARNING]
+> **Alpha.** cortexkit-release is in early development and is not yet released for general use.
+> Breaking changes will happen between versions, including changes to its settings,
+> stored data and interfaces. Pin an exact version if you depend on it.
+
 `cortexkit-release` is the Rust package for the `ck-release` binary. It drives
 declared release trains through validation, planning, approval, durable replay,
 and verified staging. Repository declarations are data in

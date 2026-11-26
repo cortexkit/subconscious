@@ -855,6 +855,7 @@ pub(super) struct SupervisorRescanContext {
     pub(super) admission_facts_carrier_module_id: Option<String>,
     pub(super) admission_facts_targets: Option<Vec<String>>,
     pub(super) scope_authority_owners: Vec<String>,
+    pub(super) flow_scope_authority_owners: Vec<String>,
     federated_scope_owner: String,
     pub(super) privileged_operator_prompt: PrivilegedOperatorPrompt,
     /// Counts executed rescans that set out to change the supervised modules'
@@ -882,6 +883,7 @@ impl ControlHandler {
             admission_facts_carrier_module_id: self.admission_facts_carrier_module_id.clone(),
             admission_facts_targets: self.admission_facts_targets.clone(),
             scope_authority_owners: self.scope_authority_owners.clone(),
+            flow_scope_authority_owners: self.flow_scope_authority_owners.clone(),
             federated_scope_owner: self.federated_scope_owner.clone(),
             privileged_operator_prompt: self.privileged_operator_prompt,
             generation: Arc::default(),
@@ -958,6 +960,7 @@ impl ControlHandler {
             admission_facts_carrier_module_id,
             admission_facts_targets,
             scope_authority_owners,
+            flow_scope_authority_owners,
             federated_scope_owner,
             privileged_operator_prompt,
             modules,
@@ -968,6 +971,7 @@ impl ControlHandler {
             config.admission_facts_carrier_module_id,
             config.admission_facts_targets,
             config.scope_authority_owners,
+            config.flow_scope_authority_owners,
             config.federated_scope_owner,
             config.privileged_operator_prompt,
             config.modules,
@@ -995,6 +999,9 @@ impl ControlHandler {
                 }
                 RestartRequiredSection::ScopeAuthorityOwners => {
                     scope_authority_owners != context.scope_authority_owners
+                }
+                RestartRequiredSection::FlowScopeAuthorityOwners => {
+                    flow_scope_authority_owners != context.flow_scope_authority_owners
                 }
                 RestartRequiredSection::FederatedScopeOwner => {
                     federated_scope_owner != context.federated_scope_owner

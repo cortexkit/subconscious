@@ -52,17 +52,19 @@ pub enum RestartRequiredSection {
     AdmissionFactsCarrierModuleId,
     AdmissionFactsTargets,
     ScopeAuthorityOwners,
+    FlowScopeAuthorityOwners,
     FederatedScopeOwner,
     PrivilegedOperatorPrompt,
 }
 
 impl RestartRequiredSection {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Port,
         Self::Storage,
         Self::AdmissionFactsCarrierModuleId,
         Self::AdmissionFactsTargets,
         Self::ScopeAuthorityOwners,
+        Self::FlowScopeAuthorityOwners,
         Self::FederatedScopeOwner,
         Self::PrivilegedOperatorPrompt,
     ];
@@ -74,6 +76,7 @@ impl RestartRequiredSection {
             Self::AdmissionFactsCarrierModuleId => "admission_facts_carrier_module_id",
             Self::AdmissionFactsTargets => "admission_facts_targets",
             Self::ScopeAuthorityOwners => "scope_authority_owners",
+            Self::FlowScopeAuthorityOwners => "flow_scope_authority_owners",
             Self::FederatedScopeOwner => "federated_scope_owner",
             Self::PrivilegedOperatorPrompt => "privileged_operator_prompt",
         }
@@ -201,6 +204,11 @@ pub struct DaemonConfig {
     /// would leave live routes holding an `owner_authorized` stamp the owner no
     /// longer has, and a restart closes every route.
     pub scope_authority_owners: Vec<String>,
+    /// Module ids whose flow scopes may carry a flow identity, an optional
+    /// author agent id and delegation. They cannot grant any other authority.
+    /// Restart-required for the same live-stamp reason as
+    /// `scope_authority_owners`.
+    pub flow_scope_authority_owners: Vec<String>,
     /// Exact reserved module id allowed to own federated scopes. Restart-required.
     pub federated_scope_owner: String,
     /// Capability names reserved to one module id. The binding may name a module
@@ -432,6 +440,8 @@ struct RawDaemonConfig {
     admission_facts_targets: Option<Vec<String>>,
     #[serde(default)]
     scope_authority_owners: Option<Vec<String>>,
+    #[serde(default)]
+    flow_scope_authority_owners: Option<Vec<String>>,
     #[serde(default = "default_federated_scope_owner")]
     federated_scope_owner: String,
     #[serde(default)]
@@ -1118,6 +1128,7 @@ fn parse_doc_with_activity(
     let scope_authority_owners = raw
         .scope_authority_owners
         .unwrap_or_else(default_scope_authority_owners);
+    let flow_scope_authority_owners = raw.flow_scope_authority_owners.unwrap_or_default();
     subc_protocol::manifest::validate_module_id(&raw.federated_scope_owner).map_err(|error| {
         DaemonConfigError::InvalidValue {
             path: path.to_path_buf(),
@@ -1128,6 +1139,26 @@ fn parse_doc_with_activity(
         return Err(DaemonConfigError::InvalidValue {
             path: path.to_path_buf(),
             message: "scope_authority_owners must not contain empty module ids".to_string(),
+        });
+    }
+    if flow_scope_authority_owners
+        .iter()
+        .any(|owner| owner.is_empty())
+    {
+        return Err(DaemonConfigError::InvalidValue {
+            path: path.to_path_buf(),
+            message: "flow_scope_authority_owners must not contain empty module ids".to_string(),
+        });
+    }
+    if let Some(owner) = flow_scope_authority_owners
+        .iter()
+        .find(|owner| scope_authority_owners.contains(owner))
+    {
+        return Err(DaemonConfigError::InvalidValue {
+            path: path.to_path_buf(),
+            message: format!(
+                "module '{owner}' appears in both scope_authority_owners and flow_scope_authority_owners; a module may appear in only one"
+            ),
         });
     }
 
@@ -1181,6 +1212,7 @@ fn parse_doc_with_activity(
             admission_facts_carrier_module_id: raw.admission_facts_carrier_module_id,
             admission_facts_targets: raw.admission_facts_targets,
             scope_authority_owners,
+            flow_scope_authority_owners,
             federated_scope_owner: raw.federated_scope_owner,
             reserved_capabilities: raw.reserved_capabilities,
             agent_policy_root: crate::policy_root::parse_section(raw.agent_policy_root),
@@ -2008,6 +2040,7 @@ mod tests {
                 "admission_facts_carrier_module_id",
                 "admission_facts_targets",
                 "scope_authority_owners",
+                "flow_scope_authority_owners",
                 "federated_scope_owner",
                 "privileged_operator_prompt",
             ]
@@ -2107,6 +2140,46 @@ mod tests {
             error.to_string().contains("scope_authority_owners"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn flow_scope_authority_owners_default_empty_and_validate_their_entries() {
+        let path = Path::new("/tmp/subc.jsonc");
+        let config = parse_doc(r#"{ "version": 1 }"#, path).unwrap();
+        assert!(config.flow_scope_authority_owners.is_empty());
+
+        let config = parse_doc(
+            r#"{ "version": 1, "flow_scope_authority_owners": ["flow-owner"] }"#,
+            path,
+        )
+        .unwrap();
+        assert_eq!(config.flow_scope_authority_owners, vec!["flow-owner"]);
+        let error = parse_doc(
+            r#"{ "version": 1, "flow_scope_authority_owners": [""] }"#,
+            path,
+        )
+        .expect_err("an empty module id is refused");
+        assert!(
+            error.to_string().contains("flow_scope_authority_owners"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn flow_scope_authority_lists_refuse_a_module_in_both() {
+        let error = parse_doc(
+            r#"{
+                "version": 1,
+                "scope_authority_owners": ["prefrontal", "flow-owner"],
+                "flow_scope_authority_owners": ["flow-owner"]
+            }"#,
+            Path::new("/tmp/subc.jsonc"),
+        )
+        .expect_err("one module cannot hold both authorities");
+        let message = error.to_string();
+        assert!(message.contains("flow-owner"), "{message}");
+        assert!(message.contains("scope_authority_owners"), "{message}");
+        assert!(message.contains("flow_scope_authority_owners"), "{message}");
     }
 
     #[test]

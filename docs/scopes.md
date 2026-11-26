@@ -120,14 +120,30 @@ Fields:
 
 **Authority gate.** `agent_id`, `on_behalf_of_agent`, `delegates`, `flow_id`,
 `flow_version`, `flow_code_hash`, `flow_install_id` and `run_id` may be set only by
-the scope-authority owner, listed in the daemon config key `scope_authority_owners`.
-A non-federated scope from any other owner may carry `kind`,
-`parent`, `child_owners`, `carriers`, `expires_at_ms`, `workdir` and `project_id`, with empty attributes; a sync or
-apply that sets a gated attribute from an unlisted owner is refused per record by name
-(`scope_attribute_not_permitted`). `expires_at_ms` is not gated by this list. `scope_authority_owners` is a
-restart-required key: a change takes effect only on a daemon restart, which closes every route, so
-no live route keeps an `owner_authorized` stamp its owner has lost. Providers rely on the stamp's
-`owner_authorized` alone and keep no copy of the list (section 7).
+the scope-authority owner, listed in the daemon config key `scope_authority_owners`,
+except for the narrow flow authority below. A non-federated scope from any other
+owner may carry `kind`, `parent`, `child_owners`, `carriers`, `expires_at_ms`,
+`workdir` and `project_id`, with empty attributes; a sync or apply that sets a
+gated attribute from an unlisted owner is refused per record by name
+(`scope_attribute_not_permitted`). `expires_at_ms` is not gated by either list.
+
+The daemon config key `flow_scope_authority_owners` (default empty) grants a narrower
+authority. A module may appear in at most one of that list and `scope_authority_owners`;
+config load refuses an overlap with a message naming the module. For a flow-scope owner,
+a record that sets any gated attribute must carry `flow_id` and have kind `head` or
+`ephemeral`. A `head` record must carry the complete installed identity (`flow_version`,
+`flow_code_hash` and `flow_install_id`). An `ephemeral` record must carry `expires_at_ms`;
+it need not carry installed identity, but any such fields it does carry obey the usual
+all-three rule. The owner may also set `agent_id` and `delegates`; `delegates: true` still
+requires `agent_id`. `on_behalf_of_agent` and `run_id` are always refused by name with
+`scope_attribute_not_permitted`, as is a gated attribute without `flow_id` or on another
+kind. A flow-scope owner's record with no gated attributes behaves exactly like an
+unlisted owner's record and does not receive an authorized stamp.
+
+Both authority lists are restart-required: a rescan reports a change but does not apply it.
+A change takes effect only on a daemon restart, which closes every route, so no live route
+keeps an `owner_authorized` stamp its owner has lost. Providers rely on the stamp's
+`owner_authorized` alone and keep no copy of either list (section 7).
 
 ### Federated identity
 
@@ -340,18 +356,20 @@ scope but never revives an ended one while its tombstone is held.
 
 ### Flow identity: `flow_id`
 
-The optional `attributes.flow_id` means "this scope belongs to flow X". The
-scope-authority owner, and only an owner in `scope_authority_owners`, may set
-it; an unlisted owner receives `scope_attribute_not_permitted`, just as for
-`agent_id`. The daemon stamps it verbatim in `ScopeStamp.attributes` on
+The optional `attributes.flow_id` means "this scope belongs to flow X". An owner in
+`scope_authority_owners` may set it; an owner in `flow_scope_authority_owners` may set it
+under the narrow head/ephemeral rules in section 2's authority gate. Any unlisted owner
+receives `scope_attribute_not_permitted`, just as for `agent_id`. The daemon stamps it
+verbatim in `ScopeStamp.attributes` on
 `route.bind`. Providers use it to distinguish a flow's routes from a head's,
 and treat a non-owner opener on a flow scope as the flow's carrier.
 
 It is 1–256 printable non-space ASCII bytes, checked with the shared opaque-token
 validator. A malformed value refuses the whole sync or apply as `invalid_control_body`, naming
-`flow_id`. Scope refs retain their existing acceptance rule. `flow_id` alone,
-without `agent_id` and with `delegates: false`, is valid; `delegates` still requires
-`agent_id`.
+`flow_id`. Scope refs retain their existing acceptance rule. For a full authority owner,
+`flow_id` alone, without `agent_id` and with `delegates: false`, is valid; a narrow
+flow-scope owner must satisfy the head/ephemeral identity rules above. `delegates` still
+requires `agent_id`.
 
 The bind stamp's flow identity is fixed for that route. As with `agent_id`, a
 same-epoch change (including adding or removing `flow_id`) is accepted, bumps the
@@ -371,8 +389,9 @@ All three must be present together or all absent, and require `flow_id`. When
 registering an identity, a partial set or any installed identity without `flow_id` refuses that record as
 `scope_attribute_not_permitted`, naming the fields, just like other invalid
 attribute combinations. Malformed individual values refuse the whole sync or
-apply as `invalid_control_body`, naming the field. Only the scope-authority owner
-may set them; a carrier cannot assert its own approved identity.
+apply as `invalid_control_body`, naming the field. Only a full or narrow flow-scope
+authority owner may set them, subject to the head/ephemeral rules above; a carrier cannot
+assert its own approved identity.
 
 Unlike `flow_id` alone, the installed identity is immutable within an epoch.
 Adding, changing or removing any of the three fields refuses the record as
@@ -685,8 +704,13 @@ On admission the daemon captures `(scope_epoch, version)` into the pending bind 
 bind with `scope {owner, ref, scope_epoch, kind, parent, parent_state, attributes}`, next to the
 principal it already stamps. The immediate opener stays in the principal field. The stamp also
 carries `owner_authorized`, computed by the daemon: true when the owner is listed in
-`scope_authority_owners`. Providers check that flag rather than keeping their own copy of the
-list.
+`scope_authority_owners`, or when a `flow_scope_authority_owners` owner's record passed the
+narrow flow-scope checks. On that narrow stamp, true vouches for `flow_id`, the complete
+installed identity when present, and any author `agent_id` and delegation the record carries.
+Delegation retains its usual meaning and still requires `agent_id`; `on_behalf_of_agent` and
+`run_id` can never be present on the strength of this narrow authority. A flow-scope owner's
+record with no gated attributes has `owner_authorized: false`. Providers check the flag rather
+than keeping their own copy of either list.
 
 The stamp includes `attributes.run_id` when set, and `expires_at_ms` when set and the
 captured target declares `call-modes/v1`. Run and flow binds are capability-gated;
@@ -870,8 +894,8 @@ is not `linked`, that route's stamp has no `agent_id`, or the two `agent_id`s di
 provider refuses the call with a typed, terminal error (obligation 5). A parent without an
 `agent_id` is not a head scope, and a run is never opened under anything else. The parent link
 confers nothing by itself: authority comes only from the agent's own route. Both `agent_id`s
-can be compared because only an owner in `scope_authority_owners` can set one (section 2). A
-run route bound before a re-point names the head's old epoch, so its calls are refused this way
+can be compared because the daemon sets one only for a full authority owner or a checked
+narrow flow record (section 2). A run route bound before a re-point names the head's old epoch, so its calls are refused this way
 until the carrier re-opens it and gets a stamp naming the new one.
 
 A provider's own tests pin, each failing by name when its rule is removed: a codemode call to a
@@ -1055,7 +1079,7 @@ caller may re-open within its own deadline.
 | `scope_live_limit_exceeded` | whole sync or apply | an input list or resulting live set exceeds 10,000 scopes | no |
 | `scope_attributes_too_large` | whole sync or apply | a record's attributes exceed 4 KiB | no |
 | `scope_epoch_regressed` | per upsert in sync or apply | the epoch is lower than the one held | no |
-| `scope_attribute_not_permitted` | per upsert in sync or apply | a gated attribute from an unauthorized owner, a federated kind/owner/attributes mismatch, local identity on a federated scope, `on_behalf_of_agent` with `agent_id`, `delegates` or `flow_id` (including a run carrying both attributions), or installed flow identity incomplete or without `flow_id` | no |
+| `scope_attribute_not_permitted` | per upsert in sync or apply | a gated attribute from an unauthorized owner; a flow-scope owner setting `on_behalf_of_agent` or `run_id`, omitting `flow_id`, using a kind other than `head` or `ephemeral`, omitting installed identity on a gated `head`, or omitting `expires_at_ms` on a gated `ephemeral`; a federated kind/owner/attributes mismatch; local identity on a federated scope; `on_behalf_of_agent` with `agent_id`, `delegates` or `flow_id` (including a run carrying both attributions); or installed flow identity incomplete or without `flow_id` | no |
 | `scope_flow_identity_changed` | per upsert in sync or apply | `flow_version`, `flow_code_hash` or `flow_install_id` added, changed or removed within an epoch | no |
 | `scope_carrier_targets_invalid` | per upsert in sync or apply | a carrier's target list is empty or has more than 16 entries | no |
 | `scope_delegates_without_agent` | per upsert in sync or apply | `delegates: true` without `agent_id` | no |
@@ -1232,7 +1256,7 @@ federated owner without `scope-federated/v1` is refused, including before the ow
 
 Installed flow identity uses a readers-first rollout: upgrade the daemon first,
 then upgrade readers and have them declare `flow-identity-scopes/v1`, then let
-the scope-authority owner set all three fields. Owners wait for the daemon to
+the appropriate full or narrow flow authority owner set all three fields. Owners wait for the daemon to
 advertise that capability in HELLO_ACK `subc_capabilities` or `server.describe`.
 Older strict `ScopeAttributes` readers receive stamps without the new fields;
 scopes without installed identity serialize byte-identically to before.
@@ -1314,7 +1338,8 @@ Each fails by name when its rule is removed:
 - the client sends no apply to an unsupported daemon; apply wire goldens round-trip and
   existing sync bodies without expiry or run identity remain compatible;
 - the same ref under two owners is two scopes;
-- a gated attribute from an owner not in `scope_authority_owners` is refused;
+- a gated attribute from an owner in neither `scope_authority_owners` nor
+  `flow_scope_authority_owners` is refused;
 - a scope ended, or changed, between admission and commit refuses the open, the module's other
   routes stay up, and the reserved pair is released;
 - removing a carrier and turning off `delegates` each drain the affected routes;

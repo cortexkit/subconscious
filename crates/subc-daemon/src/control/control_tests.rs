@@ -9533,8 +9533,8 @@ mod scopes {
     }
 
     use subc_protocol::scope::{
-        ParentState, ScopeCarrier, ScopeKind, ScopeParent, ScopeRecordOutcome, ScopeStamp,
-        ScopeStatus,
+        ParentState, ScopeAttributes, ScopeCarrier, ScopeKind, ScopeParent, ScopeRecordOutcome,
+        ScopeStamp, ScopeStatus,
     };
 
     use super::*;
@@ -9889,6 +9889,36 @@ mod scopes {
             panic!("not a describe reply");
         };
         assert!(scope.unwrap().owner_authorized);
+    }
+
+    #[tokio::test]
+    async fn flow_scope_authority_owners_reach_the_scope_table_per_record() {
+        let supervisor = SupervisorHandle::new();
+        supervisor.set_spawn_nonce("flow-owner", "b1".to_string());
+        let handler = ControlHandler::new(Arc::new(Registry::default()))
+            .with_supervisor(supervisor)
+            .with_scope_authority_owners(Vec::new())
+            .with_flow_scope_authority_owners(vec!["flow-owner".to_string()]);
+        let (flow_owner, _rx) = module(&handler, 1, "flow-owner", Some("b1")).await;
+        let mut flow = head("flow", 1);
+        flow.attributes = ScopeAttributes::new()
+            .with_flow_id(Some("flow:7".into()))
+            .with_flow_version(Some(1))
+            .with_flow_code_hash(Some("a".repeat(64)))
+            .with_flow_install_id(Some("install:7".into()))
+            .with_agent_id(Some("agent:7".into()))
+            .with_delegates(true);
+        sync(&handler, &flow_owner, 1, vec![flow, head("plain", 1)])
+            .await
+            .unwrap();
+        for (scope_ref, authorized) in [("flow", true), ("plain", false)] {
+            let ModuleControlResponseToModule::ScopeDescribe { scope, .. } =
+                describe(&handler, &flow_owner, "flow-owner", scope_ref).await
+            else {
+                panic!("not a describe reply");
+            };
+            assert_eq!(scope.unwrap().owner_authorized, authorized, "{scope_ref}");
+        }
     }
 
     /// With route admission, the stamp, the commit re-check and drains in

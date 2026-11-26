@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.54.0
+
+- Add the restart-required `flow_scope_authority_owners` config list with narrow,
+  per-record authority for installed head flow scopes and expiring ephemeral
+  target scopes. `DaemonConfig` gains the corresponding public field.
+
 ## 0.53.3
 
 - Stop putting Windows module launch nonces in the environment. Start the

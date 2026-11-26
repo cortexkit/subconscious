@@ -163,6 +163,7 @@ fn config_differences(current: &DaemonConfig, approved: &DaemonConfig) -> Differ
         admission_facts_carrier_module_id,
         admission_facts_targets,
         scope_authority_owners,
+        flow_scope_authority_owners,
         privileged_operator_prompt,
         reserved_capabilities,
         route_bind_relay_timeout_ms
@@ -223,6 +224,7 @@ impl ControlHandler {
                 "admission_facts_carrier_module_id" => admission_facts_carrier_module_id => admission_facts_carrier_module_id,
                 "admission_facts_targets" => admission_facts_targets => admission_facts_targets,
                 "scope_authority_owners" => scope_authority_owners => scope_authority_owners,
+                "flow_scope_authority_owners" => flow_scope_authority_owners => flow_scope_authority_owners,
                 "privileged_operator_prompt" => privileged_operator_prompt => privileged_operator_prompt);
         }
         for next in &approved.modules {

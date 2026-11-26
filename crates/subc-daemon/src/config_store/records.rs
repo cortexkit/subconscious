@@ -338,6 +338,7 @@ fn requires_daemon_restart(base: Option<&HistoryEntry>, entry: &HistoryEntry) ->
         || base.admission_facts_carrier_module_id != next.admission_facts_carrier_module_id
         || base.admission_facts_targets != next.admission_facts_targets
         || base.scope_authority_owners != next.scope_authority_owners
+        || base.flow_scope_authority_owners != next.flow_scope_authority_owners
         || base.privileged_operator_prompt != next.privileged_operator_prompt
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "mcp-stdio-adapter"
-version = "0.8.12"
+version = "0.8.13"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -31,8 +31,8 @@ subc-jobobject = { path = "../subc-jobobject" }
 
 [dev-dependencies]
 cortexkit-test-support = "0.1.3"
-subc-daemon = { path = "../subc-daemon", version = "0.53.0", features = ["test-support"] }
+subc-daemon = { path = "../subc-daemon", version = "0.54.0", features = ["test-support"] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
-subc-daemon = { path = "../subc-daemon", version = "0.53.0", features = ["dev-desktop-approval", "test-support"] }
+subc-daemon = { path = "../subc-daemon", version = "0.54.0", features = ["dev-desktop-approval", "test-support"] }
 subc-transport = { path = "../subc-transport", version = "0.18.0" }

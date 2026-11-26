@@ -657,6 +657,29 @@ async fn a_candidate_with_a_changed_top_level_section_reports_restart_required()
 }
 
 #[tokio::test]
+async fn flow_scope_authority_changes_are_restart_required_and_not_applied() {
+    let dir = ScratchDir::new("rescan-checked-flow-scope-authority");
+    let rig = Rig::new(&dir.join("subc.jsonc"), "flow-scope-authority");
+    let mut candidate: Value = serde_json::from_str(&doc(json!({}))).unwrap();
+    candidate["flow_scope_authority_owners"] = json!(["flow-owner"]);
+
+    let preview = rig
+        .preview(&candidate.to_string())
+        .await
+        .expect("the candidate previews");
+    assert_eq!(preview.restart_required, ["flow_scope_authority_owners"]);
+    assert!(rig.handler.flow_scope_authority_owners.is_empty());
+
+    rig.write(&candidate.to_string());
+    let applied = rig
+        .apply(preview.expect.unwrap())
+        .await
+        .expect("the rescan applies its ordinary changes");
+    assert_eq!(applied.restart_required, ["flow_scope_authority_owners"]);
+    assert!(rig.handler.flow_scope_authority_owners.is_empty());
+}
+
+#[tokio::test]
 async fn disabling_the_only_provider_of_a_required_capability_reports_a_warning() {
     const CAPABILITY: &str = "credentials-provider/v1";
     let dir = ScratchDir::new("rescan-checked-capability");

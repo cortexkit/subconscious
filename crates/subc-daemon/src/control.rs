@@ -295,6 +295,7 @@ pub struct ControlHandler {
     /// The configured `scope_authority_owners`, kept so a rescan can report a
     /// changed value as needing a daemon restart; rescan never applies it.
     scope_authority_owners: Vec<String>,
+    flow_scope_authority_owners: Vec<String>,
     federated_scope_owner: String,
     /// Fixed at startup so rescan cannot change the policy that guards rescan itself.
     privileged_operator_prompt: PrivilegedOperatorPrompt,
@@ -530,6 +531,7 @@ impl ControlHandler {
             ))),
             scope_deadline_added: Arc::new(tokio::sync::Notify::new()),
             scope_authority_owners: crate::daemon_config::default_scope_authority_owners(),
+            flow_scope_authority_owners: Vec::new(),
             federated_scope_owner: crate::daemon_config::default_federated_scope_owner(),
             privileged_operator_prompt: PrivilegedOperatorPrompt::default(),
             caller_endpoints: Arc::new(Mutex::new(HashMap::new())),
@@ -648,9 +650,23 @@ impl ControlHandler {
     pub fn with_scope_authority_owners(mut self, owners: Vec<String>) -> Self {
         self.scopes = Arc::new(RwLock::new(
             ScopeTable::new(owners.iter().cloned())
+                .with_flow_scope_authority_owners(self.flow_scope_authority_owners.iter().cloned())
                 .with_federated_owner(self.federated_scope_owner.clone()),
         ));
         self.scope_authority_owners = owners;
+        self
+    }
+
+    /// Set the module ids with narrow authority over head and ephemeral flow
+    /// scopes. Like the full authority list, this replaces an empty table and
+    /// must be called before any module can sync.
+    pub fn with_flow_scope_authority_owners(mut self, owners: Vec<String>) -> Self {
+        self.scopes = Arc::new(RwLock::new(
+            ScopeTable::new(self.scope_authority_owners.iter().cloned())
+                .with_flow_scope_authority_owners(owners.iter().cloned())
+                .with_federated_owner(self.federated_scope_owner.clone()),
+        ));
+        self.flow_scope_authority_owners = owners;
         self
     }
 
@@ -658,6 +674,7 @@ impl ControlHandler {
     pub fn with_federated_scope_owner(mut self, owner: String) -> Self {
         self.scopes = Arc::new(RwLock::new(
             ScopeTable::new(self.scope_authority_owners.iter().cloned())
+                .with_flow_scope_authority_owners(self.flow_scope_authority_owners.iter().cloned())
                 .with_federated_owner(owner.clone()),
         ));
         self.federated_scope_owner = owner;

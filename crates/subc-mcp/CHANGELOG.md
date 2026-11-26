@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.19
+
+- Require subc-daemon 0.54.0 for narrow flow-scope authority.
+
 ## 0.2.18
 
 - Require subc-client-rs 0.43.0.

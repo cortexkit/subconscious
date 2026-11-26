@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.23.2
+
+- Require subc-daemon 0.54.0 for narrow flow-scope authority.
+
 ## 0.23.1
 
 - Cancel a stopped module's full doctor check on Ctrl-C and restart the module

@@ -108,10 +108,14 @@ them), and applies changed launch settings at each module's next spawn and
 health settings at once. Some settings apply only when the daemon restarts,
 and rescan reports them as `restart_required`: `port`, `storage`,
 `admission_facts_carrier_module_id`, `admission_facts_targets`,
-`scope_authority_owners` and `privileged_operator_prompt`
+`scope_authority_owners`, `flow_scope_authority_owners` and `privileged_operator_prompt`
 (`RestartRequiredSection` in `crates/subc-daemon/src/daemon_config.rs`). An
 edit to a running module's `restart` block or `drain_timeout_ms` also waits for
 the next daemon start.
+
+`flow_scope_authority_owners` is an empty-by-default list of module ids with the
+narrow flow-scope authority defined in `docs/scopes.md`. A module may not appear
+in both authority lists; config load refuses an overlap and names the module.
 
 ### Stamp, plan and approve
 

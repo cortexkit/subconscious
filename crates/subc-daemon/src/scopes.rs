@@ -760,6 +760,9 @@ pub(crate) struct ScopeTable {
     /// the daemon's life: the config key is restart-required, so no live route
     /// can hold an `owner_authorized` stamp its owner has since lost.
     authority_owners: BTreeSet<String>,
+    /// Module ids with authority over flow identity and its optional author,
+    /// but over no other gated attributes or scope kinds.
+    flow_authority_owners: BTreeSet<String>,
     owners: HashMap<String, OwnerScopes>,
     /// Source of every `version`. One counter for the whole table, so a version
     /// is never reused within an incarnation even across an epoch change.
@@ -810,6 +813,7 @@ impl ScopeTable {
         Self {
             federated_owner: crate::daemon_config::default_federated_scope_owner(),
             authority_owners: authority_owners.into_iter().collect(),
+            flow_authority_owners: BTreeSet::new(),
             owners: HashMap::new(),
             last_version: 0,
             watches: Vec::new(),
@@ -823,6 +827,14 @@ impl ScopeTable {
 
     pub(crate) fn with_federated_owner(mut self, owner: String) -> Self {
         self.federated_owner = owner;
+        self
+    }
+
+    pub(crate) fn with_flow_scope_authority_owners(
+        mut self,
+        owners: impl IntoIterator<Item = String>,
+    ) -> Self {
+        self.flow_authority_owners = owners.into_iter().collect();
         self
     }
 
@@ -1029,6 +1041,15 @@ impl ScopeTable {
         owner != self.federated_owner && self.authority_owners.contains(owner)
     }
 
+    fn flow_scope_authority_owner(&self, owner: &str) -> bool {
+        owner != self.federated_owner && self.flow_authority_owners.contains(owner)
+    }
+
+    fn has_gated_attributes(record: &ScopeRecord) -> bool {
+        record.attributes
+            != ScopeAttributes::new().with_federated(record.attributes.federated.clone())
+    }
+
     fn next_version(&mut self) -> u64 {
         self.last_version += 1;
         self.last_version
@@ -1223,6 +1244,7 @@ impl ScopeTable {
             .collect();
 
         let owner_authorized = self.owner_authorized(owner);
+        let flow_scope_owner = self.flow_scope_authority_owner(owner);
         // The set as it will stand after this call. A refused record keeps its
         // previous state, so its held record (if any) stays in the set.
         let mut next: BTreeMap<String, ScopeRecord> = if end.is_some() {
@@ -1245,7 +1267,14 @@ impl ScopeTable {
                 .remove(&index)
                 .or_else(|| self.federated_refusal(owner, record, held))
                 .or_else(|| {
-                    Self::record_refusal(record, held, &state.tombstones, owner_authorized, now)
+                    Self::record_refusal(
+                        record,
+                        held,
+                        &state.tombstones,
+                        owner_authorized,
+                        flow_scope_owner,
+                        now,
+                    )
                 })
                 .or_else(|| {
                     #[cfg(test)]
@@ -1413,6 +1442,8 @@ impl ScopeTable {
             }
         }
         for (scope_ref, record) in next {
+            let record_owner_authorized =
+                owner_authorized || (flow_scope_owner && Self::has_gated_attributes(&record));
             let held = old
                 .get(&scope_ref)
                 .filter(|held| held.record.scope_epoch == record.scope_epoch);
@@ -1430,7 +1461,7 @@ impl ScopeTable {
                 Some(held)
                     if same_record_identity(&held.record, &record)
                         && held.parent_state == parent_state
-                        && held.owner_authorized == owner_authorized =>
+                        && held.owner_authorized == record_owner_authorized =>
                 {
                     held.version
                 }
@@ -1440,7 +1471,7 @@ impl ScopeTable {
                 scope_ref,
                 LiveScope {
                     record,
-                    owner_authorized,
+                    owner_authorized: record_owner_authorized,
                     version,
                     parent_state,
                     binds: held.map(|held| Arc::clone(&held.binds)).unwrap_or_default(),
@@ -1787,12 +1818,82 @@ impl ScopeTable {
         None
     }
 
+    /// Flow authority covers exactly the records the session runtime installs:
+    /// an installed head scope and an expiring per-target ephemeral scope.
+    fn flow_scope_attribute_refusal(record: &ScopeRecord) -> Option<RecordRefusal> {
+        for (present, field) in [
+            (
+                record.attributes.on_behalf_of_agent.is_some(),
+                "on_behalf_of_agent",
+            ),
+            (record.attributes.run_id.is_some(), "run_id"),
+        ] {
+            if present {
+                return Some((
+                    error_codes::SCOPE_ATTRIBUTE_NOT_PERMITTED,
+                    format!("a flow-scope owner may not set {field}"),
+                ));
+            }
+        }
+        if !matches!(record.kind, ScopeKind::Head | ScopeKind::Ephemeral) {
+            return Some((
+                error_codes::SCOPE_ATTRIBUTE_NOT_PERMITTED,
+                format!(
+                    "a flow-scope owner may set gated attributes only on head or ephemeral records carrying flow_id, not {:?}",
+                    record.kind
+                ),
+            ));
+        }
+
+        None
+    }
+
+    fn flow_scope_required_fields_refusal(record: &ScopeRecord) -> Option<RecordRefusal> {
+        let mut missing = Vec::new();
+        if record.attributes.flow_id.is_none() {
+            missing.push("flow_id");
+        }
+        match record.kind {
+            ScopeKind::Head => {
+                for (present, field) in [
+                    (record.attributes.flow_version.is_some(), "flow_version"),
+                    (record.attributes.flow_code_hash.is_some(), "flow_code_hash"),
+                    (
+                        record.attributes.flow_install_id.is_some(),
+                        "flow_install_id",
+                    ),
+                ] {
+                    if !present {
+                        missing.push(field);
+                    }
+                }
+            }
+            ScopeKind::Ephemeral => {
+                if record.expires_at_ms.is_none() {
+                    missing.push("expires_at_ms");
+                }
+            }
+            _ => unreachable!("the flow scope kind was checked above"),
+        }
+        if !missing.is_empty() {
+            return Some((
+                error_codes::SCOPE_ATTRIBUTE_NOT_PERMITTED,
+                format!(
+                    "a flow-scope owner record with gated attributes is missing required fields: {}",
+                    missing.join(", ")
+                ),
+            ));
+        }
+        None
+    }
+
     /// The checks one record fails or passes on its own, before parent links.
     fn record_refusal(
         record: &ScopeRecord,
         held: Option<&LiveScope>,
         tombstones: &Tombstones,
         owner_authorized: bool,
+        flow_scope_owner: bool,
         now: u64,
     ) -> Option<RecordRefusal> {
         for carrier in &record.carriers {
@@ -1809,16 +1910,21 @@ impl ScopeTable {
                 }
             }
         }
-        if record.attributes
-            != ScopeAttributes::new().with_federated(record.attributes.federated.clone())
-            && !owner_authorized
-        {
-            return Some((
-                error_codes::SCOPE_ATTRIBUTE_NOT_PERMITTED,
-                "agent_id, on_behalf_of_agent, delegates, flow_id, flow_version, flow_code_hash, flow_install_id and run_id may be set only by an owner listed in \
-                 scope_authority_owners"
-                    .to_string(),
-            ));
+        let gated = Self::has_gated_attributes(record);
+        let narrow_flow_record = gated && !owner_authorized && flow_scope_owner;
+        if gated && !owner_authorized {
+            if flow_scope_owner {
+                if let Some(refusal) = Self::flow_scope_attribute_refusal(record) {
+                    return Some(refusal);
+                }
+            } else {
+                return Some((
+                    error_codes::SCOPE_ATTRIBUTE_NOT_PERMITTED,
+                    "agent_id, on_behalf_of_agent, delegates, flow_id, flow_version, flow_code_hash, flow_install_id and run_id may be set only by an owner listed in \
+                     scope_authority_owners or, for the permitted flow attributes, flow_scope_authority_owners"
+                        .to_string(),
+                ));
+            }
         }
         // A worker run (run_id with on_behalf_of_agent) is the one combination
         // attribution may join: it names the agent the run works for without
@@ -1929,6 +2035,13 @@ impl ScopeTable {
         };
         if epoch_refusal.is_some() {
             return epoch_refusal;
+        }
+        // Epoch identity checks above must see an installed-identity change
+        // before the required-field check describes its resulting partial set.
+        if narrow_flow_record {
+            if let Some(refusal) = Self::flow_scope_required_fields_refusal(record) {
+                return Some(refusal);
+            }
         }
         let identity_fields = [
             record.attributes.flow_version.is_some(),
@@ -2575,6 +2688,7 @@ mod tests {
     }
     const MAGIC: &str = "magic-context";
     const BROCA: &str = "broca";
+    const FLOW_OWNER: &str = "flow-owner";
     const AFT: &str = "aft";
 
     fn conn(raw: u64) -> ConnectionId {
@@ -2583,6 +2697,10 @@ mod tests {
 
     fn table() -> ScopeTable {
         ScopeTable::new([PREFRONTAL.to_string()])
+    }
+
+    fn flow_table() -> ScopeTable {
+        table().with_flow_scope_authority_owners([FLOW_OWNER.to_string()])
     }
 
     #[tokio::test]
@@ -3238,6 +3356,280 @@ mod tests {
             .with_flow_version(Some(1))
             .with_flow_code_hash(Some("a".repeat(64)))
             .with_flow_install_id(Some("install:7".into()))
+    }
+
+    #[test]
+    fn flow_scope_authority_accepts_installed_head_scopes() {
+        let mut table = flow_table();
+        let agent = head("agent-flow", 1).with_attributes(
+            flow_identity()
+                .with_agent_id(Some("agent:7".into()))
+                .with_delegates(true),
+        );
+        let global = head("global-flow", 1).with_attributes(flow_identity());
+        let applied = sync(&mut table, FLOW_OWNER, conn(1), 1, vec![agent, global]);
+        for scope_ref in ["agent-flow", "global-flow"] {
+            assert_eq!(
+                outcome(&applied, scope_ref).outcome,
+                ScopeRecordOutcome::Created
+            );
+            let stamp = describe(&table, FLOW_OWNER, scope_ref).stamp.unwrap();
+            assert!(stamp.owner_authorized);
+            assert_eq!(stamp.kind, ScopeKind::Head);
+            assert_eq!(stamp.attributes.flow_version, Some(1));
+        }
+        let stamp = describe(&table, FLOW_OWNER, "agent-flow").stamp.unwrap();
+        assert_eq!(stamp.attributes.agent_id.as_deref(), Some("agent:7"));
+        assert!(stamp.attributes.delegates);
+        let stamp = describe(&table, FLOW_OWNER, "global-flow").stamp.unwrap();
+        assert_eq!(stamp.attributes.agent_id, None);
+        assert!(!stamp.attributes.delegates);
+
+        let changed = head("agent-flow", 1).with_attributes(
+            flow_identity()
+                .with_flow_version(Some(2))
+                .with_agent_id(Some("agent:7".into()))
+                .with_delegates(true),
+        );
+        let applied = sync(&mut table, FLOW_OWNER, conn(1), 2, vec![changed]);
+        assert_eq!(
+            outcome(&applied, "agent-flow").code.as_deref(),
+            Some(error_codes::SCOPE_FLOW_IDENTITY_CHANGED)
+        );
+        assert_eq!(
+            describe(&table, FLOW_OWNER, "agent-flow")
+                .stamp
+                .unwrap()
+                .attributes
+                .flow_version,
+            Some(1)
+        );
+
+        let partial = head("agent-flow", 1).with_attributes(
+            flow_identity()
+                .with_flow_version(None)
+                .with_agent_id(Some("agent:7".into()))
+                .with_delegates(true),
+        );
+        let applied = sync(&mut table, FLOW_OWNER, conn(1), 3, vec![partial]);
+        assert_eq!(
+            outcome(&applied, "agent-flow").code.as_deref(),
+            Some(error_codes::SCOPE_FLOW_IDENTITY_CHANGED),
+            "identity immutability takes precedence over the resulting partial set"
+        );
+    }
+
+    #[test]
+    fn flow_scope_authority_accepts_expiring_ephemeral_target_scopes() {
+        let mut table = flow_table();
+        table.set_wall_clock(Arc::new(|| 100));
+        let attributes = ScopeAttributes::new()
+            .with_flow_id(Some("flow:7".into()))
+            .with_agent_id(Some("agent:7".into()))
+            .with_delegates(true);
+        let target = record("target", 1, ScopeKind::Ephemeral)
+            .with_expires_at_ms(Some(10_000))
+            .with_attributes(attributes.clone());
+        let applied = sync(&mut table, FLOW_OWNER, conn(1), 1, vec![target]);
+        assert_eq!(
+            outcome(&applied, "target").outcome,
+            ScopeRecordOutcome::Created
+        );
+        let stamp = describe(&table, FLOW_OWNER, "target").stamp.unwrap();
+        assert!(stamp.owner_authorized);
+        assert_eq!(stamp.kind, ScopeKind::Ephemeral);
+        assert_eq!(stamp.expires_at_ms, Some(10_000));
+        assert_eq!(stamp.attributes, attributes);
+        assert_eq!(stamp.attributes.flow_version, None);
+        assert_eq!(stamp.attributes.flow_code_hash, None);
+        assert_eq!(stamp.attributes.flow_install_id, None);
+    }
+
+    #[test]
+    fn flow_scope_authority_requires_flow_identity_kind_and_target_expiry() {
+        let mut table = flow_table();
+        table.set_wall_clock(Arc::new(|| 100));
+        let agent_only = head("agent-only", 1)
+            .with_attributes(ScopeAttributes::new().with_agent_id(Some("agent:7".into())));
+        let flow_only = head("flow-only", 1)
+            .with_attributes(ScopeAttributes::new().with_flow_id(Some("flow:7".into())));
+        let target_without_flow = record("target-without-flow", 1, ScopeKind::Ephemeral)
+            .with_expires_at_ms(Some(10_000))
+            .with_attributes(ScopeAttributes::new().with_agent_id(Some("agent:7".into())));
+        let target_without_expiry = record("target-without-expiry", 1, ScopeKind::Ephemeral)
+            .with_attributes(ScopeAttributes::new().with_flow_id(Some("flow:7".into())));
+        let wrong_kind =
+            record("wrong-kind", 1, ScopeKind::Worker).with_attributes(flow_identity());
+        let partial_target = record("partial-target", 1, ScopeKind::Ephemeral)
+            .with_expires_at_ms(Some(10_000))
+            .with_attributes(
+                ScopeAttributes::new()
+                    .with_flow_id(Some("flow:7".into()))
+                    .with_flow_version(Some(1)),
+            );
+        let applied = sync(
+            &mut table,
+            FLOW_OWNER,
+            conn(1),
+            1,
+            vec![
+                agent_only,
+                flow_only,
+                target_without_flow,
+                target_without_expiry,
+                wrong_kind,
+                partial_target,
+            ],
+        );
+        for scope_ref in [
+            "agent-only",
+            "flow-only",
+            "target-without-flow",
+            "target-without-expiry",
+            "wrong-kind",
+        ] {
+            let result = outcome(&applied, scope_ref);
+            assert_eq!(
+                result.code.as_deref(),
+                Some(error_codes::SCOPE_ATTRIBUTE_NOT_PERMITTED),
+                "{scope_ref}"
+            );
+            assert!(
+                result.message.as_deref().unwrap().contains("flow-scope"),
+                "{scope_ref}: {}",
+                result.message.as_deref().unwrap()
+            );
+        }
+        for field in [
+            "flow_id",
+            "flow_version",
+            "flow_code_hash",
+            "flow_install_id",
+        ] {
+            assert!(outcome(&applied, "agent-only")
+                .message
+                .as_deref()
+                .unwrap()
+                .contains(field));
+        }
+        assert!(outcome(&applied, "flow-only")
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("flow_version"));
+        assert!(outcome(&applied, "target-without-flow")
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("flow_id"));
+        assert!(outcome(&applied, "target-without-expiry")
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("expires_at_ms"));
+        let wrong_kind_message = outcome(&applied, "wrong-kind").message.as_deref().unwrap();
+        assert!(wrong_kind_message.contains("head"));
+        assert!(wrong_kind_message.contains("ephemeral"));
+        let partial = outcome(&applied, "partial-target");
+        assert_eq!(
+            partial.code.as_deref(),
+            Some(error_codes::SCOPE_ATTRIBUTE_NOT_PERMITTED)
+        );
+        for field in ["flow_version", "flow_code_hash", "flow_install_id"] {
+            assert!(partial.message.as_deref().unwrap().contains(field));
+        }
+    }
+
+    #[test]
+    fn flow_scope_authority_refuses_other_identity_but_keeps_delegation_rules() {
+        let mut table = flow_table();
+        table.set_wall_clock(Arc::new(|| 100));
+        let on_behalf = head("on-behalf", 1)
+            .with_attributes(flow_identity().with_on_behalf_of_agent(Some("agent:7".into())));
+        let run = record("run", 1, ScopeKind::Ephemeral)
+            .with_expires_at_ms(Some(10_000))
+            .with_attributes(
+                ScopeAttributes::new()
+                    .with_flow_id(Some("flow:7".into()))
+                    .with_agent_id(Some("agent:7".into()))
+                    .with_run_id(Some("run:7".into())),
+            );
+        let delegating_without_agent =
+            head("delegating", 1).with_attributes(flow_identity().with_delegates(true));
+        let applied = sync(
+            &mut table,
+            FLOW_OWNER,
+            conn(1),
+            1,
+            vec![on_behalf, run, delegating_without_agent],
+        );
+        for (scope_ref, field) in [("on-behalf", "on_behalf_of_agent"), ("run", "run_id")] {
+            let result = outcome(&applied, scope_ref);
+            assert_eq!(
+                result.code.as_deref(),
+                Some(error_codes::SCOPE_ATTRIBUTE_NOT_PERMITTED)
+            );
+            assert!(result.message.as_deref().unwrap().contains("flow-scope"));
+            assert!(result.message.as_deref().unwrap().contains(field));
+        }
+        assert_eq!(
+            outcome(&applied, "delegating").code.as_deref(),
+            Some(error_codes::SCOPE_DELEGATES_WITHOUT_AGENT)
+        );
+    }
+
+    #[test]
+    fn flow_scope_authority_leaves_plain_records_and_unlisted_owners_unchanged() {
+        let mut table = flow_table();
+        let applied = sync(
+            &mut table,
+            FLOW_OWNER,
+            conn(1),
+            1,
+            vec![
+                head("plain-head", 1),
+                record("plain-worker", 1, ScopeKind::Worker),
+            ],
+        );
+        for scope_ref in ["plain-head", "plain-worker"] {
+            assert_eq!(
+                outcome(&applied, scope_ref).outcome,
+                ScopeRecordOutcome::Created
+            );
+            assert!(
+                !describe(&table, FLOW_OWNER, scope_ref)
+                    .stamp
+                    .unwrap()
+                    .owner_authorized
+            );
+        }
+
+        let gated = head("unlisted-gated", 1).with_attributes(
+            flow_identity()
+                .with_agent_id(Some("agent:7".into()))
+                .with_delegates(true),
+        );
+        let applied = sync(
+            &mut table,
+            BROCA,
+            conn(2),
+            1,
+            vec![gated, head("unlisted-plain", 1)],
+        );
+        assert_eq!(
+            outcome(&applied, "unlisted-gated").code.as_deref(),
+            Some(error_codes::SCOPE_ATTRIBUTE_NOT_PERMITTED)
+        );
+        assert_eq!(
+            outcome(&applied, "unlisted-plain").outcome,
+            ScopeRecordOutcome::Created
+        );
+        assert!(
+            !describe(&table, BROCA, "unlisted-plain")
+                .stamp
+                .unwrap()
+                .owner_authorized
+        );
     }
 
     #[test]

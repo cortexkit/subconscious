@@ -134,6 +134,7 @@ pub struct BootstrapConfig {
     admission_facts: AdmissionFactsConfig,
     /// Module ids whose scopes may carry the attributes that grant authority.
     scope_authority_owners: Vec<String>,
+    flow_scope_authority_owners: Vec<String>,
     federated_scope_owner: String,
     privileged_operator_prompt: daemon_config::PrivilegedOperatorPrompt,
     activity_config: daemon_config::ActivityConfig,
@@ -289,6 +290,7 @@ impl BootstrapConfig {
             storage_config: None,
             admission_facts: AdmissionFactsConfig::default(),
             scope_authority_owners: daemon_config::default_scope_authority_owners(),
+            flow_scope_authority_owners: Vec::new(),
             federated_scope_owner: daemon_config::default_federated_scope_owner(),
             privileged_operator_prompt: daemon_config::PrivilegedOperatorPrompt::default(),
             activity_config: daemon_config::ActivityConfig::default(),
@@ -469,6 +471,10 @@ impl BootstrapConfig {
             .as_ref()
             .map(|config| config.scope_authority_owners.clone())
             .unwrap_or_else(daemon_config::default_scope_authority_owners);
+        let flow_scope_authority_owners = daemon_config
+            .as_ref()
+            .map(|config| config.flow_scope_authority_owners.clone())
+            .unwrap_or_default();
         let federated_scope_owner = daemon_config
             .as_ref()
             .map(|config| config.federated_scope_owner.clone())
@@ -512,6 +518,7 @@ impl BootstrapConfig {
             .with_storage_config(storage_config)
             .with_admission_facts_config(admission_facts_carrier_module_id, admission_facts_targets)
             .with_scope_authority_owners(scope_authority_owners)
+            .with_flow_scope_authority_owners(flow_scope_authority_owners)
             .with_federated_scope_owner(federated_scope_owner)
             .with_privileged_operator_prompt(privileged_operator_prompt)
             .with_activity_config(activity_config)
@@ -570,6 +577,10 @@ impl BootstrapConfig {
             .as_ref()
             .map(|config| config.scope_authority_owners.clone())
             .unwrap_or_else(daemon_config::default_scope_authority_owners);
+        let flow_scope_authority_owners = daemon_config
+            .as_ref()
+            .map(|config| config.flow_scope_authority_owners.clone())
+            .unwrap_or_default();
         let federated_scope_owner = daemon_config
             .as_ref()
             .map(|config| config.federated_scope_owner.clone())
@@ -592,6 +603,7 @@ impl BootstrapConfig {
             .with_storage_config(storage_config)
             .with_admission_facts_config(admission_facts_carrier_module_id, admission_facts_targets)
             .with_scope_authority_owners(scope_authority_owners)
+            .with_flow_scope_authority_owners(flow_scope_authority_owners)
             .with_federated_scope_owner(federated_scope_owner)
             .with_privileged_operator_prompt(privileged_operator_prompt)
             .with_activity_config(activity_config)
@@ -633,6 +645,13 @@ impl BootstrapConfig {
     /// Absent from a config, this is `daemon_config::default_scope_authority_owners`.
     pub fn with_scope_authority_owners(mut self, owners: Vec<String>) -> Self {
         self.scope_authority_owners = owners;
+        self
+    }
+
+    /// Set the module ids whose head and ephemeral flow scopes may carry the
+    /// flow identity and its optional author agent id and delegation.
+    pub fn with_flow_scope_authority_owners(mut self, owners: Vec<String>) -> Self {
+        self.flow_scope_authority_owners = owners;
         self
     }
 
@@ -941,6 +960,7 @@ async fn run_with_config_inner(
     let storage_config = config.storage_config.clone();
     let admission_facts = config.admission_facts.clone();
     let scope_authority_owners = config.scope_authority_owners.clone();
+    let flow_scope_authority_owners = config.flow_scope_authority_owners.clone();
     let federated_scope_owner = config.federated_scope_owner.clone();
     let privileged_operator_prompt = config.privileged_operator_prompt;
     let activity_config = config.activity_config;
@@ -1013,6 +1033,7 @@ async fn run_with_config_inner(
                 storage_config,
                 admission_facts,
                 scope_authority_owners,
+                flow_scope_authority_owners,
                 federated_scope_owner,
                 privileged_operator_prompt,
                 activity_config,
@@ -1287,6 +1308,7 @@ async fn serve_bound_daemon(
     storage_config: Option<daemon_config::StorageConfig>,
     admission_facts: AdmissionFactsConfig,
     scope_authority_owners: Vec<String>,
+    flow_scope_authority_owners: Vec<String>,
     federated_scope_owner: String,
     privileged_operator_prompt: daemon_config::PrivilegedOperatorPrompt,
     activity_config: daemon_config::ActivityConfig,
@@ -1578,6 +1600,7 @@ async fn serve_bound_daemon(
         .with_machine_id(bound.machine_id.clone())
         .with_admission_facts_config(admission_facts.carrier_module_id, admission_facts.targets)
         .with_scope_authority_owners(scope_authority_owners)
+        .with_flow_scope_authority_owners(flow_scope_authority_owners)
         .with_federated_scope_owner(federated_scope_owner)
         .with_privileged_operator_prompt(privileged_operator_prompt)
         .with_route_bind_relay_timeouts(route_bind_relay_timeouts)
@@ -2918,7 +2941,7 @@ mod tests {
         let file = scratch.join("subc.jsonc");
         std::fs::write(
             &file,
-            br#"{"version":1,"modules":{},"scope_authority_owners":["file-owner"]}"#,
+            br#"{"version":1,"modules":{},"scope_authority_owners":["file-owner"],"flow_scope_authority_owners":["flow-owner"]}"#,
         )
         .unwrap();
         let mut config = BootstrapConfig::new(scratch.join("connection.json"), 0)
@@ -2930,6 +2953,7 @@ mod tests {
             selected.file_derived_test_probe,
             Some(vec!["file-owner".into()])
         );
+        assert_eq!(selected.flow_scope_authority_owners, ["flow-owner"]);
         assert_eq!(selected.operator_timeout, Duration::from_secs(7));
         assert_eq!(selected.daemon_config_path, Some(file));
         assert_eq!(
@@ -2971,6 +2995,7 @@ mod tests {
             config.scope_authority_owners,
             daemon_config::default_scope_authority_owners()
         );
+        assert!(config.flow_scope_authority_owners.is_empty());
         assert!(config.reserved_capabilities.is_empty());
         assert_eq!(
             config.privileged_operator_prompt,

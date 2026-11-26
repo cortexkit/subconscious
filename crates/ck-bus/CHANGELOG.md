@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.13.8
+
+- Require subc-daemon 0.54.0 for narrow flow-scope authority.
+
 ## 0.13.7
 
 - Provision prefrontal's delivery readers and session-liveness bucket at startup, even if prefrontal has not registered yet. Only `reserved:prefrontal` may manage agent durables. ck-bus no longer moves delivery resources between module ids.

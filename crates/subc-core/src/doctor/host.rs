@@ -77,6 +77,12 @@ pub(crate) enum RpcError {
     ConnectionLost,
 }
 
+#[cfg(unix)]
+pub(crate) enum SetEnabledError {
+    Reply(String),
+    Rpc(RpcError),
+}
+
 pub(crate) trait DoctorDaemon: Send + Sync + 'static {
     fn list(&self, deadline: Instant) -> RpcResult<SupervisorListResponse>;
     fn health(&self, deadline: Instant) -> RpcResult<Vec<SupervisorHealthEntry>>;
@@ -88,9 +94,29 @@ pub(crate) trait DoctorDaemon: Send + Sync + 'static {
         max_bytes: u32,
         deadline: Instant,
     ) -> RpcResult<StderrTail>;
+
+    #[cfg(unix)]
+    fn set_enabled(
+        &self,
+        _module: &str,
+        _enabled: bool,
+        _deadline: Instant,
+    ) -> Result<bool, SetEnabledError> {
+        Err(SetEnabledError::Rpc(RpcError::Failed("unsupported".into())))
+    }
 }
 
-pub(super) struct SystemHost;
+pub(super) struct SystemHost {
+    pub(super) call_timeout: Duration,
+}
+
+impl Default for SystemHost {
+    fn default() -> Self {
+        Self {
+            call_timeout: Duration::from_secs(4),
+        }
+    }
+}
 
 impl DoctorHost for SystemHost {
     fn binaries(&self) -> Result<[Binary; 2], String> {
@@ -211,7 +237,7 @@ impl DoctorHost for SystemHost {
         match connection_file::discover(path) {
             Ok(found) => {
                 hint(found.info.pid);
-                SystemDaemon::connect(found.path, deadline)
+                SystemDaemon::connect(found.path, deadline, self.call_timeout)
                     .map(|daemon| daemon as Arc<dyn DoctorDaemon>)
             }
             Err(error) => {
@@ -308,7 +334,7 @@ struct SystemDaemon {
 }
 
 impl SystemDaemon {
-    fn connect(path: PathBuf, deadline: Instant) -> RpcResult<Arc<Self>> {
+    fn connect(path: PathBuf, deadline: Instant, call_timeout: Duration) -> RpcResult<Arc<Self>> {
         let (reply, result) = mpsc::sync_channel(1);
         thread::spawn(move || {
             let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -322,7 +348,7 @@ impl SystemDaemon {
                 }
             };
             runtime.block_on(async move {
-                let daemon = Self::open(&path, deadline).await;
+                let daemon = Self::open(&path, deadline, call_timeout).await;
                 match daemon {
                     Ok((connection, lifetime)) => {
                         if reply.send(Ok(Arc::new(connection))).is_ok() {
@@ -338,13 +364,17 @@ impl SystemDaemon {
         receive_rpc(result, deadline)
     }
 
-    async fn open(path: &Path, deadline: Instant) -> RpcResult<(Self, oneshot::Receiver<()>)> {
+    async fn open(
+        path: &Path,
+        deadline: Instant,
+        call_timeout: Duration,
+    ) -> RpcResult<(Self, oneshot::Receiver<()>)> {
         if Instant::now() >= deadline {
             return Err(RpcError::TimedOut);
         }
         let opts = ConsumerOptions {
             handshake_timeout: Duration::from_secs(2),
-            call_timeout: Duration::from_secs(4),
+            call_timeout,
             ..ConsumerOptions::default()
         };
         let consumer = tokio::time::timeout_at(deadline.into(), SubcConsumer::connect(path, opts))
@@ -433,6 +463,48 @@ impl DoctorDaemon for SystemDaemon {
                 .await
                 .map(|response| response.tail)
         })
+    }
+
+    #[cfg(unix)]
+    fn set_enabled(
+        &self,
+        module: &str,
+        enabled: bool,
+        deadline: Instant,
+    ) -> Result<bool, SetEnabledError> {
+        let module = module.to_owned();
+        // Keep an actual daemon Error frame separate from a locally failed call:
+        // only the former proves the daemon is done handling the request.
+        let result = self
+            .request(deadline, move |consumer| async move {
+                Ok::<_, std::convert::Infallible>(
+                    consumer.supervisor_set_enabled(module, enabled).await,
+                )
+            })
+            .map_err(SetEnabledError::Rpc)?;
+        match result {
+            Ok(ack) => Ok(ack.applied),
+            Err(subc_client_rs::CallError::Module(body)) => Err(SetEnabledError::Reply(body.code)),
+            Err(error)
+                if matches!(
+                    error.outcome_cause(),
+                    Some(subc_client_rs::OutcomeUnknownCause::ConnectionFailed)
+                ) =>
+            {
+                Err(SetEnabledError::Rpc(RpcError::ConnectionLost))
+            }
+            Err(error)
+                if matches!(
+                    error.outcome_cause(),
+                    Some(subc_client_rs::OutcomeUnknownCause::Deadline)
+                ) =>
+            {
+                Err(SetEnabledError::Rpc(RpcError::TimedOut))
+            }
+            Err(_) => Err(SetEnabledError::Rpc(RpcError::Failed(
+                "set_enabled failed without an error reply".into(),
+            ))),
+        }
     }
 }
 

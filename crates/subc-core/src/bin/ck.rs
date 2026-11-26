@@ -31,7 +31,7 @@ mod ckni;
 mod config_cli;
 mod connection_choice;
 use connection_choice::discover_connection_file;
-mod doctor_cli;
+pub(crate) mod doctor_cli;
 #[cfg(test)]
 use doctor_cli::{collect_daemon_triage, TRIAGE_LOG_MAX_BYTES};
 use doctor_cli::{daemon_triage, triage_daemon_log_path, triage_log_fact};
@@ -1259,8 +1259,8 @@ fn dashboard_module_is_warming(health_entries: &[Value], module: &Value) -> bool
 }
 
 fn print_static_domains() {
-    const BUILTIN_DOMAINS: [&str; 7] = [
-        "setup", "upgrade", "module", "health", "routes", "quota", "daemon",
+    const BUILTIN_DOMAINS: [&str; 8] = [
+        "setup", "upgrade", "module", "health", "routes", "quota", "daemon", "doctor",
     ];
     let mut domains = BUILTIN_DOMAINS
         .iter()

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.22.0
+
+- Add module program checks and consented repairs to the doctor library.
+- `ck doctor` shows module program findings even when the daemon is down.
+  `--fix` asks before applying module repairs, and `--issue` saves sanitized
+  module reports and can file them in public GitHub repositories with consent.
+- Rust API break: `Layer` and `FixSkip` gain `ModuleProgram` and `Interrupted`,
+  respectively, and `Finding`, `DoctorReport`, and `FixReport` gain fields.
+- Additive doctor report JSON: program runs include `modules`, program findings
+  include `fix`, and fix reports include `module_fixes`.
+
 ## 0.21.59
 
 - Show the accepting drain phase in `ck module list` without changing the supervisor state string.

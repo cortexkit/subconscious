@@ -2,13 +2,17 @@ use std::{ffi::OsString, io::Write, sync::Arc};
 
 use serde::Serialize;
 use subc_core::doctor::{
-    self, DoctorOptions, DoctorReport, DoctorRun, FixSkip, Layer, LogFallback, LogFallbackRead,
-    LogTail, LogTailRecord, ReportFile, Severity,
+    self, DoctorOptions, DoctorReport, DoctorRun, FixSkip, Interrupt, Layer, LogFallback,
+    LogFallbackRead, LogTail, LogTailRecord, ModuleFix, ModuleFixDecision, ModuleFixOutcome,
+    ModuleFixSkip, ModuleRestart, Programs, Prompter, ReportFile, Severity,
 };
 
-use super::{log_tail, Command};
+use super::{log_tail, response_budget, Command};
 
 mod agent;
+#[cfg(unix)]
+mod interrupt;
+mod issue;
 mod report_file;
 use report_file::ReportTarget;
 
@@ -19,11 +23,13 @@ pub(super) const HELP: &str = "ck doctor — diagnose the stack, even when the d
 
 usage:
   ck doctor [--json] [--report <file>] [--fix] [--subc <connection-file>]
+  ck doctor --issue [--report <file>]
   ck doctor --agent [--forget]
 
   --json           print one JSON document; for a completed run, stderr is used only if the report cannot be written
   --report <file>  save a private, unsanitized report with bounded log tails
-  --fix            attempt an offered window revert with system approval
+  --fix            attempt an offered window revert or ask to apply module fixes
+  --issue          save sanitized module reports and ask before filing publicly (local, human mode only)
   --agent          open the standalone Pi rescue agent for the local stack
   --forget         with --agent, remove only the local rescue login and exit
   --subc <file>    check a specific daemon; cannot be used with --fix or an interactive rescue
@@ -33,6 +39,7 @@ usage:
 pub(super) struct Options {
     report: Option<PathBuf>,
     fix: bool,
+    issue: bool,
     pub(super) agent: bool,
     forget: bool,
 }
@@ -59,6 +66,7 @@ pub(super) fn parse(
                 options.report = Some(path_value(&mut args, "--report")?);
             }
             Some("--fix") if !options.fix => options.fix = true,
+            Some("--issue") if !options.issue => options.issue = true,
             Some("--agent") if !options.agent => options.agent = true,
             Some("--forget") if !options.forget => options.forget = true,
             Some("--force") => {
@@ -108,16 +116,147 @@ impl LogFallback for LocalLogs {
     }
 }
 
+#[derive(Default)]
+struct Terminal {
+    #[cfg(unix)]
+    tty: Option<Tty>,
+}
+
+#[cfg(unix)]
+struct Tty {
+    reader: std::sync::Mutex<io::BufReader<fs::File>>,
+    writer: fs::File,
+}
+
+impl Terminal {
+    fn open(ckni: bool) -> Self {
+        #[cfg(unix)]
+        if !ckni && env::var_os("CK_RESCUE_SESSION").is_none() {
+            if let Ok(tty) = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/tty")
+            {
+                if let Ok(reader) = tty.try_clone() {
+                    return Self {
+                        tty: Some(Tty {
+                            reader: std::sync::Mutex::new(io::BufReader::new(reader)),
+                            writer: tty,
+                        }),
+                    };
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = ckni;
+        Self::default()
+    }
+
+    #[cfg(unix)]
+    fn write(&self, text: &str) -> io::Result<()> {
+        let tty = self
+            .tty
+            .as_ref()
+            .ok_or_else(|| io::Error::other("no terminal"))?;
+        (&tty.writer).write_all(text.as_bytes())
+    }
+
+    #[cfg(unix)]
+    fn ask(&self, text: &str) -> Option<String> {
+        use io::BufRead;
+
+        self.write(text).ok()?;
+        let mut line = String::new();
+        let read = self
+            .tty
+            .as_ref()?
+            .reader
+            .lock()
+            .ok()?
+            .read_line(&mut line)
+            .ok()?;
+        (read > 0).then(|| line.trim().to_owned())
+    }
+
+    #[cfg(unix)]
+    fn yes(&self, question: &str) -> bool {
+        self.ask(question).is_some_and(|answer| {
+            answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes")
+        })
+    }
+}
+
+impl Prompter for Terminal {
+    fn interactive(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.tty.is_some()
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
+    fn confirm(&self, module: &str, finding: &cortexkit_doctor::Finding) -> bool {
+        #[cfg(unix)]
+        {
+            let fix = finding.fix();
+            let Some(plan) = fix.plan() else { return false };
+            let mut prompt = format!("\n{module}: {}\n", finding.summary());
+            for step in plan.steps() {
+                prompt.push_str(&format!("  - {step}\n"));
+            }
+            prompt.push_str(if fix.needs_stop() {
+                "The module must be stopped before applying this fix.\n"
+            } else {
+                "No module stop is needed.\n"
+            });
+            prompt.push_str("Apply this fix? [y/N] ");
+            self.yes(&prompt)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (module, finding);
+            false
+        }
+    }
+}
+
+// The test executable can substitute a local GitHub API and simulate failed
+// signal registration. The shipped ck never reads those settings from its environment.
+#[cfg(unix)]
+pub(crate) fn test_settings() -> (Option<OsString>, bool) {
+    (None, false)
+}
+
 pub(super) fn run(
     options: Options,
     explicit_connection: Option<PathBuf>,
     output: JsonOutput,
 ) -> Result<(), CkError> {
+    let env_connection = env::var_os("SUBC_CONNECTION_FILE");
+    if options.issue {
+        let conflict = [
+            (options.fix, "--fix"),
+            (output.ckni, "ckni"),
+            (output.enabled, "--json"),
+            (options.agent, "--agent"),
+            (options.forget, "--forget"),
+            (explicit_connection.is_some(), "--subc"),
+            (env_connection.is_some(), "SUBC_CONNECTION_FILE"),
+        ];
+        if let Some((_, flag)) = conflict.into_iter().find(|(present, _)| *present) {
+            return Err(CkError::Usage(format!(
+                "doctor --issue cannot be used with {flag}"
+            )));
+        }
+    }
     if options.agent || options.forget {
         return agent::run(&options, explicit_connection.is_some(), output.ckni);
     }
     let connection_override = explicit_connection.or_else(|| {
-        env::var_os("SUBC_CONNECTION_FILE")
+        env_connection
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
     });
@@ -131,15 +270,42 @@ pub(super) fn run(
         .as_deref()
         .map(ReportTarget::create)
         .transpose()?;
-    let result = doctor::run(
+    let terminal = Arc::new(Terminal::open(output.ckni));
+    let interrupt = Arc::new(Interrupt::default());
+    #[cfg(unix)]
+    let (github_api, fail_sigterm) = crate::doctor_cli::test_settings();
+    #[cfg(unix)]
+    interrupt::listen(Arc::clone(&interrupt), Arc::clone(&terminal), fail_sigterm);
+    let logs = Arc::new(LocalLogs);
+    let doctor::ProgramRun { run, checked } = doctor::run_with_programs(
         DoctorOptions {
             connection_override,
             fix: options.fix,
         },
-        Arc::new(LocalLogs),
+        Programs {
+            prompter: terminal.as_ref(),
+            interrupt: &interrupt,
+            operator_budget: response_budget::operator(),
+        },
+        logs.clone(),
     );
+    let issues = options.issue.then(|| {
+        issue::file(
+            checked,
+            &terminal,
+            &interrupt,
+            logs.as_ref(),
+            &run.document,
+            #[cfg(unix)]
+            github_api,
+        )
+    });
     let exit_code = complete(
-        result,
+        Completion {
+            run,
+            issues,
+            interrupt: Some(&interrupt),
+        },
         report,
         output,
         &mut io::stdout().lock(),
@@ -167,14 +333,35 @@ fn write_full_report(file: &mut impl Write, report: &FullReport<'_>) -> io::Resu
     writeln!(file)
 }
 
-fn complete(
-    mut result: DoctorRun,
+struct Completion<'a> {
+    run: DoctorRun,
+    issues: Option<issue::Rows>,
+    interrupt: Option<&'a Interrupt>,
+}
+
+impl From<DoctorRun> for Completion<'_> {
+    fn from(run: DoctorRun) -> Self {
+        Self {
+            run,
+            issues: None,
+            interrupt: None,
+        }
+    }
+}
+
+fn complete<'a>(
+    completion: impl Into<Completion<'a>>,
     target: Option<ReportTarget>,
     output: JsonOutput,
     stdout: &mut impl Write,
     stderr: &mut impl Write,
     write_report: impl FnOnce(&mut fs::File, &FullReport<'_>) -> io::Result<()>,
 ) -> Result<u8, CkError> {
+    let Completion {
+        run: mut result,
+        issues,
+        interrupt,
+    } = completion.into();
     let mut incomplete = None;
     if let Some(mut target) = target {
         result.document.report = Some(ReportFile {
@@ -198,14 +385,26 @@ fn complete(
             );
         }
     }
-    if output.enabled {
-        let document = output.value(&serde_json::to_value(&result.document)?);
-        serde_json::to_writer_pretty(&mut *stdout, &document)?;
-        writeln!(stdout).map_err(stdout_error)?;
-    } else {
-        write_human(stdout, &result.document, incomplete.as_deref()).map_err(stdout_error)?;
+    let printed = (|| {
+        if output.enabled {
+            let document = output.value(&serde_json::to_value(&result.document)?);
+            serde_json::to_writer_pretty(&mut *stdout, &document)?;
+            writeln!(stdout).map_err(stdout_error)?;
+        } else {
+            write_human(stdout, &result.document, incomplete.as_deref()).map_err(stdout_error)?;
+            if let Some(issues) = issues {
+                if issues.failed() {
+                    result.exit_code = 1;
+                }
+                issues.write(stdout).map_err(stdout_error)?;
+            }
+        }
+        stdout.flush().map_err(stdout_error)
+    })();
+    if let Some(signal) = interrupt.and_then(Interrupt::signal) {
+        return Ok((128 + signal) as u8);
     }
-    stdout.flush().map_err(stdout_error)?;
+    printed?;
     Ok(result.exit_code)
 }
 
@@ -221,10 +420,12 @@ fn write_human(
     if let Some(path) = &report.connection_override {
         writeln!(out, "Connection override: {}", path.display())?;
     }
-    let mut current_layer = None;
+    let mut current_heading = None;
     for finding in &report.findings {
-        if current_layer != Some(finding.layer) {
-            current_layer = Some(finding.layer);
+        let program_owner = (finding.layer == Layer::ModuleProgram).then_some(&finding.owner);
+        let heading = (finding.layer, program_owner);
+        if current_heading != Some(heading) {
+            current_heading = Some(heading);
             let name = match finding.layer {
                 Layer::Install => "install",
                 Layer::Service => "service",
@@ -232,8 +433,13 @@ fn write_human(
                 Layer::Disk => "disk",
                 Layer::Window => "window",
                 Layer::Module => "module",
+                Layer::ModuleProgram => "module program",
             };
-            writeln!(out, "{name}:")?;
+            if let Some(owner) = program_owner {
+                writeln!(out, "{name} {owner}:")?;
+            } else {
+                writeln!(out, "{name}:")?;
+            }
         }
         let severity = match finding.severity {
             Severity::Error => "error",
@@ -246,7 +452,19 @@ fn write_human(
             finding.id, finding.owner, finding.summary
         )?;
         let mut evidence = finding.evidence.clone();
-        if let Some(fields) = evidence.as_object_mut() {
+        if finding.layer == Layer::ModuleProgram {
+            writeln!(out, "    Evidence: {evidence}")?;
+            if let Some(fix) = &finding.fix {
+                if matches!(
+                    fix.class(),
+                    cortexkit_doctor::FixClass::Safe | cortexkit_doctor::FixClass::Risky
+                ) {
+                    if let Some(first) = fix.plan().and_then(|plan| plan.steps().first()) {
+                        writeln!(out, "    {first} (run `ck doctor --fix` to apply)")?;
+                    }
+                }
+            }
+        } else if let Some(fields) = evidence.as_object_mut() {
             let tail = fields.remove("tail");
             let tails = fields.remove("tails");
             if !fields.is_empty() {
@@ -270,15 +488,28 @@ fn write_human(
             writeln!(out, "{}", result.human())?;
         } else {
             match fix.skipped {
-                Some(FixSkip::NothingToFix) => writeln!(out, "Nothing to fix.")?,
+                Some(FixSkip::NothingToFix) if fix.module_fixes.is_empty() => {
+                    writeln!(out, "Nothing to fix.")?
+                }
                 Some(FixSkip::ManagerObservationOverdue) => {
                     writeln!(
                         out,
                         "Fix skipped: the service manager observation is still running."
                     )?;
                 }
-                None => (),
+                Some(FixSkip::Interrupted) => writeln!(out, "Fix skipped: interrupted.")?,
+                Some(FixSkip::NothingToFix) | None => (),
             }
+        }
+        for module in &fix.module_fixes {
+            write_module_fix(out, module)?;
+        }
+        if fix
+            .module_fixes
+            .iter()
+            .any(|row| row.skip_reason == Some(ModuleFixSkip::RevertFirst))
+        {
+            writeln!(out, "Run `ck doctor --fix` again to apply module fixes.")?;
         }
     }
     if let Some(saved) = &report.report {
@@ -299,6 +530,54 @@ fn write_human(
     Ok(())
 }
 
+fn write_module_fix(out: &mut impl Write, fix: &ModuleFix) -> io::Result<()> {
+    let decision = match fix.decision {
+        ModuleFixDecision::Applied => "applied",
+        ModuleFixDecision::Declined => "declined",
+        ModuleFixDecision::Skipped => "skipped",
+    };
+    write!(
+        out,
+        "Module fix {} [{}]: {decision}",
+        fix.finding, fix.module
+    )?;
+    if let Some(reason) = fix.skip_reason {
+        let reason = match reason {
+            ModuleFixSkip::NoTerminal => "no_terminal",
+            ModuleFixSkip::RevertFirst => "revert_first",
+            ModuleFixSkip::ManagerObservationOverdue => "manager_observation_overdue",
+            ModuleFixSkip::StopFailed => "stop_failed",
+            ModuleFixSkip::ProgramChanged => "program_changed",
+            ModuleFixSkip::Interrupted => "interrupted",
+            ModuleFixSkip::SignalSetupFailed => "signal_setup_failed",
+        };
+        write!(out, " {reason}")?;
+    }
+    if let Some(result) = &fix.result {
+        let outcome = match result.outcome {
+            ModuleFixOutcome::Fixed => "fixed",
+            ModuleFixOutcome::Refused => "refused",
+            ModuleFixOutcome::Failed => "failed",
+            ModuleFixOutcome::NoResult => "no_result",
+        };
+        write!(out, "; {outcome}")?;
+        if let Some(code) = &result.code {
+            write!(out, " {code}")?;
+            if result.outcome == ModuleFixOutcome::Refused && code == "plan_changed" {
+                write!(out, " (run `ck doctor` again)")?;
+            }
+        }
+    }
+    if let Some(restart) = fix.restart {
+        let restart = match restart {
+            ModuleRestart::Enabled => "enabled",
+            ModuleRestart::Failed => "failed",
+        };
+        write!(out, "; restart: {restart}")?;
+    }
+    writeln!(out)
+}
+
 #[cfg(test)]
 mod tests {
     use cortexkit_test_support::ScratchDir;
@@ -317,6 +596,7 @@ mod tests {
                 offer: None,
                 report: None,
                 fix: None,
+                modules: None,
             },
             log_tails: Vec::new(),
             exit_code,
@@ -370,6 +650,42 @@ mod tests {
         assert_eq!(document["ok"], false);
         assert_eq!(document["report"], Value::Null);
         assert!(document.get("log_tails").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn latched_sigterm_overrides_a_report_write_failure() {
+        let dir = ScratchDir::new("doctor-signal-write-error");
+        let target = ReportTarget::create(&dir.join("report.json")).unwrap();
+        let output =
+            JsonOutput::for_command(&Command::Doctor(Options::default()), true, false).unwrap();
+        let interrupt = Interrupt::default();
+        let guard = interrupt
+            .protect("a module fix", std::time::Instant::now())
+            .unwrap();
+        assert!(interrupt.on_signal(15).is_some());
+        drop(guard);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = complete(
+            Completion {
+                run: diagnostic(0),
+                issues: None,
+                interrupt: Some(&interrupt),
+            },
+            Some(target),
+            output,
+            &mut stdout,
+            &mut stderr,
+            |_, _| Err(io::Error::other("simulated write failure")),
+        )
+        .unwrap();
+        assert_eq!(code, 143);
+        assert!(String::from_utf8(stderr)
+            .unwrap()
+            .contains("simulated write failure"));
+        let document: Value = serde_json::from_slice(&stdout).unwrap();
+        assert!(document["report"].is_null());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "subc-core"
-version = "0.21.59"
+version = "0.22.0"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -62,6 +62,11 @@ name = "channel-module-rs"
 path = "tests/fixtures/channel_module_rs/main.rs"
 required-features = ["test-support"]
 
+[[bin]]
+name = "doctor-module-fixture"
+path = "tests/fixtures/doctor-module-fixture.rs"
+required-features = ["test-support"]
+
 [features]
 bench-harness = ["subc-daemon/bench-harness"]
 loom = ["subc-daemon/loom"]
@@ -79,10 +84,12 @@ required-features = ["bench-harness"]
 # health-metric rule `ck health` shares with it.
 ck-ui = { path = "../ck-ui", version = "0.9.8" }
 subc-daemon = { path = "../subc-daemon", version = "0.53.0" }
+cortexkit-doctor = "0.1.1"
 cortexkit-log = { version = "0.3.3" }
 cortexkit-paths = "0.1.1"
 base64 = "0.22"
 ed25519-dalek = "2"
+getrandom = "0.4"
 hex-literal = "0.4"
 rusqlite = { version = "0.32", features = ["bundled"] }
 roxmltree = "0.20"
@@ -101,6 +108,7 @@ subc-transport = { path = "../subc-transport", version = "0.18.2" }
 tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "io-util", "sync", "time", "process", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tempfile = "3"
@@ -112,6 +120,7 @@ rustix = { version = "1", default-features = false, features = ["fs", "process"]
 
 [dev-dependencies]
 async-trait = "0.1"
+cortexkit-doctor-conformance = "0.1.1"
 cortexkit-test-support = "0.1.3"
 # Key events for driving the ck app in its live-daemon test.
 crossterm = "0.29"
@@ -119,7 +128,7 @@ portable-pty = "0.9"
 tokio = { version = "1", features = ["test-util"] }
 subc-daemon = { path = "../subc-daemon", version = "0.53.0", features = ["test-support"] }
 # Keep required-feature CLI fixture targets enabled for integration tests.
-subc-core = { path = ".", version = "0.21.59", features = ["test-support"] }
+subc-core = { path = ".", version = "0.22.0", features = ["test-support"] }
 vt100 = "0.15"
 
 [lints.rust]

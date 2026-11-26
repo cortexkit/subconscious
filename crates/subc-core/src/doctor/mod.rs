@@ -3,6 +3,8 @@
 mod fix;
 mod host;
 mod module_checks;
+mod program_checks;
+mod program_fixes;
 mod report;
 pub mod rescue;
 mod run;
@@ -15,8 +17,12 @@ mod tests;
 #[cfg(all(test, feature = "test-support"))]
 pub(crate) use tests::run_with_blocked_describe;
 
+#[cfg(unix)]
+pub use program_checks::run_program_pool;
+pub use program_checks::CheckedProgram;
+pub use program_fixes::{Guard, Interrupt, Programs, Prompter, WaitStatus};
 pub use report::*;
-pub use run::run;
+pub use run::{run, run_with_programs, ProgramRun};
 
 pub(crate) use host::{DescribeOutcome, DoctorHost};
 pub(crate) use stack_checks::{classify_service_and_daemon, ProcessEntry};

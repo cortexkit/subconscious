@@ -38,12 +38,17 @@ use super::{
     window_checks::WindowRow,
 };
 
+#[cfg(unix)]
+mod programs;
+
 struct Fixture {
     scratch: ScratchDir,
     daemon: Arc<FakeDaemon>,
     answers: bool,
     describe_gate: Option<Arc<Gate>>,
     connects: AtomicUsize,
+    #[cfg(unix)]
+    replacements: Mutex<std::collections::VecDeque<RpcResult<Arc<FakeDaemon>>>>,
     manager: (Result<Job, String>, MarkerState),
     manager_gate: Option<Arc<Gate>>,
     process: Option<ProcessEntry>,
@@ -77,6 +82,8 @@ impl Fixture {
             answers: true,
             describe_gate: None,
             connects: AtomicUsize::new(0),
+            #[cfg(unix)]
+            replacements: Mutex::default(),
             manager: (
                 Ok(Job {
                     state: ManagerState::Running,
@@ -276,10 +283,16 @@ impl DoctorHost for Fixture {
         _: Instant,
         hint: &dyn Fn(u32),
     ) -> RpcResult<Arc<dyn DoctorDaemon>> {
-        self.connects.fetch_add(1, Ordering::Relaxed);
+        let _attempt = self.connects.fetch_add(1, Ordering::Relaxed);
         hint(std::process::id());
         if let Some(gate) = &self.describe_gate {
             gate.wait();
+        }
+        #[cfg(unix)]
+        if _attempt != 0 {
+            if let Some(next) = self.replacements.lock().unwrap().pop_front() {
+                return next.map(|daemon| daemon as Arc<dyn DoctorDaemon>);
+            }
         }
         if self.answers {
             Ok(self.daemon.clone())
@@ -326,6 +339,8 @@ impl Reply {
 
 #[derive(Default)]
 struct FakeDaemon {
+    #[cfg(unix)]
+    program_script: programs::DaemonScript,
     modules: Vec<SupervisorEntry>,
     resource_row: bool,
     list: Reply,
@@ -356,6 +371,15 @@ impl DoctorDaemon for FakeDaemon {
         self.record("list", "");
         if let Some(gate) = &self.list_gate {
             gate.wait();
+        }
+        #[cfg(unix)]
+        if let Some(result) = self.program_script.next_list() {
+            return result.map(|modules| SupervisorListResponse {
+                generation: 1,
+                modules,
+                daemon: None,
+                agent_commands: None,
+            });
         }
         self.list.with(|| SupervisorListResponse {
             generation: 1,
@@ -412,6 +436,17 @@ impl DoctorDaemon for FakeDaemon {
                         dropped_lines: 0,
                     })
             })
+    }
+
+    #[cfg(unix)]
+    fn set_enabled(
+        &self,
+        module: &str,
+        enabled: bool,
+        deadline: Instant,
+    ) -> Result<bool, super::host::SetEnabledError> {
+        self.record(if enabled { "start" } else { "stop" }, module);
+        self.program_script.set_enabled(module, enabled, deadline)
     }
 }
 

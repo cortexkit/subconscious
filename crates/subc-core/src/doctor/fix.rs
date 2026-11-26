@@ -11,6 +11,7 @@ pub(super) fn attempt(
         result: None,
         skipped: None,
         findings_before: first.findings.clone(),
+        module_fixes: Vec::new(),
     };
     let Some(offer) = &first.offer else {
         fix.skipped = Some(FixSkip::NothingToFix);

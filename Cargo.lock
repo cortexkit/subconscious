@@ -243,7 +243,7 @@ version = "0.50.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d83a251fa1a4c9d0fe6e816b7acd60549e473e08d14f27a1d992c2675abff05f"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures-util",
  "memchr",
@@ -354,6 +354,12 @@ name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "base64ct"
@@ -531,7 +537,7 @@ version = "0.13.5"
 dependencies = [
  "async-nats",
  "async-trait",
- "base64",
+ "base64 0.22.1",
  "cortexkit-bus-inmemory",
  "cortexkit-bus-naming",
  "cortexkit-bus-nats",
@@ -769,7 +775,7 @@ version = "0.9.5"
 dependencies = [
  "async-nats",
  "async-trait",
- "base64",
+ "base64 0.22.1",
  "cortexkit-test-support",
  "futures-util",
  "nkeys",
@@ -795,6 +801,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "cortexkit-doctor"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a7e2fbe58070e485b38710c4e31c8abf3b191067807fef9f8bb083855935e95"
+dependencies = [
+ "cortexkit-log",
+ "cortexkit-store-types",
+ "hmac",
+ "libc",
+ "regex",
+ "ryu-js 0.2.2",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subc-presence 0.2.1 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
+name = "cortexkit-doctor-conformance"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "662d4a02fced8f4c3818c193e93ae322e7e6525373d1bd4b44e863ea7cc360b0"
+dependencies = [
+ "cortexkit-doctor",
+ "rustix",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "cortexkit-lease"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -806,11 +842,12 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-log"
-version = "0.3.3"
+version = "0.3.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ceae091889f52b64ef218ca24346fd18ed14d24053396d7a8cad031a78c430e7"
+checksum = "8a57138f104249fb102f9844a24eeefe434bfb0665269028f4e207cea850f9be"
 dependencies = [
  "chrono",
+ "cortexkit-lease",
  "cortexkit-store-types",
  "regex",
  "tracing",
@@ -2750,6 +2787,7 @@ version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -2801,6 +2839,12 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
+name = "ryu-js"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6518fc26bced4d53678a22d6e423e9d8716377def84545fe328236e3af070e7f"
 
 [[package]]
 name = "ryu-js"
@@ -3189,16 +3233,19 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.21.59"
+version = "0.22.0"
 dependencies = [
  "async-trait",
- "base64",
+ "base64 0.22.1",
  "ck-ui",
+ "cortexkit-doctor",
+ "cortexkit-doctor-conformance",
  "cortexkit-log",
  "cortexkit-paths",
  "cortexkit-test-support",
  "crossterm",
  "ed25519-dalek",
+ "getrandom 0.4.3",
  "hex-literal",
  "portable-pty",
  "roxmltree",
@@ -3214,7 +3261,7 @@ dependencies = [
  "subc-daemon",
  "subc-jsonc",
  "subc-os",
- "subc-presence",
+ "subc-presence 0.2.1",
  "subc-protocol",
  "subc-transport",
  "tempfile",
@@ -3222,6 +3269,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "ureq",
  "vt100",
 ]
 
@@ -3229,7 +3277,7 @@ dependencies = [
 name = "subc-daemon"
 version = "0.53.0"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "cortexkit-log",
  "cortexkit-paths",
  "cortexkit-project-identity",
@@ -3253,7 +3301,7 @@ dependencies = [
  "subc-jobobject",
  "subc-jsonc",
  "subc-os",
- "subc-presence",
+ "subc-presence 0.2.1",
  "subc-protocol",
  "subc-transport",
  "subc-uptime",
@@ -3302,7 +3350,7 @@ dependencies = [
  "cortexkit-store-types",
  "cortexkit-test-support",
  "rmcp",
- "ryu-js",
+ "ryu-js 1.0.3",
  "serde",
  "serde_json",
  "sha2",
@@ -3347,10 +3395,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "subc-presence"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19071621a4a95e62ee359299b4a86b1e2e3ff39a9dff83d890e2bb41e08144b4"
+dependencies = [
+ "block2",
+ "objc2",
+ "objc2-foundation",
+ "objc2-local-authentication",
+ "rustix",
+ "windows",
+ "windows-future",
+ "zbus",
+ "zeroize",
+]
+
+[[package]]
 name = "subc-protocol"
 version = "0.37.11"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "serde",
  "serde_json",
  "subc-config",
@@ -3620,7 +3685,7 @@ version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f591660438b3038dd04d16c938271c79e7e06260ad2ea2885a4861bfb238605d"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures-core",
  "futures-sink",
@@ -3804,6 +3869,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
+name = "ureq"
+version = "3.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a7ac20be9b7726e0bbdbf974c059676d9acb1cd414961f570a4e8231cacd7fc"
+dependencies = [
+ "base64 0.23.1",
+ "log",
+ "percent-encoding",
+ "rustls",
+ "rustls-pki-types",
+ "ureq-proto",
+ "utf8-zero",
+ "webpki-roots 1.0.9",
+]
+
+[[package]]
+name = "ureq-proto"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "841583fc36089d7d59419568ae157f43a5a03a2e5a81ba87c77d1596ef46e922"
+dependencies = [
+ "base64 0.23.1",
+ "http",
+ "httparse",
+ "log",
+]
+
+[[package]]
 name = "url"
 version = "2.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3814,6 +3907,12 @@ dependencies = [
  "percent-encoding",
  "serde",
 ]
+
+[[package]]
+name = "utf8-zero"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8c0a043c9540bae7c578c88f91dda8bd82e59ae27c21baca69c8b191aaf5a6e"
 
 [[package]]
 name = "utf8_iter"

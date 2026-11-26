@@ -16,6 +16,8 @@ use super::{
     classify_service_and_daemon, fix,
     host::{DoctorDaemon, RpcError, RpcResult, SystemHost},
     module_checks::{self, ModuleFindings, OfflineLogs, HEALTH, LIST},
+    program_checks::{self, CheckedProgram, ProgramChecks, ProgramConfig},
+    program_fixes::Programs,
     report::{DoctorReport, DoctorRun, Finding, Layer, LogTailRecord, Offer, Severity},
     stack_checks::{self, SignatureProbes},
     window_checks::{self, WindowFindings},
@@ -27,15 +29,59 @@ use super::{
 /// This is synchronous. Call it outside an async executor; the checks own their
 /// deadlines and a revert can wait for operating-system approval.
 pub fn run(options: DoctorOptions, logs: Arc<dyn LogFallback>) -> DoctorRun {
-    let options = DoctorOptions {
-        connection_override: options.connection_override.or_else(|| {
-            std::env::var_os("SUBC_CONNECTION_FILE")
-                .filter(|path| !path.is_empty())
-                .map(PathBuf::from)
-        }),
-        ..options
+    run_with(
+        Arc::new(SystemHost::default()),
+        effective_options(options),
+        logs,
+        &Limits::default(),
+    )
+}
+
+fn effective_options(mut options: DoctorOptions) -> DoctorOptions {
+    options.connection_override = options.connection_override.or_else(|| {
+        std::env::var_os("SUBC_CONNECTION_FILE")
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+    });
+    options
+}
+
+/// The final report and the validated program checks that contributed to it.
+#[derive(Debug)]
+pub struct ProgramRun {
+    pub run: DoctorRun,
+    pub checked: Vec<CheckedProgram>,
+}
+
+/// Run the stack doctor and check local module programs. When requested, apply
+/// consented fixes or the existing window revert, but not both in one run.
+/// This is synchronous; the caller owns terminal dialogue and signal delivery.
+pub fn run_with_programs(
+    options: DoctorOptions,
+    programs: Programs<'_>,
+    logs: Arc<dyn LogFallback>,
+) -> ProgramRun {
+    let options = effective_options(options);
+    let host = SystemHost::default();
+    #[cfg(unix)]
+    let host = if options.fix {
+        // The SDK's connection-wide timeout must not cut off a long drain or
+        // operator prompt. The host still bounds each call by its own deadline.
+        let call_timeout = Duration::from_millis(u64::MAX)
+            .saturating_add(super::program_fixes::DRAIN_RESPONSE_MARGIN)
+            .saturating_add(programs.operator_budget);
+        SystemHost { call_timeout }
+    } else {
+        host
     };
-    run_with(Arc::new(SystemHost), options, logs, &Limits::default())
+    run_with_programs_on(
+        Arc::new(host),
+        options,
+        programs,
+        logs,
+        &Limits::default(),
+        &ProgramConfig::default(),
+    )
 }
 
 pub(super) struct Limits {
@@ -68,7 +114,7 @@ pub(super) fn run_with(
     if options.fix && connection_override.is_some() {
         return Pass::default().report(connection_override, None, Some(2));
     }
-    let check = || pass(&host, &logs, connection_override.clone(), limits);
+    let check = || pass(&host, &logs, connection_override.clone(), limits, false);
     let first = check();
     let (final_pass, fix, exit) = if options.fix {
         let (pass, result, exit) = fix::attempt(host.as_ref(), first, check);
@@ -79,6 +125,111 @@ pub(super) fn run_with(
     final_pass.report(connection_override, fix, exit)
 }
 
+pub(super) fn run_with_programs_on(
+    host: Arc<dyn DoctorHost>,
+    options: DoctorOptions,
+    programs: Programs<'_>,
+    logs: Arc<dyn LogFallback>,
+    limits: &Limits,
+    config: &ProgramConfig,
+) -> ProgramRun {
+    let path = options.connection_override;
+    if options.fix && path.is_some() {
+        let pass = Pass {
+            programs: Some(ProgramChecks::default()),
+            ..Pass::default()
+        };
+        return pass.program_report(path, None, Some(2));
+    }
+    let check = || {
+        thread::scope(|scope| {
+            let start = Instant::now();
+            let override_path = path.as_deref();
+            let interrupt = programs.interrupt;
+            let checks = scope
+                .spawn(move || program_checks::check_all(config, override_path, interrupt, start));
+            let mut pass = pass(&host, &logs, path.clone(), limits, options.fix);
+            let mut checks = checks.join().expect("program check worker panicked");
+            pass.findings.append(&mut checks.findings);
+            Finding::sort(&mut pass.findings);
+            pass.programs = Some(checks);
+            pass
+        })
+    };
+    let first = check();
+    if !options.fix {
+        return first.program_report(path, None, None);
+    }
+    let (last, fix, exit) = fix_program_pass(&host, first, check, &programs, limits, config);
+    last.program_report(path, Some(fix), exit)
+}
+
+fn fix_program_pass(
+    host: &Arc<dyn DoctorHost>,
+    first: Pass,
+    check: impl FnOnce() -> Pass,
+    programs: &Programs<'_>,
+    limits: &Limits,
+    config: &ProgramConfig,
+) -> (Pass, super::FixReport, Option<u8>) {
+    use super::{FixReport, FixSkip};
+
+    if programs.interrupt.signal().is_some() {
+        let report = FixReport {
+            result: None,
+            skipped: Some(FixSkip::Interrupted),
+            findings_before: first.findings.clone(),
+            #[cfg(unix)]
+            module_fixes: super::program_fixes::skipped(
+                first.checked(),
+                super::ModuleFixSkip::Interrupted,
+            ),
+            #[cfg(not(unix))]
+            module_fixes: Vec::new(),
+        };
+        return (first, report, None);
+    }
+    #[cfg(unix)]
+    {
+        use super::{program_fixes, ModuleFixSkip};
+
+        if first.offer.is_some() {
+            let reason = if first.manager_overdue {
+                ModuleFixSkip::ManagerObservationOverdue
+            } else {
+                ModuleFixSkip::RevertFirst
+            };
+            let rows = program_fixes::skipped(first.checked(), reason);
+            let (last, mut report, exit) = fix::attempt(host.as_ref(), first, check);
+            report.module_fixes = rows;
+            return (last, report, exit);
+        }
+        let mut first = first;
+        let daemon = first.daemon.take();
+        let repairs =
+            program_fixes::repair(programs, host, daemon, limits.rpc, config, first.checked());
+        let report = FixReport {
+            result: None,
+            skipped: Some(FixSkip::NothingToFix),
+            findings_before: first.findings.clone(),
+            module_fixes: repairs.rows,
+        };
+        let mut last = if repairs.recheck && programs.interrupt.signal().is_none() {
+            check()
+        } else {
+            first
+        };
+        last.findings.extend(repairs.warnings);
+        Finding::sort(&mut last.findings);
+        (last, report, repairs.failed.then_some(1))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (limits, config);
+        fix::attempt(host.as_ref(), first, check)
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Pass {
     pub(super) findings: Vec<Finding>,
@@ -86,9 +237,35 @@ pub(super) struct Pass {
     pub(super) manager_overdue: bool,
     daemon_answered: bool,
     tails: Vec<LogTailRecord>,
+    programs: Option<ProgramChecks>,
+    #[cfg(unix)]
+    daemon: Option<Arc<dyn DoctorDaemon>>,
 }
 
 impl Pass {
+    #[cfg(unix)]
+    fn checked(&self) -> &[CheckedProgram] {
+        self.programs
+            .as_ref()
+            .map_or(&[], |programs| &programs.checked)
+    }
+
+    fn program_report(
+        mut self,
+        path: Option<PathBuf>,
+        fix: Option<super::FixReport>,
+        exit: Option<u8>,
+    ) -> ProgramRun {
+        let checked = self
+            .programs
+            .as_mut()
+            .map_or_else(Vec::new, |programs| std::mem::take(&mut programs.checked));
+        ProgramRun {
+            run: self.report(path, fix, exit),
+            checked,
+        }
+    }
+
     pub(super) fn report(
         self,
         connection_override: Option<PathBuf>,
@@ -109,6 +286,7 @@ impl Pass {
                 offer: self.offer,
                 report: None,
                 fix,
+                modules: self.programs.map(|programs| programs.modules),
             },
             log_tails: self.tails,
             exit_code: exit.unwrap_or(u8::from(!ok)),
@@ -121,6 +299,7 @@ fn pass(
     logs: &Arc<dyn LogFallback>,
     connection_override: Option<PathBuf>,
     limits: &Limits,
+    keep_daemon: bool,
 ) -> Pass {
     let start = Instant::now();
     let local_deadline = start + limits.local;
@@ -177,6 +356,8 @@ fn pass(
             .map(|pid| pid as u32),
         override_path: connection_override,
     };
+    #[cfg(unix)]
+    let fix_daemon = keep_daemon.then(|| daemon.clone()).flatten();
 
     let mut findings = Vec::new();
     let (
@@ -268,12 +449,17 @@ fn pass(
     );
     findings.extend(service_findings);
     Finding::sort(&mut findings);
+    #[cfg(not(unix))]
+    let _ = keep_daemon;
     Pass {
         findings,
         offer: offer.filter(|_| describe.override_path.is_none()),
         manager_overdue,
         daemon_answered: describe.answered,
         tails,
+        programs: None,
+        #[cfg(unix)]
+        daemon: fix_daemon,
     }
 }
 
@@ -363,7 +549,7 @@ fn cpu_findings(
     }
 }
 
-fn check_rpc<T>(result: Check<RpcResult<T>>) -> RpcResult<T> {
+pub(super) fn check_rpc<T>(result: Check<RpcResult<T>>) -> RpcResult<T> {
     match result {
         Check::Finished(result) => result,
         Check::TimedOut => Err(RpcError::TimedOut),

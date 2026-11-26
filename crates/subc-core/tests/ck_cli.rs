@@ -326,7 +326,7 @@ fn bare_json_prints_the_one_top_help() {
     assert_exit(&output, 0);
     assert_eq!(
         text(&output.stdout),
-        "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  setup     plan and apply the managed CortexKit installation\n  upgrade   plan managed component upgrades\n  config    status, plan, apply, stamp, unstamp, history, rollback, place-program\n  module    supervised modules: list, status, resources, profile, stderr, terminals, restart, stop, start, rescan, release\n  catalog   what is registered on the wire (not the supervised roster)\n  routes    live consumers for one module or the whole daemon\n  provenance daemon-attested and module-declared build/process facts\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    inspect, triage, lint, or upgrade the daemon in place\n  doctor    diagnose the stack, even when the daemon is down\n  machine   this machine's id: show it, or adopt a restored one\n  activity  consequential agent and module events\n  stack     stop, start, and check the stack\n  window    record, keep, revert, or abandon placement changes\n\nflags:\n  --subc <file>   use a specific connection file (default: auto-discover)\n  --json          raw JSON output instead of tables\n  --verbose       include diagnostic detail and complete metrics\n\nrun 'ck <domain>' with no verb to see that domain's commands\n"
+        "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  setup     plan and apply the managed CortexKit installation\n  upgrade   plan managed component upgrades\n  config    status, plan, apply, stamp, unstamp, history, rollback, place-program\n  module    supervised modules: list, status, resources, profile, stderr, terminals, restart, stop, start, rescan, release\n  catalog   what is registered on the wire (not the supervised roster)\n  routes    live consumers for one module or the whole daemon\n  provenance daemon-attested and module-declared build/process facts\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    inspect, triage, lint, or upgrade the daemon in place\n  doctor    diagnose the stack and modules; --issue saves or files sanitized reports\n  machine   this machine's id: show it, or adopt a restored one\n  activity  consequential agent and module events\n  stack     stop, start, and check the stack\n  window    record, keep, revert, or abandon placement changes\n\nflags:\n  --subc <file>   use a specific connection file (default: auto-discover)\n  --json          raw JSON output instead of tables\n  --verbose       include diagnostic detail and complete metrics\n\nrun 'ck <domain>' with no verb to see that domain's commands\n"
     );
 }
 
@@ -604,11 +604,12 @@ fn doctor_document(output: &Output, exit_code: i32) -> Value {
             text(&output.stdout)
         )
     });
-    assert_eq!(document.as_object().unwrap().len(), 8, "{document}");
+    assert_eq!(document.as_object().unwrap().len(), 9, "{document}");
     assert_eq!(document["schema"], "ck.doctor.report/v1");
     assert!(document["daemon_answered"].is_boolean());
     assert!(document.get("fix").unwrap().is_null());
     assert!(document.get("offer").unwrap().is_null());
+    assert!(document["modules"].is_array(), "{document}");
     let connection = document.get("connection_override").unwrap();
     assert!(connection.is_null() || connection.is_string());
     let report = document.get("report").unwrap();
@@ -623,7 +624,18 @@ fn doctor_document(output: &Output, exit_code: i32) -> Value {
         !findings.iter().any(|f| f["severity"] == "error")
     );
     for finding in findings {
-        assert_eq!(finding.as_object().unwrap().len(), 6, "{finding}");
+        let fix = finding.get("fix");
+        assert_eq!(
+            finding.as_object().unwrap().len(),
+            6 + usize::from(fix.is_some()),
+            "{finding}"
+        );
+        if let Some(fix) = fix {
+            assert!(fix.is_object(), "{finding}");
+            assert!(finding["evidence"].is_array(), "{finding}");
+        } else {
+            assert!(finding["evidence"].is_object(), "{finding}");
+        }
         for key in ["id", "layer", "owner", "summary"] {
             assert!(finding[key].is_string(), "invalid {key}: {finding}");
         }
@@ -631,7 +643,6 @@ fn doctor_document(output: &Output, exit_code: i32) -> Value {
             finding["severity"].as_str(),
             Some("error" | "warning" | "info")
         ));
-        assert!(finding["evidence"].is_object(), "{finding}");
     }
     document
 }
@@ -803,6 +814,40 @@ async fn doctor_fix_with_subc_is_refused_before_creating_a_report() {
     assert!(output.stdout.is_empty(), "stdout: {}", text(&output.stdout));
     assert!(text(&output.stderr).contains("--fix cannot be used with --subc"));
     assert!(!requested.exists());
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn doctor_windows_reports_unsupported_programs_and_no_issue_candidates() {
+    let rig = DoctorRig::new();
+    let config = rig.root.join("config/cortexkit");
+    fs::create_dir(&config).unwrap();
+    fs::write(
+        config.join("subc.jsonc"),
+        json!({"version": 1, "modules": {
+            "binary": {"program": rig.root.join("unused.exe"), "enabled": false}
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let mut command = rig.command();
+    command.args(["doctor", "--json"]);
+    let output = doctor_output(command, Duration::from_secs(15)).await;
+    let document = doctor_document(&output, 1);
+    assert_eq!(
+        document["modules"],
+        json!([{
+            "id": "binary", "outcome": "unsupported_platform", "findings": 0, "detail": null
+        }])
+    );
+    let finding = only_doctor_finding(&document, &["module_program.unsupported_platform"]);
+    assert_eq!(finding["severity"], "info");
+
+    let mut command = rig.command();
+    command.args(["doctor", "--issue"]);
+    let output = doctor_output(command, Duration::from_secs(15)).await;
+    assert_exit(&output, 1);
+    assert!(text(&output.stdout).ends_with("No module findings to file.\n"));
 }
 
 #[tokio::test]
@@ -1513,7 +1558,7 @@ async fn bare_ck_renders_degraded_module_and_no_updates_byte_for_byte() {
     let uptime_after = connection_file_elapsed(&server.connection_file_path);
     assert_rendered_with_uptime(&output, &uptime_before, &uptime_after, |uptime| {
         format!(
-            "ck {} · daemon running (pid {}, up {uptime}, 2 clients)\nmodules: insula degraded (1 provider failing)\nupdates: none\n\ncommands: setup · upgrade · module · health · routes · quota · daemon\nrun `ck <command>` for its verbs, `ck --help` for everything\n",
+            "ck {} · daemon running (pid {}, up {uptime}, 2 clients)\nmodules: insula degraded (1 provider failing)\nupdates: none\n\ncommands: setup · upgrade · module · health · routes · quota · daemon · doctor\nrun `ck <command>` for its verbs, `ck --help` for everything\n",
             env!("CARGO_PKG_VERSION"),
             std::process::id()
         )

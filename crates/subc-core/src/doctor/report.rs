@@ -34,6 +34,9 @@ pub struct DoctorReport {
     pub report: Option<ReportFile>,
     /// Revert attempted or skipped by `--fix`.
     pub fix: Option<FixReport>,
+    /// Program outcomes, omitted by the stack-only doctor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modules: Option<Vec<ModuleCheck>>,
 }
 
 /// Path and privacy status of the full report written locally.
@@ -63,6 +66,87 @@ pub struct FixReport {
     pub skipped: Option<FixSkip>,
     /// The first pass's findings, even if a second pass ran.
     pub findings_before: Vec<Finding>,
+    /// Decisions and results in module fix application order.
+    pub module_fixes: Vec<ModuleFix>,
+}
+
+/// Outcome of asking one configured module for its own diagnostics.
+#[derive(Debug, Serialize)]
+pub struct ModuleCheck {
+    pub id: String,
+    pub outcome: ModuleOutcome,
+    pub findings: usize,
+    pub detail: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModuleOutcome {
+    Findings,
+    Clean,
+    NoChecks,
+    SpawnFailed,
+    Crashed,
+    TimedOut,
+    InvalidOutput,
+    NotStarted,
+    NotAsked,
+    UnsupportedPlatform,
+}
+
+/// Decision, result, and enabledness restoration for one offered module fix.
+#[derive(Debug, Serialize)]
+pub struct ModuleFix {
+    pub module: String,
+    pub finding: String,
+    pub class: cortexkit_doctor::FixClass,
+    pub decision: ModuleFixDecision,
+    pub skip_reason: Option<ModuleFixSkip>,
+    pub result: Option<ModuleFixResult>,
+    pub restart: Option<ModuleRestart>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModuleFixDecision {
+    Applied,
+    Declined,
+    Skipped,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModuleFixSkip {
+    NoTerminal,
+    RevertFirst,
+    ManagerObservationOverdue,
+    StopFailed,
+    ProgramChanged,
+    Interrupted,
+    SignalSetupFailed,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ModuleFixResult {
+    pub outcome: ModuleFixOutcome,
+    pub code: Option<String>,
+    pub evidence: Option<Vec<cortexkit_doctor::Evidence>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModuleFixOutcome {
+    Fixed,
+    Refused,
+    Failed,
+    NoResult,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModuleRestart {
+    Enabled,
+    Failed,
 }
 
 /// Reason an explicitly requested revert was not attempted.
@@ -71,6 +155,7 @@ pub struct FixReport {
 pub enum FixSkip {
     NothingToFix,
     ManagerObservationOverdue,
+    Interrupted,
 }
 
 /// Diagnostic layer, in report order.
@@ -83,6 +168,7 @@ pub enum Layer {
     Disk,
     Window,
     Module,
+    ModuleProgram,
 }
 
 impl Layer {
@@ -94,6 +180,7 @@ impl Layer {
             Self::Disk => "disk",
             Self::Window => "window",
             Self::Module => "module",
+            Self::ModuleProgram => "module_program",
         }
     }
 }
@@ -122,6 +209,9 @@ pub struct Finding {
     pub summary: String,
     /// Catalogue-specific structured fields.
     pub evidence: serde_json::Value,
+    /// The validated fix declaration of a program finding.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fix: Option<cortexkit_doctor::Fix>,
     #[serde(skip)]
     subject: String,
     #[serde(skip)]
@@ -146,6 +236,7 @@ impl Finding {
             summary: one_line(&summary.into()),
             evidence: serde_json::to_value(evidence)
                 .expect("findings use JSON-compatible evidence"),
+            fix: None,
             subject: String::new(),
             check: "",
             module: None,
@@ -192,7 +283,13 @@ impl Finding {
     }
 
     pub(super) fn sort(findings: &mut [Self]) {
-        findings.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+        findings.sort_by(|a, b| {
+            if a.layer == Layer::ModuleProgram && b.layer == Layer::ModuleProgram {
+                (&a.owner, a.severity, &a.id).cmp(&(&b.owner, b.severity, &b.id))
+            } else {
+                a.sort_key().cmp(&b.sort_key())
+            }
+        });
     }
 
     fn sort_key(&self) -> (Layer, Severity, &str, &str, &str, &str, Option<&str>) {

@@ -11,8 +11,8 @@ usage() {
 Usage: scripts/gate.sh {fast|lint|test|swift|ts|all} [check]
 
   fast   Formatting; committed crate versions; offline locked Cargo metadata;
-         path-dependency policy and its tests; CortexKit layout (including
-         git ls-files -ci --exclude-standard -- .cortexkit); Markdown links and
+         path-dependency policy and its tests; CortexKit layout (every tracked
+         path under .cortexkit is on the allowlist); Markdown links and
          test citations; source-file size pins; every wire-vector generator and
          SHA256SUMS; installer ShellCheck, Unix installer contract, and shell
          self-tests for release and placement scripts. Fails at the first bad check.

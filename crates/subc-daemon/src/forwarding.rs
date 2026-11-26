@@ -4502,86 +4502,10 @@ fn remove_module_connection_locked(
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct RequestCredit {
-    subscription: bool,
-    watch_credit: bool,
-    excluded_from_drain: bool,
-}
-
-/// Held credits by correlation, with exact totals kept beside them so a busy
-/// refusal can report the occupancy without walking every held credit.
-#[derive(Debug, Default)]
-struct CreditLedger {
-    by_corr: HashMap<u64, Vec<RequestCredit>>,
-    total: usize,
-    subscriptions: usize,
-}
-
-impl CreditLedger {
-    fn acquire(&mut self, corr: u64, subscription: bool, watch_credit: bool) {
-        self.total += 1;
-        self.subscriptions += usize::from(subscription);
-        self.by_corr.entry(corr).or_default().push(RequestCredit {
-            subscription,
-            watch_credit,
-            excluded_from_drain: false,
-        });
-    }
-
-    fn release(&mut self, corr: u64) -> Option<RequestCredit> {
-        let credits = self.by_corr.get_mut(&corr)?;
-        let released = credits.pop();
-        if credits.is_empty() {
-            self.by_corr.remove(&corr);
-        }
-        if let Some(credit) = &released {
-            self.total -= 1;
-            self.subscriptions -= usize::from(credit.subscription);
-        }
-        released
-    }
-
-    fn capture_subscription_exclusions(&mut self) -> u32 {
-        let mut excluded = 0u32;
-        for credit in self.by_corr.values_mut().flatten() {
-            if credit.subscription && !credit.excluded_from_drain {
-                credit.excluded_from_drain = true;
-                excluded = excluded.saturating_add(1);
-            }
-        }
-        excluded
-    }
-
-    fn in_flight(&self) -> usize {
-        self.total
-    }
-
-    fn drain_in_flight(&self) -> usize {
-        self.by_corr
-            .values()
-            .flatten()
-            .filter(|credit| !credit.excluded_from_drain)
-            .count()
-    }
-
-    /// The correlation ids of the requests a drain still waits on, one entry
-    /// per held credit, in ascending order.
-    fn drain_held_corrs(&self) -> Vec<u64> {
-        let mut corrs = self
-            .by_corr
-            .iter()
-            .flat_map(|(corr, credits)| {
-                credits
-                    .iter()
-                    .filter(|credit| !credit.excluded_from_drain)
-                    .map(move |_| *corr)
-            })
-            .collect::<Vec<_>>();
-        corrs.sort_unstable();
-        corrs
-    }
-}
+mod credit_ledger;
+mod stalled_cancels;
+use credit_ledger::CreditLedger;
+pub(crate) use stalled_cancels::StalledCancels;
 
 #[derive(Debug, Default)]
 struct ChannelFlowState {
@@ -4807,6 +4731,7 @@ impl ChannelFlow {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.closed = true;
+        state.credits.close_cancel_tracking();
         self.sem.close();
         if let Some(sem) = &self.watch_sem {
             sem.close();

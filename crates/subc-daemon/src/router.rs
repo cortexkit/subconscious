@@ -525,7 +525,12 @@ impl FrameSink {
     // including when the bytes were charged before retirement began. Ordinary
     // sends silently discard retired traffic; flush callers must not report it
     // as queued or written.
-    async fn send_outbound(&self, outbound: OutboundFrame, mask: u8) -> Result<u8, RouterError> {
+    async fn send_outbound(
+        &self,
+        outbound: OutboundFrame,
+        mask: u8,
+        on_queue: impl FnOnce(),
+    ) -> Result<u8, RouterError> {
         let header = &outbound.frame.header;
         let closed = || {
             RouterError::backend_with_epoch(
@@ -553,18 +558,21 @@ impl FrameSink {
         if state != 0 {
             return Ok(state);
         }
+        // Record a forwarded CANCEL before the module can answer it.
+        on_queue();
         permit.send(outbound);
         Ok(0)
     }
 
     pub async fn send(&self, frame: Frame) -> Result<(), RouterError> {
-        self.send_with_fence(frame, None).await
+        self.send_with_fence(frame, None, || {}).await
     }
 
     async fn send_with_fence(
         &self,
         frame: Frame,
         refusal: Option<RouterError>,
+        on_queue: impl FnOnce(),
     ) -> Result<(), RouterError> {
         let mask = EGRESS_TERMINAL
             | if refusal.is_some() {
@@ -594,7 +602,7 @@ impl FrameSink {
             Err(state) => return result(state),
         };
         result(
-            self.send_outbound(OutboundFrame::charged(frame, charge), mask)
+            self.send_outbound(OutboundFrame::charged(frame, charge), mask, on_queue)
                 .await?,
         )
     }
@@ -604,7 +612,7 @@ impl FrameSink {
         frame: Frame,
         refusal: RouterError,
     ) -> Result<(), RouterError> {
-        self.send_with_fence(frame, Some(refusal)).await
+        self.send_with_fence(frame, Some(refusal), || {}).await
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -661,7 +669,7 @@ impl FrameSink {
             .map_err(|_| RouterError::backend(0, 0, "connection writer closed"))?;
         let mut outbound = OutboundFrame::charged(frame, charge);
         outbound.flushed = Some(tx);
-        if self.send_outbound(outbound, EGRESS_TERMINAL).await? != 0 {
+        if self.send_outbound(outbound, EGRESS_TERMINAL, || {}).await? != 0 {
             return Err(RouterError::backend(0, 0, "connection egress retired"));
         }
         queued();
@@ -767,7 +775,7 @@ impl FrameSink {
         {
             return Err(failure("client_closed", closed()));
         }
-        let (frame, error) = match self.try_send_owned(frame) {
+        let (frame, error) = match self.try_send_owned(frame, || {}) {
             Ok(()) => return Ok(()),
             Err(refused) => refused,
         };
@@ -795,13 +803,19 @@ impl FrameSink {
     /// queue past its byte budget, when the channel's frame-count backstop is
     /// full, or when the writer is gone.
     pub(crate) fn try_send(&self, frame: Frame) -> Result<(), RouterError> {
-        self.try_send_owned(frame).map_err(|(_, error)| error)
+        self.try_send_owned(frame, || {})
+            .map_err(|(_, error)| error)
     }
 
-    fn try_send_owned(&self, frame: Frame) -> Result<(), (Frame, RouterError)> {
+    fn try_send_owned(
+        &self,
+        frame: Frame,
+        on_queue: impl FnOnce(),
+    ) -> Result<(), (Frame, RouterError)> {
         self.try_send_ack(
             frame,
             None,
+            on_queue,
             #[cfg(all(
                 feature = "test-support",
                 any(target_os = "linux", target_os = "macos")
@@ -823,6 +837,7 @@ impl FrameSink {
         self.try_send_ack(
             frame,
             Some(ack),
+            || {},
             #[cfg(all(
                 feature = "test-support",
                 any(target_os = "linux", target_os = "macos")
@@ -836,6 +851,7 @@ impl FrameSink {
         &self,
         frame: Frame,
         ack: Option<tokio::sync::oneshot::Sender<()>>,
+        on_queue: impl FnOnce(),
         #[cfg(all(
             feature = "test-support",
             any(target_os = "linux", target_os = "macos")
@@ -900,6 +916,8 @@ impl FrameSink {
         {
             outbound.fixture_flush_gate = fixture_flush_gate;
         }
+        // Only record a CANCEL once it has a slot and egress is still live.
+        on_queue();
         permit.send(outbound);
         Ok(())
     }
@@ -1905,38 +1923,9 @@ impl Router {
         }
         Ok(())
     }
-
-    /// Ask the module to stop a request whose client delivery was refused. The
-    /// CANCEL is best effort and never waits: the module's own reader must not
-    /// stall on that module's egress, and the request keeps its credit either
-    /// way until the module's terminal arrives.
-    fn cancel_refused_module_request(&self, route: &RouteBinding, corr: u64) {
-        let cancel = Frame::build_with_version(
-            route.module_negotiated_ver,
-            FrameType::Cancel,
-            Flags::new(false, Priority::Passive, false),
-            route.module_channel,
-            route.module_epoch,
-            corr,
-            Vec::new(),
-        );
-        let sent = cancel.map_err(|err| err.to_string()).and_then(|cancel| {
-            route
-                .module_sink
-                .try_send(cancel)
-                .map_err(|err| err.to_string())
-        });
-        if let Err(error) = sent {
-            warn!(
-                module_id = %route.module_id,
-                module_channel = route.module_channel,
-                corr,
-                %error,
-                "could not send CANCEL for a request whose stream chunk was refused as too large"
-            );
-        }
-    }
 }
+
+mod refused_delivery;
 
 impl Default for Router {
     fn default() -> Self {
@@ -2132,6 +2121,7 @@ impl ForwardBackend {
         let channel = frame.header.channel;
         let corr = frame.header.corr;
         let request = frame.header.ty == FrameType::Request;
+        let cancel = frame.header.ty == FrameType::Cancel;
         let mut frame = frame;
         frame.header.channel = route.module_channel;
         frame.header.epoch = route.module_epoch;
@@ -2147,6 +2137,11 @@ impl ForwardBackend {
                 epoch: route.client_epoch,
                 corr,
             }),
+            || {
+                if cancel {
+                    route.record_forwarded_cancel(corr, counters);
+                }
+            },
         );
         let result = counters
             .observe_reader_wait(
@@ -5244,5 +5239,10 @@ mod tests {
     mod audit_findings {
         use super::*;
         include!("router_audit_tests.rs");
+
+        mod stalled_cancels {
+            use super::*;
+            include!("router_stalled_cancel_tests.rs");
+        }
     }
 }

@@ -1811,6 +1811,8 @@ async fn serve_bound_daemon(
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     drop(publication_lock);
     let _clock_step_task = AbortOnDrop::new(crate::watchdog::spawn_clock_step_monitor());
+    let _stalled_cancel_task =
+        AbortOnDrop::new(control.forwarding().spawn_stalled_cancel_monitor());
     // Off the startup path: it runs `systemctl`, and only ever logs.
     #[cfg(target_os = "linux")]
     let _kill_mode_check = AbortOnDrop::new(tokio::spawn(

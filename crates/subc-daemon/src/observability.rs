@@ -147,6 +147,7 @@ impl Drop for ConnectedClientGuard {
 /// Counters for route lifecycle drops, delivery failures and reader waits.
 #[derive(Debug, Clone, Default)]
 pub struct DaemonCounters {
+    stalled_cancels: crate::forwarding::StalledCancels,
     reader_diagnostics: Arc<Mutex<ReaderDiagnostics>>,
     carried_containment_anchor_lost: Arc<AtomicU64>,
     /// Every non-request frame a module sent on a (channel, epoch) the daemon
@@ -260,10 +261,18 @@ impl DaemonCounters {
         Self::default()
     }
 
+    pub(crate) fn stalled_cancels(&self) -> &crate::forwarding::StalledCancels {
+        &self.stalled_cancels
+    }
+
     /// Returns a JSON snapshot whose stable, additive schema keeps the
     /// `server.describe` diagnostic endpoint backward-compatible.
     pub fn snapshot(&self) -> Value {
         let mut snapshot = serde_json::Map::new();
+        snapshot.insert(
+            "stalled_cancels".into(),
+            self.stalled_cancels.count().into(),
+        );
         let diagnostics = self
             .reader_diagnostics
             .lock()

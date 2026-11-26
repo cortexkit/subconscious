@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.52.3
+
+- Warn once when a module has not sent a terminal 30 seconds after a forwarded CANCEL. Report the number of such requests still holding credit in `server.describe` as `stalled_cancels`; request and watch credit release is unchanged.
+
 ## 0.52.2
 
 - Test-only: pause the settings integrity poller during slow-retry recovery tests so it cannot delay retry admission.

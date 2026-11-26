@@ -35,7 +35,8 @@ exit: Some(0)
     "module_orphan_route_goodbyes_sent": 0,
     "module_requests_dropped_stale_route": 0,
     "route_release_stale_skipped": 0,
-    "route_released_epoch_fenced": 0
+    "route_released_epoch_fenced": 0,
+    "stalled_cancels": 0
   },
   "machine_id": "<machine_ids>",
   "op": "server.describe",

@@ -75,10 +75,14 @@ async fn ordinary_unix_exit_terminates_helpers_before_leader_is_reaped() {
         program: PathBuf::from("/bin/sh"),
         args: vec![
             "-c".into(),
+            // As in the test below, the helper waits on a background sleep with the
+            // `wait` builtin, so a TERM that lands before the sleep child has exec'd
+            // still runs the helper's trap at once.
             r#"
                 /bin/sh -c 'trap "/usr/bin/touch \"$1/term\"; exit 0" TERM
+                    /bin/sleep 4 &
                     /usr/bin/touch "$1/ready"
-                    /bin/sleep 4' helper "$1" &
+                    wait' helper "$1" &
                 while [ ! -e "$1/ready" ]; do /bin/sleep .01; done
                 exit 33
             "#
@@ -120,12 +124,23 @@ async fn ordinary_unix_restart_stop_and_shutdown_send_term_to_the_group() {
         carry_containment: false,
         module_id: "group-stop".into(),
         program: PathBuf::from("/bin/sh"),
+        // The helper sleeps in the background and waits with the `wait` builtin
+        // rather than running the sleep in the foreground. A trapped signal ends
+        // `wait` at once, but a shell runs a trap only after its foreground
+        // command finishes. A group TERM can land after "ready" while the forked
+        // sleep child has not exec'd yet and still runs the shell's TERM handler
+        // (dash unblocks signals in the forked child before it execs the
+        // command). That child swallows the TERM and keeps sleeping, so a
+        // foreground sleep would hold the trap back until the daemon's KILL at
+        // the end of the group's TERM grace, and the helper would never write
+        // its line.
         args: vec![
             "-c".into(),
             r#"
             /bin/sh -c 'trap "echo term >> \"$1/terms\"; exit 0" TERM
+                /bin/sleep 15 &
                 echo ready >> "$1/ready"
-                /bin/sleep 15' helper "$1" &
+                wait' helper "$1" &
             wait
         "#
             .into(),
@@ -170,6 +185,8 @@ async fn ordinary_unix_restart_stop_and_shutdown_send_term_to_the_group() {
     supervisor
         .end_children_for_daemon_shutdown(false, std::future::pending())
         .await;
+    // Shutdown returns only after the group has no live members or its TERM grace has
+    // ended in a KILL, so the helper has already written its line when it returns.
     assert_eq!(
         std::fs::read_to_string(dir.join("terms"))
             .unwrap()

@@ -1870,14 +1870,17 @@ if [ "$RESTART" -eq 1 ]; then
     fi
   fi
   # Measure whether the new build changed the store, rather than assume it from
-  # --migrates. Compare the snapshot's schema and user_version with the live
-  # store's once the new build has started. A data-only migration (rows in a
+  # --migrates. Compare the snapshot's schema objects and user_version with the
+  # live store's once the new build has started. The objects are sorted by
+  # type and name: `.schema` prints them in storage order, which a backup can
+  # renumber without changing any object. A data-only migration (rows in a
   # migrations table, no shape change) doesn't show here, so "unchanged" is
   # evidence for a binary-only rollback, not proof; the owner's migration
   # chains decide. Reads only; a failed read never blocks.
   if [ -z "$WINDOW" ] && [ -n "${store_rb:-}" ] && [ -s "${store_rb:-}" ]; then
-    if s_before=$(sqlite3 "file:$store_rb?immutable=1" '.schema' 'PRAGMA user_version;' 2>/dev/null) \
-      && s_after=$(sqlite3 "file:$MIGRATES?mode=ro" '.schema' 'PRAGMA user_version;' 2>/dev/null); then
+    schema_q="SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name; PRAGMA user_version;"
+    if s_before=$(sqlite3 "file:$store_rb?immutable=1" "$schema_q" 2>/dev/null) \
+      && s_after=$(sqlite3 "file:$MIGRATES?mode=ro" "$schema_q" 2>/dev/null); then
       if [ "$s_before" = "$s_after" ]; then
         say "store schema and user_version unchanged since the snapshot: rollback is binary-only unless the owner's migration chains say otherwise; the snapshot is kept"
       else

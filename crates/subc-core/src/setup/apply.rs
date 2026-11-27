@@ -335,6 +335,25 @@ impl SetupBackend {
             let binary_ok =
                 components::is_installed(component, &self.paths.binary_home, &self.inventory);
             if !request.uninstall && selected.contains(&component) && !binary_ok {
+                if component.stops_before_upgrade()
+                    && (registered_modules
+                        .as_ref()
+                        .is_some_and(|modules| modules.contains(component.label()))
+                        || components::installation_binary_paths(
+                            component,
+                            &self.paths.binary_home,
+                        )
+                        .iter()
+                        .any(|path| {
+                            components::OWNED_BINARY_KINDS
+                                .iter()
+                                .any(|kind| self.inventory.owns_path(kind, path))
+                        }))
+                {
+                    // Setup only installs a new pair. Adding one binary from
+                    // a newer release could break the module already on disk.
+                    configuration_refusals.insert(component, format!("{component} has an incomplete managed installation; restore both binaries from its original release before upgrading"));
+                }
                 if let PlatformObservation::Supported(target) = PlatformObservation::current() {
                     if let Some((missing_commands, module_matches_release)) =
                         components::partial_install(

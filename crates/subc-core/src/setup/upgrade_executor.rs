@@ -74,6 +74,16 @@ pub trait UpgradeExecutionBackend {
     }
     fn download_and_verify(&mut self, target: UpgradeTarget) -> Result<String, String>;
     fn create_rollback_copy(&mut self, target: UpgradeTarget) -> Result<String, String>;
+    fn stop_module(
+        &mut self,
+        _target: UpgradeTarget,
+        _timeout: Duration,
+    ) -> Result<String, String> {
+        Err("stopping before placement is not implemented by this backend".into())
+    }
+    fn start_module(&mut self, _target: UpgradeTarget) -> Result<String, String> {
+        Err("starting after placement is not implemented by this backend".into())
+    }
     fn replace_destination(&mut self, target: UpgradeTarget) -> Result<String, String>;
     fn warm_execute(&mut self, target: UpgradeTarget) -> Result<String, String>;
     fn refresh_plexus_catalog(&mut self, _target: UpgradeTarget) -> Result<String, String> {
@@ -195,6 +205,11 @@ pub fn execute_upgrade<B: UpgradeExecutionBackend>(
                 "rollback-copy",
                 backend.create_rollback_copy(*target),
             ),
+            UpgradeOperation::StopModule { target } => (
+                *target,
+                "module-stop",
+                backend.stop_module(*target, RESTART_COMPLETION_TIMEOUT),
+            ),
             UpgradeOperation::ReplaceDestination { target } => (
                 *target,
                 "destination-replacement",
@@ -213,6 +228,9 @@ pub fn execute_upgrade<B: UpgradeExecutionBackend>(
                 "restart-initiation",
                 backend.initiate_module_restart(*target, DRAIN_TIMEOUT),
             ),
+            UpgradeOperation::StartModule { target } => {
+                (*target, "module-start", backend.start_module(*target))
+            }
             UpgradeOperation::PollModuleRestartCompletion { target } => (
                 *target,
                 "restart-completion",
@@ -278,6 +296,7 @@ pub fn execute_upgrade<B: UpgradeExecutionBackend>(
                     stage,
                     "download-and-verify"
                         | "rollback-copy"
+                        | "module-stop"
                         | "destination-replacement"
                         | "warm-execution"
                         | "plexus-catalog"

@@ -64,6 +64,26 @@ impl Transaction {
         )
     }
 
+    pub fn prepare_replacement(
+        &mut self,
+        target: &Path,
+        candidate: &Path,
+    ) -> Result<usize, String> {
+        let index = files::prepare(
+            &mut self.journal,
+            target,
+            files::Kind::File,
+            &files::Content::File(candidate),
+        )?;
+        files::retain_previous(&self.journal, index)?;
+        Ok(index)
+    }
+
+    pub fn apply_replacement(&mut self, index: usize, candidate: &Path) -> Result<(), String> {
+        files::act(&self.journal, index, files::Content::File(candidate))?;
+        self.journal.done(index)
+    }
+
     pub fn remove(&mut self, target: &Path) -> Result<(), String> {
         files::place(
             &mut self.journal,

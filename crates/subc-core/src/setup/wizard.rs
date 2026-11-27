@@ -270,10 +270,12 @@ pub fn operation_stage(operation: &UpgradeOperation) -> Option<(UpgradeTarget, &
         UpgradeOperation::ObservePlatform => return None,
         UpgradeOperation::DownloadAndVerify { target } => (*target, "download-and-verify"),
         UpgradeOperation::CreateRollbackCopy { target } => (*target, "rollback-copy"),
+        UpgradeOperation::StopModule { target } => (*target, "module-stop"),
         UpgradeOperation::ReplaceDestination { target } => (*target, "destination-replacement"),
         UpgradeOperation::WarmExecute { target } => (*target, "warm-execution"),
         UpgradeOperation::RefreshPlexusCatalog { target } => (*target, "plexus-catalog"),
         UpgradeOperation::InitiateModuleRestart { target } => (*target, "restart-initiation"),
+        UpgradeOperation::StartModule { target } => (*target, "module-start"),
         UpgradeOperation::PollModuleRestartCompletion { target } => (*target, "restart-completion"),
         UpgradeOperation::RestartDaemonViaServiceManager { target } => {
             (*target, "service-manager-restart")
@@ -323,7 +325,10 @@ pub fn plan_rows(
                     .contains(&UpgradeOperation::RefreshPlexusCatalog { target });
             let restarted = plan
                 .operations
-                .contains(&UpgradeOperation::InitiateModuleRestart { target });
+                .contains(&UpgradeOperation::InitiateModuleRestart { target })
+                || plan
+                    .operations
+                    .contains(&UpgradeOperation::StartModule { target });
             let (installed, new, what) = match observed.target_state(target) {
                 UpgradeState::UpdateAvailable { from, to, .. } => {
                     let what = if !replaced {
@@ -480,6 +485,16 @@ impl<B: UpgradeExecutionBackend> UpgradeExecutionBackend for Reporting<'_, B> {
         self.stage(Some(target), "rollback-copy", |b| {
             b.create_rollback_copy(target)
         })
+    }
+
+    fn stop_module(&mut self, target: UpgradeTarget, timeout: Duration) -> Result<String, String> {
+        self.stage(Some(target), "module-stop", |b| {
+            b.stop_module(target, timeout)
+        })
+    }
+
+    fn start_module(&mut self, target: UpgradeTarget) -> Result<String, String> {
+        self.stage(Some(target), "module-start", |b| b.start_module(target))
     }
 
     fn replace_destination(&mut self, target: UpgradeTarget) -> Result<String, String> {

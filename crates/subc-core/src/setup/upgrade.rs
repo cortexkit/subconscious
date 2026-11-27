@@ -30,6 +30,9 @@ use super::{
     },
 };
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "upgrade/basal_tests.rs"]
+mod basal_tests;
 mod journal;
 #[cfg(test)]
 #[path = "upgrade/plexus_tests.rs"]
@@ -611,6 +614,50 @@ pub fn observed_upgrade_targets(
         })
         .collect::<BTreeMap<_, _>>();
     let mut observed = observed_from_metadata(metadata, &installed);
+    let grouped: Vec<_> = observed
+        .roster
+        .iter()
+        .copied()
+        .filter(|target| target.component.stops_before_upgrade())
+        .collect();
+    for target in grouped
+        .iter()
+        .copied()
+        .filter(|target| target.module_id().is_some())
+    {
+        let members = || {
+            grouped
+                .iter()
+                .copied()
+                .filter(|member| member.component == target.component)
+        };
+        if members().any(|member| {
+            matches!(
+                observed.target_state(member),
+                UpgradeState::UpdateAvailable { .. }
+            )
+        }) && members().all(|member| {
+            observed.release(member) == crate::setup::model::ReleaseAvailability::Available
+        }) {
+            for member in members() {
+                if observed.target_state(member) == UpgradeState::Current {
+                    let release = &metadata.targets[member.label()];
+                    observed.targets.insert(
+                        member.label().into(),
+                        UpgradeState::UpdateAvailable {
+                            from: if release.reports_release_version {
+                                installed[member.label()].version.clone()
+                            } else {
+                                String::new()
+                            },
+                            to: release.version.clone(),
+                            reason: Some("upgrading the module and worker together".into()),
+                        },
+                    );
+                }
+            }
+        }
+    }
     let plexus = observed
         .roster
         .iter()
@@ -703,6 +750,7 @@ pub struct SystemUpgradeBackend {
     journal_activations: BTreeMap<String, usize>,
     core_cut: CoreCut,
     plexus_admin_verified: bool,
+    grouped_placement: bool,
     platform: AlphaTarget,
     targets: BTreeMap<String, ManagedUpgradeTarget>,
     executable: PathBuf,
@@ -930,6 +978,7 @@ impl SystemUpgradeBackend {
             runner: Box::new(crate::setup::runtime::SystemCommandRunner),
             core_cut: CoreCut::default(),
             plexus_admin_verified: false,
+            grouped_placement: false,
             app_hold: None,
             rollback_prompt: None,
             journal_activations: BTreeMap::new(),
@@ -1028,14 +1077,34 @@ impl SystemUpgradeBackend {
         }
     }
 
-    fn module_ready(&self, target: UpgradeTarget) -> Result<bool, String> {
+    fn run_ck_with_runner(&mut self, args: &[&str]) -> Result<String, String> {
+        let mut command = Vec::new();
+        if let Some(subc) = &self.subc {
+            command.extend(["--subc".into(), subc.to_string_lossy().into_owned()]);
+        }
+        command.extend(args.iter().map(|arg| (*arg).to_owned()));
+        let output = self
+            .runner
+            .run(&self.executable.to_string_lossy(), &command)?;
+        if output.success {
+            Ok(output.stdout)
+        } else {
+            Err(format!(
+                "ck {} failed: {}",
+                args.join(" "),
+                output.explanation()
+            ))
+        }
+    }
+
+    fn module_ready(&mut self, target: UpgradeTarget) -> Result<bool, String> {
         let module_id = target
             .module_id()
             .ok_or_else(|| format!("{target} is not a supervised module"))?;
         // A module restart rides on the daemon; if the daemon itself is
         // between incarnations when this polls, the status call fails and
         // that is "not yet" under the completion budget, not a verdict.
-        let Ok(output) = self.run_ck(&["--json", "module", "status", module_id]) else {
+        let Ok(output) = self.run_ck_with_runner(&["--json", "module", "status", module_id]) else {
             return Ok(false);
         };
         let value: Value = serde_json::from_str(&output)
@@ -1053,7 +1122,7 @@ impl SystemUpgradeBackend {
         Ok(live && healthy)
     }
 
-    fn wait_until<F>(&self, timeout: Duration, mut ready: F) -> Result<(), String>
+    fn wait_until<F>(timeout: Duration, mut ready: F) -> Result<(), String>
     where
         F: FnMut() -> Result<bool, String>,
     {
@@ -1133,11 +1202,11 @@ impl SystemUpgradeBackend {
         Ok(disk)
     }
 
-    fn module_provenance(&self, target: UpgradeTarget) -> Result<(Option<u32>, bool), String> {
+    fn module_provenance(&mut self, target: UpgradeTarget) -> Result<(Option<u32>, bool), String> {
         let module_id = target
             .module_id()
             .ok_or_else(|| format!("{target} is not a supervised module"))?;
-        let output = self.run_ck(&["--json", "provenance", module_id])?;
+        let output = self.run_ck_with_runner(&["--json", "provenance", module_id])?;
         let value: Value = serde_json::from_str(&output)
             .map_err(|error| format!("invalid provenance JSON for {target}: {error}"))?;
         let module = value
@@ -1246,7 +1315,11 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
             .inspect_err(|error| self.lines.kept.push(error.clone()))
     }
     fn abort_before_activation(&mut self) -> Result<bool, String> {
-        if !super::install_lock::InstallHold::is_held(self.inventory.manifest()) {
+        // A grouped replacement has its own locked transaction and must
+        // restore the entire pair rather than prompt after replacing only one binary.
+        if !self.grouped_placement
+            && !super::install_lock::InstallHold::is_held(self.inventory.manifest())
+        {
             return Ok(false);
         }
         if self.inventory.transaction_is_open() {
@@ -1262,6 +1335,7 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
         if self.inventory.transaction().is_none()
             || nats_companion(target)
             || target.is_plexus_admin()
+            || (target.component.stops_before_upgrade() && target.module_id().is_none())
         {
             return Ok(());
         }
@@ -1382,7 +1456,30 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
         if self.inventory.transaction().is_none() {
             self.inventory.start_transaction()?;
         }
+        if target.component.stops_before_upgrade() {
+            self.grouped_placement = true;
+            let destination = self.target(target)?.destination.clone();
+            let prepared = self
+                .prepared
+                .get_mut(target.label())
+                .ok_or("no verified candidate")?;
+            let transaction = self
+                .inventory
+                .transaction()
+                .ok_or("no install transaction")?;
+            prepared.replacement_step =
+                Some(transaction.prepare_replacement(&destination, &prepared.candidate)?);
+            return Ok("previous image retained before stopping the module".into());
+        }
         Ok("previous image retained by the install journal at replacement".into())
+    }
+
+    fn stop_module(&mut self, target: UpgradeTarget, timeout: Duration) -> Result<String, String> {
+        self.stop_for_placement(target, timeout)
+    }
+
+    fn start_module(&mut self, target: UpgradeTarget) -> Result<String, String> {
+        self.start_after_placement(target)
     }
 
     fn replace_destination(&mut self, target: UpgradeTarget) -> Result<String, String> {
@@ -1470,8 +1567,13 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
         target: UpgradeTarget,
         completion_timeout: Duration,
     ) -> Result<String, String> {
+        if target.component.stops_before_upgrade()
+            && !self.journal_activations.contains_key(target.label())
+        {
+            return Ok("module was left stopped; no restart to verify".into());
+        }
         let started = Instant::now();
-        self.wait_until(completion_timeout, || self.module_ready(target))?;
+        Self::wait_until(completion_timeout, || self.module_ready(target))?;
         Ok(format!(
             "module is live and healthy {:.0}s after restart (budget {}s)",
             started.elapsed().as_secs_f64(),
@@ -1528,14 +1630,14 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
     }
 
     fn post_verify(&mut self, target: UpgradeTarget) -> Result<String, String> {
-        let destination = &self.target(target)?.destination;
+        let destination = self.target(target)?.destination.clone();
         if target.binary == NATIVE_HOST {
             // The archive was verified before placement. Confirm that the
             // image at the destination is still the one placed from it.
-            let inode = destination_inode(destination)?;
+            let inode = destination_inode(&destination)?;
             if self.activated_inodes.get(target.label()) != Some(&inode)
-                || inventory_string(&self.inventory, destination, "sha256").as_deref()
-                    != Some(sha256_file(destination)?.as_str())
+                || inventory_string(&self.inventory, &destination, "sha256").as_deref()
+                    != Some(sha256_file(&destination)?.as_str())
             {
                 return Err(format!(
                     "{target}: destination no longer matches the verified replacement"
@@ -1543,8 +1645,11 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
             }
             return Ok(format!("inode={inode}; binary SHA-256=verified"));
         }
-        let is_supervised_module =
-            target.module_id().is_some() && self.is_module_supervised(target);
+        let is_supervised_module = if target.component.stops_before_upgrade() {
+            self.journal_activations.contains_key(target.label())
+        } else {
+            self.is_module_supervised(target)
+        };
         let (pid, healthy, running_image_matches_destination, version) = if is_supervised_module {
             let (pid, running_image_matches_destination) = self.module_provenance(target)?;
             let healthy = self.module_ready(target)?;
@@ -1552,7 +1657,7 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
                 pid,
                 healthy,
                 running_image_matches_destination,
-                binary_version(destination)?,
+                binary_version(&destination)?,
             )
         } else if target.is_daemon() {
             let disk = self.daemon_build(target)?;
@@ -1576,12 +1681,15 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
                 disk.core_version,
             )
         } else if target.is_self_replacing() {
-            (Some(process_id()), true, true, binary_version(destination)?)
+            (
+                Some(process_id()),
+                true,
+                true,
+                binary_version(&destination)?,
+            )
         } else {
-            (None, false, false, binary_version(destination)?)
+            (None, false, false, binary_version(&destination)?)
         };
-        // Keep the existing reported-version exemption limited to the two
-        // legacy targets whose releases were already accepted this way.
         let expected_version = if target.accepts_reported_version()
             || self.assets.accepts_reported_version(target, self.platform)
         {
@@ -1601,7 +1709,7 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
         );
         let evidence = VerificationEvidence {
             pid,
-            inode: destination_inode(destination)?,
+            inode: destination_inode(&destination)?,
             healthy,
             version,
             running_image_matches_destination,
@@ -1622,9 +1730,13 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
             }
         }
         if target.module_id().is_some() && !is_supervised_module {
-            Ok(format!(
-                "{detail}; module is not supervised on this host and was verified by binary version only"
-            ))
+            if target.component.stops_before_upgrade() {
+                Ok(format!(
+                    "{detail}; module left stopped and verified by binary version only"
+                ))
+            } else {
+                Ok(format!("{detail}; module is not supervised on this host and was verified by binary version only"))
+            }
         } else {
             Ok(detail)
         }
@@ -2100,6 +2212,7 @@ pub(super) mod tests {
             runner: Box::new(crate::setup::runtime::SystemCommandRunner),
             core_cut: CoreCut::default(),
             plexus_admin_verified: false,
+            grouped_placement: false,
             app_hold: None,
             rollback_prompt: None,
             journal_activations: BTreeMap::new(),
@@ -2347,6 +2460,7 @@ pub(super) mod tests {
             runner: Box::new(crate::setup::runtime::SystemCommandRunner),
             core_cut: CoreCut::default(),
             plexus_admin_verified: false,
+            grouped_placement: false,
             app_hold: None,
             rollback_prompt: None,
             journal_activations: BTreeMap::new(),
@@ -2750,6 +2864,7 @@ exit 1
             runner: Box::new(crate::setup::runtime::SystemCommandRunner),
             core_cut: CoreCut::default(),
             plexus_admin_verified: false,
+            grouped_placement: false,
             app_hold: None,
             rollback_prompt: None,
             journal_activations: BTreeMap::new(),
@@ -2807,6 +2922,7 @@ exit 1
             runner: Box::new(crate::setup::runtime::SystemCommandRunner),
             core_cut: CoreCut::default(),
             plexus_admin_verified: false,
+            grouped_placement: false,
             app_hold: None,
             rollback_prompt: None,
             journal_activations: BTreeMap::new(),

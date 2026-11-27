@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.24.7
+
+- Install Basal (Automations) with `ck setup` and upgrade its module and worker
+  together with `ck upgrade`.
+
 ## 0.24.6
 
 - Test-only: the installer crash tests wait for the installer to reach its crash point

@@ -226,7 +226,8 @@ agent browser on Linux. On macOS its native host is a command program and its
 browser extension zip (`ck-cerebellum-extension-darwin-arm64.zip`) is a separate
 release asset, not a binary. Plexus requires `ck-plexus`, `ck-plexus-admin`,
 and `ck-plexus-catalog` archives. The Windows release is incomplete while those
-assets are withheld. Setup checks for every required asset before placing any
+assets are withheld. Basal requires `ck-basal` and `ck-basal-worker` archives.
+Setup checks for every required asset before placing any
 part of a missing component.
 
 ## Installation destinations, PATH, and ownership
@@ -254,7 +255,7 @@ The command surface is:
 
 - `ck setup` selects core and all components: `aft`, `mc`, `insula`, `claustrum`,
   `synapse`, `fusiform`, `cingulate`, `entorhinal`, `astrocyte`, `striatum`,
-  `broca`, `cerebellum`, and `plexus`. Bare setup explains why it left out each
+  `broca`, `cerebellum`, `plexus`, and `basal`. Bare setup explains why it left out each
   component, including dependents whose needs could not be satisfied. It still
   installs the rest. Core cannot be left out. The plan marks fusiform, striatum and broca as
   Windows previews: they are offered before their own tests run natively there.
@@ -296,6 +297,17 @@ The command surface is:
   already enabled, and otherwise uses
   `ck-plexus-admin` to ask for operator confirmation. A refusal is not an install
   failure. Upgrade does not offer to change the policy.
+- `ck setup --with basal` selects Core, Cingulate, Entorhinal and their
+  dependencies. It installs `ck-basal` and `ck-basal-worker` in the same managed
+  binary directory and writes a reserved `modules.basal` entry with a
+  registration channel so the daemon can bind registration to its own child.
+  Only `ck-basal` is supervised. Setup leaves both
+  binaries as unpacked and does not create a settings file or data directory.
+  Basal creates `<data home>/cortexkit/basal/` on first start; uninstall retains
+  it. Upgrade stops an enabled Basal and waits for it to exit, replaces the
+  worker and then the module, and starts Basal and checks its health. On a
+  placement failure, the journal restores both old binaries before restarting
+  Basal. Upgrade does not start a module that was left disabled.
 - `ck setup --dry-run` is strictly read-only: it prints the full setup plan,
   including observations, proposed mutations, and refusals, without creating,
   replacing, registering, starting, or changing anything. Its plan must be

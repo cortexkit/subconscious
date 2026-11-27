@@ -22,12 +22,12 @@ usage:
   ck setup share-keys --with <paired-computer>
 
   Components: aft, mc, insula, claustrum, synapse, fusiform, cingulate,
-  entorhinal, astrocyte, striatum, broca, cerebellum, plexus.
+  entorhinal, astrocyte, striatum, broca, cerebellum, plexus, basal.
 
   Bare setup installs core and all available components. The plan says why
   a component was left out and marks fusiform, striatum and broca as Windows
   previews. Explicit picks also install their needs: for example,
-  ck setup --with plexus adds claustrum and entorhinal.
+  ck setup --with basal adds cingulate and entorhinal (and their needs).
   --key-path is valid whenever claustrum is selected, directly or as a need.
   share-keys exchanges Broca deployment keys. Run it on both computers after pairing.
   Module settings live in per-module JSONC files. On macOS the Cerebellum

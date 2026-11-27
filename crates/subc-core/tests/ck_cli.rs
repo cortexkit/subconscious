@@ -3670,6 +3670,138 @@ fn setup_plexus_dry_run_lists_programs_catalog_grants_and_post_health_policy() {
 }
 
 #[test]
+fn setup_basal_dry_run_lists_the_pair_and_its_needs() {
+    let fixture = SetupFixture::installed("ck-setup-basal-plan");
+    let index = serve_signed_index(|base| {
+        let (mut index, blobs) = setup_index(base, None);
+        let asset = |name| fixture_asset(format!("{base}/{name}.zip"), "12".repeat(32), 100, None);
+        for (component, binary) in [
+            ("cingulate", "ck-cingulate"),
+            ("entorhinal", "ck-entorhinal"),
+        ] {
+            index["components"][component] = index_component(
+                "v0.1.0",
+                Some("0.1.0"),
+                &host_target(),
+                [(binary, asset(binary))],
+            );
+        }
+        let target = if cfg!(windows) {
+            "linux-x64".into()
+        } else {
+            host_target()
+        };
+        index["components"]["basal"] = index_component(
+            "v0.2.0",
+            Some("0.2.0"),
+            &target,
+            ["ck-basal", "ck-basal-worker"].map(|name| (name, asset(name))),
+        );
+        (index, blobs)
+    });
+    let output = fixture
+        .command(&index, &["setup", "--with", "basal", "--dry-run"])
+        .output()
+        .unwrap();
+    let stdout = text(&output.stdout);
+    if cfg!(windows) {
+        assert_exit(&output, 1);
+        assert!(
+            stdout.contains(&format!("ck-basal-{}.zip", host_target())),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("not offered on Windows"), "{stdout}");
+        return;
+    }
+    assert_exit(&output, 0);
+    assert!(
+        stdout.contains("basal needs cingulate and entorhinal; they will be installed too"),
+        "{stdout}"
+    );
+    let plan = stdout
+        .lines()
+        .filter_map(|line| line.split_once(". would ").map(|(_, step)| step))
+        .filter(|step| step.contains("basal"))
+        .map(|step| {
+            if step.starts_with("place ") {
+                format!("place bin/{}", step.rsplit('/').next().unwrap())
+            } else if step.starts_with("configure ") {
+                "configure basal in subc.jsonc".into()
+            } else {
+                step.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    assert_eq!(plan, include_str!("golden/piped/setup-basal-plan.txt"));
+    assert!(!fixture.data_home.join("cortexkit/bin/ck-basal").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn setup_basal_places_the_unmodified_pair_and_writes_only_one_reserved_entry() {
+    const REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
+    let fixture = SetupFixture::installed("ck-setup-basal-placement");
+    let programs = [
+        ("cingulate", "ck-cingulate", "ck-cingulate 0.1.0".to_owned()),
+        (
+            "entorhinal",
+            "ck-entorhinal",
+            "ck-entorhinal 0.1.0".to_owned(),
+        ),
+        ("basal", "ck-basal", format!("ck-basal 0.2.0 ({REVISION})")),
+        (
+            "basal",
+            "ck-basal-worker",
+            format!("ck-basal-worker 0.7.0 ({REVISION})"),
+        ),
+    ];
+    let index = serve_signed_index(|base| {
+        let (mut index, mut blobs) = setup_index(base, None);
+        let target = host_target();
+        for component in ["cingulate", "entorhinal", "basal"] {
+            index["components"][component] = index_component("v0.1.0", Some("0.1.0"), &target, []);
+        }
+        for (component, binary, version) in &programs {
+            let archive = fixture_archive(fixture._root.path(), binary, version, 0);
+            let path = format!("/{binary}.zip");
+            index["components"][*component]["assets"][&target][*binary] = fixture_asset(
+                format!("{base}{path}"),
+                sha256_hex(&archive),
+                archive.len() as u64,
+                (*binary == "ck-basal").then_some(REVISION),
+            );
+            blobs.insert(path, archive);
+        }
+        (index, blobs)
+    });
+    let output = fixture
+        .command(&index, &["setup", "--with", "basal"])
+        .output()
+        .unwrap();
+    assert_exit(&output, 0);
+    let data = fixture.data_home.join("cortexkit");
+    let bin = data.join("bin");
+    for (_, binary, version) in &programs[2..] {
+        assert_eq!(
+            fs::read(bin.join(binary)).unwrap(),
+            format!("#!/bin/sh\necho '{version}'\n").into_bytes()
+        );
+    }
+    let config_home = fixture.config_home.join("cortexkit");
+    let config = fs::read_to_string(config_home.join("subc.jsonc")).unwrap();
+    let config: Value = serde_json::from_str(&subc_jsonc::jsonc_to_json(&config).unwrap()).unwrap();
+    assert_eq!(
+        config["modules"]["basal"],
+        json!({"program": bin.join("ck-basal"), "reserved": true, "registration_channel": true})
+    );
+    assert!(config["modules"].get("basal-worker").is_none());
+    assert!(!config_home.join("basal.jsonc").exists());
+    assert!(!data.join("basal").exists());
+}
+
+#[test]
 fn setup_verbose_keeps_every_preexisting_outcome_line() {
     let fixture = SetupFixture::installed("ck-setup-verbose");
     let index = serve_signed_index(|base| setup_index(base, None));

@@ -197,6 +197,16 @@ pub(super) fn act(journal: &Journal, index: usize, content: Content<'_>) -> Resu
     perform(journal.id(), &step.target, file, content)
 }
 
+pub(super) fn retain_previous(journal: &Journal, index: usize) -> Result<(), String> {
+    let step = journal.step(index);
+    let file = step.action.file().expect("placement prepared a file step");
+    verify_digest(&step.target, &file.before)?;
+    if !owned_stage(journal.id(), &file.staging_directory)? {
+        create_stage(journal.id(), &file.staging_directory)?;
+    }
+    retain_previous_file(&step.target, file)
+}
+
 pub(in crate::setup) fn bootstrap(
     journal: &mut Journal,
     target: &Path,
@@ -232,19 +242,7 @@ fn perform(id: &str, target: &Path, file: &FileStep, content: Content<'_>) -> Re
     if !owned_stage(id, &file.staging_directory)? {
         create_stage(id, &file.staging_directory)?;
     }
-    if let Some(previous) = &file.previous {
-        if file.after.is_some() && !moves_mapped_image(target) {
-            // A hard link retains the exact previous inode and its metadata.
-            if digest(previous)? != file.before {
-                remove_partial(previous)?;
-                fs::hard_link(target, previous)
-                    .or_else(|_| copy(target, previous))
-                    .map_err(|error| refusal(previous, error))?;
-            }
-            verify_digest(previous, &file.before)?;
-            sync_parent(previous)?;
-        }
-    }
+    retain_previous_file(target, file)?;
     if let Some(staged) = &file.staged {
         if digest(staged)? != file.after {
             remove_partial(staged)?;
@@ -283,6 +281,23 @@ fn perform(id: &str, target: &Path, file: &FileStep, content: Content<'_>) -> Re
     } else if let Some(previous) = &file.previous {
         verify_digest(target, &file.before)?;
         move_out(target, previous)?;
+    }
+    Ok(())
+}
+
+fn retain_previous_file(target: &Path, file: &FileStep) -> Result<(), String> {
+    if let Some(previous) = &file.previous {
+        if file.after.is_some() && !moves_mapped_image(target) {
+            // A hard link retains the exact previous inode and its metadata.
+            if digest(previous)? != file.before {
+                remove_partial(previous)?;
+                fs::hard_link(target, previous)
+                    .or_else(|_| copy(target, previous))
+                    .map_err(|error| refusal(previous, error))?;
+            }
+            verify_digest(previous, &file.before)?;
+            sync_parent(previous)?;
+        }
     }
     Ok(())
 }

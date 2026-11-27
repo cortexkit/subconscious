@@ -213,7 +213,9 @@ impl SystemUpgradeBackend {
         destination: &Path,
         prepared: &PreparedUpgradeAsset,
     ) -> Result<String, String> {
-        self.prepare_journal_target(target, &prepared.candidate)?;
+        if !target.component.stops_before_upgrade() {
+            self.prepare_journal_target(target, &prepared.candidate)?;
+        }
         let new_destination = if target.is_daemon() && self.platform == AlphaTarget::DarwinArm64 {
             let home = super::super::daemon_bundle::binary_home(destination)?;
             super::super::daemon_bundle::executable(&home)
@@ -227,23 +229,26 @@ impl SystemUpgradeBackend {
             .inventory
             .transaction()
             .ok_or("upgrade target has no install transaction")?;
-        #[cfg(unix)]
-        if target.is_daemon() && self.platform == AlphaTarget::DarwinArm64 {
-            let source = super::super::daemon_bundle::containing_bundle(&prepared.candidate)
-                .ok_or("archive has no daemon bundle")?;
-            let target_bundle = super::super::daemon_bundle::containing_bundle(&new_destination)
-                .ok_or("destination is not in its managed app bundle")?;
-            super::super::install_journal::bundle::place(
-                transaction.journal(),
-                target_bundle,
-                source,
-                &mut self.runner,
-            )?;
+        if let Some(step) = prepared.replacement_step {
+            transaction.apply_replacement(step, &prepared.candidate)?;
+        } else if cfg!(unix) && target.is_daemon() && self.platform == AlphaTarget::DarwinArm64 {
+            #[cfg(unix)]
+            {
+                let source = super::super::daemon_bundle::containing_bundle(&prepared.candidate)
+                    .ok_or("archive has no daemon bundle")?;
+                let target_bundle =
+                    super::super::daemon_bundle::containing_bundle(&new_destination)
+                        .ok_or("destination is not in its managed app bundle")?;
+                super::super::install_journal::bundle::place(
+                    transaction.journal(),
+                    target_bundle,
+                    source,
+                    &mut self.runner,
+                )?;
+            }
         } else {
             transaction.replace(destination, &prepared.candidate)?;
         }
-        #[cfg(not(unix))]
-        transaction.replace(destination, &prepared.candidate)?;
         if new_destination != destination {
             for kind in super::super::components::OWNED_BINARY_KINDS {
                 if let Some(fields) = self
@@ -282,6 +287,121 @@ impl SystemUpgradeBackend {
         ))
     }
 
+    pub(super) fn stop_for_placement(
+        &mut self,
+        target: UpgradeTarget,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        use activation::{Control, Intent};
+
+        let module = target
+            .module_id()
+            .ok_or("placement target is not a module")?;
+        let destination = self.target(target)?.destination.clone();
+        let worker = self
+            .targets
+            .values()
+            .find(|item| {
+                item.target.component == target.component && item.target.module_id().is_none()
+            })
+            .ok_or("placement target has no managed worker")?;
+        if worker.destination.parent() != destination.parent() {
+            return Err(format!(
+                "{target} and its worker must be installed in the same folder"
+            ));
+        }
+        if [target, worker.target].into_iter().any(|member| {
+            self.prepared
+                .get(member.label())
+                .and_then(|prepared| prepared.replacement_step)
+                .is_none()
+        }) {
+            return Err(format!(
+                "{target} and its worker must both be ready for replacement before stopping"
+            ));
+        }
+        let candidate = &self
+            .prepared
+            .get(target.label())
+            .ok_or("no verified module candidate")?
+            .candidate;
+        let build = Build::Image {
+            sha256: files::digest(candidate)?.ok_or("upgrade candidate is missing")?,
+        };
+        let paths = self.runtime_paths()?;
+        let mut recovery = SystemRecovery {
+            executable: &self.executable,
+            connection: self.subc.as_deref(),
+            platform: super::super::runtime::RuntimePlatform::current(),
+            paths: &paths,
+            runner: &mut self.runner,
+        };
+        let mut control = recovery.control(&destination, None);
+        let prior = activation::capture(&mut control, Some(module))?;
+        if !prior.module_enabled() {
+            if prior.live.is_some() {
+                return Err(format!(
+                    "{module} is disabled but still running; retry after it exits"
+                ));
+            }
+            return Ok("module was not enabled; left stopped".into());
+        }
+        // Write the old live image and enabled state before issuing stop. An
+        // interrupted upgrade restores both images before re-enabling the module.
+        let transaction = self
+            .inventory
+            .transaction()
+            .ok_or("module stop has no install transaction")?;
+        let index = activation::prepare_with_before(
+            transaction.journal(),
+            &destination,
+            Some(module),
+            prior,
+            Some(build),
+        )?;
+        self.journal_activations
+            .insert(target.label().into(), index);
+        let deadline = Instant::now() + timeout;
+        control.stop(Some(module))?;
+        loop {
+            if control.same_process(Some(module), None)?
+                && control.intent(Some(module))? == Some(Intent::Module { enabled: false })
+            {
+                return Ok("module disabled and no longer live".into());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "{module} did not stop within {} seconds; no binaries were replaced",
+                    timeout.as_secs()
+                ));
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    pub(super) fn start_after_placement(
+        &mut self,
+        target: UpgradeTarget,
+    ) -> Result<String, String> {
+        if !self.journal_activations.contains_key(target.label()) {
+            return Ok("module was not stopped for upgrade; left stopped".into());
+        }
+        let module = target
+            .module_id()
+            .ok_or("placement target is not a module")?;
+        let destination = self.target(target)?.destination.clone();
+        let paths = self.runtime_paths()?;
+        let mut recovery = SystemRecovery {
+            executable: &self.executable,
+            connection: self.subc.as_deref(),
+            platform: super::super::runtime::RuntimePlatform::current(),
+            paths: &paths,
+            runner: &mut self.runner,
+        };
+        activation::Control::start(&mut recovery.control(&destination, None), Some(module))?;
+        Ok("start acknowledged".into())
+    }
+
     pub(super) fn close_upgrade_journal(&mut self, commit: bool) -> Result<(), String> {
         let paths = self.runtime_paths()?;
         let mut recovery = SystemRecovery {
@@ -298,6 +418,7 @@ impl SystemUpgradeBackend {
         }
         self.journal_activations.clear();
         self.activated_inodes.clear();
+        self.grouped_placement = false;
         Ok(())
     }
 

@@ -1,0 +1,6 @@
+download and verify ck-basal (0.0 MiB)
+place bin/ck-basal
+download and verify ck-basal-worker (0.0 MiB)
+place bin/ck-basal-worker
+configure basal in subc.jsonc
+register basal with the daemon and check its health

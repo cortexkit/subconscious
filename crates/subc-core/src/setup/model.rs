@@ -30,10 +30,11 @@ pub enum Component {
     Broca,
     Cerebellum,
     Plexus,
+    Basal,
 }
 
 impl Component {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::Core,
         Self::Aft,
         Self::Mc,
@@ -48,6 +49,7 @@ impl Component {
         Self::Broca,
         Self::Cerebellum,
         Self::Plexus,
+        Self::Basal,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -66,6 +68,7 @@ impl Component {
             Self::Broca => "broca",
             Self::Cerebellum => "cerebellum",
             Self::Plexus => "plexus",
+            Self::Basal => "basal",
         }
     }
 
@@ -108,8 +111,13 @@ impl Component {
             Self::Broca => Some("Model Runner"),
             Self::Cerebellum => Some("Browser and Computer Use"),
             Self::Plexus => Some("Connectors"),
+            Self::Basal => Some("Automations"),
             _ => None,
         }
+    }
+
+    pub(super) const fn stops_before_upgrade(self) -> bool {
+        matches!(self, Self::Basal)
     }
 
     pub fn plan_name(self) -> String {
@@ -1032,10 +1040,12 @@ pub enum UpgradeOperation {
     GrantMessageKeys { target: UpgradeTarget },
     DownloadAndVerify { target: UpgradeTarget },
     CreateRollbackCopy { target: UpgradeTarget },
+    StopModule { target: UpgradeTarget },
     ReplaceDestination { target: UpgradeTarget },
     WarmExecute { target: UpgradeTarget },
     RefreshPlexusCatalog { target: UpgradeTarget },
     InitiateModuleRestart { target: UpgradeTarget },
+    StartModule { target: UpgradeTarget },
     PollModuleRestartCompletion { target: UpgradeTarget },
     RestartDaemonViaServiceManager { target: UpgradeTarget },
     PollDaemonServiceReady { target: UpgradeTarget },
@@ -1068,6 +1078,10 @@ impl fmt::Display for UpgradeOperation {
             Self::CreateRollbackCopy { target } => {
                 write!(formatter, "create {target} rollback copy")
             }
+            Self::StopModule { target } => write!(
+                formatter,
+                "if enabled, stop {target} and wait for it to exit"
+            ),
             Self::ReplaceDestination { target } => {
                 write!(formatter, "replace {target} destination")
             }
@@ -1078,6 +1092,10 @@ impl fmt::Display for UpgradeOperation {
             Self::InitiateModuleRestart { target } => {
                 write!(formatter, "initiate supervised restart for {target}")
             }
+            Self::StartModule { target } => write!(
+                formatter,
+                "start {target} if it was stopped for the upgrade"
+            ),
             Self::PollModuleRestartCompletion { target } => {
                 write!(formatter, "poll supervised restart completion for {target}")
             }

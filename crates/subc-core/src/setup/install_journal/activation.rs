@@ -13,6 +13,12 @@ pub(in crate::setup) struct Prior {
     intent: Option<Intent>,
 }
 
+impl Prior {
+    pub fn module_enabled(&self) -> bool {
+        self.intent == Some(Intent::Module { enabled: true })
+    }
+}
+
 pub(in crate::setup) trait Control {
     /// Results come from the authenticated daemon or manager. An observation
     /// failure is not evidence that the service stopped.
@@ -314,10 +320,21 @@ pub(in crate::setup) fn undo(
                     return Ok(());
                 }
             }
-            if !control
+            if control
                 .verify(module, expected)
                 .map_err(|error| refusal(step, &message(&error)))?
             {
+                // A stop can change the enabled bit before the original
+                // process has exited. Restore that bit even if the old image
+                // is still live, so a timed-out stop does not leave it disabled.
+                if let (Some(module), Some(Intent::Module { enabled: true })) =
+                    (module, before_intent)
+                {
+                    if control.intent(Some(module))? == Some(Intent::Module { enabled: false }) {
+                        control.start(Some(module))?;
+                    }
+                }
+            } else {
                 if expected.is_none()
                     || control
                         .live(module)

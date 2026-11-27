@@ -124,7 +124,7 @@ ck setup --with aft,insula --dry-run
 
 The components `ck setup` knows are `aft`, `mc`, `insula`, `claustrum`,
 `synapse`, `fusiform`, `cingulate`, `entorhinal`, `astrocyte`, `striatum`,
-`broca`, `cerebellum`, and `plexus`. A module that declares a minimum daemon
+`broca`, `cerebellum`, `plexus`, and `basal`. A module that declares a minimum daemon
 version is refused before anything is downloaded when the installed daemon is
 older; run `ck upgrade` first.
 
@@ -140,6 +140,12 @@ policies through operator confirmation once Plexus reports that it may act as
 the connector host. Declining does not stop setup; setup prints the
 command to enable policies later. `ck upgrade` refreshes the programs and
 catalog together without asking to enable policies.
+
+`ck setup --with basal` installs Automations, which runs scheduled and
+event-driven automations. It selects Cingulate and Entorhinal along with their
+dependencies, and installs `ck-basal` and `ck-basal-worker` side by side. `ck upgrade`
+stops an enabled Basal before replacing the pair and starts it again only
+after both binaries are in place. A module you stopped stays stopped.
 
 `ck setup aft --convert` and `ck setup mc --convert` move an existing
 standalone installation under the daemon. They print the plan and change

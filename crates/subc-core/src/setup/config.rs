@@ -604,7 +604,7 @@ fn desired_values_with_key(
                 }),
             );
         }
-        Component::Claustrum | Component::Plexus => {
+        Component::Claustrum | Component::Plexus | Component::Basal => {
             let mut entry = Map::new();
             entry.insert(
                 "program".to_string(),

@@ -3271,7 +3271,7 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.24.6"
+version = "0.24.7"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

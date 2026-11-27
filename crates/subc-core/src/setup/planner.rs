@@ -851,6 +851,12 @@ pub fn plan_upgrade(observed: &UpgradeObserved) -> UpgradePlan {
             .push(UpgradeOperation::ConfigureMessageHub { target });
     }
     for &target in &observed.roster {
+        if target.component.stops_before_upgrade() {
+            if target.module_id().is_some() {
+                plan_stopped_module_upgrade(&mut plan, observed, target);
+            }
+            continue;
+        }
         if target.component == Component::Plexus {
             if target.module_id() == Some("plexus") {
                 plan_plexus_upgrade(&mut plan, observed, target);
@@ -1010,6 +1016,103 @@ fn upgrade_core_floor_refusal(observed: &UpgradeObserved, target: UpgradeTarget)
             target.component
         )
     })
+}
+
+fn plan_stopped_module_upgrade(
+    plan: &mut UpgradePlan,
+    observed: &UpgradeObserved,
+    module: UpgradeTarget,
+) {
+    let component = module.component;
+    let Some(worker) = observed
+        .roster
+        .iter()
+        .copied()
+        .find(|target| target.component == component && target.module_id().is_none())
+    else {
+        plan.outcomes.push(PlanOutcome::TargetRefused {
+            component,
+            reason: format!(
+                "{component} must upgrade with its worker; repair the installation first"
+            ),
+        });
+        return;
+    };
+    let targets = [worker, module];
+    for target in targets {
+        match observed.release(target) {
+            ReleaseAvailability::Available => {}
+            ReleaseAvailability::Incomplete { missing_asset } => {
+                plan.outcomes.push(PlanOutcome::ReleaseIncomplete {
+                    component,
+                    release_tag: "the resolved release".into(),
+                    missing_asset,
+                });
+                return;
+            }
+            release => {
+                plan.outcomes.push(PlanOutcome::Refusal {
+                    reason: format!("{component} release is not available: {release:?}"),
+                });
+                return;
+            }
+        }
+    }
+    if !targets.iter().any(|&target| {
+        matches!(
+            observed.target_state(target),
+            UpgradeState::UpdateAvailable { .. }
+        )
+    }) {
+        append_registration_channel(plan, module, observed);
+        plan.outcomes.push(PlanOutcome::Noop {
+            scope: format!("{component} and its worker are already current"),
+        });
+        return;
+    }
+    if let Some(reason) = upgrade_core_floor_refusal(observed, module) {
+        plan.outcomes
+            .push(PlanOutcome::TargetRefused { component, reason });
+        append_registration_channel(plan, module, observed);
+        return;
+    }
+    if let Some(reason) = &observed.daemon_unreachable_reason {
+        plan.outcomes.push(PlanOutcome::Refusal {
+            reason: format!(
+                "{module} requires a supervised stop, but the daemon is unreachable: {reason}"
+            ),
+        });
+        return;
+    }
+    for target in targets {
+        if let UpgradeState::UpdateAvailable { from, to, reason } = observed.target_state(target) {
+            plan.outcomes.push(PlanOutcome::UpgradeAvailable {
+                target,
+                from,
+                to,
+                reason,
+            });
+        }
+    }
+    // The module finds its worker by name whenever it needs one. It cannot
+    // run while the destinations may hold binaries from different releases.
+    plan.operations
+        .extend(targets.map(|target| UpgradeOperation::DownloadAndVerify { target }));
+    plan.operations
+        .extend(targets.map(|target| UpgradeOperation::CreateRollbackCopy { target }));
+    plan.operations
+        .push(UpgradeOperation::StopModule { target: module });
+    plan.operations
+        .extend(targets.map(|target| UpgradeOperation::ReplaceDestination { target }));
+    plan.operations
+        .extend(targets.map(|target| UpgradeOperation::WarmExecute { target }));
+    append_registration_channel(plan, module, observed);
+    plan.operations.extend([
+        UpgradeOperation::StartModule { target: module },
+        UpgradeOperation::PollModuleRestartCompletion { target: module },
+    ]);
+    plan.operations
+        .extend(targets.map(|target| UpgradeOperation::PostVerify { target }));
 }
 
 fn plan_plexus_upgrade(plan: &mut UpgradePlan, observed: &UpgradeObserved, module: UpgradeTarget) {
@@ -1344,6 +1447,12 @@ mod tests {
                 missing_asset: "ck-plexus-windows-x64.zip".into(),
             },
         );
+        observed.releases.insert(
+            Component::Basal,
+            ReleaseAvailability::Incomplete {
+                missing_asset: "ck-basal-windows-x64.zip".into(),
+            },
+        );
         let plan = plan_setup(&observed, &SetupRequest::install(Vec::new()));
         assert!(plan.is_authorized());
         assert_eq!(
@@ -1366,6 +1475,7 @@ mod tests {
             Component::Synapse,
             Component::Cerebellum,
             Component::Plexus,
+            Component::Basal,
         ] {
             assert!(plan.outcomes.iter().any(|outcome| matches!(outcome,
                 PlanOutcome::LeftOut { component: omitted, .. } if *omitted == component)));
@@ -1392,12 +1502,13 @@ mod tests {
         const COMMON: &str = "install core\ninstall aft\ninstall insula — file/API providers; cookies only from vault deposits on every OS, never browser stores\ninstall claustrum\ninstall synapse — healthy immediately with an empty catalog; inference remains typed-refused until model.load arrives\ninstall fusiform (Model Catalog)\ninstall cingulate (Approvals)\ninstall entorhinal (Agents and Projects)\ninstall astrocyte (Spend Records)\ninstall striatum (AI Model Routing)\ninstall broca (Model Runner)";
         const CEREBELLUM: &str = "install cerebellum (Browser and Computer Use)";
         const PLEXUS: &str = "install plexus (Connectors)";
+        const BASAL: &str = "install basal (Automations)";
         const CATALOG: &str = "fusiform (Model Catalog): fetching the model catalog";
         let unpublished = format!("mc: left out — {}", super::super::text::MC_UNPUBLISHED_NOTE);
         for (target, expected) in [
-            (AlphaTarget::DarwinArm64, format!("{COMMON}\n{CEREBELLUM}\n{PLEXUS}\n{unpublished}\n{CATALOG}")),
-            (AlphaTarget::LinuxX64, format!("{COMMON}\n{CEREBELLUM}\n{PLEXUS}\n{unpublished}\n{CATALOG}\ncerebellum (Browser and Computer Use): agent browser only on Linux")),
-            (AlphaTarget::WindowsX64, format!("{COMMON}\nmc: left out — magic-context is not available on this platform yet\nfusiform (Model Catalog): offered on Windows before its own tests run natively there\n{CATALOG}\nstriatum (AI Model Routing): offered on Windows before its own tests run natively there\nbroca (Model Runner): offered on Windows before its own tests run natively there\ncerebellum (Browser and Computer Use): left out — cerebellum is not offered on Windows\nplexus (Connectors): left out — no ck-plexus-windows-x64.zip asset in v0.1.0 yet")),
+            (AlphaTarget::DarwinArm64, format!("{COMMON}\n{CEREBELLUM}\n{PLEXUS}\n{BASAL}\n{unpublished}\n{CATALOG}")),
+            (AlphaTarget::LinuxX64, format!("{COMMON}\n{CEREBELLUM}\n{PLEXUS}\n{BASAL}\n{unpublished}\n{CATALOG}\ncerebellum (Browser and Computer Use): agent browser only on Linux")),
+            (AlphaTarget::WindowsX64, format!("{COMMON}\nmc: left out — magic-context is not available on this platform yet\nfusiform (Model Catalog): offered on Windows before its own tests run natively there\n{CATALOG}\nstriatum (AI Model Routing): offered on Windows before its own tests run natively there\nbroca (Model Runner): offered on Windows before its own tests run natively there\ncerebellum (Browser and Computer Use): left out — cerebellum is not offered on Windows\nplexus (Connectors): left out — no ck-plexus-windows-x64.zip asset in v0.1.0 yet\nbasal (Automations): left out — no ck-basal-windows-x64.zip asset in v0.2.0 yet")),
         ] {
             let mut observed = observed_setup();
             observed.components.clear();
@@ -1409,6 +1520,9 @@ mod tests {
             } else {
                 observed.releases.insert(Component::Plexus, ReleaseAvailability::NotYetPublished {
                     release_tag: "v0.1.0".into(), missing_asset: "ck-plexus-windows-x64.zip".into(),
+                });
+                observed.releases.insert(Component::Basal, ReleaseAvailability::NotYetPublished {
+                    release_tag: "v0.2.0".into(), missing_asset: "ck-basal-windows-x64.zip".into(),
                 });
             }
             let plan = plan_setup(&observed, &SetupRequest::install(vec![]));

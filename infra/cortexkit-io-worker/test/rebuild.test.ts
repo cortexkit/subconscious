@@ -360,6 +360,31 @@ describe("rebuild", () => {
     }
   });
 
+  it("indexes Basal's two binaries with their manifest expectations and no Windows assets", async () => {
+    const platforms = ["darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64"];
+    const programs = ["ck-basal", "ck-basal-worker"];
+    const revision = "0123456789abcdef0123456789abcdef01234567";
+    const { doc, refusals } = await rebuildFixtures([{
+      repository: "cortexkit/basal",
+      tag: "v0.2.0",
+      zips: platforms.flatMap((platform) => programs.map((name) => `${name}-${platform}.zip`)),
+      manifest: { binaries: { "ck-basal": { reports: revision }, "ck-basal-worker": { reports: null } } },
+    }]);
+    expect(refusals).toEqual([]);
+    const basal = doc.components.basal;
+    expect(basal.release).toBe("v0.2.0");
+    expect(Object.keys(basal.assets).sort()).toEqual(platforms);
+    for (const platform of platforms) {
+      expect(Object.keys(basal.assets[platform]).sort()).toEqual(programs);
+      for (const name of programs) {
+        expect(basal.assets[platform][name]).toMatchObject({
+          reports: name === "ck-basal" ? revision : null,
+          sha256: EMPTY_SHA256,
+        });
+      }
+    }
+  });
+
   it("skips a withheld-only release, omits the previous component, and logs once per rebuild", async () => {
     const tag = PREVIOUS_MC.release;
     await testEnv().RELEASE_INDEX.put(KV_BUNDLE, canonicalize({

@@ -510,10 +510,11 @@ pub fn module_program(component: Component) -> Option<&'static str> {
         Component::Broca => Some("ck-broca"),
         Component::Cerebellum => Some("ck-cerebellum"),
         Component::Plexus => Some("ck-plexus"),
+        Component::Basal => Some("ck-basal"),
     }
 }
 
-const SUPERVISED_MODULE_IDS: [(&str, &str); 14] = [
+const SUPERVISED_MODULE_IDS: [(&str, &str); 15] = [
     // Core owns the daemon and MCP bridge, but only the bridge is a supervised
     // module program; Core itself remains outside the setup module lifecycle.
     ("ck-subc-mcp", "subc-mcp"),
@@ -530,6 +531,7 @@ const SUPERVISED_MODULE_IDS: [(&str, &str); 14] = [
     ("ck-broca", "broca"),
     ("ck-cerebellum", "cerebellum"),
     ("ck-plexus", "plexus"),
+    ("ck-basal", "basal"),
 ];
 
 /// Returns the managed program names and their corresponding daemon supervisor IDs.
@@ -554,6 +556,7 @@ pub(super) fn component_needs(component: Component) -> &'static [Component] {
         Astrocyte | Striatum | Broca => &[Core, Claustrum, Fusiform],
         Cerebellum => &[Core, Claustrum, Cingulate, Entorhinal],
         Plexus => &[Claustrum, Entorhinal],
+        Basal => &[Core, Cingulate, Entorhinal],
     }
 }
 
@@ -643,6 +646,7 @@ pub fn component_binaries_for_target(
         }
         (Component::Cerebellum, AlphaTarget::WindowsX64 | AlphaTarget::WindowsArm64) => &[],
         (Component::Plexus, _) => &["ck-plexus", "ck-plexus-admin"],
+        (Component::Basal, _) => &["ck-basal", "ck-basal-worker"],
     }
 }
 

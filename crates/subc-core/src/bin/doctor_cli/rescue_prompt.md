@@ -22,7 +22,8 @@ The `subc-mcp` module (`ck-subc-mcp`) presents the fleet to an MCP host.
 owns the local NATS message plane. `ck` also installs these modules, each from
 its own repository: `aft`, `magic-context`, `insula`, `claustrum`, `synapse`,
 `fusiform`, `cingulate`, `entorhinal`, `astrocyte`, `striatum`, `broca`,
-`cerebellum`, and `plexus` (GitHub and web search connectors). Other modules
+`cerebellum`, `plexus` (GitHub and web search connectors), and `basal`
+(scheduled and event-driven automations). Other modules
 may run too; `{{ck}} module list` shows them all.
 
 ## Diagnose before making changes

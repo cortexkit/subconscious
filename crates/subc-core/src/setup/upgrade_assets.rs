@@ -88,6 +88,7 @@ pub struct PreparedUpgradeAsset {
     pub candidate: PathBuf,
     /// Digest of the verified zip. Currency records this, not the extracted binary.
     pub archive_sha256: String,
+    pub(super) replacement_step: Option<usize>,
     workspace: PathBuf,
 }
 
@@ -99,6 +100,7 @@ impl PreparedUpgradeAsset {
             workspace: candidate.parent().unwrap().to_path_buf(),
             candidate,
             archive_sha256: "00".into(),
+            replacement_step: None,
         }
     }
 
@@ -268,6 +270,7 @@ pub(super) fn prepare_upgrade_asset_with_runner<
         names,
         candidate,
         archive_sha256: expected,
+        replacement_step: None,
         workspace: workspace.hand_off(),
     })
 }

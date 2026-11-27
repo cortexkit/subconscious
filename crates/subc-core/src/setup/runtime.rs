@@ -70,6 +70,7 @@ pub struct RuntimeStatus {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CommandResult {
     pub success: bool,
+    pub exit_code: Option<i32>,
     pub stdout: String,
     /// The service manager's own account of a refusal. Every registration
     /// and start step that fails must carry this into its error: a bare
@@ -203,6 +204,7 @@ impl CommandRunner for SystemCommandRunner {
             .map_err(|error| format!("could not run {program}: {error}"))?;
         Ok(CommandResult {
             success: output.status.success(),
+            exit_code: output.status.code(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
@@ -1469,8 +1471,10 @@ mod tests {
     impl CommandRunner for RecordingRunner {
         fn run(&mut self, program: &str, args: &[String]) -> Result<CommandResult, String> {
             self.calls.push((program.to_string(), args.to_vec()));
+            let success = self.results.pop_front().unwrap_or(true);
             Ok(CommandResult {
-                success: self.results.pop_front().unwrap_or(true),
+                success,
+                exit_code: Some(if success { 0 } else { 1 }),
                 stdout: if args.join(" ").contains("show -p FragmentPath") {
                     format!("FragmentPath={}", self.fragment)
                 } else if program == "powershell.exe"
@@ -1731,6 +1735,7 @@ mod tests {
             assert_eq!(args.get(3).map(String::as_str), Some("Linger"));
             Ok(CommandResult {
                 success: true,
+                exit_code: Some(0),
                 stdout: self.output.clone(),
                 stderr: String::new(),
             })
@@ -1796,6 +1801,7 @@ mod tests {
         fn run(&mut self, _program: &str, _args: &[String]) -> Result<CommandResult, String> {
             Ok(CommandResult {
                 success: false,
+                exit_code: Some(1),
                 stdout: String::new(),
                 stderr: "ERROR: Access is denied. (0x80070005)".to_string(),
             })
@@ -1810,6 +1816,7 @@ mod tests {
         fn run(&mut self, _program: &str, _args: &[String]) -> Result<CommandResult, String> {
             Ok(CommandResult {
                 success: false,
+                exit_code: Some(1),
                 stdout: String::new(),
                 stderr: "Bootstrap failed: 5: Input/output error".to_string(),
             })
@@ -1958,12 +1965,14 @@ mod tests {
     fn explanation_prefers_stderr_and_never_reads_as_withheld() {
         let both = CommandResult {
             success: false,
+            exit_code: Some(1),
             stdout: "out".into(),
             stderr: "err".into(),
         };
         assert_eq!(both.explanation(), "err");
         let only_out = CommandResult {
             success: false,
+            exit_code: Some(1),
             stdout: "out".into(),
             stderr: "  ".into(),
         };
@@ -2016,6 +2025,7 @@ mod tests {
             self.calls.push((program.to_string(), args.to_vec()));
             Ok(CommandResult {
                 success: true,
+                exit_code: Some(0),
                 stdout: if self.calls.len() == 1 {
                     String::new()
                 } else {
@@ -2075,6 +2085,7 @@ mod tests {
             };
             Ok(CommandResult {
                 success,
+                exit_code: Some(if success { 0 } else { 1 }),
                 stdout: if joined.contains("show -p FragmentPath") {
                     format!("FragmentPath={}", self.fragment)
                 } else if live {
@@ -2446,6 +2457,7 @@ mod tests {
             fn run(&mut self, _p: &str, _a: &[String]) -> Result<CommandResult, String> {
                 Ok(CommandResult {
                     success: false,
+                    exit_code: Some(1),
                     stdout: String::new(),
                     stderr: "ERROR: The system cannot find the file specified.".to_string(),
                 })
@@ -2593,6 +2605,7 @@ mod reconciliation_tests {
             };
             Ok(CommandResult {
                 success: true,
+                exit_code: Some(0),
                 stdout,
                 stderr: String::new(),
             })

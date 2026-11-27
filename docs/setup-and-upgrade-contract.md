@@ -220,9 +220,12 @@ not use a platform mapping table or an aggregate digest manifest.
 The binaries each component needs on each target are listed in
 `component_binaries_for_target` (`crates/subc-core/src/setup/components.rs`).
 Core is `ck-subc` and `ck-subc-mcp` from this repository's release lane; `ck`
-itself is placed by the bootstrap installer. Magic Context has no alpha
-release archive on Windows: setup may wire an already available Magic Context
-component there, but must not download one.
+itself is placed by the bootstrap installer. Setup never downloads Magic
+Context on Windows. Cerebellum is not offered on Windows and provides only the
+agent browser on Linux. On macOS its native host is a command program and its
+browser extension zip (`ck-cerebellum-extension-darwin-arm64.zip`) is a separate
+release asset, not a binary. Setup checks for every required asset before placing
+any part of a missing component.
 
 ## Installation destinations, PATH, and ownership
 
@@ -247,14 +250,24 @@ User configuration and component stores are never treated as managed binaries.
 
 The command surface is:
 
-- `ck setup` installs and wires core, then lists eligible optional modules in
-  one plain line with `ck setup <name>` as the add command, without prompting to
-  select modules. Only missing components with a complete release on the host
-  are listed; installed, unavailable and unpublished components are omitted.
-  The line is absent when there is nothing to add, and appears in both dry runs
-  and ordinary setup.
-- `ck setup aft` and `ck setup mc` explicitly add a component.
-- `ck setup --with aft,mc` selects optional components explicitly.
+- `ck setup` selects core and all components: `aft`, `mc`, `insula`, `claustrum`,
+  `synapse`, `fusiform`, `cingulate`, `entorhinal`, `astrocyte`, `striatum`,
+  `broca`, and `cerebellum`. Bare setup reports each component left out and why,
+  including dependents whose needs could not be satisfied. It still installs the
+  rest. Core cannot be left out. The plan marks fusiform, striatum and broca as
+  Windows previews: they are offered before their own tests run natively there.
+- `ck setup broca` selects one component. `ck setup --with cerebellum,cingulate`
+  selects several. Explicit picks include their needs, transitively, and the
+  plan names any missing ones added implicitly. A required component that cannot
+  be installed blocks the request, except that an explicit `ck setup mc` keeps
+  its existing unavailable notices when not published or on Windows.
+- `--key-path <file>` sets the claustrum key path for both bootstrap and daemon
+  configuration whenever claustrum is selected, including bare setup and an
+  implicit selection such as `ck setup --with striatum --key-path <file>`.
+  Otherwise setup uses the default claustrum key path when claustrum is selected.
+  Per-module settings (such as `fusiform.jsonc`, `broca.jsonc`, and
+  `cerebellum.jsonc`) live under the config home's `cortexkit/` directory,
+  alongside `subc.jsonc`. Setup does not overwrite existing settings files.
 - `ck setup --dry-run` is strictly read-only: it prints the full setup plan,
   including observations, proposed mutations, and refusals, without creating,
   replacing, registering, starting, or changing anything. Its plan must be

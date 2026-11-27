@@ -18,6 +18,7 @@ impl CommandRunner for Manager {
         if program == "schtasks.exe" {
             return Ok(runtime::CommandResult {
                 success: self.enabled,
+                exit_code: Some(if self.enabled { 0 } else { 1 }),
                 ..runtime::CommandResult::default()
             });
         }
@@ -55,6 +56,7 @@ impl CommandRunner for Manager {
         };
         Ok(runtime::CommandResult {
             success: result.0,
+            exit_code: Some(if result.0 { 0 } else { 1 }),
             stdout: result.1,
             stderr: String::new(),
         })

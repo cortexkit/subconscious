@@ -17,7 +17,7 @@ use super::{
     file_modes,
     inventory::Inventory,
     model::{
-        Component, ComponentState, ConfigurationState, PlatformObservation, ReleaseAvailability,
+        Component, ComponentState, PartialInstall, PlatformObservation, ReleaseAvailability,
         SetupObserved, SetupOperation, SetupRequest,
     },
     planner::{SetupExecutor, SetupPlan},
@@ -28,7 +28,14 @@ use super::{
 
 type RescanPreview = fn() -> Result<Vec<String>, String>;
 
+mod broca;
+pub(in crate::setup) mod extension;
 mod journal;
+mod module_steps;
+#[cfg(test)]
+mod module_steps_tests;
+mod settings;
+mod vault;
 
 pub struct SetupBackend {
     executable: PathBuf,
@@ -51,6 +58,7 @@ struct ComponentSteps {
     message_grants_changed: bool,
     nats_migration: Option<super::nats_migration::Migration>,
     failed_bootstrap_directory: Option<BootstrapDirectory>,
+    module_step_failed: bool,
 }
 
 struct BootstrapDirectory {
@@ -252,6 +260,8 @@ impl SetupBackend {
         let mut components = BTreeMap::new();
         let mut releases = BTreeMap::new();
         let mut unowned_binaries = BTreeMap::new();
+        let mut configuration_refusals = BTreeMap::new();
+        let mut partial_installs = BTreeMap::new();
         // A failed index is about the document, not a single component: setup
         // must not plan any installation from it.
         self.artifacts.ensure_index()?;
@@ -288,23 +298,60 @@ impl SetupBackend {
                 releases.insert(component, availability);
                 continue;
             }
-            let config_ok = match components::configuration_is_correct(
-                component,
+            let config_ok = match config::plan_component_with_key(
                 &self.paths.config_path,
+                component,
                 &self.paths.binary_home,
                 claustrum_key_path,
             ) {
-                Ok(correct) => correct,
-                // A component outside this request may have a user-owned value
-                // different from CortexKit's managed value. It must not block or
-                // be rewritten while another component is being added.
-                Err(_) if !selected.contains(&component) => false,
-                Err(error) => return Err(error),
+                Ok(change) => change.is_none(),
+                Err(conflict) => {
+                    if selected.contains(&component) {
+                        configuration_refusals.insert(
+                            component,
+                            if conflict.key == self.paths.config_path.display().to_string() {
+                                format!(
+                                    "could not check configuration at {}",
+                                    self.paths.config_path.display()
+                                )
+                            } else {
+                                format!(
+                                    "user-owned configuration conflicts at key '{}'",
+                                    conflict.key
+                                )
+                            },
+                        );
+                    }
+                    false
+                }
             } && !(component == Component::Core && nats_pending);
             let binary_ok =
                 components::is_installed(component, &self.paths.binary_home, &self.inventory);
             if !request.uninstall && selected.contains(&component) && !binary_ok {
                 if let PlatformObservation::Supported(target) = PlatformObservation::current() {
+                    if let Some((missing_commands, module_matches_release)) =
+                        components::partial_install(
+                            component,
+                            &self.paths.binary_home,
+                            &self.inventory,
+                            &release_index,
+                            target,
+                        )
+                    {
+                        partial_installs.insert(
+                            component,
+                            PartialInstall {
+                                missing_commands,
+                                module_matches_release,
+                                module_state: observed_component_state(
+                                    component,
+                                    config_ok,
+                                    true,
+                                    registered_modules.as_ref(),
+                                ),
+                            },
+                        );
+                    }
                     unowned_binaries.insert(
                         component,
                         components::observe_unowned_binaries(
@@ -335,21 +382,6 @@ impl SetupBackend {
             };
             releases.insert(component, availability);
         }
-        let configuration = selected
-            .iter()
-            .copied()
-            .find_map(|component| {
-                match config::plan_component_with_key(
-                    &self.paths.config_path,
-                    component,
-                    &self.paths.binary_home,
-                    claustrum_key_path,
-                ) {
-                    Err(conflict) => Some(ConfigurationState::Conflict { key: conflict.key }),
-                    Ok(_) => None,
-                }
-            })
-            .unwrap_or(ConfigurationState::Additive);
         let mut observed = SetupObserved::unconfigured_current_host();
         observed.components = components;
         observed.releases = releases;
@@ -371,7 +403,8 @@ impl SetupBackend {
             &mut self.runner,
             &self.inventory,
         )?;
-        observed.configuration = configuration;
+        observed.configuration_refusals = configuration_refusals;
+        observed.partial_installs = partial_installs;
         observed.running_ck_adoption = self.running_ck_adoption();
         observed.ckni = self.ckni_observation(observed.running_ck_adoption.is_some());
         if !request.uninstall {
@@ -406,12 +439,20 @@ impl SetupBackend {
             "managed-link",
             "managed-binary",
             "binary-placement",
+            extension::KIND,
         ]
         .iter()
         .map(|kind| self.inventory.paths_for_kind(kind).len())
         .sum();
         observed.permissions_need_tightening = self.permissions_need_tightening()?;
+        if !request.uninstall {
+            self.observe_module_steps(request, &release_index, &mut observed);
+        }
         Ok(observed)
+    }
+
+    pub fn unmanaged_uninstall_notes(&self) -> Vec<String> {
+        uninstall::unmanaged_uninstall_notes(self.platform, &self.inventory)
     }
 
     pub fn print_dry_run(&mut self, plan: &SetupPlan) -> Result<(), String> {
@@ -420,7 +461,11 @@ impl SetupBackend {
                 let release = self.artifacts.release_summary(*component)?;
                 println!(
                     "Installing {} ({}, {})",
-                    component.module_id().unwrap_or("CortexKit"),
+                    if component.plain_name().is_some() {
+                        component.plan_name()
+                    } else {
+                        component.module_id().unwrap_or("CortexKit").to_string()
+                    },
                     release.release,
                     release.target
                 );
@@ -440,15 +485,23 @@ impl SetupBackend {
                 SetupOperation::InstallComponent { component } => {
                     let release = self.artifacts.release_summary(*component)?;
                     for (binary, bytes) in release.assets {
-                        steps.push(format!(
-                            "would download and verify {binary} ({})",
-                            components::format_mebibytes(bytes)
-                        ));
                         let destination = self.paths.binary_home.join(if cfg!(windows) {
                             format!("{binary}.exe")
                         } else {
                             binary.to_string()
                         });
+                        if components::is_new_component_module(*component, binary)
+                            && destination.is_file()
+                            && components::OWNED_BINARY_KINDS
+                                .iter()
+                                .any(|kind| self.inventory.owns_path(kind, &destination))
+                        {
+                            continue;
+                        }
+                        steps.push(format!(
+                            "would download and verify {binary} ({})",
+                            components::format_mebibytes(bytes)
+                        ));
                         steps.push(format!(
                             "would place {}",
                             components::display_home_path(&destination)
@@ -464,7 +517,12 @@ impl SetupBackend {
                     steps.push("would initialize claustrum credentials".to_string())
                 }
                 operation @ (SetupOperation::GrantMessageKeys
-                | SetupOperation::ConfigureMessageHub) => {
+                | SetupOperation::ConfigureMessageHub
+                | SetupOperation::WriteModuleSettings { .. }
+                | SetupOperation::EnsureBrocaKey { .. }
+                | SetupOperation::GrantComponentVault { .. }
+                | SetupOperation::RegisterCerebellumNativeHost
+                | SetupOperation::EnsureCerebellumExtension { .. }) => {
                     steps.push(format!("would {operation}"));
                 }
                 SetupOperation::AdoptRunningCk { path } => steps.push(format!(
@@ -513,7 +571,6 @@ impl SetupBackend {
                     ));
                 }
                 SetupOperation::ObservePlatform
-                | SetupOperation::OfferOptionalComponents { .. }
                 | SetupOperation::OfferConversion { .. }
                 | SetupOperation::ConfirmConversion { .. }
                 | SetupOperation::RescanComponent { .. }
@@ -566,16 +623,15 @@ impl SetupBackend {
         }
         self.execute_transactions(plan, request.uninstall)?;
         if request.uninstall {
-            let report =
-                self.uninstall_report
-                    .take()
-                    .unwrap_or_else(|| uninstall::UninstallReport {
-                        removed: Vec::new(),
-                        retained: vec![
-                            format!("configuration: {}", self.paths.config_path.display()),
-                            format!("store: {}", self.paths.data_dir.join("stores").display()),
-                        ],
-                    });
+            let report = match self.uninstall_report.take() {
+                Some(report) => report,
+                None => uninstall::uninstall_user_data(
+                    self.platform,
+                    &mut self.inventory,
+                    &self.paths.config_path,
+                    &[self.paths.data_dir.join("stores")],
+                )?,
+            };
             println!("retained after uninstall:");
             for retained in report.retained {
                 println!("  {retained}");
@@ -1103,6 +1159,21 @@ impl SetupExecutor for SetupBackend {
             SetupOperation::BootstrapClaustrum { key_path } => {
                 self.bootstrap_claustrum(key_path.as_deref())
             }
+            operation @ (SetupOperation::WriteModuleSettings { .. }
+            | SetupOperation::EnsureBrocaKey { .. }
+            | SetupOperation::GrantComponentVault { .. }
+            | SetupOperation::RegisterCerebellumNativeHost
+            | SetupOperation::EnsureCerebellumExtension { .. }) => {
+                let result = self.apply_module_step(operation);
+                if result.is_err() {
+                    let component = operation.component().expect("module ensure component");
+                    self.component_steps
+                        .entry(component)
+                        .or_default()
+                        .module_step_failed = true;
+                }
+                result
+            }
             SetupOperation::GrantMessageKeys => {
                 println!("{}", super::message_plane::GRANT_STEP);
                 let auth = self.paths.binary_home.join(if cfg!(windows) {
@@ -1206,7 +1277,6 @@ impl SetupExecutor for SetupBackend {
             }
             SetupOperation::RemoveManagedComponent { .. }
             | SetupOperation::ObservePlatform
-            | SetupOperation::OfferOptionalComponents { .. }
             | SetupOperation::OfferConversion { .. }
             | SetupOperation::ConfirmConversion { .. }
             | SetupOperation::Validate { .. }
@@ -1358,6 +1428,11 @@ mod tests {
         ) -> Result<runtime::CommandResult, String> {
             Ok(runtime::CommandResult {
                 success: program == "systemctl" && args == ["show-environment"],
+                exit_code: Some(if program == "systemctl" && args == ["show-environment"] {
+                    0
+                } else {
+                    1
+                }),
                 stdout: String::new(),
                 stderr: format!("{program} {}: user manager unavailable", args.join(" ")),
             })
@@ -1534,7 +1609,7 @@ mod tests {
         }
     }
 
-    fn backend_without_user_manager(root: &ScratchDir) -> SetupBackend {
+    pub(super) fn backend_without_user_manager(root: &ScratchDir) -> SetupBackend {
         let binary_home = root.join("bin");
         let inventory_path = root.join("installer-manifest.json");
         let platform = RuntimePlatform::Linux;

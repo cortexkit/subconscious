@@ -80,14 +80,26 @@ impl SetupBackend {
             groups.entry(component).or_default().push(operation.clone());
         }
         self.prepare_apply(plan)?;
+        let mut unchanged = Vec::new();
         for component in std::iter::once(Component::Core).chain(
             Component::ALL
                 .into_iter()
                 .filter(|&component| component != Component::Core),
         ) {
             let Some(operations) = groups.remove(&component) else {
+                if plan.validation.contains(&component) {
+                    unchanged.push(component);
+                }
                 continue;
             };
+            let fusiform_is_starting = component == Component::Fusiform
+                && operations.iter().any(|operation| {
+                    matches!(
+                        operation,
+                        SetupOperation::InstallComponent { .. }
+                            | SetupOperation::EnableComponent { .. }
+                    )
+                });
             if self.platform == RuntimePlatform::Macos
                 && operations.iter().any(|operation| {
                     matches!(
@@ -108,6 +120,7 @@ impl SetupBackend {
             let subplan = SetupPlan {
                 operations,
                 outcomes: Vec::new(),
+                validation: Vec::new(),
                 permission_repair: false,
             };
             self.inventory.start_transaction()?;
@@ -119,7 +132,12 @@ impl SetupBackend {
                     self.stop_before_uninstall()?;
                 }
                 execute_setup_with_prepare(&subplan, ExecutionMode::Apply, self, false)?;
-                self.verify_transaction(component, uninstall)
+                self.verify_transaction(
+                    component,
+                    uninstall,
+                    plan.validation.contains(&component),
+                    fusiform_is_starting,
+                )
             })();
             let mut recovery = SystemRecovery {
                 executable: &self.executable,
@@ -132,14 +150,12 @@ impl SetupBackend {
                 if let Err(undo) = self.inventory.undo_transaction(&mut recovery) {
                     return Err(format!("{error}; install recovery stopped: {undo}"));
                 }
-                if let Some(directory) = self
-                    .component_steps
-                    .entry(component)
-                    .or_default()
-                    .failed_bootstrap_directory
-                    .take()
-                {
+                let steps = self.component_steps.entry(component).or_default();
+                if let Some(directory) = steps.failed_bootstrap_directory.take() {
                     crate::cli_output::println!("{}", directory.rollback()?);
+                }
+                if std::mem::take(&mut steps.module_step_failed) {
+                    return Err(super::module_steps::refusal_remedy(plan, component, &error));
                 }
                 return Err(error);
             }
@@ -154,6 +170,12 @@ impl SetupBackend {
             #[cfg(feature = "test-support")]
             super::super::install_journal::crash_hook("before-bus-monitoring");
             self.monitor_nats_after_commit(target, &mut bus_monitoring::CkBusCommand)?;
+        }
+        if !unchanged.is_empty() {
+            let mut validator = CkValidator {
+                executable: &self.executable,
+            };
+            validation::validate_selected(&mut validator, &unchanged, false)?;
         }
         Ok(())
     }
@@ -222,14 +244,22 @@ impl SetupBackend {
         transaction.journal().done(index)
     }
 
-    fn verify_transaction(&mut self, component: Component, uninstall: bool) -> Result<(), String> {
+    fn verify_transaction(
+        &mut self,
+        component: Component,
+        uninstall: bool,
+        validate_health: bool,
+        fusiform_is_starting: bool,
+    ) -> Result<(), String> {
         if uninstall {
             return Ok(());
         }
         let mut validator = CkValidator {
             executable: &self.executable,
         };
-        validation::validate_selected(&mut validator, &[component])?;
+        if validate_health {
+            validation::validate_selected(&mut validator, &[component], fusiform_is_starting)?;
+        }
         #[cfg(target_os = "macos")]
         if component == Component::Core && self.paths.runtime_paths.daemon.is_file() {
             let flat = self.paths.binary_home.join("ck-subc");

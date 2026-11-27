@@ -1666,7 +1666,7 @@ fn health_action(action: RawHealthAction) -> HealthAction {
 
 /// Platform data home for per-module storage: `$XDG_DATA_HOME`, else
 /// `~/.local/share` (or the Windows roaming app data), else a relative fallback.
-pub(crate) fn default_data_home() -> PathBuf {
+pub fn default_data_home() -> PathBuf {
     if let Some(data_home) = non_empty_os_var("XDG_DATA_HOME") {
         return PathBuf::from(data_home);
     }

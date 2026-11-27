@@ -1,11 +1,14 @@
+use std::collections::BTreeMap;
+
 use super::{
     bus_monitoring::BusMonitoring,
     ckni::CkniState,
-    conversion::{explicit_conversion_requires_confirmation, selected_components},
+    components::{component_needs, needs_closure},
+    conversion::{explicit_conversion_requires_confirmation, is_bare_setup, selected_components},
     model::{
-        Component, ComponentState, ConfigurationState, CoreVersion, DetectionOutcome, PlanOutcome,
-        PlatformObservation, ReleaseAvailability, RuntimeState, SetupObserved, SetupOperation,
-        SetupRequest, UpgradeObserved, UpgradeOperation, UpgradeState, UpgradeTarget,
+        Component, ComponentState, CoreVersion, DetectionOutcome, PlanOutcome, PlatformObservation,
+        ReleaseAvailability, RuntimeState, SetupObserved, SetupOperation, SetupRequest,
+        UpgradeObserved, UpgradeOperation, UpgradeState, UpgradeTarget,
     },
 };
 
@@ -13,6 +16,8 @@ use super::{
 pub struct SetupPlan {
     pub operations: Vec<SetupOperation>,
     pub outcomes: Vec<PlanOutcome>,
+    /// The final health roster, in dependency order.
+    pub(crate) validation: Vec<Component>,
     /// Unix setup needs this extra permissions-only step when observation finds
     /// loose modes on app-specific directories or inventory-owned files.
     pub(crate) permission_repair: bool,
@@ -40,15 +45,6 @@ impl SetupPlan {
             + usize::from(self.permission_repair)
     }
 
-    pub fn optional_components_line(&self) -> Option<String> {
-        self.operations
-            .iter()
-            .find_map(|operation| match operation {
-                SetupOperation::OfferOptionalComponents { .. } => Some(operation.to_string()),
-                _ => None,
-            })
-    }
-
     /// The dry-run text an operator reads before consenting. `ck setup`
     /// prints this verbatim.
     pub fn render(&self) -> String {
@@ -70,6 +66,7 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
     let mut plan = SetupPlan {
         operations: vec![SetupOperation::ObservePlatform],
         outcomes: Vec::new(),
+        validation: Vec::new(),
         permission_repair: cfg!(unix) && observed.permissions_need_tightening && !request.uninstall,
     };
 
@@ -86,6 +83,17 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
         return plan_uninstall(observed, plan);
     }
 
+    // Refuse a direct Windows Cerebellum request even if one of its needs
+    // would independently be unavailable. Installing needs cannot enable it.
+    if request.optional_components.contains(&Component::Cerebellum) {
+        if let Some(message) = Component::Cerebellum.unavailable_message(*target) {
+            plan.outcomes.push(PlanOutcome::Refusal {
+                reason: message.into(),
+            });
+            return plan;
+        }
+    }
+
     if let (Some(installed), Some(release)) = (
         &observed.installed_core_version,
         &observed.available_core_version,
@@ -98,31 +106,8 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
         }
     }
 
-    for component in selected_components(request) {
-        if observed.component_state(component) != ComponentState::Missing {
-            continue;
-        }
-        for binary in observed
-            .unowned_binaries
-            .get(&component)
-            .into_iter()
-            .flatten()
-        {
-            let reason = match (&binary.version, &binary.release_version) {
-                (Some(installed), Some(release)) if version_is_newer(installed, release) => {
-                    Some(downgrade_refusal(
-                        &super::components::display_home_path(&binary.path),
-                        installed,
-                        release,
-                    ))
-                }
-                (Some(installed), Some(release)) if installed == release => None,
-                _ => Some(super::text::unowned_binary_refusal(&binary.path)),
-            };
-            if let Some(reason) = reason {
-                plan.outcomes.push(PlanOutcome::Refusal { reason });
-            }
-        }
+    if let Some(reason) = unowned_binary_refusal(observed, Component::Core) {
+        plan.outcomes.push(PlanOutcome::Refusal { reason });
     }
     // A `ckni` setup didn't install is refused like any other binary it
     // didn't install: the operator moves it aside, and setup links its own.
@@ -156,21 +141,6 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
 
     record_detection_outcomes(observed, &mut plan);
     let selected = selected_components(request);
-    if request.optional_components.is_empty() && request.convert.is_none() {
-        let components = Component::ALL
-            .into_iter()
-            .filter(|component| {
-                *component != Component::Core
-                    && !component.is_declared_unsupported_on(*target)
-                    && observed.component_state(*component) == ComponentState::Missing
-                    && observed.release(*component) == ReleaseAvailability::Available
-            })
-            .collect::<Vec<_>>();
-        if !components.is_empty() {
-            plan.operations
-                .push(SetupOperation::OfferOptionalComponents { components });
-        }
-    }
 
     if let Some(component) = request.convert {
         plan.operations
@@ -186,69 +156,105 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
 
     let mut newly_configured_modules = Vec::new();
     let mut core_is_being_installed = false;
+    let mut omitted = BTreeMap::new();
     for component in selected {
-        match observed.release(component) {
-            ReleaseAvailability::DeclaredUnavailable { message } => {
-                plan.outcomes
-                    .push(PlanOutcome::DeclaredUnavailable { component, message });
-                continue;
-            }
-            ReleaseAvailability::NotYetPublished {
-                release_tag,
-                missing_asset,
-            } => {
-                plan.outcomes.push(PlanOutcome::ReleaseIncomplete {
-                    component,
-                    release_tag,
-                    missing_asset,
-                });
-                continue;
-            }
-            ReleaseAvailability::Incomplete { missing_asset } => {
-                plan.outcomes.push(PlanOutcome::ReleaseIncomplete {
-                    component,
-                    release_tag: "the resolved release".to_string(),
-                    missing_asset,
-                });
-                continue;
-            }
-            ReleaseAvailability::Unresolvable { reason } => {
-                plan.outcomes
-                    .push(PlanOutcome::ReleaseUnresolvable { component, reason });
-                continue;
-            }
-            ReleaseAvailability::Available | ReleaseAvailability::NotRequired => {}
-        }
-
-        if let Some(message) = component.unavailable_message(*target) {
-            plan.outcomes.push(PlanOutcome::DeclaredUnavailable {
+        let partial = observed.partial_installs.get(&component);
+        let state = partial.map_or_else(
+            || observed.component_state(component),
+            |partial| partial.module_state,
+        );
+        let needs_placement = partial.map_or(state == ComponentState::Missing, |partial| {
+            partial.module_matches_release
+        });
+        let unavailable_need = component_needs(component).iter().find_map(|need| {
+            omitted.get(need).map(|reason| PlanOutcome::Refusal {
+                reason: format!("{component} needs {need}: {reason}"),
+            })
+        });
+        let refusal = if component.is_declared_unsupported_on(*target) || unavailable_need.is_none()
+        {
+            component_refusal(
+                observed,
+                request,
                 component,
-                message: message.to_string(),
-            });
+                *target,
+                needs_placement,
+                core_is_being_installed,
+            )
+        } else {
+            unavailable_need
+        };
+        if let Some(refusal) = refusal {
+            let reason = omission_reason(&refusal);
+            omitted.insert(component, reason.clone());
+            plan.outcomes
+                .push(if is_bare_setup(request) && component != Component::Core {
+                    PlanOutcome::LeftOut { component, reason }
+                } else if component != Component::Core
+                    && request.convert != Some(component)
+                    && !request.optional_components.contains(&component)
+                {
+                    PlanOutcome::Refusal {
+                        reason: format!("{component} is required: {reason}"),
+                    }
+                } else {
+                    refusal
+                });
             continue;
         }
 
-        let component_state = observed.component_state(component);
-        if component.module_id().is_some() && component_state == ComponentState::Missing {
-            if let Some(reason) =
-                setup_core_floor_refusal(observed, component, core_is_being_installed)
-            {
-                plan.outcomes
-                    .push(PlanOutcome::TargetRefused { component, reason });
-                continue;
+        if component.is_windows_preview(*target) {
+            plan.outcomes
+                .push(PlanOutcome::WindowsPreview { component });
+        }
+        if let Some(partial) = partial.filter(|partial| !partial.module_matches_release) {
+            for binary in &partial.missing_commands {
+                plan.outcomes.push(PlanOutcome::SetupNote {
+                    message: format!("run ck upgrade, then ck setup, to add {binary}"),
+                });
             }
         }
+        if component == Component::Fusiform && state != ComponentState::Correct {
+            plan.outcomes.push(PlanOutcome::SetupNote {
+                message: "fusiform (Model Catalog): fetching the model catalog".into(),
+            });
+        }
+        if component == Component::Cerebellum
+            && matches!(
+                target,
+                super::model::AlphaTarget::LinuxX64 | super::model::AlphaTarget::LinuxArm64
+            )
+        {
+            plan.outcomes.push(PlanOutcome::SetupNote {
+                message: "cerebellum (Browser and Computer Use): agent browser only on Linux"
+                    .into(),
+            });
+        }
 
-        match component_state {
+        let module_steps = observed.module_steps.get(&component).into_iter().flatten();
+        if let Some(notes) = observed.module_notes.get(&component) {
+            plan.outcomes.extend(
+                notes
+                    .iter()
+                    .cloned()
+                    .map(|message| PlanOutcome::SetupNote { message }),
+            );
+        }
+        if component == Component::Fusiform {
+            plan.operations.extend(module_steps.clone().cloned());
+        }
+        if needs_placement {
+            plan.operations
+                .push(SetupOperation::InstallComponent { component });
+            if component == Component::Core {
+                core_is_being_installed = !observed.core_binary_present;
+            }
+        }
+        match state {
             ComponentState::Correct => plan.outcomes.push(PlanOutcome::Noop {
                 scope: format!("{component} is already correct"),
             }),
             ComponentState::Missing => {
-                plan.operations
-                    .push(SetupOperation::InstallComponent { component });
-                if component == Component::Core {
-                    core_is_being_installed = !observed.core_binary_present;
-                }
                 plan.operations
                     .push(SetupOperation::ConfigureComponent { component });
                 if component == Component::Claustrum {
@@ -271,16 +277,12 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
                 }
             }
         }
+        if component != Component::Fusiform {
+            plan.operations.extend(module_steps.cloned());
+        }
+        plan.validation.push(component);
     }
-
-    if matches!(observed.configuration, ConfigurationState::Conflict { .. }) {
-        let ConfigurationState::Conflict { key } = &observed.configuration else {
-            unreachable!("the match above establishes the conflict variant");
-        };
-        plan.outcomes.push(PlanOutcome::Refusal {
-            reason: format!("user-owned configuration conflicts at key '{key}'"),
-        });
-    }
+    append_needs_notes(observed, request, &mut plan);
 
     if observed.component_state(Component::Core) != ComponentState::Missing
         || observed.core_binary_present
@@ -335,15 +337,9 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
         }
     }
 
-    if observed.component_state(Component::Claustrum) != ComponentState::Missing
-        || plan.operations.iter().any(|op| {
-            matches!(
-                op,
-                SetupOperation::InstallComponent {
-                    component: Component::Claustrum
-                }
-            )
-        })
+    if !omitted.contains_key(&Component::Claustrum)
+        && (observed.component_state(Component::Claustrum) != ComponentState::Missing
+            || plan.validation.contains(&Component::Claustrum))
     {
         plan.operations.push(SetupOperation::GrantMessageKeys);
     }
@@ -375,6 +371,171 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
         },
     ]);
     plan
+}
+
+fn component_refusal(
+    observed: &SetupObserved,
+    request: &SetupRequest,
+    component: Component,
+    target: super::model::AlphaTarget,
+    needs_placement: bool,
+    core_is_being_installed: bool,
+) -> Option<PlanOutcome> {
+    let release = needs_placement.then(|| observed.release(component));
+    // Use the Magic Context plugin instructions if there is no module release,
+    // even on Windows. Otherwise explain that Windows has no download.
+    if component == Component::Mc {
+        if let Some(ReleaseAvailability::DeclaredUnavailable { message }) = &release {
+            return Some(PlanOutcome::DeclaredUnavailable {
+                component,
+                message: message.clone(),
+            });
+        }
+    }
+    if let Some(message) = component.unavailable_message(target) {
+        return Some(if component == Component::Mc {
+            PlanOutcome::DeclaredUnavailable {
+                component,
+                message: message.into(),
+            }
+        } else {
+            PlanOutcome::Refusal {
+                reason: message.into(),
+            }
+        });
+    }
+
+    let release_block = match release {
+        Some(ReleaseAvailability::DeclaredUnavailable { message }) => {
+            Some(PlanOutcome::DeclaredUnavailable { component, message })
+        }
+        Some(ReleaseAvailability::NotYetPublished {
+            release_tag,
+            missing_asset,
+        }) => Some(PlanOutcome::ReleaseIncomplete {
+            component,
+            release_tag,
+            missing_asset,
+        }),
+        Some(ReleaseAvailability::Incomplete { missing_asset }) => {
+            Some(PlanOutcome::ReleaseIncomplete {
+                component,
+                release_tag: "the resolved release".into(),
+                missing_asset,
+            })
+        }
+        Some(ReleaseAvailability::Unresolvable { reason }) => {
+            Some(PlanOutcome::ReleaseUnresolvable { component, reason })
+        }
+        Some(ReleaseAvailability::NotRequired) if component != Component::Mc => {
+            Some(PlanOutcome::Refusal {
+                reason: format!("no release is available for {component}"),
+            })
+        }
+        _ => None,
+    };
+    if release_block.is_some() {
+        return release_block;
+    }
+    if let Some(reason) = unowned_binary_refusal(observed, component) {
+        return Some(PlanOutcome::Refusal { reason });
+    }
+    if needs_placement {
+        if observed.detections.get(&component) == Some(&DetectionOutcome::OfferConversion)
+            && request.convert != Some(component)
+        {
+            return Some(PlanOutcome::Refusal {
+                reason: format!("standalone {component} detected; run ck setup {component} --convert to convert it"),
+            });
+        }
+        if component.module_id().is_some() && !observed.partial_installs.contains_key(&component) {
+            if let Some(reason) =
+                setup_core_floor_refusal(observed, component, core_is_being_installed)
+            {
+                return Some(PlanOutcome::TargetRefused { component, reason });
+            }
+        }
+    }
+    observed
+        .configuration_refusals
+        .get(&component)
+        .map(|reason| PlanOutcome::Refusal {
+            reason: reason.clone(),
+        })
+}
+
+fn unowned_binary_refusal(observed: &SetupObserved, component: Component) -> Option<String> {
+    observed
+        .unowned_binaries
+        .get(&component)?
+        .iter()
+        .find_map(|binary| match (&binary.version, &binary.release_version) {
+            (Some(installed), Some(release)) if version_is_newer(installed, release) => {
+                Some(downgrade_refusal(
+                    &super::components::display_home_path(&binary.path),
+                    installed,
+                    release,
+                ))
+            }
+            (Some(installed), Some(release)) if installed == release => None,
+            _ => Some(super::text::unowned_binary_refusal(&binary.path)),
+        })
+}
+
+fn omission_reason(outcome: &PlanOutcome) -> String {
+    match outcome {
+        PlanOutcome::Refusal { reason } | PlanOutcome::TargetRefused { reason, .. } => reason
+            .strip_suffix(" Nothing was changed.")
+            .unwrap_or(reason)
+            .to_string(),
+        PlanOutcome::ReleaseUnresolvable { reason, .. } => {
+            format!("could not resolve the release: {reason}")
+        }
+        PlanOutcome::ReleaseIncomplete { release_tag, .. }
+            if release_tag == "no published release" =>
+        {
+            release_tag.clone()
+        }
+        PlanOutcome::ReleaseIncomplete {
+            release_tag,
+            missing_asset,
+            ..
+        } => {
+            format!("no {missing_asset} asset in {release_tag} yet")
+        }
+        PlanOutcome::DeclaredUnavailable { message, .. } => message
+            .strip_suffix("; nothing was installed.")
+            .unwrap_or(message)
+            .to_string(),
+        _ => unreachable!("only a refusal can omit a component"),
+    }
+}
+
+fn append_needs_notes(observed: &SetupObserved, request: &SetupRequest, plan: &mut SetupPlan) {
+    for &pick in &request.optional_components {
+        if !plan.validation.contains(&pick) {
+            continue;
+        }
+        let needs = needs_closure([pick])
+            .into_iter()
+            .filter(|need| {
+                *need != Component::Core
+                    && !request.optional_components.contains(need)
+                    && request.convert != Some(*need)
+                    && !observed.is_installed_for_selection(*need)
+            })
+            .map(Component::label)
+            .collect::<Vec<_>>();
+        let message = match needs.as_slice() {
+            [] => continue,
+            [only] => format!("{pick} needs {only}; it will be installed too"),
+            [rest @ .., last] => format!(
+                "{pick} needs {} and {last}; they will be installed too",
+                rest.join(", ")
+            ),
+        };
+        plan.outcomes.push(PlanOutcome::SetupNote { message });
+    }
 }
 
 fn version_is_newer(installed: &str, release: &str) -> bool {
@@ -950,6 +1111,12 @@ mod message_plane_tests {
         observed
             .components
             .insert(Component::Core, ComponentState::Correct);
+        observed.releases.insert(
+            Component::Claustrum,
+            ReleaseAvailability::Unresolvable {
+                reason: "no vault release".into(),
+            },
+        );
         let plan = plan_setup(&observed, &SetupRequest::install(Vec::new()));
         assert!(!plan.operations.contains(&SetupOperation::GrantMessageKeys));
         let plan = plan_upgrade(&UpgradeObserved::for_roster(upgrade_roster([
@@ -1021,7 +1188,10 @@ mod tests {
             installed_core_version: None,
             core_binary_present: false,
             runtime: RuntimeState::Missing,
-            configuration: ConfigurationState::Additive,
+            configuration_refusals: BTreeMap::new(),
+            module_steps: BTreeMap::new(),
+            module_notes: BTreeMap::new(),
+            partial_installs: BTreeMap::new(),
             running_ck_adoption: None,
             ckni: None,
             mc_detection: None,
@@ -1033,7 +1203,7 @@ mod tests {
     }
 
     #[test]
-    fn optional_components_line_lists_only_missing_installable_modules() {
+    fn bare_setup_places_only_missing_installable_modules() {
         let mut observed = observed_setup();
         observed.platform = PlatformObservation::Supported(AlphaTarget::WindowsX64);
         observed.releases.insert(
@@ -1043,21 +1213,30 @@ mod tests {
             },
         );
         let plan = plan_setup(&observed, &SetupRequest::install(Vec::new()));
-        let lines = plan
-            .operations
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
-        assert!(
-            lines.contains(
-                &"Optional modules: insula, claustrum. Add one with `ck setup <name>`.".to_string()
-            ),
-            "{lines:?}"
+        assert!(plan.is_authorized());
+        assert_eq!(
+            plan.validation,
+            [
+                Component::Core,
+                Component::Aft,
+                Component::Insula,
+                Component::Claustrum,
+                Component::Fusiform,
+                Component::Cingulate,
+                Component::Entorhinal,
+                Component::Astrocyte,
+                Component::Striatum,
+                Component::Broca
+            ]
         );
+        for component in [Component::Mc, Component::Synapse, Component::Cerebellum] {
+            assert!(plan.outcomes.iter().any(|outcome| matches!(outcome,
+                PlanOutcome::LeftOut { component: omitted, .. } if *omitted == component)));
+        }
     }
 
     #[test]
-    fn optional_components_line_is_absent_when_everything_is_installed() {
+    fn bare_setup_places_nothing_when_everything_is_installed() {
         let mut observed = observed_setup();
         for component in Component::ALL {
             observed
@@ -1065,10 +1244,260 @@ mod tests {
                 .insert(component, ComponentState::Correct);
         }
         let plan = plan_setup(&observed, &SetupRequest::install(Vec::new()));
+        assert!(!plan.operations.iter().any(|operation| matches!(
+            operation,
+            SetupOperation::InstallComponent { .. } | SetupOperation::ConfigureComponent { .. }
+        )));
+    }
+
+    #[test]
+    fn bare_setup_platform_goldens() {
+        const COMMON: &str = "install core\ninstall aft\ninstall insula — file/API providers; cookies only from vault deposits on every OS, never browser stores\ninstall claustrum\ninstall synapse — healthy immediately with an empty catalog; inference remains typed-refused until model.load arrives\ninstall fusiform (Model Catalog)\ninstall cingulate (Approvals)\ninstall entorhinal (Agents and Projects)\ninstall astrocyte (Spend Records)\ninstall striatum (AI Model Routing)\ninstall broca (Model Runner)";
+        const CEREBELLUM: &str = "install cerebellum (Browser and Computer Use)";
+        const CATALOG: &str = "fusiform (Model Catalog): fetching the model catalog";
+        let unpublished = format!("mc: left out — {}", super::super::text::MC_UNPUBLISHED_NOTE);
+        for (target, expected) in [
+            (AlphaTarget::DarwinArm64, format!("{COMMON}\n{CEREBELLUM}\n{unpublished}\n{CATALOG}")),
+            (AlphaTarget::LinuxX64, format!("{COMMON}\n{CEREBELLUM}\n{unpublished}\n{CATALOG}\ncerebellum (Browser and Computer Use): agent browser only on Linux")),
+            (AlphaTarget::WindowsX64, format!("{COMMON}\nmc: left out — magic-context is not available on this platform yet\nfusiform (Model Catalog): offered on Windows before its own tests run natively there\n{CATALOG}\nstriatum (AI Model Routing): offered on Windows before its own tests run natively there\nbroca (Model Runner): offered on Windows before its own tests run natively there\ncerebellum (Browser and Computer Use): left out — cerebellum is not offered on Windows")),
+        ] {
+            let mut observed = observed_setup();
+            observed.components.clear();
+            observed.platform = PlatformObservation::Supported(target);
+            if target != AlphaTarget::WindowsX64 {
+                observed.releases.insert(Component::Mc, ReleaseAvailability::DeclaredUnavailable {
+                    message: super::super::text::MC_UNPUBLISHED_NOTE.to_string(),
+                });
+            }
+            let plan = plan_setup(&observed, &SetupRequest::install(vec![]));
+            assert!(plan.is_authorized(), "{target}: {}", plan.render());
+            let visible = plan.operations.iter()
+                .filter(|op| matches!(op, SetupOperation::InstallComponent { .. }))
+                .map(ToString::to_string)
+                .chain(plan.outcomes.iter().filter(|outcome| outcome.is_default_setup_note()).map(ToString::to_string))
+                .collect::<Vec<_>>().join("\n");
+            assert_eq!(visible, expected, "{target}");
+            assert!(!plan.render().contains("Optional modules:"));
+        }
+    }
+
+    #[test]
+    fn explicit_setup_names_implicit_missing_needs_including_only_dependencies() {
+        use Component::*;
+        let mut observed = observed_setup();
+        for (picks, roster, expected) in [
+            (
+                vec![Cerebellum],
+                vec![Core, Claustrum, Cingulate, Entorhinal, Cerebellum],
+                "cerebellum needs claustrum, cingulate and entorhinal; they will be installed too",
+            ),
+            (
+                vec![Cerebellum, Cingulate],
+                vec![Core, Claustrum, Cingulate, Entorhinal, Cerebellum],
+                "cerebellum needs claustrum and entorhinal; they will be installed too",
+            ),
+            (
+                vec![Striatum],
+                vec![Core, Claustrum, Fusiform, Striatum],
+                "striatum needs claustrum and fusiform; they will be installed too",
+            ),
+        ] {
+            let plan = plan_setup(&observed, &SetupRequest::install(picks));
+            assert_eq!(plan.validation, roster);
+            assert!(plan.outcomes.contains(&PlanOutcome::SetupNote {
+                message: expected.into()
+            }));
+        }
+        observed
+            .components
+            .insert(Claustrum, ComponentState::Correct);
+        let plan = plan_setup(&observed, &SetupRequest::install(vec![Broca]));
+        assert!(plan.outcomes.contains(&PlanOutcome::SetupNote {
+            message: "broca needs fusiform; it will be installed too".into()
+        }));
+        observed.platform = PlatformObservation::Supported(AlphaTarget::WindowsX64);
+        observed.releases.insert(
+            Cingulate,
+            ReleaseAvailability::Unresolvable {
+                reason: "missing release".into(),
+            },
+        );
+        let plan = plan_setup(&observed, &SetupRequest::install(vec![Cerebellum]));
+        assert_eq!(
+            plan.blocking_outcome(),
+            Some(&PlanOutcome::Refusal {
+                reason: "cerebellum is not offered on Windows".into()
+            })
+        );
+    }
+
+    #[test]
+    fn setup_checks_needs_and_installed_state_before_new_release_eligibility() {
+        use Component::*;
+        let mut observed = observed_setup();
+        observed.components.insert(Core, ComponentState::Correct);
+        observed.installed_core_version = Some("1.0.0".into());
+        observed.requires_core.insert(Fusiform, "2.0.0".into());
+        let explicit = SetupRequest::install(vec![Striatum]);
+        let plan = plan_setup(&observed, &explicit);
+        assert!(
+            matches!(plan.blocking_outcome(), Some(PlanOutcome::Refusal { reason })
+            if reason.contains("fusiform requires core ≥ 2.0.0"))
+        );
+        let plan = plan_setup(&observed, &SetupRequest::install(vec![]));
+        assert!(plan.is_authorized());
+        assert!(!plan.validation.contains(&Fusiform));
+        assert!(!plan.validation.contains(&Striatum));
+        assert!(plan
+            .outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, PlanOutcome::LeftOut {
+            component: Striatum, reason,
+        } if reason.contains("striatum needs fusiform"))));
+
+        for component in [Fusiform, Broca] {
+            observed
+                .components
+                .insert(component, ComponentState::Correct);
+            observed.releases.insert(
+                component,
+                ReleaseAvailability::Unresolvable {
+                    reason: "no index entry".into(),
+                },
+            );
+        }
+        let plan = plan_setup(&observed, &explicit);
+        assert!(plan.is_authorized());
+        assert!(plan.operations.contains(&SetupOperation::InstallComponent {
+            component: Striatum
+        }));
+        let plan = plan_setup(&observed, &SetupRequest::install(vec![Broca]));
+        assert!(plan.is_authorized());
+        assert!(plan.outcomes.contains(&PlanOutcome::Noop {
+            scope: "broca is already correct".into()
+        }));
         assert!(!plan
             .operations
             .iter()
-            .any(|operation| operation.to_string().to_lowercase().contains("optional")));
+            .any(|op| op.component() == Some(Broca)));
+        let plan = plan_setup(&observed, &SetupRequest::install(vec![Cingulate]));
+        assert_eq!(plan.validation, [Core, Cingulate]);
+    }
+
+    #[test]
+    fn bare_setup_leaves_out_an_incomplete_need_or_conflicting_config_and_dependents() {
+        use Component::*;
+        for reason in ["ck-models-linux-x64.zip", "modules.fusiform"] {
+            let mut observed = observed_setup();
+            if reason.ends_with(".zip") {
+                observed.releases.insert(
+                    Fusiform,
+                    ReleaseAvailability::Incomplete {
+                        missing_asset: reason.into(),
+                    },
+                );
+            } else {
+                observed.configuration_refusals.insert(
+                    Fusiform,
+                    format!("user-owned configuration conflicts at key '{reason}'"),
+                );
+            }
+            let plan = plan_setup(&observed, &SetupRequest::install(vec![]));
+            assert!(plan.is_authorized());
+            for component in [Fusiform, Astrocyte, Striatum, Broca] {
+                assert!(!plan.validation.contains(&component));
+                assert!(!plan
+                    .operations
+                    .iter()
+                    .any(|op| op.component() == Some(component)));
+                assert!(plan.outcomes.iter().any(|outcome| matches!(outcome,
+                    PlanOutcome::LeftOut { component: omitted, reason: message } if *omitted == component && message.contains(reason))));
+            }
+            assert!(plan.validation.contains(&Cerebellum));
+            let plan = plan_setup(&observed, &SetupRequest::install(vec![Striatum]));
+            assert!(
+                matches!(plan.blocking_outcome(), Some(PlanOutcome::Refusal { reason: message })
+                if message.contains("fusiform") && message.contains(reason))
+            );
+        }
+    }
+
+    #[test]
+    fn setup_unowned_broca_must_report_the_release_version_to_reach_adoption() {
+        let mut observed = observed_setup();
+        let path = Path::new("/managed/bin/ck-broca");
+        for same_version in [false, true] {
+            observed.unowned_binaries.insert(
+                Component::Broca,
+                vec![UnownedBinary {
+                    path: path.to_owned(),
+                    version: Some(if same_version { "1.0.0" } else { "0.9.0" }.into()),
+                    release_version: Some("1.0.0".into()),
+                }],
+            );
+            let bare = plan_setup(&observed, &SetupRequest::install(vec![]));
+            let explicit = plan_setup(&observed, &SetupRequest::install(vec![Component::Broca]));
+            assert!(bare.is_authorized());
+            assert_eq!(explicit.is_authorized(), same_version);
+            for plan in [&bare, &explicit] {
+                assert_eq!(
+                    plan.operations.contains(&SetupOperation::InstallComponent {
+                        component: Component::Broca
+                    }),
+                    same_version
+                );
+            }
+            if !same_version {
+                assert!(bare.outcomes.iter().any(|outcome| matches!(outcome,
+                    PlanOutcome::LeftOut { component: Component::Broca, reason } if reason.contains("/managed/bin/ck-broca"))));
+                assert!(explicit
+                    .blocking_outcome()
+                    .unwrap()
+                    .to_string()
+                    .contains("/managed/bin/ck-broca"));
+            }
+        }
+    }
+
+    #[test]
+    fn setup_partial_install_places_only_matching_commands_or_advises_upgrade() {
+        let component = Component::Cerebellum;
+        let mut observed = observed_setup();
+        observed.platform = PlatformObservation::Supported(AlphaTarget::DarwinArm64);
+        let request = SetupRequest::install(vec![component]);
+        for matches in [false, true] {
+            observed.partial_installs.insert(
+                component,
+                super::super::model::PartialInstall {
+                    missing_commands: vec!["ck-cerebellum-native-host"],
+                    module_matches_release: matches,
+                    module_state: ComponentState::Correct,
+                },
+            );
+            let plan = plan_setup(&observed, &request);
+            assert!(plan.is_authorized());
+            assert!(plan.validation.contains(&component));
+            assert_eq!(
+                plan.operations
+                    .iter()
+                    .filter(|op| op.component() == Some(component))
+                    .collect::<Vec<_>>(),
+                if matches {
+                    vec![&SetupOperation::InstallComponent {
+                        component: Component::Cerebellum,
+                    }]
+                } else {
+                    vec![]
+                }
+            );
+            assert_eq!(
+                plan.outcomes.contains(&PlanOutcome::SetupNote {
+                    message: "run ck upgrade, then ck setup, to add ck-cerebellum-native-host"
+                        .into()
+                }),
+                !matches
+            );
+        }
     }
 
     #[test]
@@ -1540,9 +1969,10 @@ mod tests {
     #[test]
     fn refusal_and_owner_gate_are_distinct_and_apply_nothing() {
         let mut observed = observed_setup();
-        observed.configuration = ConfigurationState::Conflict {
-            key: "transport".to_string(),
-        };
+        observed.configuration_refusals.insert(
+            Component::Core,
+            "user-owned configuration conflicts at key 'transport'".into(),
+        );
         observed.detections.insert(
             Component::Aft,
             DetectionOutcome::OwnerGated {
@@ -1626,6 +2056,9 @@ mod tests {
         ));
 
         let mut incomplete = observed_setup();
+        incomplete
+            .components
+            .insert(Component::Aft, ComponentState::Missing);
         incomplete.releases.insert(
             Component::Aft,
             ReleaseAvailability::NotYetPublished {
@@ -1654,6 +2087,9 @@ mod tests {
     #[test]
     fn unresolvable_release_is_reported_as_the_request_failure_not_as_unpublished() {
         let mut observed = observed_setup();
+        observed
+            .components
+            .insert(Component::Aft, ComponentState::Missing);
         observed.releases.insert(
             Component::Aft,
             ReleaseAvailability::Unresolvable {
@@ -1696,6 +2132,14 @@ mod tests {
         observed
             .detections
             .insert(Component::Mc, DetectionOutcome::OfferConversion);
+        for component in Component::ALL
+            .into_iter()
+            .filter(|component| *component != Component::Mc)
+        {
+            observed
+                .components
+                .insert(component, ComponentState::Correct);
+        }
 
         let plan = plan_setup(&observed, &SetupRequest::install(Vec::new()));
 
@@ -1715,8 +2159,14 @@ mod tests {
         )));
         let mut executor = RecordingExecutor::default();
         let report = execute_setup(&plan, ExecutionMode::Apply, &mut executor).unwrap();
-        assert_eq!(report.applied, [SetupOperation::ConfigureMessageHub]);
-        assert_eq!(executor.applied, [SetupOperation::ConfigureMessageHub]);
+        assert_eq!(
+            report.applied,
+            [
+                SetupOperation::ConfigureMessageHub,
+                SetupOperation::GrantMessageKeys
+            ]
+        );
+        assert_eq!(executor.applied, report.applied);
     }
 
     #[test]

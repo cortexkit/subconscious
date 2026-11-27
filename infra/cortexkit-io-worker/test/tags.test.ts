@@ -8,6 +8,13 @@ const ACCEPTED: Array<{ component: ComponentId; tag: string; version: string | n
   { component: "claustrum", tag: "v0.1.0", version: "0.1.0", train: null },
   { component: "synapse", tag: "v3.1.4", version: "3.1.4", train: null },
   { component: "mc", tag: "ck-mc-alpha.deadbeef", version: null, train: "deadbeef" },
+  { component: "fusiform", tag: "v1.2.3", version: "1.2.3", train: null },
+  { component: "astrocyte", tag: "v1.2.3", version: "1.2.3", train: null },
+  { component: "striatum", tag: "v1.2.3", version: "1.2.3", train: null },
+  { component: "broca", tag: "v1.2.3", version: "1.2.3", train: null },
+  { component: "cingulate", tag: "v1.2.3", version: "1.2.3", train: null },
+  { component: "entorhinal", tag: "v1.2.3", version: "1.2.3", train: null },
+  { component: "cerebellum", tag: "v1.2.3", version: "1.2.3", train: null },
 ];
 
 const REJECTED: Array<{ component: ComponentId; tag: string }> = [
@@ -17,6 +24,13 @@ const REJECTED: Array<{ component: ComponentId; tag: string }> = [
   { component: "claustrum", tag: "claustrum-v0.1.0" },
   { component: "synapse", tag: "synapse-v3.1.4" },
   { component: "mc", tag: "ck-mc-beta.deadbeef" },
+  { component: "fusiform", tag: "fusiform-v1.2.3" },
+  { component: "astrocyte", tag: "astrocyte-v1.2.3" },
+  { component: "striatum", tag: "striatum-v1.2.3" },
+  { component: "broca", tag: "broca-v1.2.3" },
+  { component: "cingulate", tag: "cingulate-v1.2.3" },
+  { component: "entorhinal", tag: "entorhinal-v1.2.3" },
+  { component: "cerebellum", tag: "cerebellum-v1.2.3" },
 ];
 
 describe("parseTag", () => {

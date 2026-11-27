@@ -21,6 +21,7 @@ impl CommandRunner for Runner {
             "/usr/libexec/PlistBuddy" => {
                 return Ok(CommandResult {
                     success: true,
+                    exit_code: Some(0),
                     stdout: "5R5846NBPW.io.cortexkit.daemon".into(),
                     stderr: String::new(),
                 })
@@ -30,6 +31,7 @@ impl CommandRunner for Runner {
         }
         Ok(CommandResult {
             success: true,
+            exit_code: Some(0),
             ..CommandResult::default()
         })
     }

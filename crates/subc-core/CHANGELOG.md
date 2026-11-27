@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.24.0
+
+- Make bare `ck setup` select every available component and explain what it
+  leaves out. Explicit selections include their dependencies automatically.
+- Add setup support for fusiform, cingulate, entorhinal, astrocyte, striatum,
+  broca, and cerebellum.
+- Let setup retain individual inventory rows across interrupted installs and
+  publish new settings files without replacing an existing entry.
+- Ensure the new components' vault grants, Broca's deployment key, and
+  Fusiform and Cerebellum settings during setup without overwriting user files.
+- Register Cerebellum's native host on macOS and verify, install, and recover
+  its Chrome extension independently of the program transaction.
+- Upgrade the new components' owned programs and point to setup for missing
+  commands or a Chrome extension refresh. Verify Cerebellum's native host
+  by archive digest without running a version probe at setup or upgrade.
+- Recover interrupted Chrome extension installs during uninstall and remove
+  only the extension tree setup owns. Keep module settings, vault records and
+  grants, and Chrome's native-messaging manifest.
+- Require subc-daemon 0.54.1, which exposes the default data-home resolver.
+
 ## 0.23.2
 
 - Require subc-daemon 0.54.0 for narrow flow-scope authority.

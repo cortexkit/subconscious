@@ -2834,7 +2834,10 @@ fn setup_live_daemon_uses_core_release_not_connection_library_version() {
         index["components"]["core"]["release"] = json!("subc-core-v0.20.83");
         (index, assets)
     });
-    for args in [&["setup", "--dry-run"][..], &["setup"][..]] {
+    for args in [
+        &["setup", "claustrum", "--dry-run"][..],
+        &["setup", "claustrum"][..],
+    ] {
         let output = fixture
             .command(&index, args)
             .env("SUBC_CONNECTION_FILE", &connection_path)
@@ -2861,7 +2864,7 @@ fn setup_live_daemon_uses_core_release_not_connection_library_version() {
 }
 
 #[test]
-fn setup_optional_components_line_is_shared_by_dry_run_and_apply() {
+fn setup_left_out_line_is_shared_by_dry_run_and_apply() {
     let fixture = SetupFixture::installed("ck-setup-optional-line");
     let path = fixture.config_home.join("cortexkit/subc.jsonc");
     let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -2869,6 +2872,7 @@ fn setup_optional_components_line_is_shared_by_dry_run_and_apply() {
         .as_object_mut()
         .unwrap()
         .remove("subc-mcp");
+    config["modules"]["insula"]["program"] = json!("user-owned-insula");
     fs::write(&path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
     #[cfg(unix)]
     set_setup_managed_modes(&fixture);
@@ -2897,15 +2901,30 @@ fn setup_optional_components_line_is_shared_by_dry_run_and_apply() {
         let output = fixture.command(&index, args).output().unwrap();
         assert_exit(&output, 0);
         let lines = text(&output.stdout);
-        let offers = lines
+        let insula_notes = lines
             .lines()
-            .filter(|line| line.starts_with("Optional modules:"))
+            .filter(|line| line.starts_with("insula:"))
             .collect::<Vec<_>>();
         assert_eq!(
-            offers,
-            ["Optional modules: insula. Add one with `ck setup <name>`."]
+            insula_notes,
+            ["insula: left out — user-owned configuration conflicts at key 'modules.insula'"]
         );
+        assert!(!lines.contains("Optional modules:"));
     }
+    let output = fixture
+        .command(&index, &["setup", "insula"])
+        .output()
+        .unwrap();
+    assert_exit(&output, 1);
+    assert!(
+        text(&output.stdout).contains("user-owned configuration conflicts at key 'modules.insula'")
+    );
+    let after: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(after["modules"]["insula"], config["modules"]["insula"]);
+    assert_eq!(
+        *index.requests.lock().unwrap(),
+        ["/index.json", "/index.json", "/index.json"]
+    );
 }
 
 #[test]
@@ -2985,7 +3004,10 @@ fn setup_nothing_to_do_never_renders_outcome_no_op() {
     #[cfg(unix)]
     set_setup_managed_modes(&fixture);
     let index = serve_signed_index(|base| setup_index(base, None));
-    let output = fixture.command(&index, &["setup"]).output().unwrap();
+    let output = fixture
+        .command(&index, &["setup", "claustrum"])
+        .output()
+        .unwrap();
 
     assert_exit(&output, 0);
     assert!(output.stderr.is_empty(), "stderr: {}", text(&output.stderr));
@@ -3054,7 +3076,7 @@ fn setup_puts_ckni_beside_the_managed_ck_and_then_has_nothing_to_do() {
         ("would link ckni to ck at ", "  linked ")
     };
 
-    let preview = run(&["setup", "--dry-run"]);
+    let preview = run(&["setup", "claustrum", "--dry-run"]);
     assert_exit(&preview, 0);
     assert!(
         text(&preview.stdout).contains(verb),
@@ -3066,7 +3088,7 @@ fn setup_puts_ckni_beside_the_managed_ck_and_then_has_nothing_to_do() {
         "a dry run placed ckni"
     );
 
-    let applied = run(&["setup"]);
+    let applied = run(&["setup", "claustrum"]);
     assert_exit(&applied, 0);
     assert!(
         text(&applied.stdout).contains(done),
@@ -3103,7 +3125,7 @@ fn setup_puts_ckni_beside_the_managed_ck_and_then_has_nothing_to_do() {
     expected.sort();
     assert_eq!(names, expected);
 
-    let again = run(&["setup"]);
+    let again = run(&["setup", "claustrum"]);
     assert_exit(&again, 0);
     assert_eq!(text(&again.stdout), SETUP_MAINTENANCE_NO_CHANGE);
 }
@@ -3848,7 +3870,10 @@ fn setup_tightens_existing_owned_modes_on_a_noop_plan_without_chmodding_unowned_
     fs::set_permissions(&unrelated, fs::Permissions::from_mode(0o666)).unwrap();
 
     let index = serve_signed_index(|base| setup_index(base, None));
-    let output = fixture.command_direct(&index, &["setup"]).output().unwrap();
+    let output = fixture
+        .command_direct(&index, &["setup", "claustrum"])
+        .output()
+        .unwrap();
 
     assert_exit(&output, 0);
     assert_eq!(

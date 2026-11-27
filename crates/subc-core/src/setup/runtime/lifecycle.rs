@@ -414,6 +414,7 @@ mod tests {
             }
             Ok(CommandResult {
                 success: true,
+                exit_code: Some(0),
                 stdout: self
                     .observation
                     .clone()

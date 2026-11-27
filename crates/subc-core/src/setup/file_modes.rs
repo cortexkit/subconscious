@@ -1,7 +1,8 @@
-use std::{fs, path::Path};
-
-#[cfg(unix)]
-use std::io;
+use std::{
+    fs,
+    io::{self, Write},
+    path::{Path, PathBuf},
+};
 
 use super::inventory::Inventory;
 
@@ -9,12 +10,10 @@ use super::inventory::Inventory;
 use std::{
     ffi::OsString,
     fs::File,
-    io::Write,
     os::{
         fd::OwnedFd,
         unix::fs::{DirBuilderExt, PermissionsExt},
     },
-    path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -504,6 +503,137 @@ pub(super) fn write_atomic(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CreateOnlyOutcome {
+    Created,
+    AlreadyExists,
+}
+
+/// Publishes complete bytes without taking ownership of an existing entry,
+/// even if that entry was created while the contents were being staged.
+#[allow(dead_code, reason = "used by the module settings writer")]
+pub(super) fn write_create_only(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+) -> Result<CreateOnlyOutcome, String> {
+    write_create_only_with_hook(path, bytes, mode, || {})
+}
+
+fn write_create_only_with_hook(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    before_publish: impl FnOnce(),
+) -> Result<CreateOnlyOutcome, String> {
+    let temporary = SyncedTemporary::write(path, bytes, mode)?;
+    before_publish();
+    let outcome = match fs::hard_link(&temporary.path, path) {
+        Ok(()) => CreateOnlyOutcome::Created,
+        // Windows can report access denied, rather than AlreadyExists, for
+        // some destination types. Inspect the entry itself, not its target.
+        Err(error)
+            if error.kind() == io::ErrorKind::AlreadyExists
+                || fs::symlink_metadata(path).is_ok() =>
+        {
+            CreateOnlyOutcome::AlreadyExists
+        }
+        Err(error) => return Err(format!("could not publish {}: {error}", path.display())),
+    };
+    temporary.remove()?;
+    if outcome == CreateOnlyOutcome::Created {
+        super::install_journal::sync_parent(path)?;
+    }
+    Ok(outcome)
+}
+
+/// A same-directory staging file, synced before it can be published. Only an
+/// exclusive open gives us permission to remove the temporary name on failure.
+pub(super) struct SyncedTemporary {
+    path: PathBuf,
+    cleanup: bool,
+}
+
+impl SyncedTemporary {
+    pub(super) fn write(path: &Path, bytes: &[u8], mode: u32) -> Result<Self, String> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| format!("managed file {} has no parent directory", path.display()))?;
+        ensure_private_parents(parent)?;
+
+        let mut nonce = [0; 16];
+        getrandom::fill(&mut nonce).map_err(|error| {
+            format!(
+                "could not generate temporary name for {}: {error}",
+                path.display()
+            )
+        })?;
+        let nonce = u128::from_ne_bytes(nonce);
+        let path = parent.join(format!(".ck-setup-{nonce:032x}.tmp"));
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        let mut file = options.open(&path).map_err(|error| {
+            format!(
+                "could not create temporary file {}: {error}",
+                path.display()
+            )
+        })?;
+        let temporary = Self {
+            path,
+            cleanup: true,
+        };
+        let describe = |error| format!("could not prepare {}: {error}", temporary.path.display());
+        // Close the handle before publishing or trying to remove the name.
+        let result = (|| {
+            file.write_all(bytes).map_err(describe)?;
+            #[cfg(unix)]
+            fchmod(&file, mode_from_u32(mode, &temporary.path)?)
+                .map_err(|error| describe(error.into()))?;
+            file.sync_all().map_err(describe)
+        })();
+        drop(file);
+        result?;
+        Ok(temporary)
+    }
+
+    pub(super) fn replace(mut self, path: &Path) -> Result<(), subc_os::DurableReplaceError> {
+        let result = subc_os::durable_replace(&self.path, path);
+        if result
+            .as_ref()
+            .err()
+            .is_none_or(subc_os::DurableReplaceError::renamed)
+        {
+            self.cleanup = false;
+        }
+        result
+    }
+
+    fn remove(mut self) -> Result<(), String> {
+        self.cleanup = false;
+        fs::remove_file(&self.path).map_err(|error| {
+            format!(
+                "could not remove temporary file {}: {error}",
+                self.path.display()
+            )
+        })
+    }
+}
+
+impl Drop for SyncedTemporary {
+    fn drop(&mut self) {
+        if self.cleanup {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
 #[cfg(unix)]
 fn create_missing_parents(path: &Path) -> Result<(), String> {
     if path.as_os_str().is_empty() || path.exists() {
@@ -572,6 +702,86 @@ fn unique_temporary_path(path: &Path, sequence: u64) -> PathBuf {
     name.push(path.file_name().unwrap_or_default());
     name.push(format!(".tmp-{}-{sequence}", std::process::id()));
     path.with_file_name(name)
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod create_only_tests {
+    use super::*;
+    use cortexkit_test_support::ScratchDir;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink as symlink_file;
+    #[cfg(windows)]
+    use std::os::windows::fs::symlink_file;
+
+    #[test]
+    fn create_only_publishes_the_complete_file_and_removes_the_temporary() {
+        let root = ScratchDir::new("create-only-file");
+        let path = root.join("settings.jsonc");
+        assert_eq!(
+            write_create_only(&path, b"new\n", 0o600).unwrap(),
+            CreateOnlyOutcome::Created
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"new\n");
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_directory_entries(root.path(), &["settings.jsonc"]);
+    }
+
+    #[test]
+    fn create_only_leaves_a_file_that_appears_after_staging() {
+        let root = ScratchDir::new("create-only-file-race");
+        let path = root.join("settings.jsonc");
+        let sibling = root.join("settings.jsonc.tmp");
+        fs::write(&sibling, b"unrelated").unwrap();
+        let outcome = write_create_only_with_hook(&path, b"new", 0o600, || {
+            fs::write(&path, b"existing").unwrap();
+        })
+        .unwrap();
+        assert_eq!(outcome, CreateOnlyOutcome::AlreadyExists);
+        assert_eq!(fs::read(&path).unwrap(), b"existing");
+        assert_eq!(fs::read(&sibling).unwrap(), b"unrelated");
+        assert_directory_entries(root.path(), &["settings.jsonc", "settings.jsonc.tmp"]);
+    }
+
+    #[test]
+    fn create_only_leaves_a_dangling_link_that_appears_after_staging() {
+        let root = ScratchDir::new("create-only-link-race");
+        let path = root.join("settings.jsonc");
+        let missing = root.join("missing");
+        let outcome = write_create_only_with_hook(&path, b"new", 0o600, || {
+            symlink_file(&missing, &path).expect("create a dangling settings symlink");
+        })
+        .unwrap();
+        assert_eq!(outcome, CreateOnlyOutcome::AlreadyExists);
+        assert_eq!(fs::read_link(&path).unwrap(), missing);
+        assert!(!missing.exists());
+        assert_directory_entries(root.path(), &["settings.jsonc"]);
+    }
+
+    #[test]
+    fn create_only_leaves_an_existing_directory() {
+        let root = ScratchDir::new("create-only-directory");
+        let path = root.join("settings.jsonc");
+        fs::create_dir(&path).unwrap();
+        assert_eq!(
+            write_create_only(&path, b"new", 0o600).unwrap(),
+            CreateOnlyOutcome::AlreadyExists
+        );
+        assert!(path.is_dir());
+        assert_directory_entries(root.path(), &["settings.jsonc"]);
+    }
+
+    fn assert_directory_entries(path: &Path, expected: &[&str]) {
+        let mut names: Vec<_> = fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, expected);
+    }
 }
 
 #[cfg(all(test, unix))]

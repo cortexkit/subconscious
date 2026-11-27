@@ -358,6 +358,11 @@ mod prompt_tests {
                 let live = self.0.load(Ordering::Relaxed);
                 Ok(CommandResult {
                     success: live || !args.iter().any(|arg| arg == "is-active"),
+                    exit_code: Some(if live || !args.iter().any(|arg| arg == "is-active") {
+                        0
+                    } else {
+                        1
+                    }),
                     stdout: if live {
                         "state = running\nStatus: Running".into()
                     } else {

@@ -46,6 +46,15 @@ impl Transaction {
         )
     }
 
+    pub fn write_create_only(
+        &mut self,
+        target: &Path,
+        bytes: &[u8],
+        mode: u32,
+    ) -> Result<bool, String> {
+        files::create_only(&mut self.journal, target, bytes, mode)
+    }
+
     pub fn replace(&mut self, target: &Path, candidate: &Path) -> Result<(), String> {
         files::place(
             &mut self.journal,

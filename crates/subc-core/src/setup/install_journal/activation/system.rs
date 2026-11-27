@@ -378,6 +378,7 @@ mod tests {
             };
             Ok(runtime::CommandResult {
                 success: self.registered,
+                exit_code: Some(if self.registered { 0 } else { 1 }),
                 stdout: stdout.into(),
                 ..Default::default()
             })
@@ -542,6 +543,7 @@ mod tests {
                 if program != "ck" {
                     return Ok(runtime::CommandResult {
                         success: true,
+                        exit_code: Some(0),
                         stdout: "state = running\nStatus: Running".into(),
                         ..Default::default()
                     });
@@ -549,6 +551,7 @@ mod tests {
                 if args == ["--json", "module", "list"] {
                     return Ok(runtime::CommandResult {
                         success: true,
+                        exit_code: Some(0),
                         stdout: r#"{"modules":[]}"#.into(),
                         ..Default::default()
                     });
@@ -557,6 +560,7 @@ mod tests {
                     self.stop_calls += 1;
                     return Ok(runtime::CommandResult {
                         success: false,
+                        exit_code: Some(1),
                         stderr: "unknown_module".into(),
                         ..Default::default()
                     });
@@ -610,6 +614,7 @@ mod tests {
             );
             Ok(runtime::CommandResult {
                 success: true,
+                exit_code: Some(0),
                 stdout: serde_json::json!({
                     "modules": [{ "module_id": "alpha", "daemon_observed": {
                         "pid": 772, "spawned_at_ms": 42, "running_image": { "status": "match" }

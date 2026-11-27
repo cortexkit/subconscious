@@ -4,10 +4,14 @@ use std::{
 };
 
 use super::{
+    apply::extension,
     components::digest_file,
+    install_journal,
     inventory::Inventory,
     runtime::{self, CommandRunner, RuntimePaths, RuntimePlatform},
 };
+
+const CHROME_MANIFEST_NOTE: &str = "Chrome native-messaging manifest left in place: ~/Library/Application Support/Google/Chrome/NativeMessagingHosts/com.cortexkit.cerebellum.json";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct UninstallReport {
@@ -26,7 +30,7 @@ pub fn uninstall<R: CommandRunner>(
     config_path: &Path,
     store_paths: &[PathBuf],
 ) -> Result<UninstallReport, String> {
-    let mut report = UninstallReport::default();
+    let mut report = uninstall_user_data(platform, inventory, config_path, store_paths)?;
     if inventory.owns_path("runtime-registration", &runtime_paths.definition) {
         if let Some(transaction) = inventory.transaction() {
             let mut service = super::install_journal::registration::Service {
@@ -94,13 +98,116 @@ pub fn uninstall<R: CommandRunner>(
         }
     }
 
+    Ok(report)
+}
+
+pub(super) fn uninstall_user_data(
+    platform: RuntimePlatform,
+    inventory: &mut Inventory,
+    config_path: &Path,
+    store_paths: &[PathBuf],
+) -> Result<UninstallReport, String> {
+    let mut report = UninstallReport::default();
     report
         .retained
         .push(format!("configuration: {}", config_path.display()));
     for store in store_paths {
         report.retained.push(format!("store: {}", store.display()));
     }
+    uninstall_extension(inventory, &mut report)?;
+    if platform == RuntimePlatform::Macos {
+        report.retained.push(CHROME_MANIFEST_NOTE.to_string());
+    }
     Ok(report)
+}
+
+fn extension_paths(inventory: &Inventory) -> extension::Paths {
+    let data_dir = inventory
+        .manifest()
+        .parent()
+        .expect("inventory has a parent");
+    extension::Paths::new(data_dir)
+}
+
+/// Report paths left by an uninstall that found no managed destinations.
+pub(super) fn unmanaged_uninstall_notes(
+    platform: RuntimePlatform,
+    inventory: &Inventory,
+) -> Vec<String> {
+    let paths = extension_paths(inventory);
+    [&paths.live, &paths.new, &paths.old]
+        .into_iter()
+        .filter_map(|path| extension_retention_note(path))
+        .chain((platform == RuntimePlatform::Macos).then(|| CHROME_MANIFEST_NOTE.to_string()))
+        .collect()
+}
+
+fn uninstall_extension(
+    inventory: &mut Inventory,
+    report: &mut UninstallReport,
+) -> Result<(), String> {
+    let paths = extension_paths(inventory);
+    if inventory
+        .entry_for_path(extension::KIND, &paths.live)
+        .is_some_and(|row| row.get("pending_zip_sha256").is_some())
+    {
+        if let Err(reason) = extension::recover(&paths, inventory) {
+            report
+                .retained
+                .push(format!("Chrome extension swap not recovered: {reason}"));
+            report.retained.extend(
+                [&paths.live, &paths.new, &paths.old]
+                    .into_iter()
+                    .filter_map(|path| extension_retention_note(path)),
+            );
+            return Ok(());
+        }
+    }
+
+    report.retained.extend(
+        [&paths.new, &paths.old]
+            .into_iter()
+            .filter_map(|path| extension_retention_note(path)),
+    );
+    let row = inventory.entry_for_path(extension::KIND, &paths.live);
+    match extension::tree_digest(&paths.live) {
+        Ok(None) => {}
+        Ok(Some(digest))
+            if row.and_then(|row| row.get("tree_digest").and_then(serde_json::Value::as_str))
+                == Some(digest.as_str()) =>
+        {
+            fs::remove_dir_all(&paths.live).map_err(|error| {
+                format!(
+                    "could not remove Chrome extension {}: {error}",
+                    paths.live.display()
+                )
+            })?;
+            install_journal::sync_parent(&paths.live)?;
+            report.removed.push(paths.live.clone());
+        }
+        Ok(Some(_)) => {
+            report
+                .retained
+                .extend(extension_retention_note(&paths.live));
+            return Ok(());
+        }
+        Err(reason) => {
+            report.retained.push(format!(
+                "Chrome extension left in place: {} ({reason})",
+                paths.live.display()
+            ));
+            return Ok(());
+        }
+    }
+    if row.is_some() {
+        inventory.drop_retained(extension::KIND, &paths.live)?;
+    }
+    Ok(())
+}
+
+fn extension_retention_note(path: &Path) -> Option<String> {
+    (!fs::symlink_metadata(path).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound))
+        .then(|| format!("Chrome extension path left in place: {}", path.display()))
 }
 
 fn remove_owned_path(
@@ -230,6 +337,7 @@ mod tests {
         ) -> Result<super::super::runtime::CommandResult, String> {
             Ok(super::super::runtime::CommandResult {
                 success: true,
+                exit_code: Some(0),
                 stdout: String::new(),
                 stderr: String::new(),
             })
@@ -238,6 +346,181 @@ mod tests {
 
     fn fixture_dir(name: &str) -> ScratchDir {
         ScratchDir::new(name)
+    }
+
+    fn seed_extension(path: &Path, contents: &str) -> String {
+        fs::create_dir(path).unwrap();
+        fs::write(path.join("manifest.json"), contents).unwrap();
+        extension::tree_digest(path).unwrap().unwrap()
+    }
+
+    fn mac_inventory(manifest: &Path) -> Inventory {
+        Inventory::load_locked(
+            manifest,
+            "darwin-arm64",
+            "test uninstall",
+            std::time::Duration::ZERO,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn uninstall_recovers_both_swap_rename_cuts_and_keeps_user_data() {
+        for published in [false, true] {
+            let root = fixture_dir(if published {
+                "uninstall-published"
+            } else {
+                "uninstall-rename-gap"
+            });
+            let manifest = root.join("installer-manifest.json");
+            let paths = extension::Paths::new(&root);
+            // Both interruption points occur after renaming live to .old.
+            // Before the second rename, only .new has the pending digest;
+            // after it, live does.
+            let old = seed_extension(&paths.old, "old tree");
+            let pending = seed_extension(
+                if published { &paths.live } else { &paths.new },
+                "pending tree",
+            );
+            let mut seed = mac_inventory(&manifest);
+            seed.persist_retained(
+                extension::KIND,
+                &paths.live,
+                Map::from_iter([
+                    ("zip_sha256".into(), "11".repeat(32).into()),
+                    ("tree_digest".into(), old.into()),
+                    ("pending_zip_sha256".into(), "22".repeat(32).into()),
+                    ("pending_tree_digest".into(), pending.into()),
+                ]),
+            )
+            .unwrap();
+
+            let broca = root.join("broca.jsonc");
+            let fusiform = root.join("fusiform.jsonc");
+            let simulated_vault = root.join("vault");
+            let preserved = [
+                (&broca, "broca settings"),
+                (&fusiform, "fusiform settings"),
+                (&simulated_vault, "vault records and grants"),
+            ];
+            for (path, bytes) in preserved {
+                fs::write(path, bytes).unwrap();
+            }
+            seed.persist_retained(
+                "broca-key-intent",
+                &broca,
+                Map::from_iter([("deployment_key_id".into(), "42".into())]),
+            )
+            .unwrap();
+            seed.record("settings-receipt", &fusiform, Map::new());
+            seed.save().unwrap();
+            drop(seed);
+
+            let mut inventory = mac_inventory(&manifest);
+            let runtime_paths = RuntimePaths {
+                definition: root.join("unit"),
+                daemon: root.join("ck-subc"),
+                config_store_root: root.join("config-store"),
+            };
+            let report = uninstall(
+                RuntimePlatform::Macos,
+                &runtime_paths,
+                None,
+                &mut SuccessfulRunner,
+                &mut inventory,
+                &root.join("subc.jsonc"),
+                &[],
+            )
+            .unwrap();
+            assert_eq!(report.removed.as_slice(), std::slice::from_ref(&paths.live));
+            assert!(report
+                .retained
+                .iter()
+                .any(|line| line == CHROME_MANIFEST_NOTE));
+            assert!(!paths.live.exists());
+            assert!(!paths.new.exists());
+            assert!(!paths.old.exists());
+            for (path, bytes) in preserved {
+                assert_eq!(fs::read_to_string(path).unwrap(), bytes);
+            }
+            let disk = Inventory::load_snapshot(&manifest, "darwin-arm64").unwrap();
+            assert!(!disk.owns_path(extension::KIND, &paths.live));
+            assert!(disk.owns_path("broca-key-intent", &broca));
+            assert!(disk.owns_path("settings-receipt", &fusiform));
+        }
+    }
+
+    #[test]
+    fn uninstall_keeps_unverifiable_extension_paths_but_drops_an_absent_live_row() {
+        let root = fixture_dir("uninstall-unverifiable-extension");
+        let mut inventory = mac_inventory(&root.join("manifest.json"));
+        let paths = extension::Paths::new(&root);
+        let digest = seed_extension(&paths.live, "original");
+        assert!(
+            unmanaged_uninstall_notes(RuntimePlatform::Macos, &inventory)
+                .iter()
+                .any(|line| line.contains(paths.live.to_str().unwrap()))
+        );
+        let report = uninstall_user_data(
+            RuntimePlatform::Macos,
+            &mut inventory,
+            &root.join("config"),
+            &[],
+        )
+        .unwrap();
+        assert!(
+            report.removed.is_empty(),
+            "an unowned tree must not be removed"
+        );
+        let kept = |p: &Path, report: &UninstallReport| {
+            report.retained.contains(&format!(
+                "Chrome extension path left in place: {}",
+                p.display()
+            ))
+        };
+        assert!(kept(&paths.live, &report));
+
+        inventory
+            .persist_retained(
+                extension::KIND,
+                &paths.live,
+                Map::from_iter([
+                    ("zip_sha256".into(), "11".repeat(32).into()),
+                    ("tree_digest".into(), digest.into()),
+                ]),
+            )
+            .unwrap();
+        fs::create_dir(paths.live.join("empty-new-directory")).unwrap();
+        seed_extension(&paths.new, "user's staging sibling");
+        seed_extension(&paths.old, "user's backup sibling");
+        let report = uninstall_user_data(
+            RuntimePlatform::Macos,
+            &mut inventory,
+            &root.join("config"),
+            &[],
+        )
+        .unwrap();
+        assert!(report.removed.is_empty());
+        for path in [&paths.live, &paths.new, &paths.old] {
+            assert!(
+                path.is_dir() && kept(path, &report),
+                "{} should be kept",
+                path.display()
+            );
+        }
+        assert!(inventory.owns_path(extension::KIND, &paths.live));
+
+        fs::remove_dir_all(&paths.live).unwrap();
+        let report = uninstall_user_data(
+            RuntimePlatform::Macos,
+            &mut inventory,
+            &root.join("config"),
+            &[],
+        )
+        .unwrap();
+        assert!(report.removed.is_empty());
+        assert!(!inventory.owns_path(extension::KIND, &paths.live));
+        assert!(paths.new.exists() && paths.old.exists());
     }
 
     #[test]

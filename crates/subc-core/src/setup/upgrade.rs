@@ -12,7 +12,8 @@ use serde_json::Value;
 use subc_transport::connection_file;
 
 use super::{
-    components::{installed_components, upgrade_roster},
+    apply::extension,
+    components::{self, installed_components, upgrade_roster},
     file_modes,
     install_lock::InstallHold,
     inventory::Inventory,
@@ -31,6 +32,8 @@ use super::{
 
 mod journal;
 
+const NATIVE_HOST: &str = "ck-cerebellum-native-host";
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DaemonCatalogBuild {
     pub pid: u32,
@@ -46,6 +49,19 @@ pub struct ManagedUpgradeTarget {
     pub installed_version: String,
     /// Archive digest recorded at placement. Currency is undecidable without it.
     pub installed_archive_sha256: Option<String>,
+}
+
+impl ManagedUpgradeTarget {
+    /// Whether setup still needs to prepare the installed module's Chrome extension.
+    pub fn chrome_extension_refresh_needed(&self, index: &ReleaseIndex) -> Result<bool, String> {
+        if !cfg!(target_os = "macos") || self.target.module_id() != Some("cerebellum") {
+            return Ok(false);
+        }
+        Ok(chrome_extension_refresh_needed(
+            &load_current_inventory()?,
+            index,
+        ))
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -183,6 +199,7 @@ pub fn upgrade_ownership_outcomes(
         discovered,
         &inventory,
         &binary_home,
+        super::PlatformObservation::current(),
     ))
 }
 
@@ -193,20 +210,52 @@ fn ownership_outcomes(
     discovered: &[ManagedUpgradeTarget],
     inventory: &Inventory,
     binary_home: &Path,
+    platform: super::PlatformObservation,
 ) -> Vec<super::PlanOutcome> {
     let mut outcomes = Vec::new();
-    if let super::PlatformObservation::Supported(target) = super::PlatformObservation::current() {
+    if let super::PlatformObservation::Supported(target) = platform {
         let mut unowned = Vec::new();
-        for binaries in Component::ALL
-            .into_iter()
-            .map(|component| super::components::component_binaries_for_target(component, target))
-            .chain(std::iter::once(&["ck"][..]))
-        {
-            for (_, path) in
-                super::components::unowned_binary_paths(binaries, binary_home, inventory)
-            {
-                unowned.push(path);
+        let mut left_alone = Vec::new();
+        let owned = components::owned_binary_paths(inventory);
+        for component in Component::ALL {
+            let binaries = components::component_binaries_for_target(component, target);
+            let is_new = component.plain_name().is_some();
+            let any_owned = binaries
+                .iter()
+                .any(|binary| owned_program(&owned, binary).is_some());
+            let paths = components::unowned_binary_paths(binaries, binary_home, inventory);
+            if is_new && !any_owned {
+                left_alone.extend(paths.into_iter().map(|(_, path)| path));
+            } else {
+                unowned.extend(paths.into_iter().map(|(_, path)| path));
             }
+            if is_new && owned_module_program(&owned, component).is_some() {
+                for binary in binaries
+                    .iter()
+                    .filter(|binary| owned_program(&owned, binary).is_none())
+                {
+                    outcomes.push(super::PlanOutcome::SetupNote {
+                        message: format!("run ck setup to add {binary}"),
+                    });
+                }
+            }
+        }
+        unowned.extend(
+            components::unowned_binary_paths(&["ck"], binary_home, inventory)
+                .into_iter()
+                .map(|(_, path)| path),
+        );
+        if !left_alone.is_empty() {
+            outcomes.push(super::PlanOutcome::SetupNote {
+                message: format!(
+                    "leaving unowned programs in place: {}",
+                    left_alone
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            });
         }
         // A `ckni` that `ck setup` did not install, sitting beside the
         // managed `ck`, is refused with the other unowned binaries before
@@ -243,12 +292,57 @@ fn ownership_outcomes(
     outcomes
 }
 
+fn owned_program<'a>(owned: &'a [PathBuf], binary: &str) -> Option<&'a Path> {
+    let name = components::platform_binary(binary);
+    owned
+        .iter()
+        .map(PathBuf::as_path)
+        .find(|path| path.file_name().is_some_and(|base| base == name.as_str()))
+}
+
+fn owned_module_program(owned: &[PathBuf], component: Component) -> Option<&Path> {
+    owned_program(owned, components::module_program(component)?).filter(|path| path.is_file())
+}
+
+// The catalog, routing, browser and other selectable modules with plain names
+// count as installed when their owned module program is present. For the
+// remaining components, keep checking their whole program set.
+fn upgrade_components(inventory: &Inventory, owned: &[PathBuf]) -> Vec<Component> {
+    installed_components(inventory)
+        .into_iter()
+        .filter(|component| component.plain_name().is_none())
+        .chain(Component::ALL.into_iter().filter(|&component| {
+            component.plain_name().is_some() && owned_module_program(owned, component).is_some()
+        }))
+        .collect()
+}
+
+fn chrome_extension_refresh_needed(inventory: &Inventory, index: &ReleaseIndex) -> bool {
+    let data_dir = inventory
+        .manifest()
+        .parent()
+        .expect("inventory has a parent");
+    let paths = extension::Paths::new(data_dir);
+    let Some(row) = inventory.entry_for_path(extension::KIND, &paths.live) else {
+        return true;
+    };
+    index
+        .components
+        .get(Component::Cerebellum.label())
+        .and_then(|entry| entry.assets.get(AlphaTarget::DarwinArm64.label()))
+        .and_then(|assets| assets.get("ck-cerebellum-extension"))
+        .is_some_and(|asset| {
+            row.get("zip_sha256").and_then(Value::as_str) != Some(asset.sha256.as_str())
+        })
+}
+
 /// Reads only inventory evidence for the dashboard. It avoids probing binaries:
 /// a bare `ck` must not assume every managed sibling shares its own crate version.
 pub fn dashboard_installed_binaries() -> Result<BTreeMap<String, InstalledBinary>, String> {
     let inventory = load_current_inventory()?;
     let mut installed = BTreeMap::new();
-    for target in upgrade_roster(installed_components(&inventory)) {
+    let owned = components::owned_binary_paths(&inventory);
+    for target in upgrade_roster(upgrade_components(&inventory, &owned)) {
         let path = ["managed-binary", "binary-placement"]
             .into_iter()
             .flat_map(|kind| inventory.paths_for_kind(kind))
@@ -351,20 +445,17 @@ pub fn discover_managed_upgrade_targets(
     executable: &Path,
     _daemon_catalog: Option<&DaemonCatalogBuild>,
 ) -> Result<Vec<ManagedUpgradeTarget>, String> {
-    let owned = super::components::owned_binary_paths(inventory);
+    let owned = components::owned_binary_paths(inventory);
     let executable = canonical_or_original(executable);
     let mut targets = Vec::new();
-    for target in upgrade_roster(installed_components(inventory)) {
+    for target in upgrade_roster(upgrade_components(inventory, &owned)) {
         let destination = if target.is_self_replacing() {
             owned
                 .iter()
                 .find(|path| canonical_or_original(path) == executable)
                 .cloned()
         } else {
-            owned
-                .iter()
-                .find(|path| file_name_matches(path, target))
-                .cloned()
+            owned_program(&owned, target.binary).map(Path::to_path_buf)
         };
         let Some(destination) = destination else {
             if super::components::is_later_companion(target.component, target.binary) {
@@ -405,16 +496,7 @@ pub fn discover_managed_upgrade_targets(
                 destination.display()
             ));
         }
-        let installed_version = {
-            #[cfg(feature = "test-support")]
-            if let Some(version) = test_installed_version(target) {
-                version
-            } else {
-                binary_version(&destination)?
-            }
-            #[cfg(not(feature = "test-support"))]
-            binary_version(&destination)?
-        };
+        let installed_version = installed_version(target, &destination)?;
         let installed_archive_sha256 = inventory_string(inventory, &destination, "archive_sha256");
         targets.push(ManagedUpgradeTarget {
             target,
@@ -424,6 +506,17 @@ pub fn discover_managed_upgrade_targets(
         });
     }
     Ok(targets)
+}
+
+fn installed_version(target: UpgradeTarget, destination: &Path) -> Result<String, String> {
+    if target.binary == NATIVE_HOST {
+        return Ok("version not reported".into());
+    }
+    #[cfg(feature = "test-support")]
+    if let Some(version) = test_installed_version(target) {
+        return Ok(version);
+    }
+    binary_version(destination)
 }
 
 #[cfg(feature = "test-support")]
@@ -968,7 +1061,11 @@ impl SystemUpgradeBackend {
         // ownership digest, the archive digest currency compares to the index,
         // and the self-reported version for the next dashboard. Version text is
         // not an update decision.
-        let version = binary_version(destination).ok();
+        let version = if target.binary == NATIVE_HOST {
+            None
+        } else {
+            binary_version(destination).ok()
+        };
         let kinds = ["managed-binary", "binary-placement"]
             .into_iter()
             .filter(|kind| self.inventory.owns_path(kind, destination))
@@ -1167,6 +1264,9 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
     }
 
     fn warm_execute(&mut self, target: UpgradeTarget) -> Result<String, String> {
+        if target.binary == NATIVE_HOST {
+            return Ok("no version probe: the native host only accepts --register".into());
+        }
         let destination = &self.target(target)?.destination;
         let output = Command::new(destination)
             .arg("--version")
@@ -1274,6 +1374,20 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
 
     fn post_verify(&mut self, target: UpgradeTarget) -> Result<String, String> {
         let destination = &self.target(target)?.destination;
+        if target.binary == NATIVE_HOST {
+            // The archive was verified before placement. Confirm that the
+            // image at the destination is still the one placed from it.
+            let inode = destination_inode(destination)?;
+            if self.activated_inodes.get(target.label()) != Some(&inode)
+                || inventory_string(&self.inventory, destination, "sha256").as_deref()
+                    != Some(sha256_file(destination)?.as_str())
+            {
+                return Err(format!(
+                    "{target}: destination no longer matches the verified replacement"
+                ));
+            }
+            return Ok(format!("inode={inode}; binary SHA-256=verified"));
+        }
         let is_supervised_module =
             target.module_id().is_some() && self.is_module_supervised(target);
         let (pid, healthy, running_image_matches_destination, version) = if is_supervised_module {
@@ -1489,6 +1603,218 @@ pub(super) mod tests {
             path,
             format!("#!/bin/sh\necho 'binary {version}'\n").as_bytes(),
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn upgrade_plans_only_owned_new_component_programs_and_names_missing_commands() {
+        use crate::setup::model::UpgradeOperation;
+        use crate::setup::update_cache::CachedRelease;
+
+        let root = fixture_dir("new-component-upgrade");
+        let mut inventory = Inventory::load(root.join("manifest.json"), "linux-x64").unwrap();
+        // Fusiform has no command row. Broca has both rows, including a
+        // command with no supervised module id to infer ownership from.
+        let programs = ["ck-fusiform", "ck-broca", "broca-session"];
+        for program in programs {
+            let path = root.join(program);
+            version_binary(&path, "1.0.0");
+            inventory.record(
+                "managed-binary",
+                &path,
+                Map::from_iter([("archive_sha256".into(), Value::String("a1".repeat(32)))]),
+            );
+        }
+        let executable = root.join("ck");
+        let discovered = discover_managed_upgrade_targets(&inventory, &executable, None).unwrap();
+        let outcomes = ownership_outcomes(
+            &executable,
+            &discovered,
+            &inventory,
+            &root,
+            super::super::PlatformObservation::Supported(AlphaTarget::LinuxX64),
+        );
+        assert!(
+            outcomes.contains(&super::super::PlanOutcome::SetupNote {
+                message: "run ck setup to add ck-models".into(),
+            }),
+            "{outcomes:?}"
+        );
+        let metadata = UpdateMetadata {
+            format_version: super::super::update_cache::UPDATE_CACHE_FORMAT_VERSION,
+            checked_at_unix_secs: 0,
+            targets: programs
+                .into_iter()
+                .map(|program| {
+                    (
+                        program.into(),
+                        CachedRelease {
+                            version: "2.0.0".into(),
+                            sha256: Some("b2".repeat(32)),
+                            reports_release_version: true,
+                        },
+                    )
+                })
+                .collect(),
+        };
+        let observed = observed_upgrade_targets(&metadata, &discovered, Ok(BTreeSet::new()), None);
+        let plan = plan_upgrade(&observed);
+        assert!(plan.is_authorized(), "{plan:?}");
+        let replaced = plan
+            .operations
+            .iter()
+            .filter_map(|operation| match operation {
+                UpgradeOperation::ReplaceDestination { target } => Some(target.binary),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(replaced, programs);
+    }
+
+    #[test]
+    fn upgrade_lists_unowned_programs_but_refuses_when_the_component_has_an_owner() {
+        use super::super::{PlanOutcome, PlatformObservation};
+
+        let root = cortexkit_test_support::ScratchDir::new("upgrade-unowned-component");
+        let mut inventory = Inventory::load(root.join("manifest.json"), "darwin-arm64").unwrap();
+        let executable = root.join(components::platform_binary("ck"));
+        let discovered = [ManagedUpgradeTarget {
+            target: upgrade_target("ck"),
+            destination: executable.clone(),
+            installed_version: "1.0.0".into(),
+            installed_archive_sha256: None,
+        }];
+        for binary in ["ck-broca", "ck-models", "ck-cerebellum-extension"] {
+            fs::write(
+                root.join(components::platform_binary(binary)),
+                "user program",
+            )
+            .unwrap();
+        }
+        let outcomes = |inventory: &Inventory| {
+            ownership_outcomes(
+                &executable,
+                &discovered,
+                inventory,
+                &root,
+                PlatformObservation::Supported(AlphaTarget::DarwinArm64),
+            )
+        };
+        let initial = outcomes(&inventory);
+        assert_eq!(initial.len(), 1, "{initial:?}");
+        assert!(matches!(&initial[0], PlanOutcome::SetupNote { message }
+            if message.contains("ck-broca") && message.contains("ck-models") && !message.contains("ck-cerebellum-extension")));
+
+        let module = root.join(components::platform_binary("ck-fusiform"));
+        fs::write(&module, "owned program").unwrap();
+        inventory.record("managed-binary", &module, Map::new());
+        let after = outcomes(&inventory);
+        assert!(
+            after
+                .iter()
+                .any(|outcome| matches!(outcome, PlanOutcome::Refusal { reason }
+            if reason.contains("ck-models") && !reason.contains("ck-broca"))),
+            "{after:?}"
+        );
+        assert!(
+            after.iter().any(
+                |outcome| matches!(outcome, PlanOutcome::SetupNote { message }
+            if message.contains("ck-broca"))
+            ),
+            "{after:?}"
+        );
+
+        // A command row is also enough to refuse an unowned module, even
+        // though a command by itself doesn't make the component installed.
+        inventory.record(
+            "binary-placement",
+            &root.join(components::platform_binary("broca-session")),
+            Map::new(),
+        );
+        assert!(outcomes(&inventory)
+            .iter()
+            .any(|outcome| matches!(outcome, PlanOutcome::Refusal { reason }
+            if reason.contains("ck-broca"))));
+    }
+
+    #[test]
+    fn upgrade_extension_refresh_depends_on_the_signed_zip_and_inventory_row() {
+        let root = cortexkit_test_support::ScratchDir::new("upgrade-chrome-extension");
+        let mut inventory = Inventory::load_locked(
+            root.join("manifest.json"),
+            "darwin-arm64",
+            "test upgrade",
+            Duration::ZERO,
+        )
+        .unwrap();
+        let dir = extension::Paths::new(&root).live;
+        let index: ReleaseIndex = serde_json::from_value(serde_json::json!({
+            "schema": 1, "channel": "alpha", "generated_at_ms": 0,
+            "components": {"cerebellum": {"release": "v2.0.0", "version": "2.0.0",
+                "assets": {"darwin-arm64": {"ck-cerebellum-extension": {
+                    "url": "https://example.invalid/extension.zip", "sha256": "22".repeat(32), "reports": null
+                }}}}}
+        })).unwrap();
+        assert!(chrome_extension_refresh_needed(&inventory, &index));
+        for (digest, needs_refresh) in [("11", true), ("22", false)] {
+            inventory
+                .persist_retained(
+                    extension::KIND,
+                    &dir,
+                    Map::from_iter([
+                        (
+                            "zip_sha256".into(),
+                            serde_json::Value::String(digest.repeat(32)),
+                        ),
+                        (
+                            "tree_digest".into(),
+                            serde_json::Value::String("aa".repeat(32)),
+                        ),
+                    ]),
+                )
+                .unwrap();
+            assert_eq!(
+                chrome_extension_refresh_needed(&inventory, &index),
+                needs_refresh
+            );
+        }
+        assert!(!dir.exists(), "upgrade must not extract the extension");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_host_replacement_does_not_probe_and_verifies_placed_bytes() {
+        let root = fixture_dir("native-host-no-version");
+        let target = UpgradeTarget {
+            component: Component::Cerebellum,
+            binary: NATIVE_HOST,
+            module_id: None,
+        };
+        let destination = root.join(NATIVE_HOST);
+        let executable = b"#!/bin/sh\ntouch \"$0.was-run\"\nexit 2\n";
+        write_executable(&destination, executable);
+        assert_eq!(
+            installed_version(target, &destination).unwrap(),
+            "version not reported"
+        );
+
+        let mut backend = managed_backend(&root, target, &destination);
+        stage_candidate(&mut backend, &root, target, executable);
+        backend.create_rollback_copy(target).unwrap();
+        backend.replace_destination(target).unwrap();
+        backend.warm_execute(target).unwrap();
+        backend.post_verify(target).unwrap();
+        assert_eq!(
+            inventory_string(&backend.inventory, &destination, "archive_sha256").as_deref(),
+            Some("00")
+        );
+        assert!(!root.join(format!("{NATIVE_HOST}.was-run")).exists());
+        // Change the bytes in place so the destination inode remains the same.
+        fs::write(&destination, b"modified binary").unwrap();
+        assert!(backend
+            .post_verify(target)
+            .unwrap_err()
+            .contains("destination no longer matches the verified replacement"));
     }
 
     #[cfg(unix)]

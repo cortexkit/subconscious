@@ -1,4 +1,17 @@
-export type ComponentId = "core" | "aft" | "insula" | "claustrum" | "synapse" | "mc";
+export type ComponentId =
+  | "core"
+  | "aft"
+  | "insula"
+  | "claustrum"
+  | "synapse"
+  | "mc"
+  | "fusiform"
+  | "astrocyte"
+  | "striatum"
+  | "broca"
+  | "cingulate"
+  | "entorhinal"
+  | "cerebellum";
 
 export type ResolveRule = "latest-non-draft" | "newest-ck-mc";
 
@@ -23,6 +36,13 @@ export const COMPONENTS: readonly ComponentSpec[] = [
       "ck-mc-alpha.22464bf2": "predates the module contracts the current plugin speaks; the plugin works without the module",
     },
   },
+  { id: "fusiform", repository: "cortexkit/fusiform", resolve: "latest-non-draft" },
+  { id: "astrocyte", repository: "cortexkit/astrocyte", resolve: "latest-non-draft" },
+  { id: "striatum", repository: "cortexkit/striatum", resolve: "latest-non-draft" },
+  { id: "broca", repository: "cortexkit/broca", resolve: "latest-non-draft" },
+  { id: "cingulate", repository: "cortexkit/cingulate", resolve: "latest-non-draft" },
+  { id: "entorhinal", repository: "cortexkit/entorhinal", resolve: "latest-non-draft" },
+  { id: "cerebellum", repository: "cortexkit/cerebellum", resolve: "latest-non-draft" },
 ];
 
 export interface TagFields {
@@ -81,7 +101,14 @@ export function parseTag(component: ComponentId, tag: string): TagFields | null 
     case "aft":
     case "insula":
     case "claustrum":
-    case "synapse": {
+    case "synapse":
+    case "fusiform":
+    case "astrocyte":
+    case "striatum":
+    case "broca":
+    case "cingulate":
+    case "entorhinal":
+    case "cerebellum": {
       const m = /^v(.+)$/.exec(tag);
       if (!m || m[1].length === 0) return null;
       return { version: m[1], train: null };

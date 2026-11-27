@@ -10,10 +10,10 @@ use super::{
     mc_detection::{self, McDetection},
 };
 
-/// The independently selectable pieces of an alpha CortexKit installation.
+/// The selectable pieces of an alpha CortexKit installation.
 ///
-/// Core owns the daemon and MCP bridge. Every other entry is independently
-/// addable, so adding one cannot disturb another component's known-good state.
+/// Core owns the daemon and MCP bridge. Selecting a component also selects
+/// its needs; declaration order puts each need before its dependents.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Component {
     Core,
@@ -22,16 +22,30 @@ pub enum Component {
     Insula,
     Claustrum,
     Synapse,
+    Fusiform,
+    Cingulate,
+    Entorhinal,
+    Astrocyte,
+    Striatum,
+    Broca,
+    Cerebellum,
 }
 
 impl Component {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 13] = [
         Self::Core,
         Self::Aft,
         Self::Mc,
         Self::Insula,
         Self::Claustrum,
         Self::Synapse,
+        Self::Fusiform,
+        Self::Cingulate,
+        Self::Entorhinal,
+        Self::Astrocyte,
+        Self::Striatum,
+        Self::Broca,
+        Self::Cerebellum,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -42,28 +56,26 @@ impl Component {
             Self::Insula => "insula",
             Self::Claustrum => "claustrum",
             Self::Synapse => "synapse",
+            Self::Fusiform => "fusiform",
+            Self::Cingulate => "cingulate",
+            Self::Entorhinal => "entorhinal",
+            Self::Astrocyte => "astrocyte",
+            Self::Striatum => "striatum",
+            Self::Broca => "broca",
+            Self::Cerebellum => "cerebellum",
         }
     }
 
     pub const fn module_id(self) -> Option<&'static str> {
         match self {
             Self::Core => None,
-            Self::Aft => Some("aft"),
             Self::Mc => Some("magic-context"),
-            Self::Insula => Some("insula"),
-            Self::Claustrum => Some("claustrum"),
-            Self::Synapse => Some("synapse"),
+            _ => Some(self.label()),
         }
     }
 
     pub const fn is_declared_unsupported_on(self, target: AlphaTarget) -> bool {
-        matches!(
-            (self, target),
-            (
-                Self::Mc,
-                AlphaTarget::WindowsX64 | AlphaTarget::WindowsArm64
-            )
-        )
+        self.unavailable_message(target).is_some()
     }
 
     pub const fn unavailable_message(self, target: AlphaTarget) -> Option<&'static str> {
@@ -71,8 +83,34 @@ impl Component {
             (Self::Mc, AlphaTarget::WindowsX64 | AlphaTarget::WindowsArm64) => {
                 Some("magic-context is not available on this platform yet; nothing was installed.")
             }
+            (Self::Cerebellum, AlphaTarget::WindowsX64 | AlphaTarget::WindowsArm64) => {
+                Some("cerebellum is not offered on Windows")
+            }
             _ => None,
         }
+    }
+
+    pub const fn is_windows_preview(self, target: AlphaTarget) -> bool {
+        matches!(target, AlphaTarget::WindowsX64 | AlphaTarget::WindowsArm64)
+            && matches!(self, Self::Fusiform | Self::Striatum | Self::Broca)
+    }
+
+    pub const fn plain_name(self) -> Option<&'static str> {
+        match self {
+            Self::Fusiform => Some("Model Catalog"),
+            Self::Cingulate => Some("Approvals"),
+            Self::Entorhinal => Some("Agents and Projects"),
+            Self::Astrocyte => Some("Spend Records"),
+            Self::Striatum => Some("AI Model Routing"),
+            Self::Broca => Some("Model Runner"),
+            Self::Cerebellum => Some("Browser and Computer Use"),
+            _ => None,
+        }
+    }
+
+    pub fn plan_name(self) -> String {
+        self.plain_name()
+            .map_or_else(|| self.to_string(), |name| format!("{self} ({name})"))
     }
 }
 
@@ -268,14 +306,12 @@ pub enum RuntimeState {
     Unowned { reason: String },
 }
 
-// Filesystem configuration probing is supplied by the setup backend. Keeping
-// conflicts in the model prevents an executor from treating a proposed write as
-// authorization to overwrite a user-owned key.
-#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ConfigurationState {
-    Additive,
-    Conflict { key: String },
+pub struct PartialInstall {
+    pub missing_commands: Vec<&'static str>,
+    pub module_matches_release: bool,
+    /// State of the owned module without considering its missing commands.
+    pub module_state: ComponentState,
 }
 
 /// Read-only standalone-detection evidence. Detection can affect an offer, but
@@ -318,7 +354,11 @@ pub struct SetupObserved {
     /// needs repair. Setup does not replace existing managed binaries.
     pub core_binary_present: bool,
     pub runtime: RuntimeState,
-    pub configuration: ConfigurationState,
+    /// A refusal to read or to change this component's daemon configuration.
+    pub configuration_refusals: BTreeMap<Component, String>,
+    pub module_steps: BTreeMap<Component, Vec<SetupOperation>>,
+    pub module_notes: BTreeMap<Component, Vec<String>>,
+    pub partial_installs: BTreeMap<Component, PartialInstall>,
     /// The bootstrap installer owns the running `ck` placement but setup has
     /// not yet recorded its managed-binary identity.
     pub running_ck_adoption: Option<std::path::PathBuf>,
@@ -377,7 +417,10 @@ impl SetupObserved {
             installed_core_version: None,
             core_binary_present: false,
             runtime: RuntimeState::Missing,
-            configuration: ConfigurationState::Additive,
+            configuration_refusals: BTreeMap::new(),
+            module_steps: BTreeMap::new(),
+            module_notes: BTreeMap::new(),
+            partial_installs: BTreeMap::new(),
             running_ck_adoption: None,
             ckni: None,
             mc_detection: Some(mc_detection),
@@ -400,6 +443,11 @@ impl SetupObserved {
             .get(&component)
             .cloned()
             .unwrap_or(ReleaseAvailability::Available)
+    }
+
+    pub(super) fn is_installed_for_selection(&self, component: Component) -> bool {
+        self.component_state(component) != ComponentState::Missing
+            || self.partial_installs.contains_key(&component)
     }
 }
 
@@ -429,6 +477,10 @@ impl SetupRequest {
             claustrum_key_path: None,
         }
     }
+
+    pub fn needs_claustrum(&self) -> bool {
+        super::conversion::selected_components(self).contains(&Component::Claustrum)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -450,6 +502,16 @@ pub enum PlanOutcome {
     },
     DeclaredUnavailable {
         component: Component,
+        message: String,
+    },
+    LeftOut {
+        component: Component,
+        reason: String,
+    },
+    WindowsPreview {
+        component: Component,
+    },
+    SetupNote {
         message: String,
     },
     Refusal {
@@ -490,6 +552,13 @@ pub enum PlanOutcome {
 }
 
 impl PlanOutcome {
+    pub fn is_default_setup_note(&self) -> bool {
+        matches!(
+            self,
+            Self::LeftOut { .. } | Self::WindowsPreview { .. } | Self::SetupNote { .. }
+        )
+    }
+
     pub fn blocks_execution(&self) -> bool {
         matches!(
             self,
@@ -528,6 +597,15 @@ impl fmt::Display for PlanOutcome {
                 "{component}: could not resolve the release: {reason} — retry later; nothing was installed"
             ),
             Self::DeclaredUnavailable { message, .. } => formatter.write_str(message),
+            Self::LeftOut { component, reason } => {
+                write!(formatter, "{}: left out — {reason}", component.plan_name())
+            }
+            Self::WindowsPreview { component } => write!(
+                formatter,
+                "{}: offered on Windows before its own tests run natively there",
+                component.plan_name()
+            ),
+            Self::SetupNote { message } => formatter.write_str(message),
             Self::Refusal { reason } | Self::TargetRefused { reason, .. } => {
                 write!(formatter, "refusal: {reason}")
             }
@@ -566,9 +644,6 @@ impl fmt::Display for PlanOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SetupOperation {
     ObservePlatform,
-    OfferOptionalComponents {
-        components: Vec<Component>,
-    },
     OfferConversion {
         component: Component,
     },
@@ -587,6 +662,23 @@ pub enum SetupOperation {
         key_path: Option<std::path::PathBuf>,
     },
     GrantMessageKeys,
+    WriteModuleSettings {
+        component: Component,
+        path: std::path::PathBuf,
+    },
+    EnsureBrocaKey {
+        path: std::path::PathBuf,
+        observation: String,
+    },
+    GrantComponentVault {
+        component: Component,
+    },
+    RegisterCerebellumNativeHost,
+    EnsureCerebellumExtension {
+        path: std::path::PathBuf,
+        url: String,
+        sha256: String,
+    },
     ConfigureMessageHub,
     AdoptRunningCk {
         path: std::path::PathBuf,
@@ -629,26 +721,38 @@ pub enum SetupOperation {
 }
 
 impl SetupOperation {
-    pub const fn mutates(&self) -> bool {
+    pub(super) const fn is_module_ensure(&self) -> bool {
         matches!(
             self,
-            Self::InstallComponent { .. }
-                | Self::ConfigureComponent { .. }
-                | Self::BootstrapClaustrum { .. }
-                | Self::GrantMessageKeys
-                | Self::ConfigureMessageHub
-                | Self::AdoptRunningCk { .. }
-                | Self::LinkCkni { .. }
-                | Self::RescanComponent { .. }
-                | Self::EnableComponent { .. }
-                | Self::RestartRuntime { .. }
-                | Self::RegisterRuntime
-                | Self::UpdateRuntimeDefinition { .. }
-                | Self::StartRuntime
-                | Self::DeregisterRuntime
-                | Self::RemoveManagedComponent { .. }
-                | Self::MonitorNatsServer { .. }
+            Self::WriteModuleSettings { .. }
+                | Self::EnsureBrocaKey { .. }
+                | Self::GrantComponentVault { .. }
+                | Self::RegisterCerebellumNativeHost
+                | Self::EnsureCerebellumExtension { .. }
         )
+    }
+
+    pub const fn mutates(&self) -> bool {
+        self.is_module_ensure()
+            || matches!(
+                self,
+                Self::InstallComponent { .. }
+                    | Self::ConfigureComponent { .. }
+                    | Self::BootstrapClaustrum { .. }
+                    | Self::GrantMessageKeys
+                    | Self::ConfigureMessageHub
+                    | Self::AdoptRunningCk { .. }
+                    | Self::LinkCkni { .. }
+                    | Self::RescanComponent { .. }
+                    | Self::EnableComponent { .. }
+                    | Self::RestartRuntime { .. }
+                    | Self::RegisterRuntime
+                    | Self::UpdateRuntimeDefinition { .. }
+                    | Self::StartRuntime
+                    | Self::DeregisterRuntime
+                    | Self::RemoveManagedComponent { .. }
+                    | Self::MonitorNatsServer { .. }
+            )
     }
 
     /// Identifies the component whose completed setup steps must be removed if
@@ -658,11 +762,16 @@ impl SetupOperation {
             Self::InstallComponent { component }
             | Self::ConfigureComponent { component }
             | Self::RescanComponent { component }
+            | Self::WriteModuleSettings { component, .. }
+            | Self::GrantComponentVault { component }
             | Self::EnableComponent { component } => Some(*component),
+            Self::EnsureBrocaKey { .. } => Some(Component::Broca),
+            Self::RegisterCerebellumNativeHost | Self::EnsureCerebellumExtension { .. } => {
+                Some(Component::Cerebellum)
+            }
             Self::BootstrapClaustrum { .. } => Some(Component::Claustrum),
             Self::ConfigureMessageHub => Some(Component::Core),
             Self::ObservePlatform
-            | Self::OfferOptionalComponents { .. }
             | Self::OfferConversion { .. }
             | Self::ConfirmConversion { .. }
             | Self::AdoptRunningCk { .. }
@@ -685,11 +794,6 @@ impl fmt::Display for SetupOperation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ObservePlatform => formatter.write_str("observe alpha platform support"),
-            Self::OfferOptionalComponents { components } => write!(
-                formatter,
-                "Optional modules: {}. Add one with `ck setup <name>`.",
-                components.iter().map(|component| component.label()).collect::<Vec<_>>().join(", ")
-            ),
             Self::OfferConversion { component } => {
                 write!(formatter, "offer standalone {component} conversion")
             }
@@ -702,7 +806,7 @@ impl fmt::Display for SetupOperation {
             Self::InstallComponent { component: Component::Synapse } => formatter.write_str(
                 "install synapse — healthy immediately with an empty catalog; inference remains typed-refused until model.load arrives",
             ),
-            Self::InstallComponent { component } => write!(formatter, "install {component}"),
+            Self::InstallComponent { component } => write!(formatter, "install {}", component.plan_name()),
             Self::ConfigureComponent { component } => write!(formatter, "configure {component}"),
             Self::BootstrapClaustrum {
                 key_path: Some(key_path),
@@ -716,6 +820,11 @@ impl fmt::Display for SetupOperation {
                 formatter.write_str("bootstrap claustrum with ck auth bootstrap")
             }
             Self::GrantMessageKeys => formatter.write_str(super::message_plane::GRANT_STEP),
+            Self::WriteModuleSettings { path, .. } => write!(formatter, "write {}", path.display()),
+            Self::EnsureBrocaKey { observation, .. } => write!(formatter, "ensure Broca deployment key: {observation}"),
+            Self::GrantComponentVault { component } => write!(formatter, "ensure {component} vault grants"),
+            Self::RegisterCerebellumNativeHost => formatter.write_str("ensure Chrome native messaging with ck-cerebellum-native-host --register"),
+            Self::EnsureCerebellumExtension { path, .. } => write!(formatter, "extract Chrome extension to {}; load that folder in chrome://extensions with Developer mode on; macOS permissions: Accessibility, Screen Recording and Input Monitoring", path.display()),
             Self::ConfigureMessageHub => formatter.write_str(super::message_plane::HUB_STEP),
             Self::AdoptRunningCk { path } => {
                 write!(formatter, "adopt running ck binary at {}", path.display())

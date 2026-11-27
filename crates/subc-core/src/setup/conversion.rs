@@ -1,17 +1,29 @@
 use std::collections::BTreeSet;
 
-use super::model::{Component, SetupRequest};
+use super::{
+    components::needs_closure,
+    model::{Component, SetupRequest},
+};
+
+pub const fn is_bare_setup(request: &SetupRequest) -> bool {
+    !request.uninstall && request.convert.is_none() && request.optional_components.is_empty()
+}
 
 /// Selects components through the ordinary component-add path. A confirmed
 /// explicit conversion contributes its component to this same set, so it cannot
 /// acquire a separate installation or configuration path.
 pub fn selected_components(request: &SetupRequest) -> BTreeSet<Component> {
-    let mut selected = BTreeSet::from([Component::Core]);
-    selected.extend(request.optional_components.iter().copied());
-    if let Some(component) = request.convert {
-        selected.insert(component);
+    if request.uninstall {
+        return BTreeSet::new();
     }
-    selected
+    if is_bare_setup(request) {
+        return Component::ALL.into_iter().collect();
+    }
+    needs_closure(
+        std::iter::once(Component::Core)
+            .chain(request.optional_components.iter().copied())
+            .chain(request.convert),
+    )
 }
 
 /// An explicit conversion may be planned for review, but authorization remains

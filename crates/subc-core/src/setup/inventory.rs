@@ -1,11 +1,11 @@
 use std::{
-    fs, io,
+    fs,
+    io::{self, Read},
     path::{Path, PathBuf},
 };
 
 use serde_json::{json, Map, Value};
 
-#[cfg(test)]
 use super::file_modes;
 use super::install_journal::{transaction::Transaction, Recovery};
 use super::{components::OWNED_BINARY_KINDS, install_lock::InstallLock};
@@ -96,9 +96,7 @@ impl Inventory {
 
     pub(super) fn read(path: PathBuf, platform: &str) -> Result<Self, String> {
         let document = match fs::read_to_string(&path) {
-            Ok(contents) => serde_json::from_str(&contents).map_err(|error| {
-                format!("inventory {} is invalid JSON: {error}", path.display())
-            })?,
+            Ok(contents) => Self::parse_document(&path, &contents)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => json!({
                 "schema_version": SCHEMA_VERSION,
                 "platform": platform,
@@ -111,18 +109,6 @@ impl Inventory {
                 ))
             }
         };
-        if !document.is_object() {
-            return Err(format!(
-                "inventory {} must be a JSON object",
-                path.display()
-            ));
-        }
-        if !document.get("mutations").is_some_and(Value::is_array) {
-            return Err(format!(
-                "inventory {} has no mutations array",
-                path.display()
-            ));
-        }
         let inventory = Self {
             path,
             document,
@@ -135,6 +121,24 @@ impl Inventory {
             opened_transaction: false,
         };
         Ok(inventory)
+    }
+
+    fn parse_document(path: &Path, contents: &str) -> Result<Value, String> {
+        let document: Value = serde_json::from_str(contents)
+            .map_err(|error| format!("inventory {} is invalid JSON: {error}", path.display()))?;
+        if !document.is_object() {
+            return Err(format!(
+                "inventory {} must be a JSON object",
+                path.display()
+            ));
+        }
+        if !document.get("mutations").is_some_and(Value::is_array) {
+            return Err(format!(
+                "inventory {} has no mutations array",
+                path.display()
+            ));
+        }
+        Ok(document)
     }
 
     pub fn owns_path(&self, kind: &str, path: &Path) -> bool {
@@ -172,13 +176,7 @@ impl Inventory {
             return;
         }
         self.transfer_binary_ownership(kind, path);
-        let mut entry = fields;
-        entry.insert("kind".to_string(), Value::String(kind.to_string()));
-        entry.insert(
-            "path".to_string(),
-            Value::String(path.to_string_lossy().into_owned()),
-        );
-        self.mutations_mut().push(Value::Object(entry));
+        self.mutations_mut().push(row(kind, path, fields));
         self.changed = true;
     }
 
@@ -198,14 +196,115 @@ impl Inventory {
 
     pub fn remove_owned_path(&mut self, kind: &str, path: &Path) {
         let path = path.to_string_lossy();
+        self.changed |= remove_rows(&mut self.document, kind, &path, self.windows_separators);
+    }
+
+    /// Saves a row that must survive a failed or interrupted install. The
+    /// ordinary transaction may still update or remove the row at commit.
+    #[allow(
+        dead_code,
+        reason = "used by setup steps that retain progress across runs"
+    )]
+    pub(super) fn persist_retained(
+        &mut self,
+        kind: &str,
+        path: &Path,
+        fields: Map<String, Value>,
+    ) -> Result<(), String> {
+        self.update_retained(kind, path, Some(row(kind, path, fields)))
+    }
+
+    /// Removes a retained row immediately, including from the rollback state.
+    #[allow(
+        dead_code,
+        reason = "used by setup steps that retain progress across runs"
+    )]
+    pub(super) fn drop_retained(&mut self, kind: &str, path: &Path) -> Result<(), String> {
+        self.update_retained(kind, path, None)
+    }
+
+    fn update_retained(
+        &mut self,
+        kind: &str,
+        path: &Path,
+        replacement: Option<Value>,
+    ) -> Result<(), String> {
+        if self._lock.is_none() {
+            return Err(format!(
+                "refusal: cannot change retained rows in inventory {} without the install lock",
+                self.path.display()
+            ));
+        }
+
+        // The loaded document and the rollback snapshot can both contain
+        // unsaved rows. Only the on-disk document is safe to publish here.
+        let (mut disk, mode) = self.read_for_retained_update()?;
+        let path = path.to_string_lossy();
         let windows_separators = self.windows_separators;
-        let mutations = self.mutations_mut();
-        let before = mutations.len();
-        mutations.retain(|entry| {
-            !(entry.get("kind").and_then(Value::as_str) == Some(kind)
-                && entry_has_path(entry, path.as_ref(), windows_separators))
-        });
-        self.changed |= mutations.len() != before;
+        let apply = |document: &mut Value| {
+            let removed = remove_rows(document, kind, &path, windows_separators);
+            if let Some(entry) = &replacement {
+                mutations_mut(document).push(entry.clone());
+            }
+            removed || replacement.is_some()
+        };
+
+        let publication = if apply(&mut disk) {
+            let bytes = serialize_document(&disk);
+            file_modes::SyncedTemporary::write(&self.path, bytes.as_bytes(), mode)?
+                .replace(&self.path)
+        } else {
+            Ok(())
+        };
+        if publication
+            .as_ref()
+            .err()
+            .is_none_or(|error| error.renamed())
+        {
+            // The change can already be visible even if the final sync failed.
+            // An undo must then leave the in-memory row aligned with disk.
+            apply(&mut self.document);
+            if let Some((_, prior)) = self.active.as_mut() {
+                apply(prior);
+            }
+        }
+        publication.map_err(|error| {
+            format!(
+                "could not publish inventory {}: {error}",
+                self.path.display()
+            )
+        })
+    }
+
+    fn read_for_retained_update(&self) -> Result<(Value, u32), String> {
+        let describe = |error| format!("could not read inventory {}: {error}", self.path.display());
+        match subc_os::open_regular_nofollow(&self.path) {
+            Ok(mut file) => {
+                let mut contents = String::new();
+                file.read_to_string(&mut contents).map_err(describe)?;
+                #[cfg(unix)]
+                let mode = {
+                    use std::os::unix::fs::PermissionsExt;
+                    file.metadata().map_err(describe)?.permissions().mode() & 0o644
+                };
+                #[cfg(not(unix))]
+                let mode = 0o644;
+                Ok((Self::parse_document(&self.path, &contents)?, mode))
+            }
+            Err(subc_os::OpenRegularError::Io(error))
+                if error.kind() == io::ErrorKind::NotFound =>
+            {
+                // Only the rows are mutable; keep the metadata of a new
+                // manifest while excluding every staged row.
+                let mut disk = self.document.clone();
+                mutations_mut(&mut disk).clear();
+                Ok((disk, 0o644))
+            }
+            Err(error) => Err(format!(
+                "could not read inventory {}: {error}",
+                self.path.display()
+            )),
+        }
     }
 
     /// Keep the ownership digest aligned with a managed replacement. Without
@@ -289,8 +388,6 @@ impl Inventory {
             .parent()
             .ok_or_else(|| format!("inventory {} has no parent directory", self.path.display()))?;
         file_modes::ensure_owned_directory(parent, 0o700)?;
-        // Sorted keys, so the file's bytes don't depend on whether the build
-        // turned on serde_json's `preserve_order`.
         let serialized = self.serialized();
         file_modes::write_atomic(&self.path, serialized.as_bytes(), 0o644, 0o644, "json.tmp")?;
         self.changed = false;
@@ -298,7 +395,7 @@ impl Inventory {
     }
 
     pub(super) fn serialized(&self) -> String {
-        format!("{}\n", subc_jsonc::to_string_pretty_sorted(&self.document))
+        serialize_document(&self.document)
     }
 
     pub(super) fn has_changes(&self) -> bool {
@@ -384,14 +481,38 @@ impl Inventory {
     }
 
     fn mutations_mut(&mut self) -> &mut Vec<Value> {
-        self.document
-            .as_object_mut()
-            .expect("validated JSON object")
-            .entry("mutations")
-            .or_insert_with(|| Value::Array(Vec::new()))
-            .as_array_mut()
-            .expect("validated mutations array")
+        mutations_mut(&mut self.document)
     }
+}
+
+fn serialize_document(document: &Value) -> String {
+    // Sorted keys, so the build's serde_json features do not affect the bytes.
+    format!("{}\n", subc_jsonc::to_string_pretty_sorted(document))
+}
+
+fn mutations_mut(document: &mut Value) -> &mut Vec<Value> {
+    document["mutations"]
+        .as_array_mut()
+        .expect("validated mutations array")
+}
+
+fn row(kind: &str, path: &Path, mut fields: Map<String, Value>) -> Value {
+    fields.insert("kind".to_string(), Value::String(kind.to_string()));
+    fields.insert(
+        "path".to_string(),
+        Value::String(path.to_string_lossy().into_owned()),
+    );
+    Value::Object(fields)
+}
+
+fn remove_rows(document: &mut Value, kind: &str, path: &str, windows_separators: bool) -> bool {
+    let mutations = mutations_mut(document);
+    let before = mutations.len();
+    mutations.retain(|entry| {
+        !(entry.get("kind").and_then(Value::as_str) == Some(kind)
+            && entry_has_path(entry, path, windows_separators))
+    });
+    mutations.len() != before
 }
 
 /// Ordinary Windows paths accept either separator. Do not rewrite recorded
@@ -414,10 +535,177 @@ fn entry_has_path(entry: &Value, path: &str, windows_separators: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::setup::install_journal::{bootstrap::FileRecovery, Journal};
     use cortexkit_test_support::ScratchDir;
+    use std::time::Duration;
+
+    const PLATFORM: &str = if cfg!(windows) {
+        "windows-x64"
+    } else {
+        "linux-x64"
+    };
 
     fn fixture_path(name: &str) -> ScratchDir {
         ScratchDir::new(name)
+    }
+
+    #[test]
+    fn retained_replacement_survives_commit_and_undo_without_publishing_staged_rows() {
+        for commit in [false, true] {
+            let root = fixture_path("retained-replacement");
+            let manifest = root.join("installer-manifest.json");
+            let settings = root.join("settings.jsonc");
+            let mut inventory =
+                Inventory::load_locked(&manifest, PLATFORM, "test", Duration::ZERO).unwrap();
+            inventory
+                .persist_retained(
+                    "key-intent",
+                    &settings,
+                    json_fields(json!({"id": 2, "old": true})),
+                )
+                .unwrap();
+            inventory.start_transaction().unwrap();
+            inventory.record("settings-receipt", &settings, Map::new());
+            inventory
+                .persist_retained("key-intent", &settings, json_fields(json!({"id": 3})))
+                .unwrap();
+            let expected = json!({"kind": "key-intent", "path": settings, "id": 3});
+            assert!(inventory.owns_path("settings-receipt", &settings));
+            assert_eq!(
+                inventory.entry_for_path("key-intent", &settings),
+                Some(&expected)
+            );
+            let disk = Inventory::load_snapshot(&manifest, PLATFORM).unwrap();
+            assert_eq!(
+                disk.paths_for_kind("key-intent").as_slice(),
+                std::slice::from_ref(&settings)
+            );
+            assert_eq!(
+                disk.entry_for_path("key-intent", &settings),
+                Some(&expected)
+            );
+            assert!(!disk.owns_path("settings-receipt", &settings));
+
+            finish(&mut inventory, commit);
+            let disk = Inventory::load_snapshot(&manifest, PLATFORM).unwrap();
+            for view in [&inventory, &disk] {
+                assert_eq!(
+                    view.entry_for_path("key-intent", &settings),
+                    Some(&expected)
+                );
+                assert_eq!(view.owns_path("settings-receipt", &settings), commit);
+            }
+        }
+    }
+
+    #[test]
+    fn retained_removal_survives_commit_and_undo_without_publishing_staged_rows() {
+        for commit in [false, true] {
+            let root = fixture_path("retained-removal");
+            let manifest = root.join("installer-manifest.json");
+            let settings = root.join("settings.jsonc");
+            let other = root.join("other.jsonc");
+            let mut inventory =
+                Inventory::load_locked(&manifest, PLATFORM, "test", Duration::ZERO).unwrap();
+            for path in [&settings, &other] {
+                inventory
+                    .persist_retained("key-intent", path, Map::new())
+                    .unwrap();
+            }
+            inventory.start_transaction().unwrap();
+            inventory.record("settings-receipt", &settings, Map::new());
+            inventory.drop_retained("key-intent", &settings).unwrap();
+            assert!(!inventory.owns_path("key-intent", &settings));
+            assert!(inventory.owns_path("settings-receipt", &settings));
+            let disk = Inventory::load_snapshot(&manifest, PLATFORM).unwrap();
+            assert_eq!(
+                disk.paths_for_kind("key-intent").as_slice(),
+                std::slice::from_ref(&other)
+            );
+            assert!(!disk.owns_path("settings-receipt", &settings));
+
+            finish(&mut inventory, commit);
+            let disk = Inventory::load_snapshot(&manifest, PLATFORM).unwrap();
+            for view in [&inventory, &disk] {
+                assert!(!view.owns_path("key-intent", &settings));
+                assert!(view.owns_path("key-intent", &other));
+                assert_eq!(view.owns_path("settings-receipt", &settings), commit);
+            }
+        }
+    }
+
+    #[test]
+    fn a_retained_row_survives_recovery_even_before_first_inventory_commit() {
+        let root = fixture_path("retained-recovery");
+        let manifest = root.join("installer-manifest.json");
+        let settings = root.join("settings.jsonc");
+        let binary = root.join("managed");
+        let mut inventory =
+            Inventory::load_locked(&manifest, PLATFORM, "test", Duration::ZERO).unwrap();
+        // Staged before the transaction opened: publishing its snapshot
+        // rather than reading disk would mistakenly make the receipt durable.
+        inventory.record("settings-receipt", &settings, Map::new());
+        inventory.start_transaction().unwrap();
+        inventory
+            .transaction()
+            .unwrap()
+            .write(&binary, b"new", 0o600)
+            .unwrap();
+        inventory
+            .persist_retained("key-intent", &settings, Map::new())
+            .unwrap();
+        drop(inventory);
+
+        let _lock = InstallLock::acquire_within(&manifest, "recovery", Duration::ZERO).unwrap();
+        Journal::open(&manifest)
+            .unwrap()
+            .unwrap()
+            .recover(&mut FileRecovery)
+            .unwrap();
+        let disk = Inventory::load_snapshot(&manifest, PLATFORM).unwrap();
+        assert!(disk.owns_path("key-intent", &settings));
+        assert!(!disk.owns_path("settings-receipt", &settings));
+        assert!(!binary.exists());
+    }
+
+    #[test]
+    fn retained_changes_cannot_publish_without_the_install_lock() {
+        let root = fixture_path("retained-lock");
+        let manifest = root.join("installer-manifest.json");
+        let settings = root.join("settings.jsonc");
+        let mut locked =
+            Inventory::load_locked(&manifest, PLATFORM, "test", Duration::ZERO).unwrap();
+        locked
+            .persist_retained("key-intent", &settings, Map::new())
+            .unwrap();
+        locked.release_lock();
+        let snapshot = Inventory::load_snapshot(&manifest, PLATFORM).unwrap();
+        let bytes = fs::read(&manifest).unwrap();
+        for mut unlocked in [locked, snapshot] {
+            for error in [
+                unlocked
+                    .persist_retained("settings-receipt", &settings, Map::new())
+                    .unwrap_err(),
+                unlocked.drop_retained("key-intent", &settings).unwrap_err(),
+            ] {
+                assert!(error.contains("without the install lock"), "{error}");
+            }
+            assert!(unlocked.owns_path("key-intent", &settings));
+            assert!(!unlocked.owns_path("settings-receipt", &settings));
+        }
+        assert_eq!(fs::read(&manifest).unwrap(), bytes);
+    }
+
+    fn json_fields(fields: Value) -> Map<String, Value> {
+        fields.as_object().unwrap().clone()
+    }
+
+    fn finish(inventory: &mut Inventory, commit: bool) {
+        if commit {
+            inventory.commit_transaction(&mut FileRecovery).unwrap();
+        } else {
+            inventory.undo_transaction(&mut FileRecovery).unwrap();
+        }
     }
 
     #[test]

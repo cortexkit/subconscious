@@ -7,7 +7,7 @@
 
 use subc_core::cli_output::stdout_result;
 use subc_core::setup;
-use subc_core::setup::text::{human_blocking_outcome, upgrade_current_summary};
+use subc_core::setup::text::human_blocking_outcome;
 
 // A reader may stop after the first line (for example, `ck health | head -1`).
 // Treat that as successful consumption, not a panic from std's print macros.
@@ -25,6 +25,9 @@ macro_rules! println {
 #[path = "activity/mod.rs"]
 mod activity;
 mod ck_help;
+mod ck_setup_cli;
+mod ck_upgrade_cli;
+use ck_upgrade_cli::upgrade_command;
 mod ck_upgrade_in_place;
 use ck_upgrade_in_place::DAEMON_HELP;
 mod ckni;
@@ -45,6 +48,9 @@ use routes_cli::supervisor_routes;
 mod stack_cli;
 mod window_cli;
 use ck_help::{is_builtin_domain, top_help, BUILTIN_DOMAINS};
+#[cfg(test)]
+use ck_setup_cli::parse_setup_component;
+use ck_setup_cli::{parse_setup_command, SETUP_HELP};
 use ckni::JsonOutput;
 use log_tail::{follow_module_logs, LogFollower};
 
@@ -419,8 +425,6 @@ const QUOTA_REDACT_JSON_REFUSAL: &str = "--redact cannot be used with --json. Om
 const HEALTH_HELP: &str = "ck health — module health\n\nusage: ck [--json] [--verbose] health [<module-id>]\n\n  ck health            one-line health for every supervised module (cached)\n  ck health <id>       fresh health.check probe with headline metrics\n  ck health <id> --verbose  fresh probe with the complete metrics tree";
 
 const MACHINE_HELP: &str = "ck machine — this machine's id, the name the daemon gives every module\n\nusage:\n  ck [--json] machine show\n  ck [--json] machine adopt <id> [--force]\n\n  show prints the id stored in <data home>/cortexkit/machine-id and the id the\n  running daemon serves, and says when they differ.\n  adopt replaces the stored id with <id> (32 lowercase hex characters), for\n  restoring a machine's identity. It takes effect at the next daemon start, and\n  every module on this machine then reports the new id. It refuses while the\n  daemon is running unless --force is given; even then the running daemon keeps\n  serving its current id until it restarts.";
-
-const SETUP_HELP: &str = "ck setup — plan managed CortexKit installation\n\nusage:\n  ck setup [aft|mc|insula|claustrum|synapse] [--with aft,mc,insula,claustrum,synapse] [--dry-run] [--verbose] [--yes|-y]\n  ck setup claustrum [--key-path <file>]\n  ck setup <aft|mc> --convert [--confirm]\n  ck setup --uninstall [--dry-run]\n  ck setup operator-prompt [--uninstall]\n\n  Bare setup installs core and lists available optional modules to add with\n  `ck setup <name>`; it does not prompt to select optional modules. --dry-run prints the\n  complete plan without changing anything. Interactive setup shows that plan and\n  asks Continue? [y/N] before changes; --yes (-y) skips the question. Piped or\n  non-terminal setup proceeds without a question. --convert is explicit and requires\n  --confirm before it can apply a conversion plan. --verbose includes plan outcomes\n  and download diagnostics when a network request fails.";
 
 const UPGRADE_HELP: &str = "ck upgrade — plan managed component upgrades\n\nusage:\n  ck upgrade [--dry-run] [--verbose]\n  ck upgrade --check [--verbose]\n\n  --check reports available updates without changing anything. --dry-run prints\n  the complete plan without changing anything. --verbose includes plan outcomes\n  and execution evidence. --check exits 0 for current binaries or available\n  updates, and 1 when ownership is missing or an unowned destination is found.";
 
@@ -6788,18 +6792,24 @@ fn setup_command(program: &Path, request: &setup::SetupRequest, ckni: bool) -> R
         print_verbose_setup_outcomes(&plan, request.verbose);
         return Err(CkError::RenderedExit { exit_code: 1 });
     }
+    for outcome in plan
+        .outcomes
+        .iter()
+        .filter(|outcome| outcome.is_default_setup_note())
+    {
+        println!("{outcome}");
+    }
     if plan.mutation_count() == 0 {
         for line in setup_no_change_summary(&observed, request) {
             println!("{line}");
         }
-        if let Some(line) = plan.optional_components_line() {
-            println!("{line}");
+        if request.uninstall {
+            for line in backend.unmanaged_uninstall_notes() {
+                println!("{line}");
+            }
         }
         print_verbose_setup_outcomes(&plan, request.verbose);
         return Ok(());
-    }
-    if let Some(line) = plan.optional_components_line() {
-        println!("{line}");
     }
     if request.dry_run {
         backend.print_dry_run(&plan).map_err(CkError::Message)?;
@@ -6907,6 +6917,11 @@ fn setup_unavailable_message(
     observed: &setup::SetupObserved,
 ) -> Option<String> {
     plan.outcomes.iter().find_map(|outcome| match outcome {
+        setup::PlanOutcome::ReleaseIncomplete { component, .. }
+            if component.plain_name().is_some() =>
+        {
+            Some(outcome.to_string())
+        }
         setup::PlanOutcome::ReleaseIncomplete { component, .. } => {
             let target = match &observed.platform {
                 setup::PlatformObservation::Supported(target) => target.to_string(),
@@ -6951,12 +6966,12 @@ mod setup_message_tests {
 
 fn print_verbose_setup_outcomes(plan: &setup::SetupPlan, verbose: bool) {
     if verbose {
-        for line in plan
-            .render()
-            .lines()
-            .filter(|line| line.trim_start().starts_with("outcome:"))
+        for outcome in plan
+            .outcomes
+            .iter()
+            .filter(|outcome| !outcome.is_default_setup_note())
         {
-            println!("{line}");
+            println!("  outcome: {outcome}");
         }
     }
 }
@@ -6991,338 +7006,6 @@ async fn fetch_supervised_roster(subc: Option<&Path>) -> Result<BTreeSet<String>
         .map(ToOwned::to_owned)
         .collect();
     Ok(ids)
-}
-
-async fn upgrade_command(
-    executable: &Path,
-    subc: Option<&Path>,
-    check: bool,
-    verbose: bool,
-    dry_run: bool,
-) -> Result<(), CkError> {
-    // Keep the discovered path for post-restart verification (core versions come from the binary).
-    let connection = discover_connection_file(subc).ok();
-    let connection_path = subc
-        .map(Path::to_path_buf)
-        .or_else(|| connection.as_ref().map(|found| found.path.clone()));
-    let (_install_hold, discovered) =
-        setup::lock_and_discover_upgrade_targets(executable, subc, check || dry_run)
-            .map_err(CkError::rejected)?;
-    let ownership_outcomes =
-        setup::upgrade_ownership_outcomes(executable, &discovered).map_err(CkError::rejected)?;
-    if let Some(refusal) = setup::text::upgrade_ownership_refusal(&ownership_outcomes) {
-        println!("{refusal}");
-        return Err(CkError::RenderedExit { exit_code: 1 });
-    }
-    let cache = setup::UpdateCache::from_environment();
-    let source = setup::IndexReleaseSource::from_environment(setup::TARGET_CHECK_BUDGET);
-    let upgrade_roster = discovered
-        .iter()
-        .map(|item| item.target)
-        .collect::<Vec<setup::UpgradeTarget>>();
-    let metadata = match setup::check_update_metadata(&cache, &source, &upgrade_roster).await {
-        Ok(metadata) => metadata,
-        Err(error @ setup::UpdateCheckError::IndexStale { .. }) => {
-            println!("{error}");
-            return Err(CkError::UpdateCheck(error));
-        }
-        Err(error @ setup::UpdateCheckError::IndexUnreachable { .. }) => {
-            println!("{}", setup::not_checked_from_cache(&cache).render());
-            return Err(CkError::UpdateCheck(error));
-        }
-        Err(error) => return Err(CkError::UpdateCheck(error)),
-    };
-    // Availability is a signed-index observation, not an activation attempt.
-    // A stopped daemon must not prevent a read-only update check.
-    let roster = if check {
-        Ok(BTreeSet::new())
-    } else {
-        fetch_supervised_roster(subc).await
-    };
-    let planning_index = if check {
-        None
-    } else {
-        Some(
-            source
-                .cloned_index()
-                .map_err(|error| CkError::Message(error.to_string()))?,
-        )
-    };
-    let observed =
-        setup::observed_upgrade_targets(&metadata, &discovered, roster, planning_index.as_ref());
-    let plan = setup::plan_upgrade(&observed);
-    if dry_run {
-        println!("{}", plan.render());
-        return if plan.is_authorized() {
-            Ok(())
-        } else {
-            Err(CkError::RenderedExit { exit_code: 1 })
-        };
-    }
-    if let Some(message) = setup::text::upgrade_plan_refusal(&plan) {
-        println!("{message}");
-        print!(
-            "{}",
-            setup::text::print_verbose_outcomes(&plan.outcomes, verbose)
-        );
-        return Err(CkError::RenderedExit { exit_code: 1 });
-    }
-    let planned_mutations = plan
-        .operations
-        .iter()
-        .filter(|operation| operation.mutates())
-        .count();
-    if check {
-        let updates = plan
-            .outcomes
-            .iter()
-            .filter_map(|outcome| match outcome {
-                setup::PlanOutcome::UpgradeAvailable {
-                    target, from, to, ..
-                } => Some(format!(
-                    "{}. Run ck upgrade.",
-                    setup::version_transition(&target.to_string(), from, to)
-                )),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        if updates.is_empty() {
-            println!("{}", upgrade_current_summary(&discovered));
-        } else {
-            for update in updates {
-                println!("{update}");
-            }
-        }
-        print!(
-            "{}",
-            setup::text::print_verbose_outcomes(&plan.outcomes, verbose)
-        );
-        return Ok(());
-    }
-    if planned_mutations == 0 {
-        println!("{}", upgrade_current_summary(&discovered));
-        print!(
-            "{}",
-            setup::text::print_verbose_outcomes(&plan.outcomes, verbose)
-        );
-        return Ok(());
-    }
-
-    #[cfg(feature = "test-support")]
-    if env::var_os("CK_TEST_UPGRADE_APPLY_OK").is_some() {
-        for outcome in &plan.outcomes {
-            if let setup::PlanOutcome::UpgradeAvailable {
-                target, from, to, ..
-            } = outcome
-            {
-                println!("{}", setup::upgraded_line(*target, from, to));
-            }
-        }
-        println!("Done.");
-        print!(
-            "{}",
-            setup::text::print_verbose_outcomes(&plan.outcomes, verbose)
-        );
-        return Ok(());
-    }
-
-    let index = planning_index.expect("non-check upgrade loaded its planning index");
-    let mut backend = setup::SystemUpgradeBackend::new(
-        executable,
-        connection_path,
-        discovered,
-        index,
-        setup::UpgradeOutput::Terminal,
-    )
-    .map_err(CkError::rejected)?;
-    backend.set_supervised_modules(observed.supervised_modules.clone());
-    for &target in &observed.roster {
-        if let setup::UpgradeState::UpdateAvailable { from, to, .. } = observed.target_state(target)
-        {
-            backend.set_planned_from(target, from);
-            backend.set_expected_version(target, to);
-        }
-    }
-    match setup::execute_upgrade(&plan, &mut backend) {
-        Ok(report) => {
-            println!(
-                "{}",
-                if report.nothing_changed() {
-                    "Nothing changed."
-                } else {
-                    "Done."
-                }
-            );
-            print!(
-                "{}",
-                setup::text::print_verbose_outcomes(&plan.outcomes, verbose)
-            );
-            if verbose {
-                setup::render_execution_report(&report);
-            }
-            Ok(())
-        }
-        Err(failure) => {
-            setup::render_execution_report(&failure.report);
-            Err(CkError::rejected(failure.to_string()))
-        }
-    }
-}
-
-fn parse_setup_command(tail: &[OsString]) -> Result<setup::SetupRequest, CkError> {
-    let mut optional = BTreeSet::new();
-    let mut explicit_component = None;
-    let mut used_with = false;
-    let mut uninstall = false;
-    let mut dry_run = false;
-    let mut verbose = false;
-    let mut yes = false;
-    let mut convert = false;
-    let mut conversion_confirmed = false;
-    let mut claustrum_key_path = None;
-    let mut index = 0;
-
-    while let Some(argument) = tail.get(index) {
-        let argument = argument.to_string_lossy();
-        match argument.as_ref() {
-            "--with" => {
-                let Some(value) = tail.get(index + 1) else {
-                    return Err(CkError::Usage(format!(
-                        "ck setup --with requires a comma-separated component list\n\n{SETUP_HELP}"
-                    )));
-                };
-                if used_with || explicit_component.is_some() {
-                    return Err(CkError::Usage(format!(
-                        "ck setup accepts either one explicit component or one --with list\n\n{SETUP_HELP}"
-                    )));
-                }
-                used_with = true;
-                let value = value.to_string_lossy();
-                if value.is_empty() {
-                    return Err(CkError::Usage(format!(
-                        "ck setup --with requires at least one component\n\n{SETUP_HELP}"
-                    )));
-                }
-                for component in value.split(',') {
-                    let component = parse_setup_component(component)?;
-                    if !optional.insert(component) {
-                        return Err(CkError::Usage(format!(
-                            "ck setup --with repeats component '{component}'\n\n{SETUP_HELP}"
-                        )));
-                    }
-                }
-                index += 2;
-            }
-            "--dry-run" => {
-                dry_run = true;
-                index += 1;
-            }
-            "--verbose" => {
-                verbose = true;
-                index += 1;
-            }
-            "--yes" | "-y" => {
-                yes = true;
-                index += 1;
-            }
-            "--uninstall" => {
-                uninstall = true;
-                index += 1;
-            }
-            "--convert" => {
-                convert = true;
-                index += 1;
-            }
-            "--confirm" => {
-                conversion_confirmed = true;
-                index += 1;
-            }
-            "--key-path" => {
-                let Some(value) = tail.get(index + 1) else {
-                    return Err(CkError::Usage(format!(
-                        "ck setup --key-path requires a file path\n\n{SETUP_HELP}"
-                    )));
-                };
-                if claustrum_key_path.is_some() {
-                    return Err(CkError::Usage(format!(
-                        "ck setup accepts one --key-path\n\n{SETUP_HELP}"
-                    )));
-                }
-                claustrum_key_path = Some(PathBuf::from(value));
-                index += 2;
-            }
-            value if value.starts_with('-') => {
-                return Err(CkError::Usage(format!(
-                    "unknown setup flag '{value}'\n\n{SETUP_HELP}"
-                )));
-            }
-            value => {
-                if used_with || explicit_component.is_some() {
-                    return Err(CkError::Usage(format!(
-                        "ck setup accepts one optional component\n\n{SETUP_HELP}"
-                    )));
-                }
-                let component = parse_setup_component(value)?;
-                optional.insert(component);
-                explicit_component = Some(component);
-                index += 1;
-            }
-        }
-    }
-
-    if uninstall && (!optional.is_empty() || convert || conversion_confirmed) {
-        return Err(CkError::Usage(format!(
-            "ck setup --uninstall cannot be combined with component installation or conversion\n\n{SETUP_HELP}"
-        )));
-    }
-    if convert && explicit_component.is_none() {
-        return Err(CkError::Usage(format!(
-            "ck setup --convert requires 'aft' or 'mc'\n\n{SETUP_HELP}"
-        )));
-    }
-    if conversion_confirmed && !convert {
-        return Err(CkError::Usage(format!(
-            "ck setup --confirm is only valid with --convert\n\n{SETUP_HELP}"
-        )));
-    }
-    if claustrum_key_path.is_some()
-        && explicit_component != Some(setup::Component::Claustrum)
-        && !optional.contains(&setup::Component::Claustrum)
-    {
-        return Err(CkError::Usage(format!(
-            "ck setup --key-path is only valid for claustrum\n\n{SETUP_HELP}"
-        )));
-    }
-
-    let claustrum_selected = explicit_component == Some(setup::Component::Claustrum)
-        || optional.contains(&setup::Component::Claustrum);
-    let mut request = setup::SetupRequest::install(optional.into_iter().collect());
-    request.uninstall = uninstall;
-    request.dry_run = dry_run;
-    request.verbose = verbose;
-    request.yes = yes;
-    request.convert = if convert { explicit_component } else { None };
-    request.conversion_confirmed = conversion_confirmed;
-    if claustrum_selected {
-        request.claustrum_key_path = match claustrum_key_path {
-            Some(path) => Some(path),
-            None => setup::default_claustrum_key_path().map_err(CkError::Message)?,
-        };
-    }
-    Ok(request)
-}
-
-fn parse_setup_component(value: &str) -> Result<setup::Component, CkError> {
-    match value {
-        "aft" => Ok(setup::Component::Aft),
-        "mc" => Ok(setup::Component::Mc),
-        "insula" => Ok(setup::Component::Insula),
-        "claustrum" => Ok(setup::Component::Claustrum),
-        "synapse" => Ok(setup::Component::Synapse),
-        _ => Err(CkError::Usage(format!(
-            "unknown setup component '{value}'; expected aft, mc, insula, claustrum, or synapse\n\n{SETUP_HELP}"
-        ))),
-    }
 }
 
 fn parse_upgrade_command(tail: &[OsString]) -> Result<Command, CkError> {
@@ -11379,6 +11062,30 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(explicit.claustrum_key_path, Some(key));
+    }
+
+    #[test]
+    fn setup_key_path_follows_effective_selection() {
+        let test_tail = |tokens: &[&str]| tokens.iter().map(OsString::from).collect::<Vec<_>>();
+        for args in [
+            &["--key-path", "key"][..],
+            &["--with", "striatum", "--key-path", "key"][..],
+        ] {
+            let request = parse_setup_command(&test_tail(args)).unwrap();
+            assert!(request.needs_claustrum());
+            assert_eq!(request.claustrum_key_path, Some(PathBuf::from("key")));
+        }
+        let request = parse_setup_command(&test_tail(&["--with", "cerebellum,cingulate"])).unwrap();
+        assert_eq!(
+            request.optional_components,
+            [setup::Component::Cingulate, setup::Component::Cerebellum]
+        );
+        assert_eq!(
+            request.claustrum_key_path,
+            setup::default_claustrum_key_path().unwrap()
+        );
+        assert!(parse_setup_command(&test_tail(&["fusiform", "--key-path", "key"])).is_err());
+        assert!(parse_setup_command(&test_tail(&["--uninstall", "--key-path", "key"])).is_err());
     }
 
     #[test]

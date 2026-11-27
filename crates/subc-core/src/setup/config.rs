@@ -503,7 +503,17 @@ fn desired_values_with_key(
                 }),
             );
         }
-        Component::Aft | Component::Mc | Component::Insula | Component::Synapse => {
+        Component::Aft
+        | Component::Mc
+        | Component::Insula
+        | Component::Synapse
+        | Component::Fusiform
+        | Component::Cingulate
+        | Component::Entorhinal
+        | Component::Astrocyte
+        | Component::Striatum
+        | Component::Broca
+        | Component::Cerebellum => {
             let module_id = component.module_id().expect("non-core modules have an id");
             values.insert(
                 format!("modules.{module_id}"),
@@ -1141,5 +1151,28 @@ mod tests {
             pending_dotted_keys(&config, Component::Core, root.path(), None).expect("pending");
         assert_eq!(keys, ["modules.subc-mcp"]);
         assert!(restart_required_from_pending_keys(true, &keys).is_empty());
+    }
+    #[test]
+    fn setup_new_module_configuration_has_only_program_values() {
+        let binary_home = Path::new("bin");
+        for (component, id) in [
+            (Component::Fusiform, "fusiform"),
+            (Component::Cingulate, "cingulate"),
+            (Component::Entorhinal, "entorhinal"),
+            (Component::Astrocyte, "astrocyte"),
+            (Component::Striatum, "striatum"),
+            (Component::Broca, "broca"),
+            (Component::Cerebellum, "cerebellum"),
+        ] {
+            assert_eq!(
+                desired_values_with_key(component, binary_home, Some(Path::new("key"))),
+                BTreeMap::from([(
+                    format!("modules.{id}"),
+                    serde_json::json!({
+                        "program": binary_home.join(platform_binary(&format!("ck-{id}")))
+                    })
+                )])
+            );
+        }
     }
 }

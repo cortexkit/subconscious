@@ -20,8 +20,9 @@ Modules talk to the daemon and own their own durable data.
 The `subc-mcp` module (`ck-subc-mcp`) presents the fleet to an MCP host.
 `ck-mcp-stdio-adapter` hosts third-party stdio MCP servers, and `ck-bus`
 owns the local NATS message plane. `ck` also installs these modules, each from
-its own repository: `aft`, `magic-context`, `insula`, `claustrum`, and
-`synapse`. Other modules may run too; `{{ck}} module list` shows them all.
+its own repository: `aft`, `magic-context`, `insula`, `claustrum`, `synapse`,
+`fusiform`, `cingulate`, `entorhinal`, `astrocyte`, `striatum`, `broca`, and
+`cerebellum`. Other modules may run too; `{{ck}} module list` shows them all.
 
 ## Diagnose before making changes
 

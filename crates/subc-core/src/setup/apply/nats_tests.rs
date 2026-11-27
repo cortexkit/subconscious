@@ -227,6 +227,7 @@ fn message_plane_setup_uses_the_installed_vault_cli_after_it_is_live() {
             *count += 1;
             Ok(runtime::CommandResult {
                 success: true,
+                exit_code: Some(0),
                 stdout,
                 stderr: String::new(),
             })

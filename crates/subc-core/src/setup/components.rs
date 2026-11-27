@@ -148,7 +148,9 @@ impl ReleaseArtifactSource {
         component: Component,
     ) -> Result<ReleaseAvailability, String> {
         let target = self.target;
-        let needed = component_binaries_for_target(component, target);
+        let needed = component_binaries_for_target(component, target)
+            .iter()
+            .chain(extra_required_assets(component, target));
         let index = self.loaded_index()?;
         let Some(entry) = index.components.get(component.label()) else {
             if component == Component::Mc {
@@ -157,7 +159,8 @@ impl ReleaseArtifactSource {
                 });
             }
             let missing_asset = needed
-                .first()
+                .into_iter()
+                .next()
                 .map(|binary| format!("{}-{}.zip", binary, target.label()))
                 .unwrap_or_else(|| component.label().to_string());
             return Ok(ReleaseAvailability::NotYetPublished {
@@ -166,7 +169,7 @@ impl ReleaseArtifactSource {
             });
         };
         let target_assets = entry.assets.get(target.label());
-        let missing_asset = needed.iter().find_map(|binary| {
+        let missing_asset = needed.into_iter().find_map(|binary| {
             if target_assets.is_some_and(|assets| assets.contains_key(*binary)) {
                 None
             } else {
@@ -428,6 +431,7 @@ impl ArtifactSource for ReleaseArtifactSource {
     fn acceptance(&mut self, component: Component, binary: &str) -> Result<Acceptance, String> {
         let asset = self.lookup_asset(component, binary)?;
         Ok(match asset.reports {
+            _ if binary == NATIVE_HOST => Acceptance::DigestOnly,
             Some(reports) => Acceptance::Reports(reports),
             None => Acceptance::RunsAndReports,
         })
@@ -498,10 +502,17 @@ pub fn module_program(component: Component) -> Option<&'static str> {
         Component::Insula => Some("ck-insula"),
         Component::Claustrum => Some("ck-claustrum"),
         Component::Synapse => Some("ck-synapse"),
+        Component::Fusiform => Some("ck-fusiform"),
+        Component::Cingulate => Some("ck-cingulate"),
+        Component::Entorhinal => Some("ck-entorhinal"),
+        Component::Astrocyte => Some("ck-astrocyte"),
+        Component::Striatum => Some("ck-striatum"),
+        Component::Broca => Some("ck-broca"),
+        Component::Cerebellum => Some("ck-cerebellum"),
     }
 }
 
-const SUPERVISED_MODULE_IDS: [(&str, &str); 6] = [
+const SUPERVISED_MODULE_IDS: [(&str, &str); 13] = [
     // Core owns the daemon and MCP bridge, but only the bridge is a supervised
     // module program; Core itself remains outside the setup module lifecycle.
     ("ck-subc-mcp", "subc-mcp"),
@@ -510,6 +521,13 @@ const SUPERVISED_MODULE_IDS: [(&str, &str); 6] = [
     ("ck-insula", "insula"),
     ("ck-claustrum", "claustrum"),
     ("ck-synapse", "synapse"),
+    ("ck-fusiform", "fusiform"),
+    ("ck-cingulate", "cingulate"),
+    ("ck-entorhinal", "entorhinal"),
+    ("ck-astrocyte", "astrocyte"),
+    ("ck-striatum", "striatum"),
+    ("ck-broca", "broca"),
+    ("ck-cerebellum", "cerebellum"),
 ];
 
 /// Returns the managed program names and their corresponding daemon supervisor IDs.
@@ -523,6 +541,42 @@ pub fn supervised_module_id(binary: &str) -> Option<&'static str> {
     SUPERVISED_MODULE_IDS
         .iter()
         .find_map(|(program, module_id)| (*program == binary).then_some(*module_id))
+}
+
+pub(super) fn component_needs(component: Component) -> &'static [Component] {
+    use Component::*;
+    match component {
+        Core => &[],
+        Aft | Mc | Insula | Claustrum | Synapse | Fusiform | Cingulate => &[Core],
+        Entorhinal => &[Core, Claustrum],
+        Astrocyte | Striatum | Broca => &[Core, Claustrum, Fusiform],
+        Cerebellum => &[Core, Claustrum, Cingulate, Entorhinal],
+    }
+}
+
+/// Returns the picks and all their transitive needs in installation order.
+pub(super) fn needs_closure(picks: impl IntoIterator<Item = Component>) -> BTreeSet<Component> {
+    let mut selected = BTreeSet::new();
+    let mut pending = picks.into_iter().collect::<Vec<_>>();
+    while let Some(component) = pending.pop() {
+        if selected.insert(component) {
+            pending.extend_from_slice(component_needs(component));
+        }
+    }
+    selected
+}
+
+const NATIVE_HOST: &str = "ck-cerebellum-native-host";
+
+pub(super) fn is_new_component_module(component: Component, binary: &str) -> bool {
+    component.plain_name().is_some() && module_program(component) == Some(binary)
+}
+
+fn extra_required_assets(component: Component, target: AlphaTarget) -> &'static [&'static str] {
+    match (component, target) {
+        (Component::Cerebellum, AlphaTarget::DarwinArm64) => &["ck-cerebellum-extension"],
+        _ => &[],
+    }
 }
 
 /// Release asset sets are data, not filesystem discovery, so setup never loses
@@ -573,6 +627,17 @@ pub fn component_binaries_for_target(
             | AlphaTarget::WindowsX64
             | AlphaTarget::WindowsArm64,
         ) => &["ck-synapse", "ck-synapse-opctl", "ck-synapse-worker-llama"],
+        (Component::Fusiform, _) => &["ck-fusiform", "ck-models"],
+        (Component::Cingulate, _) => &["ck-cingulate"],
+        (Component::Entorhinal, _) => &["ck-entorhinal"],
+        (Component::Astrocyte, _) => &["ck-astrocyte"],
+        (Component::Striatum, _) => &["ck-striatum"],
+        (Component::Broca, _) => &["ck-broca", "broca-session"],
+        (Component::Cerebellum, AlphaTarget::DarwinArm64) => &["ck-cerebellum", NATIVE_HOST],
+        (Component::Cerebellum, AlphaTarget::LinuxX64 | AlphaTarget::LinuxArm64) => {
+            &["ck-cerebellum"]
+        }
+        (Component::Cerebellum, AlphaTarget::WindowsX64 | AlphaTarget::WindowsArm64) => &[],
     }
 }
 
@@ -623,6 +688,52 @@ pub(super) fn installation_binary_paths(component: Component, binary_home: &Path
         .collect()
 }
 
+/// A command may be added alongside an owned module only from that module's release.
+pub(super) fn partial_install(
+    component: Component,
+    binary_home: &Path,
+    inventory: &Inventory,
+    index: &ReleaseIndex,
+    target: AlphaTarget,
+) -> Option<(Vec<&'static str>, bool)> {
+    if !matches!(
+        component,
+        Component::Fusiform | Component::Broca | Component::Cerebellum
+    ) {
+        return None;
+    }
+    let (program, commands) = component_binaries_for_target(component, target).split_first()?;
+    let path = installed_binary_path(binary_home, program);
+    if !path.is_file() {
+        return None;
+    }
+    let row = OWNED_BINARY_KINDS
+        .iter()
+        .find_map(|kind| inventory.entry_for_path(kind, &path))?;
+    let missing_commands = commands
+        .iter()
+        .copied()
+        .filter(|binary| {
+            let path = installed_binary_path(binary_home, binary);
+            !OWNED_BINARY_KINDS
+                .iter()
+                .any(|kind| inventory.owns_path(kind, &path))
+        })
+        .collect::<Vec<_>>();
+    if missing_commands.is_empty() {
+        return None;
+    }
+    let release = index
+        .components
+        .get(component.label())
+        .and_then(|entry| entry.assets.get(target.label()))
+        .and_then(|assets| assets.get(*program));
+    let same_release = release.is_some_and(|asset| {
+        row.get("archive_sha256").and_then(Value::as_str) == Some(asset.sha256.as_str())
+    });
+    Some((missing_commands, same_release))
+}
+
 pub(super) fn observe_unowned_binaries(
     component: Component,
     binary_home: &Path,
@@ -647,7 +758,11 @@ pub(super) fn observe_unowned_binaries(
                 .or_else(|| entry.version.clone())
         });
         UnownedBinary {
-            version: observed_binary_version(&path),
+            version: if binary == NATIVE_HOST {
+                None
+            } else {
+                observed_binary_version(&path)
+            },
             path,
             release_version,
         }
@@ -904,7 +1019,15 @@ fn record_placement(
     // Version text helps operators identify an update, but currency compares
     // the archive digest to the index asset. The extracted-binary digest is
     // a different file and is kept as the ownership proof for uninstall.
-    if let Ok(version) = super::upgrade::binary_version(destination) {
+    let version = if destination
+        .file_name()
+        .is_some_and(|name| name == platform_binary(NATIVE_HOST).as_str())
+    {
+        None
+    } else {
+        super::upgrade::binary_version(destination).ok()
+    };
+    if let Some(version) = version {
         fields.insert("version".to_string(), Value::String(version));
     }
     inventory.record("managed-binary", destination, fields);
@@ -963,19 +1086,6 @@ pub(super) fn display_home_path(path: &Path) -> String {
     }
 }
 
-pub fn configuration_is_correct(
-    component: Component,
-    config_path: &Path,
-    binary_home: &Path,
-    claustrum_key_path: Option<&Path>,
-) -> Result<bool, String> {
-    match config::plan_component_with_key(config_path, component, binary_home, claustrum_key_path) {
-        Ok(None) => Ok(true),
-        Ok(Some(_)) => Ok(false),
-        Err(conflict) => Err(format!("configuration conflict at {}", conflict.key)),
-    }
-}
-
 /// What a placed binary can prove about the release it came from, read off
 /// its `--version` line. The index digest already proves the bytes are the
 /// release's; this is the second, independent check that the binary reports
@@ -988,6 +1098,8 @@ pub enum Acceptance {
     /// The index did not name a substring. The binary must execute and print
     /// a name and a version; provenance rests on the verified sha256.
     RunsAndReports,
+    /// This command has no version probe; the verified archive is the evidence.
+    DigestOnly,
 }
 
 /// Runs the placed binary before configuration and checks its `--version`
@@ -995,6 +1107,9 @@ pub enum Acceptance {
 /// carries the wrong binary from becoming a supervised module, and pays the
 /// first-exec toll on the destination inode before the daemon spawns it.
 fn verify_acceptance(path: &Path, acceptance: &Acceptance) -> Result<(), String> {
+    if *acceptance == Acceptance::DigestOnly {
+        return Ok(());
+    }
     let output = run_probe_tolerating_text_busy(path, "--version", ProbeSubject::PlacedBySetup)
         .map_err(|error| format!("could not run {} --version: {error}", path.display()))?;
     if !output.status.success() {
@@ -1117,6 +1232,7 @@ fn check_reported(reported: &str, acceptance: &Acceptance) -> Result<(), String>
                 return Err("did not self-report a name and version".to_string());
             }
         }
+        Acceptance::DigestOnly => {}
     }
     Ok(())
 }
@@ -1163,7 +1279,7 @@ pub fn digest_file(path: &Path) -> Result<String, String> {
 /// not see. On a host the gate refuses, no asset lookup will succeed
 /// anyway; the fallback only has to be a real tuple so the refusal, not
 /// a panic, is what the operator reads.
-fn host_alpha_target() -> AlphaTarget {
+pub(super) fn host_alpha_target() -> AlphaTarget {
     match PlatformObservation::current() {
         PlatformObservation::Supported(target) => target,
         PlatformObservation::Unsupported(_) => AlphaTarget::LinuxX64,
@@ -1246,6 +1362,7 @@ mod tests {
             };
             Ok(CommandResult {
                 success: true,
+                exit_code: Some(0),
                 stdout,
                 stderr: String::new(),
             })
@@ -2277,7 +2394,7 @@ mod tests {
     }
 
     #[test]
-    fn available_core_index_plans_install_and_offers_extras() {
+    fn available_core_index_plans_install_and_places_available_extras() {
         let mut source =
             ReleaseArtifactSource::from_index(index_with_core_linux(), AlphaTarget::LinuxX64);
         assert_eq!(
@@ -2287,6 +2404,7 @@ mod tests {
         let mut observed = super::super::model::SetupObserved::unconfigured_current_host();
         observed.platform =
             super::super::model::PlatformObservation::Supported(AlphaTarget::LinuxX64);
+        observed.detections.clear();
         observed
             .releases
             .insert(Component::Core, ReleaseAvailability::Available);
@@ -2305,7 +2423,9 @@ mod tests {
         )));
         assert!(plan.operations.iter().any(|operation| matches!(
             operation,
-            super::super::model::SetupOperation::OfferOptionalComponents { .. }
+            super::super::model::SetupOperation::InstallComponent {
+                component: Component::Aft
+            }
         )));
     }
 
@@ -2330,21 +2450,29 @@ mod tests {
 
     fn setup_plan_from_source(
         source: &mut ReleaseArtifactSource,
+        picks: Vec<Component>,
     ) -> super::super::planner::SetupPlan {
         use super::super::model::{PlatformObservation, SetupObserved, SetupRequest};
 
         let mut observed = SetupObserved::unconfigured_current_host();
         observed.platform = PlatformObservation::Supported(source.target);
+        observed.detections.clear();
+        if matches!(
+            source.target,
+            AlphaTarget::WindowsX64 | AlphaTarget::WindowsArm64
+        ) {
+            observed.components.insert(
+                Component::Core,
+                super::super::model::ComponentState::Correct,
+            );
+        }
         for component in Component::ALL {
             let availability = source
                 .release_availability(component)
                 .unwrap_or_else(|reason| ReleaseAvailability::Unresolvable { reason });
             observed.releases.insert(component, availability);
         }
-        super::super::planner::plan_setup(
-            &observed,
-            &SetupRequest::install(Component::ALL.to_vec()),
-        )
+        super::super::planner::plan_setup(&observed, &SetupRequest::install(picks))
     }
 
     #[test]
@@ -2354,7 +2482,7 @@ mod tests {
         let mut index = index_with_all_components_linux();
         index.components.remove("mc");
         let mut source = ReleaseArtifactSource::from_index(index, AlphaTarget::LinuxX64);
-        let plan = setup_plan_from_source(&mut source);
+        let plan = setup_plan_from_source(&mut source, Component::ALL.to_vec());
         let note = "Magic Context's module (ck-mc) isn't published for public installs yet. Magic Context runs fully inside its OpenCode and Pi plugin, so you don't need the module. Install the plugin with:\n  OpenCode:    npx @cortexkit/magic-context@latest setup\n  Pi:          npx @cortexkit/magic-context@latest setup --harness pi\n  Oh My Pi:    npx @cortexkit/magic-context@latest setup --harness omp\nThe module will install through `ck setup mc` once a release is published.";
 
         let outcome = PlanOutcome::DeclaredUnavailable {
@@ -2387,7 +2515,7 @@ mod tests {
             index_with_all_components_linux(),
             AlphaTarget::LinuxX64,
         );
-        let plan = setup_plan_from_source(&mut source);
+        let plan = setup_plan_from_source(&mut source, Component::ALL.to_vec());
 
         assert!(plan.is_authorized());
         assert!(plan.operations.contains(&SetupOperation::InstallComponent {
@@ -2410,7 +2538,7 @@ mod tests {
             let mut index = index_with_all_components_linux();
             index.components.remove("mc");
             let mut source = ReleaseArtifactSource::from_index(index, target);
-            let plan = setup_plan_from_source(&mut source);
+            let plan = setup_plan_from_source(&mut source, vec![Component::Mc]);
 
             assert!(plan.outcomes.contains(&PlanOutcome::DeclaredUnavailable {
                 component: Component::Mc,
@@ -2420,7 +2548,7 @@ mod tests {
     }
 
     #[test]
-    fn setup_index_load_failure_keeps_mc_unresolvable() {
+    fn setup_index_load_failure_blocks_core_without_installing_siblings() {
         use super::super::model::{PlanOutcome, SetupOperation};
 
         for refusal in [
@@ -2439,12 +2567,13 @@ mod tests {
             );
             source.index = Some(Err(refusal));
             let reason = source.ensure_index().expect_err("index must fail to load");
-            let plan = setup_plan_from_source(&mut source);
+            let plan = setup_plan_from_source(&mut source, Component::ALL.to_vec());
 
             assert!(plan.outcomes.contains(&PlanOutcome::ReleaseUnresolvable {
-                component: Component::Mc,
+                component: Component::Core,
                 reason,
             }));
+            assert!(!plan.is_authorized());
             assert!(!plan
                 .operations
                 .iter()
@@ -2454,5 +2583,189 @@ mod tests {
                 .iter()
                 .any(|outcome| matches!(outcome, PlanOutcome::DeclaredUnavailable { .. })));
         }
+    }
+    #[test]
+    fn setup_component_needs_are_known_and_topological() {
+        assert_eq!(component_needs(Component::Core), []);
+        assert!(Component::ALL.windows(2).all(|pair| pair[0] < pair[1]));
+        for (index, component) in Component::ALL.into_iter().enumerate() {
+            for need in component_needs(component) {
+                assert!(
+                    Component::ALL[..index].contains(need),
+                    "{component} needs {need}, which does not precede it"
+                );
+            }
+        }
+        // Every edge goes strictly earlier in the finite order, so none can
+        // return to its starting component.
+        assert_eq!(
+            needs_closure([Component::Cerebellum])
+                .into_iter()
+                .collect::<Vec<_>>(),
+            [
+                Component::Core,
+                Component::Claustrum,
+                Component::Cingulate,
+                Component::Entorhinal,
+                Component::Cerebellum,
+            ]
+        );
+    }
+
+    #[test]
+    fn setup_new_component_ids_and_repos_match_the_release_worker() {
+        let worker = include_str!("../../../../infra/cortexkit-io-worker/src/components.ts");
+        let components = worker
+            .split_once("export const COMPONENTS: readonly ComponentSpec[] = [")
+            .unwrap()
+            .1
+            .split_once("];")
+            .unwrap()
+            .0;
+        for component in Component::ALL
+            .into_iter()
+            .filter(|component| component.plain_name().is_some())
+        {
+            let id = component.label();
+            let row = format!("{{ id: \"{id}\", repository: \"cortexkit/{id}\",");
+            assert!(
+                components.lines().any(|line| line.trim().starts_with(&row)),
+                "components.ts is missing the {id} → cortexkit/{id} release row"
+            );
+        }
+    }
+
+    fn darwin_cerebellum_index() -> ReleaseIndex {
+        let mut index = index_with_core_linux();
+        let mut entry = index.components["core"].clone();
+        entry.assets.insert(
+            "darwin-arm64".into(),
+            [
+                ("ck-cerebellum".into(), asset(Some("0.16.0"))),
+                ("ck-cerebellum-native-host".into(), asset(None)),
+            ]
+            .into(),
+        );
+        index.components.insert("cerebellum".into(), entry);
+        index
+    }
+
+    #[test]
+    fn setup_darwin_cerebellum_requires_the_extension_as_a_non_program_asset() {
+        let mut source =
+            ReleaseArtifactSource::from_index(darwin_cerebellum_index(), AlphaTarget::DarwinArm64);
+        assert!(
+            matches!(source.release_availability(Component::Cerebellum).unwrap(),
+            ReleaseAvailability::NotYetPublished { missing_asset, .. } if missing_asset == "ck-cerebellum-extension-darwin-arm64.zip")
+        );
+        assert_eq!(
+            component_binaries_for_target(Component::Cerebellum, AlphaTarget::DarwinArm64),
+            ["ck-cerebellum", "ck-cerebellum-native-host"]
+        );
+    }
+
+    #[test]
+    fn setup_partial_cerebellum_uses_the_owned_program_archive_digest() {
+        let root = fixture_dir("setup-partial-cerebellum");
+        let program = root.join(platform_binary("ck-cerebellum"));
+        fs::write(&program, b"module").unwrap();
+        let mut inventory =
+            Inventory::load(root.join("installer-manifest.json"), "darwin-arm64").unwrap();
+        let index = darwin_cerebellum_index();
+        let digest = &index.components["cerebellum"].assets["darwin-arm64"]["ck-cerebellum"].sha256;
+        let observe = |inventory: &Inventory| {
+            partial_install(
+                Component::Cerebellum,
+                &root,
+                inventory,
+                &index,
+                AlphaTarget::DarwinArm64,
+            )
+        };
+        assert_eq!(observe(&inventory), None);
+        for (archive_sha256, same_release) in [("0".repeat(64), false), (digest.clone(), true)] {
+            inventory.remove_owned_path("binary-placement", &program);
+            inventory.record(
+                "binary-placement",
+                &program,
+                [("archive_sha256".into(), Value::String(archive_sha256))]
+                    .into_iter()
+                    .collect(),
+            );
+            inventory.save().unwrap();
+            let reloaded =
+                Inventory::load(root.join("installer-manifest.json"), "darwin-arm64").unwrap();
+            assert_eq!(
+                observe(&reloaded),
+                Some((vec!["ck-cerebellum-native-host"], same_release))
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_native_host_uses_digest_only_and_is_never_probed() {
+        let root = fixture_dir("setup-unowned-native-host");
+        let path = root.join("ck-cerebellum-native-host");
+        let marker = root.join("was-executed");
+        crate::setup::test_exec::write_executable(
+            &path,
+            format!(
+                "#!/bin/sh\ntouch '{}'\necho 'native-host 0.16.0'\n",
+                marker.display()
+            )
+            .as_bytes(),
+        );
+        let index = darwin_cerebellum_index();
+        let inventory =
+            Inventory::load(root.join("installer-manifest.json"), "darwin-arm64").unwrap();
+        let findings = observe_unowned_binaries(
+            Component::Cerebellum,
+            &root,
+            &inventory,
+            &index,
+            AlphaTarget::DarwinArm64,
+        );
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].path, path);
+        assert_eq!(findings[0].version, None);
+        let mut source = ReleaseArtifactSource::from_index(index, AlphaTarget::DarwinArm64);
+        let acceptance = source
+            .acceptance(Component::Cerebellum, "ck-cerebellum-native-host")
+            .unwrap();
+        assert_eq!(acceptance, Acceptance::DigestOnly);
+        verify_acceptance(&path, &acceptance).unwrap();
+        assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recording_setup_native_host_placement_never_probes_its_version() {
+        let root = fixture_dir("setup-placed-native-host");
+        let path = root.join(NATIVE_HOST);
+        let marker = root.join(format!("{NATIVE_HOST}.was-run"));
+        crate::setup::test_exec::write_executable(
+            &path,
+            b"#!/bin/sh\ntouch \"$0.was-run\"\necho 'native host 1.0.0'\n",
+        );
+        let mut inventory =
+            Inventory::load(root.join("installer-manifest.json"), "darwin-arm64").unwrap();
+        record_placement(
+            Component::Cerebellum,
+            &path,
+            PlacementDigests {
+                binary_sha256: digest_file(&path).unwrap(),
+                archive_sha256: "12".repeat(32),
+            },
+            &mut inventory,
+        )
+        .unwrap();
+        assert!(
+            !marker.exists(),
+            "recording inventory must not execute the native host"
+        );
+        let row = inventory.entry_for_path("managed-binary", &path).unwrap();
+        assert!(row.get("version").is_none());
+        assert_eq!(row["archive_sha256"], "12".repeat(32));
     }
 }

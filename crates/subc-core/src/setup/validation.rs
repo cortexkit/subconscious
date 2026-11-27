@@ -62,6 +62,7 @@ const SETTLE_PAUSE: Duration = Duration::from_millis(500);
 pub fn validate_selected<V: Validator>(
     validator: &mut V,
     selected: &[Component],
+    fusiform_is_starting: bool,
 ) -> Result<(), String> {
     require_settled(
         validator,
@@ -70,23 +71,26 @@ pub fn validate_selected<V: Validator>(
         DAEMON_SETTLE_DEADLINE,
     )?;
     for component in selected {
-        let args = match component {
-            Component::Core => vec!["health".to_string()],
-            Component::Aft => vec!["health".to_string(), "aft".to_string()],
-            Component::Mc => vec!["health".to_string(), "magic-context".to_string()],
-            Component::Insula => vec!["health".to_string(), "insula".to_string()],
-            Component::Claustrum => vec!["health".to_string(), "claustrum".to_string()],
-            Component::Synapse => vec!["health".to_string(), "synapse".to_string()],
-        };
-        // Core's `ck health` reads the daemon, already settled above; a
-        // module's probe settles on its own registration.
-        let deadline = match component {
-            Component::Core => Duration::ZERO,
-            _ => MODULE_SETTLE_DEADLINE,
-        };
-        require_settled(validator, "ck", &args, deadline)?;
+        let mut args = vec!["health".to_string()];
+        args.extend(component.module_id().map(str::to_string));
+        require_settled(
+            validator,
+            "ck",
+            &args,
+            health_deadline(*component, fusiform_is_starting),
+        )?;
     }
     Ok(())
+}
+
+fn health_deadline(component: Component, fusiform_is_starting: bool) -> Duration {
+    match component {
+        // Core's probe reads the daemon, which `ck daemon triage` already waited for.
+        Component::Core => Duration::ZERO,
+        // The first registration waits for the model catalog fetch.
+        Component::Fusiform if fusiform_is_starting => Duration::from_secs(120),
+        _ => MODULE_SETTLE_DEADLINE,
+    }
 }
 
 pub const MCP_HARNESS_NEXT: &str = "next: connect your agent — Claude Code: claude mcp add ck -- ck subc-mcp shim --harness claude-code\n      other harnesses: https://github.com/cortexkit/subconscious#readme";
@@ -148,7 +152,7 @@ mod tests {
     #[test]
     fn validation_uses_triage_and_health_and_never_fleet_lint() {
         let mut validator = RecordingValidator::default();
-        validate_selected(&mut validator, &[Component::Core, Component::Aft])
+        validate_selected(&mut validator, &[Component::Core, Component::Aft], false)
             .expect("healthy fixture");
         assert_eq!(validator.calls[0], ["daemon", "triage"]);
         assert!(validator
@@ -207,7 +211,7 @@ mod tests {
             triage_probes: 0,
             pauses: 0,
         };
-        validate_selected(&mut daemon, &[Component::Core]).expect("settles");
+        validate_selected(&mut daemon, &[Component::Core], false).expect("settles");
         assert_eq!(daemon.triage_probes, 4);
         assert_eq!(
             daemon.pauses, 3,
@@ -260,7 +264,7 @@ mod tests {
             core_probes: 0,
             pauses: 0,
         };
-        validate_selected(&mut module, &[Component::Core, Component::Aft]).expect("settles");
+        validate_selected(&mut module, &[Component::Core, Component::Aft], false).expect("settles");
         assert_eq!(module.module_probes, 3, "probed until aft registered");
         assert_eq!(module.core_probes, 1, "core reads the settled daemon once");
         assert_eq!(
@@ -302,5 +306,74 @@ mod tests {
         assert!(error.contains("validation failed after 0s"), "{error}");
         assert_eq!(daemon.triage_probes, 1);
         assert_eq!(daemon.pauses, 0);
+    }
+    #[test]
+    fn bare_setup_validates_only_the_successful_roster() {
+        use crate::setup::{
+            plan_setup, AlphaTarget, PlanOutcome, PlatformObservation, SetupObserved, SetupRequest,
+        };
+        for omit_broca in [false, true] {
+            let mut observed = SetupObserved::unconfigured_current_host();
+            observed.platform = PlatformObservation::Supported(AlphaTarget::LinuxX64);
+            observed.detections.clear();
+            observed.releases.insert(
+                Component::Mc,
+                super::super::model::ReleaseAvailability::DeclaredUnavailable {
+                    message: "unpublished".into(),
+                },
+            );
+            if omit_broca {
+                observed
+                    .configuration_refusals
+                    .insert(Component::Broca, "conflicts at modules.broca".into());
+            }
+            let plan = plan_setup(&observed, &SetupRequest::install(vec![]));
+            assert!(plan.is_authorized());
+            assert_eq!(
+                plan.outcomes
+                    .iter()
+                    .filter(|outcome| matches!(outcome, PlanOutcome::LeftOut { .. }))
+                    .count(),
+                if omit_broca { 2 } else { 1 }
+            );
+            let mut validator = RecordingValidator::default();
+            validate_selected(&mut validator, &plan.validation, true).unwrap();
+            let mut expected = vec![vec!["daemon", "triage"], vec!["health"]];
+            expected.extend(
+                [
+                    "aft",
+                    "insula",
+                    "claustrum",
+                    "synapse",
+                    "fusiform",
+                    "cingulate",
+                    "entorhinal",
+                    "astrocyte",
+                    "striatum",
+                ]
+                .map(|id| vec!["health", id]),
+            );
+            if !omit_broca {
+                expected.push(vec!["health", "broca"]);
+            }
+            expected.push(vec!["health", "cerebellum"]);
+            assert_eq!(validator.calls, expected);
+        }
+    }
+
+    #[test]
+    fn fusiform_gets_two_minutes_only_when_started_by_setup() {
+        assert_eq!(
+            health_deadline(Component::Fusiform, true),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            health_deadline(Component::Fusiform, false),
+            MODULE_SETTLE_DEADLINE
+        );
+        assert_eq!(
+            health_deadline(Component::Striatum, true),
+            MODULE_SETTLE_DEADLINE
+        );
     }
 }

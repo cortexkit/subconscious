@@ -50,7 +50,7 @@ function testEnv(): Env {
 interface ReleaseFixture {
   repository: string;
   tag: string;
-  binary: string;
+  zips: string[];
   manifest?: unknown;
   createdAt?: string;
 }
@@ -60,13 +60,15 @@ async function rebuildFixtures(fixtures: ReleaseFixture[]) {
   const blobs: Record<string, string> = {};
   const repos: Record<string, GitHubRelease[]> = {};
   for (const fixture of fixtures) {
-    const zipName = `${fixture.binary}-linux-x64.zip`;
-    const assets = [
-      zipAsset(fixture.repository, fixture.tag, zipName, 0),
-      zipAsset(fixture.repository, fixture.tag, `${zipName}.sha256`, 80),
-    ];
-    blobs[downloadUrl(fixture.repository, fixture.tag, zipName)] = "";
-    blobs[downloadUrl(fixture.repository, fixture.tag, `${zipName}.sha256`)] = `${EMPTY_SHA256}  ${zipName}\n`;
+    const assets = fixture.zips.flatMap((zipName) => {
+      const sidecarName = `${zipName}.sha256`;
+      blobs[downloadUrl(fixture.repository, fixture.tag, zipName)] = "";
+      blobs[downloadUrl(fixture.repository, fixture.tag, sidecarName)] = `${EMPTY_SHA256}  ${zipName}\n`;
+      return [
+        zipAsset(fixture.repository, fixture.tag, zipName, 0),
+        zipAsset(fixture.repository, fixture.tag, sidecarName, 80),
+      ];
+    });
     if (fixture.manifest !== undefined) {
       assets.push(zipAsset(fixture.repository, fixture.tag, "release-manifest.json", 80));
       blobs[downloadUrl(fixture.repository, fixture.tag, "release-manifest.json")] = JSON.stringify(
@@ -285,6 +287,57 @@ describe("rebuild", () => {
     expect(await e.RELEASE_INDEX.get("index.json.sig")).toBeNull();
   });
 
+  it("indexes the new components' assets with platform-specific version reports", async () => {
+    const tag = "v1.2.3";
+    const programsByComponent = {
+      fusiform: ["ck-fusiform", "ck-models"],
+      astrocyte: ["ck-astrocyte"],
+      striatum: ["ck-striatum"],
+      broca: ["ck-broca", "broca-session"],
+      cingulate: ["ck-cingulate"],
+      entorhinal: ["ck-entorhinal"],
+      cerebellum: ["ck-cerebellum"],
+    };
+    const platforms = ["darwin-arm64", "linux-x64"];
+    const { doc, refusals } = await rebuildFixtures(
+      Object.entries(programsByComponent).map(([id, programs]) => {
+        const zips = platforms.flatMap((platform) => programs.map((program) => `${program}-${platform}.zip`));
+        const fixture: ReleaseFixture = { repository: `cortexkit/${id}`, tag, zips };
+        if (id === "cerebellum") {
+          zips.push("ck-cerebellum-native-host-darwin-arm64.zip", "ck-cerebellum-extension-darwin-arm64.zip");
+          fixture.manifest = {
+            binaries: {
+              "ck-cerebellum-native-host": { reports: "9.9.9" },
+              "ck-cerebellum-extension": { reports: "9.9.9" },
+            },
+          };
+        }
+        return fixture;
+      }),
+    );
+
+    expect(refusals).toEqual([]);
+    for (const [id, programs] of Object.entries(programsByComponent)) {
+      const component = doc.components[id];
+      expect(component.repository).toBe(`cortexkit/${id}`);
+      expect(component.release).toBe(tag);
+      expect(component.version).toBe("1.2.3");
+      for (const platform of platforms) {
+        const expectedReports: Record<string, string | null> = Object.fromEntries(
+          programs.map((program) => [program, "1.2.3"]),
+        );
+        if (id === "cerebellum" && platform === "darwin-arm64") {
+          expectedReports["ck-cerebellum-native-host"] = null;
+          expectedReports["ck-cerebellum-extension"] = null;
+        }
+        const reports = Object.fromEntries(
+          Object.entries(component.assets[platform]).map(([name, asset]) => [name, asset.reports]),
+        );
+        expect(reports, `${id}/${platform}`).toEqual(expectedReports);
+      }
+    }
+  });
+
   it("skips a withheld-only release, omits the previous component, and logs once per rebuild", async () => {
     const tag = PREVIOUS_MC.release;
     await testEnv().RELEASE_INDEX.put(KV_BUNDLE, canonicalize({
@@ -297,7 +350,7 @@ describe("rebuild", () => {
       sig: "placeholder-previous",
     }));
     const log = vi.spyOn(console, "info").mockImplementation(() => {});
-    const fixture = { repository: "cortexkit/magic-context", tag, binary: "ck-mc" };
+    const fixture = { repository: "cortexkit/magic-context", tag, zips: ["ck-mc-linux-x64.zip"] };
 
     for (let count = 1; count <= 2; count++) {
       const { doc, refusals } = await rebuildFixtures([fixture, fixture]);
@@ -329,11 +382,11 @@ describe("rebuild", () => {
     }));
     const log = vi.spyOn(console, "info").mockImplementation(() => {});
     const { doc, refusals } = await rebuildFixtures([
-      { repository: "cortexkit/magic-context", tag: PREVIOUS_MC.release, binary: "ck-mc" },
+      { repository: "cortexkit/magic-context", tag: PREVIOUS_MC.release, zips: ["ck-mc-linux-x64.zip"] },
       {
         repository: "cortexkit/magic-context",
         tag: "ck-mc-alpha.33445566",
-        binary: "ck-mc",
+        zips: ["ck-mc-linux-x64.zip"],
         createdAt: "2026-09-02T00:00:00Z",
         manifest: { requires_core: "v0.17.20" },
       },
@@ -360,13 +413,13 @@ describe("rebuild", () => {
       {
         repository: "cortexkit/magic-context",
         tag: "ck-mc-alpha.22464bf2",
-        binary: "ck-mc",
+        zips: ["ck-mc-linux-x64.zip"],
         createdAt: "2026-09-01T00:00:00Z",
       },
       {
         repository: "cortexkit/magic-context",
         tag: "ck-mc-alpha.33445566",
-        binary: "ck-mc",
+        zips: ["ck-mc-linux-x64.zip"],
         createdAt,
       },
     ]);
@@ -380,11 +433,11 @@ describe("rebuild", () => {
   it("keeps the canonical index bytes unchanged for components without withheld releases", async () => {
     vi.spyOn(Date, "now").mockReturnValue(1_800_000_000_000);
     const { body } = await rebuildFixtures([
-      { repository: "cortexkit/subconscious", tag: "subc-core-v1.0.0", binary: "ck" },
-      { repository: "cortexkit/aft", tag: "v1.0.0", binary: "ck-aft" },
-      { repository: "cortexkit/insula", tag: "v1.0.0", binary: "ck-insula" },
-      { repository: "cortexkit/claustrum", tag: "v1.0.0", binary: "ck-claustrum" },
-      { repository: "cortexkit/synapse", tag: "v1.0.0", binary: "ck-synapse" },
+      { repository: "cortexkit/subconscious", tag: "subc-core-v1.0.0", zips: ["ck-linux-x64.zip"] },
+      { repository: "cortexkit/aft", tag: "v1.0.0", zips: ["ck-aft-linux-x64.zip"] },
+      { repository: "cortexkit/insula", tag: "v1.0.0", zips: ["ck-insula-linux-x64.zip"] },
+      { repository: "cortexkit/claustrum", tag: "v1.0.0", zips: ["ck-claustrum-linux-x64.zip"] },
+      { repository: "cortexkit/synapse", tag: "v1.0.0", zips: ["ck-synapse-linux-x64.zip"] },
     ]);
 
     expect(body).toBe(
@@ -403,13 +456,13 @@ describe("rebuild", () => {
       {
         repository: "cortexkit/aft",
         tag: "v1.0.0",
-        binary: "ck-aft",
+        zips: ["ck-aft-linux-x64.zip"],
         manifest: { requires_core: "0.17.20" },
       },
       {
         repository: "cortexkit/synapse",
         tag: "v1.0.0",
-        binary: "ck-synapse",
+        zips: ["ck-synapse-linux-x64.zip"],
       },
     ]);
 
@@ -423,7 +476,7 @@ describe("rebuild", () => {
       {
         repository: "cortexkit/aft",
         tag: "v1.0.0",
-        binary: "ck-aft",
+        zips: ["ck-aft-linux-x64.zip"],
         manifest: { requires_core: "v0.17.20" },
       },
     ]);

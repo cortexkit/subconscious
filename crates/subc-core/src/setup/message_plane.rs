@@ -208,6 +208,7 @@ mod tests {
                 );
                 Ok(super::super::runtime::CommandResult {
                     success: true,
+                    exit_code: Some(0),
                     stdout: json!({"module":{"live":self.0}}).to_string(),
                     stderr: String::new(),
                 })

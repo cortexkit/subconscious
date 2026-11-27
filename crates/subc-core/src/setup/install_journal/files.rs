@@ -9,6 +9,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 const MARKER: &str = "transaction";
+const CREATE_ONLY_SUFFIX: &str = "-create-only";
 
 #[derive(Clone, Copy)]
 pub(in crate::setup) enum Kind {
@@ -37,6 +38,100 @@ pub(in crate::setup) fn place(
     #[cfg(feature = "test-support")]
     super::crash_hook("file-act");
     journal.done(index)
+}
+
+pub(super) fn create_only(
+    journal: &mut Journal,
+    target: &Path,
+    bytes: &[u8],
+    mode: u32,
+) -> Result<bool, String> {
+    create_only_with(journal, target, bytes, mode, || ())
+}
+
+fn create_only_with(
+    journal: &mut Journal,
+    target: &Path,
+    bytes: &[u8],
+    mode: u32,
+    before_link: impl FnOnce(),
+) -> Result<bool, String> {
+    if metadata(target)?.is_some() {
+        return Ok(false);
+    }
+    let parent = target
+        .parent()
+        .ok_or_else(|| refusal(target, "file has no parent directory"))?;
+    let stage = parent.join(format!(
+        ".ck-install-{}-{}{}",
+        journal.id(),
+        journal.next_index(),
+        CREATE_ONLY_SUFFIX
+    ));
+    let witness = stage.join("next");
+    let index = journal.prepare(Step {
+        target: target.to_owned(),
+        action: Action::File(FileStep {
+            before: None,
+            after: Some(format!("{:x}", Sha256::digest(bytes))),
+            previous: None,
+            staged: Some(witness.clone()),
+            staging_directory: stage.clone(),
+        }),
+    })?;
+    super::super::file_modes::ensure_private_parents(parent)?;
+    create_stage(journal.id(), &stage)?;
+    create_bytes(&witness, bytes, mode)?;
+    sync_parent(&witness)?;
+    before_link();
+    let created = match fs::hard_link(&witness, target) {
+        Ok(()) => {
+            sync_parent(target)?;
+            true
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
+        Err(error) => return Err(refusal(target, error)),
+    };
+    journal.done(index)?;
+    Ok(created)
+}
+
+// The staging name distinguishes this create-only use of the File action.
+// The staged copy (`<stage>/next`, a hard link to the published file) stays
+// after publication so undo can compare file identities and tell our link
+// from a file the operator created independently, even when the bytes match.
+fn is_create_only(step: &Step, file: &FileStep) -> bool {
+    matches!(step.action, Action::File(_))
+        && file.before.is_none()
+        && file
+            .staging_directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(CREATE_ONLY_SUFFIX))
+}
+
+fn restore_create_only(id: &str, step: &Step, file: &FileStep) -> Result<(), String> {
+    let target = &step.target;
+    if !metadata(target)?.is_some_and(|info| info.is_file() && !is_reparse_point(&info))
+        || !owned_stage(id, &file.staging_directory)?
+    {
+        return Ok(());
+    }
+    let Some(witness) = &file.staged else {
+        return Ok(());
+    };
+    if digest(witness)? != file.after {
+        return Ok(());
+    }
+    let identity = |path: &Path| {
+        let fd = subc_os::open_regular_nofollow(path).map_err(|error| refusal(path, error))?;
+        subc_os::retained_file_identity(&fd).map_err(|error| refusal(path, error))
+    };
+    if identity(witness)? == identity(target)? {
+        fs::remove_file(target).map_err(|error| refusal(target, error))?;
+        sync_parent(target)?;
+    }
+    Ok(())
 }
 
 pub(super) fn prepare(
@@ -240,6 +335,11 @@ fn remove_partial(path: &Path) -> Result<(), String> {
 
 pub(in crate::setup) fn verify(step: &Step) -> Result<bool, String> {
     let file = step.action.file().expect("verified a file step");
+    if is_create_only(step, file) {
+        // A concurrent writer winning publication is successful too. Never
+        // inspect or try to replay that writer's destination at commit.
+        return Ok(true);
+    }
     if digest(&step.target)? != file.after {
         return Ok(false);
     }
@@ -277,6 +377,9 @@ pub(in crate::setup) fn replay(id: &str, step: &Step) -> Result<(), String> {
 
 pub(in crate::setup) fn restore(id: &str, step: &Step) -> Result<(), String> {
     let file = step.action.file().expect("restored a file step");
+    if is_create_only(step, file) {
+        return restore_create_only(id, step, file);
+    }
     let target = &step.target;
     let actual = digest(target)?;
     if actual == file.before {
@@ -634,4 +737,60 @@ fn replace(source: &Path, target: &Path) -> Result<(), String> {
 
 fn refusal(path: &Path, detail: impl std::fmt::Display) -> String {
     format!("refusal: install journal file {}: {detail}", path.display())
+}
+
+#[cfg(test)]
+mod create_only_tests {
+    use super::*;
+    use crate::setup::install_journal::bootstrap::FileRecovery;
+    use cortexkit_test_support::ScratchDir;
+
+    #[test]
+    fn module_settings_race_keeps_equal_bytes_and_unrelated_siblings_after_recovery() {
+        let root = ScratchDir::new("ck-settings-race");
+        let manifest = root.join("inventory.json");
+        let file = root.join("broca.jsonc");
+        let sibling = root.join("operator.tmp");
+        fs::write(&sibling, "keep").unwrap();
+        let mut journal = Journal::create(&manifest).unwrap();
+        assert!(!create_only_with(&mut journal, &file, b"equal", 0o600, || {
+            fs::write(&file, b"equal").unwrap();
+        })
+        .unwrap());
+        drop(journal);
+        assert_eq!(
+            Journal::open(&manifest)
+                .unwrap()
+                .unwrap()
+                .recover(&mut FileRecovery)
+                .unwrap(),
+            super::super::Outcome::Undone
+        );
+        assert_eq!(fs::read(&file).unwrap(), b"equal");
+        assert_eq!(fs::read(&sibling).unwrap(), b"keep");
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn module_settings_race_keeps_dangling_link_after_recovery() {
+        let root = ScratchDir::new("ck-settings-dangling");
+        let manifest = root.join("inventory.json");
+        let file = root.join("fusiform.jsonc");
+        let mut journal = Journal::create(&manifest).unwrap();
+        assert!(
+            !create_only_with(&mut journal, &file, b"settings", 0o600, || {
+                std::os::unix::fs::symlink("absent", &file).unwrap();
+            })
+            .unwrap()
+        );
+        drop(journal);
+        Journal::open(&manifest)
+            .unwrap()
+            .unwrap()
+            .recover(&mut FileRecovery)
+            .unwrap();
+        assert_eq!(fs::read_link(&file).unwrap(), Path::new("absent"));
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+    }
 }

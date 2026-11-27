@@ -133,6 +133,7 @@ impl CommandRunner for FakeRunner<'_> {
         let success = |stdout: String| {
             Ok(CommandResult {
                 success: true,
+                exit_code: Some(0),
                 stdout,
                 stderr: String::new(),
             })
@@ -140,6 +141,7 @@ impl CommandRunner for FakeRunner<'_> {
         let failure = |stderr: &str| {
             Ok(CommandResult {
                 success: false,
+                exit_code: Some(1),
                 stdout: String::new(),
                 stderr: stderr.into(),
             })
@@ -147,6 +149,7 @@ impl CommandRunner for FakeRunner<'_> {
         let negative = |stdout: &str| {
             Ok(CommandResult {
                 success: false,
+                exit_code: Some(1),
                 stdout: stdout.into(),
                 stderr: String::new(),
             })

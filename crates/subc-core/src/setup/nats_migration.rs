@@ -259,6 +259,7 @@ mod tests {
             };
             Ok(CommandResult {
                 success: true,
+                exit_code: Some(0),
                 stdout: value.to_string(),
                 stderr: String::new(),
             })

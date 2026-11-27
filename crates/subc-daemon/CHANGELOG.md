@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.54.1
+
+- Expose the daemon's default data-home resolver so setup can check the same
+  Fusiform store location that the daemon describes to the module.
+
 ## 0.54.0
 
 - Add the restart-required `flow_scope_authority_owners` config list with narrow,

@@ -951,6 +951,7 @@ pub struct UpgradeObserved {
     pub available_core_version: Option<String>,
     /// Installed ck-subc release, read from the managed binary before planning.
     pub installed_core_version: Option<String>,
+    pub(super) registration_channels_to_add: BTreeSet<UpgradeTarget>,
     pub supervised_modules: BTreeSet<String>,
     pub daemon_unreachable_reason: Option<String>,
 }
@@ -971,6 +972,7 @@ impl UpgradeObserved {
             requires_core: BTreeMap::new(),
             available_core_version: None,
             installed_core_version: None,
+            registration_channels_to_add: BTreeSet::new(),
             supervised_modules: BTreeSet::new(),
             daemon_unreachable_reason: None,
         }
@@ -1001,6 +1003,7 @@ impl UpgradeObserved {
 pub enum UpgradeOperation {
     ObservePlatform,
     ConfigureMessageHub { target: UpgradeTarget },
+    AddRegistrationChannel { target: UpgradeTarget },
     GrantMessageKeys { target: UpgradeTarget },
     DownloadAndVerify { target: UpgradeTarget },
     CreateRollbackCopy { target: UpgradeTarget },
@@ -1024,6 +1027,11 @@ impl fmt::Display for UpgradeOperation {
         match self {
             Self::ObservePlatform => formatter.write_str("observe alpha platform support"),
             Self::ConfigureMessageHub { .. } => formatter.write_str(super::message_plane::HUB_STEP),
+            Self::AddRegistrationChannel { target } => write!(
+                formatter,
+                "add modules.{}.registration_channel: true",
+                target.module_id().unwrap_or(target.label())
+            ),
             Self::GrantMessageKeys { .. } => formatter.write_str(super::message_plane::GRANT_STEP),
             Self::DownloadAndVerify { target } => {
                 write!(

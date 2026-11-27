@@ -848,9 +848,12 @@ pub fn plan_upgrade(observed: &UpgradeObserved) -> UpgradePlan {
             UpgradeState::NotInstalled => plan.outcomes.push(PlanOutcome::Noop {
                 scope: format!("{target} is not installed"),
             }),
-            UpgradeState::Current => plan.outcomes.push(PlanOutcome::Noop {
-                scope: format!("{target} is already current"),
-            }),
+            UpgradeState::Current => {
+                append_registration_channel(&mut plan, target, observed);
+                plan.outcomes.push(PlanOutcome::Noop {
+                    scope: format!("{target} is already current"),
+                });
+            }
             UpgradeState::UpdateAvailable { from, to, reason } => {
                 let release = observed.release(target);
                 if release == ReleaseAvailability::Available {
@@ -859,6 +862,7 @@ pub fn plan_upgrade(observed: &UpgradeObserved) -> UpgradePlan {
                             component: target.component,
                             reason,
                         });
+                        append_registration_channel(&mut plan, target, observed);
                         continue;
                     }
                 }
@@ -913,12 +917,14 @@ pub fn plan_upgrade(observed: &UpgradeObserved) -> UpgradePlan {
                             });
                         } else {
                             plan_upgrade_target(&mut plan, target, observed);
+                            continue;
                         }
                     }
                     ReleaseAvailability::NotRequired => plan.outcomes.push(PlanOutcome::Refusal {
                         reason: format!("{target} has no alpha release archive"),
                     }),
                 }
+                append_registration_channel(&mut plan, target, observed);
             }
         }
     }
@@ -997,6 +1003,7 @@ fn plan_upgrade_target(plan: &mut UpgradePlan, target: UpgradeTarget, observed: 
         UpgradeOperation::ReplaceDestination { target },
         UpgradeOperation::WarmExecute { target },
     ]);
+    append_registration_channel(plan, target, observed);
     if target.module_id().is_some() {
         if observed.is_module_supervised(target) {
             plan.operations
@@ -1015,6 +1022,17 @@ fn plan_upgrade_target(plan: &mut UpgradePlan, target: UpgradeTarget, observed: 
     }
     plan.operations
         .push(UpgradeOperation::PostVerify { target });
+}
+
+fn append_registration_channel(
+    plan: &mut UpgradePlan,
+    target: UpgradeTarget,
+    observed: &UpgradeObserved,
+) {
+    if observed.registration_channels_to_add.contains(&target) {
+        plan.operations
+            .push(UpgradeOperation::AddRegistrationChannel { target });
+    }
 }
 
 #[cfg(test)]
@@ -2600,6 +2618,7 @@ mod tests {
         let mut supervised_modules = std::collections::BTreeSet::new();
         supervised_modules.insert("aft".to_string());
         supervised_modules.insert("subc-mcp".to_string());
+        let aft = upgrade_target("ck-aft");
         let plan = plan_upgrade(&UpgradeObserved {
             platform: PlatformObservation::Supported(AlphaTarget::LinuxX64),
             roster,
@@ -2608,6 +2627,7 @@ mod tests {
             requires_core: BTreeMap::new(),
             available_core_version: None,
             installed_core_version: Some("1.0.0".to_string()),
+            registration_channels_to_add: [aft].into_iter().collect(),
             supervised_modules,
             daemon_unreachable_reason: None,
         });
@@ -2616,9 +2636,20 @@ mod tests {
             .iter()
             .any(|operation| operation.to_string().contains("ck-mc")));
 
-        let aft = upgrade_target("ck-aft");
         let ck = upgrade_target("ck");
         let operations = &plan.operations;
+        let declaration_stage = operations
+            .iter()
+            .position(|op| *op == UpgradeOperation::AddRegistrationChannel { target: aft })
+            .unwrap();
+        assert_eq!(
+            operations[declaration_stage - 1],
+            UpgradeOperation::WarmExecute { target: aft }
+        );
+        assert_eq!(
+            operations[declaration_stage + 1],
+            UpgradeOperation::InitiateModuleRestart { target: aft }
+        );
         let aft_poll = operations
             .iter()
             .position(|operation| {

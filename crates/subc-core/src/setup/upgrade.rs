@@ -49,6 +49,7 @@ pub struct ManagedUpgradeTarget {
     pub installed_version: String,
     /// Archive digest recorded at placement. Currency is undecidable without it.
     pub installed_archive_sha256: Option<String>,
+    pub(super) registration_channel_missing: bool,
 }
 
 impl ManagedUpgradeTarget {
@@ -98,7 +99,23 @@ pub fn discover_current_upgrade_targets(
     daemon_catalog: Option<&DaemonCatalogBuild>,
 ) -> Result<Vec<ManagedUpgradeTarget>, String> {
     let inventory = load_current_inventory()?;
-    discover_managed_upgrade_targets(&inventory, executable, daemon_catalog)
+    let mut targets = discover_managed_upgrade_targets(&inventory, executable, daemon_catalog)?;
+    if targets.iter().any(|item| item.target.module_id().is_some()) {
+        observe_registration_channels(&mut targets, &upgrade_config_path(&inventory));
+    }
+    Ok(targets)
+}
+
+fn observe_registration_channels(targets: &mut [ManagedUpgradeTarget], path: &Path) {
+    // Release checks still work without a readable config. Only propose
+    // declarations for entries observed matching an owned program.
+    if let Ok(Some((_, document))) = super::config::read_registration_config(path) {
+        for item in targets {
+            item.registration_channel_missing = item.target.module_id().is_some_and(|module_id| {
+                super::config::missing_registration_channel(&document, module_id, &item.destination)
+            });
+        }
+    }
 }
 
 /// Recover under the install lock before reading ownership or checking the
@@ -484,6 +501,7 @@ pub fn discover_managed_upgrade_targets(
                             destination,
                             installed_version: String::new(),
                             installed_archive_sha256: None,
+                            registration_channel_missing: false,
                         });
                     }
                 }
@@ -503,6 +521,7 @@ pub fn discover_managed_upgrade_targets(
             destination,
             installed_version,
             installed_archive_sha256,
+            registration_channel_missing: false,
         });
     }
     Ok(targets)
@@ -556,6 +575,11 @@ pub fn observed_upgrade_targets(
         })
         .collect::<BTreeMap<_, _>>();
     let mut observed = observed_from_metadata(metadata, &installed);
+    observed.registration_channels_to_add = discovered
+        .iter()
+        .filter(|item| item.registration_channel_missing)
+        .map(|item| item.target)
+        .collect();
     observed.installed_core_version = discovered
         .iter()
         .find(|item| item.target.is_daemon())
@@ -646,6 +670,14 @@ fn default_upgrade_config_path() -> PathBuf {
     panic!("an upgrade test backend must receive an explicit config path");
     #[cfg(not(test))]
     subc_daemon::daemon_config::default_config_path()
+}
+
+fn upgrade_config_path(inventory: &Inventory) -> PathBuf {
+    inventory
+        .paths_for_kind("configuration")
+        .into_iter()
+        .next()
+        .unwrap_or_else(default_upgrade_config_path)
 }
 
 /// Where [`SystemUpgradeBackend`] sends its own lines: the completion line
@@ -765,11 +797,7 @@ impl SystemUpgradeBackend {
             super::install_lock::WAIT,
         )?;
         tighten_upgrade_permissions(&data_dir, &inventory)?;
-        let config_path = inventory
-            .paths_for_kind("configuration")
-            .into_iter()
-            .next()
-            .unwrap_or_else(default_upgrade_config_path);
+        let config_path = upgrade_config_path(&inventory);
         let mut backend = Self::with_inventory(
             platform,
             executable,
@@ -1195,6 +1223,35 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
         }
     }
 
+    fn add_registration_channel(
+        &mut self,
+        target: UpgradeTarget,
+    ) -> Result<(bool, String), String> {
+        let module_id = target
+            .module_id()
+            .ok_or_else(|| format!("{target} has no module entry"))?;
+        let program = &self.target(target)?.destination;
+        let Some(change) =
+            super::config::plan_registration_channel(&self.config_path, module_id, program)?
+        else {
+            return Ok((
+                false,
+                format!("{module_id}: no missing registration_channel in a matching entry"),
+            ));
+        };
+        let independent = self.inventory.transaction().is_none();
+        if independent {
+            self.inventory.start_transaction()?;
+        }
+        super::config::apply_recorded(&change, &mut self.inventory)?;
+        if independent {
+            self.close_upgrade_journal(true)?;
+        }
+        let detail = format!("Added modules.{module_id}.registration_channel: true");
+        self.lines.completed(detail.clone());
+        Ok((true, detail))
+    }
+
     fn grant_message_keys(&mut self, target: UpgradeTarget) -> Result<(bool, String), String> {
         let auth = self.target(target)?.destination.clone();
         self.lines
@@ -1607,6 +1664,54 @@ pub(super) mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn upgrade_adds_registration_channel_only_when_missing_and_journals_the_edit() {
+        for existing in [None, Some(false), Some(true)] {
+            let root = fixture_dir("upgrade-registration-channel");
+            let target = upgrade_target("ck-broca");
+            let destination = root.join(target.binary);
+            version_binary(&destination, "0.1.0");
+            let mut backend = managed_backend(&root, target, &destination);
+            let mut entry = serde_json::json!({"program": destination});
+            if let Some(existing) = existing {
+                entry["registration_channel"] = Value::Bool(existing);
+            }
+            let before =
+                format!("// keep operator comments\n{{\"modules\": {{\"broca\": {entry}}}}}\n");
+            fs::write(&backend.config_path, &before).unwrap();
+            let workspace = root.join("candidate");
+            fs::create_dir(&workspace).unwrap();
+            let candidate = workspace.join("ck-broca");
+            version_binary(&candidate, "0.2.0");
+            backend.prepared.insert(
+                target.label().into(),
+                PreparedUpgradeAsset::test_candidate(candidate, target),
+            );
+            backend.create_rollback_copy(target).unwrap();
+            backend.replace_destination(target).unwrap();
+            backend.warm_execute(target).unwrap();
+            let (changed, _) = backend.add_registration_channel(target).unwrap();
+            assert_eq!(changed, existing.is_none());
+
+            let after = fs::read_to_string(&backend.config_path).unwrap();
+            if existing.is_some() {
+                assert_eq!(after, before);
+            } else {
+                assert!(after.starts_with("// keep operator comments\n"));
+                let document: Value =
+                    serde_json::from_str(&subc_jsonc::jsonc_to_json(&after).unwrap()).unwrap();
+                assert_eq!(
+                    document["modules"]["broca"]["registration_channel"],
+                    Value::Bool(true)
+                );
+            }
+            backend.close_upgrade_journal(false).unwrap();
+            assert_eq!(fs::read_to_string(&backend.config_path).unwrap(), before);
+            assert_eq!(binary_version(&destination).unwrap(), "0.1.0");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn upgrade_plans_only_owned_new_component_programs_and_names_missing_commands() {
         use crate::setup::model::UpgradeOperation;
         use crate::setup::update_cache::CachedRelease;
@@ -1683,6 +1788,7 @@ pub(super) mod tests {
             destination: executable.clone(),
             installed_version: "1.0.0".into(),
             installed_archive_sha256: None,
+            registration_channel_missing: false,
         }];
         for binary in ["ck-broca", "ck-models", "ck-cerebellum-extension"] {
             fs::write(
@@ -1896,6 +2002,7 @@ pub(super) mod tests {
                     destination: root.join(target.label()),
                     installed_version: "0.1.0".into(),
                     installed_archive_sha256: None,
+                    registration_channel_missing: false,
                 },
             )]
             .into_iter()
@@ -2141,6 +2248,7 @@ pub(super) mod tests {
                     destination: destination.to_path_buf(),
                     installed_version: "0.1.0".into(),
                     installed_archive_sha256: None,
+                    registration_channel_missing: false,
                 },
             )]),
             executable: root.join("ck"),
@@ -2385,6 +2493,7 @@ pub(super) mod tests {
             destination: PathBuf::from("/managed/ck-aft"),
             installed_version: "1.0.0".to_string(),
             installed_archive_sha256: Some("ab".repeat(32)),
+            registration_channel_missing: false,
         };
         let mut metadata = UpdateMetadata {
             format_version: super::super::update_cache::UPDATE_CACHE_FORMAT_VERSION,
@@ -2445,12 +2554,14 @@ pub(super) mod tests {
                 destination: PathBuf::from("/managed/ck-subc"),
                 installed_version: "0.17.19".to_string(),
                 installed_archive_sha256: Some("old-daemon".to_string()),
+                registration_channel_missing: false,
             },
             ManagedUpgradeTarget {
                 target: aft,
                 destination: PathBuf::from("/managed/ck-aft"),
                 installed_version: "0.9.0".to_string(),
                 installed_archive_sha256: Some("old-aft".to_string()),
+                registration_channel_missing: false,
             },
         ];
         let mut metadata = UpdateMetadata {
@@ -2539,6 +2650,7 @@ exit 1
                     destination: aft_path,
                     installed_version: "1.0.0".to_string(),
                     installed_archive_sha256: None,
+                    registration_channel_missing: false,
                 },
             )]
             .into_iter()
@@ -2594,6 +2706,7 @@ exit 1
                     destination: root.join("ck-subc-mcp"),
                     installed_version: "0.1.0".to_string(),
                     installed_archive_sha256: None,
+                    registration_channel_missing: false,
                 },
             )]
             .into_iter()

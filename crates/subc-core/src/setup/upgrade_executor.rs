@@ -63,6 +63,12 @@ pub trait UpgradeExecutionBackend {
     fn configure_message_hub(&mut self, _target: UpgradeTarget) -> Result<(bool, String), String> {
         Err("message hub configuration is not implemented by this backend".into())
     }
+    fn add_registration_channel(
+        &mut self,
+        _target: UpgradeTarget,
+    ) -> Result<(bool, String), String> {
+        Err("registration channel configuration is not implemented by this backend".into())
+    }
     fn grant_message_keys(&mut self, _target: UpgradeTarget) -> Result<(bool, String), String> {
         Err("message-plane grants are not implemented by this backend".into())
     }
@@ -151,6 +157,16 @@ pub fn execute_upgrade<B: UpgradeExecutionBackend>(
                 "message-hub-entry",
                 backend
                     .configure_message_hub(*target)
+                    .map(|(changed, detail)| {
+                        report.changed |= changed;
+                        detail
+                    }),
+            ),
+            UpgradeOperation::AddRegistrationChannel { target } => (
+                *target,
+                "registration-channel-entry",
+                backend
+                    .add_registration_channel(*target)
                     .map(|(changed, detail)| {
                         report.changed |= changed;
                         detail
@@ -247,6 +263,7 @@ pub fn execute_upgrade<B: UpgradeExecutionBackend>(
                         | "rollback-copy"
                         | "destination-replacement"
                         | "warm-execution"
+                        | "registration-channel-entry"
                 ) {
                     match backend.abort_before_activation() {
                         Ok(aborted) => (reason, aborted),

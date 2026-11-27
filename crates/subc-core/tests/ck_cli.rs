@@ -2955,6 +2955,7 @@ fn setup_rerun_applies_the_missing_core_gateway_entry() {
             "program": fixture.data_home.join("cortexkit").join("bin").join(platform_binary("ck-subc-mcp")),
             "args": ["module"],
             "reserved": true,
+            "registration_channel": true,
         })
     );
     assert_eq!(written["modules"]["aft"], config["modules"]["aft"]);
@@ -3315,6 +3316,12 @@ fn setup_mc_apply_reports_each_completed_change_without_a_plan() {
         !stdout.contains("proposed configuration diff:"),
         "stdout:\n{stdout}"
     );
+    let config = fixture.config_home.join("cortexkit/subc.jsonc");
+    let (_, document) = subc_jsonc::read_document(&config).unwrap();
+    assert_eq!(
+        document["modules"]["magic-context"]["registration_channel"],
+        true
+    );
 }
 
 #[cfg(not(windows))]
@@ -3531,6 +3538,7 @@ fn setup_mc_dry_run_has_future_steps_and_the_config_diff() {
         "  7. would Let the message module use this computer's message-plane keys".to_string(),
         "proposed configuration diff:".to_string(),
         "+    \"magic-context\": {".to_string(),
+        "+      \"registration_channel\": true".to_string(),
     ] {
         assert!(
             stdout.contains(&line),
@@ -4331,6 +4339,61 @@ fn upgrade_adds_the_missing_hub_once_and_then_reports_no_changes() {
     assert_exit(&second, 0);
     assert_eq!(text(&second.stdout), UPGRADE_MAINTENANCE_NO_CHANGE);
     assert_eq!(fs::read(&config).unwrap(), saved);
+}
+
+#[test]
+fn upgrade_previews_and_adds_a_missing_registration_channel_without_replacing_the_binary() {
+    let fixture = UpgradeFixture::new("ck-upgrade-registration-channel");
+    let config = fixture.home.join(".config/cortexkit/subc.jsonc");
+    let bin = fixture.home.join(".local/share/cortexkit/bin");
+    let (_, mut original) = subc_jsonc::read_document(&config).unwrap();
+    original["modules"]["aft"] =
+        json!({ "program": bin.join(platform_binary("ck-aft")), "protocol": "subc" });
+    original["modules"]["claustrum"] =
+        json!({ "program": bin.join(platform_binary("ck-claustrum")), "protocol": "none" });
+    original["modules"]["subc-mcp"] = json!({ "program": bin.join(platform_binary("ck-subc-mcp")), "registration_channel": false });
+    let before = serde_json::to_vec_pretty(&original).unwrap();
+    fs::write(&config, &before).unwrap();
+    let index = serve_signed_index(|base| {
+        upgrade_index(
+            base,
+            "0.55.1",
+            &"22".repeat(32),
+            "0.17.9",
+            &"44".repeat(32),
+            "0.8.0",
+            &"55".repeat(32),
+        )
+    });
+
+    let preview = fixture
+        .command(&index, &["upgrade", "--dry-run"])
+        .output()
+        .unwrap();
+    assert_exit(&preview, 0);
+    let preview = text(&preview.stdout);
+    assert!(
+        preview
+            .lines()
+            .any(|line| line.ends_with("add modules.aft.registration_channel: true")),
+        "{preview}"
+    );
+    assert!(!preview.contains("add modules.claustrum.registration_channel"));
+    assert!(!preview.contains("add modules.subc-mcp.registration_channel"));
+    assert!(!preview.contains("replace ck-aft destination"));
+    assert_eq!(fs::read(&config).unwrap(), before);
+
+    let apply = fixture.command(&index, &["upgrade"]).output().unwrap();
+    assert_exit(&apply, 0);
+    assert!(text(&apply.stdout).contains("Added modules.aft.registration_channel: true"));
+    original["modules"]["aft"]["registration_channel"] = Value::Bool(true);
+    let (after_bytes, after) = subc_jsonc::read_document(&config).unwrap();
+    assert_eq!(after, original);
+
+    let again = fixture.command(&index, &["upgrade"]).output().unwrap();
+    assert_exit(&again, 0);
+    assert_eq!(text(&again.stdout), UPGRADE_MAINTENANCE_NO_CHANGE);
+    assert_eq!(fs::read_to_string(&config).unwrap(), after_bytes);
 }
 
 // These byte pins protect redirected output as the terminal UI evolves. The

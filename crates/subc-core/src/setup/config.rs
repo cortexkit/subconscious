@@ -171,27 +171,23 @@ pub fn plan_component_with_key(
         });
     }
 
-    let pending = pending_keys_against(&document, component, binary_home, claustrum_key_path)?;
+    let pending = pending_values_against(&document, component, binary_home, claustrum_key_path)?;
     if pending.is_empty() {
         return Ok(None);
     }
-    let additions = desired_values_with_key(component, binary_home, claustrum_key_path);
     let mut after = before.clone();
-    for (key, desired) in additions {
-        if pending.iter().any(|pending_key| pending_key == &key) {
-            // Keep the parsed document as the conflict authority. The textual
-            // insertion below deliberately changes only missing values.
-            insert_value(&mut document, &key, desired.clone())
-                .map_err(|key| ConfigConflict { key })?;
-            if !before.is_empty() {
-                insert_textual_value(
-                    &mut after,
-                    &key,
-                    desired,
-                    component == Component::Claustrum && key == "modules.claustrum",
-                )
-                .map_err(|key| ConfigConflict { key })?;
-            }
+    for (key, desired) in pending {
+        // Keep the parsed document as the conflict authority. The textual
+        // insertion below deliberately changes only missing values.
+        insert_value(&mut document, &key, desired.clone()).map_err(|key| ConfigConflict { key })?;
+        if !before.is_empty() {
+            insert_textual_value(
+                &mut after,
+                &key,
+                desired,
+                component == Component::Claustrum && key == "modules.claustrum",
+            )
+            .map_err(|key| ConfigConflict { key })?;
         }
     }
     if before.is_empty() {
@@ -205,6 +201,65 @@ pub fn plan_component_with_key(
         before,
         after,
     }))
+}
+
+/// Plan only the declaration for a matching managed program's existing entry.
+pub(super) fn plan_registration_channel(
+    path: &Path,
+    module_id: &str,
+    program: &Path,
+) -> Result<Option<ConfigChange>, String> {
+    let Some((before, document)) = read_registration_config(path)? else {
+        return Ok(None);
+    };
+    if !missing_registration_channel(&document, module_id, program) {
+        return Ok(None);
+    }
+    let key = format!("modules.{module_id}.registration_channel");
+    let mut after = before.clone();
+    insert_textual_value(&mut after, &key, Value::Bool(true), false)
+        .map_err(|key| format!("could not add {key} to {}", path.display()))?;
+    Ok(Some(ConfigChange {
+        path: path.to_owned(),
+        before,
+        after,
+    }))
+}
+
+pub(super) fn read_registration_config(path: &Path) -> Result<Option<(String, Value)>, String> {
+    let before = match fs::read_to_string(path) {
+        Ok(contents) if !contents.is_empty() => contents,
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("could not read {}: {error}", path.display())),
+    };
+    let strict = jsonc_to_json(&before)
+        .map_err(|error| format!("could not parse {}: {error}", path.display()))?;
+    let document: Value = serde_json::from_str(&strict)
+        .map_err(|error| format!("could not parse {}: {error}", path.display()))?;
+    Ok(Some((before, document)))
+}
+
+pub(super) fn missing_registration_channel(
+    document: &Value,
+    module_id: &str,
+    program: &Path,
+) -> bool {
+    document
+        .get("modules")
+        .and_then(|modules| modules.get(module_id))
+        .and_then(Value::as_object)
+        .is_some_and(|entry| {
+            entry.get("program").and_then(Value::as_str).map(Path::new) == Some(program)
+                && needs_channel_declaration(entry)
+        })
+}
+
+fn needs_channel_declaration(entry: &Map<String, Value>) -> bool {
+    entry
+        .get("protocol")
+        .is_none_or(|protocol| protocol.as_str() == Some("subc"))
+        && !entry.contains_key("registration_channel")
 }
 
 /// Dotted keys core (or another component) would write. Empty when the file
@@ -240,29 +295,52 @@ pub fn pending_dotted_keys(
             key: "<root>".to_string(),
         });
     }
-    pending_keys_against(&document, component, binary_home, claustrum_key_path)
+    Ok(
+        pending_values_against(&document, component, binary_home, claustrum_key_path)?
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect(),
+    )
 }
 
-fn pending_keys_against(
+fn pending_values_against(
     document: &Value,
     component: Component,
     binary_home: &Path,
     claustrum_key_path: Option<&Path>,
-) -> Result<Vec<String>, ConfigConflict> {
+) -> Result<Vec<(String, Value)>, ConfigConflict> {
     let mut pending = Vec::new();
-    for (key, desired) in desired_values_with_key(component, binary_home, claustrum_key_path) {
+    for (key, mut desired) in desired_values_with_key(component, binary_home, claustrum_key_path) {
         match existing_value(document, &key) {
             Some(actual) if actual == &desired => {}
-            // Omitting --key-path must not remove or conflict with an existing
-            // operator environment: the vault may still depend on its key file.
-            Some(Value::Object(actual))
-                if component == Component::Claustrum && claustrum_key_path.is_none() && {
-                    let mut without_env = actual.clone();
-                    without_env.remove("env");
-                    Value::Object(without_env) == desired
-                } => {}
+            Some(Value::Object(actual)) if key.starts_with("modules.") => {
+                let mut managed = actual.clone();
+                // Keep any existing declaration and respect an explicit
+                // protocol choice, including opting out of subc entirely.
+                managed.remove("registration_channel");
+                if matches!(
+                    managed.get("protocol").and_then(Value::as_str),
+                    Some("subc" | "none")
+                ) {
+                    managed.remove("protocol");
+                }
+                // Without --key-path, keep any existing vault key environment.
+                if component == Component::Claustrum && claustrum_key_path.is_none() {
+                    managed.remove("env");
+                }
+                let declaration = desired
+                    .as_object_mut()
+                    .and_then(|entry| entry.remove("registration_channel"));
+                if Value::Object(managed) != desired {
+                    return Err(ConfigConflict { key });
+                }
+                if let Some(declaration) = declaration.filter(|_| needs_channel_declaration(actual))
+                {
+                    pending.push((format!("{key}.registration_channel"), declaration));
+                }
+            }
             Some(_) => return Err(ConfigConflict { key }),
-            None => pending.push(key),
+            None => pending.push((key, desired)),
         }
     }
     Ok(pending)
@@ -500,6 +578,7 @@ fn desired_values_with_key(
                     "program": binary_home.join(platform_binary("ck-subc-mcp")).to_string_lossy(),
                     "args": ["module"],
                     "reserved": true,
+                    "registration_channel": true,
                 }),
             );
         }
@@ -521,6 +600,7 @@ fn desired_values_with_key(
                     "program": binary_home
                         .join(platform_binary(daemon_binary(component)))
                         .to_string_lossy(),
+                    "registration_channel": true,
                 }),
             );
         }
@@ -536,6 +616,7 @@ fn desired_values_with_key(
                 ),
             );
             entry.insert("reserved".to_string(), Value::Bool(true));
+            entry.insert("registration_channel".to_string(), Value::Bool(true));
             if let Some(key_path) = claustrum_key_path {
                 entry.insert(
                     "env".to_string(),
@@ -682,6 +763,7 @@ mod tests {
                 "program": root.join(binary).to_string_lossy(),
                 "args": ["module"],
                 "reserved": true,
+                "registration_channel": true,
             })
         );
     }
@@ -691,7 +773,7 @@ mod tests {
         let root = fixture_path("core-gateway-existing");
         let config = root.join("subc.jsonc");
         let original = format!(
-            "{{\n  // operator's gateway entry\n  \"version\": 1,\n  \"storage\": {{\"backend\": \"sqlite\"}},\n  \"modules\": {{\"subc-mcp\": {{\"program\": {}, \"args\": [\"module\"], \"reserved\": true}}}}\n}}\n",
+            "{{\n  // operator's gateway entry\n  \"version\": 1,\n  \"storage\": {{\"backend\": \"sqlite\"}},\n  \"modules\": {{\"subc-mcp\": {{\"program\": {}, \"args\": [\"module\"], \"reserved\": true, \"registration_channel\": true}}}}\n}}\n",
             serde_json::to_string(&root.join(platform_binary("ck-subc-mcp"))).unwrap()
         );
         fs::write(&config, &original).unwrap();
@@ -710,6 +792,36 @@ mod tests {
         let conflict = plan_component(&config, Component::Core, &root).expect_err("conflict");
         assert_eq!(conflict.key, "modules.subc-mcp");
         assert_eq!(fs::read_to_string(&config).unwrap(), original);
+    }
+
+    #[test]
+    fn component_plan_leaves_protocol_none_and_existing_declarations_untouched() {
+        let root = fixture_path("setup-existing-registration-channel");
+        let config = root.join("subc.jsonc");
+        let program = root.join(platform_binary("ck-aft"));
+        for (fields, expected) in [
+            (r#""protocol": "none""#, None),
+            (r#""protocol": "subc", "registration_channel": false"#, None),
+            (r#""registration_channel": true"#, None),
+            (r#""protocol": "subc""#, Some(true)),
+        ] {
+            let original = format!(
+                "{{\n  // keep this comment\n  \"modules\": {{\"aft\": {{\"program\": {}, {fields}}}}}\n}}\n",
+                serde_json::to_string(&program).unwrap()
+            );
+            fs::write(&config, &original).unwrap();
+            let plan = plan_component(&config, Component::Aft, &root).unwrap();
+            assert_eq!(fs::read_to_string(&config).unwrap(), original);
+            assert_eq!(plan.is_some(), expected.is_some(), "{fields}");
+            if let Some(change) = plan {
+                let document: Value =
+                    serde_json::from_str(&jsonc_to_json(&change.after).unwrap()).unwrap();
+                assert_eq!(
+                    document["modules"]["aft"]["registration_channel"].as_bool(),
+                    expected
+                );
+            }
+        }
     }
 
     #[test]
@@ -1153,7 +1265,7 @@ mod tests {
         assert!(restart_required_from_pending_keys(true, &keys).is_empty());
     }
     #[test]
-    fn setup_new_module_configuration_has_only_program_values() {
+    fn setup_new_module_configuration_declares_program_and_registration_channel() {
         let binary_home = Path::new("bin");
         for (component, id) in [
             (Component::Fusiform, "fusiform"),
@@ -1169,7 +1281,8 @@ mod tests {
                 BTreeMap::from([(
                     format!("modules.{id}"),
                     serde_json::json!({
-                        "program": binary_home.join(platform_binary(&format!("ck-{id}")))
+                        "program": binary_home.join(platform_binary(&format!("ck-{id}"))),
+                        "registration_channel": true,
                     })
                 )])
             );

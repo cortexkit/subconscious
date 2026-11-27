@@ -263,6 +263,9 @@ fn daemon_target(plan: &UpgradePlan) -> Option<UpgradeTarget> {
 pub fn operation_stage(operation: &UpgradeOperation) -> Option<(UpgradeTarget, &'static str)> {
     Some(match operation {
         UpgradeOperation::ConfigureMessageHub { target } => (*target, "message-hub-entry"),
+        UpgradeOperation::AddRegistrationChannel { target } => {
+            (*target, "registration-channel-entry")
+        }
         UpgradeOperation::GrantMessageKeys { target } => (*target, "message-plane-grants"),
         UpgradeOperation::ObservePlatform => return None,
         UpgradeOperation::DownloadAndVerify { target } => (*target, "download-and-verify"),
@@ -435,6 +438,19 @@ impl<B: UpgradeExecutionBackend> UpgradeExecutionBackend for Reporting<'_, B> {
         let mut changed = false;
         let detail = self.stage(Some(target), "message-hub-entry", |b| {
             let result = b.configure_message_hub(target)?;
+            changed = result.0;
+            Ok(result.1)
+        })?;
+        Ok((changed, detail))
+    }
+
+    fn add_registration_channel(
+        &mut self,
+        target: UpgradeTarget,
+    ) -> Result<(bool, String), String> {
+        let mut changed = false;
+        let detail = self.stage(Some(target), "registration-channel-entry", |b| {
+            let result = b.add_registration_channel(target)?;
             changed = result.0;
             Ok(result.1)
         })?;
@@ -981,6 +997,7 @@ mod tests {
                 destination: PathBuf::from(target.label()),
                 installed_version: "1.0.0".to_string(),
                 installed_archive_sha256: None,
+                registration_channel_missing: false,
             })
             .collect();
         let rows = plan_rows(&discovered, &observed, &plan);

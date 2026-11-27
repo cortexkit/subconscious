@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.24.1
+
+- Have `ck setup` and `ck upgrade` add `registration_channel: true` to managed
+  subc module entries that don't already declare a value.
+
 ## 0.24.0
 
 - Make bare `ck setup` select every available component and explain what it

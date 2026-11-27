@@ -29,6 +29,7 @@ A module is supervised when it has an entry under `modules` in
       "enabled": true,
       "reserved": false,
       "protocol": "subc",          // or "none"
+      "registration_channel": false,
       "overlap": "exclusive",      // or "safe"
       "drain_timeout_ms": 30000,
       "route_bind_relay_timeout_ms": 12000,
@@ -64,6 +65,16 @@ root, are in [`daemon-config.md`](daemon-config.md).
 - `overlap: "safe"` permits a blue/green swap (section 7). The default,
   `exclusive`, refuses it, because most modules are single writers to their
   store.
+- `registration_channel: true` declares channel support to the
+  [module settings gate](control-plane.md#module-settings). The daemon passes
+  the channel to every `protocol: "subc"` child regardless of this key;
+  without an approved configuration stamp, children that don't use the channel
+  can register with their launch nonce. The gate refuses to approve a stamp
+  if an enabled subc module entry lacks the declaration. Once the stamp is
+  approved, the gate also requires the declaration for module admission.
+  `ck setup` includes the key when it writes a managed subc module entry.
+  `ck upgrade` adds it to existing managed subc entries that lack it. Neither
+  command changes an existing value.
 
 ## 2. Start-up
 
@@ -75,6 +86,8 @@ The daemon starts a `protocol: "subc"` module as
 | Variable | Value |
 | --- | --- |
 | `SUBC_MODULE_ID` | The configured module id. Register under exactly this id. |
+| `SUBC_REGISTRATION_FD` | macOS and Linux: inherited descriptor for the module registration channel. |
+| `SUBC_REGISTRATION_PIPE` | Windows: the name of the module registration pipe. |
 | `SUBC_LAUNCH_NONCE_FD` | macOS and Linux: `3:<inode>`. Descriptor 3 is a pipe holding the one-time launch nonce. |
 | `SUBC_LAUNCH_NONCE_PIPE` | Windows: the name of a one-time named pipe that serves the nonce to this process only. |
 | `SUBC_LAUNCH_NONCE` | Windows only, while modules move to the named pipe: the nonce itself. Never set on macOS or Linux. |
@@ -121,6 +134,8 @@ the daemon predates it, never that the machine has none.
 `ModuleManifest` (`crates/subc-protocol/src/manifest.rs`) declares:
 
 - `module_id`, `module_version`, `protocol_ver`.
+- Optional `registration_channel`: `true` declares that the program can
+  register over the daemon-provided channel.
 - Optional `display_name`: the module's human-readable plain-text name, mirrored
   on every `catalog.list` entry for that registration. Apps fall back to the bare
   `module_id` when absent. A name must already be trimmed and contain 1–40 Unicode

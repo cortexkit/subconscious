@@ -298,13 +298,17 @@ impl SetupBackend {
                 releases.insert(component, availability);
                 continue;
             }
-            let config_ok = match config::plan_component_with_key(
+            let config_ok = match config::pending_dotted_keys(
                 &self.paths.config_path,
                 component,
                 &self.paths.binary_home,
                 claustrum_key_path,
             ) {
-                Ok(change) => change.is_none(),
+                // Upgrade repairs existing declarations. A missing declaration
+                // alone does not make setup reinstall an otherwise configured component.
+                Ok(keys) => keys
+                    .iter()
+                    .all(|key| key.ends_with(".registration_channel")),
                 Err(conflict) => {
                     if selected.contains(&component) {
                         configuration_refusals.insert(

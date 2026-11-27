@@ -26,44 +26,45 @@ public struct FedShareSessionReport: Sendable, Equatable {
 /// Both processes use the same Keychain identity and App Group share ledger.
 public struct FedShareClient: Sendable {
     typealias Dial = @Sendable (FedPeerCandidate, Data, Data) async throws -> any FedSessionByteTransport
+    private enum Dialer: Sendable {
+        case network(FedNetworkDialFactory, any FedNoiseEntropy)
+        case injected(Dial)
+    }
     let keyStore: any FedPrivateKeyStore
     let ledger: FedShareLedger
     let policy: FedHelloPolicy
     let dialPolicy: FedDialPolicy
     let clock: any FedMonotonicClock
-    let dial: Dial
+    private let dialer: Dialer
+    private let observedNetwork: SubcFedClient.ObservedNetworkProvider
 
+    /// Uses a fresh local subnet snapshot for each dial unless `observedNetwork`
+    /// supplies one, for example from the same provider as the main session.
     public init(keyStore: any FedPrivateKeyStore, ledger: FedShareLedger,
                 helloPolicy: FedHelloPolicy, dialPolicy: FedDialPolicy = FedDialPolicy(),
                 clock: any FedMonotonicClock = SystemFedMonotonicClock(),
-                entropy: any FedNoiseEntropy = SystemFedNoiseEntropy()) {
-        self.keyStore = keyStore
-        self.ledger = ledger
-        self.policy = helloPolicy
-        self.dialPolicy = dialPolicy
-        self.clock = clock
-        self.dial = { candidate, privateKey, responderKey in
-            let host: String
-            let port: UInt16
-            switch candidate {
-            case .lanDirect(let lan): host = lan.host; port = lan.port
-            case .publicDirect(let publicAddress):
-                if let reason = FedPublicCandidateHygiene.addressRejection(host: publicAddress.host) {
-                    throw FedFailure.candidateRejected(reason: reason)
-                }
-                host = publicAddress.host; port = publicAddress.port
-            case .relay: throw FedShareError.invalidRequest
-            }
-            return try await FedNetworkDialFactory().dialShare(host: host, port: port, privateKey: privateKey,
-                responderKey: responderKey, clock: clock, policy: dialPolicy, entropy: entropy)
-        }
+                entropy: any FedNoiseEntropy = SystemFedNoiseEntropy(),
+                observedNetwork: SubcFedClient.ObservedNetworkProvider? = nil) {
+        self.init(keyStore: keyStore, ledger: ledger, helloPolicy: helloPolicy, dialPolicy: dialPolicy, clock: clock,
+                  entropy: entropy, observedNetwork: observedNetwork ?? { .localInterfaces() }, networkFactory: .init())
     }
 
     init(keyStore: any FedPrivateKeyStore, ledger: FedShareLedger, helloPolicy: FedHelloPolicy,
          dialPolicy: FedDialPolicy = FedDialPolicy(), clock: any FedMonotonicClock = SystemFedMonotonicClock(),
+         entropy: any FedNoiseEntropy = SystemFedNoiseEntropy(),
+         observedNetwork: @escaping SubcFedClient.ObservedNetworkProvider, networkFactory: FedNetworkDialFactory) {
+        self.keyStore = keyStore; self.ledger = ledger; self.policy = helloPolicy
+        self.dialPolicy = dialPolicy; self.clock = clock; self.observedNetwork = observedNetwork
+        self.dialer = .network(networkFactory, entropy)
+    }
+
+    init(keyStore: any FedPrivateKeyStore, ledger: FedShareLedger, helloPolicy: FedHelloPolicy,
+         dialPolicy: FedDialPolicy = FedDialPolicy(), clock: any FedMonotonicClock = SystemFedMonotonicClock(),
+         observedNetwork: @escaping SubcFedClient.ObservedNetworkProvider = { .init() },
          dial: @escaping Dial) {
         self.keyStore = keyStore; self.ledger = ledger; self.policy = helloPolicy
-        self.dialPolicy = dialPolicy; self.clock = clock; self.dial = dial
+        self.dialPolicy = dialPolicy; self.clock = clock; self.observedNetwork = observedNetwork
+        self.dialer = .injected(dial)
     }
 
     /// Requests beyond the negotiated session budget are left unattempted. Once
@@ -98,24 +99,15 @@ public struct FedShareClient: Sendable {
                 bindingChanged: ownKey != computer.ownPublicKey),
                 byeCode: nil, notSupportedByComputer: !computer.advertisedShareV1)
         }
-        // There is no relay candidate in the directory's schema. LAN always
-        // precedes public, and a failed dial never opens a rendezvous socket.
-        let candidates = computer.lanCandidates.map(FedPeerCandidate.lanDirect)
-            + computer.publicCandidates.map(FedPeerCandidate.publicDirect)
-        var transport: (any FedSessionByteTransport)?
-        for candidate in candidates {
-            try Task.checkCancellation()
-            do { transport = try await dial(candidate, privateKey, computer.publicKey); break }
-            catch is CancellationError { throw CancellationError() }
-            catch { continue }
+        let (connection, remote): (FedShareConnection, FedShareRemote)
+        do {
+            (connection, remote) = try await openShare(to: computer, privateKey: privateKey, reportProtocolViolation: true)
+        } catch let failure as FedShareDialFailed {
+            return FedShareSessionReport(calls: try await unattempted(requests, code: failure.bye?.code), byeCode: failure.bye?.code)
         }
-        guard let transport else {
-            return FedShareSessionReport(calls: try await unattempted(requests, code: nil), byeCode: nil)
-        }
-        let connection = FedShareConnection(transport: transport, maximumBodyBytes: UInt32(policy.maxBodyBytes), clock: clock)
         return try await withTaskCancellationHandler {
             do {
-                let report = try await exchange(requests, computer: computer, ownKey: ownKey, connection: connection)
+                let report = try await exchange(requests, computer: computer, ownKey: ownKey, connection: connection, remote: remote)
                 await connection.close()
                 return report
             } catch {
@@ -123,6 +115,95 @@ public struct FedShareClient: Sendable {
                 throw error
             }
         } onCancel: { Task { await connection.close() } }
+    }
+
+    // Retry only before share_ready: no request or ledger mark belongs to a
+    // failed connection yet. The directory contains no relay candidates.
+    func openShare(to computer: FedShareDirectoryEntry, privateKey: Data, reportProtocolViolation: Bool = false)
+        async throws -> (FedShareConnection, FedShareRemote) {
+        let snapshot = await observedNetwork()
+        let candidates = computer.lanCandidates.map(FedPeerCandidate.lanDirect)
+            + computer.publicCandidates.map(FedPeerCandidate.publicDirect)
+        // send and sendUpload check the paired directory entry's binding to our
+        // local key before dialing its pinned peer key.
+        var remaining = candidates.indices.filter {
+            candidates[$0].directHygieneRejection(peerVerified: true, snapshot: snapshot) == nil
+        }
+        var failures: [Int: CandidateFailure] = [:]
+        var bye: ShareClose?
+        while !remaining.isEmpty {
+            try Task.checkCancellation()
+            let index: Int
+            let transport: any FedSessionByteTransport
+            switch dialer {
+            case .network(let factory, let entropy):
+                let result = try await factory.raceDirect(remaining.map { candidates[$0] }, clock: clock, policy: dialPolicy)
+                for (offset, failure) in result.failures { failures[remaining[offset]] = failure }
+                guard let winner = result.winner else {
+                    remaining.removeAll()
+                    continue
+                }
+                index = remaining.remove(at: winner.index)
+                remaining.removeAll { failures[$0] != nil }
+                do {
+                    transport = try await factory.dialShare(carrier: winner.carrier, privateKey: privateKey,
+                        responderKey: computer.publicKey, clock: clock, policy: dialPolicy, entropy: entropy)
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    failures[index] = shareCandidateFailure(candidates[index], stage: .noiseHandshake, error: error)
+                    continue
+                }
+            case .injected(let dial):
+                index = remaining.removeFirst()
+                do { transport = try await dial(candidates[index], privateKey, computer.publicKey) }
+                catch is CancellationError { throw CancellationError() }
+                catch {
+                    failures[index] = shareCandidateFailure(candidates[index], stage: .carrierConnect, error: error)
+                    continue
+                }
+            }
+            let connection = FedShareConnection(transport: transport, maximumBodyBytes: UInt32(policy.maxBodyBytes), clock: clock)
+            do {
+                let remote = try await withTaskCancellationHandler {
+                    try Task.checkCancellation()
+                    return try await negotiate(computer: computer, connection: connection)
+                } onCancel: { Task { await connection.close() } }
+                try Task.checkCancellation()
+                return (connection, remote)
+            } catch {
+                if Task.isCancelled || error is CancellationError {
+                    await connection.close()
+                    throw CancellationError()
+                }
+                let byeCode = shareCloseCode(error)
+                bye = ShareClose(code: byeCode)
+                if reportProtocolViolation && byeCode == "fed_protocol_violation" {
+                    try? await connection.send(FedFrame(type: "bye", fields: ["code": .string("fed_protocol_violation")]),
+                                               maximum: UInt32(policy.maxBodyBytes))
+                }
+                await connection.close()
+                // Another address cannot cure an authenticated refusal or a
+                // malformed hello. Only a transport loss before readiness can.
+                switch error {
+                case FedFailure.disconnected, FedNoiseError.transportClosed, FedCarrierError.carrierClosed,
+                     FedDeadlineError.timedOut(.fedNegotiation), FedCarrierError.timeout(.fedNegotiation):
+                    break
+                default:
+                    throw FedShareDialFailed.refused(ShareClose(code: byeCode))
+                }
+                failures[index] = shareCandidateFailure(candidates[index], stage: .fedNegotiation, error: error)
+            }
+        }
+        try Task.checkCancellation()
+        let ordered = candidates.indices.compactMap { failures[$0] }
+        throw FedShareDialFailed.candidates(ordered.isEmpty ? .noEligibleCandidates([]) : .allCandidatesFailed(ordered), bye)
+    }
+
+    private func shareCandidateFailure(_ candidate: FedPeerCandidate, stage: FedCandidateStage, error: Error) -> CandidateFailure {
+        let id = candidate.candidateID
+        let reason = fedCandidateFailure(candidateID: id, stage: stage, error: error) ?? .transport(.otherTransport)
+        return CandidateFailure(candidateID: id, stage: stage, reason: reason)
     }
 
     private func unattempted(_ requests: [FedShareRequest], code: String?, bindingChanged: Bool = false) async throws -> [FedShareCallResult] {
@@ -153,20 +234,10 @@ public struct FedShareClient: Sendable {
     }
 
     private func exchange(_ requests: [FedShareRequest], computer: FedShareDirectoryEntry, ownKey: Data,
-                          connection: FedShareConnection) async throws -> FedShareSessionReport {
+                          connection: FedShareConnection, remote: FedShareRemote) async throws -> FedShareSessionReport {
         let runner = FedStageDeadlineRunner(clock: clock)
         var calls: [FedShareCallResult] = []
         var byeCode: String?
-        let remote: FedShareRemote
-        do {
-            remote = try await negotiate(computer: computer, connection: connection)
-        } catch {
-            byeCode = shareCloseCode(error)
-            if byeCode == "fed_protocol_violation" {
-                try? await connection.send(FedFrame(type: "bye", fields: ["code": .string("fed_protocol_violation")]), maximum: UInt32(policy.maxBodyBytes))
-            }
-            return FedShareSessionReport(calls: try await unattempted(requests, code: byeCode), byeCode: byeCode)
-        }
         var budget = FedShareBudget(remote: remote)
         for request in requests {
             if !budget.canSend(bodyBytes: request.body.count, now: clock.nowNanoseconds()) {
@@ -252,6 +323,18 @@ public struct FedShareClient: Sendable {
         calls.append(contentsOf: try await unattempted(Array(requests.dropFirst(calls.count)), code: nil))
         try? await connection.send(FedFrame(type: "bye", fields: ["code": .string(FedShareByeCode.done.rawValue)]), maximum: remote.maximum)
         return FedShareSessionReport(calls: calls, byeCode: FedShareByeCode.done.rawValue)
+    }
+}
+
+enum FedShareDialFailed: Error {
+    case candidates(FedFailure, ShareClose?)
+    case refused(ShareClose)
+
+    var bye: ShareClose? {
+        switch self {
+        case .candidates(_, let bye): return bye
+        case .refused(let bye): return bye
+        }
     }
 }
 
@@ -388,7 +471,7 @@ actor FedShareConnection {
             }
             let bytes = try await transport.receive()
             if let failure { throw failure }
-            guard !bytes.isEmpty else { throw ShareClose(code: nil) }
+            guard !bytes.isEmpty else { throw FedFailure.disconnected }
             keepalive?.noteAssemblyProgress(at: clock.nowNanoseconds())
             let frames = try decoder.append(bytes)
             if !frames.isEmpty { keepalive?.noteInboundFrame(at: clock.nowNanoseconds()) }

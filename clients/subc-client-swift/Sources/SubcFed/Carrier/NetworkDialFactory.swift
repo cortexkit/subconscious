@@ -103,19 +103,38 @@ public struct FedNetworkDialFactory: FedCandidateDialFactory {
 
     // MARK: - Direct TCP rung
 
+    func raceDirect(
+        _ candidates: [FedPeerCandidate], clock: any FedMonotonicClock, policy: FedDialPolicy,
+        willConnect: @escaping @Sendable (FedPeerCandidate) async throws -> Void = { _ in }
+    ) async throws -> FedDirectConnectResult {
+        try await FedDirectConnectRace.run(candidates, clock: clock, timeout: policy.carrierConnect) { candidate in
+            let endpoint: (String, UInt16)
+            switch candidate {
+            case .lanDirect(let lan): endpoint = (lan.host, lan.port)
+            case .publicDirect(let address): endpoint = (address.host, address.port)
+            case .relay: throw FedFailure.notDialOwner
+            }
+            try await willConnect(candidate)
+            try Task.checkCancellation()
+            return try await connect(endpoint.0, endpoint.1)
+        }
+    }
+
     // Share sessions reuse the established direct carrier and Noise IK stack,
     // but never create an ordinary engine or open its lifetime-locked store.
-    func dialShare(host: String, port: UInt16, privateKey: Data, responderKey: Data,
+    func dialShare(carrier: FedTCPRecordCarrier, privateKey: Data, responderKey: Data,
                    clock: any FedMonotonicClock, policy: FedDialPolicy,
                    entropy: any FedNoiseEntropy) async throws -> any FedSessionByteTransport {
-        let initiator = try FedNoiseIKInitiator(staticKey: FedNoiseKeyPair(privateKey: privateKey),
-                                               pinnedResponderStatic: responderKey)
-        let connect = self.connect
-        let carrier = try await FedTCPRecordCarrier.establish(clock: clock, timeout: policy.carrierConnect) {
-            try await connect(host, port)
+        do {
+            try Task.checkCancellation()
+            let initiator = try FedNoiseIKInitiator(staticKey: FedNoiseKeyPair(privateKey: privateKey),
+                                                   pinnedResponderStatic: responderKey)
+            let session = try await initiator.establish(on: carrier, clock: clock, timeout: policy.noiseHandshake, entropy: entropy)
+            return FedNoiseSessionByteTransport(session: session)
+        } catch {
+            await carrier.close()
+            throw error
         }
-        let session = try await initiator.establish(on: carrier, clock: clock, timeout: policy.noiseHandshake, entropy: entropy)
-        return FedNoiseSessionByteTransport(session: session)
     }
 
     func dialPairing(
@@ -142,12 +161,7 @@ public struct FedNetworkDialFactory: FedCandidateDialFactory {
     }
 
     private func dialDirect(host: String, port: UInt16, context: FedDialAttemptContext) async throws -> FedDialedSession {
-        let staticKey = try FedNoiseKeyPair(privateKey: context.localPrivateKey)
-        let initiator = try FedNoiseIKInitiator(
-            staticKey: staticKey,
-            pinnedResponderStatic: context.responderStaticPublicKey
-        )
-
+        let initiator = try makeDirectInitiator(context)
         let connect = self.connect
         let carrier = try await FedTCPRecordCarrier.establish(
             clock: context.clock,
@@ -157,6 +171,22 @@ public struct FedNetworkDialFactory: FedCandidateDialFactory {
         }
 
         return try await finishHandshake(initiator: initiator, carrier: carrier, context: context)
+    }
+
+    func dialDirect(carrier: FedTCPRecordCarrier, context: FedDialAttemptContext) async throws -> FedDialedSession {
+        do {
+            try Task.checkCancellation()
+            let initiator = try makeDirectInitiator(context)
+            return try await finishHandshake(initiator: initiator, carrier: carrier, context: context)
+        } catch {
+            await carrier.close()
+            throw error
+        }
+    }
+
+    private func makeDirectInitiator(_ context: FedDialAttemptContext) throws -> FedNoiseIKInitiator {
+        try FedNoiseIKInitiator(staticKey: FedNoiseKeyPair(privateKey: context.localPrivateKey),
+                                pinnedResponderStatic: context.responderStaticPublicKey)
     }
 
     // MARK: - Relay pipe rung

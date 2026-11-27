@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Use current private subnets to filter direct share and upload addresses. The
+  main session and shares stagger TCP connects by 250 ms, then run Noise and
+  hello only on the winning socket. A failed Noise handshake or a connection
+  lost during hello can fall through to the remaining addresses; authenticated
+  refusals still stop the dial. Shares never use relay.
+
 - Accept the optional `machine_id` on granted remote pairing results, including
   status lookups. `FedPairingGrant.computerMachineID` exposes it alongside the
   authenticated key and is `nil` when the result does not include it.

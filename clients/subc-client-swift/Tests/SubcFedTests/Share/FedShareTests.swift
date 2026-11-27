@@ -72,9 +72,10 @@ final class FedShareTests: XCTestCase {
     }
 
     func client(ledger: FedShareLedger, server: ShareTestServer, privateKey: Data? = nil,
-                clock: any FedMonotonicClock = SystemFedMonotonicClock()) throws -> FedShareClient {
+                clock: any FedMonotonicClock = SystemFedMonotonicClock(),
+                snapshot: FedObservedNetworkSnapshot = .init()) throws -> FedShareClient {
         try FedShareClient(keyStore: FedMemoryPrivateKeyStore(noisePrivateKey: privateKey ?? ownPrivate), ledger: ledger,
-                           helloPolicy: FedHelloPolicy(), clock: clock, dial: { candidate, _, _ in
+                           helloPolicy: FedHelloPolicy(), clock: clock, observedNetwork: { snapshot }, dial: { candidate, _, _ in
             await server.dialed(candidate)
             return server
         })
@@ -266,7 +267,8 @@ final class FedShareTests: XCTestCase {
         do { _ = try await competitor.open(localPublicKey: own); XCTFail("origin ownership unexpectedly released") }
         catch is FedStateStoreInUse {}
         let ledger = shareTestLedger(directoryURL: dir)
-        let report = try await client(ledger: ledger, server: ShareTestServer()).send([request()], to: XCTUnwrap(file.read().first))
+        let report = try await client(ledger: ledger, server: ShareTestServer(), snapshot: FedPublicTestSupport.observedHomeLAN())
+            .send([request()], to: XCTUnwrap(file.read().first))
         XCTAssertEqual(report.calls.first?.outcome.disposition, .sent)
         let after = try await store.snapshot()
         XCTAssertEqual(after, before)

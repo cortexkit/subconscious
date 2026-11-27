@@ -109,8 +109,9 @@ extension FedShareTests {
     func testDirectCandidatesLANThenPublicOnly() async throws {
         let dir = try directory(), ledger = shareTestLedger(directoryURL: dir)
         let server = ShareTestServer()
+        let snapshot = try FedPublicTestSupport.observedHomeLAN()
         let client = try FedShareClient(keyStore: FedMemoryPrivateKeyStore(noisePrivateKey: ownPrivate), ledger: ledger,
-            helloPolicy: FedHelloPolicy(), dial: { candidate, _, _ in
+            helloPolicy: FedHelloPolicy(), observedNetwork: { snapshot }, dial: { candidate, _, _ in
                 await server.dialed(candidate)
                 if case .lanDirect = candidate { throw FedFailure.disconnected }
                 if case .relay = candidate { XCTFail("share must never dial relay") }

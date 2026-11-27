@@ -256,6 +256,58 @@ final class NetworkDialFactoryTests: XCTestCase {
         XCTAssertEqual(endpoint?.port, 7841)
     }
 
+    func testMainSessionSkipsForeignLANAndRetriesPublicAfterLANWinnerFailsNoise() async throws {
+        let candidates = try [.lanDirect(FedLANDirectCandidate(candidateID: "off-subnet", host: "10.0.0.2", port: 9))]
+            + directTestCandidates()
+        let snapshot = try FedPublicTestSupport.observedHomeLAN()
+        let key = try FedNoiseKeyPair(privateKey: responderPrivateKey)
+        let pipe = RemotePairingPipe()
+        let loser = DirectDialTestEOF()
+        let log = DirectDialTestLog()
+        let factory = FedNetworkDialFactory(connect: { host, _ in
+            await log.record(host)
+            if host == "192.168.1.2" { return loser }
+            if host == "8.8.8.8" { return pipe.device }
+            throw FedCarrierError.carrierClosed
+        })
+        let client = SubcFedClient(profile: try FedPublicTestSupport.humanProfile(candidates: candidates),
+            keyStore: try FedPublicTestSupport.keyStore(), stateStore: FedMemoryStateStore(),
+            observedNetwork: { snapshot }, dialFactory: factory)
+        let peer = Task { try? await Self.runResponderDaemon(stream: pipe.target, staticKey: key) }
+        do {
+            try await client.connect()
+        } catch {
+            await pipe.close()
+            throw error
+        }
+        let state = await client.state
+        if case .ready = state {} else { XCTFail("expected ready, got \(state)") }
+        let entries = await log.entries
+        let writes = await loser.writes
+        let closed = await loser.closed
+        XCTAssertEqual(entries.map(\.host), ["192.168.1.2", "8.8.8.8"])
+        XCTAssertGreaterThan(writes, 0)
+        XCTAssertTrue(closed)
+        await client.disconnect()
+        _ = await peer.value
+    }
+
+    func testMainSessionReportsEveryFailedDirectCandidate() async throws {
+        let snapshot = try FedPublicTestSupport.observedHomeLAN()
+        let client = SubcFedClient(profile: try FedPublicTestSupport.humanProfile(candidates: directTestCandidates()),
+            keyStore: try FedPublicTestSupport.keyStore(), stateStore: FedMemoryStateStore(),
+            observedNetwork: { snapshot }, dialFactory: FedNetworkDialFactory(connect: { _, _ in throw FedCarrierError.carrierClosed }))
+        do {
+            try await client.connect()
+            XCTFail("expected both direct candidates to fail")
+        } catch let failure as FedFailure {
+            XCTAssertEqual(failure, .allCandidatesFailed(["lan", "public"].map {
+                CandidateFailure(candidateID: $0, stage: .carrierConnect, reason: .transport(.eof))
+            }))
+        }
+        await client.disconnect()
+    }
+
     // MARK: - Responder daemon
 
     /// Speaks the daemon side of the protocol over one accepted connection:
@@ -265,7 +317,10 @@ final class NetworkDialFactoryTests: XCTestCase {
         connection: NWConnection,
         staticKey: FedNoiseKeyPair
     ) async throws {
-        let stream = try await FedNetworkByteStream.start(connection)
+        try await runResponderDaemon(stream: FedNetworkByteStream.start(connection), staticKey: staticKey)
+    }
+
+    private static func runResponderDaemon(stream: any FedTCPByteStream, staticKey: FedNoiseKeyPair) async throws {
         let carrier = FedTCPRecordCarrier(stream: stream)
 
         let responder = try SessionNoiseResponder(staticKey: staticKey)

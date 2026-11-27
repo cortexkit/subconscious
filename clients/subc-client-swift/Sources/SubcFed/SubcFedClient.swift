@@ -1257,23 +1257,7 @@ public actor SubcFedClient {
             var ownershipBlocked = false
             for id in ids {
                 guard let candidate = profile.candidate(id: id) else { continue }
-                let hygieneRejection: CandidateRejectionReason?
-                switch candidate {
-                case .lanDirect(let lan):
-                    hygieneRejection = FedLANCandidateHygiene.classifyIPv4String(
-                        lan.host,
-                        peerVerified: profile.isVerified,
-                        snapshot: snapshot
-                    )
-                case .publicDirect(let publicDirect):
-                    hygieneRejection = FedPublicCandidateHygiene.classify(
-                        host: publicDirect.host,
-                        peerVerified: profile.isVerified
-                    )
-                case .relay:
-                    hygieneRejection = nil
-                }
-                if let reason = hygieneRejection {
+                if let reason = candidate.directHygieneRejection(peerVerified: profile.isVerified, snapshot: snapshot) {
                     let failure = CandidateFailure(
                         candidateID: id,
                         stage: .carrierConnect,
@@ -1349,22 +1333,67 @@ public actor SubcFedClient {
         let localPrivateKey = try await keyStore.staticPrivateKey()
         let companionKey = try await keyStore.companionSigningPrivateKey()
 
-        var failures = FedCandidateFailureAccumulator()
+        var failures: [String: CandidateFailure] = [:]
         let orderedCandidates: [(FedPeerCandidate, FedDialInitiationRole)] = eligible.compactMap { entry in
             guard let candidate = activeProfile.candidate(id: entry.id) else { return nil }
             return (candidate, entry.role)
         }
+        let networkFactory = dialFactory as? FedNetworkDialFactory
+        var remaining = orderedCandidates
+        if networkFactory != nil {
+            // Keep the order within each class, with the existing direct ladder
+            // (LAN then public) ahead of relay. Custom factories keep profile order.
+            remaining = [.lanDirect, .publicDirect, .relay].flatMap { candidateClass in
+                orderedCandidates.filter { $0.0.candidateClass == candidateClass }
+            }
+        }
+        let dialOrder = remaining.map { $0.0.candidateID }
 
-        for (candidate, role) in orderedCandidates {
+        func recordFailure(_ failure: CandidateFailure, for candidate: FedPeerCandidate) {
+            failures[failure.candidateID] = failure
+            planner.noteFailure(candidateID: failure.candidateID, candidateClass: candidate.candidateClass,
+                failure: failure, facts: suppressionFacts(for: candidate, snapshot: snapshot, profile: activeProfile))
+        }
+
+        while let first = remaining.first {
             if isDialStale(generation) {
                 throw FedFailure.cancelled
             }
-            publish(.dialing(
-                attemptID: attemptID,
-                candidateID: candidate.candidateID,
-                stage: .carrierConnect
-            ))
-            carrierOperationsStarted &+= 1
+            let (candidate, role): (FedPeerCandidate, FedDialInitiationRole)
+            let directCarrier: FedTCPRecordCarrier?
+            if let networkFactory, first.0.candidateClass != .relay {
+                let direct = remaining.prefix { $0.0.candidateClass != .relay }.map { $0.0 }
+                let result: FedDirectConnectResult
+                do {
+                    result = try await networkFactory.raceDirect(direct, clock: clock, policy: dialPolicy) { candidate in
+                        try await self.startCarrier(candidate, attemptID: attemptID, generation: generation)
+                    }
+                } catch is CancellationError {
+                    throw FedFailure.cancelled
+                }
+                if isDialStale(generation) {
+                    await result.winner?.carrier.close()
+                    throw FedFailure.cancelled
+                }
+                for (index, failure) in result.failures {
+                    recordFailure(failure, for: direct[index])
+                }
+                if let winner = result.winner {
+                    (candidate, role) = remaining[winner.index]
+                    directCarrier = winner.carrier
+                    // A later racer may have published its connect stage first.
+                    publish(.dialing(attemptID: attemptID, candidateID: candidate.candidateID, stage: .noiseHandshake))
+                    remaining.remove(at: winner.index)
+                } else {
+                    remaining.removeFirst(direct.count)
+                    continue
+                }
+                remaining.removeAll { failures[$0.0.candidateID] != nil }
+            } else {
+                (candidate, role) = remaining.removeFirst()
+                directCarrier = nil
+                try startCarrier(candidate, attemptID: attemptID, generation: generation)
+            }
             let context = FedDialAttemptContext(
                 attemptID: attemptID,
                 localPublicKey: localPublicKey,
@@ -1387,7 +1416,12 @@ public actor SubcFedClient {
                 appAttestProvider: appAttestProvider
             )
             do {
-                let dialed = try await dialFactory.dial(candidate: candidate, context: context)
+                let dialed: FedDialedSession
+                if let directCarrier, let networkFactory {
+                    dialed = try await networkFactory.dialDirect(carrier: directCarrier, context: context)
+                } else {
+                    dialed = try await dialFactory.dial(candidate: candidate, context: context)
+                }
                 // A cancelled dial can still return a carrier. Close it before
                 // establishment, which could otherwise wait forever for hello.
                 if isDialStale(generation) {
@@ -1449,41 +1483,17 @@ public actor SubcFedClient {
             } catch let error as FedStateStoreClosed {
                 await handleSessionLoss(error)
                 throw error
-            } catch let failure as FedFailure {
-                if failure == .cancelled {
-                    // Stale-dial abort: the invalidating event owns the published
-                    // state; propagate without overwrite or reconnect scheduling.
-                    throw failure
-                }
-                if failure.isTerminalProfileFailure {
-                    throw finishAttempt(with: failure, attemptID: attemptID)
-                }
-                let reason = fedCandidateFailure(
-                    candidateID: candidate.candidateID,
-                    stage: .carrierConnect,
-                    error: failure
-                ) ?? .transport(.otherTransport)
-                let recorded = CandidateFailure(
-                    candidateID: candidate.candidateID,
-                    stage: failureStage(reason),
-                    reason: reason
-                )
-                failures.append(
-                    candidateID: recorded.candidateID,
-                    stage: recorded.stage,
-                    reason: recorded.reason
-                )
-                planner.noteFailure(
-                    candidateID: candidate.candidateID,
-                    candidateClass: candidate.candidateClass,
-                    failure: recorded,
-                    facts: suppressionFacts(
-                        for: candidate,
-                        snapshot: snapshot,
-                        profile: activeProfile
-                    )
-                )
             } catch {
+                if let failure = error as? FedFailure {
+                    if failure == .cancelled {
+                        // The invalidating event owns the published state. Do not
+                        // overwrite it or schedule a reconnect from this attempt.
+                        throw failure
+                    }
+                    if failure.isTerminalProfileFailure {
+                        throw finishAttempt(with: failure, attemptID: attemptID)
+                    }
+                }
                 let reason = fedCandidateFailure(
                     candidateID: candidate.candidateID,
                     stage: .carrierConnect,
@@ -1494,26 +1504,20 @@ public actor SubcFedClient {
                     stage: failureStage(reason),
                     reason: reason
                 )
-                failures.append(
-                    candidateID: recorded.candidateID,
-                    stage: recorded.stage,
-                    reason: recorded.reason
-                )
-                planner.noteFailure(
-                    candidateID: candidate.candidateID,
-                    candidateClass: candidate.candidateClass,
-                    failure: recorded,
-                    facts: suppressionFacts(
-                        for: candidate,
-                        snapshot: snapshot,
-                        profile: activeProfile
-                    )
-                )
+                recordFailure(recorded, for: candidate)
             }
         }
 
-        let aggregate = failures.aggregateFailure ?? .disconnected
-        throw finishAttempt(with: aggregate, attemptID: attemptID, scheduleReconnect: failures.hasRetryablePartition)
+        let orderedFailures = dialOrder.compactMap { failures[$0] }
+        let aggregate: FedFailure = orderedFailures.isEmpty ? .disconnected : .allCandidatesFailed(orderedFailures)
+        throw finishAttempt(with: aggregate, attemptID: attemptID,
+            scheduleReconnect: orderedFailures.contains { $0.reason.permitsAutomaticReconnect })
+    }
+
+    private func startCarrier(_ candidate: FedPeerCandidate, attemptID: String, generation: UInt64) throws {
+        guard !isDialStale(generation) else { throw FedFailure.cancelled }
+        publish(.dialing(attemptID: attemptID, candidateID: candidate.candidateID, stage: .carrierConnect))
+        carrierOperationsStarted &+= 1
     }
 
     // MARK: - Receive / calls

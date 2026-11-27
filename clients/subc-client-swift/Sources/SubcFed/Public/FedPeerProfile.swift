@@ -505,6 +505,22 @@ public enum FedDialOwnership {
     }
 }
 
+extension FedPeerCandidate {
+    /// For LAN candidates, non-IPv4 hosts (including hostnames and IPv6
+    /// literals) pass through for dialing. A carrier-grade NAT (CGNAT) interface
+    /// allows mesh targets even when their addresses are not in the observed subnet.
+    func directHygieneRejection(peerVerified: Bool, snapshot: FedObservedNetworkSnapshot) -> CandidateRejectionReason? {
+        switch self {
+        case .lanDirect(let lan):
+            return FedLANCandidateHygiene.classifyIPv4String(lan.host, peerVerified: peerVerified, snapshot: snapshot)
+        case .publicDirect(let candidate):
+            return FedPublicCandidateHygiene.classify(host: candidate.host, peerVerified: peerVerified)
+        case .relay:
+            return nil
+        }
+    }
+}
+
 /// LAN-direct hygiene checks are performed and reported during the `carrierConnect` stage.
 public enum FedLANCandidateHygiene {
     /// Classifies a concrete IP for LAN-direct eligibility without performing

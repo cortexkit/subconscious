@@ -82,21 +82,17 @@ extension FedShareClient {
                 try ledger.withLedgerLock { try $0.nextUploadMember(id, nowNanoseconds: clock.nowNanoseconds()) }
             }
             guard next != nil else { break }
-            let candidates = computer.lanCandidates.map(FedPeerCandidate.lanDirect)
-                + computer.publicCandidates.map(FedPeerCandidate.publicDirect)
-            var transport: (any FedSessionByteTransport)?
-            for candidate in candidates {
-                try Task.checkCancellation()
-                do { transport = try await dial(candidate, privateKey, computer.publicKey); break }
-                catch is CancellationError { throw CancellationError() }
-                catch { continue }
+            let (connection, remote): (FedShareConnection, FedShareRemote)
+            do {
+                (connection, remote) = try await openShare(to: computer, privateKey: privateKey)
+            } catch let failure as FedShareDialFailed {
+                if let negotiation = failure.bye { bye = negotiation.code }
+                break
             }
-            guard let transport else { break }
-            let connection = FedShareConnection(transport: transport, maximumBodyBytes: UInt32(policy.maxBodyBytes), clock: clock)
             let session: (calls: [FedShareCallResult], bye: String?, rollover: Bool)
             session = try await withTaskCancellationHandler {
                 do {
-                    let report = try await exchangeUpload(work, computer: computer, ownKey: ownKey, connection: connection)
+                    let report = try await exchangeUpload(work, computer: computer, ownKey: ownKey, connection: connection, remote: remote)
                     await connection.close()
                     return report
                 } catch {
@@ -112,10 +108,7 @@ extension FedShareClient {
     }
 
     private func exchangeUpload(_ work: FedShareUploadWork, computer: FedShareDirectoryEntry, ownKey: Data,
-                                connection: FedShareConnection) async throws -> (calls: [FedShareCallResult], bye: String?, rollover: Bool) {
-        let remote: FedShareRemote
-        do { remote = try await negotiate(computer: computer, connection: connection) }
-        catch { return ([], shareCloseCode(error), false) }
+                                connection: FedShareConnection, remote: FedShareRemote) async throws -> (calls: [FedShareCallResult], bye: String?, rollover: Bool) {
         var budget = FedShareBudget(remote: remote)
         var calls: [FedShareCallResult] = []
         var rollover = false

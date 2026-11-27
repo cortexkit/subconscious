@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.20
+
+- Require subc-daemon 0.54.4 for tests.
+
 ## 0.2.19
 
 - Require subc-daemon 0.54.0 for narrow flow-scope authority.

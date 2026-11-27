@@ -82,9 +82,26 @@ impl RescanMode {
     }
 }
 
-/// One supervised module as a rescan finds it: the module, its staged launch
-/// spec and health policy, and whether it is enabled.
-pub(super) type CurrentModule = (SupervisedModule, ModuleSpec, HealthConfig, bool);
+/// One supervised module as a rescan finds it.
+pub(super) struct CurrentModule {
+    module: SupervisedModule,
+    spec: ModuleSpec,
+    health: HealthConfig,
+    enabled: bool,
+    drain_timeout: Duration,
+    staged_drain_timeout: Option<Duration>,
+}
+
+impl CurrentModule {
+    fn drain_changed(&self, next: Duration) -> bool {
+        // A swap can acknowledge an update before replaying it. Comparing
+        // the last staged budget too lets a later rescan undo that update.
+        self.drain_timeout != next
+            || self
+                .staged_drain_timeout
+                .is_some_and(|staged| staged != next)
+    }
+}
 
 #[derive(Debug, Default)]
 pub(super) struct ModuleEntries {
@@ -160,19 +177,6 @@ pub(super) fn entry_pending_fields(
             }),
         );
     }
-    let drain = |module: &ConfiguredModule| {
-        module
-            .drain_timeout_ms
-            .map(Duration::from_millis)
-            .unwrap_or(crate::supervise::DEFAULT_DRAIN_TIMEOUT)
-    };
-    if !applies_configuration && drain(current) != drain(next) {
-        add(
-            "drain_timeout_ms",
-            Apply::WithNextLaunchOrHealthChange,
-            serde_json::json!(drain(next).as_millis() as u64),
-        );
-    }
     let relay = |module: &ConfiguredModule| {
         module
             .route_bind_relay_timeout_ms
@@ -193,7 +197,31 @@ pub(super) fn entry_pending_fields(
             serde_json::json!(next.registration_channel),
         );
     }
+    if !applies_configuration {
+        let default = crate::supervise::DEFAULT_DRAIN_TIMEOUT;
+        fields.extend(pending_drain_timeout(
+            configured_drain_timeout(current, default),
+            configured_drain_timeout(next, default),
+        ));
+    }
     fields
+}
+
+fn configured_drain_timeout(entry: &ConfiguredModule, default: Duration) -> Duration {
+    entry
+        .drain_timeout_ms
+        .map_or(default, Duration::from_millis)
+}
+
+fn pending_drain_timeout(
+    effective: Duration,
+    configured: Duration,
+) -> Option<subc_control::SupervisorPendingField> {
+    (effective != configured).then(|| subc_control::SupervisorPendingField {
+        field: "drain_timeout_ms".to_owned(),
+        applies: subc_control::PendingModuleApply::WithNextLaunchOrHealthChange,
+        value: Some(serde_json::json!(duration_ms(configured))),
+    })
 }
 
 impl ControlHandler {
@@ -237,9 +265,15 @@ impl ControlHandler {
                 )
             })
             .unwrap_or_default();
-        let Some(next) = proposed.cloned().or(recorded) else {
+        let Some(mut next) = proposed.cloned().or(recorded) else {
             return Ok(Vec::new());
         };
+        if let Some(context) = &self.rescan {
+            next.drain_timeout_ms = Some(duration_ms(configured_drain_timeout(
+                &next,
+                context.supervisor.default_drain_timeout(),
+            )));
+        }
         let status = module.status().map_err(|e| e.to_string())?;
         let mut current = next.clone();
         current.register_timeout = module
@@ -288,7 +322,7 @@ pub(super) struct RescanPlan {
     /// one until it restarts.
     pub(super) changed_pending_reload: Vec<String>,
     pub(super) changed_pending: Vec<subc_control::SupervisorPendingModule>,
-    /// Modules whose launch spec or health policy changes.
+    /// Modules whose launch spec, health policy, or drain budget changes.
     pub(super) configuration_changes: BTreeSet<String>,
     pub(super) enabled_changes: BTreeSet<String>,
     pub(super) unchanged: u32,
@@ -341,6 +375,7 @@ fn duration_ms(duration: Duration) -> u64 {
 fn changed_parts(
     current_spec: &ModuleSpec,
     current_health: &HealthConfig,
+    drain_changed: bool,
     configured: &ConfiguredModule,
 ) -> Vec<String> {
     let next = configured.module_spec();
@@ -360,6 +395,7 @@ fn changed_parts(
             current_spec.carry_containment != next.carry_containment,
         ),
         ("health", *current_health != configured.health),
+        ("drain_timeout_ms", drain_changed),
     ]
     .into_iter()
     .filter(|(_, changed)| *changed)
@@ -633,9 +669,9 @@ impl ControlHandler {
         modules: Vec<ConfiguredModule>,
         candidate: &str,
     ) -> Result<SupervisorRescanResult, String> {
-        let plan = self.plan_rescan(modules)?;
+        let default_drain_timeout = context.supervisor.default_drain_timeout();
+        let plan = self.plan_rescan(modules, default_drain_timeout)?;
         let mut result = plan.preview_result();
-        let default_drain_ms = duration_ms(context.supervisor.default_drain_timeout());
         let module_ids = plan
             .current
             .keys()
@@ -649,23 +685,33 @@ impl ControlHandler {
                 (None, Some(configured)) if configured.enabled => {
                     (RescanModuleActionKind::Start, Vec::new())
                 }
-                (Some((_, _, _, true)), None) => (RescanModuleActionKind::Stop, Vec::new()),
-                (Some((_, _, _, enabled)), Some(configured)) if *enabled != configured.enabled => {
+                (Some(current), None) if current.enabled => {
+                    (RescanModuleActionKind::Stop, Vec::new())
+                }
+                (Some(current), Some(configured)) if current.enabled != configured.enabled => {
                     if configured.enabled {
                         (RescanModuleActionKind::Start, Vec::new())
                     } else {
                         (RescanModuleActionKind::Stop, Vec::new())
                     }
                 }
-                (Some((_, spec, health, enabled)), Some(configured))
+                (Some(current), Some(configured))
                     if plan.configuration_changes.contains(module_id) =>
                 {
-                    let changed = changed_parts(spec, health, configured);
+                    let changed = changed_parts(
+                        &current.spec,
+                        &current.health,
+                        current.drain_changed(configured_drain_timeout(
+                            configured,
+                            default_drain_timeout,
+                        )),
+                        configured,
+                    );
                     // A rescan stores new launch inputs without touching the
                     // running process, so only a module that is enabled needs
                     // a restart to use them. A disabled one starts with them
                     // whenever it is enabled.
-                    if *enabled && plan.changed_pending_reload.contains(module_id) {
+                    if current.enabled && plan.changed_pending_reload.contains(module_id) {
                         (RescanModuleActionKind::Restart, changed)
                     } else {
                         (RescanModuleActionKind::Reload, changed)
@@ -684,8 +730,8 @@ impl ControlHandler {
                 entry.action,
                 RescanModuleActionKind::Restart | RescanModuleActionKind::Stop
             ) {
-                if let Some((module, ..)) = current {
-                    let status = module.status().map_err(|err| {
+                if let Some(current) = current {
+                    let status = current.module.status().map_err(|err| {
                         format!("failed to read status for module_id '{module_id}': {err}")
                     })?;
                     // A rescan that changes the entry also installs its drain
@@ -693,7 +739,7 @@ impl ControlHandler {
                     // keeps the budget it runs with now.
                     entry.drain_timeout_ms = Some(match configured {
                         Some(configured) if plan.configuration_changes.contains(module_id) => {
-                            configured.drain_timeout_ms.unwrap_or(default_drain_ms)
+                            duration_ms(configured_drain_timeout(configured, default_drain_timeout))
                         }
                         _ => duration_ms(status.drain_timeout),
                     });
@@ -720,15 +766,15 @@ impl ControlHandler {
             }
             result.module_actions.push(entry);
         }
-        for (module_id, (module, spec, _, _)) in &plan.current {
+        for (module_id, current) in &plan.current {
             if drained.contains(module_id) {
                 continue;
             }
-            let status = module.status().map_err(|err| {
+            let status = current.module.status().map_err(|err| {
                 format!("failed to read status for module_id '{module_id}': {err}")
             })?;
             if launch_spec_agreement(
-                spec,
+                &current.spec,
                 status.process_alive,
                 status.launch_spec_digest.as_ref(),
             ) == LaunchSpecAgreement::Mismatch
@@ -1132,7 +1178,23 @@ impl ControlHandler {
     fn plan_rescan(
         &self,
         configured_modules: Vec<crate::daemon_config::ConfiguredModule>,
+        default_drain_timeout: Duration,
     ) -> Result<RescanPlan, String> {
+        let staged_drain_timeouts = self.rescan.as_ref().map(|context| {
+            context
+                .module_entries
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .configured
+                .iter()
+                .map(|(id, entry)| {
+                    (
+                        id.clone(),
+                        configured_drain_timeout(entry, default_drain_timeout),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        });
         let mut current = BTreeMap::new();
         for module in self.supervisor.list() {
             let (spec, health) = module.configuration().map_err(|err| {
@@ -1141,18 +1203,26 @@ impl ControlHandler {
                     module.module_id()
                 )
             })?;
-            let enabled = module
-                .status()
-                .map_err(|err| {
-                    format!(
-                        "failed to read status for module_id '{}': {err}",
-                        module.module_id()
-                    )
-                })?
-                .enabled;
+            let status = module.status().map_err(|err| {
+                format!(
+                    "failed to read status for module_id '{}': {err}",
+                    module.module_id()
+                )
+            })?;
+            let staged_drain_timeout = staged_drain_timeouts
+                .as_ref()
+                .and_then(|timeouts| timeouts.get(module.module_id()))
+                .copied();
             current.insert(
                 module.module_id().to_string(),
-                (module, spec, health, enabled),
+                CurrentModule {
+                    module,
+                    spec,
+                    health,
+                    enabled: status.enabled,
+                    drain_timeout: status.drain_timeout,
+                    staged_drain_timeout,
+                },
             );
         }
         let configured = configured_modules
@@ -1181,19 +1251,19 @@ impl ControlHandler {
             .and_then(|owner| owner.polled_snapshot().ok());
 
         for (module_id, configured_module) in &configured {
-            let Some((module, current_spec, current_health, current_enabled)) =
-                current.get(module_id)
-            else {
+            let Some(current) = current.get(module_id) else {
                 continue;
             };
             // Compare the whole launch spec so a future launch field cannot
             // accidentally become a live-only policy change. Health is stored
             // separately and applies live without replacing the process.
-            let launch_changed = *current_spec != configured_module.module_spec();
+            let launch_changed = current.spec != configured_module.module_spec();
+            let drain_timeout = configured_drain_timeout(configured_module, default_drain_timeout);
+            let drain_changed = current.drain_changed(drain_timeout);
             let configuration_changed =
-                launch_changed || *current_health != configured_module.health;
+                launch_changed || current.health != configured_module.health || drain_changed;
             let pending = self.pending_module_fields(
-                module,
+                &current.module,
                 Some(configured_module),
                 configuration_changed,
                 Self::registration_channel_in_force(
@@ -1232,7 +1302,7 @@ impl ControlHandler {
             }
             // Applying a rescan also replaces the recorded config value, even
             // when an operator already put the runtime in the requested state.
-            let enabled_changed = *current_enabled != configured_module.enabled
+            let enabled_changed = current.enabled != configured_module.enabled
                 || self
                     .capability_evaluator
                     .configured_enabled(module_id)
@@ -1278,7 +1348,8 @@ impl ControlHandler {
         preview: bool,
         requester: Principal,
     ) -> Result<(SupervisorRescanResult, Vec<String>), String> {
-        let plan = self.plan_rescan(configured_modules)?;
+        let default_drain_timeout = supervisor.default_drain_timeout();
+        let plan = self.plan_rescan(configured_modules, default_drain_timeout)?;
 
         // Everything above this point is pure computation over two snapshots.
         // Everything below MUTATES. The preview returns here so the boundary is a
@@ -1299,7 +1370,7 @@ impl ControlHandler {
             added,
             removed,
             changed_pending_reload,
-            changed_pending,
+            mut changed_pending,
             configuration_changes,
             enabled_changes,
             unchanged,
@@ -1325,7 +1396,7 @@ impl ControlHandler {
             let module = &current
                 .get(module_id)
                 .expect("removed module came from current supervisor state")
-                .0;
+                .module;
             module
                 .retire_requested(Some(requester.clone()))
                 .await
@@ -1371,9 +1442,10 @@ impl ControlHandler {
         }
 
         for module_id in configured.keys() {
-            let Some((module, _, _, current_enabled)) = current.get(module_id) else {
+            let Some(current) = current.get(module_id) else {
                 continue;
             };
+            let module = &current.module;
             let configured_module = configured
                 .get(module_id)
                 .expect("configured module id came from configured map");
@@ -1390,10 +1462,29 @@ impl ControlHandler {
                             "failed to update module_id '{module_id}' configuration during rescan: {err}"
                         )
                     })?;
+                let effective = module
+                    .status()
+                    .map_err(|err| err.to_string())?
+                    .drain_timeout;
+                let configured = configured_drain_timeout(configured_module, default_drain_timeout);
+                if let Some(mut field) = pending_drain_timeout(effective, configured) {
+                    field.value = None;
+                    if let Some(pending) = changed_pending
+                        .iter_mut()
+                        .find(|pending| pending.module_id == *module_id)
+                    {
+                        pending.fields.push(field);
+                    } else {
+                        changed_pending.push(subc_control::SupervisorPendingModule {
+                            module_id: module_id.clone(),
+                            fields: vec![field],
+                        });
+                    }
+                }
             }
             // Config-only drift is applied by the evaluator's config update;
             // do not turn it into a runtime start or stop.
-            if *current_enabled != configured_module.enabled {
+            if current.enabled != configured_module.enabled {
                 // A rescan that starts or stops a module applies an operator's
                 // edit to the config, so the resulting outage was asked for.
                 self.route_outages.mark_operator_action(module_id);
@@ -1409,6 +1500,7 @@ impl ControlHandler {
                     })?;
             }
         }
+        changed_pending.sort_by(|a, b| a.module_id.cmp(&b.module_id));
 
         for module_id in &added {
             let configured_module = configured

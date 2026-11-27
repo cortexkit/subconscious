@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.13.10
+
+- Require subc-daemon 0.54.4 for tests.
+
 ## 0.13.9
 
 - Test only: the sentinel restart test waits for the verdict file instead of

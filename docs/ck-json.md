@@ -262,10 +262,12 @@ returned as `module` by `module status --json`) optionally carry
 `pending:[{field:string,applies:string,value:JSON}]` with the configured values.
 Empty pending arrays are omitted. A dry run does not stage status values.
 Activation boundaries are `next_supervision` (daemon restart or remove/re-add,
-not a child respawn), `with_next_launch_or_health_change` (or daemon restart),
-`daemon_restart`, and `config_gate` (the configuration approval system must
-accept and activate the module entry; rescan alone cannot do so). These
-diagnostics do not change when configuration takes effect.
+not a child respawn), `daemon_restart`, and `config_gate` (the configuration
+approval system must accept and activate the module entry; rescan alone cannot
+do so). A successful rescan normally applies `drain_timeout_ms` without a
+pending row. A swap already in progress keeps its original budget, and the
+field can appear as `with_next_launch_or_health_change` until the swap finishes.
+Older daemons can also report this value for drain-only edits outside a swap.
 
 ### `ck.module.release/v1`
 

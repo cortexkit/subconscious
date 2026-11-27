@@ -1672,17 +1672,21 @@ pub(super) async fn handle_supervisor_command(
                 }));
                 return true;
             }
-            stage_supervisor_configuration(
-                spec,
-                runtime,
-                snapshot,
-                next_spec,
-                health,
-                drain_timeout_ms,
-            );
-            let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
-                state.configuration_updated_since_spawn = true;
-            });
+            if *spec == next_spec && runtime.health == health {
+                stage_drain_timeout(runtime, drain_timeout_ms);
+            } else {
+                stage_supervisor_configuration(
+                    spec,
+                    runtime,
+                    snapshot,
+                    next_spec,
+                    health,
+                    drain_timeout_ms,
+                );
+                let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
+                    state.configuration_updated_since_spawn = true;
+                });
+            }
             let _ = reply.send(Ok(()));
             true
         }
@@ -1757,6 +1761,12 @@ fn stage_supervisor_configuration(
             state.last_probe_evidence = None;
         });
     }
+    stage_drain_timeout(runtime, drain_timeout_ms);
+}
+
+fn stage_drain_timeout(runtime: &mut SupervisorRuntimeConfig, drain_timeout_ms: Option<u64>) {
+    // Drains take a copy of the budget when they begin, so this update only
+    // affects future drains and never moves an in-progress deadline.
     runtime.drain_timeout = drain_timeout_ms
         .map(Duration::from_millis)
         .unwrap_or(runtime.default_drain_timeout);

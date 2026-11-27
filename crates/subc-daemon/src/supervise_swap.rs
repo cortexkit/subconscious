@@ -778,8 +778,9 @@ fn serve_command_while_warming(
             reply,
         } => {
             let _ = reply.send(Ok(()));
-            // The caller has its answer; the replayed command's reply channel
-            // has no receiver and is only there to fit the command's shape.
+            // A swap keeps the drain budget it started with, even if it hasn't
+            // begun draining the incumbent yet. Replay the update after the swap
+            // so subsequent drains use it. The caller already has its answer.
             let (unanswered, _) = oneshot::channel();
             end.requeue.push(SupervisorCommand::UpdateConfiguration {
                 spec,

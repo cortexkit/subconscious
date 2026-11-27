@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.54.4
+
+- Apply drain timeout edits on module rescan, including changes to the inherited
+  daemon default. A drain or swap already in progress keeps its original budget.
+
 ## 0.54.3
 
 - An in-place upgrade now resumes a module that keeps its container across

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.24.4
+
+- Require subc-daemon 0.54.4 so `ck module rescan` applies drain timeout edits
+  to subsequent drains without a module or daemon restart.
+
 ## 0.24.3
 
 - Install and upgrade Plexus with its admin command and a verified, journaled

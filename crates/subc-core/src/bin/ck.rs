@@ -10159,6 +10159,8 @@ mod tests {
 
     /// This fixture pins the bytes emitted by the `--json` renderer. Human-only
     /// dashboard and footer changes must not alter machine-consumed output.
+    /// A drain row can still arrive during a swap, or from an older daemon that
+    /// defers drain-only edits, so it stays among the rendered fields.
     #[test]
     fn rescan_pending_fields_and_status_explain_activation_and_values() {
         let fields = json!([

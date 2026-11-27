@@ -25,7 +25,7 @@ An explicit `0` is a value, not an absent setting.
 
 | Key | What it bounds | Built-in default | `0` |
 | --- | --- | --- | --- |
-| `drain_timeout_ms` | Time for already-dispatched requests to finish while a module tears down. | 30,000 ms | Accepted: tear the module down now. This is the wedge-bounce action. |
+| `drain_timeout_ms` | Time for already-dispatched requests to finish while a module tears down. `ck module rescan` applies the module override or inherited daemon default to the next drain. A drain or swap already in progress keeps its original budget. | 30,000 ms | Accepted: tear the module down now. |
 | `route_bind_relay_timeout_ms` | Time for a target module to acknowledge a relayed `route.bind` before the daemon reports `module_timeout`. | 12,000 ms | Refused at both the daemon and module layers. A zero budget makes every bind to that module fail instantly and forever; use `enabled: false` to make a module unreachable. |
 
 The `0` asymmetry is intentional. `drain_timeout_ms: 0` remains a valid
@@ -120,8 +120,8 @@ reload, or re-enable hands the whole budget back; `lifetime_restarts` is the
 ledger and never moves backwards.
 
 The block is read when a module starts being supervised (daemon start, or a
-rescan that adds the module). Like `drain_timeout_ms`, editing it for an
-already-running module takes effect on the next daemon start.
+rescan that adds the module). Editing it for an already-running module takes
+effect on the next daemon start.
 
 ## `protocol` declares whether a module speaks subc at all
 

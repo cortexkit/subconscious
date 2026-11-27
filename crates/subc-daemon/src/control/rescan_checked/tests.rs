@@ -45,6 +45,7 @@ impl Rig {
     fn new(config: &Path, incarnation: &str) -> Self {
         let registry = Arc::new(Registry::default());
         let handle = SupervisorHandle::new();
+        let handler = ControlHandler::new(registry.clone());
         // On macOS every child, even one with no control protocol, is started
         // through the privacy trampoline (the helper that execs it as its own
         // responsible process, so it never borrows the daemon's privacy grants).
@@ -53,9 +54,10 @@ impl Rig {
         let supervisor =
             Supervisor::new_for_test(registry.clone(), RestartPolicy::new(0, Duration::ZERO))
                 .with_handle(handle.clone())
+                .with_forwarding(handler.forwarding())
                 .with_daemon_incarnation(incarnation.to_string());
         let ledger = ScratchDir::new("rescan-checked-ledger");
-        let handler = ControlHandler::new(registry)
+        let handler = handler
             .with_supervisor(handle)
             .with_activity_ledger(ledger.path(), incarnation.to_string())
             .with_supervisor_rescan(supervisor, config, None);
@@ -315,15 +317,162 @@ async fn rescan_unstamped_registration_channel_is_not_pending() {
     assert!(status["modules"][0].get("pending").is_none(), "{status}");
 }
 
+#[cfg(unix)]
 #[tokio::test]
-async fn rescan_pending_covers_every_non_launch_policy_without_applying_it() {
+async fn rescan_drain_only_change_sets_the_next_restart_accepting_budget() {
+    use crate::control::claims::tests::Wire;
+    use subc_protocol::session::ACCEPTING_DRAIN_CAPABILITY;
+
+    const NEW_BUDGET_MS: u64 = 60_000;
+    let dir = ScratchDir::new("rescan-restart-drain-budget");
+    let rig = Rig::new(&dir.join("subc.jsonc"), "drain-budget");
+    let handle = &rig.handler.supervisor;
+    handle.capture_registration_channels_for_test();
+    let mut worker = json!({
+        "program": "/bin/sleep", "args": ["600"], "protocol": "subc",
+        "reserved": true, "drain_timeout_ms": 0,
+        "env": {"XDG_DATA_HOME": dir.path(), "XDG_RUNTIME_DIR": dir.path(), "XDG_CONFIG_HOME": dir.path()},
+    });
+    rig.write(&doc(json!({"worker": worker})));
+    assert_eq!(rig.apply_file().await.added, ["worker"]);
+    let module = handle.get("worker").unwrap();
+    let before = module.status().unwrap();
+    assert_eq!(before.drain_timeout, Duration::ZERO);
+    let pid = rustix::process::Pid::from_raw(before.pid.unwrap() as i32).unwrap();
+
+    let router = Arc::new(crate::Router::with_control_handler(Arc::new(
+        rig.handler.clone(),
+    )));
+    let mut wire = Wire::new(&router);
+    let launch = handle.registration_for_test("worker").unwrap();
+    tokio::time::timeout(Duration::from_secs(5), launch.wait_launch())
+        .await
+        .unwrap();
+    launch.bind(wire.connection.id());
+    let mut manifest = ModuleManifest::builder("worker", "1.0.0").build();
+    manifest.capabilities = Some(CapabilityDeclarations {
+        provides: vec![ACCEPTING_DRAIN_CAPABILITY.into()],
+        requires: Vec::new(),
+        must_never_reach: Vec::new(),
+    });
+    let hello = Frame::build(
+        FrameType::Hello,
+        control_flags(),
+        0,
+        0,
+        1,
+        serde_json::to_vec(&ModuleHelloBody {
+            manifest,
+            protocol_ver: PROTOCOL_VERSION,
+            module_capabilities: None,
+            resume_token: None,
+            control_ops: None,
+            launch_nonce: None,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        wire.call(&router, hello).await.header.ty,
+        FrameType::HelloAck
+    );
+
+    worker["drain_timeout_ms"] = json!(NEW_BUDGET_MS);
+    rig.write(&doc(json!({"worker": worker})));
+    let rescan = rig.apply_file().await;
+    let staged = module.status().unwrap();
+    assert_eq!(
+        staged.pid, before.pid,
+        "rescan must not replace the process"
+    );
+    let unix_ms = || std::time::UNIX_EPOCH.elapsed().unwrap().as_millis() as u64;
+    let earliest_start = unix_ms();
+    module.restart(None).await.unwrap();
+    let notice = tokio::time::timeout(Duration::from_secs(5), wire.replies.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let latest_start = unix_ms();
+    let body: Value = serde_json::from_slice(&notice.frame.body).unwrap();
+
+    // The fixture stands in for the module closing its connection and exiting.
+    rig.handler
+        .cleanup_connection(wire.connection.id())
+        .unwrap();
+    match rustix::process::kill_process(pid, rustix::process::Signal::TERM) {
+        Ok(()) | Err(rustix::io::Errno::SRCH) => {}
+        Err(error) => panic!("failed to stop test child: {error}"),
+    }
+    module.stop().await.unwrap();
+
+    assert_eq!(body["op"], "module.draining");
+    assert_eq!(
+        body["accepting"], true,
+        "plain restart must use the nonzero rescan budget"
+    );
+    let deadline = body["deadline_ms"].as_u64().unwrap();
+    assert!((earliest_start + NEW_BUDGET_MS..=latest_start + NEW_BUDGET_MS).contains(&deadline));
+    assert_eq!(staged.drain_timeout, Duration::from_millis(NEW_BUDGET_MS));
+    assert!(rescan.changed_pending.is_empty(), "{rescan:?}");
+    assert!(rescan.changed_pending_reload.is_empty(), "{rescan:?}");
+    assert_eq!(rescan.unchanged, 0);
+}
+
+#[tokio::test]
+async fn rescan_updates_the_inherited_drain_budget_without_changing_an_override() {
+    let dir = ScratchDir::new("rescan-default-drain-budget");
+    let rig = Rig::new(&dir.join("subc.jsonc"), "default-drain-budget");
+    let inherited = entry(false);
+    let mut explicit = entry(false);
+    explicit["drain_timeout_ms"] = json!(0);
+    let config = |default: Option<u64>| {
+        let mut config =
+            json!({"version": 1, "modules": {"inherited": inherited, "explicit": explicit}});
+        if let Some(default) = default {
+            config["drain_timeout_ms"] = json!(default);
+        }
+        config.to_string()
+    };
+    rig.write(&config(Some(15_000)));
+    rig.apply_file().await;
+
+    let draft = config(Some(45_000));
+    let preview = rig.preview(&draft).await.unwrap();
+    assert_eq!(preview.unchanged, 1);
+    assert!(preview.changed_pending.is_empty());
+    assert_eq!(preview.module_actions.len(), 1);
+    assert_eq!(preview.module_actions[0].module_id, "inherited");
+    assert_eq!(
+        preview.module_actions[0].action,
+        RescanModuleActionKind::Reload
+    );
+    assert_eq!(preview.module_actions[0].changed, ["drain_timeout_ms"]);
+
+    for (default, expected) in [(Some(45_000), 45_000), (None, 30_000)] {
+        rig.write(&config(default));
+        let result = rig.apply_file().await;
+        assert_eq!(result.unchanged, 1);
+        assert!(result.changed_pending.is_empty());
+        assert!(result.changed_pending_reload.is_empty());
+        let status = rig.send(ClientControlRequest::SupervisorList {}).await;
+        let status: Value = serde_json::from_slice(&status.body).unwrap();
+        let modules = status["modules"].as_array().unwrap();
+        assert_eq!(modules.len(), 2);
+        for module in modules {
+            match module["module_id"].as_str().unwrap() {
+                "explicit" => assert_eq!(module["drain_timeout_ms"], 0),
+                "inherited" => assert_eq!(module["drain_timeout_ms"], expected),
+                other => panic!("unexpected supervised module: {other}"),
+            }
+            assert!(module.get("pending").is_none(), "{module}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn rescan_pending_restart_and_relay_policies_remain_deferred() {
     for (field, value, applies) in [
         ("restart", json!({"max_restarts": 9}), "next_supervision"),
-        (
-            "drain_timeout_ms",
-            json!(60000),
-            "with_next_launch_or_health_change",
-        ),
         (
             "route_bind_relay_timeout_ms",
             json!(60000),
@@ -336,7 +485,7 @@ async fn rescan_pending_covers_every_non_launch_policy_without_applying_it() {
         rig.apply_file().await;
         let mut next = entry(false);
         next[field] = value;
-        rig.write(&doc(json!({"worker": next.clone()})));
+        rig.write(&doc(json!({"worker": next})));
         let result = rig.apply_file().await;
         assert_eq!(result.unchanged, 0, "{field}");
         assert_eq!(result.changed_pending.len(), 1, "{field}");
@@ -348,24 +497,11 @@ async fn rescan_pending_covers_every_non_launch_policy_without_applying_it() {
         let status: Value = serde_json::from_slice(&status.body).unwrap();
         assert_eq!(status["modules"][0]["pending"][0]["field"], field);
         assert_eq!(status["modules"][0]["pending"][0]["applies"], applies);
-        if field == "drain_timeout_ms" {
-            next["env"] = json!({"NEW_LAUNCH_VALUE":"1"});
-            rig.write(&doc(json!({"worker": next})));
-            let result = rig.apply_file().await;
-            assert!(result.changed_pending.is_empty());
-            let status = rig.send(ClientControlRequest::SupervisorList {}).await;
-            let status: Value = serde_json::from_slice(&status.body).unwrap();
-            assert!(status["modules"][0].get("pending").is_none());
-            assert_eq!(status["modules"][0]["drain_timeout_ms"], 60000);
-        }
         rig.write(&doc(json!({"worker": entry(false)})));
         rig.apply_file().await;
         let status = rig.send(ClientControlRequest::SupervisorList {}).await;
         let status: Value = serde_json::from_slice(&status.body).unwrap();
-        // Drain policy only returns to its default with another launch/health update.
-        if field != "drain_timeout_ms" {
-            assert!(status["modules"][0].get("pending").is_none(), "{field}");
-        }
+        assert!(status["modules"][0].get("pending").is_none(), "{field}");
     }
 }
 
@@ -562,7 +698,7 @@ async fn a_candidate_that_adds_env_to_a_module_reports_its_restart() {
     let action = &preview.module_actions[0];
     assert_eq!(action.module_id, "worker");
     assert_eq!(action.action, RescanModuleActionKind::Restart);
-    assert_eq!(action.changed, ["environment"]);
+    assert_eq!(action.changed, ["environment", "drain_timeout_ms"]);
     assert_eq!(action.drain_timeout_ms, Some(1500));
     assert!(preview.earlier_pending.is_empty());
 }

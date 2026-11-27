@@ -238,11 +238,14 @@ ordinary reads, file diagnostics and edit-plan requests.
 returns the selected project's merged values and their sources. Precedence is
 defaults, user, workspace, then project. Workspace and project files live at
 `<registry root>/.cortexkit/<module_id>.jsonc`; module declarations cannot supply
-repository roots. If a project's root also serves as its workspace root, that
-file counts once, as the project's layer for that project. Other workspace
-members can still read it as their workspace layer. `layers` lists present files:
-user layers carry no IDs, workspace layers carry `workspace_id`, and project
-layers carry `project_id`.
+repository roots. Workspace files apply only under a workspace root that
+Entorhinal reports as approved. If approval is missing or not recognized, the
+workspace file is ignored. Project roots must independently meet their own
+eligibility rules. If an eligible project root is also an approved workspace
+root, that file counts once, as the project's layer for that project. Other
+workspace members can still read it as their workspace layer. `layers` lists
+present files: user layers carry no IDs, workspace layers carry `workspace_id`,
+and project layers carry `project_id`.
 
 An optional `through` (`default`, `user`, or `workspace`) selects an inclusive
 cutoff. On stamped installs these views come from the project's own approval,
@@ -612,8 +615,9 @@ What a module does with these is in [`module-surface.md`](module-surface.md).
 `consent/v1`, not a routed capability request. The request is
 `{"op":"projects.enumerate"}`. Success is
 `{"op":"projects.enumerate","result":<EnumerateReply>}`, where `EnumerateReply`
-is the `cortexkit-project-identity` 0.1.5 shape (projects with `rootRecords` and
-workspaces with `root` and `fileId`). Refusals use an `ERROR` frame containing
+is the `cortexkit-project-identity` 0.1.6 shape (projects with `rootRecords` and
+workspaces with `root`, `fileId`, and optional `approval`). Refusals use an
+`ERROR` frame containing
 `{"code":"unavailable","message":"store not open yet"}`, for example, rather
 than a successful response with an error field. The daemon maps refusals to
 `project_registry_unavailable`, preserving the message. Queue admission and

@@ -1,7 +1,9 @@
 use super::settings_observation::SettingsFiles;
 use super::*;
 use crate::config_gate::{
-    capture::CapturedFile, capture_plan::approved_user, project_registry::RegistryScope,
+    capture::CapturedFile,
+    capture_plan::approved_user,
+    project_registry::{approved_workspace_root, layer_path, RegistryScope},
     GateSnapshot, InputKey,
 };
 use std::path::{Path, PathBuf};
@@ -939,28 +941,20 @@ impl RuntimeOwner {
                     let roots = reply
                         .projects
                         .iter()
-                        .flat_map(|project| &project.roots)
+                        .flat_map(|project| project.roots.iter().map(String::as_str))
                         .collect::<BTreeSet<_>>();
                     let mut work = BTreeMap::new();
-                    for workspace in reply.workspaces {
-                        if let Some(root) = workspace.root {
-                            // A root used as both layers is a project-layer
-                            // input: like project files, it is only marked as
-                            // having unapplied edits in status, with no automatic card.
-                            if roots.contains(&root) {
-                                continue;
-                            }
-                            let paths = modules
-                                .iter()
-                                .map(|module| {
-                                    crate::config_gate::project_registry::layer_path(
-                                        Path::new(&root),
-                                        module,
-                                    )
-                                })
-                                .collect::<Vec<_>>();
-                            work.insert(PathBuf::from(root), paths);
+                    for root in reply.workspaces.iter().filter_map(approved_workspace_root) {
+                        // When a root serves both layers, report unapplied
+                        // edits in settings status without opening a review card.
+                        if roots.contains(root) {
+                            continue;
                         }
+                        let paths = modules
+                            .iter()
+                            .map(|module| layer_path(Path::new(root), module))
+                            .collect::<Vec<_>>();
+                        work.insert(PathBuf::from(root), paths);
                     }
                     if let Some(pool) = self.capturer.projects.root_io() {
                         let mut work = work.into_iter();

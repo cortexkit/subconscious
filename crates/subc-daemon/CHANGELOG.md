@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.54.6
+
+- Apply workspace settings files only when the workspace root is approved.
+  Roots without a reported approval are ignored.
+- Test-only: the late project write test gives the root I/O pool 3 seconds
+  instead of 500 ms to start its write, so a loaded Windows runner doesn't
+  miss the write it holds open.
+
 ## 0.54.5
 
 - Log when the daemon ends a carried container, including the module ID, the

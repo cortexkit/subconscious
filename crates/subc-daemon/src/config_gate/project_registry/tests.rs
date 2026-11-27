@@ -55,7 +55,7 @@ fn project(id: &str, roots: Vec<Value>) -> Value {
 }
 
 fn enumeration(projects: Vec<Value>, workspace: &Path) -> EnumerateReply {
-    serde_json::from_value(json!({"projects":projects,"workspaces":[{"workspaceId":"workspace","name":"Workspace","root":workspace,"fileId":file_id(workspace)}],
+    serde_json::from_value(json!({"projects":projects,"workspaces":[{"workspaceId":"workspace","name":"Workspace","root":workspace,"fileId":file_id(workspace),"approval":{"state":"approved","journalSeq":1}}],
         "generation":7,"incarnation":"registry-process"})).unwrap()
 }
 

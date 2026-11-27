@@ -13,6 +13,7 @@ pub use super::root_io::RootIoPool;
 use super::{root_io::RootIoError, GateError, Result};
 use cortexkit_project_identity::{
     Approval, ApprovalState, EnumerateReply, Project, RootIdentity, RootIncarnation, RootRecord,
+    Workspace,
 };
 use serde::{Deserialize, Serialize};
 use subc_config::{Digest, Layer};
@@ -315,7 +316,7 @@ impl RegistryRevision {
                     .filter(|workspace| {
                         project.workspace_id.as_ref() == Some(&workspace.workspace_id)
                     })
-                    .filter_map(|workspace| workspace.root.as_deref());
+                    .filter_map(approved_workspace_root);
                 scope
                     .includes(
                         &project.project_id,
@@ -395,7 +396,7 @@ impl RegistryRevision {
                 if matches.next().is_some() {
                     return Err(unavailable(format!("{id}: duplicate workspace identity")));
                 }
-                workspace.root.as_ref().map(|path| {
+                approved_workspace_root(workspace).map(|path| {
                     let file_id = read_id(workspace.file_id.as_deref(), path, &mut metadata_errors);
                     if workspace.file_id.is_none() {
                         metadata_errors.entry(id.clone()).or_insert_with(|| {
@@ -406,7 +407,7 @@ impl RegistryRevision {
                         path: path.into(),
                         file_id,
                         incarnation: None,
-                        approval: None,
+                        approval: workspace.approval.clone(),
                         identity: None,
                     }
                 })
@@ -775,6 +776,15 @@ fn eligible(root: &RootRecord) -> bool {
         )
         && (root.identity == RootIdentity::Bound && root.incarnation.is_some()
             || root.file_id.is_some())
+}
+
+pub(super) fn approved_workspace_root(workspace: &Workspace) -> Option<&str> {
+    workspace.root.as_deref().filter(|_| {
+        workspace
+            .approval
+            .as_ref()
+            .is_some_and(|approval| approval.state == ApprovalState::Approved)
+    })
 }
 
 pub type RegistryFuture<'a> = Pin<Box<dyn Future<Output = Result<RegistryRevision>> + Send + 'a>>;

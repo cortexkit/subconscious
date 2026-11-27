@@ -119,7 +119,7 @@ fn member(id: &str, workspace: Option<&str>, roots: &[&Path]) -> serde_json::Val
 
 fn enumerate(workspace: &Path, projects: Vec<serde_json::Value>) -> EnumerateReply {
     serde_json::from_value(json!({"generation":7,"incarnation":"registry-fixture","projects":projects,
-        "workspaces":[{"workspaceId":"W","name":"Workspace","root":workspace,"fileId":file_id(workspace)}]})).unwrap()
+        "workspaces":[{"workspaceId":"W","name":"Workspace","root":workspace,"fileId":file_id(workspace),"approval":{"state":"approved","journalSeq":1}}]})).unwrap()
 }
 
 fn write_layer(root: &Path, limit: u64) -> PathBuf {
@@ -587,6 +587,34 @@ async fn config_pending_settings_mixed_user_and_workspace_share_one_capture() {
         .unwrap();
     assert_eq!(delivery.modules["a"].effective["limit"], 3);
     assert_eq!(delivery.project_views["a"]["P"].effective["limit"], 5);
+}
+
+#[tokio::test]
+async fn config_pending_settings_fingerprints_ignore_unapproved_workspace() {
+    let rig = CaptureRig::new();
+    write_layer(&rig.workspace, 5);
+    let mut reply = enumerate(&rig.workspace, vec![member("P", Some("W"), &[])]);
+    let approved = reply.workspaces[0].approval.take();
+    *rig.registry.reply.lock().unwrap() = Some(reply.clone());
+    let (_, unapproved) = rig
+        .owner
+        .pending_settings_fingerprints()
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(unapproved.is_complete());
+    assert_eq!(unapproved.observed_path_count(), 1);
+
+    reply.workspaces[0].approval = approved;
+    *rig.registry.reply.lock().unwrap() = Some(reply);
+    let (_, approved) = rig
+        .owner
+        .pending_settings_fingerprints()
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(approved.is_complete());
+    assert_eq!(approved.observed_path_count(), 2);
 }
 
 #[tokio::test]

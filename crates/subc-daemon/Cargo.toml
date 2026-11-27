@@ -1,6 +1,6 @@
 [package]
 name = "subc-daemon"
-version = "0.54.5"
+version = "0.54.6"
 edition = "2021"
 publish = true
 description = "Embeddable subc daemon: bootstrap, module supervision, and opaque-byte splice routing."
@@ -43,7 +43,7 @@ required-features = ["test-support"]
 base64 = "0.22"
 cortexkit-log = { version = "0.3.3" }
 cortexkit-paths = "0.1.1"
-cortexkit-project-identity = "=0.1.5"
+cortexkit-project-identity = "=0.1.6"
 ed25519-dalek = "2"
 fs4 = "1"
 getrandom = "0.2"

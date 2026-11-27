@@ -22,6 +22,84 @@ fn request(project: Option<&str>) -> ConfigGetRequest {
     request
 }
 
+#[tokio::test]
+async fn unstamped_projects_workspace_layer_requires_approval_on_each_pass() {
+    use cortexkit_project_identity::{Approval, ApprovalState};
+
+    let rig = unstamped();
+    let local = root(&rig.workspace, "private");
+    let mut denied = member("P", Some("W"), &[&local]);
+    denied["rootRecords"][0]["approval"] = json!({"state":"unapproved","journalSeq":null});
+    let mut reply = enumerate(
+        &rig.workspace,
+        vec![denied, member("Q", Some("W"), &[&local])],
+    );
+    let publish = |reply: &EnumerateReply| {
+        *rig.registry.reply.lock().unwrap() = Some(reply.clone());
+    };
+    let workspace_file = write_layer(&rig.workspace, 5);
+    write_layer(&local, 9);
+
+    reply.workspaces[0].approval = Some(Approval::new(ApprovalState::Unapproved, None));
+    publish(&reply);
+    let fallback = get(&rig, CONNECTION, "P").await.unwrap();
+    assert_eq!(fallback.effective["limit"], 1, "unapproved workspace");
+    assert_eq!(fallback.layers.len(), 1);
+
+    reply.workspaces[0].approval = Some(Approval::new(ApprovalState::Approved, Some(2)));
+    publish(&reply);
+    assert_eq!(poll(&rig).await, ["P"]);
+    let view = get(&rig, CONNECTION, "P").await.unwrap();
+    assert_eq!(view.effective["limit"], 5);
+    assert_eq!(view.layers.len(), 2);
+    assert_eq!(view.layers[1].layer, ConfigLayer::Workspace);
+    let view = get(&rig, CONNECTION, "Q").await.unwrap();
+    assert_eq!(view.effective["limit"], 9);
+    assert_eq!(view.layers[2].layer, ConfigLayer::Project);
+
+    std::fs::write(&workspace_file, b"not jsonc").unwrap();
+    assert!(poll(&rig).await.is_empty());
+    let observation =
+        || rig.owner.unstamped_project_observations().unwrap()[&("a".into(), "P".into())].clone();
+    assert!(observation().file_error.is_some());
+
+    reply.workspaces[0].approval = Some(Approval::new(ApprovalState::Unapproved, None));
+    publish(&reply);
+    assert_eq!(poll(&rig).await, ["P", "Q"]);
+    assert!(observation().file_error.is_none());
+    assert!(!observation().present);
+    assert_eq!(
+        get(&rig, CONNECTION, "P").await.unwrap().effective["limit"],
+        1
+    );
+    assert_eq!(
+        get(&rig, CONNECTION, "Q").await.unwrap().effective["limit"],
+        9
+    );
+
+    std::fs::write(&workspace_file, b"{\"limit\":5}").unwrap();
+    for approval in [
+        None,
+        Some(Approval::new(ApprovalState::new("unknown"), None)),
+    ] {
+        reply.workspaces[0].approval = approval;
+        publish(&reply);
+        assert_eq!(
+            get(&rig, CONNECTION, "P").await.unwrap().effective["limit"],
+            1
+        );
+    }
+
+    reply.workspaces[0].root = None;
+    reply.workspaces[0].file_id = None;
+    reply.workspaces[0].approval = None;
+    publish(&reply);
+    assert_eq!(
+        get(&rig, CONNECTION, "P").await.unwrap().effective["limit"],
+        1
+    );
+}
+
 async fn get(rig: &CaptureRig, connection: ConnectionId, id: &str) -> Result<ConfigView> {
     let read = rig
         .owner

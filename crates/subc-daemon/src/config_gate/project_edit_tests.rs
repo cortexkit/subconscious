@@ -78,7 +78,7 @@ async fn project_edit_first_layer_reviews_shared_root_readers_and_checks_joiners
         let mut reply = enumerate(&rig.workspace, projects);
         reply.workspaces.push(
             serde_json::from_value(
-                json!({"workspaceId":"other","name":"Other","root":other,"fileId":file_id(&other)}),
+                json!({"workspaceId":"other","name":"Other","root":other,"fileId":file_id(&other),"approval":{"state":"approved","journalSeq":1}}),
             )
             .unwrap(),
         );
@@ -379,9 +379,12 @@ async fn project_edit_first_publish_never_replaces_another_writer() {
 
 #[tokio::test]
 async fn project_edit_late_write_adopts_by_content_after_restart_without_writing() {
+    // The write must start before the pool's deadline and then outlast it, so
+    // the deadline leaves room for a loaded runner to start the worker, and
+    // the hook below holds the write far longer than every wait in this test.
     let rig = CaptureRig::with_pool(
         true,
-        RootIoPool::with_timeout(Duration::from_millis(500)).unwrap(),
+        RootIoPool::with_timeout(Duration::from_secs(3)).unwrap(),
     );
     let private = root(&rig.project_scratch, "private");
     rig.set_projects(vec![member("A", None, &[&private])]);
@@ -409,7 +412,7 @@ async fn project_edit_late_write_adopts_by_content_after_restart_without_writing
                 writes.fetch_add(1, Ordering::Relaxed);
                 hold.lock()
                     .unwrap()
-                    .recv_timeout(Duration::from_secs(10))
+                    .recv_timeout(Duration::from_secs(60))
                     .unwrap();
             }
             Ok(())

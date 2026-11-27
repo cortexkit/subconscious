@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.24.1
+
+- Require subc-daemon 0.54.3, which resumes modules that keep their container
+  across restarts during an in-place upgrade. Test-only: cover that resume end
+  to end, including a module that restarted inside its container.
+
 ## 0.24.0
 
 - Make bare `ck setup` select every available component and explain what it

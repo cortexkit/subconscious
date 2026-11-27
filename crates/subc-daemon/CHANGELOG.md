@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.54.3
+
+- An in-place upgrade now resumes a module that keeps its container across
+  restarts (`carry_containment: true`) when no cgroup holds it, as on macOS.
+  The old image hands over the pinned process group in an optional
+  `carried_container` handover member. The new image takes the container
+  over only after proving that the pin is still its unreaped child, with the
+  recorded birth, boot and session, and that the module is in that group.
+  The container then keeps its helpers through later module restarts.
+  Without that proof, or if taking it over fails later, the module is held
+  until the handed-over group is proven empty, even when its recorded row is
+  missing. The pin is reaped only after an exact identity check and an empty
+  scan, and only then does a replacement start. Reaping the module never drops
+  the container's recorded row. A missing row is restored before settlement;
+  failed writes keep the module held and are retried. If process visibility is
+  incomplete, the daemon keeps the fence rather than guessing the group is
+  empty. Resume HELLO refuses a module that has left its carried group.
+- Keep the reaped carried container's fence until the roster removal is
+  durable. Retry a missing fence during shutdown within the module's shutdown
+  budget, even after a second termination request. Without a proven pin, stop
+  only the recorded anchor with a matching birth, and hold the module while
+  any unrecorded group members survive.
+- Keep shutdown within the module's deadline even if saving the record that
+  prevents a replacement from starting stalls, or a carried container's
+  cleanup waits for another record write. An in-flight write keeps ownership
+  of the run directory until it finishes, so it cannot overwrite the next
+  daemon's record. Signal a carried group's original leader immediately after
+  checking its identity, without letting the daemon reap that child between
+  the check and the signal.
+
 ## 0.54.2
 
 - Test-only: wait for macOS exec confirmation before checking module PIDs in

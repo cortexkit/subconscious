@@ -677,8 +677,8 @@ mod unix {
         supervise::{spawn::RegisteredConfiguredModule, *},
     };
     use handover::{
-        ChildWitness, ContainmentWitness, FileIdentity, HexBytes, ProgramKey,
-        RegistrationSpawnKind, StreamWitness,
+        CarriedContainerWitness, ChildWitness, ContainmentWitness, FileIdentity, HexBytes,
+        ProgramKey, RegistrationSpawnKind, StreamWitness,
     };
     use rustix::process::{Pid, Signal, WaitOptions};
     #[cfg(any(target_os = "linux", test))]
@@ -1061,8 +1061,10 @@ mod unix {
 
     fn select_child(child: &SupervisedChild, registry: &Registry) -> Option<ChildWitness> {
         let registration = child.registration_spawn.as_ref()?;
-        // The nonce path closes its unused registration channel. Its durable
-        // token and current registry slot still identify a registered primary.
+        // A module that registered by presenting its launch nonce, rather
+        // than over the inherited registration channel, has closed that
+        // unused channel. Its durable token and current registry slot still
+        // identify a registered primary.
         if child.capture_stop.is_none()
             || registry
                 .get_module(&registration.module_id)
@@ -1096,17 +1098,33 @@ mod unix {
         };
         #[cfg(target_os = "macos")]
         let cgroup = None;
-        let containment = cgroup.or_else(|| {
-            child
-                .child
-                .plain_group
-                .as_ref()
-                .filter(|_| subc_os::process_group::pgid(pid).ok().flatten() == Some(pid))
-                .map(|_| ContainmentWitness::ProcessGroup {
-                    leader_pid: pid,
-                    leader_start_time: start_time,
-                })
-        })?;
+        // A module that keeps its container across restarts runs in the
+        // container's pinned process group, not in a group of its own.
+        let carried_container = cgroup
+            .is_none()
+            .then(|| child.child.container())
+            .flatten()
+            .filter(|container| container.group().is_some())
+            .map(|container| container.handover_witness(pid));
+        let containment = match &carried_container {
+            Some(None) => return None,
+            Some(Some(carried)) => ContainmentWitness::ProcessGroup {
+                leader_pid: carried.pin_pid,
+                leader_start_time: carried.created_start_time,
+            },
+            None => cgroup.or_else(|| {
+                child
+                    .child
+                    .plain_group
+                    .as_ref()
+                    .filter(|_| subc_os::process_group::pgid(pid).ok().flatten() == Some(pid))
+                    .map(|_| ContainmentWitness::ProcessGroup {
+                        leader_pid: pid,
+                        leader_start_time: start_time,
+                    })
+            })?,
+        };
+        let carried_container = carried_container.flatten();
         Some(ChildWitness {
             module_id: registration.module_id.clone(),
             pid,
@@ -1138,6 +1156,7 @@ mod unix {
             spawned_at_ms: child.spawned_at_ms,
             stdout: StreamWitness::Ended {},
             stderr: StreamWitness::Ended {},
+            carried_container,
         })
     }
 
@@ -1375,6 +1394,13 @@ mod unix {
         Group,
         #[cfg(target_os = "linux")]
         Cgroup(CgroupTarget),
+        /// A member of a carried container's group. Signals reach only this
+        /// process; the rebuilt container owns the group. When `pin` is set
+        /// the process is the group's first module process, which only the
+        /// container may reap, because its pid reserves the group id.
+        Carried {
+            pin: bool,
+        },
         LeaderOnly,
     }
 
@@ -1540,6 +1566,8 @@ mod unix {
     struct ReapState {
         reaped: bool,
         settled: bool,
+        /// Set when a settled container reaped this process as its pin.
+        pin_reaped: bool,
     }
 
     impl VerifiedChild {
@@ -1701,7 +1729,16 @@ mod unix {
                 if matches!(self.containment, Containment::Group) {
                     plain_group::settle_pinned_exited_group(self.recorded.pid, true)?;
                 }
-                reap_owned(self.recorded.pid)?;
+                if matches!(self.containment, Containment::Carried { pin: true }) {
+                    // Leave the exited pin for its container to reap: a
+                    // settled container reaps it through `reap_as_pin`, which
+                    // marks this child reaped under the same lock.
+                    if subc_os::child_exit::observe(self.recorded.pid)?.is_none() {
+                        return Err(io::Error::other("child has not exited"));
+                    }
+                } else {
+                    reap_owned(self.recorded.pid)?;
+                }
                 reaped.reaped = true;
             } else if matches!(self.containment, Containment::Group) {
                 return Err(io::Error::other(
@@ -1721,6 +1758,21 @@ mod unix {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .settled
+        }
+
+        /// Reap this process as a settled carried container's pin. `reap`
+        /// runs under the lock that every check-and-signal of this process
+        /// holds, so no signal can straddle the reap, and once it succeeds the
+        /// process can no longer be signalled.
+        pub(crate) fn reap_as_pin(&self, reap: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+            let mut state = self.reaped.lock().unwrap_or_else(|p| p.into_inner());
+            if state.pin_reaped {
+                return Ok(());
+            }
+            reap()?;
+            state.reaped = true;
+            state.pin_reaped = true;
+            Ok(())
         }
     }
 
@@ -1854,6 +1906,9 @@ mod unix {
     pub(crate) struct PreparedAdoption {
         witness: ChildWitness,
         recorded: live_children::RecordedChild,
+        /// A proven carried container and its recorded row, rebuilt when the
+        /// module is installed or stopped.
+        carried: Option<(CarriedContainerWitness, live_children::RecordedChild)>,
         process: AdoptedProcess,
     }
 
@@ -1861,6 +1916,9 @@ mod unix {
         witness: ChildWitness,
         exit: HeldExit,
         ending: bool,
+        /// A rebuilt carried container to end once the module process has
+        /// exited, before any replacement starts.
+        container: Option<containment::Slot>,
     }
 
     struct HeldExit {
@@ -1869,6 +1927,9 @@ mod unix {
         watcher: Option<Arc<AsyncFd<OwnedFd>>>,
         verified: Option<Arc<VerifiedChild>>,
         unverified_group: Option<u32>,
+        /// The child is a handed-over container's pin. Its exit is observed
+        /// but never reaped here: the container's settlement reaps it.
+        pin_reserved: bool,
         #[cfg(target_os = "linux")]
         unverified_cgroup: Option<CgroupTarget>,
     }
@@ -1887,6 +1948,80 @@ mod unix {
         witness: ChildWitness,
         record: Option<&live_children::RecordedChild>,
     ) -> io::Result<ReconciledChild> {
+        reconcile_child_with_container(witness, record, None)
+    }
+
+    /// Every fact a carried container needs before this image takes over its
+    /// process group: the recorded container row, this boot and session, the
+    /// pin still this daemon's unreaped child with the recorded birth, and the
+    /// module process still in that group. Reads never reap, and any failure
+    /// or mismatch refuses.
+    fn prove_carried_container(
+        witness: &ChildWitness,
+        carried: &CarriedContainerWitness,
+        record: Option<&live_children::RecordedChild>,
+    ) -> io::Result<bool> {
+        let pgid = carried.pgid;
+        let recorded_container = live_children::ContainerIdentity {
+            pgid: Some(pgid),
+            created_start_time: Some(carried.created_start_time),
+            boot_id: Some(carried.boot_id.clone()),
+            session_id: Some(carried.session_id),
+            cgroup_path: None,
+        };
+        let record_matches = record.is_some_and(|record| {
+            record.child.module_id == witness.module_id
+                && record.child.pid == pgid
+                && record.child.start_time == Some(carried.created_start_time)
+                && record.child.container.as_ref() == Some(&recorded_container)
+        });
+        if pgid <= 1
+            || carried.pin_pid != pgid
+            || !record_matches
+            || (witness.pid == pgid && witness.start_time != carried.created_start_time)
+            || witness.containment
+                != (ContainmentWitness::ProcessGroup {
+                    leader_pid: pgid,
+                    leader_start_time: carried.created_start_time,
+                })
+        {
+            return Ok(false);
+        }
+        if subc_os::boot_id::current()? != carried.boot_id
+            || subc_os::process_group::session_id(std::process::id())? != Some(carried.session_id)
+        {
+            return Ok(false);
+        }
+        // Observing the pin without reaping it proves it is still this
+        // daemon's own child, so its pid cannot have been reused.
+        subc_os::child_exit::observe(pgid)?;
+        Ok(
+            containment::group_pin_birth(pgid)? == carried.created_start_time
+                && subc_os::process_group::pgid(witness.pid)? == Some(pgid),
+        )
+    }
+
+    pub(crate) fn reconcile_child_with_container(
+        witness: ChildWitness,
+        record: Option<&live_children::RecordedChild>,
+        container_record: Option<&live_children::RecordedChild>,
+    ) -> io::Result<ReconciledChild> {
+        reconcile_child_with_fence(witness, record, container_record, true)
+    }
+
+    pub(crate) fn reconcile_child_with_unrecorded_fence(
+        witness: ChildWitness,
+        record: Option<&live_children::RecordedChild>,
+    ) -> io::Result<ReconciledChild> {
+        reconcile_child_with_fence(witness, record, None, false)
+    }
+
+    fn reconcile_child_with_fence(
+        witness: ChildWitness,
+        record: Option<&live_children::RecordedChild>,
+        container_record: Option<&live_children::RecordedChild>,
+        fence_recorded: bool,
+    ) -> io::Result<ReconciledChild> {
         let mut watcher = async_watch(witness.pid).ok();
         let owned = subc_os::child_exit::observe(witness.pid);
         let roster = record.filter(|record| {
@@ -1900,7 +2035,43 @@ mod unix {
         let gone =
             owned.as_ref().is_err_and(is_no_child) && proven_gone(witness.pid, witness.start_time);
         let exited_owned = matches!(owned, Ok(Some(_)));
+        let matches = roster.is_some_and(|record| {
+            subc_os::Process::open(witness.pid)
+                .ok()
+                .flatten()
+                .and_then(|process| process.observe())
+                .is_some_and(|observed| {
+                    live_children::identity_verdict(&record.child, witness.pid, &observed)
+                        == live_children::IdentityVerdict::Matches
+                })
+        });
+        // A carried container is taken over only together with a running,
+        // verified module process; otherwise its row stays held for settlement.
+        let carried = witness
+            .carried_container
+            .as_ref()
+            .filter(|_| {
+                matches!(owned, Ok(None))
+                    && matches
+                    && authenticated_launch
+                    && witness.spawn_generation != 0
+                    && watcher.is_some()
+            })
+            .filter(|carried| {
+                prove_carried_container(&witness, carried, container_record).unwrap_or(false)
+            })
+            .cloned()
+            .zip(container_record.cloned());
+        // The handed-over pin reserves the group id until its container is
+        // settled, so no module path may reap it, proven takeover or not.
+        let carried_pin = witness
+            .carried_container
+            .as_ref()
+            .is_some_and(|carried| carried.pin_pid == witness.pid);
         let mut containment = match &witness.containment {
+            _ if witness.carried_container.is_some() => {
+                Some(Containment::Carried { pin: carried_pin })
+            }
             ContainmentWitness::ProcessGroup {
                 leader_pid,
                 leader_start_time,
@@ -1931,22 +2102,13 @@ mod unix {
         };
         let is_contained = match &containment {
             Some(Containment::Group) => true,
+            Some(Containment::Carried { .. }) => carried.is_some(),
             #[cfg(target_os = "linux")]
             Some(Containment::Cgroup(target)) => {
                 target.directory.is_some() && cgroup_matches(witness.pid, &target.path)
             }
             _ => false,
         };
-        let matches = roster.is_some_and(|record| {
-            subc_os::Process::open(witness.pid)
-                .ok()
-                .flatten()
-                .and_then(|process| process.observe())
-                .is_some_and(|observed| {
-                    live_children::identity_verdict(&record.child, witness.pid, &observed)
-                        == live_children::IdentityVerdict::Matches
-                })
-        });
         // A zombie no longer exposes its executable. Its unreaped pid, start
         // time and authenticated launch still identify the group pin we inherited.
         let verified = roster
@@ -1957,14 +2119,16 @@ mod unix {
             .map(|record| {
                 Arc::new(VerifiedChild {
                     recorded: record.child.clone(),
-                    containment: if is_contained || authenticated_launch && (exited_owned || gone) {
+                    containment: if witness.carried_container.is_some() {
+                        Containment::Carried { pin: carried_pin }
+                    } else if is_contained || authenticated_launch && (exited_owned || gone) {
                         containment.take().unwrap_or(Containment::LeaderOnly)
                     } else {
                         Containment::LeaderOnly
                     },
                     reaped: Mutex::new(ReapState {
                         reaped: gone,
-                        settled: false,
+                        ..ReapState::default()
                     }),
                     #[cfg(test)]
                     signal_attempts: Default::default(),
@@ -1975,8 +2139,10 @@ mod unix {
                 })
             });
         if let Some(verified) = &verified {
+            // An exited module with a handed-over container still waits for
+            // that container to be settled, as a held child.
             if exited_owned || gone {
-                if verified.reap().is_ok() {
+                if witness.carried_container.is_none() && verified.reap().is_ok() {
                     return Ok(ReconciledChild::Exited);
                 }
             } else if matches!(owned, Ok(None))
@@ -1989,6 +2155,7 @@ mod unix {
                     return Ok(ReconciledChild::Adopt(Box::new(PreparedAdoption {
                         witness,
                         recorded: roster.expect("verified roster").clone(),
+                        carried,
                         process: AdoptedProcess {
                             watcher,
                             verified: verified.clone(),
@@ -2001,7 +2168,8 @@ mod unix {
                 }
             }
         }
-        let ending = matches!(owned, Ok(None))
+        let ending = fence_recorded
+            && matches!(owned, Ok(None))
             && verified
                 .as_ref()
                 .is_some_and(|verified| verified.signal(Signal::KILL).is_ok());
@@ -2010,7 +2178,7 @@ mod unix {
             Some(Containment::Cgroup(target)) => Some(target),
             _ => None,
         };
-        let unverified_group = if verified.is_some() {
+        let unverified_group = if verified.is_some() || witness.carried_container.is_some() {
             None
         } else {
             match &witness.containment {
@@ -2029,16 +2197,21 @@ mod unix {
             watcher,
             verified,
             unverified_group,
+            pin_reserved: carried_pin,
             #[cfg(target_os = "linux")]
             unverified_cgroup,
         };
-        if (exited_owned || gone) && exit.try_resolution().is_ok_and(|resolved| resolved) {
+        if witness.carried_container.is_none()
+            && (exited_owned || gone)
+            && exit.try_resolution().is_ok_and(|resolved| resolved)
+        {
             return Ok(ReconciledChild::Exited);
         }
         Ok(ReconciledChild::Held(Box::new(UnresolvedChild {
             witness,
             exit,
             ending,
+            container: None,
         })))
     }
 
@@ -2046,7 +2219,7 @@ mod unix {
     pub(in crate::supervise) struct AwaitingResume {
         attempt: [u8; 16],
         deadline: Instant,
-        accepted: oneshot::Receiver<Option<crate::config_gate::runtime::DeliverySpawn>>,
+        accepted: oneshot::Receiver<resume_hello::AdoptionOutcome>,
     }
 
     /// The roster guard owns a watcher even if the normal actor loses its child
@@ -2158,13 +2331,21 @@ mod unix {
             tokio::select! {
                 biased;
                 accepted = &mut resume.accepted, if accepted_open => {
-                    if let Ok(delivery) = accepted {
+                    if let Ok(Ok(delivery)) = accepted {
                         active.registration_deadline = None;
                         active.config_delivery = delivery;
                         handle.upgrade_state.update(id, Disposition::Resumed);
                         return true;
                     }
                     accepted_open = false;
+                    if matches!(accepted, Ok(Err(resume_hello::CarriedGroupChanged))) {
+                        warn!(module_id = %id, "the carried container no longer holds the module at resume HELLO; stopping it");
+                        if let Err(error) = active.start_kill() {
+                            warn!(module_id = %id, %error, "the resumed child could not be safely signalled");
+                            *child = None; // The roster guard transfers ownership to Held.
+                            return true;
+                        }
+                    }
                 }
                 status = active.wait() => break status,
                 _ = sleep_until(resume.deadline), if !deadline_fired => {
@@ -2250,6 +2431,52 @@ mod unix {
             self.witness.pid
         }
 
+        /// The group id of the proven carried container this adoption takes
+        /// over, whose recorded row the resume bootstrap protects from sweep.
+        pub(crate) fn carried_pgid(&self) -> Option<u32> {
+            self.carried.as_ref().map(|(carried, _)| carried.pgid)
+        }
+
+        /// Rebuild the proven carried container into `slot`. On failure the
+        /// module is not adopted with it; the caller stops the module instead.
+        fn rebuild_container(
+            &mut self,
+            roster: &ChildRoster,
+            slot: &containment::Slot,
+        ) -> Option<io::Result<Arc<containment::CarriedContainment>>> {
+            let (carried, record) = self.carried.take()?;
+            let owner =
+                (carried.pin_pid == self.witness.pid).then(|| self.process.verified.clone());
+            Some(containment::adopt_after_upgrade(
+                &self.witness.module_id,
+                self.witness.pid,
+                roster,
+                slot,
+                &carried,
+                &record,
+                owner,
+            ))
+        }
+
+        /// Stop a module that will not be adopted. A proven carried container
+        /// is first rebuilt into a slot of its own, so it can be ended with
+        /// its pin as proof once the module process has exited.
+        pub(crate) fn stop_with_container(mut self, roster: &ChildRoster) -> UnresolvedChild {
+            let slot = containment::Slot::default();
+            let container = match self.rebuild_container(roster, &slot) {
+                Some(Ok(_)) => Some(slot),
+                Some(Err(error)) => {
+                    warn!(module_id = %self.witness.module_id, %error,
+                        "could not take over the carried container of a stopped module");
+                    None
+                }
+                None => None,
+            };
+            let mut stopped = self.stop();
+            stopped.container = container;
+            stopped
+        }
+
         /// The resume bootstrap calls this for a disabled child or a refused binding.
         pub(crate) fn stop(self) -> UnresolvedChild {
             let ending = self.process.verified.signal(Signal::KILL).is_ok();
@@ -2257,6 +2484,7 @@ mod unix {
                 exit: HeldExit::for_adopted(&self.process),
                 ending,
                 witness: self.witness,
+                container: None,
             }
         }
     }
@@ -2283,6 +2511,7 @@ mod unix {
                 watcher: Some(process.watcher.clone()),
                 verified: Some(process.verified.clone()),
                 unverified_group: None,
+                pin_reserved: false,
                 #[cfg(target_os = "linux")]
                 unverified_cgroup: None,
             }
@@ -2305,7 +2534,9 @@ mod unix {
                             if let Some(leader) = self.unverified_group {
                                 plain_group::settle_pinned_exited_group(leader, false)?;
                             }
-                            reap_owned(self.pid)?;
+                            if !self.pin_reserved {
+                                reap_owned(self.pid)?;
+                            }
                         }
                     }
                     Err(error) if is_no_child(&error) && proven_gone(self.pid, self.start_time) => {
@@ -2414,6 +2645,57 @@ mod unix {
             Ok(())
         }
 
+        /// Hold a module's replacement until the container it handed over, but
+        /// this image did not take over, is proven empty and its pin reaped.
+        /// A container that cannot be proven keeps the module held and
+        /// reported; it never restarts beside a possibly surviving group.
+        async fn settle_carried_fence(
+            &self,
+            module: &str,
+            fence: &CarriedContainerWitness,
+            owner: containment::PinOwner,
+        ) -> io::Result<()> {
+            let pin = containment::InheritedPin::from_witness(fence, owner);
+            let held =
+                self.child_roster
+                    .held_container_row(module, fence.pgid, fence.created_start_time);
+            let handle = self.supervisor_handle.clone();
+            let settled = containment::hold_until_settled(module, &pin, held, |_| {
+                if let Some(handle) = &handle {
+                    handle.upgrade_state.update(module, Disposition::Blocked);
+                }
+            })
+            .await;
+            if settled {
+                Ok(())
+            } else {
+                Err(io::Error::other(
+                    "the daemon stopped before the carried container settled",
+                ))
+            }
+        }
+
+        /// Wait until no recorded previous instance holds the module back,
+        /// such as a carried container still being settled after it ended.
+        async fn await_no_previous_instance(&self, module: &str) -> io::Result<()> {
+            while self.child_roster.previous_instance(module).is_some() {
+                if self.child_roster.is_closed() {
+                    return Err(io::Error::other(
+                        "the daemon stopped before the carried container settled",
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Ok(())
+        }
+
+        /// Stop a verified child whose module is no longer configured, ending
+        /// any carried container it handed over once the child has exited.
+        pub(crate) fn stop_unconfigured_after_upgrade(&self, prepared: PreparedAdoption) {
+            let stopped = prepared.stop_with_container(&self.child_roster);
+            self.watch_unresolved_after_upgrade(stopped, None, false);
+        }
+
         /// Observe a Held child without signalling it. A bootstrap rejection
         /// whose verified kill was already sent uses the same one-reap path.
         pub(crate) fn watch_unresolved_after_upgrade(
@@ -2421,6 +2703,16 @@ mod unix {
             unresolved: UnresolvedChild,
             registered: Option<RegisteredConfiguredModule>,
             allow_start: bool,
+        ) -> tokio::task::JoinHandle<()> {
+            self.watch_unresolved_with_fence(unresolved, registered, allow_start, None)
+        }
+
+        pub(crate) fn watch_unresolved_with_fence(
+            &self,
+            mut unresolved: UnresolvedChild,
+            registered: Option<RegisteredConfiguredModule>,
+            allow_start: bool,
+            unrecorded_fence: Option<live_children::RecordedChild>,
         ) -> tokio::task::JoinHandle<()> {
             let supervisor = self.clone();
             let module = unresolved.witness.module_id.clone();
@@ -2436,12 +2728,54 @@ mod unix {
             }
             let pid = unresolved.witness.pid;
             let start = unresolved.witness.start_time;
+            let container = unresolved.container.take();
+            // A handed-over container that was not rebuilt is settled from the
+            // handover's own facts, whether or not its row was recorded.
+            let fence = container
+                .is_none()
+                .then(|| unresolved.witness.carried_container.clone())
+                .flatten();
+            let carried = container.is_some() || fence.is_some();
+            let owner = unresolved.exit.verified.clone().filter(|verified| {
+                matches!(verified.containment, Containment::Carried { pin: true })
+            });
+            let unrecorded_fence = unrecorded_fence.map(|row| {
+                let budget = registered
+                    .as_ref()
+                    .map_or(self.drain_timeout, |entry| entry.runtime.drain_timeout);
+                (
+                    row.child.pid,
+                    self.child_roster.hold_unrecorded_fence(row, budget),
+                )
+            });
             tokio::spawn(async move {
                 let result = async {
+                    if let Some((pgid, held)) = unrecorded_fence {
+                        if !containment::record_held_fence(&module, pgid, &held).await {
+                            return Ok(());
+                        }
+                        if let Some(verified) = &unresolved.exit.verified {
+                            if let Err(error) = verified.signal(Signal::KILL) {
+                                warn!(module_id = %module, pid, %error,
+                                    "the held child could not be safely signalled");
+                            }
+                        }
+                    }
                     unresolved.reap().await?;
                     supervisor
                         .child_roster
                         .remove_reaped_adoption(&module, pid, start)?;
+                    if let Some(slot) = &container {
+                        containment::terminate(slot).await;
+                    }
+                    if let Some(fence) = &fence {
+                        supervisor
+                            .settle_carried_fence(&module, fence, owner)
+                            .await?;
+                    }
+                    if carried {
+                        supervisor.await_no_previous_instance(&module).await?;
+                    }
                     if !supervisor.child_roster.is_closed() {
                         supervisor
                             .start_planned_after_upgrade(&module, registered, allow_start)
@@ -2469,9 +2803,29 @@ mod unix {
             allow_start: bool,
         ) -> io::Result<()> {
             if !allow_start {
-                self.watch_unresolved_after_upgrade(prepared.stop(), Some(registered), false);
+                let stopped = prepared.stop_with_container(&registered.runtime.child_roster);
+                self.watch_unresolved_after_upgrade(stopped, Some(registered), false);
                 return Ok(());
             }
+            let mut prepared = prepared;
+            // Take over a carried container before anything else, so every
+            // later failure ends it through the module's own slot.
+            let container = match prepared.rebuild_container(
+                &registered.runtime.child_roster,
+                &registered.runtime.child_roster.containment,
+            ) {
+                Some(Ok(container)) => Some(container),
+                Some(Err(error)) => {
+                    warn!(module_id = %registered.spec.module_id, %error,
+                        "could not take over the carried container; restarting the module");
+                    self.watch_unresolved_after_upgrade(prepared.stop(), Some(registered), true);
+                    return Ok(());
+                }
+                None => None,
+            };
+            let container_slot = container
+                .as_ref()
+                .map(|_| registered.runtime.child_roster.containment.clone());
             let RegisteredConfiguredModule {
                 spec,
                 runtime,
@@ -2481,6 +2835,7 @@ mod unix {
             let PreparedAdoption {
                 witness,
                 recorded,
+                carried: _,
                 process,
             } = prepared;
             let handle = self
@@ -2536,17 +2891,34 @@ mod unix {
                     "carried program preparation expired",
                 ))
             });
+            #[cfg(test)]
+            let _ = runtime.child_roster.admission_event_for_test(
+                module_id,
+                "after_resume_preparation",
+                Some(pid),
+            );
+            // Preparation can wait on the configuration owner. Prove the
+            // carried container again at this final admission boundary.
+            let admission = admission.and_then(|admission| match &container {
+                Some(container) if !container.still_holds_member(pid) => Err(io::Error::other(
+                    "the carried container's pin or the module's membership in its group changed before installation",
+                )),
+                _ => Ok(admission),
+            });
             let (mut admission, admission_base) = match admission {
                 Ok(admission) => admission,
                 Err(error) => {
                     tracing::info!(%module_id, %error, "carried program needs a fresh admission");
-                    let prepared = PreparedAdoption {
+                    let mut stopped = PreparedAdoption {
                         witness,
                         recorded,
+                        carried: None,
                         process,
-                    };
+                    }
+                    .stop();
+                    stopped.container = container_slot;
                     self.watch_unresolved_after_upgrade(
-                        prepared.stop(),
+                        stopped,
                         Some(RegisteredConfiguredModule {
                             spec,
                             runtime,
@@ -2671,6 +3043,9 @@ mod unix {
                 pid,
                 roster_guard: None,
             };
+            if let Some(container) = &container {
+                containment::attach_after_upgrade(&mut child, container, &runtime.child_roster);
+            }
             if witness.store_gated {
                 child.live_program_binding =
                     launch
@@ -2699,6 +3074,7 @@ mod unix {
                             },
                             witness,
                             ending,
+                            container: container_slot,
                         },
                         Some(RegisteredConfiguredModule {
                             spec,
@@ -2773,6 +3149,7 @@ mod unix {
                         register: runtime.register_timeout,
                         health: runtime.health.deadline,
                     }),
+                    carried: container.as_ref().map(Arc::downgrade),
                     accepted,
                 })
                 .map_err(io::Error::other)?;
@@ -2867,6 +3244,7 @@ mod unix {
                 spawned_at_ms: 140,
                 stdout: StreamWitness::Ended {},
                 stderr: StreamWitness::Ended {},
+                carried_container: None,
             }
         }
 
@@ -3253,6 +3631,927 @@ mod unix {
         }
 
         #[tokio::test]
+        async fn carried_container_is_adopted_only_with_every_proof() {
+            use std::os::unix::process::CommandExt;
+            let scratch = ScratchDir::new("carried-container-proof");
+            let env = spec("sample", &scratch).env;
+            let spawn = || {
+                AdoptionTestChild(
+                    std::process::Command::new("/bin/sleep")
+                        .arg("60")
+                        .envs(env.clone())
+                        .process_group(0)
+                        .spawn()
+                        .unwrap(),
+                )
+            };
+            // The module is still its container's first process, so the
+            // group id is its own pid.
+            let proven = |pid: u32| {
+                let record = recorded(pid, "sample");
+                let start = record.child.start_time.unwrap();
+                let carried = CarriedContainerWitness {
+                    pgid: pid,
+                    pin_pid: pid,
+                    created_start_time: start,
+                    boot_id: subc_os::boot_id::current().unwrap(),
+                    session_id: subc_os::process_group::session_id(std::process::id())
+                        .unwrap()
+                        .unwrap(),
+                };
+                let container = live_children::RecordedChild {
+                    child: live_children::LiveChild {
+                        module_id: "sample".into(),
+                        pid,
+                        protocol: ModuleProtocol::Subc,
+                        start_time: Some(start),
+                        executable: None,
+                        cgroup_name: None,
+                        container: Some(live_children::ContainerIdentity {
+                            pgid: Some(pid),
+                            created_start_time: Some(start),
+                            boot_id: Some(carried.boot_id.clone()),
+                            session_id: Some(carried.session_id),
+                            cgroup_path: None,
+                        }),
+                    },
+                    resume_token_sha256: None,
+                };
+                let mut witness = witness(&record);
+                witness.carried_container = Some(carried);
+                (record, container, witness)
+            };
+
+            let child = spawn();
+            let pid = child.0.id();
+            let (record, container, witness) = proven(pid);
+            let ReconciledChild::Adopt(prepared) =
+                reconcile_child_with_container(witness, Some(&record), Some(&container)).unwrap()
+            else {
+                panic!("a fully proven carried container should be adopted");
+            };
+            assert_eq!(prepared.carried_pgid(), Some(pid));
+            let mut process = prepared.process;
+            assert!(matches!(
+                process.verified.containment,
+                Containment::Carried { pin: true }
+            ));
+            process.verified.signal(Signal::KILL).unwrap();
+            timeout(Duration::from_secs(5), process.wait())
+                .await
+                .unwrap()
+                .unwrap();
+            process.reap().unwrap();
+            assert!(
+                subc_os::child_exit::observe(pid).unwrap().is_some(),
+                "the exited pin stays unreaped for its container"
+            );
+            drop(child);
+
+            type Forgery = fn(&mut ChildWitness, &mut live_children::RecordedChild);
+            let forgeries: [(&str, Forgery); 7] = [
+                ("session", |witness, _| {
+                    witness.carried_container.as_mut().unwrap().session_id += 1
+                }),
+                ("birth", |witness, _| {
+                    witness
+                        .carried_container
+                        .as_mut()
+                        .unwrap()
+                        .created_start_time += 1
+                }),
+                ("boot", |witness, _| {
+                    witness
+                        .carried_container
+                        .as_mut()
+                        .unwrap()
+                        .boot_id
+                        .push('x')
+                }),
+                ("pin", |witness, _| {
+                    witness.carried_container.as_mut().unwrap().pin_pid += 1
+                }),
+                ("group", |witness, _| {
+                    let carried = witness.carried_container.as_mut().unwrap();
+                    carried.pgid = std::process::id();
+                    carried.pin_pid = std::process::id();
+                }),
+                ("leader", |witness, _| {
+                    witness.containment = ContainmentWitness::ProcessGroup {
+                        leader_pid: witness.pid,
+                        leader_start_time: witness.start_time + 1,
+                    }
+                }),
+                ("recorded row", |_, container| {
+                    let row = container.child.container.as_mut().unwrap();
+                    row.session_id = row.session_id.map(|session| session.wrapping_add(1));
+                }),
+            ];
+            for (name, forge) in forgeries {
+                let child = spawn();
+                let (record, mut container, mut witness) = proven(child.0.id());
+                forge(&mut witness, &mut container);
+                let reconciled =
+                    reconcile_child_with_container(witness, Some(&record), Some(&container))
+                        .unwrap();
+                assert!(
+                    !matches!(reconciled, ReconciledChild::Adopt(_)),
+                    "a forged {name} must not be adopted"
+                );
+            }
+            let child = spawn();
+            let (record, _, witness) = proven(child.0.id());
+            assert!(
+                !matches!(
+                    reconcile_child_with_container(witness, Some(&record), None).unwrap(),
+                    ReconciledChild::Adopt(_)
+                ),
+                "a carried container without its recorded row must not be adopted"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn carried_witness_without_its_row_holds_the_pin_until_the_group_is_proven_empty() {
+            use std::{os::unix::process::CommandExt, process::Stdio};
+            let scratch = ScratchDir::new("carried-fence-without-row");
+            let env = spec("sample", &scratch).env;
+            let mut pin = AdoptionTestChild(
+                std::process::Command::new("/bin/sh")
+                    .args(["-c", "read line"])
+                    .envs(env.clone())
+                    .process_group(0)
+                    .stdin(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+            let pid = pin.0.id();
+            let mut helper = std::process::Command::new("/bin/sleep")
+                .arg("60")
+                .envs(env)
+                .process_group(i32::try_from(pid).unwrap())
+                .spawn()
+                .unwrap();
+            let helper_pid = helper.id();
+            let record = recorded(pid, "sample");
+            let fence = CarriedContainerWitness {
+                pgid: pid,
+                pin_pid: pid,
+                created_start_time: record.child.start_time.unwrap(),
+                boot_id: subc_os::boot_id::current().unwrap(),
+                session_id: subc_os::process_group::session_id(std::process::id())
+                    .unwrap()
+                    .unwrap(),
+            };
+            let mut witness = witness(&record);
+            witness.carried_container = Some(fence.clone());
+            drop(pin.0.stdin.take());
+            wait_until(|| subc_os::child_exit::observe(pid).unwrap().is_some()).await;
+
+            // The signed handover names a container, but the roster has no row
+            // for it: missing evidence does not prove the container empty.
+            let ReconciledChild::Held(held) =
+                reconcile_child_with_container(witness, Some(&record), None).unwrap()
+            else {
+                panic!("an exited module with an unsettled handed-over container must stay held");
+            };
+            assert!(subc_os::child_exit::observe(pid).unwrap().is_some());
+            timeout(Duration::from_secs(5), held.reap())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                subc_os::child_exit::observe(pid).unwrap().is_some(),
+                "the module's own resolution never reaps the pin"
+            );
+
+            // A pin that is not exactly the recorded one is refused, and
+            // nothing waits on it.
+            let mut forged = fence.clone();
+            forged.created_start_time += 1;
+            assert!(
+                containment::settle_inherited_group(&containment::InheritedPin::from_witness(
+                    &forged, None
+                ))
+                .is_err()
+            );
+            assert!(subc_os::child_exit::observe(pid).unwrap().is_some());
+            assert!(subc_os::Process::open(helper_pid)
+                .unwrap()
+                .and_then(|process| process.observe())
+                .is_some());
+
+            // The exact pin proves the group is the daemon's: the helper is
+            // ended, the scan proves the group empty, and only then is the pin
+            // reaped. The test reaps its own helper, as its real parent would.
+            let helper_exit = std::thread::spawn(move || helper.wait());
+            #[cfg(target_os = "linux")]
+            let _view = containment::settle_faults::complete_view(pid);
+            containment::settle_inherited_group(&containment::InheritedPin::from_witness(
+                &fence, None,
+            ))
+            .unwrap();
+            assert!(
+                subc_os::child_exit::observe(pid).is_err(),
+                "the pin was reaped"
+            );
+            assert!(!helper_exit.join().unwrap().unwrap().success());
+        }
+
+        #[tokio::test]
+        async fn carried_container_rebuild_rechecks_membership_and_reaps_only_a_settled_pin() {
+            use std::os::unix::process::CommandExt;
+            let scratch = ScratchDir::new("carried-container-rebuild");
+            let env = spec("sample", &scratch).env;
+            let spawn = || {
+                AdoptionTestChild(
+                    std::process::Command::new("/bin/sleep")
+                        .arg("60")
+                        .envs(env.clone())
+                        .process_group(0)
+                        .spawn()
+                        .unwrap(),
+                )
+            };
+            let pin = spawn();
+            let outsider = spawn();
+            let pid = pin.0.id();
+            let start = recorded(pid, "sample").child.start_time.unwrap();
+            let witness = CarriedContainerWitness {
+                pgid: pid,
+                pin_pid: pid,
+                created_start_time: start,
+                boot_id: subc_os::boot_id::current().unwrap(),
+                session_id: subc_os::process_group::session_id(std::process::id())
+                    .unwrap()
+                    .unwrap(),
+            };
+            let row = live_children::RecordedChild {
+                child: live_children::LiveChild {
+                    module_id: "sample".into(),
+                    pid,
+                    protocol: ModuleProtocol::Subc,
+                    start_time: Some(start),
+                    executable: None,
+                    cgroup_name: None,
+                    container: Some(live_children::ContainerIdentity {
+                        pgid: Some(pid),
+                        created_start_time: Some(start),
+                        boot_id: Some(witness.boot_id.clone()),
+                        session_id: Some(witness.session_id),
+                        cgroup_path: None,
+                    }),
+                },
+                resume_token_sha256: None,
+            };
+            let path = scratch.join("live-children.json");
+            live_children::write_record_with_reasons(
+                &path,
+                std::slice::from_ref(&row),
+                Default::default(),
+            )
+            .unwrap();
+            let roster = crate::child_roster::ChildRoster::default();
+            roster.record_to_with_adopted(
+                path.clone(),
+                &live_children::AdoptedPids::from_classes([pid], []),
+            );
+            let slot = containment::Slot::default();
+
+            // A module process outside the pinned group is refused right
+            // before publication, and the container's row stays recorded.
+            assert!(containment::adopt_after_upgrade(
+                "sample",
+                outsider.0.id(),
+                &roster,
+                &slot,
+                &witness,
+                &row,
+                None
+            )
+            .is_err());
+            assert!(containment::current(&slot).is_none());
+            assert_eq!(
+                live_children::read_record_entries(&path).unwrap().0,
+                std::slice::from_ref(&row)
+            );
+
+            containment::adopt_after_upgrade("sample", pid, &roster, &slot, &witness, &row, None)
+                .unwrap();
+            assert!(containment::current(&slot).is_some());
+            // Ending the rebuilt container stops the group, proves it empty,
+            // and only then reaps the inherited pin.
+            #[cfg(target_os = "linux")]
+            let _view = containment::settle_faults::complete_view(pid);
+            timeout(Duration::from_secs(30), containment::terminate(&slot))
+                .await
+                .unwrap();
+            assert!(
+                subc_os::child_exit::observe(pid).is_err(),
+                "the settled pin was reaped"
+            );
+            assert!(live_children::read_record_entries(&path)
+                .unwrap()
+                .0
+                .is_empty());
+            drop(outsider);
+        }
+
+        /// A `/bin/sleep 60` in process group `group`, or in a new group of
+        /// its own when `group` is 0.
+        fn group_child(scratch: &ScratchDir, group: u32) -> AdoptionTestChild {
+            use std::os::unix::process::CommandExt;
+            AdoptionTestChild(
+                std::process::Command::new("/bin/sleep")
+                    .arg("60")
+                    .envs(spec("sample", scratch).env)
+                    .process_group(i32::try_from(group).unwrap())
+                    .spawn()
+                    .unwrap(),
+            )
+        }
+
+        /// The handover facts and recorded row of a carried container whose
+        /// pin is the running process `pin`.
+        fn carried_facts(pin: u32) -> (CarriedContainerWitness, live_children::RecordedChild) {
+            let start = recorded(pin, "sample").child.start_time.unwrap();
+            let witness = CarriedContainerWitness {
+                pgid: pin,
+                pin_pid: pin,
+                created_start_time: start,
+                boot_id: subc_os::boot_id::current().unwrap(),
+                session_id: subc_os::process_group::session_id(std::process::id())
+                    .unwrap()
+                    .unwrap(),
+            };
+            let row = live_children::RecordedChild {
+                child: live_children::LiveChild {
+                    module_id: "sample".into(),
+                    pid: pin,
+                    protocol: ModuleProtocol::Subc,
+                    start_time: Some(start),
+                    executable: None,
+                    cgroup_name: None,
+                    container: Some(live_children::ContainerIdentity {
+                        pgid: Some(pin),
+                        created_start_time: Some(start),
+                        boot_id: Some(witness.boot_id.clone()),
+                        session_id: Some(witness.session_id),
+                        cgroup_path: None,
+                    }),
+                },
+                resume_token_sha256: None,
+            };
+            (witness, row)
+        }
+
+        /// When the pin is also the adopted module process, that process can
+        /// be signalled by pid. Its reap must wait for any check-and-signal
+        /// in flight, and end the signal authority once it happens.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_inherited_pin_is_reaped_only_under_its_signal_lock() {
+            let scratch = ScratchDir::new("carried-pin-signal-lock");
+            let pin = group_child(&scratch, 0);
+            let pid = pin.0.id();
+            let record = recorded(pid, "sample");
+            let (carried, row) = carried_facts(pid);
+            let mut witness = witness(&record);
+            witness.carried_container = Some(carried.clone());
+            let ReconciledChild::Adopt(prepared) =
+                reconcile_child_with_container(witness, Some(&record), Some(&row)).unwrap()
+            else {
+                panic!("a fully proven carried container should be adopted");
+            };
+            let verified = prepared.process.verified.clone();
+            verified.signal(Signal::KILL).unwrap();
+            wait_until(|| subc_os::child_exit::observe(pid).unwrap().is_some()).await;
+
+            // Hold the signal lock as an in-flight check-and-signal would.
+            let (locked, is_locked) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let holder = {
+                let verified = verified.clone();
+                std::thread::spawn(move || {
+                    let _signal = verified.reaped.lock().unwrap();
+                    locked.send(()).unwrap();
+                    released.recv().unwrap();
+                })
+            };
+            is_locked.recv().unwrap();
+            #[cfg(target_os = "linux")]
+            let _view = containment::settle_faults::complete_view(pid);
+            let pin_facts =
+                containment::InheritedPin::from_witness(&carried, Some(verified.clone()));
+            let settle =
+                std::thread::spawn(move || containment::settle_inherited_group(&pin_facts));
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(
+                subc_os::child_exit::observe(pid).unwrap().is_some(),
+                "the pin was reaped while a signal check held its lock"
+            );
+            release.send(()).unwrap();
+            holder.join().unwrap();
+            settle.join().unwrap().unwrap();
+            assert!(
+                subc_os::child_exit::observe(pid).is_err(),
+                "the settled pin was reaped"
+            );
+            let state = verified.reaped.lock().unwrap();
+            assert!(
+                state.pin_reaped && state.reaped,
+                "signal authority ended with the reap"
+            );
+        }
+
+        #[test]
+        fn proc_restrictions_that_hide_processes_are_recognized() {
+            let line = |mount: &str, superblock: &str| {
+                format!("25 1 0:23 / /proc {mount} shared:13 - proc proc {superblock}\n")
+            };
+            assert_eq!(
+                containment::proc_view_restriction(&line("rw,nosuid", "rw")),
+                None
+            );
+            assert_eq!(
+                containment::proc_view_restriction(&line("rw", "rw,hidepid=0")),
+                None
+            );
+            assert_eq!(
+                containment::proc_view_restriction(&line("rw", "rw,hidepid=off")),
+                None
+            );
+            for restricted in ["hidepid=2", "hidepid=invisible", "hidepid=1", "subset=pid"] {
+                assert!(
+                    containment::proc_view_restriction(&line("rw", &format!("rw,{restricted}")))
+                        .is_some_and(|reason| reason.contains(restricted)),
+                    "{restricted}"
+                );
+            }
+            // The last mount on /proc decides.
+            let stacked = line("rw", "rw") + &line("rw", "rw,hidepid=2");
+            assert!(containment::proc_view_restriction(&stacked).is_some());
+            assert!(containment::proc_view_restriction("").is_some());
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn carried_group_settlement_checks_the_real_proc_mount() {
+            let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+            let own = std::fs::read_link("/proc/self").unwrap();
+            let restriction = containment::proc_view_restriction(&mountinfo).or_else(|| {
+                (own.as_os_str() != std::process::id().to_string().as_str())
+                    .then(|| "another PID namespace".into())
+            });
+            match restriction {
+                Some(reason) => {
+                    let error =
+                        containment::require_complete_process_view(std::process::id()).unwrap_err();
+                    assert!(error.to_string().contains(&reason), "{error}");
+                }
+                None => containment::require_complete_process_view(std::process::id()).unwrap(),
+            }
+        }
+
+        /// A zombie member has exited and cannot fork, so it does not keep the
+        /// group from settling. An incomplete process list never proves the
+        /// group empty: the fence holds, reports why once, and the module's
+        /// waiting reason says so, until the list is complete again.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn settlement_ignores_zombies_and_holds_on_an_incomplete_process_list() {
+            let scratch = ScratchDir::new("carried-settle-visibility");
+            let pin = group_child(&scratch, 0);
+            let pid = pin.0.id();
+            let mut helper = group_child(&scratch, pid);
+            let (carried, row) = carried_facts(pid);
+            let path = scratch.join("live-children.json");
+            live_children::write_record_with_reasons(
+                &path,
+                std::slice::from_ref(&row),
+                Default::default(),
+            )
+            .unwrap();
+            let roster = crate::child_roster::ChildRoster::default();
+            roster.record_to_with_adopted(
+                path.clone(),
+                &live_children::AdoptedPids::from_classes([], [pid]),
+            );
+            // The helper exits but stays an unreaped zombie in the group.
+            helper.0.kill().unwrap();
+            wait_until(|| {
+                subc_os::child_exit::observe(helper.0.id())
+                    .unwrap()
+                    .is_some()
+            })
+            .await;
+            rustix::process::kill_process(raw_pid(pid).unwrap(), Signal::KILL).unwrap();
+            wait_until(|| subc_os::child_exit::observe(pid).unwrap().is_some()).await;
+
+            #[cfg(target_os = "linux")]
+            containment::settle_faults::set_mountinfo(
+                pid,
+                Some("25 1 0:23 / /proc rw - proc proc rw,hidepid=2\n"),
+            );
+            #[cfg(target_os = "linux")]
+            {
+                let reports = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let held = roster.held_container_row("sample", pid, carried.created_start_time);
+                let facts = containment::InheritedPin::from_witness(&carried, None);
+                let counted = reports.clone();
+                let holding = tokio::spawn(async move {
+                    containment::hold_until_settled("sample", &facts, held, |_| {
+                        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    })
+                    .await
+                });
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                assert!(
+                    !holding.is_finished(),
+                    "an incomplete process list proved nothing"
+                );
+                assert_eq!(reports.load(std::sync::atomic::Ordering::SeqCst), 1);
+                assert!(subc_os::child_exit::observe(pid).unwrap().is_some());
+                let (_, reason) = roster.previous_instance("sample").unwrap();
+                assert!(
+                    reason.waiting_message(pid).contains("hidepid=2"),
+                    "{reason:?}"
+                );
+                let _view = containment::settle_faults::complete_view(pid);
+                assert!(timeout(Duration::from_secs(10), holding)
+                    .await
+                    .unwrap()
+                    .unwrap());
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let held = roster.held_container_row("sample", pid, carried.created_start_time);
+                let facts = containment::InheritedPin::from_witness(&carried, None);
+                assert!(timeout(
+                    Duration::from_secs(10),
+                    containment::hold_until_settled("sample", &facts, held, |_| {})
+                )
+                .await
+                .unwrap());
+            }
+            assert!(
+                subc_os::child_exit::observe(pid).is_err(),
+                "the settled pin was reaped"
+            );
+            assert!(roster.previous_instance("sample").is_none());
+            assert!(live_children::read_record_entries(&path)
+                .unwrap()
+                .0
+                .is_empty());
+            helper.0.wait().unwrap();
+        }
+
+        /// When ending a rebuilt container cannot reap its pin yet, the row is
+        /// held with the reap authority and retried; it is never dropped while
+        /// the pin is unreaped.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_unreaped_inherited_pin_keeps_its_row_until_a_retry_reaps_it() {
+            let scratch = ScratchDir::new("carried-pin-retry");
+            let pin = group_child(&scratch, 0);
+            let pid = pin.0.id();
+            let (carried, row) = carried_facts(pid);
+            let path = scratch.join("live-children.json");
+            live_children::write_record_with_reasons(
+                &path,
+                std::slice::from_ref(&row),
+                Default::default(),
+            )
+            .unwrap();
+            let roster = crate::child_roster::ChildRoster::default();
+            roster.record_to_with_adopted(
+                path.clone(),
+                &live_children::AdoptedPids::from_classes([pid], []),
+            );
+            let slot = containment::Slot::default();
+            containment::adopt_after_upgrade("sample", pid, &roster, &slot, &carried, &row, None)
+                .unwrap();
+            #[cfg(target_os = "linux")]
+            let _view = containment::settle_faults::complete_view(pid);
+            containment::settle_faults::fail_reaps(pid, 3);
+            timeout(Duration::from_secs(30), containment::terminate(&slot))
+                .await
+                .unwrap();
+            let (_, reason) = roster
+                .previous_instance("sample")
+                .expect("an unreaped pin keeps its container's row");
+            assert!(
+                reason
+                    .waiting_message(pid)
+                    .contains("injected transient pin wait failure"),
+                "{reason:?}"
+            );
+            assert_eq!(
+                live_children::read_record_entries(&path).unwrap().0.len(),
+                1
+            );
+            timeout(Duration::from_secs(10), async {
+                while roster.previous_instance("sample").is_some() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the retry reaps the pin and releases the row");
+            assert!(
+                subc_os::child_exit::observe(pid).is_err(),
+                "the retry reaped the pin"
+            );
+            assert!(live_children::read_record_entries(&path)
+                .unwrap()
+                .0
+                .is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_carried_fence_write_failure_holds_the_module_until_the_row_is_durable() {
+            let scratch = ScratchDir::new("carried-fence-write-retry");
+            let pin = group_child(&scratch, 0);
+            let pid = pin.0.id();
+            let record = recorded(pid, "sample");
+            let (carried, row) = carried_facts(pid);
+            let mut witness = witness(&record);
+            witness.carried_container = Some(carried);
+            let ReconciledChild::Held(held) =
+                reconcile_child_with_unrecorded_fence(witness, Some(&record)).unwrap()
+            else {
+                panic!("a missing row must hold the module");
+            };
+            let path = scratch.join("live-children.json");
+            let handle = SupervisorHandle::new();
+            handle.begin_resume_report("attempt".into(), 1, ["sample".to_owned()]);
+            let restart = RestartPolicy::default();
+            let supervisor = Supervisor::new_for_test(Arc::new(Registry::default()), restart)
+                .with_handle(handle.clone());
+            supervisor.child_roster.record_to_with_adopted(
+                path.clone(),
+                &live_children::AdoptedPids::from_classes([], [pid]),
+            );
+            // Atomic replacement cannot replace a directory with a file.
+            std::fs::create_dir(&path).unwrap();
+            let mut launch = spec("sample", &scratch);
+            launch.carry_containment = true;
+            let registered = supervisor
+                .register_configured_with_health(
+                    launch,
+                    false,
+                    HealthConfig::default(),
+                    None,
+                    restart,
+                    Duration::from_secs(60),
+                )
+                .unwrap();
+            let watcher = supervisor.watch_unresolved_with_fence(
+                *held,
+                Some(registered),
+                true,
+                Some(row.clone()),
+            );
+            tokio::time::sleep(Duration::from_millis(220)).await;
+            let module = handle.get("sample").unwrap();
+            let status = module.status().unwrap();
+            assert!(
+                status
+                    .waiting_for_previous_detail
+                    .as_deref()
+                    .is_some_and(|detail| {
+                        detail.contains("carried container fence has not been recorded yet")
+                    }),
+                "{status:?}"
+            );
+            assert_eq!(status.spawn_generation, 0);
+            assert_eq!(supervisor.child_roster.live_count_for_test(), 0);
+            assert_eq!(
+                handle.resume_report().unwrap()["modules"][0]["disposition"],
+                "blocked"
+            );
+
+            #[cfg(target_os = "linux")]
+            let _view = containment::settle_faults::complete_view(pid);
+            containment::settle_faults::fail_reaps(pid, usize::MAX);
+            assert!(subc_os::child_exit::observe(pid).unwrap().is_none());
+            std::fs::remove_dir(&path).unwrap();
+            wait_until(|| {
+                live_children::read_record_entries(&path).is_ok_and(|(rows, _)| rows.contains(&row))
+            })
+            .await;
+            assert_eq!(module.status().unwrap().waiting_for_previous_pid, Some(pid));
+            assert_eq!(module.status().unwrap().spawn_generation, 0);
+            watcher.abort();
+            assert!(watcher.await.unwrap_err().is_cancelled());
+            containment::settle_faults::fail_reaps(pid, 0);
+        }
+
+        /// Configuration preparation can wait. If the carried container stops
+        /// proving its pin meanwhile, installation refuses the module instead
+        /// of adopting it.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn installation_rechecks_the_carried_container_after_preparation() {
+            let scratch = ScratchDir::new("carried-final-recheck");
+            let pin = group_child(&scratch, 0);
+            let pin_pid = pin.0.id();
+            let module_child = group_child(&scratch, pin_pid);
+            let module_pid = module_child.0.id();
+            let (carried, container_row) = carried_facts(pin_pid);
+            // The module restarted inside its container: the pin has exited.
+            rustix::process::kill_process(raw_pid(pin_pid).unwrap(), Signal::KILL).unwrap();
+            wait_until(|| subc_os::child_exit::observe(pin_pid).unwrap().is_some()).await;
+            let record = recorded(module_pid, "sample");
+            let mut witness = witness(&record);
+            witness.containment = ContainmentWitness::ProcessGroup {
+                leader_pid: pin_pid,
+                leader_start_time: carried.created_start_time,
+            };
+            witness.carried_container = Some(carried);
+            let ReconciledChild::Adopt(prepared) =
+                reconcile_child_with_container(witness, Some(&record), Some(&container_row))
+                    .unwrap()
+            else {
+                panic!("a fully proven carried container should be adopted");
+            };
+
+            let path = scratch.join("live-children.json");
+            live_children::write_record_with_reasons(
+                &path,
+                &[record, container_row],
+                BTreeMap::new(),
+            )
+            .unwrap();
+            let handle = SupervisorHandle::new();
+            handle.begin_resume_report("attempt".into(), 1, ["sample".to_owned()]);
+            let restart = RestartPolicy::new(0, Duration::from_secs(60));
+            let supervisor = Supervisor::new_for_test(Arc::new(Registry::default()), restart)
+                .with_handle(handle.clone());
+            supervisor.child_roster.record_to_with_adopted(
+                path,
+                &live_children::AdoptedPids::from_classes([module_pid, pin_pid], []),
+            );
+            // Break the pin proof while preparation is in progress: something
+            // other than the container reaps the pin.
+            supervisor
+                .child_roster
+                .set_admission_hook_for_test(move |_, stage, _| {
+                    if stage == "after_resume_preparation" {
+                        let _ = rustix::process::waitpid(
+                            Some(raw_pid(pin_pid).unwrap()),
+                            WaitOptions::empty(),
+                        );
+                    }
+                    true
+                });
+            let mut launch = spec("sample", &scratch);
+            launch.carry_containment = true;
+            let registered = supervisor
+                .register_configured_with_health(
+                    launch,
+                    false,
+                    HealthConfig::default(),
+                    None,
+                    restart,
+                    Duration::from_secs(60),
+                )
+                .unwrap();
+            supervisor
+                .start_adopted_after_upgrade(
+                    registered,
+                    *prepared,
+                    [None, None],
+                    [1; 16],
+                    Instant::now() + Duration::from_secs(60),
+                    true,
+                )
+                .await
+                .unwrap();
+            timeout(Duration::from_secs(10), async {
+                while subc_os::child_exit::observe(module_pid).is_ok_and(|exit| exit.is_none()) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the module was refused instead of waiting to resume");
+            assert_ne!(
+                handle.resume_report().unwrap()["modules"][0]["disposition"],
+                "resumed"
+            );
+        }
+
+        #[test]
+        #[ignore = "subprocess of carried_resume_hello_refuses_a_module_that_left_its_group"]
+        fn leave_group_on_stdin() {
+            let mut line = String::new();
+            assert!(std::io::stdin().read_line(&mut line).unwrap() > 0);
+            rustix::process::setpgid(None, None).unwrap();
+            // Do not exit: the daemon must refuse HELLO and stop this child.
+            let _ = std::io::stdin().read_line(&mut line);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn carried_resume_hello_refuses_a_module_that_left_its_group() {
+            use std::{os::unix::process::CommandExt, process::Stdio};
+            let scratch = ScratchDir::new("carried-resume-hello-left-group");
+            let pin = group_child(&scratch, 0);
+            let pin_pid = pin.0.id();
+            let mut module = AdoptionTestChild(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--ignored",
+                        "--exact",
+                        "supervise::live_upgrade::unix::tests::leave_group_on_stdin",
+                    ])
+                    .envs(spec("sample", &scratch).env)
+                    .process_group(i32::try_from(pin_pid).unwrap())
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+            let pid = module.0.id();
+            let (carried, container_row) = carried_facts(pin_pid);
+            #[cfg(target_os = "linux")]
+            let _view = containment::settle_faults::complete_view(pin_pid);
+            let mut record = recorded(pid, "sample");
+            let hello = serde_json::json!({
+                "manifest": {"module_id": "sample"},
+                "resume_token": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            });
+            let hash = HexBytes(resume_hello::parse_resume_hash(&hello).unwrap());
+            record.resume_token_sha256 = Some(hash.to_string());
+            let mut witness = witness(&record);
+            witness.resume_token_sha256 = hash;
+            witness.containment = ContainmentWitness::ProcessGroup {
+                leader_pid: pin_pid,
+                leader_start_time: carried.created_start_time,
+            };
+            witness.carried_container = Some(carried);
+            let ReconciledChild::Adopt(prepared) =
+                reconcile_child_with_container(witness, Some(&record), Some(&container_row))
+                    .unwrap()
+            else {
+                panic!("a fully proven carried container should be adopted");
+            };
+            let path = scratch.join("live-children.json");
+            live_children::write_record_with_reasons(
+                &path,
+                &[record, container_row],
+                BTreeMap::new(),
+            )
+            .unwrap();
+            let handle = SupervisorHandle::new();
+            handle.begin_resume_report("attempt".into(), 1, ["sample".to_owned()]);
+            let restart = RestartPolicy::default();
+            let supervisor = Supervisor::new_for_test(Arc::new(Registry::default()), restart)
+                .with_handle(handle.clone());
+            supervisor.child_roster.record_to_with_adopted(
+                path,
+                &live_children::AdoptedPids::from_classes([pid, pin_pid], []),
+            );
+            let mut launch = spec("sample", &scratch);
+            launch.carry_containment = true;
+            let registered = supervisor
+                .register_configured_with_health(
+                    launch,
+                    false,
+                    HealthConfig::default(),
+                    None,
+                    restart,
+                    Duration::from_secs(60),
+                )
+                .unwrap();
+            supervisor
+                .start_adopted_after_upgrade(
+                    registered,
+                    *prepared,
+                    [None, None],
+                    [1; 16],
+                    Instant::now() + Duration::from_secs(60),
+                    true,
+                )
+                .await
+                .unwrap();
+
+            module
+                .0
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(b"leave\n")
+                .unwrap();
+            wait_until(|| subc_os::process_group::pgid(pid).unwrap() == Some(pid)).await;
+            let attempt = handle.pending_adoptions.verify(&hello, pid).unwrap();
+            assert_eq!(
+                attempt.accept(|_, _| Ok(((), None))),
+                Err(resume_hello::REFUSED)
+            );
+            assert!(!handle.pending_adoptions.contains("sample"));
+            wait_until(|| subc_os::child_exit::observe(pid).is_err()).await;
+            wait_until(|| subc_os::child_exit::observe(pin_pid).is_err()).await;
+            assert_ne!(
+                handle.resume_report().unwrap()["modules"][0]["disposition"],
+                "resumed"
+            );
+        }
+
+        #[tokio::test]
         async fn held_child_is_left_unsignalled_and_resolved_only_after_its_exit() {
             let (_scratch, mut child) = running_child().await;
             let mut recorded = recorded(child.pid, "sample");
@@ -3555,7 +4854,7 @@ mod unix {
                 .remove_pending(id, [1; 16])
                 .unwrap()
                 .accepted
-                .send(None)
+                .send(Ok(None))
                 .unwrap();
             wait_until(|| handle.upgrade_state.disposition(id) == Some(Disposition::Resumed)).await;
             let module = handle.get(id).unwrap();
@@ -3619,7 +4918,7 @@ mod unix {
                 .remove_pending(id, [1; 16])
                 .unwrap()
                 .accepted
-                .send(None)
+                .send(Ok(None))
                 .unwrap();
             wait_until(|| handle.upgrade_state.disposition(id) == Some(Disposition::Resumed)).await;
             let attempt = handle.begin_upgrade().unwrap();

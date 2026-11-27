@@ -47,6 +47,12 @@
 //!     `open` also has `fd` (i32, the inherited pipe read end) and `tail`
 //!     (string, padded standard base64 of the unterminated output bytes).
 //!     `ended` has no additional members and replays nothing.
+//!   - `carried_container`: optional object, present only for a module that
+//!     keeps its process group across its own restarts. It has `pgid` (u32),
+//!     `pin_pid` (u32, the group's first module process, which the daemon keeps
+//!     unreaped), `created_start_time` (u64, that pin's start value),
+//!     `boot_id` (string) and `session_id` (u32). The child's `containment`
+//!     then names the pin as its `process_group` leader.
 //!
 //! Optional witnesses are omitted by the writer when absent. All objects are
 //! closed to unknown members. Runtime guards, process handles, deadlines and
@@ -212,6 +218,31 @@ pub(crate) struct ChildWitness {
     pub(crate) stdout: StreamWitness,
     #[serde(rename = "stderr")]
     pub(crate) stderr: StreamWitness,
+    #[serde(
+        rename = "carried_container",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) carried_container: Option<CarriedContainerWitness>,
+}
+
+/// The process group a module keeps across its own restarts. The group's
+/// first module process (the pin) stays an unreaped child of the daemon after
+/// it exits, so its pid still reserves the group id. Later module processes
+/// join that group, so the module child's pid may differ from `pgid`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CarriedContainerWitness {
+    #[serde(rename = "pgid")]
+    pub(crate) pgid: u32,
+    #[serde(rename = "pin_pid")]
+    pub(crate) pin_pid: u32,
+    #[serde(rename = "created_start_time")]
+    pub(crate) created_start_time: u64,
+    #[serde(rename = "boot_id")]
+    pub(crate) boot_id: String,
+    #[serde(rename = "session_id")]
+    pub(crate) session_id: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -706,6 +737,7 @@ mod tests {
                         tail: b"\x00\xffhi".to_vec(),
                     },
                     stderr: StreamWitness::Ended {},
+                    carried_container: None,
                 },
                 ChildWitness {
                     module_id: "sample-two".into(),
@@ -735,6 +767,7 @@ mod tests {
                         fd: 9,
                         tail: vec![],
                     },
+                    carried_container: None,
                 },
             ],
         }
@@ -834,6 +867,36 @@ mod tests {
                 "{before}"
             );
         }
+    }
+
+    #[test]
+    fn carried_container_witness_is_optional_authenticated_and_closed() {
+        let mut handover = sample();
+        handover.children[0].carried_container = Some(CarriedContainerWitness {
+            pgid: 400,
+            pin_pid: 400,
+            created_start_time: 8000,
+            boot_id: "boot".into(),
+            session_id: 12,
+        });
+        let encoded = encode(&handover, KEY).unwrap();
+        assert_eq!(decode(&encoded, KEY).unwrap(), handover);
+        let text = std::str::from_utf8(&encoded).unwrap();
+        let json = text.split_once('\n').unwrap().0;
+        assert!(json.contains("\"carried_container\":{\"pgid\":400,"));
+        // The HMAC covers the new member like every other one.
+        let forged = text.replacen("\"session_id\":12", "\"session_id\":13", 1);
+        assert_ne!(forged, text);
+        assert_eq!(
+            decode(forged.as_bytes(), KEY),
+            Err(HandoverError::Authentication)
+        );
+        let changed = json.replacen("\"pin_pid\":", "\"unexpected\":0,\"pin_pid\":", 1);
+        assert_eq!(decode(&signed(&changed), KEY), Err(HandoverError::Payload));
+        // A handover written without the member (every older image) still decodes.
+        assert!(!std::str::from_utf8(GOLDEN)
+            .unwrap()
+            .contains("carried_container"));
     }
 
     #[test]

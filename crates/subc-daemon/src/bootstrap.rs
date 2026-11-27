@@ -972,7 +972,6 @@ async fn run_with_config_inner(
     let cgroup_placement_config = config.cgroup_placement.clone();
     let capture_logs_dir = config.capture_logs_dir.clone();
     let terminal_journal_path = config.terminal_journal_path.clone();
-    let live_children_path = config.live_children_path.clone();
     let privacy_trampoline = config.privacy_trampoline.clone();
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let upgrade =
@@ -1045,7 +1044,6 @@ async fn run_with_config_inner(
                 watchdog_config,
                 capture_logs_dir,
                 terminal_journal_path,
-                live_children_path,
                 privacy_trampoline,
                 #[cfg(any(target_os = "linux", target_os = "macos"))]
                 upgrade,
@@ -1323,7 +1321,6 @@ async fn serve_bound_daemon(
     watchdog_config: DaemonSelfWatchdogConfig,
     capture_logs_dir: Option<PathBuf>,
     terminal_journal_path: Option<PathBuf>,
-    live_children_path: Option<PathBuf>,
     privacy_trampoline: Option<PathBuf>,
     #[cfg(any(target_os = "linux", target_os = "macos"))] upgrade: Option<UpgradeStartup>,
     #[cfg(any(target_os = "linux", target_os = "macos"))] resume: Option<resume::Resume>,
@@ -1382,8 +1379,8 @@ async fn serve_bound_daemon(
     // the run directory the record lives in, and a running daemon holds that
     // lock for its whole life. (Claiming the singleton is not enough: it is
     // keyed on the connection file, which can live in a different runtime
-    // directory from the run directory.) The lock stays held until this
-    // function returns, which is when the daemon exits.
+    // directory from the run directory.) An in-flight record write keeps the
+    // lock even if shutdown reaches its deadline and this function returns.
     let run_dir_lock = bound.run_dir_lock.take();
     let mut publication_lock = bound.publication_lock.take();
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1565,10 +1562,8 @@ async fn serve_bound_daemon(
         Some(dir) => supervisor.with_capture_logs_dir(dir),
         None => supervisor,
     };
-    let supervisor = match live_children_path {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        Some(path) if adoption.is_some() => supervisor.with_resume_roster(path, protected),
-        Some(path) => supervisor.with_live_children_record(path),
+    let supervisor = match &run_dir_lock {
+        Some(owner) => supervisor.with_owned_live_children_record(owner, protected),
         None => supervisor,
     };
     #[cfg(target_os = "linux")]

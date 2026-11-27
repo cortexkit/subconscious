@@ -124,13 +124,15 @@ impl SupervisedChild {
     /// change whether a module is reported as stopped.
     pub(super) fn start_kill(&mut self) -> io::Result<()> {
         self.retire_registration();
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        if self.child.verified_adoptee().is_some() {
-            return self.child.start_kill();
-        }
+        // A carried container comes first, also for a module adopted after an
+        // in-place upgrade, so its helpers end with it.
         if let Some(container) = self.child.container() {
             container.hard_kill();
             return self.kill_leader();
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if self.child.verified_adoptee().is_some() {
+            return self.child.start_kill();
         }
         #[cfg(windows)]
         if let Some(job) = &self.job {

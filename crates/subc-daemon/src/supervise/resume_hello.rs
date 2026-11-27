@@ -12,7 +12,8 @@
 //! `remove_pending` withdraws it on exit. Both name the attempt to avoid
 //! touching a later adoption for the same id. The deadline check and commit
 //! share the same lock, so expiry and acceptance cannot both claim an entry.
-//! A rejected HELLO never removes the entry, even if it arrived too late.
+//! A rejected HELLO leaves the entry alone unless it proves the module has
+//! lost its carried container, in which case it wakes the adopter to stop it.
 
 use std::{
     collections::HashMap,
@@ -40,6 +41,10 @@ const TOKEN_PLACEHOLDER: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
 type TokenHash = [u8; 32];
 type AttemptId = [u8; 16];
+pub(crate) type AdoptionOutcome = Result<Option<DeliverySpawn>, CarriedGroupChanged>;
+
+#[derive(Debug)]
+pub(crate) struct CarriedGroupChanged;
 
 pub(crate) struct PendingAdoption {
     pub(crate) spawn: Arc<RegistrationSpawn>,
@@ -51,7 +56,9 @@ pub(crate) struct PendingAdoption {
     pub(crate) provider_declarations: Option<String>,
     pub(crate) launch_nonce_sha256: Option<TokenHash>,
     pub(crate) delivery: Option<PendingDelivery>,
-    pub(crate) accepted: oneshot::Sender<Option<DeliverySpawn>>,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) carried: Option<std::sync::Weak<super::containment::CarriedContainment>>,
+    pub(crate) accepted: oneshot::Sender<AdoptionOutcome>,
 }
 
 pub(crate) struct PendingDelivery {
@@ -274,7 +281,7 @@ pub(crate) struct ResumeAttempt {
 }
 
 impl ResumeAttempt {
-    fn accept<T>(
+    pub(super) fn accept<T>(
         self,
         commit: impl FnOnce(
             &PendingAdoption,
@@ -291,11 +298,23 @@ impl ResumeAttempt {
         {
             return Err(REFUSED);
         }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if entry.carried.as_ref().is_some_and(|container| {
+            !container
+                .upgrade()
+                .is_some_and(|container| container.still_holds_member(entry.pid))
+        }) {
+            let entry = pending
+                .remove(module)
+                .expect("adoption locked through refusal");
+            let _ = entry.accepted.send(Err(CarriedGroupChanged));
+            return Err(REFUSED);
+        }
         let (value, delivery) = commit(entry, now)?;
         let entry = pending
             .remove(module)
             .expect("adoption locked through acceptance");
-        let _ = entry.accepted.send(delivery);
+        let _ = entry.accepted.send(Ok(delivery));
         Ok(value)
     }
 }
@@ -625,7 +644,7 @@ mod tests {
     fn pending(
         handle: &SupervisorHandle,
         deadline: Instant,
-    ) -> (PendingAdoption, oneshot::Receiver<Option<DeliverySpawn>>) {
+    ) -> (PendingAdoption, oneshot::Receiver<AdoptionOutcome>) {
         let spawn = RegistrationSpawn::new(handle, "sample", SpawnRole::Plain, None);
         spawn.ready();
         let (accepted, receiver) = oneshot::channel();
@@ -640,6 +659,7 @@ mod tests {
                 provider_declarations: None,
                 launch_nonce_sha256: None,
                 delivery: None,
+                carried: None,
                 accepted,
             },
             receiver,
@@ -709,7 +729,7 @@ mod tests {
         release.send(()).unwrap();
         accepting.await.unwrap().unwrap();
         assert!(expiry.await.unwrap().is_none());
-        assert!(accepted.await.unwrap().is_none());
+        assert!(accepted.await.unwrap().unwrap().is_none());
         assert!(state
             .verify_witnesses("sample", hash, 42, 10, None)
             .is_err());
@@ -1182,7 +1202,7 @@ mod tests {
         let new_hash = hash_hex(&sha256(token.as_bytes()));
         assert_ne!(new_hash, old_hash);
         assert_eq!(read_hash(&roster_path).as_deref(), Some(new_hash.as_str()));
-        let delivery = accepted.await.unwrap().unwrap();
+        let delivery = accepted.await.unwrap().unwrap().unwrap();
         assert_eq!(delivery.module(), "sample");
         assert!(Arc::ptr_eq(delivery.authority().unwrap(), &spawn.authority));
         let sync = exchange_frame(

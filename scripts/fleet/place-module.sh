@@ -1672,7 +1672,7 @@ fi
 if [ -n "$MIGRATES" ]; then
   [ -f "$MIGRATES" ] || refuse "--migrates named $MIGRATES, which is not a file; nothing has been placed"
   # Named for the module as well as the store file: several modules keep a
-  # store.db, and snapshots sharing a name could not be pruned per module.
+  # store.db, and snapshots sharing a name could not be told apart.
   store_rb="$STAGING/$MODULE.$(basename "$MIGRATES").rollback-$(date -u +%Y%m%dT%H%M%SZ)"
   # A consistent copy, NOT cp: the module holds the store open with a live -wal,
   # and cp captures a torn .db beside a WAL it does not include -- a snapshot
@@ -1757,14 +1757,14 @@ record_program_placement
 say "warm-exec at destination: $("$DEST" --version 2>&1 | head -1)"
 reconcile_cli_faces
 
-# Rollback retention: the newest three per binary (and per module store) are
-# kept, which always includes the one taken above. Without it every placement
-# left a full copy behind for good; staging had grown to 16 GB of them.
+# Rollback retention: the newest three binary rollbacks are kept, which always
+# includes the one taken above. Without it every placement left a full copy
+# behind for good; staging had grown to 16 GB of them. Store snapshots are never
+# pruned here: an owner may need an older one until a backup restore is checked,
+# and this script can't see that, so the owner releases each snapshot by name.
 if [ -z "$WINDOW" ]; then
   prune="$(dirname "$0")/prune-rollbacks.sh"
-  prune_names=("$(basename "$DEST")")
-  [ -n "$MIGRATES" ] && prune_names+=("$MODULE.$(basename "$MIGRATES")")
-  if ! CK_STAGING="$STAGING" "$prune" --keep 3 --apply "${prune_names[@]}"; then # nonempty-array: seeded with destination basename
+  if ! CK_STAGING="$STAGING" "$prune" --keep 3 --apply "$(basename "$DEST")"; then
     say "WARNING: rollback prune failed; the placement itself succeeded and older rollbacks were kept"
   fi
 fi

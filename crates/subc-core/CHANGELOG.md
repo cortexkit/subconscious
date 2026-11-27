@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.24.2
+
+- Show why a previous instance blocks a module in `ck module list`, including
+  the surviving process ID when a container remains after a daemon crash.
+- Require subc-daemon 0.54.3, which resumes modules that keep their container
+  across restarts during an in-place upgrade. Test-only: cover that resume end
+  to end, including a module that restarted inside its container.
+
 ## 0.24.1
 
 - Have `ck setup` and `ck upgrade` add `registration_channel: true` to managed

@@ -178,7 +178,10 @@ async fn run() {
         }])
         .build();
     let upgrade_fixture = std::env::var("CHANNEL_MODULE_UPGRADE_FIXTURE").ok();
-    let live_upgrade = matches!(upgrade_fixture.as_deref(), Some("carry" | "e2e-carry"));
+    let live_upgrade = matches!(
+        upgrade_fixture.as_deref(),
+        Some("carry" | "e2e-carry" | "carry-helper")
+    );
     let (handle, serving) = ServeOptions::default()
         .with_live_upgrade(live_upgrade)
         .serve_from_env_with_handle(
@@ -193,6 +196,23 @@ async fn run() {
         .unwrap()
         .unwrap();
     if upgrade_fixture.is_some() {
+        // The first process starts one long-lived helper in its own process
+        // group. Later processes leave it alone, so a test can see whether the
+        // helper outlives restarts of the module.
+        let helper = root.join(format!("{id}.helper"));
+        if upgrade_fixture.as_deref() == Some("carry-helper") && !helper.exists() {
+            // The helper is meant to outlive this process, which therefore
+            // never waits for it; its eventual parent reaps it.
+            #[allow(clippy::zombie_processes)]
+            let process = std::process::Command::new("/bin/sleep")
+                .arg("600")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            fs::write(&helper, process.id().to_string()).unwrap();
+        }
         fs::write(
             root.join(format!("{id}.registered")),
             std::process::id().to_string(),

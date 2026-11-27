@@ -1209,13 +1209,12 @@ impl Supervisor {
         self
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    pub(crate) fn with_resume_roster(
+    pub(crate) fn with_owned_live_children_record(
         self,
-        path: PathBuf,
+        owner: &crate::run_dir_lock::RunDirLock,
         protected: &crate::live_children::AdoptedPids,
     ) -> Self {
-        self.child_roster.record_to_with_adopted(path, protected);
+        self.child_roster.record_to_owned(owner, protected);
         self
     }
 

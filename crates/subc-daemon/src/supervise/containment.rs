@@ -38,7 +38,7 @@ enum Resource {
         created_start_time: Option<u64>,
         identity: LaunchIdentity,
         anchor_lost: std::sync::atomic::AtomicBool,
-        pin: Mutex<Option<Child>>,
+        pin: ReapLock,
         pending_pin: std::sync::atomic::AtomicBool,
     },
     #[cfg(target_os = "linux")]
@@ -53,10 +53,91 @@ enum Resource {
 }
 
 #[cfg(unix)]
+type ReapLock = Arc<Mutex<Option<Pin>>>;
+
+#[cfg(unix)]
 #[derive(Debug, Clone)]
 pub(super) struct LaunchIdentity {
     pub(super) boot_id: String,
     pub(super) session_id: u32,
+}
+
+/// The group's first module process, kept unreaped so its pid keeps
+/// reserving the process-group id.
+#[cfg(unix)]
+#[derive(Debug)]
+pub(super) enum Pin {
+    /// Spawned by this image, with its Tokio handle.
+    Spawned(Child),
+    /// Inherited across an in-place upgrade. The exec keeps this daemon's
+    /// pid, so the process is still this daemon's unreaped child, but there is
+    /// no Tokio handle for it.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    Inherited { pid: u32, owner: PinOwner },
+}
+
+/// The adopted module process that is also an inherited pin, if it is one.
+/// That process can be signalled by pid, so its pin is reaped only under the
+/// same lock as every check-and-signal of it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) type PinOwner = Option<Arc<super::live_upgrade::VerifiedChild>>;
+
+#[cfg(unix)]
+impl Pin {
+    fn id(&self) -> Option<u32> {
+        match self {
+            Self::Spawned(child) => child.id(),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Self::Inherited { pid, .. } => Some(*pid),
+        }
+    }
+
+    /// Reap the pin if it has exited.
+    fn try_wait(&mut self) -> io::Result<Option<()>> {
+        match self {
+            Self::Spawned(child) => child.try_wait().map(|status| status.map(|_| ())),
+            // Only `settle_inherited_group`, after the container has settled,
+            // reaps an inherited pin.
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Self::Inherited { .. } => Err(io::Error::other(
+                "an inherited process-group pin is reaped only after its container settles",
+            )),
+        }
+    }
+
+    fn start_kill(&mut self) -> io::Result<()> {
+        match self {
+            Self::Spawned(child) => child.start_kill(),
+            // An inherited pin that is still running is the adopted module
+            // process itself, which is signalled through its adoption.
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Self::Inherited { .. } => Err(io::Error::other(
+                "an inherited process-group pin is signalled through its adopted child",
+            )),
+        }
+    }
+}
+
+/// The pin's kernel start time. It must equal the group's recorded creation
+/// time before the daemon signals or joins the group, or adopts it after an
+/// upgrade.
+#[cfg(unix)]
+pub(super) fn group_pin_birth(pgid: u32) -> io::Result<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        subc_os::owned_child_start_time(pgid)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        subc_os::process_group::inspect(pgid).and_then(|identity| {
+            identity.map(|identity| identity.start_time).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "process-group pin identity is missing",
+                )
+            })
+        })
+    }
 }
 
 #[cfg(unix)]
@@ -106,7 +187,7 @@ impl CarriedContainment {
         {
             self.counters.increment_carried_containment_anchor_lost();
             error!(module_id = %self.module_id, pgid, ?created_start_time, %error,
-                "carried process-group anchor was unexpectedly reaped; only verified per-PID cleanup is safe");
+                "carried process-group anchor was unexpectedly reaped; group-wide signals refused");
         }
     }
 
@@ -166,13 +247,13 @@ impl CarriedContainment {
     fn owns_pin(
         &self,
         pgid: u32,
-        pin: &Option<Child>,
+        pin: &Option<Pin>,
         anchor_lost: &std::sync::atomic::AtomicBool,
     ) -> bool {
         let pending = matches!(&self.resource, Resource::Group { pending_pin, .. }
             if pending_pin.load(std::sync::atomic::Ordering::Acquire));
         if anchor_lost.load(std::sync::atomic::Ordering::Acquire)
-            || (pin.as_ref().and_then(Child::id) != Some(pgid) && !pending)
+            || (pin.as_ref().and_then(Pin::id) != Some(pgid) && !pending)
         {
             return false;
         }
@@ -186,18 +267,7 @@ impl CarriedContainment {
         let Some(record) = self.recorded_group() else {
             return false;
         };
-        #[cfg(target_os = "macos")]
-        let birth = subc_os::owned_child_start_time(pgid);
-        #[cfg(not(target_os = "macos"))]
-        let birth = subc_os::process_group::inspect(pgid).and_then(|identity| {
-            identity.map(|identity| identity.start_time).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "process-group pin identity is missing",
-                )
-            })
-        });
-        match birth {
+        match group_pin_birth(pgid) {
             Ok(actual) if actual == record.created_start_time => {}
             actual => {
                 error!(module_id = %self.module_id, pgid, expected = record.created_start_time,
@@ -256,12 +326,15 @@ impl CarriedContainment {
     fn release_roster(&self) {
         let guard = self.roster.lock().unwrap_or_else(|p| p.into_inner()).take();
         #[cfg(unix)]
-        if let Some(reason) = self
+        // Retaining can wait for a record write. Shutdown's hard kill must
+        // still be able to update the cleanup result while that write stalls.
+        let reason = self
             .cleanup_block
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .take()
-        {
+            .take();
+        #[cfg(unix)]
+        if let Some(reason) = reason {
             if let Some(guard) = guard {
                 guard.retain(reason);
             }
@@ -338,14 +411,7 @@ impl CarriedContainment {
                 // Signal acceptance does not establish that all live members
                 // have exited, including when Drop is the only cleanup owner.
                 *self.cleanup_block.lock().unwrap_or_else(|p| p.into_inner()) =
-                    self.recorded_group().map_or_else(
-                        || {
-                            Some(crate::live_children::RetainedReason::ContainerUnverifiable(
-                                "unpinned group has no recorded creation identity".into(),
-                            ))
-                        },
-                        crate::group_recovery::recheck,
-                    );
+                    self.recheck_group(crate::group_recovery::signal_recorded_anchor);
             }
             #[cfg(target_os = "linux")]
             Resource::Cgroup {
@@ -361,6 +427,34 @@ impl CarriedContainment {
                 }
             }
         }
+    }
+
+    #[cfg(unix)]
+    fn recheck_group(
+        &self,
+        signal_anchor: impl FnOnce(
+            crate::group_recovery::RecordedGroup<'_>,
+            subc_os::Signal,
+        ) -> io::Result<()>,
+    ) -> Option<crate::live_children::RetainedReason> {
+        #[allow(irrefutable_let_patterns)]
+        let Resource::Group { pin, .. } = &self.resource
+        else {
+            unreachable!("only Unix process groups have a recorded anchor");
+        };
+        self.recorded_group().map_or_else(
+            || {
+                Some(crate::live_children::RetainedReason::ContainerUnverifiable(
+                    "unpinned group has no recorded creation identity".into(),
+                ))
+            },
+            |record| {
+                crate::group_recovery::recheck_with(record, |record, signal| {
+                    let _reap = pin.lock().unwrap_or_else(|p| p.into_inner());
+                    signal_anchor(record, signal)
+                })
+            },
+        )
     }
 
     pub(super) async fn stop_members(&self) {
@@ -422,11 +516,23 @@ impl CarriedContainment {
                 }
                 self.hard_kill();
                 let owned_pin = pin.lock().unwrap_or_else(|p| p.into_inner()).take();
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                let (owned_pin, inherited_pin) = match owned_pin {
+                    Some(Pin::Inherited { pid, owner }) => {
+                        self.await_inherited_pin_exit(pid).await;
+                        (None, Some((pid, owner)))
+                    }
+                    other => (other, None),
+                };
                 if let Some(mut child) = owned_pin {
                     // Rejection cleanup may run on a separate timer driver
                     // while the child's original I/O reactor is blocked.
                     loop {
-                        match child.try_wait() {
+                        let reaped = {
+                            let _reap = pin.lock().unwrap_or_else(|p| p.into_inner());
+                            child.try_wait()
+                        };
+                        match reaped {
                             Ok(Some(_)) => {
                                 let binding = self
                                     .binding_retirement
@@ -471,6 +577,10 @@ impl CarriedContainment {
                 // exited. Retain an unverifiable or surviving tree before a
                 // caller can start a fresh container after a failed join.
                 self.recover_group().await;
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                if let Some((pid, owner)) = inherited_pin {
+                    self.settle_inherited_pin(pid, owner, Arc::clone(pin));
+                }
             }
             #[cfg(target_os = "linux")]
             Resource::Cgroup {
@@ -876,7 +986,7 @@ pub(super) fn adopt(
                 });
             }
             if pending_pin.swap(false, std::sync::atomic::Ordering::AcqRel) {
-                *pin = child.child.process.take();
+                *pin = child.child.process.take().map(Pin::Spawned);
             }
         }
     }
@@ -910,7 +1020,7 @@ pub(super) fn prepare_before_exec(
         created_start_time: Some(birth),
         identity: identity.clone(),
         anchor_lost: std::sync::atomic::AtomicBool::new(false),
-        pin: Mutex::new(None),
+        pin: Arc::new(Mutex::new(None)),
         // The readiness pipe proves this is our unreaped forked child, even
         // though Command::spawn cannot return its handle until after go.
         pending_pin: std::sync::atomic::AtomicBool::new(true),
@@ -1089,6 +1199,677 @@ impl CarriedContainment {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl CarriedContainment {
+    /// Wait, without reaping, until an inherited pin has exited, then revoke
+    /// the program binding as the spawned-pin path does on its reap.
+    async fn await_inherited_pin_exit(&self, pid: u32) {
+        loop {
+            match subc_os::child_exit::observe(pid) {
+                Ok(None) => sleep(Duration::from_millis(1)).await,
+                Ok(Some(_)) => break,
+                Err(error) => {
+                    warn!(module_id = %self.module_id, pid, %error,
+                        "cannot observe the inherited process-group pin; leaving it unreaped");
+                    break;
+                }
+            }
+        }
+        let binding = self
+            .binding_retirement
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .and_then(|hook| hook.upgrade());
+        if let Some(binding) = &binding {
+            binding.retire();
+        }
+    }
+
+    /// Settle an inherited pin's group after the container has been ended, and
+    /// reap the pin. If that cannot be proven yet, the container's row becomes
+    /// a held fence that keeps the reap authority: a retry settles it and
+    /// reaps the pin before removing the row, and until then the module
+    /// cannot start a fresh copy.
+    fn settle_inherited_pin(&self, pid: u32, owner: PinOwner, reap_lock: ReapLock) {
+        let Some(record) = self.recorded_group() else {
+            return;
+        };
+        let pin = InheritedPin {
+            pid,
+            birth: record.created_start_time,
+            boot_id: record.boot_id.to_owned(),
+            session_id: record.session_id,
+            owner,
+            reap_lock: Some(reap_lock),
+        };
+        let unsettled = match settle_inherited_group(&pin) {
+            Ok(()) => return,
+            Err(unsettled) => unsettled,
+        };
+        let reason = unsettled.reason();
+        warn!(module_id = %self.module_id, pgid = pid, reason = %reason.waiting_message(pid),
+            "the ended carried container is not proven settled; its module stays held");
+        let guard = self.roster.lock().unwrap_or_else(|p| p.into_inner()).take();
+        let Some(held) = guard.and_then(|guard| guard.hold_carried(reason)) else {
+            return;
+        };
+        let module = self.module_id.clone();
+        let retry = async move {
+            hold_until_settled(&module, &pin, held, |_| {}).await;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(retry);
+            }
+            Err(_) => {
+                std::thread::spawn(move || {
+                    if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        runtime.block_on(retry);
+                    }
+                });
+            }
+        }
+    }
+
+    /// Whether this container still owns its exact pin and `module_pid` is
+    /// still in its group, rechecked where an adopted module is installed.
+    pub(super) fn still_holds_member(&self, module_pid: u32) -> bool {
+        #[allow(irrefutable_let_patterns)]
+        let Resource::Group {
+            pgid,
+            pin,
+            anchor_lost,
+            ..
+        } = &self.resource
+        else {
+            return false;
+        };
+        let pin = pin.lock().unwrap_or_else(|p| p.into_inner());
+        self.owns_pin(*pgid, &pin, anchor_lost)
+            && subc_os::process_group::pgid(module_pid).ok().flatten() == Some(*pgid)
+    }
+
+    /// The facts the next image needs to take this process-group container over
+    /// across an in-place upgrade, or `None` when ownership of the group cannot
+    /// be proven right now. `child_pid` is the module process being handed over;
+    /// it must still be a member of the group.
+    pub(super) fn handover_witness(
+        &self,
+        child_pid: u32,
+    ) -> Option<super::handover::CarriedContainerWitness> {
+        use std::sync::atomic::Ordering::Acquire;
+        #[allow(irrefutable_let_patterns)]
+        let Resource::Group {
+            pgid,
+            created_start_time: Some(created_start_time),
+            identity,
+            anchor_lost,
+            pin,
+            pending_pin,
+        } = &self.resource
+        else {
+            return None;
+        };
+        if self.ending.load(Acquire)
+            || self.terminated.load(Acquire)
+            || self.admitting.load(Acquire)
+            || pending_pin.load(Acquire)
+        {
+            return None;
+        }
+        let pin = pin.lock().unwrap_or_else(|p| p.into_inner());
+        if !self.owns_pin(*pgid, &pin, anchor_lost)
+            || subc_os::process_group::pgid(child_pid).ok().flatten() != Some(*pgid)
+        {
+            return None;
+        }
+        Some(super::handover::CarriedContainerWitness {
+            pgid: *pgid,
+            pin_pid: *pgid,
+            created_start_time: *created_start_time,
+            boot_id: identity.boot_id.clone(),
+            session_id: identity.session_id,
+        })
+    }
+}
+
+/// A handed-over container's pin and the facts that identify it exactly.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug)]
+pub(super) struct InheritedPin {
+    pub(super) pid: u32,
+    pub(super) birth: u64,
+    pub(super) boot_id: String,
+    pub(super) session_id: u32,
+    pub(super) owner: PinOwner,
+    // Keep the container's lock after taking the pin out of its slot. A
+    // concurrent shutdown recheck still uses it when signalling the anchor.
+    reap_lock: Option<ReapLock>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl InheritedPin {
+    pub(super) fn from_witness(
+        witness: &super::handover::CarriedContainerWitness,
+        owner: PinOwner,
+    ) -> Self {
+        Self {
+            pid: witness.pin_pid,
+            birth: witness.created_start_time,
+            boot_id: witness.boot_id.clone(),
+            session_id: witness.session_id,
+            owner,
+            reap_lock: None,
+        }
+    }
+}
+
+/// Why a handed-over container is not settled yet.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug)]
+pub(super) enum Unsettled {
+    /// Verified live members remain after the group was signalled.
+    Survivors(Vec<u32>),
+    /// Ownership or emptiness could not be proven: the pin is not exactly the
+    /// recorded one, the process list is incomplete, or a member could not be
+    /// read. The fence stays until the proof succeeds.
+    Unproven(io::Error),
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Unsettled {
+    pub(super) fn reason(&self) -> crate::live_children::RetainedReason {
+        match self {
+            Self::Survivors(pids) => {
+                crate::live_children::RetainedReason::ContainerSurvivors(pids.clone())
+            }
+            Self::Unproven(error) => {
+                crate::live_children::RetainedReason::ContainerUnverifiable(error.to_string())
+            }
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl From<io::Error> for Unsettled {
+    fn from(error: io::Error) -> Self {
+        Self::Unproven(error)
+    }
+}
+
+/// Check that `pid` is exactly a handed-over pin: this boot, still this
+/// daemon's own exited and unreaped child (observed without reaping), with the
+/// recorded birth.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn exact_exited_pin(pid: u32, birth: u64, boot_id: &str) -> io::Result<()> {
+    if !subc_os::boot_id::is_current(boot_id)? {
+        return Err(io::Error::other(
+            "the process-group pin belongs to another boot",
+        ));
+    }
+    if subc_os::child_exit::observe(pid)?.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "the process-group pin has not exited",
+        ));
+    }
+    let actual = group_pin_birth(pid)?;
+    if actual != birth {
+        return Err(io::Error::other(format!(
+            "the process-group pin's birth differs: recorded {birth}, observed {actual}"
+        )));
+    }
+    Ok(())
+}
+
+/// Prove the pin exactly, then reap it with one non-blocking wait. Nothing
+/// waits on a pin that fails the proof.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn reap_exact_pin(pin: &InheritedPin) -> io::Result<()> {
+    exact_exited_pin(pin.pid, pin.birth, &pin.boot_id)?;
+    #[cfg(test)]
+    if settle_faults::take_failed_reap(pin.pid) {
+        return Err(io::Error::other("injected transient pin wait failure"));
+    }
+    let raw = i32::try_from(pin.pid)
+        .ok()
+        .filter(|pid| *pid > 1)
+        .and_then(rustix::process::Pid::from_raw)
+        .ok_or_else(|| io::Error::other("invalid process-group pin pid"))?;
+    loop {
+        match rustix::process::waitpid(Some(raw), rustix::process::WaitOptions::NOHANG) {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => return Err(io::Error::other("the process-group pin has not exited")),
+            Err(rustix::io::Errno::INTR) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+/// A membership scan proves a group empty only if it can see every process
+/// that could be in the group.
+///
+/// Linux lists processes from `/proc`. That listing is complete only when
+/// `/proc` belongs to this daemon's PID namespace and is mounted without
+/// `hidepid` (other than 0/off) or `subset=pid`; an entry that is listed but
+/// unreadable fails the scan itself.
+///
+/// macOS answers the group listing from the kernel's whole process table,
+/// which has no per-user hiding for an unsandboxed daemon. A listed process
+/// the daemon may not inspect fails the scan, so it keeps the fence.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn require_complete_process_view(pgid: u32) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        #[cfg(test)]
+        let injected = settle_faults::mountinfo(pgid);
+        #[cfg(not(test))]
+        let injected: Option<String> = None;
+        let mountinfo = match injected {
+            Some(text) => text,
+            None => std::fs::read_to_string("/proc/self/mountinfo")?,
+        };
+        if let Some(restriction) = proc_view_restriction(&mountinfo) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("the process list cannot show every process: {restriction}"),
+            ));
+        }
+        let own = std::fs::read_link("/proc/self")?;
+        if own.to_str().and_then(|pid| pid.parse::<u32>().ok()) != Some(std::process::id()) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "/proc belongs to another PID namespace",
+            ));
+        }
+    }
+    let _ = pgid;
+    Ok(())
+}
+
+/// The restriction that keeps `/proc` from listing every process, from
+/// `/proc/self/mountinfo` text: the last `proc` mount on `/proc` decides.
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) fn proc_view_restriction(mountinfo: &str) -> Option<String> {
+    let mut options = None;
+    for line in mountinfo.lines() {
+        let Some((mount, filesystem)) = line.split_once(" - ") else {
+            continue;
+        };
+        let mount: Vec<_> = mount.split(' ').collect();
+        let mut filesystem = filesystem.split(' ');
+        let (Some(fstype), _, superblock) =
+            (filesystem.next(), filesystem.next(), filesystem.next())
+        else {
+            continue;
+        };
+        if mount.get(4) == Some(&"/proc") && fstype == "proc" {
+            options = Some(format!(
+                "{},{}",
+                mount.get(5).unwrap_or(&""),
+                superblock.unwrap_or("")
+            ));
+        }
+    }
+    let Some(options) = options else {
+        return Some("no proc filesystem is mounted at /proc".into());
+    };
+    options
+        .split(',')
+        .find_map(|option| match option.split_once('=') {
+            Some(("hidepid", "0" | "off")) => None,
+            Some(("hidepid", _)) | Some(("subset", _)) => {
+                Some(format!("/proc is mounted with {option}"))
+            }
+            _ => None,
+        })
+}
+
+/// The group's live members other than the pin. A zombie has exited and
+/// cannot fork, so it is not live. Any process that cannot be listed or read
+/// fails the scan.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn live_group_members(pgid: u32) -> io::Result<Vec<u32>> {
+    require_complete_process_view(pgid)?;
+    let mut live = Vec::new();
+    for pid in subc_os::process_group::members(pgid)? {
+        if pid == pgid {
+            continue;
+        }
+        if subc_os::process_group::inspect(pid)?
+            .is_some_and(|member| member.pgid == pgid && !member.exited)
+        {
+            live.push(pid);
+        }
+    }
+    Ok(live)
+}
+
+/// Settle a handed-over container's group and reap its pin.
+///
+/// The pin must be exactly the recorded one, in this daemon's session: that
+/// proves the daemon created the group and that the unreaped pin still
+/// reserves its id, which is the only authority for a group-wide signal. Live
+/// members are signalled, a complete scan must then find none, and only then
+/// is the pin reaped, under its owner's signal lock when it is an adopted
+/// module process. No replacement may start until this succeeds.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn settle_inherited_group(pin: &InheritedPin) -> Result<(), Unsettled> {
+    if subc_os::process_group::session_id(std::process::id())? != Some(pin.session_id) {
+        return Err(
+            io::Error::other("the handed-over container belongs to another session").into(),
+        );
+    }
+    exact_exited_pin(pin.pid, pin.birth, &pin.boot_id)?;
+    let mut live = live_group_members(pin.pid)?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !live.is_empty() {
+        if std::time::Instant::now() >= deadline {
+            return Err(Unsettled::Survivors(live));
+        }
+        exact_exited_pin(pin.pid, pin.birth, &pin.boot_id)?;
+        signal_group(pin.pid, rustix::process::Signal::KILL);
+        std::thread::sleep(Duration::from_millis(20));
+        live = live_group_members(pin.pid)?;
+    }
+    let _reap = pin
+        .reap_lock
+        .as_ref()
+        .map(|lock| lock.lock().unwrap_or_else(|p| p.into_inner()));
+    match &pin.owner {
+        Some(owner) => owner.reap_as_pin(|| reap_exact_pin(pin))?,
+        None => reap_exact_pin(pin)?,
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const HELD_RETRY: Duration = Duration::from_millis(100);
+
+/// Persist a missing carried fence before its watcher can remove even the
+/// module's process row. Bootstrap already logged the initial failure.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) async fn record_held_fence(
+    module: &str,
+    pgid: u32,
+    held: &crate::child_roster::HeldContainerRow,
+) -> bool {
+    while !held.daemon_closing() {
+        if held.persist_fence().is_ok() {
+            tracing::info!(module_id = %module, pgid, "recorded the held carried container fence");
+            return true;
+        }
+        sleep(HELD_RETRY).await;
+    }
+    // Shutdown owns the remaining retries. This watcher must not settle the
+    // pin or remove any evidence while the daemon is shutting down.
+    false
+}
+
+/// Keep settling a held container until it is proven and its pin reaped, then
+/// remove its held row. `report` hears each new reason it is still held, which
+/// is also logged once and shown as the module's waiting reason. Returns
+/// false if the daemon began shutting down first; the row then stays in the
+/// record for the next start.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) async fn hold_until_settled(
+    module: &str,
+    pin: &InheritedPin,
+    held: crate::child_roster::HeldContainerRow,
+    report: impl Fn(&crate::live_children::RetainedReason),
+) -> bool {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut child_events = signal(SignalKind::child()).ok();
+    let mut reported: Option<crate::live_children::RetainedReason> = None;
+    loop {
+        let attempt = {
+            let work = || settle_inherited_group(pin);
+            if tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+                handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+            }) {
+                tokio::task::block_in_place(work)
+            } else {
+                work()
+            }
+        };
+        match attempt {
+            Ok(()) => {
+                // The pin has been reaped. Retry only the durable release;
+                // the original child ownership check cannot succeed again.
+                loop {
+                    match held.release() {
+                        Ok(_) => return true,
+                        Err(error) => warn!(module_id = %module, pgid = pin.pid, %error,
+                            "settled the carried container but could not remove its record row"),
+                    }
+                    if held.daemon_closing() {
+                        return false;
+                    }
+                    sleep(HELD_RETRY).await;
+                }
+            }
+            Err(unsettled) => {
+                let reason = unsettled.reason();
+                if reported.as_ref() != Some(&reason) {
+                    warn!(module_id = %module, pgid = pin.pid,
+                        reason = %reason.waiting_message(pin.pid),
+                        "held: the carried container is not proven settled");
+                    held.report(reason.clone());
+                    report(&reason);
+                    reported = Some(reason);
+                }
+            }
+        }
+        if held.daemon_closing() {
+            return false;
+        }
+        tokio::select! {
+            _ = sleep(HELD_RETRY) => {}
+            _ = async {
+                match &mut child_events {
+                    Some(events) => { events.recv().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {}
+        }
+    }
+}
+
+/// Test-only faults for one group: a mount table to read instead of the real
+/// one, and a number of pin waits to fail as if transiently.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(super) mod settle_faults {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Faults {
+        #[cfg(target_os = "linux")]
+        mountinfo: BTreeMap<u32, String>,
+        failed_reaps: BTreeMap<u32, usize>,
+    }
+
+    static FAULTS: Mutex<Option<Faults>> = Mutex::new(None);
+
+    #[cfg(target_os = "linux")]
+    const COMPLETE_VIEW: &str = "25 1 0:23 / /proc rw - proc proc rw\n";
+
+    #[cfg(target_os = "linux")]
+    pub(crate) struct CompleteView(u32);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for CompleteView {
+        fn drop(&mut self) {
+            set_mountinfo(self.0, None);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn complete_view(pgid: u32) -> CompleteView {
+        // These tests own their members, so even the runner's restricted
+        // procfs lists them. Override only the mount policy for this group.
+        set_mountinfo(pgid, Some(COMPLETE_VIEW));
+        CompleteView(pgid)
+    }
+
+    fn with<T>(work: impl FnOnce(&mut Faults) -> T) -> T {
+        work(
+            FAULTS
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get_or_insert_with(Faults::default),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn set_mountinfo(pgid: u32, text: Option<&str>) {
+        with(|faults| match text {
+            Some(text) => {
+                faults.mountinfo.insert(pgid, text.to_owned());
+            }
+            None => {
+                faults.mountinfo.remove(&pgid);
+            }
+        });
+    }
+
+    pub(crate) fn fail_reaps(pgid: u32, count: usize) {
+        with(|faults| {
+            faults.failed_reaps.insert(pgid, count);
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn mountinfo(pgid: u32) -> Option<String> {
+        with(|faults| faults.mountinfo.get(&pgid).cloned())
+    }
+
+    pub(super) fn take_failed_reap(pgid: u32) -> bool {
+        with(|faults| match faults.failed_reaps.get_mut(&pgid) {
+            Some(count) if *count > 0 => {
+                *count -= 1;
+                true
+            }
+            _ => false,
+        })
+    }
+}
+/// Rebuild a carried process-group container that the previous image handed
+/// over, after the resume bootstrap proved its facts. The pin and the module
+/// process's membership are re-proven here, immediately before the container
+/// takes over the group's recorded row and is published in `slot`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn adopt_after_upgrade(
+    module_id: &str,
+    module_pid: u32,
+    roster: &ChildRoster,
+    slot: &Slot,
+    witness: &super::handover::CarriedContainerWitness,
+    record: &crate::live_children::RecordedChild,
+    pin_owner: PinOwner,
+) -> io::Result<Arc<CarriedContainment>> {
+    if current(slot).is_some() {
+        return Err(io::Error::other(
+            "the module already has a carried container",
+        ));
+    }
+    let container = Arc::new(CarriedContainment {
+        binding_retirement: Mutex::new(None),
+        module_id: module_id.to_owned(),
+        counters: roster.counters.clone(),
+        cleanup_block: Mutex::new(None),
+        #[cfg(test)]
+        group_signals: Mutex::new(None),
+        resource: Resource::Group {
+            pgid: witness.pgid,
+            created_start_time: Some(witness.created_start_time),
+            identity: LaunchIdentity {
+                boot_id: witness.boot_id.clone(),
+                session_id: witness.session_id,
+            },
+            anchor_lost: std::sync::atomic::AtomicBool::new(false),
+            pin: Arc::new(Mutex::new(Some(Pin::Inherited {
+                pid: witness.pin_pid,
+                owner: pin_owner,
+            }))),
+            pending_pin: std::sync::atomic::AtomicBool::new(false),
+        },
+        roster: Mutex::new(None),
+        terminated: std::sync::atomic::AtomicBool::new(false),
+        ending: std::sync::atomic::AtomicBool::new(false),
+        admitting: std::sync::atomic::AtomicBool::new(false),
+        admission_changed: tokio::sync::Notify::new(),
+        cleanup_finished: tokio::sync::Notify::new(),
+        hard_killed: std::sync::atomic::AtomicBool::new(false),
+        kill_notify: tokio::sync::Notify::new(),
+    });
+    let proven = match &container.resource {
+        Resource::Group {
+            pgid,
+            pin,
+            anchor_lost,
+            ..
+        } => {
+            container.owns_pin(
+                *pgid,
+                &pin.lock().unwrap_or_else(|p| p.into_inner()),
+                anchor_lost,
+            ) && subc_os::process_group::pgid(module_pid).ok().flatten() == Some(*pgid)
+        }
+        #[cfg(target_os = "linux")]
+        Resource::Cgroup { .. } => false,
+    };
+    // The module actor has not started yet, so nothing reads the slot before
+    // the row transfer below either succeeds or withdraws the container.
+    let guard = if proven {
+        *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(&container));
+        roster.admit_adopted_container(record, Arc::downgrade(&container))
+    } else {
+        Err(io::Error::other(
+            "the inherited process-group pin or the module's membership in its group is no longer proven",
+        ))
+    };
+    match guard {
+        Ok(guard) => {
+            *container.roster.lock().unwrap_or_else(|p| p.into_inner()) = Some(guard);
+            Ok(container)
+        }
+        Err(error) => {
+            slot.lock().unwrap_or_else(|p| p.into_inner()).take();
+            // Nothing was taken over. Dropping a container ends its group, so
+            // mark it finished first: the caller settles the group from the
+            // handover's facts, and its recorded row stays until then.
+            container
+                .terminated
+                .store(true, std::sync::atomic::Ordering::Release);
+            Err(error)
+        }
+    }
+}
+
+/// Bind an adopted module process to the container the resume rebuilt for it,
+/// as `adopt` binds a spawned one.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn attach_after_upgrade(
+    child: &mut SupervisedChild,
+    container: &Arc<CarriedContainment>,
+    roster: &ChildRoster,
+) {
+    child.child.container = Arc::downgrade(container);
+    child.child.slot = Arc::downgrade(&roster.containment);
+    if let Some(binding) = &child._program_binding {
+        *container
+            .binding_retirement
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(binding.retirement_hook());
+    }
+}
+
 pub(super) fn terminate_deferred(slot: &Slot) {
     let owned = slot.lock().unwrap_or_else(|p| p.into_inner()).take();
     if let Some(container) = owned {
@@ -1204,7 +1985,7 @@ mod anchor_tests {
                 pgid: pid,
                 created_start_time: Some(birth),
                 anchor_lost: std::sync::atomic::AtomicBool::new(false),
-                pin: Mutex::new(Some(leader)),
+                pin: Arc::new(Mutex::new(Some(Pin::Spawned(leader)))),
                 pending_pin: std::sync::atomic::AtomicBool::new(false),
             },
             roster: Mutex::new(None),
@@ -1281,7 +2062,7 @@ mod anchor_tests {
                 pgid,
                 created_start_time: Some(actual + 1),
                 anchor_lost: std::sync::atomic::AtomicBool::new(false),
-                pin: Mutex::new(Some(leader)),
+                pin: Arc::new(Mutex::new(Some(Pin::Spawned(leader)))),
                 pending_pin: std::sync::atomic::AtomicBool::new(false),
             },
             roster: Mutex::new(None),
@@ -1320,7 +2101,7 @@ mod anchor_tests {
                 pgid: u32::MAX,
                 created_start_time: None,
                 anchor_lost: std::sync::atomic::AtomicBool::new(false),
-                pin: Mutex::new(None),
+                pin: Arc::new(Mutex::new(None)),
                 pending_pin: std::sync::atomic::AtomicBool::new(false),
             },
             roster: Mutex::new(None),
@@ -1388,7 +2169,7 @@ mod anchor_tests {
                 pgid,
                 created_start_time: Some(facts.start_time),
                 anchor_lost: std::sync::atomic::AtomicBool::new(false),
-                pin: Mutex::new(Some(leader)),
+                pin: Arc::new(Mutex::new(Some(Pin::Spawned(leader)))),
                 pending_pin: std::sync::atomic::AtomicBool::new(false),
             },
             roster: Mutex::new(None),
@@ -1431,16 +2212,250 @@ mod anchor_tests {
                 .any(|entry| entry.module_id == "drop-retention" && entry.container.is_some()),
             "accepting KILL must not erase the only record before members are proven gone"
         );
-        // The verified per-PID cleanup still terminates the owned holder.
-        timeout(Duration::from_secs(2), holder.wait())
-            .await
-            .unwrap()
-            .unwrap();
+        let (pid, reason) = roster
+            .previous_instance("drop-retention")
+            .expect("an unrecorded survivor must hold the module");
+        assert!(reason
+            .waiting_message(pid)
+            .contains(&format!("pid {} (", holder.id().unwrap())));
+        assert!(holder.try_wait().unwrap().is_none());
+        holder.start_kill().unwrap();
+        holder.wait().await.unwrap();
     }
 
     #[tokio::test]
     #[allow(irrefutable_let_patterns)]
-    async fn lost_first_anchor_uses_only_verified_member_signals() {
+    async fn hard_kill_recheck_serializes_identity_and_delivery_with_pin_reap() {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("600").process_group(0).kill_on_drop(true);
+        let leader = command.spawn().unwrap();
+        let pgid = leader.id().unwrap();
+        let birth = group_pin_birth(pgid).unwrap();
+        let container = CarriedContainment {
+            binding_retirement: Mutex::new(None),
+            module_id: "recheck-lock".into(),
+            counters: crate::observability::DaemonCounters::default(),
+            cleanup_block: Mutex::new(None),
+            group_signals: Mutex::new(None),
+            resource: Resource::Group {
+                identity: LaunchIdentity::capture().unwrap(),
+                pgid,
+                created_start_time: Some(birth),
+                anchor_lost: std::sync::atomic::AtomicBool::new(false),
+                pin: Arc::new(Mutex::new(Some(Pin::Spawned(leader)))),
+                pending_pin: std::sync::atomic::AtomicBool::new(false),
+            },
+            roster: Mutex::new(None),
+            terminated: std::sync::atomic::AtomicBool::new(false),
+            ending: std::sync::atomic::AtomicBool::new(false),
+            admitting: std::sync::atomic::AtomicBool::new(false),
+            admission_changed: tokio::sync::Notify::new(),
+            cleanup_finished: tokio::sync::Notify::new(),
+            hard_killed: std::sync::atomic::AtomicBool::new(false),
+            kill_notify: tokio::sync::Notify::new(),
+        };
+        let Resource::Group { pin, .. } = &container.resource else {
+            unreachable!()
+        };
+        std::thread::scope(|scope| {
+            let (try_reap, reap_requested) = std::sync::mpsc::channel();
+            let (attempted, reap_blocked) = std::sync::mpsc::channel();
+            let reaper = scope.spawn(move || {
+                reap_requested.recv_timeout(Duration::from_secs(5)).unwrap();
+                attempted.send(pin.try_lock().is_err()).unwrap();
+                pin.lock().unwrap().as_mut().unwrap().try_wait().unwrap();
+            });
+            let delivered = std::cell::Cell::new(false);
+            container.recheck_group(|record, signal| {
+                crate::group_recovery::signal_recorded_anchor_using(
+                    record,
+                    signal,
+                    subc_os::process_group::session_id,
+                    |pid| {
+                        try_reap.send(()).unwrap();
+                        assert!(
+                            reap_blocked.recv_timeout(Duration::from_secs(5)).unwrap(),
+                            "pin reaper could enter during the final identity check"
+                        );
+                        subc_os::process_group::inspect(pid)
+                    },
+                    |process, signal| {
+                        assert!(
+                            pin.try_lock().is_err(),
+                            "reap lock released before delivery"
+                        );
+                        delivered.set(true);
+                        process.signal(signal).map(|_| ())
+                    },
+                )
+            });
+            reaper.join().unwrap();
+            assert!(delivered.get(), "recheck did not attempt anchor delivery");
+        });
+        container.terminate().await;
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn retained_container_does_not_block_shutdown_behind_a_stalled_fence_write() {
+        use crate::child_roster::RecordedIdentity;
+        use crate::live_children::{ContainerIdentity, LiveChild, RecordedChild, RetainedReason};
+
+        let dir = cortexkit_test_support::ScratchDir::new("stalled-fence-container-retain");
+        let record = dir.join("children.json");
+        let roster = ChildRoster::default();
+        roster.record_to(record.clone());
+
+        let mut command = Command::new("/bin/sleep");
+        command.arg("60").process_group(0).kill_on_drop(true);
+        let mut leader = command.spawn().unwrap();
+        let pgid = leader.id().unwrap();
+        let birth = group_pin_birth(pgid).unwrap();
+        command.process_group(pgid as i32);
+        let mut survivor = command.spawn().unwrap();
+        leader.kill().await.unwrap();
+        let identity = LaunchIdentity::capture().unwrap();
+        let container = Arc::new(CarriedContainment {
+            binding_retirement: Mutex::new(None),
+            module_id: "retiring".into(),
+            counters: crate::observability::DaemonCounters::default(),
+            cleanup_block: Mutex::new(Some(RetainedReason::ContainerSurvivors(vec![survivor
+                .id()
+                .unwrap()]))),
+            group_signals: Mutex::new(None),
+            resource: Resource::Group {
+                pgid,
+                created_start_time: Some(birth),
+                identity,
+                anchor_lost: std::sync::atomic::AtomicBool::new(true),
+                pin: Arc::new(Mutex::new(None)),
+                pending_pin: std::sync::atomic::AtomicBool::new(false),
+            },
+            roster: Mutex::new(None),
+            terminated: std::sync::atomic::AtomicBool::new(false),
+            ending: std::sync::atomic::AtomicBool::new(true),
+            admitting: std::sync::atomic::AtomicBool::new(false),
+            admission_changed: tokio::sync::Notify::new(),
+            cleanup_finished: tokio::sync::Notify::new(),
+            hard_killed: std::sync::atomic::AtomicBool::new(false),
+            kill_notify: tokio::sync::Notify::new(),
+        });
+        let guard = roster
+            .admit(
+                "retiring".into(),
+                pgid,
+                ModuleProtocol::Subc,
+                Some(birth),
+                RecordedIdentity {
+                    container: Some(ContainerIdentity {
+                        pgid: Some(pgid),
+                        created_start_time: Some(birth),
+                        ..ContainerIdentity::test_metadata()
+                    }),
+                    carried: Some(Arc::downgrade(&container)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        *container.roster.lock().unwrap() = Some(guard);
+
+        command.process_group(0);
+        let mut other = command.spawn().unwrap();
+        let other_pid = other.id().unwrap();
+        let _other_guard = roster
+            .admit(
+                "other".into(),
+                other_pid,
+                ModuleProtocol::Subc,
+                Some(group_pin_birth(other_pid).unwrap()),
+                RecordedIdentity::default(),
+            )
+            .unwrap();
+        roster.hold_unrecorded_fence(
+            RecordedChild {
+                child: LiveChild {
+                    module_id: "pending".into(),
+                    pid: 42,
+                    protocol: ModuleProtocol::Subc,
+                    start_time: Some(123),
+                    executable: None,
+                    cgroup_name: None,
+                    container: Some(ContainerIdentity {
+                        pgid: Some(42),
+                        created_start_time: Some(123),
+                        ..ContainerIdentity::test_metadata()
+                    }),
+                },
+                resume_token_sha256: None,
+            },
+            Duration::from_millis(750),
+        );
+
+        let (entered, writing) = std::sync::mpsc::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let first_write = Mutex::new(Some((entered, blocked)));
+        roster.set_record_write_hook_for_test(move |_| {
+            if let Some((entered, blocked)) = first_write.lock().unwrap().take() {
+                entered.send(()).unwrap();
+                // Allow the pre-fix synchronous wait to finish and fail the
+                // test rather than hanging the runtime indefinitely.
+                let _ = blocked.recv_timeout(Duration::from_secs(5));
+            }
+        });
+        let retaining = std::thread::spawn({
+            let container = Arc::clone(&container);
+            move || {
+                writing.recv_timeout(Duration::from_secs(5)).unwrap();
+                container.release_roster();
+            }
+        });
+
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            crate::child_roster::end_children_for_daemon_shutdown(&roster, false, async {
+                // Escalate only when release_roster has reached its retain
+                // branch. The old code still holds the cleanup mutex here;
+                // the fixed code has taken the reason and released it.
+                while container
+                    .cleanup_block
+                    .try_lock()
+                    .is_ok_and(|state| state.is_some())
+                {
+                    sleep(Duration::from_millis(1)).await;
+                }
+            }),
+        )
+        .await
+        .expect("carried-container retain blocked shutdown behind the record write");
+        assert!(!retaining.is_finished(), "the retain must still be pending");
+        release
+            .send(())
+            .expect("the fence write must still be parked");
+        retaining.join().unwrap();
+        assert!(container
+            .hard_killed
+            .load(std::sync::atomic::Ordering::Acquire));
+        assert!(
+            other.try_wait().unwrap().is_some(),
+            "escalation must reach the other live child"
+        );
+        assert!(
+            survivor.try_wait().unwrap().is_none(),
+            "the unrecorded survivor must not be signalled"
+        );
+        let (_, reasons) = crate::live_children::read_record_with_reasons(&record).unwrap();
+        assert_eq!(
+            reasons.get(&pgid),
+            Some(&RetainedReason::ContainerSurvivors(vec![survivor
+                .id()
+                .unwrap()]))
+        );
+        survivor.kill().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(irrefutable_let_patterns)]
+    async fn lost_first_anchor_keeps_unrecorded_members_held_without_signalling() {
         let mut leader_command = Command::new("/bin/sleep");
         leader_command
             .arg("600")
@@ -1474,7 +2489,7 @@ mod anchor_tests {
                 pgid,
                 created_start_time: Some(facts.start_time),
                 anchor_lost: std::sync::atomic::AtomicBool::new(false),
-                pin: Mutex::new(Some(leader)),
+                pin: Arc::new(Mutex::new(Some(Pin::Spawned(leader)))),
                 pending_pin: std::sync::atomic::AtomicBool::new(false),
             },
             roster: Mutex::new(None),
@@ -1534,16 +2549,18 @@ mod anchor_tests {
             "an already-reaped P1 must never authorize a group-wide signal"
         );
         assert_eq!(counters.snapshot()["carried_containment_anchor_lost"], 1);
-        timeout(Duration::from_secs(2), holder.wait())
-            .await
-            .unwrap()
-            .unwrap();
+        assert!(
+            holder.try_wait().unwrap().is_none(),
+            "losing the pin also loses signal authority over unrecorded members"
+        );
         assert!(
             sentinel.try_wait().unwrap().is_none(),
             "a separate owned group is not part of the container"
         );
         sentinel.start_kill().unwrap();
         sentinel.wait().await.unwrap();
+        holder.start_kill().unwrap();
+        holder.wait().await.unwrap();
         observed.settled = true;
     }
 }

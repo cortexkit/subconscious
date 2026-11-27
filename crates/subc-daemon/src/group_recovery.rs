@@ -1,8 +1,10 @@
 //! Recovery when no unreaped child reserves a container's process-group ID.
-//! Never signal the group: authorize and recheck each individual member instead.
+//! Membership can block a replacement, but it cannot authorize a signal.
+//! Only the recorded anchor can be stopped, after verifying its exact birth.
 
 use crate::live_children::{RetainedReason, SweepBounds, SweepDecision};
 use std::io;
+use subc_os::local_peer::DiagnosticProcess;
 use subc_os::{process_group::Identity, Process, Signal};
 use tokio::time::{sleep, Duration, Instant};
 
@@ -51,6 +53,28 @@ struct Members {
     unknown: Option<String>,
 }
 
+impl Members {
+    fn surviving_reason(&self) -> String {
+        let members = self
+            .live
+            .iter()
+            .map(|pid| describe_member(*pid))
+            .collect::<Vec<_>>();
+        match (&self.unknown, members.is_empty()) {
+            (Some(error), true) => error.clone(),
+            (Some(error), false) => format!("still present: {}; {error}", members.join(", ")),
+            (None, _) => format!("still present: {}", members.join(", ")),
+        }
+    }
+}
+
+fn describe_member(pid: u32) -> String {
+    let name = DiagnosticProcess::capture(pid)
+        .short_name()
+        .unwrap_or_else(|| "executable unavailable".into());
+    format!("pid {pid} ({name})")
+}
+
 fn members(
     record: RecordedGroup<'_>,
     pids: impl Fn() -> io::Result<Vec<u32>>,
@@ -94,7 +118,10 @@ fn members_using(
             }
             Ok(Some(identity)) if identity.pgid == record.pgid && !identity.exited => {
                 members.unknown.get_or_insert_with(|| {
-                    format!("process {pid} is in the group but its container identity cannot be verified")
+                    format!(
+                        "{} is in the group but its container identity cannot be verified",
+                        describe_member(pid)
+                    )
                 });
             }
             Ok(_) => {}
@@ -128,16 +155,32 @@ fn confirmed_members(
     Ok(first)
 }
 
-/// Reuse the roster's existing cadence without waiting: keep the block for
-/// members observed alive in this round, even if their SIGKILL is already pending.
+/// Reuse the roster's existing cadence without waiting. Hold for any survivors,
+/// including the recorded anchor if it has not yet acted on the signal.
 pub(crate) fn recheck(record: RecordedGroup<'_>) -> Option<RetainedReason> {
-    recheck_candidates(record, subc_os::process_group::pids)
+    recheck_with(record, signal_recorded_anchor)
+}
+
+pub(crate) fn recheck_with(
+    record: RecordedGroup<'_>,
+    signal_anchor: impl FnOnce(RecordedGroup<'_>, Signal) -> io::Result<()>,
+) -> Option<RetainedReason> {
+    recheck_candidates_with(record, subc_os::process_group::pids, signal_anchor)
         .unwrap_or_else(|error| Some(RetainedReason::ContainerUnverifiable(error.to_string())))
 }
 
+#[cfg(test)]
 fn recheck_candidates(
     record: RecordedGroup<'_>,
     pids: impl Fn() -> io::Result<Vec<u32>>,
+) -> io::Result<Option<RetainedReason>> {
+    recheck_candidates_with(record, pids, signal_recorded_anchor)
+}
+
+fn recheck_candidates_with(
+    record: RecordedGroup<'_>,
+    pids: impl Fn() -> io::Result<Vec<u32>>,
+    signal_anchor: impl FnOnce(RecordedGroup<'_>, Signal) -> io::Result<()>,
 ) -> io::Result<Option<RetainedReason>> {
     if !subc_os::boot_id::is_current(record.boot_id)? {
         return Ok(None);
@@ -152,24 +195,18 @@ fn recheck_candidates(
             "recorded container anchor PID was reused".into(),
         )));
     }
-    let mut unknown = found.unknown;
-    for pid in &found.live {
-        if let Err(error) = signal_member(record, *pid, Signal::Kill) {
-            unknown.get_or_insert_with(|| {
-                format!("could not signal verified container member {pid}: {error}")
-            });
+    let mut reason = found.surviving_reason();
+    if found.live.contains(&record.pgid) {
+        if let Err(error) = signal_anchor(record, Signal::Kill) {
+            reason.push_str(&format!("; could not signal the recorded anchor: {error}"));
         }
     }
-    Ok(Some(match unknown {
-        Some(error) => RetainedReason::ContainerUnverifiable(error),
-        None => RetainedReason::ContainerSurvivors(found.live),
-    }))
+    Ok(Some(RetainedReason::ContainerUnverifiable(reason)))
 }
 
-fn signal_member(record: RecordedGroup<'_>, pid: u32, signal: Signal) -> io::Result<()> {
-    signal_member_using(
+pub(crate) fn signal_recorded_anchor(record: RecordedGroup<'_>, signal: Signal) -> io::Result<()> {
+    signal_recorded_anchor_using(
         record,
-        pid,
         signal,
         subc_os::process_group::session_id,
         subc_os::process_group::inspect,
@@ -177,24 +214,30 @@ fn signal_member(record: RecordedGroup<'_>, pid: u32, signal: Signal) -> io::Res
     )
 }
 
-fn signal_member_using(
+pub(crate) fn signal_recorded_anchor_using(
     record: RecordedGroup<'_>,
-    pid: u32,
     signal: Signal,
     session: impl Fn(u32) -> io::Result<Option<u32>>,
     inspect: impl Fn(u32) -> io::Result<Option<Identity>>,
     deliver: impl Fn(&Process, Signal) -> io::Result<()>,
 ) -> io::Result<()> {
-    // Open first: Linux uses this process's pidfd even if the numeric PID is
-    // reused between inspection and signalling. macOS rechecks immediately.
+    // Open first so Linux can deliver through a pidfd. Without one, a numeric
+    // PID is trusted only if its birth still matches the child the daemon
+    // created. Reuse in the gap before the syscall is still possible.
+    let pid = record.pgid;
     let Some(process) = Process::open(pid)? else {
         return Ok(());
     };
     if !record.anchor_matches()? {
         return Ok(());
     }
-    if inspect(pid)?.is_some_and(|facts| record.owns(facts) && !facts.exited)
-        && session(pid)? == Some(record.session_id)
+    if session(pid)? == Some(record.session_id)
+        && inspect(pid)?.is_some_and(|facts| {
+            facts.pid == pid
+                && facts.start_time == record.created_start_time
+                && record.owns(facts)
+                && !facts.exited
+        })
     {
         deliver(&process, signal)?;
     }
@@ -227,9 +270,9 @@ async fn sweep_checked(
     }
     record.validate()?;
     let found = confirmed_members(record, &pids)?;
-    let unknown = found.unknown;
     if found.live.is_empty() {
-        return Ok(unknown
+        return Ok(found
+            .unknown
             .map(SweepDecision::Unverifiable)
             .unwrap_or(SweepDecision::Gone));
     }
@@ -238,17 +281,18 @@ async fn sweep_checked(
             "recorded container anchor PID was reused".into(),
         ));
     }
-    for pid in found.live {
-        if let Err(error) = signal_member(record, pid, Signal::Terminate) {
-            tracing::debug!(pgid = record.pgid, pid, %error, "verified member SIGTERM failed");
-        }
+    if !found.live.contains(&record.pgid) {
+        return Ok(SweepDecision::Unverifiable(found.surviving_reason()));
+    }
+    if let Err(error) = signal_recorded_anchor(record, Signal::Terminate) {
+        tracing::debug!(pgid = record.pgid, %error, "recorded anchor SIGTERM failed");
     }
     let term_deadline = Instant::now() + bounds.term_grace;
     loop {
         let found = confirmed_members(record, &pids)?;
-        let unknown = found.unknown;
         if found.live.is_empty() {
-            return Ok(unknown
+            return Ok(found
+                .unknown
                 .map(SweepDecision::Unverifiable)
                 .unwrap_or(SweepDecision::Terminated));
         }
@@ -256,6 +300,9 @@ async fn sweep_checked(
             return Ok(SweepDecision::Unverifiable(
                 "recorded container anchor PID was reused".into(),
             ));
+        }
+        if !found.live.contains(&record.pgid) {
+            return Ok(SweepDecision::Unverifiable(found.surviving_reason()));
         }
         if Instant::now() >= term_deadline {
             break;
@@ -265,9 +312,9 @@ async fn sweep_checked(
     let kill_deadline = Instant::now() + bounds.kill_bound;
     loop {
         let found = confirmed_members(record, &pids)?;
-        let unknown = found.unknown;
         if found.live.is_empty() {
-            return Ok(unknown
+            return Ok(found
+                .unknown
                 .map(SweepDecision::Unverifiable)
                 .unwrap_or(SweepDecision::Killed));
         }
@@ -276,17 +323,12 @@ async fn sweep_checked(
                 "recorded container anchor PID was reused".into(),
             ));
         }
-        if Instant::now() >= kill_deadline {
-            return Ok(unknown
-                .map(SweepDecision::Unverifiable)
-                .unwrap_or(SweepDecision::ContainerSurvivors(found.live)));
+        if !found.live.contains(&record.pgid) || Instant::now() >= kill_deadline {
+            return Ok(SweepDecision::Unverifiable(found.surviving_reason()));
         }
-        // Rescan after every round: an exiting member may have forked another
-        // helper before receiving its signal. Never reuse a prior identity check.
-        for pid in found.live {
-            if let Err(error) = signal_member(record, pid, Signal::Kill) {
-                tracing::debug!(pgid = record.pgid, pid, %error, "verified member SIGKILL failed");
-            }
+        // Never reuse a prior identity check to signal the recorded anchor.
+        if let Err(error) = signal_recorded_anchor(record, Signal::Kill) {
+            tracing::debug!(pgid = record.pgid, %error, "recorded anchor SIGKILL failed");
         }
         sleep(Duration::from_millis(10)).await;
     }
@@ -345,6 +387,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unpinned_cleanup_signals_only_the_recorded_member() {
+        for startup_sweep in [true, false] {
+            let mut recorded = OwnedChild::spawn(0);
+            let record = record(&recorded);
+            let mut unrecorded = OwnedChild::spawn(recorded.id());
+            let pids = || Ok(vec![recorded.id(), unrecorded.id()]);
+            let reason = if startup_sweep {
+                match sweep_candidates(record, bounds(), pids).await {
+                    SweepDecision::Unverifiable(detail) => {
+                        Some(RetainedReason::ContainerUnverifiable(detail))
+                    }
+                    decision => decision.retained_reason(),
+                }
+            } else {
+                recheck_candidates(record, pids).unwrap()
+            };
+            let reason = reason.expect("the unrecorded survivor must hold the module");
+            assert!(
+                unrecorded.0.try_wait().unwrap().is_none(),
+                "membership is not authority to signal an unrecorded process"
+            );
+            let detail = reason.waiting_message(record.pgid);
+            assert!(
+                detail.contains(&unrecorded.id().to_string()) && detail.contains("sleep"),
+                "{detail}"
+            );
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while recorded.0.try_wait().unwrap().is_none() {
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the process with the recorded birth should have been stopped");
+        }
+    }
+
+    #[tokio::test]
     async fn sweep_requires_two_empty_passes_before_declaring_a_group_gone() {
         let mut first = OwnedChild::spawn(0);
         let record = record(&first);
@@ -362,16 +441,25 @@ mod tests {
             }
         })
         .await;
+        assert!(
+            matches!(outcome, SweepDecision::Unverifiable(_)),
+            "the second pass must find and hold for the survivor, not return Gone: {outcome:?}"
+        );
+        assert_eq!(passes.load(std::sync::atomic::Ordering::SeqCst), 2);
+        holder.0.kill().unwrap();
+        holder.0.wait().unwrap();
         assert_eq!(
-            outcome,
-            SweepDecision::Terminated,
-            "the second pass must find and terminate the survivor, not return Gone"
+            sweep_candidates(record, bounds(), || {
+                passes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Vec::new())
+            })
+            .await,
+            SweepDecision::Gone
         );
         assert!(
             passes.load(std::sync::atomic::Ordering::SeqCst) >= 4,
-            "termination also needs two subsequent complete empty passes"
+            "release still needs two subsequent complete empty passes"
         );
-        assert!(holder.0.wait().is_ok());
     }
 
     #[test]
@@ -390,12 +478,12 @@ mod tests {
             }
         })
         .unwrap();
-        assert_eq!(
-            retained,
-            Some(RetainedReason::ContainerSurvivors(vec![holder.id()])),
-            "an empty first pass must not erase the surviving container identity"
+        assert!(
+            matches!(retained, Some(RetainedReason::ContainerUnverifiable(ref detail))
+            if detail.contains(&format!("pid {}", holder.id()))),
+            "an empty first pass must not erase the surviving container identity: {retained:?}"
         );
-        assert!(holder.0.wait().is_ok());
+        assert!(holder.0.try_wait().unwrap().is_none());
     }
 
     #[test]
@@ -570,9 +658,8 @@ mod tests {
         let child = OwnedChild::spawn(0);
         let record = record(&child);
         let queried = std::cell::Cell::new(false);
-        signal_member_using(
+        signal_recorded_anchor_using(
             record,
-            child.id(),
             Signal::Kill,
             |_| {
                 queried.set(true);
@@ -589,29 +676,27 @@ mod tests {
     }
 
     #[test]
-    fn equal_zero_session_never_authorizes_a_member_older_than_its_container() {
+    fn equal_zero_session_does_not_authorize_an_anchor_with_a_different_birth() {
         let first = OwnedChild::spawn(0);
-        let holder = OwnedChild::spawn(first.id());
         let record = RecordedGroup {
             session_id: 0,
             ..record(&first)
         };
-        let mut facts = subc_os::process_group::inspect(holder.id())
+        let mut facts = subc_os::process_group::inspect(first.id())
             .unwrap()
             .unwrap();
         facts.session_id = 0;
-        facts.start_time = record.created_start_time.checked_sub(1).unwrap();
+        facts.start_time = record.created_start_time + 1;
         let inspected = std::cell::Cell::new(false);
-        signal_member_using(
+        signal_recorded_anchor_using(
             record,
-            holder.id(),
             Signal::Kill,
             |_| Ok(Some(0)),
             |_| {
                 inspected.set(true);
                 Ok(Some(facts))
             },
-            |_, _| panic!("equal zero sessions must not authorize an older member"),
+            |_, _| panic!("equal zero sessions must not authorize a different birth"),
         )
         .unwrap();
         assert!(
@@ -621,7 +706,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovered_group_stops_owned_holder_and_spares_separate_group() {
+    async fn recovered_group_reports_only_members_of_the_recorded_group() {
         let mut first = OwnedChild::spawn(0);
         let record = record(&first);
         let mut holder = OwnedChild::spawn(first.id());
@@ -632,19 +717,20 @@ mod tests {
         // no ambient PID is ever a candidate.
         let candidates = || Ok(vec![holder.id(), sentinel.id()]);
         let outcome = sweep_candidates(record, bounds(), candidates).await;
-        assert_eq!(outcome, SweepDecision::Terminated);
-        // Group inspection can observe an exited member before its owned child
-        // wait status is available. Wait for that separate kernel transition.
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while holder.0.try_wait().unwrap().is_none() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the owned holder's exit status must become available");
+        let SweepDecision::Unverifiable(detail) = outcome else {
+            panic!("the unrecorded holder must keep the container held: {outcome:?}");
+        };
         assert!(
-            holder.0.try_wait().unwrap().is_some(),
-            "the owned holder must have exited"
+            detail.contains(&format!("pid {} (", holder.id())),
+            "{detail}"
+        );
+        assert!(
+            !detail.contains(&format!("pid {} (", sentinel.id())),
+            "{detail}"
+        );
+        assert!(
+            holder.0.try_wait().unwrap().is_none(),
+            "the unrecorded holder must survive"
         );
         assert!(
             sentinel.0.try_wait().unwrap().is_none(),

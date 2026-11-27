@@ -1063,6 +1063,9 @@ pub struct SupervisorModuleProvenanceExt {
     /// Absence means unknown; future strings are retained unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registration_declaration: Option<String>,
+    /// Why a previous instance or its remaining container blocks a new start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_for_previous_detail: Option<String>,
 }
 
 impl SupervisorModuleProvenanceExt {
@@ -1073,6 +1076,12 @@ impl SupervisorModuleProvenanceExt {
     #[must_use]
     pub fn with_registration(mut self, registration: Option<RegistrationMethod>) -> Self {
         self.registration = registration;
+        self
+    }
+
+    #[must_use]
+    pub fn with_waiting_for_previous_detail(mut self, detail: Option<String>) -> Self {
+        self.waiting_for_previous_detail = detail;
         self
     }
 
@@ -1102,6 +1111,10 @@ impl SupervisorModuleProvenanceExt {
                 "registration_declaration".into(),
                 declaration.clone().into(),
             );
+        }
+        object.remove("waiting_for_previous_detail");
+        if let Some(detail) = &self.waiting_for_previous_detail {
+            object.insert("waiting_for_previous_detail".into(), detail.clone().into());
         }
         Ok(())
     }
@@ -2949,6 +2962,10 @@ pub struct SupervisorEntry {
     /// PID is not the supervised child and must not be presented as its identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting_for_previous_pid: Option<u32>,
+    /// Why the previous instance blocks a new start. Container details may
+    /// name surviving processes other than the recorded PID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_for_previous_detail: Option<String>,
     pub module_id: String,
     pub state: String,
     /// Present and true while a draining module still admits routes and requests.
@@ -3142,6 +3159,7 @@ impl SupervisorEntry {
             admission_refused: None,
             next_retry_at_ms: None,
             waiting_for_previous_pid: None,
+            waiting_for_previous_detail: None,
             accepting_drain: None,
             enabled,
             configured_enabled: None,
@@ -3208,6 +3226,12 @@ impl SupervisorEntry {
     #[must_use]
     pub fn with_waiting_for_previous_pid(mut self, pid: Option<u32>) -> Self {
         self.waiting_for_previous_pid = pid;
+        self
+    }
+
+    #[must_use]
+    pub fn with_waiting_for_previous_detail(mut self, detail: Option<String>) -> Self {
+        self.waiting_for_previous_detail = detail;
         self
     }
 
@@ -3871,6 +3895,30 @@ mod tests {
         assert_eq!(wire["waiting_for_previous_pid"], 42);
         let decoded: SupervisorEntry = serde_json::from_value(wire).unwrap();
         assert_eq!(decoded.waiting_for_previous_pid, Some(42));
+    }
+
+    #[test]
+    fn supervisor_waiting_previous_detail_is_optional_and_round_trips() {
+        let entry = SupervisorEntry::new(
+            "worker",
+            "starting",
+            true,
+            false,
+            SupervisorHealthStatus::Unknown,
+        )
+        .with_waiting_for_previous_pid(Some(41));
+        let old_wire = serde_json::to_value(&entry).unwrap();
+        assert!(old_wire.get("waiting_for_previous_detail").is_none());
+        let decoded: SupervisorEntry = serde_json::from_value(old_wire).unwrap();
+        assert_eq!(decoded.waiting_for_previous_detail, None);
+        let detail = "waiting: container survivors (pids [42])";
+        let wire =
+            serde_json::to_value(entry.with_waiting_for_previous_detail(Some(detail.into())))
+                .unwrap();
+        assert_eq!(wire["waiting_for_previous_pid"], 41);
+        assert_eq!(wire["waiting_for_previous_detail"], detail);
+        let decoded: SupervisorEntry = serde_json::from_value(wire).unwrap();
+        assert_eq!(decoded.waiting_for_previous_detail.as_deref(), Some(detail));
     }
 
     #[test]
@@ -4636,6 +4684,30 @@ mod claim_wire_tests {
             assert!(SupervisorModuleProvenanceExt::read_from(&invalid).is_err());
             assert!(absent.write_to(&mut invalid).is_err());
         }
+    }
+
+    #[test]
+    fn provenance_waiting_previous_detail_preserves_legacy_entry() {
+        let legacy = legacy_provenance();
+        let mut wire = serde_json::to_value(&legacy).unwrap();
+        let absent = SupervisorModuleProvenanceExt::read_from(&wire).unwrap();
+        assert_eq!(absent.waiting_for_previous_detail, None);
+        let detail = "waiting: container survivors (pids [42])";
+        let ext = absent
+            .clone()
+            .with_waiting_for_previous_detail(Some(detail.into()));
+        ext.write_to(&mut wire).unwrap();
+        assert_eq!(wire["waiting_for_previous_detail"], detail);
+        assert_eq!(
+            SupervisorModuleProvenanceExt::read_from(&wire).unwrap(),
+            ext
+        );
+        assert_eq!(
+            serde_json::from_value::<SupervisorModuleProvenance>(wire.clone()).unwrap(),
+            legacy
+        );
+        absent.write_to(&mut wire).unwrap();
+        assert!(wire.get("waiting_for_previous_detail").is_none());
     }
 
     #[test]

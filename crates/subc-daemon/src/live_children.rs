@@ -231,6 +231,17 @@ pub struct LiveChild {
     pub container: Option<ContainerIdentity>,
 }
 
+impl LiveChild {
+    /// Whether this row records a carried process-group container rather than
+    /// a module process. Such a row is written under the group's first module
+    /// process, whose pid is the group id.
+    pub(crate) fn is_group_container(&self) -> bool {
+        self.container
+            .as_ref()
+            .is_some_and(|container| container.pgid == Some(self.pid))
+    }
+}
+
 /// Daemon-private fields travel with the child's identity in the v2 record,
 /// but aren't part of the public inspection API.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -760,7 +771,7 @@ pub(crate) enum SweepDecision {
     ForcedStopped,
     /// Matched and signalled, but still observed at the end of the bound.
     Survived,
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     ContainerSurvivors(Vec<u32>),
     #[cfg(target_os = "linux")]
     EmptyContainerDirectory,
@@ -1067,20 +1078,21 @@ async fn sweep_entries_with_hooks(
                 decisions.push((entry, SweepDecision::AliveButUnobservable))
             }
             Some(verdict) if verdict.permits_signal() => {
+                let result = signal(&process, Signal::Terminate);
                 #[cfg(target_os = "linux")]
                 if verdict == IdentityVerdict::MatchesWithExecutablePermissionDenied {
                     info!(
                         module_id = %entry.child.module_id,
                         pid = entry.child.pid,
                         pidfd = process.signals_through_pidfd(),
-                        "orphan sweep: pid and start time match; executable not readable (non-dumpable); sending SIGTERM"
+                        "orphan sweep: pid and start time matched; executable not readable (non-dumpable); requested SIGTERM"
                     );
                 } else {
                     info!(
                         module_id = %entry.child.module_id,
                         pid = entry.child.pid,
                         pidfd = process.signals_through_pidfd(),
-                        "orphan sweep: previous daemon's child still running and matches pid, start time and executable; sending SIGTERM"
+                        "orphan sweep: previous daemon's child matched pid, start time and executable; requested SIGTERM"
                     );
                 }
                 #[cfg(not(target_os = "linux"))]
@@ -1088,9 +1100,9 @@ async fn sweep_entries_with_hooks(
                     module_id = %entry.child.module_id,
                     pid = entry.child.pid,
                     pidfd = process.signals_through_pidfd(),
-                    "orphan sweep: previous daemon's child still running and matches pid, start time and executable; sending SIGTERM"
+                    "orphan sweep: previous daemon's child matched pid, start time and executable; requested SIGTERM"
                 );
-                match signal(&process, Signal::Terminate) {
+                match result {
                     Ok(true) => signalled.push((entry, process)),
                     // It exited between the check and the signal.
                     Ok(false) => decisions.push((entry, SweepDecision::Gone)),
@@ -1140,19 +1152,18 @@ async fn sweep_entries_with_hooks(
     }
 
     for (entry, process) in &signalled {
-        // Checked again right before the signal: without a pidfd this is what
-        // keeps a SIGKILL from reaching a process that took the pid after the
-        // orphan exited.
+        // Recheck immediately before delivery, not before the log: without a
+        // pidfd, the PID could be reused after the earlier check for SIGTERM.
         if !verdict_for(&entry.child, process).is_some_and(IdentityVerdict::permits_signal) {
             continue;
         }
+        let _ = signal(process, Signal::Kill);
         warn!(
             module_id = %entry.child.module_id,
             pid = entry.child.pid,
             grace_ms = bounds.term_grace.as_millis() as u64,
-            "orphan sweep: previous daemon's child still running after SIGTERM grace; sending SIGKILL"
+            "orphan sweep: previous daemon's child still running after SIGTERM grace; requested SIGKILL"
         );
-        let _ = signal(process, Signal::Kill);
     }
     let kill_deadline = Instant::now() + bounds.kill_bound;
     loop {

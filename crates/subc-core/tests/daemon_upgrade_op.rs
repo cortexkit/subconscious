@@ -63,6 +63,28 @@ impl Daemon {
         real_resume: bool,
         with_store: bool,
     ) -> Self {
+        Self::boot_fixture_with(
+            hook,
+            prompt,
+            approval,
+            modules,
+            real_resume,
+            with_store,
+            json!({}),
+        )
+        .await
+    }
+
+    /// `module_config` holds extra keys merged into every module's config entry.
+    async fn boot_fixture_with(
+        hook: Option<(&str, &str)>,
+        prompt: &str,
+        approval: &str,
+        modules: &[(&str, &str)],
+        real_resume: bool,
+        with_store: bool,
+        module_config: Value,
+    ) -> Self {
         let root = ShortRoot::create_short_socket_root();
         let executable = root.join("ckdev-subc-upgrade-fixture");
         copy_executable(&common::ckdev_subc_under_test(), &executable);
@@ -77,14 +99,24 @@ impl Daemon {
         )
         .unwrap();
         fs::create_dir_all(root.join("config/cortexkit")).unwrap();
-        let modules: serde_json::Map<_, _> = modules.iter().map(|&(id, mode)| {
-            (id.to_owned(), json!({
-                "program": env!("CARGO_BIN_EXE_channel-module-rs"), "protocol":"subc",
-                "enabled":true,"reserved":true,"registration_channel":true,
-                "restart":{"max_restarts":0},
-                "env":{"CHANNEL_MODULE_ROOT":root.path(),"CHANNEL_MODULE_UPGRADE_FIXTURE":mode},
-            }))
-        }).collect();
+        let modules: serde_json::Map<_, _> = modules
+            .iter()
+            .map(|&(id, mode)| {
+                let mut entry = json!({
+                    "program": env!("CARGO_BIN_EXE_channel-module-rs"), "protocol":"subc",
+                    "enabled":true,"reserved":true,"registration_channel":true,
+                    "restart":{"max_restarts":0},
+                    "env":{"CHANNEL_MODULE_ROOT":root.path(),"CHANNEL_MODULE_UPGRADE_FIXTURE":mode},
+                });
+                for (key, value) in module_config
+                    .as_object()
+                    .expect("module config is an object")
+                {
+                    entry[key] = value.clone();
+                }
+                (id.to_owned(), entry)
+            })
+            .collect();
         fs::write(
             root.join("config/cortexkit/subc.jsonc"),
             serde_json::to_vec(
@@ -199,6 +231,19 @@ impl Daemon {
         })
         .await
         .expect("module registered with a new pid")
+    }
+
+    async fn module_start_count(&self) -> u64 {
+        let (ty, reply) = self.call(json!({"op":"supervisor.list"})).await.unwrap();
+        assert_eq!(ty, FrameType::Response, "{reply}");
+        reply["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|module| module["module_id"] == "upgrade-child")
+            .unwrap()["spawn_generation"]
+            .as_u64()
+            .unwrap()
     }
 
     fn socket(&self) -> PathBuf {
@@ -628,20 +673,153 @@ async fn renamed_candidate_execs_same_pid_after_receipt() {
 
 #[tokio::test]
 async fn real_resume_republishes_and_keeps_the_registered_child_reachable() {
+    assert_real_resume(json!({})).await;
+}
+
+/// A module that keeps its process container across restarts runs in a
+/// daemon-pinned process group rather than a group of its own. Without a
+/// cgroup (every Mac, and Linux with placement disabled as here) that pinned
+/// group is the only containment evidence, and the upgrade must still resume
+/// the module instead of stopping and restarting it.
+#[tokio::test]
+async fn real_resume_keeps_a_carried_container_module_without_a_cgroup() {
+    assert_real_resume(json!({"carry_containment": true})).await;
+}
+
+fn alive(pid: u32) -> bool {
+    subc_os::Process::open(pid)
+        .ok()
+        .flatten()
+        .and_then(|process| process.observe())
+        .is_some()
+}
+
+fn kill(pid: u32) {
+    if let Some(process) = subc_os::Process::open(pid).unwrap() {
+        process.signal(subc_os::Signal::Kill).unwrap();
+    }
+}
+
+/// Ends the fixture's helper, which nothing else stops when the test daemon
+/// is killed.
+struct KillOnDrop(u32);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if alive(self.0) {
+            kill(self.0);
+        }
+    }
+}
+
+/// After its first restart a carrying module no longer leads the container's
+/// process group: the group id is still the pid of the module's first process,
+/// which the daemon keeps unreaped. The upgrade must resume that module, and
+/// the resumed daemon must keep carrying the container, so a later module
+/// restart still leaves the container's helper running.
+#[tokio::test]
+async fn real_resume_keeps_a_restarted_carried_module_and_its_helper() {
+    let daemon = Daemon::boot_fixture_with(
+        None,
+        "log",
+        "approve",
+        &[("upgrade-child", "carry-helper")],
+        true,
+        false,
+        json!({"carry_containment": true, "restart": {"max_restarts": 5}}),
+    )
+    .await;
+    let daemon_pid = daemon.process.id().unwrap();
+    let daemon_started = subc_os::process_start_time_ms(daemon_pid).unwrap();
+    let first = daemon.module_pid(None).await;
+    let helper: u32 = fs::read_to_string(daemon.root.join("upgrade-child.helper"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let _helper = KillOnDrop(helper);
+    assert_eq!(subc_os::process_group::pgid(helper).unwrap(), Some(first));
+
+    kill(first);
+    let second = daemon.module_pid(Some(first)).await;
+    assert_eq!(
+        subc_os::process_group::pgid(second).unwrap(),
+        Some(first),
+        "the restart joined the carried container"
+    );
+    assert!(
+        alive(helper),
+        "a module restart keeps the container's helper"
+    );
+    let module_starts = daemon.module_start_count().await;
+
+    let old = subc_transport::read_for_client(&daemon.connection).unwrap();
+    let (ty, receipt) = daemon.request_upgrade(daemon.stage_compatible()).await;
+    assert_eq!(ty, FrameType::Response, "{receipt}");
+    assert_eq!(
+        receipt["carried"],
+        json!(["upgrade-child"]),
+        "{receipt}: {}",
+        daemon_logs(&daemon.root)
+    );
+    let describe = fresh_daemon(&daemon, old.daemon_id).await;
+    assert_eq!(describe["counters"]["daemon_identity"]["pid"], daemon_pid);
+    assert_eq!(
+        subc_os::process_start_time_ms(daemon_pid),
+        Some(daemon_started)
+    );
+    let outcome = timeout(WAIT, async {
+        loop {
+            let outcome = daemon.last_upgrade().await;
+            if outcome["outcome"] != "pending" {
+                break outcome;
+            }
+            sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("child did not resume: {}", daemon_logs(&daemon.root)));
+    assert_eq!(
+        outcome["modules"],
+        json!([{"id":"upgrade-child", "disposition":"resumed"}]),
+        "{outcome}: {}",
+        daemon_logs(&daemon.root)
+    );
+    assert!(alive(second));
+    assert_eq!(daemon.module_start_count().await, module_starts);
+    assert!(alive(helper), "the upgrade keeps the container's helper");
+
+    kill(second);
+    let third = daemon.module_pid(Some(second)).await;
+    assert_eq!(
+        subc_os::process_group::pgid(third).unwrap(),
+        Some(first),
+        "the resumed daemon restarts the module in the same container: {}",
+        daemon_logs(&daemon.root)
+    );
+    assert!(
+        alive(helper),
+        "a restart after the upgrade keeps the container's helper"
+    );
+}
+
+async fn assert_real_resume(module_config: Value) {
     use subc_client_rs::{CallOptions, SubcConsumer};
     use subc_protocol::{BindIdentity, RouteTarget};
 
-    let daemon = Daemon::boot_fixture(
+    let daemon = Daemon::boot_fixture_with(
         None,
         "log",
         "approve",
         &[("upgrade-child", "carry")],
         true,
         false,
+        module_config,
     )
     .await;
     let daemon_pid = daemon.process.id().unwrap();
+    let daemon_started = subc_os::process_start_time_ms(daemon_pid).unwrap();
     let module_pid = daemon.module_pid(None).await;
+    let module_starts = daemon.module_start_count().await;
     let old = subc_transport::read_for_client(&daemon.connection).unwrap();
     let _old_tcp_client = connect_authed_client(&daemon.connection).await.unwrap();
 
@@ -650,6 +828,10 @@ async fn real_resume_republishes_and_keeps_the_registered_child_reachable() {
     assert_eq!(receipt["carried"], json!(["upgrade-child"]));
     let describe = fresh_daemon(&daemon, old.daemon_id).await;
     assert_eq!(describe["counters"]["daemon_identity"]["pid"], daemon_pid);
+    assert_eq!(
+        subc_os::process_start_time_ms(daemon_pid),
+        Some(daemon_started)
+    );
     assert_eq!(
         describe["counters"]["daemon_identity"]["core_version"],
         receipt["expected"]["core_version"]
@@ -681,6 +863,7 @@ async fn real_resume_republishes_and_keeps_the_registered_child_reachable() {
         json!([{"id":"upgrade-child", "disposition":"resumed"}])
     );
     assert_eq!(daemon.module_pid(None).await, module_pid);
+    assert_eq!(daemon.module_start_count().await, module_starts);
     assert!(subc_os::Process::open(module_pid)
         .unwrap()
         .unwrap()

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.43.1
+
+- Add optional `waiting_for_previous_detail` to supervisor listing and module
+  provenance entries, without changing replies for modules that are not held.
+
 ## 0.43.0
 
 - Add optional `accepting_drain` to `supervisor.list` entries, keeping `state: "draining"` during both drain phases.

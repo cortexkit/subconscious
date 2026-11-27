@@ -21,6 +21,7 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     process,
+    sync::{Arc, Weak},
 };
 
 use fs4::{FileExt, TryLockError};
@@ -32,11 +33,12 @@ use crate::bootstrap::{open_owner_only_lock, BootstrapError};
 pub(crate) const RUN_DIR_LOCK_FILE_NAME: &str = "daemon.lock";
 
 /// Exclusive ownership of the run directory that holds a live-children
-/// record. Dropping it (or the process ending) releases the directory.
+/// record. The last owner closing the file (or the process ending) releases
+/// the directory.
 #[derive(Debug)]
 pub(crate) struct RunDirLock {
     // Closing this handle releases the advisory lock; the file itself stays.
-    _file: fs::File,
+    _file: Arc<fs::File>,
     live_children_record: PathBuf,
 }
 
@@ -44,7 +46,7 @@ impl RunDirLock {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn from_inherited(live_children_record: PathBuf, file: fs::File) -> Self {
         Self {
-            _file: file,
+            _file: Arc::new(file),
             live_children_record,
         }
     }
@@ -87,7 +89,7 @@ impl RunDirLock {
             warn!(path = %path.display(), %error, "could not record the run directory owner's pid");
         }
         Ok(Self {
-            _file: file,
+            _file: Arc::new(file),
             live_children_record: live_children_record.to_path_buf(),
         })
     }
@@ -95,6 +97,12 @@ impl RunDirLock {
     /// The live-children record inside the owned run directory.
     pub(crate) fn live_children_record(&self) -> &Path {
         &self.live_children_record
+    }
+
+    /// Let record writers hold ownership from the start to the end of their
+    /// I/O, without keeping the directory locked just because a roster exists.
+    pub(crate) fn record_owner(&self) -> Weak<fs::File> {
+        Arc::downgrade(&self._file)
     }
 }
 
@@ -114,7 +122,7 @@ fn read_holder_pid(path: &Path) -> Option<u32> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use cortexkit_test_support::ScratchDir;
 
@@ -122,7 +130,7 @@ mod tests {
     /// fork while a case holds a flock; their children retain the shared open
     /// file description until exec even when FD_CLOEXEC is set. A parent drop
     /// therefore cannot promise immediate release during concurrent spawns.
-    fn isolated_case(name: &str, case: fn()) {
+    pub(crate) fn isolated_case(name: &str, case: fn()) {
         const CASE_ENV: &str = "SUBC_RUN_DIR_LOCK_TEST_CASE";
         const PARENT_ENV: &str = "SUBC_RUN_DIR_LOCK_TEST_PARENT";
         if std::env::var(CASE_ENV).as_deref() == Ok(name) {

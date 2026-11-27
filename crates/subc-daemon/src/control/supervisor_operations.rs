@@ -489,6 +489,7 @@ impl ControlHandler {
             .with_launch_nonce_env(Some(!cfg!(any(unix, windows))))
             .with_launch_nonce_source(status.launch_nonce_source)
             .with_waiting_for_previous_pid(status.waiting_for_previous_pid)
+            .with_waiting_for_previous_detail(status.waiting_for_previous_detail)
             .with_protocol(status.protocol)
             .with_pending_reload(pending_reload)
             .with_last_probe_ms(status.health.last_probe_ms)
@@ -863,7 +864,8 @@ impl ControlHandler {
                 let running_image = observed_image;
                 let registration = self.running_registration_method(&status.module_id);
                 let mut extension = subc_control::SupervisorModuleProvenanceExt::new()
-                    .with_registration(registration);
+                    .with_registration(registration)
+                    .with_waiting_for_previous_detail(status.waiting_for_previous_detail);
                 extension.registration_declaration = declarations
                     .as_ref()
                     .and_then(|entries| entries.get(&status.module_id))

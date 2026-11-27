@@ -126,7 +126,7 @@ struct RosterInner {
     record_write: Mutex<()>,
     /// Where the live-children record is written; unset means no record, the
     /// default for an in-process daemon (see `BootstrapConfig`).
-    record_path: OnceLock<PathBuf>,
+    record: OnceLock<RecordTarget>,
     recovery_block: OnceLock<String>,
     pending_admissions: Mutex<HashMap<String, (u32, String)>>,
     unquarantined_record: std::sync::atomic::AtomicBool,
@@ -149,15 +149,46 @@ struct RosterInner {
 }
 
 #[derive(Debug)]
+struct RecordTarget {
+    path: PathBuf,
+    owner: Option<std::sync::Weak<std::fs::File>>,
+}
+
+impl RecordTarget {
+    fn write_owner(&self) -> std::io::Result<Option<Arc<std::fs::File>>> {
+        self.owner
+            .as_ref()
+            .map(|owner| {
+                owner.upgrade().ok_or_else(|| {
+                    std::io::Error::other("the daemon no longer owns the live-children record")
+                })
+            })
+            .transpose()
+    }
+}
+
+#[derive(Debug)]
 struct RetainedEntry {
     recorded: RecordedChild,
     reason: Option<RetainedReason>,
     protection: Option<ProtectedChild>,
+    pending_fence_budget: Option<Duration>,
 }
 
 impl RetainedEntry {
     fn waiting_reason(&self) -> &RetainedReason {
         if self.protection.is_some() {
+            // A held carried container reports why it still blocks: that is
+            // the only thing a person can act on while the module waits.
+            if self.recorded.child.is_group_container() {
+                if let Some(reason) = self
+                    .reason
+                    .as_ref()
+                    .filter(|reason| reason.blocks_fresh_copy())
+                {
+                    return reason;
+                }
+            }
             // Handover children block starts even if the old on-disk reason
             // was non-blocking. Don't replace that reason in the record.
             &RetainedReason::Hidden
@@ -240,7 +271,7 @@ impl RosterInner {
         let multi_threaded = tokio::runtime::Handle::try_current().is_ok_and(|handle| {
             handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
         });
-        if multi_threaded && self.record_path.get().is_some() {
+        if multi_threaded && self.record.get().is_some() {
             tokio::task::block_in_place(work)
         } else {
             work()
@@ -251,14 +282,35 @@ impl RosterInner {
     /// each snapshot inside that gate prevents an older snapshot from replacing
     /// a newer record, without locking the live roster across disk syncs.
     fn write_record(&self, live: &HashMap<u64, RosterEntry>) -> std::io::Result<()> {
+        let result = self.write_record_quiet(live);
+        if let Err(error) = &result {
+            warn!(path = ?self.record.get().map(|record| &record.path), %error,
+                "could not rewrite the live-children record; a crash now could leave orphans the next boot cannot find");
+        }
+        result
+    }
+
+    fn write_record_quiet(&self, live: &HashMap<u64, RosterEntry>) -> std::io::Result<()> {
+        self.write_record_except(live, |_| false)
+    }
+
+    fn write_record_except(
+        &self,
+        live: &HashMap<u64, RosterEntry>,
+        skip: impl Fn(&RetainedEntry) -> bool,
+    ) -> std::io::Result<()> {
         if self.unquarantined_record.load(Ordering::Acquire) {
             return Err(std::io::Error::other(
                 "unusable recovery record could not be quarantined; refusing to overwrite it",
             ));
         }
-        let Some(path) = self.record_path.get() else {
+        let Some(record) = self.record.get() else {
             return Ok(());
         };
+        // A shutdown write may finish after bootstrap returns. Keep the
+        // lock alive through the rename and directory sync; a queued writer
+        // that only starts after ownership ended must not touch the record.
+        let _owner = record.write_owner()?;
         #[cfg(test)]
         {
             let hook = lock(&self.record_write_hook).clone();
@@ -272,24 +324,35 @@ impl RosterInner {
         let children: Vec<_> = entries
             .into_iter()
             .map(|(_, entry)| entry.to_recorded_child())
-            .chain(retained.iter().map(|entry| entry.recorded.clone()))
+            .chain(
+                retained
+                    .iter()
+                    .filter(|entry| !skip(entry))
+                    .map(|entry| entry.recorded.clone()),
+            )
             .collect();
         let reasons = retained
             .iter()
+            .filter(|entry| !skip(entry) && entry.pending_fence_budget.is_none())
             .filter_map(|entry| Some((entry.recorded.child.pid, entry.reason.clone()?)))
             .collect();
         drop(retained);
-        if let Err(error) =
-            crate::live_children::write_record_with_reasons(path, &children, reasons)
-        {
-            warn!(
-                path = %path.display(),
-                %error,
-                "could not rewrite the live-children record; a crash now could leave orphans the next boot cannot find"
-            );
-            return Err(error);
+        crate::live_children::write_record_with_reasons(&record.path, &children, reasons)?;
+        for entry in lock(&self.retained).iter_mut().filter(|entry| !skip(entry)) {
+            if entry.pending_fence_budget.take().is_some() {
+                entry.reason = None;
+            }
         }
         Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn write_pending_fences(&self) -> std::io::Result<()> {
+        if self.record.get().is_none() {
+            return Err(std::io::Error::other("no live-children record path"));
+        }
+        let live = lock(&self.live).clone();
+        self.write_record_quiet(&live)
     }
 
     fn recheck_retained(&self) {
@@ -490,6 +553,7 @@ impl RosterGuard {
                 recorded: entry.to_recorded_child(),
                 reason: None,
                 protection: Some(ProtectedChild::Held),
+                pending_fence_budget: None,
             });
         });
     }
@@ -502,7 +566,7 @@ impl RosterGuard {
     }
 
     pub(crate) fn resume_token_record(&self) -> Option<ResumeTokenRecord> {
-        self.inner.record_path.get()?;
+        self.inner.record.get()?;
         Some(ResumeTokenRecord {
             inner: Arc::downgrade(&self.inner),
             key: self.key,
@@ -606,11 +670,139 @@ impl RosterGuard {
                 recorded,
                 reason: Some(reason),
                 protection: None,
+                pending_fence_budget: None,
             });
             let live = lock(&self.inner.live).clone();
             let _ = self.inner.write_record(&live);
         });
         self.inner.ensure_rechecks();
+    }
+
+    /// Keep a carried container's row as a held fence instead of releasing
+    /// it: recovery rechecks leave a held row alone, it still blocks the
+    /// module's fresh start, and the record keeps it across a restart. The
+    /// returned handle removes it once the container is settled. A row that
+    /// does not record a process-group container is retained as usual.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn hold_carried(
+        self,
+        reason: crate::live_children::RetainedReason,
+    ) -> Option<HeldContainerRow> {
+        let handle = lock(&self.inner.live).get(&self.key).and_then(|entry| {
+            let child = entry.to_recorded_child().child;
+            let created_start_time = child
+                .container
+                .as_ref()
+                .and_then(|container| container.created_start_time)
+                .filter(|_| child.is_group_container())?;
+            Some(HeldContainerRow {
+                inner: Arc::clone(&self.inner),
+                module: child.module_id,
+                pgid: child.pid,
+                created_start_time,
+            })
+        });
+        let Some(handle) = handle else {
+            self.retain(reason);
+            return None;
+        };
+        self.inner.without_stalling_runtime(|| {
+            let _write = lock(&self.inner.record_write);
+            if let Some(entry) = lock(&self.inner.live).remove(&self.key) {
+                lock(&self.inner.retained).push(RetainedEntry {
+                    recorded: entry.to_recorded_child(),
+                    reason: Some(reason),
+                    protection: Some(ProtectedChild::Held),
+                    pending_fence_budget: None,
+                });
+            }
+            let live = lock(&self.inner.live).clone();
+            let _ = self.inner.write_record(&live);
+        });
+        Some(handle)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const UNRECORDED_CARRIED_FENCE: &str = "the carried container fence has not been recorded yet";
+
+/// A handed-over or ended carried container's held row. While it exists, its
+/// module cannot start a fresh copy, and the module's status reports the
+/// row's reason.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug)]
+pub(crate) struct HeldContainerRow {
+    inner: Arc<RosterInner>,
+    module: String,
+    pgid: u32,
+    created_start_time: u64,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl HeldContainerRow {
+    fn matches(&self, child: &LiveChild) -> bool {
+        child.is_group_container()
+            && child.pid == self.pgid
+            && child.module_id == self.module
+            && child
+                .container
+                .as_ref()
+                .and_then(|container| container.created_start_time)
+                == Some(self.created_start_time)
+    }
+
+    /// Whether the daemon has begun shutting down. A held row then stays in
+    /// the record for the next start's recovery.
+    pub(crate) fn daemon_closing(&self) -> bool {
+        self.inner.closed.is_set()
+    }
+
+    /// Record a pending fence along with the roster's current rows. A retry
+    /// must not replace entries added or removed since bootstrap.
+    pub(crate) fn persist_fence(&self) -> std::io::Result<()> {
+        self.inner.without_stalling_runtime(|| {
+            let _write = lock(&self.inner.record_write);
+            if !lock(&self.inner.retained).iter().any(|entry| {
+                entry.pending_fence_budget.is_some() && self.matches(&entry.recorded.child)
+            }) {
+                return Ok(());
+            }
+            self.inner.write_pending_fences()
+        })
+    }
+
+    /// Record why the container is not settled yet, if that changed.
+    pub(crate) fn report(&self, reason: crate::live_children::RetainedReason) {
+        self.inner.without_stalling_runtime(|| {
+            let _write = lock(&self.inner.record_write);
+            let changed = lock(&self.inner.retained).iter_mut().any(|entry| {
+                if !self.matches(&entry.recorded.child) || entry.reason.as_ref() == Some(&reason) {
+                    return false;
+                }
+                entry.reason = Some(reason.clone());
+                true
+            });
+            if changed {
+                let live = lock(&self.inner.live).clone();
+                let _ = self.inner.write_record(&live);
+            }
+        });
+    }
+
+    /// Remove the row once the container has been proven empty and its pin
+    /// reaped. Only this exact row goes.
+    pub(crate) fn release(&self) -> std::io::Result<bool> {
+        self.inner.without_stalling_runtime(|| {
+            let _write = lock(&self.inner.record_write);
+            let matches = |entry: &RetainedEntry| self.matches(&entry.recorded.child);
+            if !lock(&self.inner.retained).iter().any(matches) {
+                return Ok(false);
+            }
+            let live = lock(&self.inner.live).clone();
+            self.inner.write_record_except(&live, matches)?;
+            lock(&self.inner.retained).retain(|entry| !matches(entry));
+            Ok(true)
+        })
     }
 }
 
@@ -752,17 +944,47 @@ impl ChildRoster {
         self.record_to_with_adopted(path, &AdoptedPids::none());
     }
 
+    /// Install the daemon's record without extending run-directory ownership
+    /// except during writes. The caller holds the lock through startup.
+    pub(crate) fn record_to_owned(
+        &self,
+        owner: &crate::run_dir_lock::RunDirLock,
+        protected: &AdoptedPids,
+    ) {
+        self.install_record(
+            owner.live_children_record(),
+            Some(owner.record_owner()),
+            protected,
+        );
+    }
+
     /// Seed the record after startup's sweep. Protected entries stay in the
     /// record until the supervisor takes ownership or confirms a Held exit.
     pub(crate) fn record_to_with_adopted(&self, path: PathBuf, protected: &AdoptedPids) {
-        if self.inner.record_path.set(path.clone()).is_err() {
+        self.install_record(&path, None, protected);
+    }
+
+    fn install_record(
+        &self,
+        path: &std::path::Path,
+        owner: Option<std::sync::Weak<std::fs::File>>,
+        protected: &AdoptedPids,
+    ) {
+        if self
+            .inner
+            .record
+            .set(RecordTarget {
+                path: path.to_owned(),
+                owner,
+            })
+            .is_err()
+        {
             return;
         }
-        let (retained, reasons) = match crate::live_children::read_record_entries(&path) {
+        let (retained, reasons) = match crate::live_children::read_record_entries(path) {
             Ok(record) => record,
             Err(error) => {
-                if let Err(quarantine_error) =
-                    crate::live_children::quarantine_record(&path, &error)
+                if let Err(quarantine_error) = crate::live_children::quarantine_record(path, &error)
                 {
                     self.inner
                         .unquarantined_record
@@ -777,7 +999,7 @@ impl ChildRoster {
                 Default::default()
             }
         };
-        if let Some(reason) = crate::live_children::quarantine_block(&path) {
+        if let Some(reason) = crate::live_children::quarantine_block(path) {
             tracing::error!(%reason, "carried modules blocked by quarantined recovery identity");
             let _ = self.inner.recovery_block.set(reason);
         }
@@ -794,6 +1016,7 @@ impl ChildRoster {
                         recorded,
                         reason,
                         protection,
+                        pending_fence_budget: None,
                     }
                 })
                 .collect();
@@ -943,8 +1166,11 @@ impl ChildRoster {
         tracing::error!(module_id, %source, "failed late admission write; quarantining the recovery store");
         self.inner.without_stalling_runtime(|| {
             let _write = lock(&self.inner.record_write);
-            if let Some(path) = self.inner.record_path.get() {
-                if let Err(error) = crate::live_children::quarantine_failed_admission(path, &reason, source) {
+            if let Some(record) = self.inner.record.get() {
+                let result = record.write_owner().and_then(|_owner| {
+                    crate::live_children::quarantine_failed_admission(&record.path, &reason, source)
+                });
+                if let Err(error) = result {
                     self.inner.unquarantined_record.store(true, Ordering::Release);
                     tracing::error!(%error, %reason, "cannot persist admission failure quarantine; preserving recovery evidence");
                 }
@@ -1057,6 +1283,71 @@ impl ChildRoster {
         })
     }
 
+    /// Transfer a carried process-group container's row, staged by
+    /// `record_to_with_adopted`, into the live roster. The rebuilt container
+    /// owns the returned guard, as the old image's container owned its own.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn admit_adopted_container(
+        &self,
+        verified: &RecordedChild,
+        carried: std::sync::Weak<crate::supervise::containment::CarriedContainment>,
+    ) -> std::io::Result<RosterGuard> {
+        self.inner.without_stalling_runtime(|| {
+            let _write = lock(&self.inner.record_write);
+            let recorded = {
+                let mut retained = lock(&self.inner.retained);
+                let mut matching = retained.iter().enumerate().filter(|(_, entry)| {
+                    entry.recorded.child.pid == verified.child.pid
+                        && entry.recorded.child.is_group_container()
+                });
+                match (matching.next(), matching.next()) {
+                    (Some((index, entry)), None)
+                        if entry.protection == Some(ProtectedChild::Adopted)
+                            && verified.child.is_group_container()
+                            && &entry.recorded == verified =>
+                    {
+                        retained.remove(index).recorded
+                    }
+                    _ => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "verified carried container is not staged for adoption",
+                        ));
+                    }
+                }
+            };
+            let child = recorded.child;
+            let key = self.inner.next_key.fetch_add(1, Ordering::Relaxed);
+            lock(&self.inner.live).insert(
+                key,
+                RosterEntry {
+                    adopted_signal: None,
+                    module_id: child.module_id,
+                    pid: child.pid,
+                    protocol: child.protocol,
+                    start_time: child.start_time,
+                    recorded: RecordedIdentity {
+                        start_time: child.start_time,
+                        executable: child.executable,
+                        cgroup_name: child.cgroup_name,
+                        container: child.container,
+                        carried: Some(carried),
+                        plain_group: None,
+                        #[cfg(target_os = "linux")]
+                        cgroup_placement: None,
+                    },
+                    resume_token_sha256: None,
+                    drain_budget: Arc::clone(&self.drain_budget),
+                },
+            );
+            Ok(RosterGuard {
+                inner: Arc::clone(&self.inner),
+                key,
+                adoption: None,
+            })
+        })
+    }
+
     /// Remove only the protected row whose exact pid and start time the
     /// supervisor confirmed and reaped as its own child.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1073,10 +1364,13 @@ impl ChildRoster {
                 let before = retained.len();
                 retained.retain(|entry| {
                     let child = &entry.recorded.child;
+                    // A carried container's row can share the module's pid
+                    // and birth. It is settled separately, never with the module.
                     !(entry.protection.is_some()
                         && child.pid == pid
                         && child.module_id == module
-                        && child.start_time == Some(start_time))
+                        && child.start_time == Some(start_time)
+                        && !child.is_group_container())
                 });
                 retained.len() != before
             };
@@ -1086,6 +1380,55 @@ impl ChildRoster {
             }
             Ok(removed)
         })
+    }
+
+    /// A handle on a handed-over carried container's retained row, which holds
+    /// back the module's fresh start until that container is settled.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn held_container_row(
+        &self,
+        module: &str,
+        pgid: u32,
+        created_start_time: u64,
+    ) -> HeldContainerRow {
+        HeldContainerRow {
+            inner: Arc::clone(&self.inner),
+            module: module.to_owned(),
+            pgid,
+            created_start_time,
+        }
+    }
+
+    /// Keep a missing handover row in memory until its watcher can record it.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn hold_unrecorded_fence(
+        &self,
+        row: RecordedChild,
+        drain_budget: Duration,
+    ) -> HeldContainerRow {
+        let child = &row.child;
+        let birth = child
+            .start_time
+            .expect("carried fence has a recorded birth");
+        let handle = self.held_container_row(&child.module_id, child.pid, birth);
+        debug_assert!(handle.matches(child));
+        let _write = lock(&self.inner.record_write);
+        let mut retained = lock(&self.inner.retained);
+        // The initial write can have replaced the file before its sync
+        // failed. Keep just one row and put its waiting reason first.
+        retained.retain(|entry| !handle.matches(&entry.recorded.child));
+        retained.insert(
+            0,
+            RetainedEntry {
+                recorded: row,
+                reason: Some(RetainedReason::ContainerUnverifiable(
+                    UNRECORDED_CARRIED_FENCE.into(),
+                )),
+                protection: Some(ProtectedChild::Held),
+                pending_fence_budget: Some(drain_budget),
+            },
+        );
+        handle
     }
 
     #[cfg(all(test, unix))]
@@ -1281,6 +1624,44 @@ mod resume_hash_tests {
         assert_eq!(read_record_entries(&path).unwrap(), (vec![held], reasons));
     }
 
+    /// A carried container's row is written under its first module process,
+    /// so it can share that process's module id, pid and birth. Reaping the
+    /// module must leave the container's row until the container is settled.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn reaping_a_module_keeps_its_carried_container_row_until_settled() {
+        let dir = ScratchDir::new("roster-carried-container-row");
+        let path = dir.join("live-children.json");
+        let pid = i32::MAX as u32;
+        let module = record("carried", pid, Some(&"a".repeat(64)));
+        let start = module.child.start_time.unwrap();
+        let mut container = record("carried", pid, None);
+        container.child.container = Some(crate::live_children::ContainerIdentity {
+            pgid: Some(pid),
+            created_start_time: Some(start),
+            boot_id: Some("boot".into()),
+            session_id: Some(1),
+            cgroup_path: None,
+        });
+        write_record_with_reasons(&path, &[module, container.clone()], BTreeMap::new()).unwrap();
+        let roster = ChildRoster::default();
+        roster.record_to_with_adopted(path.clone(), &AdoptedPids::from_classes([pid], []));
+
+        assert!(roster
+            .remove_reaped_adoption("carried", pid, start)
+            .unwrap());
+        assert_eq!(entries(&path), std::slice::from_ref(&container));
+        assert!(!roster
+            .held_container_row("carried", pid, start + 1)
+            .release()
+            .unwrap());
+        assert!(roster
+            .held_container_row("carried", pid, start)
+            .release()
+            .unwrap());
+        assert!(entries(&path).is_empty());
+    }
+
     #[test]
     fn adopt_moves_the_verified_entry_and_hash_into_the_live_roster_once() {
         let dir = ScratchDir::new("roster-adopted-hash");
@@ -1385,15 +1766,109 @@ mod unix_shutdown {
     ///
     /// Spawns are refused first, so a module exiting on EOF is not restarted.
     /// `already_escalated` or `escalate` resolving (a second SIGTERM to the
-    /// daemon) skips every remaining wait and kills what is left: the
-    /// operator has said stop waiting, and leaving children behind would be
-    /// the orphan this exists to prevent.
+    /// daemon) skips the remaining child grace and kills what is left. It
+    /// does not shorten a pending fence's budget: the next daemon needs the
+    /// record to know that the module may still have a container.
     pub(crate) async fn end_children_for_daemon_shutdown(
         roster: &ChildRoster,
         already_escalated: bool,
         escalate: impl Future<Output = ()>,
     ) {
         roster.close();
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        tokio::join!(
+            end_live_children(roster, already_escalated, escalate),
+            flush_pending_fences(roster),
+        );
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        end_live_children(roster, already_escalated, escalate).await;
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn flush_pending_fences(roster: &ChildRoster) {
+        let start = Instant::now();
+        let cadence = Duration::from_millis(100);
+        let mut expired = HashSet::new();
+        let mut writing = None;
+        let mut retry_at = start;
+        loop {
+            let pending: Vec<_> = lock(&roster.inner.retained)
+                .iter()
+                .filter_map(|entry| {
+                    let deadline = start + entry.pending_fence_budget?.min(CHILD_SHUTDOWN_CAP);
+                    let child = &entry.recorded.child;
+                    Some((child.module_id.clone(), child.pid, deadline))
+                })
+                .collect();
+            let now = Instant::now();
+            let active: Vec<_> = pending
+                .into_iter()
+                .filter(|(module, pgid, deadline)| {
+                    if now < *deadline {
+                        return true;
+                    }
+                    if expired.insert((module.clone(), *pgid)) {
+                        tracing::error!(module_id = %module, pgid,
+                            "shutdown budget expired; carried container fence is not durable");
+                    }
+                    false
+                })
+                .collect();
+            let Some(deadline) = active.iter().map(|(_, _, deadline)| *deadline).min() else {
+                return;
+            };
+            if writing.is_none() && now < retry_at {
+                tokio::time::sleep_until(deadline.min(retry_at)).await;
+                continue;
+            }
+            let attempt = match writing.get_or_insert_with(|| start_fence_write(roster)) {
+                Ok(result) => match tokio::time::timeout_at(deadline, result).await {
+                    Ok(result) => result.unwrap_or_else(|_| {
+                        Err(std::io::Error::other(
+                            "carried container fence writer stopped",
+                        ))
+                    }),
+                    // Keep the same attempt if another module has more time.
+                    Err(_) => continue,
+                },
+                Err(error) => Err(std::io::Error::other(error.to_string())),
+            };
+            writing = None;
+            if let Err(error) = attempt {
+                for (module, pgid, _) in active {
+                    warn!(module_id = %module, pgid, %error,
+                        "could not record the held carried container fence during shutdown");
+                }
+            }
+            retry_at = Instant::now() + cadence;
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn start_fence_write(
+        roster: &ChildRoster,
+    ) -> std::io::Result<tokio::sync::oneshot::Receiver<std::io::Result<()>>> {
+        let inner = std::sync::Arc::clone(&roster.inner);
+        let (done, result) = tokio::sync::oneshot::channel();
+        // A stalled store must not also hold up destruction of the Tokio
+        // runtime. It waits for its own blocking tasks, but not this thread.
+        std::thread::Builder::new()
+            .name("shutdown-fence-write".into())
+            .spawn(move || {
+                let _write = lock(&inner.record_write);
+                if done.is_closed() {
+                    return;
+                }
+                let _ = done.send(inner.write_pending_fences());
+            })?;
+        Ok(result)
+    }
+
+    async fn end_live_children(
+        roster: &ChildRoster,
+        already_escalated: bool,
+        escalate: impl Future<Output = ()>,
+    ) {
         tokio::pin!(escalate);
         let started = Instant::now();
         let mut termed = HashMap::new();
@@ -1826,6 +2301,250 @@ mod retained_container_tests {
         (dir, roster, holder, first.id())
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn witness_row() -> RecordedChild {
+        RecordedChild {
+            child: LiveChild {
+                module_id: "sample".into(),
+                pid: 42,
+                protocol: ModuleProtocol::None,
+                start_time: Some(123),
+                executable: None,
+                cgroup_name: None,
+                container: Some(ContainerIdentity {
+                    pgid: Some(42),
+                    created_start_time: Some(123),
+                    ..ContainerIdentity::test_metadata()
+                }),
+            },
+            resume_token_sha256: None,
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn held_pin_stays_in_the_roster_if_its_durable_release_fails() {
+        let dir = ScratchDir::new("held-pin-release-write");
+        let path = dir.join("children.json");
+        let roster = ChildRoster::default();
+        roster.record_to(path.clone());
+        let held = roster.hold_unrecorded_fence(witness_row(), Duration::from_secs(1));
+        held.persist_fence().unwrap();
+        let saved = dir.join("saved-children.json");
+        std::fs::rename(&path, &saved).unwrap();
+        std::fs::create_dir(&path).unwrap();
+
+        assert!(held.release().is_err());
+        assert_eq!(roster.previous_instance_pid("sample"), Some(42));
+        assert_eq!(crate::live_children::read_record(&saved).unwrap().len(), 1);
+        std::fs::remove_dir(&path).unwrap();
+        assert!(held.release().unwrap());
+        assert!(crate::live_children::read_record(&path).unwrap().is_empty());
+        assert_eq!(roster.previous_instance_pid("sample"), None);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn unwritable_fence(label: &str, budget: Duration) -> (ScratchDir, PathBuf, ChildRoster) {
+        let dir = ScratchDir::new(label);
+        let path = dir.join("children.json");
+        let roster = ChildRoster::default();
+        roster.record_to(path.clone());
+        std::fs::create_dir(&path).unwrap();
+        let held = roster.hold_unrecorded_fence(witness_row(), budget);
+        assert!(held.persist_fence().is_err());
+        (dir, path, roster)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn shutdown_makes_a_pending_fence_durable_even_after_a_second_request() {
+        let (_dir, path, roster) = unwritable_fence("shutdown-fence-retry", Duration::from_secs(3));
+        let shutdown = end_children_for_daemon_shutdown(&roster, true, std::future::pending());
+        tokio::pin!(shutdown);
+        tokio::select! {
+            biased;
+            () = &mut shutdown => panic!("escalated shutdown returned with an undurable fence"),
+            () = tokio::time::sleep(Duration::from_millis(30)) => {}
+        }
+        std::fs::remove_dir(&path).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), shutdown)
+            .await
+            .expect("shutdown did not return after the store became writable");
+        assert_eq!(
+            crate::live_children::read_record_entries(&path).unwrap().0,
+            vec![witness_row()]
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn shutdown_reports_an_undurable_fence_after_its_budget() {
+        let budget = Duration::from_millis(125);
+        let (_dir, _path, roster) = unwritable_fence("shutdown-fence-budget", budget);
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let _subscriber = capture_shutdown_log(&output);
+        let start = tokio::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            end_children_for_daemon_shutdown(&roster, true, std::future::pending()),
+        )
+        .await
+        .expect("unwritable fence kept shutdown alive after its budget");
+        let output = String::from_utf8(lock(&output).clone()).unwrap();
+        assert!(output.lines().any(is_pending_fence_error), "{output}");
+        assert!(start.elapsed() >= budget);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn capture_shutdown_log(output: &Arc<Mutex<Vec<u8>>>) -> tracing::subscriber::DefaultGuard {
+        let sink = Arc::clone(output);
+        struct Log(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Log {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                std::io::Write::write(&mut *lock(&self.0), buf)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || Log(Arc::clone(&sink)))
+            .finish();
+        tracing::subscriber::set_default(subscriber)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn is_pending_fence_error(line: &str) -> bool {
+        line.contains("ERROR")
+            && line.contains("module_id=sample")
+            && line.contains("carried container fence is not durable")
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn stalled_fence_write_does_not_block_shutdown_or_escalation() {
+        let budget = Duration::from_millis(750);
+        let mut child = OwnedChild::spawn(0);
+        let (entered, writing) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let first_write = Mutex::new(Some((entered, blocked)));
+        // Admit before inserting the pending fence, so admission cannot
+        // incidentally persist the fence before the shutdown write starts.
+        let dir = ScratchDir::new("shutdown-fence-stalled-with-child");
+        let roster = ChildRoster::default();
+        roster.record_to(dir.join("children.json"));
+        let guard = roster
+            .admit(
+                "live".into(),
+                child.id(),
+                ModuleProtocol::Subc,
+                None,
+                RecordedIdentity::default(),
+            )
+            .unwrap();
+        let _held = roster.hold_unrecorded_fence(witness_row(), budget);
+        roster.set_record_write_hook_for_test(move |_| {
+            if let Some((entered, blocked)) = lock(&first_write).take() {
+                entered.send(()).unwrap();
+                // The fallback prevents a regression from hanging the test
+                // thread before Tokio has a chance to poll the timeout.
+                let _ = blocked.recv_timeout(Duration::from_secs(5));
+            }
+        });
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let _subscriber = capture_shutdown_log(&output);
+        let start = tokio::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            end_children_for_daemon_shutdown(&roster, false, async { writing.await.unwrap() }),
+        )
+        .await
+        .expect("stalled fence writer kept shutdown alive after its budget");
+        release.send(()).expect("writer must still be blocked");
+        let output = String::from_utf8(lock(&output).clone()).unwrap();
+        let deadline_log = output.lines().position(is_pending_fence_error);
+        let escalation = output
+            .lines()
+            .position(|line| line.contains("second SIGTERM"));
+        assert!(
+            matches!((escalation, deadline_log), (Some(first), Some(last)) if first < last),
+            "{output}"
+        );
+        assert!(start.elapsed() >= budget);
+        assert!(
+            child.0.try_wait().unwrap().is_some(),
+            "live child was not killed"
+        );
+        drop(guard);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_stalled_shutdown_fence_writer_keeps_the_run_directory_owned() {
+        crate::run_dir_lock::tests::isolated_case(
+            "child_roster::retained_container_tests::a_stalled_shutdown_fence_writer_keeps_the_run_directory_owned",
+            stalled_fence_keeps_run_directory_owned_case,
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn stalled_fence_keeps_run_directory_owned_case() {
+        use crate::{bootstrap::BootstrapError, run_dir_lock::RunDirLock};
+        let dir = ScratchDir::new("shutdown-fence-run-owner");
+        let path = dir.join("children.json");
+        let owner = RunDirLock::acquire(&path).unwrap();
+        let roster = ChildRoster::default();
+        roster.record_to_owned(&owner, &AdoptedPids::none());
+        roster.hold_unrecorded_fence(witness_row(), Duration::from_millis(750));
+        let (entered, writing) = std::sync::mpsc::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let blocked = Mutex::new(blocked);
+        roster.set_record_write_hook_for_test(move |_| {
+            entered.send(()).unwrap();
+            let _ = lock(&blocked).recv_timeout(Duration::from_secs(5));
+        });
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(end_children_for_daemon_shutdown(
+                &roster,
+                true,
+                std::future::pending(),
+            ));
+        writing
+            .try_recv()
+            .expect("the shutdown writer never entered");
+        drop(roster);
+        drop(owner);
+        assert!(
+            matches!(
+                RunDirLock::acquire(&path),
+                Err(BootstrapError::RunDirBusy { .. })
+            ),
+            "the run directory was released while the old writer was parked"
+        );
+
+        release.send(()).expect("the writer must still be parked");
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let _new_owner = loop {
+            match RunDirLock::acquire(&path) {
+                Ok(owner) => break owner,
+                Err(BootstrapError::RunDirBusy { .. }) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                other => panic!("the completed write did not release its run directory: {other:?}"),
+            }
+        };
+        assert_eq!(
+            crate::live_children::read_record_entries(&path).unwrap().0,
+            vec![witness_row()],
+            "a new owner must see the completed record"
+        );
+    }
+
     #[test]
     fn retained_container_survivor_blocks_until_its_death() {
         let label = "retained-container-live";
@@ -1841,17 +2560,17 @@ mod retained_container_tests {
             .previous_instance(label)
             .expect("a live container member blocks a fresh copy");
         assert_eq!(pid, pgid);
-        assert_eq!(
-            reason,
-            RetainedReason::ContainerSurvivors(vec![holder.id()])
-        );
         let detail = reason.waiting_message(pid);
         assert!(
-            detail.contains("container survivors") && detail.contains(&holder.id().to_string()),
+            detail.contains("container survivors")
+                && detail.contains(&format!("pid {} (", holder.id())),
             "{detail}"
         );
-        // The recheck queued SIGKILL after verifying this owned child. Confirm
-        // its death before checking that the roster no longer blocks a fresh copy.
+        assert!(
+            holder.0.try_wait().unwrap().is_none(),
+            "rechecks can hold for an unrecorded process, but cannot stop it"
+        );
+        holder.0.kill().unwrap();
         holder.0.wait().unwrap();
         assert_eq!(roster.previous_instance(label), None);
         assert!(

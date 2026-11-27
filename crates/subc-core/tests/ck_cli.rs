@@ -46,6 +46,9 @@ mod inline_actions;
 mod inline_views;
 #[path = "ck_cli/install_crashes.rs"]
 mod install_crashes;
+#[path = "fixtures/message-bus.rs"]
+mod message_bus;
+use message_bus::{bus_env, public_half, BUS_VERSION, SIGNER_ID, SYSACCOUNT_ID, VAULT_VERSION};
 
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
 const SETUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1865,6 +1868,7 @@ impl SetupFixture {
                 ("core", "ck-script-runner-python"),
                 ("core", "ck-nats-engine"),
                 ("core", "ck-nats-server"),
+                ("core", "ck-bus"),
                 ("aft", "ck-aft"),
                 ("claustrum", "ck-claustrum"),
                 ("claustrum", "ck-auth"),
@@ -1876,7 +1880,7 @@ impl SetupFixture {
                     let path = fixture_binary_path(&bin, binary);
                     if cfg!(target_os = "macos") && *binary == "ck-subc" {
                         write_fixture_daemon(&bin, "0.17.9");
-                    } else if *binary == "ck-auth" {
+                    } else if matches!(*binary, "ck-auth" | "ck-bus") {
                         common::copy_executable(
                             Path::new(env!("CARGO_BIN_EXE_vault-cli-fixture")),
                             &path,
@@ -1895,6 +1899,18 @@ impl SetupFixture {
                 "kind": "runtime-definition",
                 "path": runtime_definition(&home),
             }));
+            let nats = cortexkit.join("nats");
+            fs::create_dir_all(&nats).unwrap();
+            fs::write(nats.join("operator.jwt"), b"fixture operator JWT").unwrap();
+            mutations.push(json!({
+                "kind": "bus-trust", "path": nats, "state": "applied",
+                "root_pub": "78".repeat(32), "signer_pub": public_half(SIGNER_ID),
+                "sysaccount_pub": public_half(SYSACCOUNT_ID), "activation_pending": false,
+            }));
+            let connection = root
+                .path()
+                .join("runtime")
+                .join(subc_transport::connection_file::CONNECTION_FILE_NAME);
             fs::create_dir_all(config.parent().unwrap()).unwrap();
             fs::write(
                 &config,
@@ -1909,6 +1925,12 @@ impl SetupFixture {
                         },
                         "aft": {"program": bin.join(platform_binary("ck-aft"))},
                         "claustrum": installed_claustrum_entry(&bin),
+                        "ckbus": {"program": bin.join(platform_binary("ck-bus")), "args": [],
+                            "env": bus_env(&nats), "registration_channel": true, "reserved": true, "enabled": true},
+                        "nats-server": {"program": bin.join(platform_binary("ck-nats-server")),
+                            "args": ["-c", nats.join("server.conf").to_str().unwrap(), "--subc", connection.to_str().unwrap()],
+                            "protocol": "subc", "health": {"cadence_ms": 30000, "deadline_ms": 5000},
+                            "registration_channel": true, "reserved": true, "enabled": true},
                         "nats-hub": fixture_hub_entry(&bin, &cortexkit),
                         "insula": {"program": bin.join(platform_binary("ck-insula"))},
                     },
@@ -1919,12 +1941,14 @@ impl SetupFixture {
             fs::create_dir_all(&cortexkit).unwrap();
             fs::write(
                 cortexkit.join("installer-manifest.json"),
-                serde_json::to_vec_pretty(&json!({
-                    "schema_version": 1,
-                    "platform": host_target(),
-                    "mutations": mutations,
-                }))
-                .unwrap(),
+                format!(
+                    "{:#}\n",
+                    json!({
+                        "schema_version": 1,
+                        "platform": host_target(),
+                        "mutations": mutations,
+                    })
+                ),
             )
             .unwrap();
         }
@@ -1943,10 +1967,14 @@ impl SetupFixture {
     }
 
     fn write_runtime_definition(&self, outdated: bool) {
-        let path = runtime_definition(&self.home);
+        Self::write_runtime_definition_at(&self.home, &self.data_home.join("cortexkit"), outdated);
+    }
+
+    fn write_runtime_definition_at(home: &Path, cortexkit: &Path, outdated: bool) {
+        let path = runtime_definition(home);
         // Each component needs its own join: a slash embedded in a component
         // survives Windows stringification, unlike the inventory's separators.
-        let daemon = fixture_binary_path(&self.data_home.join("cortexkit").join("bin"), "ck-subc");
+        let daemon = fixture_binary_path(&cortexkit.join("bin"), "ck-subc");
         let raw = daemon.to_string_lossy();
         let escape_xml = |text: &str| {
             text.replace('&', "&amp;")
@@ -1957,7 +1985,7 @@ impl SetupFixture {
         };
         let xml = escape_xml(&raw);
         // Setup pins the daemon's config store beside bin/ in every definition.
-        let store = self.data_home.join("cortexkit").join("config-store");
+        let store = cortexkit.join("config-store");
         let raw_store = store.to_string_lossy();
         let store_xml = escape_xml(&raw_store);
         let definition = if cfg!(target_os = "macos") {
@@ -2063,7 +2091,7 @@ fn fixture_hub_entry(bin: &Path, data: &Path) -> Value {
 }
 
 const SETUP_MAINTENANCE_NO_CHANGE: &str = "Install an idle message hub entry\n  Message hub entry: nothing changed (existing entry kept)\nLet the message module use this computer's message-plane keys\n  Message-plane grants: nothing changed (all already granted)\nNothing changed.\n";
-const UPGRADE_MAINTENANCE_NO_CHANGE: &str = "Message hub entry: nothing changed (existing entry kept)\nLet the message module use this computer's message-plane keys\nMessage-plane grants: nothing changed (all already granted)\nNothing changed.\n";
+const UPGRADE_MAINTENANCE_PREFIX: &str = "Message hub entry: nothing changed (existing entry kept)\nLet the message module use this computer's message-plane keys\nMessage-plane grants: nothing changed (all already granted)\n";
 
 /// Default setup leaves key-store selection to the vault on every platform.
 fn installed_claustrum_entry(bin: &Path) -> Value {
@@ -2076,7 +2104,7 @@ fn installed_claustrum_entry(bin: &Path) -> Value {
 struct SignedIndex {
     url: String,
     public_key: String,
-    // Only the Unix-only setup refusal tests assert which URLs were fetched.
+    // Only Unix tests assert which URLs were fetched.
     #[cfg_attr(not(unix), allow(dead_code))]
     requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
@@ -2162,6 +2190,8 @@ fn nats_fixture_archives(fixture: &SetupFixture) -> (Vec<u8>, Vec<u8>) {
 fn setup_index(base: &str, mc_archive: Option<&[u8]>) -> (Value, BTreeMap<String, Vec<u8>>) {
     let target = host_target();
     let dummy = fixture_asset(format!("{base}/unused.zip"), "00".repeat(32), 1, None);
+    let mut assets = BTreeMap::new();
+    let bus = message_bus_fixture_asset(base, &mut assets, "ck-bus");
     let mut components = serde_json::Map::new();
     components.insert(
         "core".to_string(),
@@ -2176,14 +2206,23 @@ fn setup_index(base: &str, mc_archive: Option<&[u8]>) -> (Value, BTreeMap<String
                 ("ck-script-runner-python", dummy.clone()),
                 ("ck-nats-engine", dummy.clone()),
                 ("ck-nats-server", dummy.clone()),
+                ("ck-bus", bus),
             ],
+        ),
+    );
+    components.insert(
+        "claustrum".to_string(),
+        index_component(
+            &format!("claustrum-v{VAULT_VERSION}"),
+            Some(VAULT_VERSION),
+            &target,
+            [("ck-claustrum", dummy.clone()), ("ck-auth", dummy)],
         ),
     );
     components.insert(
         "synapse".to_string(),
         json!({"release": "v0.1.0", "version": "0.1.0", "assets": {}}),
     );
-    let mut assets = BTreeMap::new();
     if let Some(archive) = mc_archive {
         let path = "/ck-mc.zip";
         components.insert(
@@ -2239,6 +2278,56 @@ fn fixture_asset(url: String, sha256: String, bytes: u64, reports: Option<&str>)
     json!({"url": url, "sha256": sha256, "bytes": bytes, "reports": reports})
 }
 
+fn message_bus_fixture_archive(binary: &str) -> (Vec<u8>, String) {
+    let executable = fs::read(env!("CARGO_BIN_EXE_vault-cli-fixture")).unwrap();
+    let archive = stored_zip(&[(&platform_binary(binary), &executable)]);
+    let digest = sha256_hex(&archive);
+    (archive, digest)
+}
+
+fn bus_fixture_archive() -> &'static (Vec<u8>, String) {
+    static ARCHIVE: std::sync::OnceLock<(Vec<u8>, String)> = std::sync::OnceLock::new();
+    ARCHIVE.get_or_init(|| message_bus_fixture_archive("ck-bus"))
+}
+
+fn message_bus_fixture_asset(
+    base: &str,
+    assets: &mut BTreeMap<String, Vec<u8>>,
+    binary: &str,
+) -> Value {
+    let (archive, digest) = if binary == "ck-bus" {
+        bus_fixture_archive().clone()
+    } else {
+        message_bus_fixture_archive(binary)
+    };
+    let path = format!("/{binary}.zip");
+    // ck-bus reports its own crate version, not the Core release version.
+    let reports = (binary != "ck-bus").then_some(VAULT_VERSION);
+    let asset = fixture_asset(
+        format!("{base}{path}"),
+        digest,
+        archive.len() as u64,
+        reports,
+    );
+    assets.insert(path, archive);
+    asset
+}
+
+#[cfg(not(windows))]
+fn vault_fixture_release(
+    base: &str,
+    assets: &mut BTreeMap<String, Vec<u8>>,
+    target: &str,
+) -> Value {
+    index_component(
+        &format!("claustrum-v{VAULT_VERSION}"),
+        Some(VAULT_VERSION),
+        target,
+        ["ck-claustrum", "ck-auth"]
+            .map(|binary| (binary, message_bus_fixture_asset(base, assets, binary))),
+    )
+}
+
 // Used only by the setup-apply tests, which are gated off Windows above.
 #[cfg(not(windows))]
 fn fixture_archive(_root: &Path, binary: &str, version_line: &str, filler_bytes: u64) -> Vec<u8> {
@@ -2263,8 +2352,6 @@ fn fixture_archive(_root: &Path, binary: &str, version_line: &str, filler_bytes:
     ])
 }
 
-// Used only by the setup-apply tests, which are gated off Windows above.
-#[cfg(not(windows))]
 fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
     let mut archive = Vec::new();
     let mut central = Vec::new();
@@ -2319,8 +2406,6 @@ fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
     archive
 }
 
-// Used only by the setup-apply tests, which are gated off Windows above.
-#[cfg(not(windows))]
 fn crc32(bytes: &[u8]) -> u32 {
     let mut crc = u32::MAX;
     for byte in bytes {
@@ -2332,14 +2417,10 @@ fn crc32(bytes: &[u8]) -> u32 {
     !crc
 }
 
-// Used only by the setup-apply tests, which are gated off Windows above.
-#[cfg(not(windows))]
 fn push_u16(output: &mut Vec<u8>, value: u16) {
     output.extend_from_slice(&value.to_le_bytes());
 }
 
-// Used only by the setup-apply tests, which are gated off Windows above.
-#[cfg(not(windows))]
 fn push_u32(output: &mut Vec<u8>, value: u32) {
     output.extend_from_slice(&value.to_le_bytes());
 }
@@ -2724,6 +2805,169 @@ fn setup_unowned_refusals_match_dry_run_without_downloads_or_changes() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn setup_refuses_unowned_ck_bus_without_invoking_it() {
+    let fixture = SetupFixture::fresh("ck-setup-unowned-bus");
+    let data = fixture.data_home.join("cortexkit");
+    let bus = data.join("bin/ck-bus");
+    let marker = data.join("nats/server.conf");
+    let script = format!("#!/bin/sh\ntouch \"$0.invoked\"\necho 'ck-bus {BUS_VERSION}'\n");
+    write_executable(&bus, &script);
+    fs::create_dir(marker.parent().unwrap()).unwrap();
+    fs::write(&marker, b"operator NATS config\n").unwrap();
+    let index = serve_signed_index(|base| setup_index(base, None));
+
+    for args in [&["setup", "--dry-run"][..], &["setup"][..]] {
+        let output = fixture.command(&index, args).output().unwrap();
+        assert_exit(&output, 1);
+        assert_eq!(text(&output.stdout), "ck setup did not install ~/.local/share/cortexkit/bin/ck-bus, so it won't replace it. Move it aside and run ck setup again. Nothing was changed.\n");
+        assert!(
+            !bus.with_extension("invoked").exists(),
+            "the unowned ck-bus was invoked"
+        );
+        assert_eq!(fs::read(&bus).unwrap(), script.as_bytes());
+        assert_eq!(fs::read(&marker).unwrap(), b"operator NATS config\n");
+        assert_eq!(fs::read_dir(data.join("bin")).unwrap().count(), 1);
+        assert!(!data.join("installer-manifest.json").exists());
+        assert!(!fixture.config_home.join("cortexkit/subc.jsonc").exists());
+        assert!(!runtime_definition(&fixture.home).exists());
+    }
+    assert_eq!(
+        *index.requests.lock().unwrap(),
+        ["/index.json", "/index.json"]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn setup_without_a_vault_release_refuses_before_placing_core() {
+    let fixture = SetupFixture::fresh("ck-setup-no-vault-release");
+    let index = serve_signed_index(|base| {
+        let (mut index, assets) = setup_index(base, None);
+        index["components"]
+            .as_object_mut()
+            .unwrap()
+            .remove("claustrum")
+            .unwrap();
+        (index, assets)
+    });
+    let data = fixture.data_home.join("cortexkit");
+
+    for args in [&["setup", "--dry-run"][..], &["setup"][..]] {
+        let output = fixture.command(&index, args).output().unwrap();
+        assert_exit(&output, 1);
+        assert_eq!(
+            text(&output.stdout),
+            "the vault has no complete release for this computer, and core needs it\n"
+        );
+        assert_eq!(fs::read_dir(data.join("bin")).unwrap().count(), 0);
+        assert!(!data.join("installer-manifest.json").exists());
+        assert!(!fixture.config_home.join("cortexkit/subc.jsonc").exists());
+        assert!(!runtime_definition(&fixture.home).exists());
+    }
+    assert_eq!(
+        *index.requests.lock().unwrap(),
+        ["/index.json", "/index.json"]
+    );
+}
+
+#[cfg(unix)]
+fn remove_installed_fixture_bus(data: &Path) -> Value {
+    let bus = data.join("bin/ck-bus");
+    fs::remove_file(&bus).unwrap();
+    fs::remove_dir_all(data.join("nats")).unwrap();
+    let manifest = data.join("installer-manifest.json");
+    let mut inventory: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+    inventory["mutations"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|row| row["path"] != json!(bus) && row["kind"] != "bus-trust");
+    fs::write(&manifest, serde_json::to_vec(&inventory).unwrap()).unwrap();
+    inventory
+}
+
+#[cfg(unix)]
+fn assert_installed_fixture_bus(data: &Path, config: &Path) {
+    let bus = data.join("bin/ck-bus");
+    let nats = data.join("nats");
+    assert_eq!(
+        fs::read(&bus).unwrap(),
+        fs::read(env!("CARGO_BIN_EXE_vault-cli-fixture")).unwrap()
+    );
+    let inventory: Value =
+        serde_json::from_slice(&fs::read(data.join("installer-manifest.json")).unwrap()).unwrap();
+    let rows = inventory["mutations"].as_array().unwrap();
+    let bus_row = rows.iter().find(|row| row["path"] == json!(bus)).unwrap();
+    assert_eq!(bus_row["archive_sha256"], json!(bus_fixture_archive().1));
+    let trust = rows.iter().find(|row| row["kind"] == "bus-trust").unwrap();
+    assert_eq!(trust["state"], "applied");
+    assert_eq!(trust["activation_pending"], false);
+    let (_, config) = subc_jsonc::read_document(config).unwrap();
+    assert_eq!(config["modules"]["ckbus"]["program"], json!(bus));
+    assert_eq!(config["modules"]["ckbus"]["env"], bus_env(&nats));
+    assert_eq!(config["modules"]["nats-server"]["enabled"], true);
+    assert!(nats.join("operator.jwt").is_file());
+    assert!(nats.join("server.conf").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn setup_pre_bus_core_adds_only_the_bus_even_when_the_daemon_digest_differs() {
+    let fixture = SetupFixture::installed("ck-setup-pre-bus-core");
+    let data = fixture.data_home.join("cortexkit");
+    let config = fixture.config_home.join("cortexkit/subc.jsonc");
+    let daemon = fixture_binary_path(&data.join("bin"), "ck-subc");
+    write_fixture_daemon(&data.join("bin"), "0.17.9");
+    let daemon_before = fs::read(&daemon).unwrap();
+    let mut ownership = remove_installed_fixture_bus(&data);
+    let installed_digest = "33".repeat(32);
+    ownership["mutations"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|row| row["path"] == json!(daemon))
+        .unwrap()["archive_sha256"] = json!(installed_digest);
+    let manifest = data.join("installer-manifest.json");
+    fs::write(&manifest, serde_json::to_vec(&ownership).unwrap()).unwrap();
+    let (_, mut document) = subc_jsonc::read_document(&config).unwrap();
+    let modules = document["modules"].as_object_mut().unwrap();
+    modules.remove("ckbus").unwrap();
+    modules.remove("nats-server").unwrap();
+    fs::write(&config, serde_json::to_vec(&document).unwrap()).unwrap();
+    let index = serve_signed_index(|base| {
+        let (index, assets) = setup_index(base, None);
+        assert_ne!(
+            index["components"]["core"]["assets"][host_target()]["ck-subc"]["sha256"],
+            json!(installed_digest)
+        );
+        (index, assets)
+    });
+
+    let output = fixture.command(&index, &["setup"]).output().unwrap();
+
+    assert_exit(&output, 0);
+    let stdout = text(&output.stdout);
+    assert!(
+        !stdout.contains("run ck upgrade, then ck setup"),
+        "{stdout}"
+    );
+    assert_eq!(
+        *index.requests.lock().unwrap(),
+        ["/index.json", "/ck-bus.zip"]
+    );
+    assert_eq!(fs::read(&daemon).unwrap(), daemon_before);
+    let after: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+    let daemon_row = after["mutations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["path"] == json!(daemon))
+        .unwrap();
+    assert_eq!(daemon_row["archive_sha256"], json!(installed_digest));
+    assert_installed_fixture_bus(&data, &config);
+}
+
 #[test]
 #[cfg(unix)]
 fn setup_owned_newer_daemon_refuses_even_when_configuration_is_correct() {
@@ -2847,7 +3091,7 @@ fn setup_live_daemon_uses_core_release_not_connection_library_version() {
         assert_eq!(
             text(&output.stdout),
             if args.contains(&"--dry-run") {
-                "  1. would Install an idle message hub entry\n  2. would Let the message module use this computer's message-plane keys\n"
+                "  1. would Install an idle message hub entry\n  2. would Let the message module use this computer's message-plane keys\n  3. message bus: checked after the vault is live\n"
             } else {
                 SETUP_MAINTENANCE_NO_CHANGE
             }
@@ -3403,7 +3647,7 @@ fn upgrade_without_mc_index_entry_leaves_installed_mc_unchanged() {
             assert!(stdout.starts_with("Everything is up to date"), "{stdout}");
             assert!(stdout.contains("ck-mc ck-mc-alpha.22464bf2"), "{stdout}");
         } else {
-            assert_eq!(stdout, UPGRADE_MAINTENANCE_NO_CHANGE);
+            assert_eq!(stdout, upgrade_hand_made_bus_output());
         }
         assert!(!stdout.contains("ck-mc →"), "{stdout}");
         assert_eq!(fs::read(&manifest).unwrap(), manifest_before);
@@ -3859,6 +4103,8 @@ fn fresh_setup_installs_runner_and_prints_the_pasteable_claude_code_command() {
         let (nats_engine, nats_server) = nats_fixture_archives(&fixture);
         assets.insert("/nats-engine.zip".to_string(), nats_engine.clone());
         assets.insert("/nats-server.zip".to_string(), nats_server.clone());
+        let bus = message_bus_fixture_asset(base, &mut assets, "ck-bus");
+        let vault = vault_fixture_release(base, &mut assets, &target);
         (
             json!({
                 "schema": 1,
@@ -3876,8 +4122,10 @@ fn fresh_setup_installs_runner_and_prints_the_pasteable_claude_code_command() {
                             ("ck-script-runner-python", fixture_asset(format!("{base}/python.zip"), sha256_hex(&python), python.len() as u64, None)),
                             ("ck-nats-engine", fixture_asset(format!("{base}/nats-engine.zip"), sha256_hex(&nats_engine), nats_engine.len() as u64, None)),
                             ("ck-nats-server", fixture_asset(format!("{base}/nats-server.zip"), sha256_hex(&nats_server), nats_server.len() as u64, None)),
+                            ("ck-bus", bus),
                         ],
                     ),
+                    "claustrum": vault,
                 },
             }),
             assets,
@@ -3965,6 +4213,7 @@ case "$archive" in
   *ck-script-runner-python-*.zip) binary=ck-script-runner-python ;;
   *ck-nats-engine-*.zip) binary=ck-nats-engine ;;
   *ck-nats-server-*.zip) binary=ck-nats-server ;;
+  *ck-bus-*.zip|*ck-claustrum-*.zip|*ck-auth-*.zip) exec /usr/bin/unzip -q "$archive" -d "$destination" ;;
   *ck-subc-*.zip) binary=ck-subc ;;
   *) exit 2 ;;
 esac
@@ -4013,6 +4262,8 @@ exec /usr/bin/ditto "$@"
         let (nats_engine, nats_server) = nats_fixture_archives(&fixture);
         assets.insert("/nats-engine.zip".to_string(), nats_engine.clone());
         assets.insert("/nats-server.zip".to_string(), nats_server.clone());
+        let bus = message_bus_fixture_asset(base, &mut assets, "ck-bus");
+        let vault = vault_fixture_release(base, &mut assets, &target);
         (
             json!({
                 "schema": 1,
@@ -4030,8 +4281,10 @@ exec /usr/bin/ditto "$@"
                             ("ck-script-runner-python", fixture_asset(format!("{base}/python.zip"), sha256_hex(&python), python.len() as u64, None)),
                             ("ck-nats-engine", fixture_asset(format!("{base}/nats-engine.zip"), sha256_hex(&nats_engine), nats_engine.len() as u64, None)),
                             ("ck-nats-server", fixture_asset(format!("{base}/nats-server.zip"), sha256_hex(&nats_server), nats_server.len() as u64, None)),
+                            ("ck-bus", bus),
                         ],
                     ),
+                    "claustrum": vault,
                 },
             }),
             assets,
@@ -4055,7 +4308,7 @@ exec /usr/bin/ditto "$@"
     assert_mode(&config.join("subc.jsonc"), 0o600);
     assert_mode(&runtime_definition(&fixture.home), 0o644);
     let stage_modes = fs::read_to_string(stage_report).expect("staging mode report");
-    assert_eq!(stage_modes.lines().count(), 6, "{stage_modes}");
+    assert_eq!(stage_modes.lines().count(), 9, "{stage_modes}");
     for modes in stage_modes.lines() {
         assert_eq!(modes, "700 700 600", "unexpected staging modes: {modes}");
     }
@@ -4147,18 +4400,11 @@ fn setup_keeps_bootstrapped_claustrum_key_owner_only_under_zero_umask() {
         "ck-subc-mcp 0.17.10",
         0,
     );
-    let claustrum = fixture_archive(
-        fixture._root.path(),
-        "ck-claustrum",
-        "ck-claustrum 0.17.10",
-        0,
-    );
-    let auth_binary = platform_binary("ck-auth");
-    let auth_script = "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'ck-auth 0.17.10'; exit 0; fi\nif [ \"$1\" = \"grant\" ]; then echo 'already granted (no change)'; exit 0; fi\nif [ \"$1\" = \"bootstrap\" ]; then shift; while [ $# -gt 0 ]; do if [ \"$1\" = \"--key-path\" ]; then key=\"$2\"; shift 2; else shift; fi; done; if [ -n \"${key:-}\" ]; then printf secret >\"$key\"; fi; exit 0; fi\nexit 2\n".to_string();
-    let auth = stored_zip(&[(&auth_binary, auth_script.as_bytes())]);
     let index = serve_signed_index(|base| {
         let target = host_target();
         let mut assets = BTreeMap::new();
+        let bus = message_bus_fixture_asset(base, &mut assets, "ck-bus");
+        let vault = vault_fixture_release(base, &mut assets, &target);
         let runner = fixture_archive(
             fixture._root.path(),
             "ck-script-runner-bun",
@@ -4179,8 +4425,6 @@ fn setup_keeps_bootstrapped_claustrum_key_owner_only_under_zero_umask() {
             ("ck-subc-mcp", &core_mcp),
             ("ck-script-runner-bun", &runner),
             ("ck-script-runner-python", &python),
-            ("ck-claustrum", &claustrum),
-            ("ck-auth", &auth),
         ] {
             assets.insert(format!("/{name}.zip"), archive.clone());
         }
@@ -4201,18 +4445,11 @@ fn setup_keeps_bootstrapped_claustrum_key_owner_only_under_zero_umask() {
                             ("ck-script-runner-python", fixture_asset(format!("{base}/ck-script-runner-python.zip"), sha256_hex(&python), python.len() as u64, None)),
                             ("ck-nats-engine", fixture_asset(format!("{base}/ck-nats-engine.zip"), sha256_hex(&nats_engine), nats_engine.len() as u64, None)),
                             ("ck-nats-server", fixture_asset(format!("{base}/ck-nats-server.zip"), sha256_hex(&nats_server), nats_server.len() as u64, None)),
+                            ("ck-bus", bus),
 
                         ],
                     ),
-                    "claustrum": index_component(
-                        "subc-claustrum-v0.17.10",
-                        Some("0.17.10"),
-                        &target,
-                        [
-                            ("ck-claustrum", fixture_asset(format!("{base}/ck-claustrum.zip"), sha256_hex(&claustrum), claustrum.len() as u64, Some("0.17.10"))),
-                            ("ck-auth", fixture_asset(format!("{base}/ck-auth.zip"), sha256_hex(&auth), auth.len() as u64, Some("0.17.10"))),
-                        ],
-                    ),
+                    "claustrum": vault,
                 },
             }),
             assets,
@@ -4256,6 +4493,10 @@ impl UpgradeFixture {
         let cortexkit = home.join(".local/share/cortexkit");
         let bin = cortexkit.join("bin");
         fs::create_dir_all(&bin).unwrap();
+        // A standalone server.conf makes the bus look hand-installed, so
+        // other upgrade tests leave it alone. Managed-bus tests remove it.
+        fs::create_dir_all(cortexkit.join("nats")).unwrap();
+        fs::write(cortexkit.join("nats/server.conf"), "operator NATS config\n").unwrap();
         #[cfg(target_os = "macos")]
         {
             let tools = root.join("tools");
@@ -4269,6 +4510,7 @@ impl UpgradeFixture {
         let python = bin.join(platform_binary("ck-script-runner-python"));
         let nats_engine = bin.join(platform_binary("ck-nats-engine"));
         let nats_server = bin.join(platform_binary("ck-nats-server"));
+        let bus = bin.join(platform_binary("ck-bus"));
         let claustrum = bin.join(platform_binary("ck-claustrum"));
         let auth = bin.join(platform_binary("ck-auth"));
         write_executable(&aft, "#!/bin/sh\necho 'ck-aft 0.55.1'\n");
@@ -4280,6 +4522,7 @@ impl UpgradeFixture {
         write_executable(&nats_server, "#!/bin/sh\necho 'ck-nats-server 0.1.1'\n");
         write_executable(&claustrum, "#!/bin/sh\necho 'ck-claustrum 0.8.0'\n");
         common::copy_executable(Path::new(env!("CARGO_BIN_EXE_vault-cli-fixture")), &auth);
+        common::copy_executable(Path::new(env!("CARGO_BIN_EXE_vault-cli-fixture")), &bus);
         // The manifest names the `ck` this fixture's commands run: the test
         // CLI as published under its `ckdev-` name.
         let ck = fs::canonicalize(cortexkit_test_support::ckdev_binary(env!(
@@ -4297,6 +4540,7 @@ impl UpgradeFixture {
             (python, "88".repeat(32)),
             (nats_engine, "99".repeat(32)),
             (nats_server, "ab".repeat(32)),
+            (bus, bus_fixture_archive().1.clone()),
         ]
         .into_iter()
         .map(|(path, archive_sha256)| {
@@ -4376,8 +4620,7 @@ impl UpgradeFixture {
             .env("CK_TEST_NATS_ENGINE_VERSION", "0.1.1")
             .env("CK_TEST_NATS_SERVER_VERSION", "0.1.1")
             .env("CK_TEST_AFT_VERSION", "0.55.1")
-            .env("CK_TEST_CLAUSTRUM_VERSION", "0.8.0")
-            .env("CK_TEST_AUTH_VERSION", "0.8.0")
+            .env("CK_TEST_CLAUSTRUM_VERSION", VAULT_VERSION)
             .env("CK_TEST_SETUP_CONTROL_OK", "1")
             .env("CK_TEST_SETUP_MODULES", "aft,claustrum")
             .env(
@@ -4418,6 +4661,22 @@ impl UpgradeFixture {
     }
 }
 
+fn upgrade_hand_made_bus_output() -> String {
+    format!("{UPGRADE_MAINTENANCE_PREFIX}message bus installed outside setup; left as is\nNothing changed.\n")
+}
+
+fn current_upgrade_index(base: &str) -> (Value, BTreeMap<String, Vec<u8>>) {
+    upgrade_index(
+        base,
+        "0.55.1",
+        &"22".repeat(32),
+        "0.17.9",
+        &"44".repeat(32),
+        VAULT_VERSION,
+        &"55".repeat(32),
+    )
+}
+
 fn upgrade_index(
     base: &str,
     aft_version: &str,
@@ -4428,6 +4687,8 @@ fn upgrade_index(
     claustrum_digest: &str,
 ) -> (Value, BTreeMap<String, Vec<u8>>) {
     let target = host_target();
+    let mut archives = BTreeMap::new();
+    let bus = message_bus_fixture_asset(base, &mut archives, "ck-bus");
     (
         json!({
             "schema": 1,
@@ -4445,6 +4706,7 @@ fn upgrade_index(
                         ("ck-script-runner-python", fixture_asset(format!("{base}/python.zip"), "88".repeat(32), 1, None)),
                         ("ck-nats-engine", fixture_asset(format!("{base}/nats-engine.zip"), "99".repeat(32), 1, Some("0.1.1"))),
                         ("ck-nats-server", fixture_asset(format!("{base}/nats-server.zip"), "ab".repeat(32), 1, Some("0.1.1"))),
+                        ("ck-bus", bus),
                         ("ck", fixture_asset(format!("{base}/ck.zip"), ck_digest.to_string(), 1, Some(ck_version))),
                     ],
                 ),
@@ -4484,40 +4746,293 @@ fn upgrade_index(
                 ),
             },
         }),
-        BTreeMap::new(),
+        archives,
     )
 }
 
 #[test]
 fn upgrade_runs_message_maintenance_while_check_only_reports_binary_currency() {
     let fixture = UpgradeFixture::new("ck-upgrade-current");
-    let index = serve_signed_index(|base| {
-        upgrade_index(
-            base,
-            "0.55.1",
-            &"22".repeat(32),
-            "0.17.9",
-            &"44".repeat(32),
-            "0.8.0",
-            &"55".repeat(32),
-        )
-    });
-    let expected =
-        "Everything is up to date (ck 0.17.9 · ck-nats-engine 0.1.1 · ck-nats-server 0.1.1 · ck-subc 0.17.9 · ck-subc-mcp · ck-script-runner-bun 0.1.0 · ck-script-runner-python 0.1.0 · ck-aft 0.55.1 · ck-claustrum 0.8.0 · ck-auth 0.8.0).\n";
+    let data = fixture.home.join(".local/share/cortexkit");
+    let config = fixture.home.join(".config/cortexkit/subc.jsonc");
+    fs::remove_file(data.join("nats/server.conf")).unwrap();
+    let index = serve_signed_index(current_upgrade_index);
+    let expected = format!(
+        "Everything is up to date (ck 0.17.9 · ck-nats-engine 0.1.1 · ck-nats-server 0.1.1 · ck-subc 0.17.9 · ck-subc-mcp · ck-script-runner-bun 0.1.0 · ck-script-runner-python 0.1.0 · ck-bus {BUS_VERSION} · ck-aft 0.55.1 · ck-claustrum 0.8.0 · ck-auth 0.8.0).\n"
+    );
 
-    for args in [&["upgrade"][..], &["upgrade", "--check"][..]] {
+    for (args, expected) in [
+        (&["upgrade", "--check"][..], expected),
+        (
+            &["upgrade"][..],
+            format!("{UPGRADE_MAINTENANCE_PREFIX}Configured the message bus\nDone.\n"),
+        ),
+        (
+            &["upgrade"][..],
+            format!("{UPGRADE_MAINTENANCE_PREFIX}Message bus: nothing changed\nNothing changed.\n"),
+        ),
+    ] {
         let output = fixture.command(&index, args).output().unwrap();
         assert_exit(&output, 0);
         assert!(output.stderr.is_empty(), "stderr: {}", text(&output.stderr));
+        assert_eq!(text(&output.stdout), expected);
         assert_eq!(
-            text(&output.stdout),
-            if args.contains(&"--check") {
-                expected
-            } else {
-                UPGRADE_MAINTENANCE_NO_CHANGE
-            }
+            data.join("nats/server.conf").exists(),
+            !args.contains(&"--check")
         );
     }
+    let (_, after) = subc_jsonc::read_document(&config).unwrap();
+    assert_eq!(
+        after["modules"]["ckbus"]["program"],
+        json!(data.join("bin").join(platform_binary("ck-bus")))
+    );
+    assert_eq!(
+        after["modules"]["nats-server"]["args"][3],
+        json!(fixture.connection_file)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn upgrade_pre_bus_core_replaces_the_daemon_with_a_differing_digest_and_adds_the_bus() {
+    use common::scripted_daemon::ScriptedDescribeDaemon;
+
+    let fixture = UpgradeFixture::new("ck-upgrade-pre-bus-core");
+    let data = fixture.home.join(".local/share/cortexkit");
+    let config = fixture.home.join(".config/cortexkit/subc.jsonc");
+    let daemon = fixture_binary_path(&data.join("bin"), "ck-subc");
+    let mut inventory = remove_installed_fixture_bus(&data);
+    SetupFixture::write_runtime_definition_at(&fixture.home, &data, false);
+    inventory["mutations"].as_array_mut().unwrap().push(json!({
+        "kind": "runtime-definition", "path": runtime_definition(&fixture.home),
+    }));
+    let manifest = data.join("installer-manifest.json");
+    fs::write(&manifest, serde_json::to_vec(&inventory).unwrap()).unwrap();
+    let old_daemon = inventory["mutations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["path"] == json!(daemon))
+        .unwrap();
+
+    let version = "0.17.9";
+    let build = json!({
+        "core_version": version,
+        "build_git_sha": "12".repeat(20),
+        "build_lock_digest": "34".repeat(32),
+    });
+    let replacement = format!(
+        "#!/bin/sh\nif [ \"$1\" = --build-info ]; then echo '{build}'; else echo 'ck-subc {version}'; fi\n"
+    );
+    let archive = stored_zip(&[("ck-subc", replacement.as_bytes())]);
+    let digest = sha256_hex(&archive);
+    assert_ne!(old_daemon["archive_sha256"], json!(digest));
+    let index = serve_signed_index(|base| {
+        let (mut index, mut assets) = current_upgrade_index(base);
+        index["components"]["core"]["assets"][host_target()]["ck-subc"] = fixture_asset(
+            format!("{base}/daemon.zip"),
+            digest.clone(),
+            archive.len() as u64,
+            Some(version),
+        );
+        assets.insert("/daemon.zip".into(), archive);
+        (index, assets)
+    });
+
+    let previous = ScriptedDescribeDaemon::start(
+        "ck-upgrade-previous-daemon",
+        common::TEST_DAEMON_VER,
+        json!({
+            "op": "server.describe",
+            "protocol_ver": PROTOCOL_VERSION,
+            "build_git_sha": "ab".repeat(20),
+            "build_lock_digest": "cd".repeat(32),
+        }),
+    )
+    .await;
+    fs::copy(&previous.connection_file_path, &fixture.connection_file).unwrap();
+    let running = ScriptedDescribeDaemon::start(
+        "ck-upgrade-replacement-daemon",
+        common::TEST_DAEMON_VER,
+        json!({
+            "op": "server.describe",
+            "protocol_ver": PROTOCOL_VERSION,
+            "build_git_sha": build["build_git_sha"],
+            "build_lock_digest": build["build_lock_digest"],
+        }),
+    )
+    .await;
+    let tools = fixture._root.join("tools");
+    fs::create_dir(&tools).unwrap();
+    // Publish the matching connection only when the installer restarts the service.
+    write_executable(
+        &tools.join("systemctl"),
+        "#!/bin/sh\nif [ \"$2\" = restart ]; then exec cp \"$FIXTURE_NEW_CONNECTION\" \"$FIXTURE_CONNECTION\"; fi\nif [ \"$2\" = show ]; then echo \"FragmentPath=$XDG_CONFIG_HOME/systemd/user/cortexkit-subc.service\"; echo 'NeedDaemonReload=no'; fi\n",
+    );
+    let path = std::env::join_paths(
+        std::iter::once(tools).chain(std::env::split_paths(&system_path_only())),
+    )
+    .unwrap();
+    let mut command = tokio::process::Command::from(fixture.command(&index, &["upgrade"]));
+    command
+        .env("PATH", path)
+        .env("FIXTURE_NEW_CONNECTION", &running.connection_file_path)
+        .env("FIXTURE_CONNECTION", &fixture.connection_file)
+        .kill_on_drop(true);
+    let output = timeout(SETUP_TIMEOUT, command.output())
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_exit(&output, 0);
+    let stdout = text(&output.stdout);
+    assert!(stdout.contains("Configured the message bus"), "{stdout}");
+    assert_eq!(
+        *index.requests.lock().unwrap(),
+        ["/index.json", "/daemon.zip", "/ck-bus.zip"]
+    );
+    assert_eq!(fs::read(&daemon).unwrap(), replacement.as_bytes());
+    let inventory: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+    let daemon_row = inventory["mutations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["path"] == json!(daemon))
+        .unwrap();
+    assert_eq!(daemon_row["archive_sha256"], json!(digest));
+    assert_installed_fixture_bus(&data, &config);
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrade_refuses_unowned_ck_bus_without_invoking_it() {
+    let fixture = UpgradeFixture::new("ck-upgrade-unowned-bus");
+    let data = fixture.home.join(".local/share/cortexkit");
+    let bus = data.join("bin/ck-bus");
+    let manifest = data.join("installer-manifest.json");
+    let config = fixture.home.join(".config/cortexkit/subc.jsonc");
+    let invoked = data.join("invoked-bus");
+    write_executable(
+        &bus,
+        &format!(
+            "#!/bin/sh\ntouch '{}'\necho 'ck-bus {BUS_VERSION}'\n",
+            invoked.display()
+        ),
+    );
+    let mut record: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+    record["mutations"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|row| row["path"] != json!(bus));
+    fs::write(&manifest, serde_json::to_vec(&record).unwrap()).unwrap();
+    let paths = [&manifest, &config, &bus];
+    let before = paths.map(|path| fs::read(path).unwrap());
+    let index = serve_signed_index(current_upgrade_index);
+
+    for args in [&["upgrade", "--dry-run"][..], &["upgrade"][..]] {
+        let output = fixture.command(&index, args).output().unwrap();
+        assert_exit(&output, 1);
+        let stdout = text(&output.stdout);
+        assert_eq!(stdout, "ck upgrade manages only what ck setup installed. ck setup did not install these, so ck upgrade won't replace them:\n  ~/.local/share/cortexkit/bin/ck-bus\nMove them aside and run ck setup again. Nothing was changed.\n");
+        assert!(!invoked.exists(), "the unowned ck-bus was invoked");
+        assert!(index.requests.lock().unwrap().is_empty());
+        assert_eq!(paths.map(|path| fs::read(path).unwrap()), before);
+    }
+}
+
+#[test]
+fn upgrade_refuses_a_signed_core_release_without_ck_bus_before_writing() {
+    let fixture = UpgradeFixture::new("ck-upgrade-incomplete-bus-release");
+    let data = fixture.home.join(".local/share/cortexkit");
+    let paths = [
+        data.join("installer-manifest.json"),
+        data.join("nats/server.conf"),
+        data.join("bin").join(platform_binary("ck-bus")),
+        fixture.home.join(".config/cortexkit/subc.jsonc"),
+    ];
+    let before = paths.each_ref().map(|path| fs::read(path).unwrap());
+    let index = serve_signed_index(|base| {
+        let (mut index, archives) = current_upgrade_index(base);
+        assert!(index["components"]["core"]["assets"][host_target()]
+            .as_object_mut()
+            .unwrap()
+            .remove("ck-bus")
+            .is_some());
+        (index, archives)
+    });
+
+    let output = fixture.command(&index, &["upgrade"]).output().unwrap();
+    assert_exit(&output, 1);
+    let stdout = text(&output.stdout);
+    assert!(
+        stdout.contains("no ck-bus asset in subc-core-v0.17.10 yet"),
+        "{stdout}"
+    );
+    assert_eq!(paths.each_ref().map(|path| fs::read(path).unwrap()), before);
+}
+
+#[test]
+fn upgrade_without_a_vault_prints_the_handoff_and_does_not_install_one() {
+    let fixture = UpgradeFixture::new("ck-upgrade-without-vault");
+    let data = fixture.home.join(".local/share/cortexkit");
+    let manifest = data.join("installer-manifest.json");
+    let mut record: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+    let vault =
+        ["ck-claustrum", "ck-auth"].map(|binary| data.join("bin").join(platform_binary(binary)));
+    for binary in &vault {
+        fs::remove_file(binary).unwrap();
+    }
+    record["mutations"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|row| vault.iter().all(|binary| row["path"] != json!(binary)));
+    fs::write(&manifest, serde_json::to_vec(&record).unwrap()).unwrap();
+    let before = fs::read(&manifest).unwrap();
+    let index = serve_signed_index(current_upgrade_index);
+
+    let output = fixture.command(&index, &["upgrade"]).output().unwrap();
+    assert_exit(&output, 0);
+    assert_eq!(text(&output.stdout), "the vault and message bus are not installed yet; run ck setup\nMessage hub entry: nothing changed (existing entry kept)\nNothing changed.\n");
+    assert!(vault.iter().all(|binary| !binary.exists()));
+    assert_eq!(fs::read(&manifest).unwrap(), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrade_reports_bus_entry_write_failure_and_closes_its_journal() {
+    let fixture = UpgradeFixture::new("ck-upgrade-bus-entry-write-error");
+    let data = fixture.home.join(".local/share/cortexkit");
+    fs::remove_file(data.join("nats/server.conf")).unwrap();
+    let config = fixture.home.join(".config/cortexkit/subc.jsonc");
+    let original = config.with_file_name("operator-config.jsonc");
+    fs::rename(&config, &original).unwrap();
+    let before = fs::read(&original).unwrap();
+    std::os::unix::fs::symlink(&original, &config).unwrap();
+    let index = serve_signed_index(current_upgrade_index);
+
+    let output = fixture.command(&index, &["upgrade"]).output().unwrap();
+    assert_exit(&output, 1);
+    let stdout = text(&output.stdout);
+    let stderr = text(&output.stderr);
+    assert!(
+        stdout.contains("evidence: ck-bus message bus: failed:"),
+        "{stdout}"
+    );
+    assert!(
+        stderr.contains("ck-bus message bus failed:")
+            && stderr.contains(config.to_str().unwrap())
+            && stderr.contains("run ck setup to retry"),
+        "{stderr}"
+    );
+    assert!(!stdout.contains("rollback-offer"), "{stdout}");
+    let preview = fixture
+        .command(&index, &["upgrade", "--dry-run"])
+        .output()
+        .unwrap();
+    assert_exit(&preview, 0);
+    assert!(!text(&preview.stdout).contains("An install transaction needs recovery"));
+    assert_eq!(fs::read_link(&config).unwrap(), original);
+    assert_eq!(fs::read(&original).unwrap(), before);
 }
 
 #[test]
@@ -4563,7 +5078,7 @@ fn upgrade_adds_the_missing_hub_once_and_then_reports_no_changes() {
     );
     let second = fixture.command(&index, &["upgrade"]).output().unwrap();
     assert_exit(&second, 0);
-    assert_eq!(text(&second.stdout), UPGRADE_MAINTENANCE_NO_CHANGE);
+    assert_eq!(text(&second.stdout), upgrade_hand_made_bus_output());
     assert_eq!(fs::read(&config).unwrap(), saved);
 }
 
@@ -4618,7 +5133,7 @@ fn upgrade_previews_and_adds_a_missing_registration_channel_without_replacing_th
 
     let again = fixture.command(&index, &["upgrade"]).output().unwrap();
     assert_exit(&again, 0);
-    assert_eq!(text(&again.stdout), UPGRADE_MAINTENANCE_NO_CHANGE);
+    assert_eq!(text(&again.stdout), upgrade_hand_made_bus_output());
     assert_eq!(fs::read_to_string(&config).unwrap(), after_bytes);
 }
 
@@ -4969,7 +5484,7 @@ fn upgrade_noops_when_0_20_83_is_installed_and_cache_and_index_offer_0_20_41() {
                 "stdout:\n{stdout}"
             );
         } else if !args.contains(&"--dry-run") {
-            assert_eq!(stdout, UPGRADE_MAINTENANCE_NO_CHANGE);
+            assert_eq!(stdout, upgrade_hand_made_bus_output());
         }
         assert_eq!(
             fs::read(&manifest).unwrap(),

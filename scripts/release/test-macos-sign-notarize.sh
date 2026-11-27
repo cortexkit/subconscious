@@ -25,7 +25,7 @@ finish() {
 trap finish EXIT
 
 mkdir -p "$FIXTURE_DIR/bin" "$FIXTURE_DIR/source" "$FIXTURE_DIR/dist"
-for binary in ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python ck-nats-server ck-nats-engine; do
+for binary in ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python ck-nats-server ck-nats-engine ck-bus; do
   # Signing smoke-runs a copied binary with --version before checking identities.
   cat > "$FIXTURE_DIR/source/$binary" <<EOF
 #!/bin/sh
@@ -163,11 +163,12 @@ if grep -Fq 'stapler staple '"$FIXTURE_DIR/dist/ck-subc-darwin-arm64.zip" "$FIXT
 fi
 unzip -Z1 "$FIXTURE_DIR/dist/ck-subc-darwin-arm64.zip" | grep -Fxq 'Subconscious.app/Contents/embedded.provisionprofile'
 (cd "$FIXTURE_DIR/dist" && shasum -a 256 -c ck-subc-darwin-arm64.zip.sha256)
-for binary in ck-nats-server ck-nats-engine; do
+for binary in ck-nats-server ck-nats-engine ck-bus; do
   grep -Fq -- "--force --options runtime --timestamp --sign Developer ID Application: CortexKit (ABCDE12345) $FIXTURE_DIR/source/$binary" "$FIXTURE_DIR/codesign.log"
   grep -Fq "notarytool submit $FIXTURE_DIR/dist/$binary-darwin-arm64.zip" "$FIXTURE_DIR/notary.log"
   [[ "$(unzip -Z1 "$FIXTURE_DIR/dist/$binary-darwin-arm64.zip")" == "$binary" ]]
+  (cd "$FIXTURE_DIR/dist" && shasum -a 256 -c "$binary-darwin-arm64.zip.sha256")
 done
-printf 'signing fixtures passed (5 checks: mixed identity, Python entitlements, bundled notarization, NATS wrapper, NATS engine)\n'
+printf 'signing fixtures passed (6 checks: mixed identity, Python entitlements, bundled notarization, NATS wrapper, NATS engine, ck-bus)\n'
 bash "$SCRIPT_DIR/test-macos-daemon-bundle.sh"
 finished=1

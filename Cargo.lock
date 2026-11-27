@@ -542,7 +542,7 @@ dependencies = [
 
 [[package]]
 name = "ck-bus"
-version = "0.13.12"
+version = "0.13.13"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -566,6 +566,7 @@ dependencies = [
  "sha2",
  "subc-client-rs",
  "subc-control",
+ "subc-core",
  "subc-daemon",
  "subc-jsonc",
  "subc-protocol",
@@ -1197,6 +1198,7 @@ checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
 dependencies = [
  "curve25519-dalek",
  "ed25519",
+ "rand_core 0.6.4",
  "serde",
  "sha2",
  "signature",
@@ -3271,7 +3273,7 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.24.7"
+version = "0.24.8"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3286,6 +3288,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hex-literal",
  "portable-pty",
+ "rand_core 0.6.4",
  "roxmltree",
  "rusqlite",
  "rustix",

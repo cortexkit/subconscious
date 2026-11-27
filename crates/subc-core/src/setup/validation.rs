@@ -314,6 +314,8 @@ mod tests {
         };
         for omit_broca in [false, true] {
             let mut observed = SetupObserved::unconfigured_current_host();
+            let floor = super::super::planner::BUS_VAULT_FLOOR;
+            observed.claustrum_release = Some((format!("claustrum-v{floor}"), floor.parse().ok()));
             observed.platform = PlatformObservation::Supported(AlphaTarget::LinuxX64);
             observed.detections.clear();
             observed.releases.insert(

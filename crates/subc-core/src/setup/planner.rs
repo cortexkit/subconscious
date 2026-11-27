@@ -165,7 +165,8 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
         );
         let needs_placement = partial.map_or(state == ComponentState::Missing, |partial| {
             partial.module_matches_release
-        });
+        }) && !(component == Component::Claustrum
+            && observed.claustrum_binaries_owned);
         let unavailable_need = component_needs(component).iter().find_map(|need| {
             omitted.get(need).map(|reason| PlanOutcome::Refusal {
                 reason: format!("{component} needs {need}: {reason}"),
@@ -187,11 +188,12 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
         if let Some(refusal) = refusal {
             let reason = omission_reason(&refusal);
             omitted.insert(component, reason.clone());
-            plan.outcomes
-                .push(if is_bare_setup(request) && component != Component::Core {
+            plan.outcomes.push(
+                if matches!(component, Component::Core | Component::Claustrum) {
+                    refusal
+                } else if is_bare_setup(request) {
                     PlanOutcome::LeftOut { component, reason }
-                } else if component != Component::Core
-                    && request.convert != Some(component)
+                } else if request.convert != Some(component)
                     && !request.optional_components.contains(&component)
                 {
                     PlanOutcome::Refusal {
@@ -199,7 +201,8 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
                     }
                 } else {
                     refusal
-                });
+                },
+            );
             continue;
         }
 
@@ -341,7 +344,10 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
         && (observed.component_state(Component::Claustrum) != ComponentState::Missing
             || plan.validation.contains(&Component::Claustrum))
     {
-        plan.operations.push(SetupOperation::GrantMessageKeys);
+        plan.operations.extend([
+            SetupOperation::GrantMessageKeys,
+            SetupOperation::ConfigureMessageBus,
+        ]);
     }
 
     if plan.validation.contains(&Component::Plexus)
@@ -357,19 +363,21 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
     // After every rescan this run makes: a rescan applies a new health check
     // live, and nats-server opens its new listener only when it restarts, so
     // a rescan after this write would probe a listener that is not there yet.
-    match &observed.bus_monitoring {
-        BusMonitoring::Observed(bus) if bus.needs_change() => {
-            plan.operations.push(SetupOperation::MonitorNatsServer {
-                target: bus.target.clone(),
-            });
+    if !observed.has_bus_trust {
+        match &observed.bus_monitoring {
+            BusMonitoring::Observed(bus) if bus.needs_change() => {
+                plan.operations.push(SetupOperation::MonitorNatsServer {
+                    target: bus.target.clone(),
+                });
+            }
+            BusMonitoring::Observed(bus) => plan.outcomes.push(PlanOutcome::Noop {
+                scope: bus.noop_scope(),
+            }),
+            skipped @ BusMonitoring::Skipped { .. } => plan.outcomes.push(PlanOutcome::Noop {
+                scope: skipped.to_string(),
+            }),
+            BusMonitoring::NotDeclared => {}
         }
-        BusMonitoring::Observed(bus) => plan.outcomes.push(PlanOutcome::Noop {
-            scope: bus.noop_scope(),
-        }),
-        skipped @ BusMonitoring::Skipped { .. } => plan.outcomes.push(PlanOutcome::Noop {
-            scope: skipped.to_string(),
-        }),
-        BusMonitoring::NotDeclared => {}
     }
 
     plan.operations.extend([
@@ -391,6 +399,11 @@ fn component_refusal(
     needs_placement: bool,
     core_is_being_installed: bool,
 ) -> Option<PlanOutcome> {
+    if component == Component::Claustrum {
+        if let Some(reason) = vault_floor_refusal(observed, needs_placement) {
+            return Some(PlanOutcome::Refusal { reason });
+        }
+    }
     let release = needs_placement.then(|| observed.release(component));
     // Use the Magic Context plugin instructions if there is no module release,
     // even on Windows. Otherwise explain that Windows has no download.
@@ -472,6 +485,43 @@ fn component_refusal(
         .map(|reason| PlanOutcome::Refusal {
             reason: reason.clone(),
         })
+}
+
+// First Claustrum release with `ck auth public-key`.
+pub(super) const BUS_VAULT_FLOOR: &str = "0.4.0";
+
+fn vault_floor_refusal(observed: &SetupObserved, needs_placement: bool) -> Option<String> {
+    let floor = BUS_VAULT_FLOOR
+        .parse::<CoreVersion>()
+        .expect("valid vault floor");
+    if needs_placement {
+        match (
+            &observed.claustrum_release,
+            observed.release(Component::Claustrum),
+        ) {
+            (Some((tag, Some(version))), ReleaseAvailability::Available) => {
+                if *version < floor {
+                    return Some(format!(
+                        "core needs the vault at {BUS_VAULT_FLOOR} or later; {tag} is older"
+                    ));
+                }
+            }
+            _ => {
+                return Some(
+                    "the vault has no complete release for this computer, and core needs it".into(),
+                )
+            }
+        }
+    }
+    if observed
+        .owned_auth_version
+        .is_some_and(|version| !matches!(version, Ok(version) if version >= floor))
+    {
+        return Some(
+            "the vault is older than this setup needs; run ck upgrade, then ck setup".into(),
+        );
+    }
+    None
 }
 
 fn unowned_binary_refusal(observed: &SetupObserved, component: Component) -> Option<String> {
@@ -739,6 +789,7 @@ pub(super) fn execute_setup_with_prepare<E: SetupExecutor>(
             SetupOperation::RescanComponent { .. }
                 | SetupOperation::EnableComponent { .. }
                 | SetupOperation::GrantMessageKeys
+                | SetupOperation::ConfigureMessageBus
         ) && !restart_applied
         {
             if let Some(sections) = pending_restart.take() {
@@ -866,6 +917,20 @@ pub fn plan_upgrade(observed: &UpgradeObserved) -> UpgradePlan {
         if target.is_self_replacing() {
             append_message_grants(observed, &mut plan);
         }
+        if target.binary == "ck-bus" {
+            if let ReleaseAvailability::NotYetPublished {
+                release_tag,
+                missing_asset,
+            } = observed.release(target)
+            {
+                plan.outcomes.push(PlanOutcome::ReleaseIncomplete {
+                    component: target.component,
+                    release_tag,
+                    missing_asset,
+                });
+                continue;
+            }
+        }
         match observed.target_state(target) {
             UpgradeState::NotInstalled => plan.outcomes.push(PlanOutcome::Noop {
                 scope: format!("{target} is not installed"),
@@ -971,6 +1036,10 @@ fn append_message_grants(observed: &UpgradeObserved, plan: &mut UpgradePlan) {
     }) {
         plan.operations
             .push(UpgradeOperation::GrantMessageKeys { target });
+        if let Some(&target) = observed.roster.iter().find(|t| t.binary == "ck-bus") {
+            plan.operations
+                .push(UpgradeOperation::ConfigureMessageBus { target });
+        }
     }
 }
 
@@ -1276,7 +1345,10 @@ mod message_plane_tests {
         let observed =
             UpgradeObserved::for_roster(upgrade_roster([Component::Core, Component::Claustrum]));
         let plan = plan_upgrade(&observed);
-        assert_eq!(plan.operations.iter().filter(|op| op.mutates()).count(), 2);
+        assert_eq!(plan.operations.iter().filter(|op| op.mutates()).count(), 3);
+        assert!(plan
+            .render()
+            .contains("message bus: checked after the vault is live"));
         assert!(plan
             .render()
             .contains(super::super::message_plane::GRANT_STEP));
@@ -1287,7 +1359,11 @@ mod message_plane_tests {
 
     #[test]
     fn message_plane_grants_follow_vault_enable_and_precede_cli_replacement() {
-        let observed = SetupObserved::unconfigured_current_host();
+        let mut observed = SetupObserved::unconfigured_current_host();
+        observed.claustrum_release = Some((
+            format!("claustrum-v{BUS_VAULT_FLOOR}"),
+            BUS_VAULT_FLOOR.parse().ok(),
+        ));
         let plan = plan_setup(
             &observed,
             &SetupRequest::install(vec![Component::Claustrum]),
@@ -1310,6 +1386,14 @@ mod message_plane_tests {
             })
             .unwrap();
         assert!(grant > enable);
+        assert_eq!(
+            plan.operations[grant + 1],
+            SetupOperation::ConfigureMessageBus
+        );
+        assert_eq!(
+            plan.operations[grant + 1].to_string(),
+            "message bus: checked after the vault is live"
+        );
 
         let mut observed =
             UpgradeObserved::for_roster(upgrade_roster([Component::Core, Component::Claustrum]));
@@ -1412,6 +1496,12 @@ mod tests {
             releases,
             unowned_binaries: BTreeMap::new(),
             available_core_version: None,
+            claustrum_release: Some((
+                format!("claustrum-v{BUS_VAULT_FLOOR}"),
+                BUS_VAULT_FLOOR.parse().ok(),
+            )),
+            claustrum_binaries_owned: false,
+            owned_auth_version: None,
             permissions_need_tightening: false,
             requires_core: BTreeMap::new(),
             installed_core_version: None,
@@ -1427,7 +1517,87 @@ mod tests {
             detections: BTreeMap::new(),
             restart_required: Vec::new(),
             inventory_owned_paths: 0,
+            has_bus_trust: false,
             bus_monitoring: BusMonitoring::NotDeclared,
+        }
+    }
+
+    #[test]
+    fn setup_requires_usable_claustrum_for_every_install_selection() {
+        const UNAVAILABLE: &str =
+            "the vault has no complete release for this computer, and core needs it";
+        const OLD_OWNED: &str =
+            "the vault is older than this setup needs; run ck upgrade, then ck setup";
+        let floor = BUS_VAULT_FLOOR.parse::<CoreVersion>().unwrap();
+        let old = "0.0.0".parse::<CoreVersion>().unwrap();
+        assert!(old < floor);
+        let old_index = || Some(("claustrum-v0.0.0".into(), Some(old)));
+        let too_old = format!(
+            "core needs the vault at {BUS_VAULT_FLOOR} or later; claustrum-v0.0.0 is older"
+        );
+
+        for picks in [vec![], vec![Component::Claustrum], vec![Component::Aft]] {
+            let request = SetupRequest::install(picks);
+            let base = observed_setup();
+            let mut incomplete = base.clone();
+            incomplete.releases.insert(
+                Component::Claustrum,
+                ReleaseAvailability::Incomplete {
+                    missing_asset: "ck-auth".into(),
+                },
+            );
+            let mut old_release = base.clone();
+            old_release.claustrum_release = old_index();
+            let mut old_owned = base.clone();
+            old_owned.owned_auth_version = Some(Ok(old));
+            let mut unreadable = base.clone();
+            unreadable.owned_auth_version = Some(Err(()));
+            for (observed, reason) in [
+                (&incomplete, UNAVAILABLE),
+                (&old_release, too_old.as_str()),
+                (&old_owned, OLD_OWNED),
+                (&unreadable, OLD_OWNED),
+            ] {
+                let plan = plan_setup(observed, &request);
+                assert_eq!(
+                    plan.blocking_outcome(),
+                    Some(&PlanOutcome::Refusal {
+                        reason: reason.into()
+                    })
+                );
+                let mut executor = RecordingExecutor::default();
+                assert!(execute_setup(&plan, ExecutionMode::Apply, &mut executor)
+                    .unwrap()
+                    .applied
+                    .is_empty());
+            }
+
+            let fresh = plan_setup(&base, &request);
+            assert!(fresh.is_authorized(), "{}", fresh.render());
+            assert!(fresh
+                .operations
+                .contains(&SetupOperation::InstallComponent {
+                    component: Component::Claustrum
+                }));
+            assert!(fresh
+                .operations
+                .contains(&SetupOperation::ConfigureMessageBus));
+
+            // Both binaries are already in place, even if their configuration needs repair.
+            let mut installed = base;
+            installed.claustrum_release = old_index();
+            installed.claustrum_binaries_owned = true;
+            installed.owned_auth_version = Some(Ok(floor));
+            let plan = plan_setup(&installed, &request);
+            assert!(plan.is_authorized(), "{}", plan.render());
+            assert!(
+                !plan.operations.contains(&SetupOperation::InstallComponent {
+                    component: Component::Claustrum
+                })
+            );
+            assert!(plan
+                .operations
+                .contains(&SetupOperation::ConfigureMessageBus));
         }
     }
 
@@ -1642,7 +1812,7 @@ mod tests {
             .iter()
             .any(|op| op.component() == Some(Broca)));
         let plan = plan_setup(&observed, &SetupRequest::install(vec![Cingulate]));
-        assert_eq!(plan.validation, [Core, Cingulate]);
+        assert_eq!(plan.validation, [Core, Claustrum, Cingulate]);
     }
 
     #[test]
@@ -2425,6 +2595,7 @@ mod tests {
             [
                 SetupOperation::ConfigureMessageHub,
                 SetupOperation::GrantMessageKeys,
+                SetupOperation::ConfigureMessageBus,
                 SetupOperation::EnablePlexusAgentPolicies,
             ]
         );
@@ -2705,6 +2876,7 @@ mod tests {
                     component: Component::Claustrum,
                 },
                 SetupOperation::GrantMessageKeys,
+                SetupOperation::ConfigureMessageBus,
             ]
         );
         assert!(plan.outcomes.iter().any(|outcome| {
@@ -3255,6 +3427,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{}", plan.render()))
         };
         let monitor = position(|op| matches!(op, SetupOperation::MonitorNatsServer { .. }));
+        assert!(monitor > position(|op| matches!(op, SetupOperation::ConfigureMessageBus)));
         let last_rescan = plan
             .operations
             .iter()
@@ -3287,6 +3460,13 @@ mod tests {
                 .count(),
             1
         );
+        settled.has_bus_trust = true;
+        let plan = plan_setup(&settled, &request);
+        assert!(!plan
+            .operations
+            .iter()
+            .any(|op| matches!(op, SetupOperation::MonitorNatsServer { .. })));
+        settled.has_bus_trust = false;
         for (listener, health) in [
             (ListenerState::Present, HealthState::Matching),
             (ListenerState::Kept, HealthState::Kept),

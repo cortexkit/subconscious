@@ -55,7 +55,7 @@ write_release() {
 
 subconscious_release="$test_root/subconscious"
 aft_release="$test_root/aft"
-write_release "$subconscious_release" ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python ck-nats-server ck-nats-engine
+write_release "$subconscious_release" ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python ck-nats-server ck-nats-engine ck-bus
 write_release "$aft_release" ck-aft
 
 pass_output="$test_root/pass-output"
@@ -69,6 +69,11 @@ grep -Fq 'inventory-lane: name=aft-external-dependency' "$pass_output" \
   || fail 'external AFT dependency lane was not recorded'
 grep -Fq 'component=ck-subc-mcp lane=subconscious archive=ck-subc-mcp-windows-x64.zip sidecar=ck-subc-mcp-windows-x64.zip.sha256' "$pass_output" \
   || fail 'subconscious Windows sidecar evidence was not recorded'
+for tuple in darwin-arm64 linux-x64 linux-arm64 windows-x64 windows-arm64; do
+  archive="ck-bus-$tuple.zip"
+  grep -Fq "inventory-available: component=ck-bus lane=subconscious archive=$archive sidecar=$archive.sha256" "$pass_output" \
+    || fail "ck-bus archive and sidecar evidence was not recorded for $tuple"
+done
 grep -Fq 'component=ck-aft lane=aft-external-dependency archive=ck-aft-darwin-arm64.zip sidecar=ck-aft-darwin-arm64.zip.sha256' "$pass_output" \
   || fail 'AFT archive and sidecar evidence was not recorded'
 grep -Fq 'release-inventory: passed; operator matrix may begin' "$pass_output" \
@@ -94,7 +99,7 @@ grep -Fq 'release-incomplete: component=ck-script-runner-python lane=subconsciou
   || fail 'missing Python runner archive did not block the inventory by name'
 write_asset "$subconscious_release" 'ck-script-runner-python-windows-arm64.zip'
 
-for binary in ck-nats-server ck-nats-engine; do
+for binary in ck-nats-server ck-nats-engine ck-bus; do
   archive="$binary-linux-arm64.zip"
   rm -f "$subconscious_release/$archive"
   if bash "$gate" --subconscious-release-url "file://${subconscious_release}" \
@@ -105,6 +110,15 @@ for binary in ck-nats-server ck-nats-engine; do
     || fail "missing $binary archive did not block the inventory by name"
   write_asset "$subconscious_release" "$archive"
 done
+
+rm -f "$subconscious_release/ck-bus-windows-arm64.zip.sha256"
+if bash "$gate" --subconscious-release-url "file://${subconscious_release}" \
+  --aft-release-url "file://${aft_release}" >"$test_root/missing-bus-sidecar-output" 2>&1; then
+  fail 'missing ck-bus sidecar unexpectedly passed'
+fi
+grep -Fq 'release-incomplete: component=ck-bus lane=subconscious missing=ck-bus-windows-arm64.zip.sha256' "$test_root/missing-bus-sidecar-output" \
+  || fail 'missing ck-bus sidecar did not block the inventory by name'
+write_asset "$subconscious_release" 'ck-bus-windows-arm64.zip'
 
 rm -f "$aft_release/ck-aft-windows-x64.zip"
 missing_aft_output="$test_root/missing-aft-output"

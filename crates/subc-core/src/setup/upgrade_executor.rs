@@ -14,6 +14,7 @@ pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// a cold VM. Polling for only the drain budget refused a restart that
 /// succeeded thirty seconds later and stopped the ladder before the daemon.
 pub const RESTART_COMPLETION_TIMEOUT: Duration = Duration::from_secs(180);
+pub(super) const MESSAGE_BUS_STAGE: &str = "message bus";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UpgradeEvidence {
@@ -71,6 +72,9 @@ pub trait UpgradeExecutionBackend {
     }
     fn grant_message_keys(&mut self, _target: UpgradeTarget) -> Result<(bool, String), String> {
         Err("message-plane grants are not implemented by this backend".into())
+    }
+    fn configure_message_bus(&mut self, _target: UpgradeTarget) -> Result<(bool, String), String> {
+        Err("message bus configuration is not implemented by this backend".into())
     }
     fn download_and_verify(&mut self, target: UpgradeTarget) -> Result<String, String>;
     fn create_rollback_copy(&mut self, target: UpgradeTarget) -> Result<String, String>;
@@ -162,6 +166,7 @@ pub fn execute_upgrade<B: UpgradeExecutionBackend>(
         });
     }
     let mut replaced = BTreeSet::new();
+    let mut deferred_bus = None;
     for operation in &plan.operations {
         let (target, stage, result) = match operation {
             UpgradeOperation::ObservePlatform => continue,
@@ -190,6 +195,16 @@ pub fn execute_upgrade<B: UpgradeExecutionBackend>(
                 "message-plane-grants",
                 backend
                     .grant_message_keys(*target)
+                    .map(|(changed, detail)| {
+                        report.changed |= changed;
+                        detail
+                    }),
+            ),
+            UpgradeOperation::ConfigureMessageBus { target } => (
+                *target,
+                MESSAGE_BUS_STAGE,
+                backend
+                    .configure_message_bus(*target)
                     .map(|(changed, detail)| {
                         report.changed |= changed;
                         detail
@@ -270,7 +285,7 @@ pub fn execute_upgrade<B: UpgradeExecutionBackend>(
                     return Err(UpgradeExecutionFailure {
                         target: *target,
                         stage: "post-verification",
-                        reason,
+                        reason: include_deferred_bus_failure(reason, deferred_bus),
                         report,
                     });
                 }
@@ -290,6 +305,16 @@ pub fn execute_upgrade<B: UpgradeExecutionBackend>(
                     stage,
                     detail,
                 });
+            }
+            Err(reason) if stage == MESSAGE_BUS_STAGE => {
+                // The bus step handles recovery for its own config writes.
+                // Keep completed placements and run the remaining stages.
+                report.evidence.push(UpgradeEvidence {
+                    target,
+                    stage,
+                    detail: format!("failed: {reason}"),
+                });
+                deferred_bus = Some((target, format!("{reason}; run ck setup to retry")));
             }
             Err(reason) => {
                 let (reason, aborted) = if matches!(
@@ -315,13 +340,34 @@ pub fn execute_upgrade<B: UpgradeExecutionBackend>(
                 return Err(UpgradeExecutionFailure {
                     target,
                     stage,
-                    reason,
+                    reason: include_deferred_bus_failure(reason, deferred_bus),
                     report,
                 });
             }
         }
     }
-    Ok(report)
+    if let Some((target, reason)) = deferred_bus {
+        Err(UpgradeExecutionFailure {
+            target,
+            stage: MESSAGE_BUS_STAGE,
+            reason,
+            report,
+        })
+    } else {
+        Ok(report)
+    }
+}
+
+fn include_deferred_bus_failure(
+    reason: String,
+    deferred: Option<(UpgradeTarget, String)>,
+) -> String {
+    match deferred {
+        Some((target, bus_reason)) => {
+            format!("{reason}; {target} {MESSAGE_BUS_STAGE} failed: {bus_reason}")
+        }
+        None => reason,
+    }
 }
 
 fn abort_before_activation(
@@ -420,8 +466,13 @@ mod tests {
         fail_warm: bool,
         fail_activation: bool,
         fail_verify: bool,
+        fail_bus: bool,
         rollback: bool,
         maintenance_changes: bool,
+        bus_changes: bool,
+        open_transaction_target: Option<UpgradeTarget>,
+        aborts: usize,
+        rollback_offers: Vec<UpgradeTarget>,
     }
 
     #[test]
@@ -432,10 +483,129 @@ mod tests {
         let mut backend = RecordingBackend::default();
         let report = execute_upgrade(&plan, &mut backend).unwrap();
         assert!(report.nothing_changed());
-        assert_eq!(report.evidence.len(), 2);
+        assert_eq!(report.evidence.len(), 3);
+        backend.bus_changes = true;
+        let report = execute_upgrade(&plan, &mut backend).unwrap();
+        assert!(!report.nothing_changed());
+        backend.bus_changes = false;
         backend.maintenance_changes = true;
         let report = execute_upgrade(&plan, &mut backend).unwrap();
         assert!(!report.nothing_changed());
+    }
+
+    #[test]
+    fn upgrade_plans_bus_after_grants_and_restarts_ckbus_after_daemon_when_supervised() {
+        use super::super::model::UpgradeState;
+
+        let daemon = upgrade_target("ck-subc");
+        let auth = upgrade_target("ck-auth");
+        let bus = upgrade_target("ck-bus");
+        let ck = upgrade_target("ck");
+        let mut observed =
+            UpgradeObserved::for_roster(upgrade_roster([Component::Core, Component::Claustrum]));
+        let maintenance = [
+            UpgradeOperation::GrantMessageKeys { target: auth },
+            UpgradeOperation::ConfigureMessageBus { target: bus },
+        ];
+        let plan = plan_upgrade(&observed);
+        assert!(plan.operations.windows(2).any(|ops| ops == maintenance));
+
+        for target in [daemon, bus, ck] {
+            observed.targets.insert(
+                target.label().into(),
+                UpgradeState::UpdateAvailable {
+                    from: String::new(),
+                    to: "2.0.0".into(),
+                    reason: None,
+                },
+            );
+        }
+        for supervised in [false, true] {
+            if supervised {
+                observed.supervised_modules.insert("ckbus".into());
+            }
+            let plan = plan_upgrade(&observed);
+            assert!(plan.is_authorized(), "{plan:?}");
+            let position = |operation| plan.operations.iter().position(|op| *op == operation);
+            let daemon = position(UpgradeOperation::PostVerify { target: daemon }).unwrap();
+            let placement = position(UpgradeOperation::ReplaceDestination { target: bus }).unwrap();
+            let restart = position(UpgradeOperation::InitiateModuleRestart { target: bus });
+            let verified = position(UpgradeOperation::PostVerify { target: bus }).unwrap();
+            let grants = position(maintenance[0].clone()).unwrap();
+            let configure = position(maintenance[1].clone()).unwrap();
+            let self_update = position(UpgradeOperation::DownloadAndVerify { target: ck }).unwrap();
+            assert!(daemon < placement && placement < verified && verified < grants);
+            assert_eq!(configure, grants + 1);
+            assert!(configure < self_update);
+            assert_eq!(bus.module_id(), Some("ckbus"));
+            assert_eq!(restart.is_some(), supervised);
+            if let Some(restart) = restart {
+                assert!(placement < restart && restart < verified);
+            }
+        }
+    }
+
+    #[test]
+    fn upgrade_defers_message_bus_failure_without_rollback_and_reports_later_failure_too() {
+        let bus = upgrade_target("ck-bus");
+        let ck = upgrade_target("ck");
+        let plan = UpgradePlan {
+            operations: vec![
+                UpgradeOperation::ConfigureMessageBus { target: bus },
+                UpgradeOperation::DownloadAndVerify { target: ck },
+                UpgradeOperation::CreateRollbackCopy { target: ck },
+                UpgradeOperation::ReplaceDestination { target: ck },
+                UpgradeOperation::PostVerify { target: ck },
+            ],
+            outcomes: vec![],
+        };
+        for fail_verify in [false, true] {
+            let mut backend = RecordingBackend {
+                fail_bus: true,
+                fail_verify,
+                // Even if the backend reports an open upgrade transaction,
+                // the bus failure must not offer to undo it.
+                open_transaction_target: Some(bus),
+                ..Default::default()
+            };
+            let failure = execute_upgrade(&plan, &mut backend).unwrap_err();
+            assert_eq!(
+                backend.calls,
+                if fail_verify {
+                    vec!["bus", "download", "copy", "replace", "verify"]
+                } else {
+                    vec!["bus", "download", "copy", "replace", "verify", "completed"]
+                }
+            );
+            assert_eq!(backend.aborts, 0);
+            assert_eq!(
+                backend.rollback_offers,
+                if fail_verify { vec![ck] } else { vec![] }
+            );
+            assert_eq!(failure.target, if fail_verify { ck } else { bus });
+            assert_eq!(
+                failure.stage,
+                if fail_verify {
+                    "post-verification"
+                } else {
+                    "message bus"
+                }
+            );
+            let rendered = failure.to_string();
+            assert!(rendered.contains("ck-bus message bus failed: ck-bus install-plan failed: invalid JSON; run ck setup to retry"), "{rendered}");
+            assert_eq!(
+                rendered.contains("new process has stale version"),
+                fail_verify
+            );
+            assert_eq!(
+                failure.report.evidence[0],
+                UpgradeEvidence {
+                    target: bus,
+                    stage: "message bus",
+                    detail: "failed: ck-bus install-plan failed: invalid JSON".into(),
+                }
+            );
+        }
     }
 
     #[test]
@@ -455,6 +625,13 @@ mod tests {
     }
 
     impl UpgradeExecutionBackend for RecordingBackend {
+        fn abort_before_activation(&mut self) -> Result<bool, String> {
+            self.aborts += 1;
+            Ok(false)
+        }
+        fn failure_rollback_target(&self) -> Option<UpgradeTarget> {
+            self.open_transaction_target
+        }
         fn configure_message_hub(
             &mut self,
             _target: UpgradeTarget,
@@ -464,8 +641,20 @@ mod tests {
         fn grant_message_keys(&mut self, _target: UpgradeTarget) -> Result<(bool, String), String> {
             Ok((self.maintenance_changes, "all grants checked".into()))
         }
+        fn configure_message_bus(
+            &mut self,
+            _target: UpgradeTarget,
+        ) -> Result<(bool, String), String> {
+            self.calls.push("bus");
+            if self.fail_bus {
+                Err("ck-bus install-plan failed: invalid JSON".into())
+            } else {
+                Ok((self.bus_changes, "message bus checked".into()))
+            }
+        }
         fn download_and_verify(&mut self, _target: UpgradeTarget) -> Result<String, String> {
             self.calls.push("download");
+            self.open_transaction_target = None;
             Ok("sha256 verified".to_string())
         }
         fn create_rollback_copy(&mut self, _target: UpgradeTarget) -> Result<String, String> {
@@ -536,7 +725,8 @@ mod tests {
         fn completed(&mut self, _target: UpgradeTarget) {
             self.calls.push("completed");
         }
-        fn rollback_decision(&mut self, _target: UpgradeTarget) -> RollbackDecision {
+        fn rollback_decision(&mut self, target: UpgradeTarget) -> RollbackDecision {
+            self.rollback_offers.push(target);
             if self.rollback {
                 RollbackDecision::Accepted
             } else {

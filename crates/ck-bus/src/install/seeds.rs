@@ -76,9 +76,17 @@ pub fn refuse_seed_in_content(path: &Path, content: &str) -> Result<(), String> 
 
 #[cfg(test)]
 mod tests {
-    use super::{find_seeds, refuse_seeds_in_files};
+    use super::{find_seeds, holds_seed, refuse_seeds_in_files};
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use nkeys::KeyPair;
+    use subc_core::setup::bus::seed_detector_test_vectors;
+
+    #[test]
+    fn seed_detector_matches_shared_vectors() {
+        for (name, text, expected) in seed_detector_test_vectors() {
+            assert_eq!(holds_seed(&text), expected, "{name}");
+        }
+    }
 
     #[test]
     fn a_planted_seed_is_found_and_public_keys_are_not() {
@@ -98,7 +106,7 @@ mod tests {
         std::fs::write(&planted, format!("name: \"{seed}\"\n")).unwrap();
         // Inside a JWT's base64url claims the seed is not visible as text.
         let claims = URL_SAFE_NO_PAD.encode(format!("{{\"name\":\"{seed}\"}}"));
-        assert!(find_seeds(&claims).is_empty() && super::holds_seed(&format!("e30.{claims}.sig")));
+        assert!(find_seeds(&claims).is_empty() && holds_seed(&format!("e30.{claims}.sig")));
         let found = find_seeds(&std::fs::read_to_string(&planted).unwrap());
         assert!(found.len() == 1 && seed.starts_with(&found[0]), "{found:?}");
         let error = refuse_seeds_in_files(&[clean, planted]).unwrap_err();

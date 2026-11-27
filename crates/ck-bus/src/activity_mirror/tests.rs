@@ -897,7 +897,9 @@ fn supervised_main_starts_the_activity_mirror() {
         .items
         .iter()
         .find_map(|item| match item {
-            syn::Item::Fn(fun) if fun.sig.ident == "main" => Some(fun),
+            // `main` answers `--version` and the install commands, then hands
+            // supervised startup to `run_supervised`, which must wire the mirror.
+            syn::Item::Fn(fun) if fun.sig.ident == "run_supervised" => Some(fun),
             _ => None,
         })
         .unwrap();

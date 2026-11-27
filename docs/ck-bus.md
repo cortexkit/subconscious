@@ -10,7 +10,13 @@ The local message plane works without a hub and remains isolated from federation
 
 The daemon supplies the opaque, persistent machine name defined in `docs/machine-id-and-required-capabilities.md`, §1; the NATS account name `{acct}` is `box_<machine id>`, and that name grants no authority.
 
-`nats-server` is supervised with `protocol: "none"`, meaning process supervision without the subc HELLO handshake; no separate handshake-bypassing supervision mode is added. The daemon holds no bus credential and opens no subc route to the Claustrum credentials vault. The ck-bus sentinel, not the supervisor's liveness probe, reports message-plane health.
+Setup's `modules.nats-server` entry runs the `ck-nats-server` wrapper with
+`-c <nats dir>/server.conf --subc <daemon connection file>` and `protocol: "subc"`.
+The wrapper registers with the daemon and reports NATS readiness. Older
+hand-made installs may supervise the stock `nats-server` directly with
+`protocol: "none"`, without the subc HELLO handshake. The daemon holds no bus
+credential and opens no subc route to the Claustrum credentials vault. The ck-bus
+sentinel reports message-plane health separately from NATS readiness.
 
 An acceptance row may retire its F-PROV fixture only after every gate covering that row is discharged and no row still runs against that fixture; an absent dependency is a named skip or rig failure, never a pass.
 
@@ -368,10 +374,9 @@ never called, and a signing key refuses them by design.
   reports health down/`Unavailable` naming the target, without exiting.
 
 Credentials (design D; foundation amendment `48c83a68e`, `0eb12229f`, `b9e827c69`).
-- Root keys are the only vault records. The operator creates them once by ceremony,
-  in the syntax the placed `ck auth` accepts: `ck auth mint-signing-key --id
-  signing:<provider>[:<generation>]`. It generates the Ed25519 pair inside the vault
-  and prints only the public key and key id. Each key then gets exact grants to the
+- Setup creates the missing local bus signing keys with `ck auth mint-signing-key
+  --id signing:<provider>[:<generation>]`. The vault generates the Ed25519 pair
+  and prints only the public key and key id. Each local bus key gets exact grants to the
   principal `reserved:ckbus`, one `ck auth grant --principal reserved:ckbus
   --selector-kind exact --selector <credential id> --operation <op>` per operation. The
   selector is exact, never a category. Claustrum's authorization contract requires TWO grants per key, `sign` for `credential.sign` and `read` for
@@ -379,8 +384,8 @@ Credentials (design D; foundation amendment `48c83a68e`, `0eb12229f`, `b9e827c69
   key. Claustrum's own test
   `credentials-module/src/main.rs::sign_grant_does_not_authorize_scoped_public_key`
   pins that at `57a501b`.
-- Rotation. A root rotates only by `ck auth mint-signing-key --replace` on the same
-  id. `record_version` is NOT monotonic across a delete-and-remint or a vault
+- Vault key rotation. Setup never replaces or removes a vault key.
+  `record_version` is NOT monotonic across a delete-and-remint or a vault
   restore, so a consumer detects a rotated key by comparing `key_id` first, and uses
   the version only when the `key_id` values are equal. ck-bus keeps the `key_id` of
   every root it signed with in memory. When a `credential.sign` or
@@ -393,14 +398,18 @@ Credentials (design D; foundation amendment `48c83a68e`, `0eb12229f`, `b9e827c69
   | --- | --- | --- |
   | box account signing key | `signing:ck-bus-account:1` | participant and ck-bus box-account user JWTs |
   | system account signing key | `signing:ck-bus-sysaccount:1` | the system-account user JWT |
-  | operator root | `signing:ck-bus-operator-root:1` | the operator JWT (self-signed) and the system account JWT, once, by ceremony at install |
+  | operator root | none; setup creates a one-time key in memory and discards its private half | the operator JWT (self-signed) and the system account JWT |
   | operator signer | `signing:ck-bus-operator-signer:1` | the box account JWT, at first boot and in every revocation claims update |
   | federation account signing key | `signing:ck-bus-fedaccount:1` | ck-bus's federation-account user JWT |
   | message-signing key | `signing:msgsig` | per-message sender signatures |
 
+  Older hand-made installs may still hold `signing:ck-bus-operator-root:1` in the vault.
   ck-bus never calls the vault for the operator root; `RootCredential::OperatorRoot` refuses a credential ID. The operator signer needs exact `sign` and `read` grants to `reserved:ckbus`; the message-signing key needs `sign` for `reserved:ckbus` and `read` for `reserved:callosum`, which publishes its public half.
   Resolve credential IDs through `cortexkit-bus-naming::root_credential_id`. For installation key roles, JWT issuers and first-boot behavior, the requirements in `docs/nats-install-trust-chain.md`, §§1–5 and §7, take precedence over conflicting statements here.
-- Root ceremony is a per-root deployment prerequisite, not an acceptance-row gate. Harness signers use throwaway roots generated per run, and real-vault rows run the ceremony in fixture vaults; finding a production credential ID or `key_id` in a fixture fails the run. When a production root answers `not_found`, ck-bus reports `root-key-unreachable` and names the credential ID.
+- Harness signers use throwaway keys generated per run, and real-vault rows use
+  fixture vaults; finding a production credential ID or `key_id` in a fixture
+  fails the run. When a required vault key answers `not_found`, ck-bus reports
+  `root-key-unreachable` and names the credential ID.
 - `credential.sign` wire shape, implemented by claustrum at `57a501b`
   (`crates/credentials-core/src/signing.rs::sign_ed25519`, `::key_id_for_public`;
   `crates/credentials-module/src/read_surface.rs`). The request carries
@@ -518,22 +527,28 @@ Credentials (design D; foundation amendment `48c83a68e`, `0eb12229f`, `b9e827c69
     token. Whether a new `{acct}` needs new account keys is an Open question.
 - Server configuration. The local server needs its operator JWT, system account and
   the directory resolver before it starts. It is a sibling started concurrently, so
-  ck-bus cannot write that config in time. ck-bus's install tooling (`ck-bus
-   install-plan` and `install-apply`) writes it. The production `ck setup` bus step
-  that runs this tooling on an operator's machine is not built
-  (`server-config-writer-unnamed`, a deployment gate). In
-  acceptance the harness writes the config from the fixture roots. The resolver runs
-  with deletion disabled, per the foundation.
+  the running ckbus module does not write that config. The setup bus step uses
+  `ck-bus install-plan` and `ck-bus install-apply` before activating the modules.
+  In acceptance the harness writes the config from the fixture keys. The resolver
+  runs with deletion disabled.
+- Setup records ownership of the bus in its `bus-trust` inventory row. If there
+  is no row and the bus step finds an existing bus module entry, NATS install
+  file or the legacy vault-held operator root, it reports
+  `message bus installed outside setup; left as is` and does not take over.
+  An unowned `ck-bus` in setup's binary home blocks both `ck setup` and
+  `ck upgrade` until moved aside, even with a hand-made bus. Neither command
+  runs that binary.
 - `server.conf` contains `listen: "127.0.0.1:<port>"` (`install-apply --port`, default
   14222), `http: "127.0.0.1:<monitor_port>"` (`--monitor-port`, default 18222),
   `max_control_line: 65536`, the JetStream store directory, operator JWT path, system
   account id, full directory resolver with `allow_delete: false`, and system account
   JWT preload. Both ports must differ and both hosts are always IPv4 loopback. The
-  HTTP listener serves the daemon's plain `/healthz` probe and NATS server, connection,
+  HTTP listener serves `/healthz` and NATS server, connection,
   account and JetStream statistics. It has no authentication: any local process can
   read it under the existing local trust model, but it must never bind a wildcard or
-  non-loopback interface. Apply output includes `health_url` for the supervised
-  `protocol: "none"` module's `health.http` in `subc.jsonc`.
+  non-loopback interface. Apply output includes `health_url` for a hand-made
+  `protocol: "none"` module's `health.http` in `subc.jsonc`; the setup-managed
+  wrapper reports health through the subc protocol instead.
   Normal re-apply verifies/reuses stored JWTs when no signatures are supplied, but
   still rewrites `operator.jwt` as well as `server.conf`; it does not generate keys or
   touch existing resolver files. `install-plan` records signing inputs, not ports.
@@ -551,7 +566,6 @@ Credentials (design D; foundation amendment `48c83a68e`, `0eb12229f`, `b9e827c69
   against the only party that can reach the listener: a process on this machine, which
   is already inside the trust boundary every participant shares (R15). The server needs
   no TLS material for it. Hub links leave the machine and carry TLS.
-- `server-config-writer-unnamed` and `root-ceremony-unrun` block placement, not rows.
 
 Ownership of acts.
 - Issuance: ck-bus issues every per-process credential. Issuing and writing the census
@@ -1420,8 +1434,8 @@ The index summarizes normative requirements; where an index line and a section d
   `protocol: "none"`, under the default protocol, and a SIGTERM-ignoring one as the
   negative control (amended for #125, when an unregistered subc module began being
   signalled at drain start).
-- R9: WITHDRAWN in r2. The root-record lookup and mint-on-absence rule has no subject
-  under design D, because roots are ceremony keys and ck-bus mints nothing in the vault.
+- R9: withdrawn. The supervised ckbus module does not mint vault keys; `ck setup`
+  makes sure they exist.
 - R10: the route targets in acceptance are the real ids `claustrum` and `callosum`,
   served by harness modules registered under those ids. This discharges
   `route-target-ids-unnamed`. Amended by R12.
@@ -1434,7 +1448,10 @@ The index summarizes normative requirements; where an index line and a section d
   `claustrum-binary` alone serves authorization rows, and its absence is a loud skip,
   never a pass. Every row states its side.
 - R13: leaf signing uses a Go binary embedding `nats-server`, with `RemoteLeafOpts.SignatureCB` obtaining each connect signature from the vault so the leaf seed never touches disk. The binary is a subc-declared module with its own launch nonce, and the exact leaf-key `sign` grant belongs to its reserved principal, never `reserved:ckbus`. It signs only length-capped NATS-nonce-shaped input, keeps its vault connection CLOEXEC toward children, and presents `ConsumerIdentity {module_id, launch_nonce}` on `route.open`; acceptance must confirm a real sign arrives as that reserved principal, not `direct`.
-- R14: revocation uses a narrow operator signing key and short-lived user tokens; the operator root stays out of daily use and can remove an exposed signer from the operator JWT, while ck-bus updates the account JWT's revocation list using its exact signing grant.
+- R14: revocation uses a narrow operator signing key and short-lived user tokens.
+  ck-bus updates the account JWT's revocation list using its exact signing grant.
+  The operator root stays out of daily use; changing the operator signer requires
+  setup to replace the install JWTs under a fresh root.
 - R15: agent bus access is account-scoped. A participant's
   credential names no agents, and its grant may pull from any agent's durable in its box
   account. The operator accepts that any bus module on the machine can read any agent's

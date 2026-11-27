@@ -6,7 +6,7 @@ export LC_ALL=C
 SOURCE_DIR="${1:?usage: $0 <binary-dir>}"
 MAX_GLIBC=2.28
 
-for binary in ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python ck-nats-server ck-nats-engine; do
+for binary in ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python ck-nats-server ck-nats-engine ck-bus; do
   path="${SOURCE_DIR}/${binary}"
   if [[ "$binary" == ck-nats-engine ]]; then
     # The engine build disables Go's C interop (CGO_ENABLED=0). Refuse any interpreter or shared

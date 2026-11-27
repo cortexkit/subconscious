@@ -9,6 +9,7 @@ use crate::cli_output::println;
 use serde_json::{Map, Value};
 
 use super::{
+    bus,
     bus_monitoring::{self, BusMonitoring},
     ckni,
     components::{self, ReleaseArtifactSource},
@@ -17,8 +18,8 @@ use super::{
     file_modes,
     inventory::Inventory,
     model::{
-        Component, ComponentState, PartialInstall, PlatformObservation, ReleaseAvailability,
-        SetupObserved, SetupOperation, SetupRequest,
+        Component, ComponentState, CoreVersion, PartialInstall, PlatformObservation,
+        ReleaseAvailability, SetupObserved, SetupOperation, SetupRequest,
     },
     planner::{SetupExecutor, SetupPlan},
     runtime::{self, CommandRunner, RuntimePlatform, RuntimeStatus, SystemCommandRunner},
@@ -37,7 +38,7 @@ mod module_steps_tests;
 mod plexus_policy;
 mod settings;
 pub(super) mod share_keys;
-mod vault;
+pub(super) mod vault;
 
 pub struct SetupBackend {
     executable: PathBuf,
@@ -45,6 +46,7 @@ pub struct SetupBackend {
     platform: RuntimePlatform,
     inventory: Inventory,
     runner: Box<dyn CommandRunner>,
+    bus_control: Box<dyn bus::BusControl>,
     artifacts: ReleaseArtifactSource,
     runtime_status: RuntimeStatus,
     uninstall_report: Option<uninstall::UninstallReport>,
@@ -58,6 +60,7 @@ pub struct SetupBackend {
 struct ComponentSteps {
     message_hub_change: Option<config::ConfigChange>,
     message_grants_changed: bool,
+    message_bus_changed: bool,
     plexus_maintenance_changed: bool,
     nats_migration: Option<super::nats_migration::Migration>,
     failed_bootstrap_directory: Option<BootstrapDirectory>,
@@ -179,6 +182,7 @@ impl SetupBackend {
             )?
         };
         Ok(Self {
+            bus_control: super::bus_control(&executable),
             executable,
             paths: SetupPaths {
                 data_dir: data_dir.clone(),
@@ -280,13 +284,9 @@ impl SetupBackend {
             })
             .collect::<BTreeMap<_, _>>();
         let nats_pending = !request.uninstall
-            && super::nats_migration::Migration::capture(
-                &self.paths.config_path,
-                &self.paths.binary_home,
-                &subc_daemon::bootstrap::connection_file_path(),
-                &self.inventory,
-            )?
-            .is_some_and(|m| m.needs_rewrite());
+            && self
+                .legacy_nats_migration()?
+                .is_some_and(|m| m.needs_rewrite());
         for component in Component::ALL {
             if matches!(
                 PlatformObservation::current(),
@@ -416,6 +416,27 @@ impl SetupBackend {
             .components
             .get("core")
             .and_then(|entry| entry.version.clone());
+        if !request.uninstall && selected.contains(&Component::Claustrum) {
+            observed.claustrum_release = release_index.components.get("claustrum").map(|entry| {
+                let version = entry.version.as_deref().and_then(|version| {
+                    CoreVersion::from_release(version.trim_start_matches('v')).ok()
+                });
+                (entry.release.clone(), version)
+            });
+            observed.claustrum_binaries_owned = components::is_installed(
+                Component::Claustrum,
+                &self.paths.binary_home,
+                &self.inventory,
+            );
+            let auth = self.auth_path();
+            if auth.is_file() && owns_binary(&self.inventory, &auth) {
+                observed.owned_auth_version = Some(
+                    super::upgrade::binary_version(&auth)
+                        .map_err(|_| ())
+                        .and_then(|version| CoreVersion::from_release(&version)),
+                );
+            }
+        }
         observed.requires_core = requires_core;
         observed.core_binary_present =
             self.paths.runtime_paths.daemon.is_file() || self.runtime_status.live;
@@ -433,9 +454,12 @@ impl SetupBackend {
         observed.partial_installs = partial_installs;
         observed.running_ck_adoption = self.running_ck_adoption();
         observed.ckni = self.ckni_observation(observed.running_ck_adoption.is_some());
-        if !request.uninstall {
-            observed.bus_monitoring =
-                bus_monitoring::observe(&self.paths.config_path, &mut bus_monitoring::CkBusCommand);
+        observed.has_bus_trust = self.has_bus_trust();
+        if !request.uninstall && !observed.has_bus_trust {
+            observed.bus_monitoring = bus_monitoring::observe(
+                &self.paths.config_path,
+                &mut OwnedBusMonitor(&self.inventory),
+            );
             if let BusMonitoring::Skipped { .. } = &observed.bus_monitoring {
                 println!("{}", observed.bus_monitoring);
             }
@@ -541,6 +565,9 @@ impl SetupBackend {
                 )),
                 SetupOperation::BootstrapClaustrum { .. } => {
                     steps.push("would initialize claustrum credentials".to_string())
+                }
+                operation @ SetupOperation::ConfigureMessageBus => {
+                    steps.push(operation.to_string())
                 }
                 operation @ (SetupOperation::GrantMessageKeys
                 | SetupOperation::ConfigureMessageHub
@@ -694,6 +721,7 @@ impl SetupBackend {
                 matches!(
                     op,
                     SetupOperation::GrantMessageKeys
+                        | SetupOperation::ConfigureMessageBus
                         | SetupOperation::ConfigureMessageHub
                         | SetupOperation::GrantComponentVault {
                             component: Component::Plexus
@@ -704,6 +732,7 @@ impl SetupBackend {
         let maintenance_changed = self.component_steps.values().any(|steps| {
             steps.message_hub_change.is_some()
                 || steps.message_grants_changed
+                || steps.message_bus_changed
                 || steps.plexus_maintenance_changed
         });
         println!(
@@ -749,6 +778,62 @@ impl SetupBackend {
                 format!("ck {} failed: {detail}", args.join(" "))
             })
         }
+    }
+
+    fn auth_path(&self) -> PathBuf {
+        self.paths
+            .binary_home
+            .join(components::platform_binary("ck-auth"))
+    }
+
+    fn has_bus_trust(&self) -> bool {
+        !self.inventory.paths_for_kind(bus::BUS_TRUST).is_empty()
+    }
+
+    fn legacy_nats_migration(&self) -> Result<Option<super::nats_migration::Migration>, String> {
+        // The message-bus step repairs and verifies the managed wrapper after Core commits.
+        if self.has_bus_trust() {
+            return Ok(None);
+        }
+        super::nats_migration::Migration::capture(
+            &self.paths.config_path,
+            &self.paths.binary_home,
+            &subc_daemon::bootstrap::connection_file_path(),
+            &self.inventory,
+        )
+    }
+
+    fn configure_message_bus(&mut self) -> Result<(), String> {
+        let paths = bus::BusPaths {
+            nats_dir: &self.paths.data_dir.join("nats"),
+            config_path: &self.paths.config_path,
+            ck_bus: &self
+                .paths
+                .binary_home
+                .join(components::platform_binary("ck-bus")),
+            ck_auth: &self.auth_path(),
+        };
+        let changed = bus::configure(
+            &paths,
+            &self
+                .paths
+                .binary_home
+                .join(components::platform_binary("ck-nats-server")),
+            &subc_daemon::bootstrap::connection_file_path(),
+            &mut self.inventory,
+            &mut *self.runner,
+            &mut *self.bus_control,
+            std::thread::sleep,
+        )?;
+        if let Some(changed) = changed {
+            self.component_steps
+                .entry(Component::Core)
+                .or_default()
+                .message_bus_changed |= changed;
+        } else {
+            println!("  {}", bus::HAND_MADE);
+        }
+        Ok(())
     }
 
     fn observed_core_version(&self) -> Option<String> {
@@ -1137,7 +1222,9 @@ impl SetupExecutor for SetupBackend {
             op.mutates()
                 && !matches!(
                     op,
-                    SetupOperation::GrantMessageKeys | SetupOperation::ConfigureMessageHub
+                    SetupOperation::GrantMessageKeys
+                        | SetupOperation::ConfigureMessageBus
+                        | SetupOperation::ConfigureMessageHub
                 )
         });
         if plan.permission_repair && !has_mutating_operation {
@@ -1165,12 +1252,7 @@ impl SetupExecutor for SetupBackend {
             }
             SetupOperation::ConfigureComponent { component } => {
                 let mut nats = if *component == Component::Core {
-                    super::nats_migration::Migration::capture(
-                        &self.paths.config_path,
-                        &self.paths.binary_home,
-                        &subc_daemon::bootstrap::connection_file_path(),
-                        &self.inventory,
-                    )?
+                    self.legacy_nats_migration()?
                 } else {
                     None
                 };
@@ -1224,11 +1306,10 @@ impl SetupExecutor for SetupBackend {
             }
             SetupOperation::GrantMessageKeys => {
                 println!("{}", super::message_plane::GRANT_STEP);
-                let auth = self.paths.binary_home.join(if cfg!(windows) {
-                    "ck-auth.exe"
-                } else {
-                    "ck-auth"
-                });
+                let auth = self.auth_path();
+                if !owns_binary(&self.inventory, &auth) {
+                    return Err(super::text::unowned_binary_refusal(&auth));
+                }
                 super::message_plane::wait_for_vault(
                     &self.executable,
                     None,
@@ -1243,6 +1324,7 @@ impl SetupExecutor for SetupBackend {
                 println!("  {detail}");
                 Ok(())
             }
+            SetupOperation::ConfigureMessageBus => self.configure_message_bus(),
             SetupOperation::ConfigureMessageHub => {
                 println!("{}", super::message_plane::HUB_STEP);
                 if let Some(change) = super::message_plane::plan_hub(
@@ -1359,6 +1441,38 @@ impl SetupExecutor for SetupBackend {
     }
 }
 
+fn owns_binary(inventory: &Inventory, path: &Path) -> bool {
+    components::OWNED_BINARY_KINDS
+        .iter()
+        .any(|kind| inventory.owns_path(kind, path))
+}
+
+struct OwnedBusMonitor<'a>(&'a Inventory);
+
+impl bus_monitoring::ConfTool for OwnedBusMonitor<'_> {
+    fn conf_only(
+        &mut self,
+        target: &bus_monitoring::BusTarget,
+        dry_run: bool,
+    ) -> Result<bus_monitoring::ConfReport, String> {
+        check_monitor_ownership(self.0, target)?;
+        bus_monitoring::CkBusCommand.conf_only(target, dry_run)
+    }
+}
+
+fn check_monitor_ownership(
+    inventory: &Inventory,
+    target: &bus_monitoring::BusTarget,
+) -> Result<(), String> {
+    if !owns_binary(inventory, &target.ckbus) {
+        return Err(format!(
+            "{} is not owned by setup; it was not run",
+            target.ckbus.display()
+        ));
+    }
+    Ok(())
+}
+
 fn observed_component_state(
     component: Component,
     config_ok: bool,
@@ -1465,6 +1579,44 @@ mod tests {
     use super::*;
     use cortexkit_test_support::ScratchDir;
     include!("apply/nats_tests.rs");
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_monitoring_probes_only_an_inventory_owned_ck_bus() {
+        let root = ScratchDir::new("setup-legacy-monitoring-owner");
+        let config = root.join("subc.jsonc");
+        let server_conf = root.join("server.conf");
+        let bus = root.join("external-ck-bus");
+        let sentinel = root.join("monitor-probe-ran");
+        fs::write(&server_conf, b"operator-owned NATS configuration").unwrap();
+        let before = serde_json::json!({"modules": {
+            "nats-server": {"protocol": "none", "args": ["-c", server_conf]},
+            "ckbus": {"program": bus},
+        }})
+        .to_string();
+        fs::write(&config, &before).unwrap();
+        super::super::test_exec::write_executable(&bus, format!(
+            "#!/bin/sh\ntouch '{}'\nprintf '%s\\n' '{{\"status\":\"would apply\",\"health_url\":\"http://127.0.0.1:18222/healthz\"}}'\n",
+            sentinel.display()
+        ).as_bytes());
+        let mut inventory = Inventory::load(root.join("inventory.json"), "linux-x64").unwrap();
+
+        let observed = bus_monitoring::observe(&config, &mut OwnedBusMonitor(&inventory));
+        assert!(
+            matches!(observed, BusMonitoring::Skipped { reason } if reason.contains("not owned by setup; it was not run"))
+        );
+        assert!(!sentinel.exists());
+
+        inventory.record("binary-placement", &bus, Map::new());
+        let observed = bus_monitoring::observe(&config, &mut OwnedBusMonitor(&inventory));
+        assert!(matches!(observed, BusMonitoring::Observed(target) if target.needs_change()));
+        assert!(sentinel.is_file());
+        assert_eq!(fs::read_to_string(config).unwrap(), before);
+        assert_eq!(
+            fs::read(server_conf).unwrap(),
+            b"operator-owned NATS configuration"
+        );
+    }
 
     struct UnavailableUserManager;
 
@@ -1663,6 +1815,7 @@ mod tests {
         let platform = RuntimePlatform::Linux;
         let inventory = Inventory::load(&inventory_path, "linux-x64").unwrap();
         SetupBackend {
+            bus_control: crate::setup::bus_control(&binary_home.join("ck")),
             executable: binary_home.join("ck"),
             paths: SetupPaths {
                 data_dir: root.join("data"),
@@ -1775,6 +1928,7 @@ mod adoption_tests {
             Inventory::load(root.join("installer-manifest.json"), "linux-x64").unwrap();
         inventory.record("binary-placement", &executable, Map::new());
         let mut backend = SetupBackend {
+            bus_control: crate::setup::bus_control(&executable),
             executable: executable.clone(),
             paths: SetupPaths {
                 data_dir: root.join("data"),
@@ -1844,6 +1998,7 @@ mod adoption_tests {
         );
         inventory.record("binary-placement", &executable, bootstrap);
         let mut backend = SetupBackend {
+            bus_control: crate::setup::bus_control(&executable),
             executable: executable.clone(),
             paths: SetupPaths {
                 data_dir: root.join("data"),

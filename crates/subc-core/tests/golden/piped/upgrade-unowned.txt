@@ -7,6 +7,7 @@ ck upgrade manages only what ck setup installed. ck setup did not install these,
   ~/.local/share/cortexkit/bin/ck-script-runner-python
   ~/.local/share/cortexkit/bin/ck-nats-engine
   ~/.local/share/cortexkit/bin/ck-nats-server
+  ~/.local/share/cortexkit/bin/ck-bus
   ~/.local/share/cortexkit/bin/ck-aft
   ~/.local/share/cortexkit/bin/ck-claustrum
   ~/.local/share/cortexkit/bin/ck-auth

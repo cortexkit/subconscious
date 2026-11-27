@@ -13,6 +13,7 @@ use subc_transport::connection_file;
 
 use super::{
     apply::extension,
+    bus,
     components::{self, installed_components, upgrade_roster},
     file_modes,
     install_lock::InstallHold,
@@ -711,10 +712,25 @@ pub fn observed_upgrade_targets(
         .find(|item| item.target.is_daemon())
         .map(|item| item.installed_version.clone());
     if let Some(index) = index {
-        observed.available_core_version = index
-            .components
-            .get(Component::Core.label())
-            .and_then(|entry| entry.version.clone());
+        let core = index.components.get(Component::Core.label());
+        observed.available_core_version = core.and_then(|entry| entry.version.clone());
+        if let (Some(core), super::PlatformObservation::Supported(platform)) =
+            (core, &observed.platform)
+        {
+            if !core
+                .assets
+                .get(platform.label())
+                .is_some_and(|assets| assets.contains_key("ck-bus"))
+            {
+                observed.releases.insert(
+                    "ck-bus".into(),
+                    super::model::ReleaseAvailability::NotYetPublished {
+                        release_tag: core.release.clone(),
+                        missing_asset: "ck-bus".into(),
+                    },
+                );
+            }
+        }
         observed.requires_core = Component::ALL
             .into_iter()
             .filter_map(|component| {
@@ -1303,6 +1319,53 @@ impl SystemUpgradeBackend {
             .map(String::as_str)
             .ok_or_else(|| format!("no expected release version recorded for {target}"))
     }
+
+    fn configure_bus_with_control(
+        &mut self,
+        target: UpgradeTarget,
+        connection: &Path,
+        control: &mut dyn bus::BusControl,
+    ) -> Result<(bool, String), String> {
+        if self.inventory.transaction_is_open() {
+            return Err(
+                "cannot configure the message bus while an upgrade transaction is open".into(),
+            );
+        }
+        let ck_bus = self.target(target)?.destination.clone();
+        let ck_auth = self
+            .targets
+            .get("ck-auth")
+            .ok_or("ck-auth is not installed")?
+            .destination
+            .clone();
+        let nats_dir = self
+            .inventory
+            .manifest()
+            .parent()
+            .ok_or("installer manifest has no parent")?
+            .join("nats");
+        let result = bus::configure(
+            &bus::BusPaths {
+                nats_dir: &nats_dir,
+                config_path: &self.config_path,
+                ck_bus: &ck_bus,
+                ck_auth: &ck_auth,
+            },
+            &ck_bus.with_file_name(components::platform_binary("ck-nats-server")),
+            connection,
+            &mut self.inventory,
+            &mut *self.runner,
+            control,
+            thread::sleep,
+        )?;
+        let detail = match result {
+            Some(true) => "Configured the message bus",
+            Some(false) => "Message bus: nothing changed",
+            None => bus::HAND_MADE,
+        };
+        self.lines.completed(detail.into());
+        Ok((result == Some(true), detail.into()))
+    }
 }
 
 impl UpgradeExecutionBackend for SystemUpgradeBackend {
@@ -1424,6 +1487,16 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
         self.lines.completed(detail.clone());
         Ok((changed, detail))
     }
+
+    fn configure_message_bus(&mut self, target: UpgradeTarget) -> Result<(bool, String), String> {
+        let connection = self
+            .subc
+            .clone()
+            .unwrap_or_else(subc_daemon::bootstrap::connection_file_path);
+        let mut control = super::bus_control_at(&self.executable, &connection);
+        self.configure_bus_with_control(target, &connection, &mut *control)
+    }
+
     fn failure_rollback_target(&self) -> Option<UpgradeTarget> {
         if !self.inventory.transaction_is_open() {
             return None;
@@ -1879,6 +1952,33 @@ pub(super) mod tests {
             path,
             format!("#!/bin/sh\necho 'binary {version}'\n").as_bytes(),
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn upgrade_bus_refuses_an_open_transaction_without_writing() {
+        use super::super::install_journal::Journal;
+
+        let root = fixture_dir("upgrade-bus-open-transaction");
+        let bus = upgrade_target("ck-bus");
+        let mut backend = managed_backend(&root, bus, &root.join("ck-bus"));
+        let manifest = backend.inventory.manifest().to_owned();
+        let config = backend.config_path.clone();
+        fs::write(&config, "{}\n").unwrap();
+        backend.inventory.start_transaction().unwrap();
+        let journal = Journal::path(&manifest);
+        let paths = [&manifest, &journal, &config];
+        let before = paths.map(|path| fs::read(path).unwrap());
+
+        let error = backend.configure_message_bus(bus).unwrap_err();
+
+        assert_eq!(
+            error,
+            "cannot configure the message bus while an upgrade transaction is open"
+        );
+        assert!(backend.inventory.transaction_is_open());
+        assert_eq!(paths.map(|path| fs::read(path).unwrap()), before);
+        assert!(!root.join("nats").exists());
     }
 
     #[cfg(unix)]
@@ -2536,15 +2636,17 @@ pub(super) mod tests {
         let mcp = root.join("ck-subc-mcp");
         let aft = root.join("ck-aft");
         let daemon = root.join("ck-subc");
+        let bus = root.join("ck-bus");
         let mc = root.join("ck-mc");
         version_binary(&ck, "1.0.0");
         version_binary(&mcp, "1.1.0");
         version_binary(&aft, "1.2.0");
         version_binary(&daemon, "1.3.0");
+        version_binary(&bus, "1.4.0");
         version_binary(&mc, "99.0.0");
         let mut inventory =
             Inventory::load(root.join("installer-manifest.json"), "linux-x64").expect("inventory");
-        for path in [&ck, &mcp, &aft, &daemon, &mc] {
+        for path in [&ck, &mcp, &aft, &daemon, &bus, &mc] {
             inventory.record("managed-binary", path, Map::new());
         }
         inventory.record("binary-placement", &ck, Map::new());
@@ -2570,6 +2672,7 @@ pub(super) mod tests {
                 "ck-subc-mcp",
                 "ck-script-runner-bun",
                 "ck-script-runner-python",
+                "ck-bus",
                 "ck-aft",
                 "ck-mc",
                 "ck"
@@ -2582,9 +2685,10 @@ pub(super) mod tests {
         assert_eq!(targets[3].installed_version, "1.1.0");
         assert_eq!(targets[4].installed_version, "");
         assert_eq!(targets[5].installed_version, "");
-        assert_eq!(targets[6].installed_version, "1.2.0");
-        assert_eq!(targets[7].installed_version, "99.0.0");
-        assert_eq!(targets[8].installed_version, "1.0.0");
+        assert_eq!(targets[6].installed_version, "1.4.0");
+        assert_eq!(targets[7].installed_version, "1.2.0");
+        assert_eq!(targets[8].installed_version, "99.0.0");
+        assert_eq!(targets[9].installed_version, "1.0.0");
     }
 
     #[cfg(unix)]

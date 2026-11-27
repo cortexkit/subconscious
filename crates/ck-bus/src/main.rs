@@ -97,17 +97,24 @@ impl ModuleHandler for BusHandler {
     }
 }
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
-    // The install commands are offline: evaluated before anything supervised, they need
-    // no SUBC_MODULE_ID and reach neither the daemon nor the vault.
+fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    // Version and install commands need neither the async runtime nor supervision.
     let args: Vec<String> = env::args_os()
         .skip(1)
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
+    if args.first().is_some_and(|arg| arg == "--version") {
+        println!("ck-bus {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     if let Some(status) = install::run(&args) {
         std::process::exit(status);
     }
+    run_supervised()
+}
+
+#[tokio::main(flavor = "multi_thread")]
+async fn run_supervised() -> Result<(), Box<dyn Error + Send + Sync>> {
     let module_id = env::var(SUBC_MODULE_ID_ENV)
         .map_err(|_| format!("{SUBC_MODULE_ID_ENV} is required; ck-bus only runs supervised"))?;
     let store_root = runtime::resolve_store_root()?;

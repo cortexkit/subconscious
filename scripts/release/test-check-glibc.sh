@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Give only the Python runner an ELF import newer than the release ceiling.
+# Exercise the glibc compatibility limit with ELF fixtures that import specific glibc versions.
 set -euo pipefail
 finished=
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,7 +26,7 @@ for version in 2.28 2.29; do
   cc -shared -nostdlib "$fixture/provider.c" -Wl,--version-script="$fixture/versions.map" -o "$fixture/libfixture.so"
   cc -shared -nostdlib "$fixture/consumer.c" -L"$fixture" -lfixture -o "$fixture/import-$version"
 done
-for binary in ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python ck-nats-server; do
+for binary in ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python ck-nats-server ck-bus; do
   cp "$fixture/import-2.28" "$fixture/bin/$binary"
 done
 cc -static -nostdlib "$fixture/provider.c" -Wl,-e,fixture -o "$fixture/bin/ck-nats-engine"
@@ -49,10 +49,20 @@ if bash "$SCRIPT_DIR/check-glibc.sh" "$fixture/bin" > "$fixture/output" 2>&1; th
 fi
 grep -Fq 'ck-script-runner-python: cannot read ELF version requirements' "$fixture/output"
 cp "$fixture/import-2.28" "$fixture/bin/ck-script-runner-python"
+
+cp "$fixture/import-2.29" "$fixture/bin/ck-bus"
+if bash "$SCRIPT_DIR/check-glibc.sh" "$fixture/bin" > "$fixture/output" 2>&1; then
+  echo 'glibc_bus_newer_import: newer ck-bus import unexpectedly passed' >&2
+  exit 1
+fi
+grep -Fq 'ck-bus: requires GLIBC_2.29, newer than allowed GLIBC_2.28' "$fixture/output"
+printf 'glibc_bus_newer_import: rejected GLIBC_2.29\n'
+cp "$fixture/import-2.28" "$fixture/bin/ck-bus"
+
 cp "$fixture/import-2.28" "$fixture/bin/ck-nats-engine"
 if bash "$SCRIPT_DIR/check-glibc.sh" "$fixture/bin" > "$fixture/output" 2>&1; then
   echo 'dynamic NATS engine unexpectedly passed' >&2; exit 1
 fi
 grep -Fq 'ck-nats-engine: expected a static ELF' "$fixture/output"
-printf 'check-glibc: passed (4 checks)\n'
+printf 'check-glibc: passed (5 checks)\n'
 finished=1

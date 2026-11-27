@@ -549,6 +549,12 @@ fi
 printf '{"status":"%s","health_url":"http://127.0.0.1:8222/healthz"}\n' "$status"
 "#,
     );
+    let manifest = fixture.data_home.join("cortexkit/installer-manifest.json");
+    let mut inventory: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+    let mutations = inventory["mutations"].as_array_mut().unwrap();
+    mutations.retain(|row| row["kind"] != "bus-trust");
+    mutations.push(json!({"kind": "managed-binary", "path": ckbus, "component": "core"}));
+    fs::write(manifest, serde_json::to_vec_pretty(&inventory).unwrap()).unwrap();
     let config = fixture.config_home.join("cortexkit/subc.jsonc");
     let mut document: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
     document["modules"]["ckbus"] = json!({ "program": ckbus });

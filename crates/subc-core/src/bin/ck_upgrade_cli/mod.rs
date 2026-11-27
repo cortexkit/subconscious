@@ -32,6 +32,12 @@ pub(super) async fn upgrade_command(
         println!("{refusal}");
         return Err(CkError::RenderedExit { exit_code: 1 });
     }
+    if !discovered
+        .iter()
+        .any(|item| item.target.binary == "ck-auth")
+    {
+        println!("the vault and message bus are not installed yet; run ck setup");
+    }
     let cache = setup::UpdateCache::from_environment();
     let source = setup::IndexReleaseSource::from_environment(setup::TARGET_CHECK_BUDGET);
     let upgrade_roster = discovered

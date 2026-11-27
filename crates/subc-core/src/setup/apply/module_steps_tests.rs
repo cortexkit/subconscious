@@ -558,7 +558,15 @@ fn second_bare_setup_plans_ensures_but_leaves_files_and_inventory_unchanged() {
         &backend.paths.binary_home.join("ck-plexus-admin"),
         b"#!/bin/sh\ncase \"$1 $2\" in\n'connector-home status') printf '%s\\n' '{\"result\":{\"connectorHome\":{\"admitted\":true}}}' ;;\n'agent-policy preview') printf '%s\\n' '{\"enabled\":true}' ;;\n*) exit 64 ;;\nesac\n",
     );
-    fs::write(&backend.paths.config_path, "{\"version\":1}\n").unwrap();
+    fs::write(
+        &backend.paths.config_path,
+        "{\"version\":1,\"modules\":{\"ckbus\":{}}}\n",
+    )
+    .unwrap();
+    let auth = backend.auth_path();
+    backend
+        .inventory
+        .record("managed-binary", &auth, Map::new());
     backend.inventory.start_transaction().unwrap();
     backend.apply(&SetupOperation::ConfigureMessageHub).unwrap();
     for name in ["fusiform.jsonc", "broca.jsonc", "cerebellum.jsonc"] {

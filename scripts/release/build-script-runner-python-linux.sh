@@ -11,9 +11,14 @@ esac
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # Match the host's selected Rust toolchain, including its LLVM bitcode reader.
 rust_version="$(rustc --version | cut -d' ' -f2)"
+# The container runs as root, so files it creates under target/ would be root-owned and later
+# steps on the host (which write their own scratch folders under target/) would be refused.
+# Hand target/ back to the calling user however the build ends.
 docker run --rm -v "$root:/io" -w /io \
   -e RUST_VERSION="$rust_version" -e RUST_TARGET="$target" \
+  -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
   "$image" bash -ec '
+    trap '\''chown -R "$HOST_UID:$HOST_GID" /io/target 2>/dev/null || true'\'' EXIT
     dnf install -y zstd
     export RUSTUP_HOME=/root/python-rustup CARGO_HOME=/root/python-cargo
     curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$RUST_VERSION"

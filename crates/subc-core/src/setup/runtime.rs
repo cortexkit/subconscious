@@ -2663,6 +2663,11 @@ mod reconciliation_tests {
         observed
             .components
             .insert(Component::Core, ComponentState::Correct);
+        observed
+            .components
+            .insert(Component::Claustrum, ComponentState::Correct);
+        observed.claustrum_binaries_owned = true;
+        observed.owned_auth_version = Some(super::super::planner::BUS_VAULT_FLOOR.parse());
         observed.runtime = state;
         plan_setup(&observed, &SetupRequest::install(vec![]))
     }

@@ -267,6 +267,9 @@ pub fn operation_stage(operation: &UpgradeOperation) -> Option<(UpgradeTarget, &
             (*target, "registration-channel-entry")
         }
         UpgradeOperation::GrantMessageKeys { target } => (*target, "message-plane-grants"),
+        UpgradeOperation::ConfigureMessageBus { target } => {
+            (*target, super::upgrade_executor::MESSAGE_BUS_STAGE)
+        }
         UpgradeOperation::ObservePlatform => return None,
         UpgradeOperation::DownloadAndVerify { target } => (*target, "download-and-verify"),
         UpgradeOperation::CreateRollbackCopy { target } => (*target, "rollback-copy"),
@@ -473,6 +476,19 @@ impl<B: UpgradeExecutionBackend> UpgradeExecutionBackend for Reporting<'_, B> {
             changed = result.0;
             Ok(result.1)
         })?;
+        Ok((changed, detail))
+    }
+    fn configure_message_bus(&mut self, target: UpgradeTarget) -> Result<(bool, String), String> {
+        let mut changed = false;
+        let detail = self.stage(
+            Some(target),
+            super::upgrade_executor::MESSAGE_BUS_STAGE,
+            |b| {
+                let result = b.configure_message_bus(target)?;
+                changed = result.0;
+                Ok(result.1)
+            },
+        )?;
         Ok((changed, detail))
     }
     fn download_and_verify(&mut self, target: UpgradeTarget) -> Result<String, String> {

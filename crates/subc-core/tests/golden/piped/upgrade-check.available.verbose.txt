@@ -7,6 +7,7 @@ ck-aft 0.55.1 → 0.55.2. Run ck upgrade.
   outcome: no-op: ck-subc-mcp is already current
   outcome: no-op: ck-script-runner-bun is already current
   outcome: no-op: ck-script-runner-python is already current
+  outcome: no-op: ck-bus is already current
   outcome: ck-aft 0.55.1 → 0.55.2
   outcome: ck-aft: module is not supervised on this host; restart omitted, verified by binary version only
   outcome: no-op: ck-claustrum is already current

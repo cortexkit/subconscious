@@ -58,6 +58,7 @@ impl SetupBackend {
     ) -> Result<(), String> {
         let mut groups = BTreeMap::<Component, Vec<SetupOperation>>::new();
         let mut grants = false;
+        let mut configure_bus = false;
         let mut plexus_policies = false;
         let mut monitor = None;
         for operation in plan
@@ -67,6 +68,10 @@ impl SetupBackend {
         {
             if matches!(operation, SetupOperation::GrantMessageKeys) {
                 grants = true;
+                continue;
+            }
+            if matches!(operation, SetupOperation::ConfigureMessageBus) {
+                configure_bus = true;
                 continue;
             }
             if matches!(operation, SetupOperation::EnablePlexusAgentPolicies) {
@@ -171,11 +176,15 @@ impl SetupBackend {
             // the installation whose keys will be used has been committed.
             self.apply(&SetupOperation::GrantMessageKeys)?;
         }
+        if configure_bus {
+            self.apply(&SetupOperation::ConfigureMessageBus)?;
+        }
         if plexus_policies {
             // The operator owns this change; do not ask until Plexus is committed.
             self.apply(&SetupOperation::EnablePlexusAgentPolicies)?;
         }
         if let Some(target) = monitor {
+            check_monitor_ownership(&self.inventory, target)?;
             #[cfg(feature = "test-support")]
             super::super::install_journal::crash_hook("before-bus-monitoring");
             self.monitor_nats_after_commit(target, &mut bus_monitoring::CkBusCommand)?;

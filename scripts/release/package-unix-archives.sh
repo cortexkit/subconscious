@@ -6,7 +6,7 @@ OS="${1:?usage: $0 <darwin|linux> <arm64|x64> <source-dir> <dist-dir>}"
 ARCH="${2:?usage: $0 <darwin|linux> <arm64|x64> <source-dir> <dist-dir>}"
 SOURCE_DIR="${3:?usage: $0 <darwin|linux> <arm64|x64> <source-dir> <dist-dir>}"
 DIST_DIR="${4:?usage: $0 <darwin|linux> <arm64|x64> <source-dir> <dist-dir>}"
-BINARIES=(ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python ck-nats-server ck-nats-engine)
+BINARIES=(ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python ck-nats-server ck-nats-engine ck-bus)
 
 case "$OS" in
   darwin|linux) ;;

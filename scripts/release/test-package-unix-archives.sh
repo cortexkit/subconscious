@@ -16,7 +16,7 @@ finish() {
 trap finish EXIT
 
 mkdir -p "$FIXTURE_DIR/source" "$FIXTURE_DIR/dist"
-for binary in ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python ck-nats-server ck-nats-engine; do
+for binary in ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python ck-nats-server ck-nats-engine ck-bus; do
   printf '%s fixture\n' "$binary" > "$FIXTURE_DIR/source/$binary"
 done
 # ck must answer for its own build shape; the packager refuses a ck that
@@ -39,7 +39,7 @@ fi
 write_ck_fixture off
 "${SCRIPT_DIR}/package-unix-archives.sh" linux x64 "$FIXTURE_DIR/source" "$FIXTURE_DIR/dist"
 
-for binary in ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python ck-nats-server ck-nats-engine; do
+for binary in ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python ck-nats-server ck-nats-engine ck-bus; do
   archive_name="${binary}-linux-x64.zip"
   archive_path="$FIXTURE_DIR/dist/$archive_name"
   sidecar_path="${archive_path}.sha256"
@@ -52,7 +52,7 @@ for binary in ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-pytho
     shasum -a 256 -c "${archive_name}.sha256"
   )
 done
-printf 'Unix package fixtures passed (7 archives and sidecars, test-support refusal)\n'
+printf 'Unix package fixtures passed (8 archives and sidecars, test-support refusal)\n'
 if command -v ditto >/dev/null; then
   bundle="$FIXTURE_DIR/source/Subconscious.app"
   mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/_CodeSignature"
@@ -61,7 +61,7 @@ if command -v ditto >/dev/null; then
   printf 'profile fixture\n' > "$bundle/Contents/embedded.provisionprofile"
   printf 'seal fixture\n' > "$bundle/Contents/_CodeSignature/CodeResources"
   "${SCRIPT_DIR}/package-unix-archives.sh" darwin arm64 "$FIXTURE_DIR/source" "$FIXTURE_DIR/dist"
-  for binary in ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python ck-nats-server ck-nats-engine; do
+  for binary in ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python ck-nats-server ck-nats-engine ck-bus; do
     archive_name="$binary-darwin-arm64.zip"
     archive_path="$FIXTURE_DIR/dist/$archive_name"
     if [[ "$binary" == ck-subc ]]; then
@@ -77,7 +77,7 @@ if command -v ditto >/dev/null; then
     fi
     (cd "$FIXTURE_DIR/dist" && shasum -a 256 -c "$archive_name.sha256")
   done
-  printf 'Darwin package fixtures passed (7 archives and sidecars, bundle contents)\n'
+  printf 'Darwin package fixtures passed (8 archives and sidecars, bundle contents)\n'
 else
   printf 'Darwin package fixtures skipped: native ditto not available\n'
 fi

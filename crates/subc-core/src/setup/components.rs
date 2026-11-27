@@ -514,10 +514,10 @@ pub fn module_program(component: Component) -> Option<&'static str> {
     }
 }
 
-const SUPERVISED_MODULE_IDS: [(&str, &str); 15] = [
-    // Core owns the daemon and MCP bridge, but only the bridge is a supervised
-    // module program; Core itself remains outside the setup module lifecycle.
+const SUPERVISED_MODULE_IDS: [(&str, &str); 16] = [
+    // Core has supervised companions, but the daemon itself is not a module.
     ("ck-subc-mcp", "subc-mcp"),
+    ("ck-bus", "ckbus"),
     ("ck-aft", "aft"),
     ("ck-mc", "magic-context"),
     ("ck-insula", "insula"),
@@ -600,6 +600,7 @@ pub fn component_binaries_for_target(
             "ck-script-runner-python",
             "ck-nats-engine",
             "ck-nats-server",
+            "ck-bus",
         ],
         // The managed name is the daemon-placed name (`ck-aft`), not the
         // crate's own binary name: the spec inventory, `ck upgrade`, and the
@@ -697,7 +698,8 @@ pub(super) fn installation_binary_paths(component: Component, binary_home: &Path
         .collect()
 }
 
-/// A command may be added alongside an owned module only from that module's release.
+/// Core can add later companions from the index without replacing the daemon.
+/// Other components add commands only from their owned module's release.
 pub(super) fn partial_install(
     component: Component,
     binary_home: &Path,
@@ -707,7 +709,11 @@ pub(super) fn partial_install(
 ) -> Option<(Vec<&'static str>, bool)> {
     if !matches!(
         component,
-        Component::Fusiform | Component::Broca | Component::Cerebellum | Component::Plexus
+        Component::Core
+            | Component::Fusiform
+            | Component::Broca
+            | Component::Cerebellum
+            | Component::Plexus
     ) {
         return None;
     }
@@ -722,11 +728,13 @@ pub(super) fn partial_install(
     let missing_commands = commands
         .iter()
         .copied()
+        .filter(|binary| component != Component::Core || is_later_companion(component, binary))
         .filter(|binary| {
             let path = installed_binary_path(binary_home, binary);
-            !OWNED_BINARY_KINDS
-                .iter()
-                .any(|kind| inventory.owns_path(kind, &path))
+            (component == Component::Core && !path.is_file())
+                || !OWNED_BINARY_KINDS
+                    .iter()
+                    .any(|kind| inventory.owns_path(kind, &path))
         })
         .collect::<Vec<_>>();
     if missing_commands.is_empty() {
@@ -737,9 +745,10 @@ pub(super) fn partial_install(
         .get(component.label())
         .and_then(|entry| entry.assets.get(target.label()))
         .and_then(|assets| assets.get(*program));
-    let same_release = release.is_some_and(|asset| {
-        row.get("archive_sha256").and_then(Value::as_str) == Some(asset.sha256.as_str())
-    });
+    let same_release = component == Component::Core
+        || release.is_some_and(|asset| {
+            row.get("archive_sha256").and_then(Value::as_str) == Some(asset.sha256.as_str())
+        });
     Some((missing_commands, same_release))
 }
 
@@ -767,7 +776,7 @@ pub(super) fn observe_unowned_binaries(
                 .or_else(|| entry.version.clone())
         });
         UnownedBinary {
-            version: if binary == NATIVE_HOST {
+            version: if matches!(binary, NATIVE_HOST | "ck-bus") {
                 None
             } else {
                 observed_binary_version(&path)
@@ -839,6 +848,7 @@ pub(super) fn is_later_companion(component: Component, binary: &str) -> bool {
                 | "ck-script-runner-python"
                 | "ck-nats-engine"
                 | "ck-nats-server"
+                | "ck-bus"
         )
 }
 
@@ -1691,6 +1701,7 @@ mod tests {
                 "ck-subc-mcp",
                 "ck-script-runner-bun",
                 "ck-script-runner-python",
+                "ck-bus",
                 "ck"
             ]
         );
@@ -1699,6 +1710,16 @@ mod tests {
     #[test]
     fn roster_restart_targets_are_bound_to_component_programs_and_module_ids() {
         let roster = upgrade_roster(Component::ALL);
+        let bus = roster
+            .iter()
+            .position(|target| target.binary == "ck-bus")
+            .unwrap();
+        let daemon = roster
+            .iter()
+            .position(|target| target.binary == "ck-subc")
+            .unwrap();
+        assert!(daemon < bus);
+        assert_eq!(roster[bus].module_id(), Some("ckbus"));
         for component in Component::ALL {
             let Some(module_id) = component.module_id() else {
                 continue;
@@ -1743,7 +1764,7 @@ mod tests {
         assert!(is_installed(Component::Core, &binary_home, &inventory));
         install_component(Component::Core, &binary_home, &mut inventory, &mut source)
             .expect("repeat core install");
-        assert_eq!(inventory.paths_for_kind("managed-binary").len(), 6);
+        assert_eq!(inventory.paths_for_kind("managed-binary").len(), 7);
         let placed = desired_binary_path(&binary_home, "ck-subc");
         let entry = inventory
             .entry_for_path("managed-binary", &placed)
@@ -2117,7 +2138,7 @@ mod tests {
         )
         .expect("re-run after a partial refusal installs the rest cleanly");
         assert!(is_installed(Component::Core, &binary_home, &reloaded));
-        assert_eq!(reloaded.paths_for_kind("managed-binary").len(), 6);
+        assert_eq!(reloaded.paths_for_kind("managed-binary").len(), 7);
     }
 
     #[test]
@@ -2181,6 +2202,7 @@ mod tests {
         binaries.insert("ck-script-runner-python".to_string(), asset(None));
         binaries.insert("ck-nats-engine".to_string(), asset(None));
         binaries.insert("ck-nats-server".to_string(), asset(None));
+        binaries.insert("ck-bus".to_string(), asset(Some("0.3.0")));
         let mut targets = std::collections::BTreeMap::new();
         targets.insert("linux-x64".to_string(), binaries);
         let mut components = std::collections::BTreeMap::new();
@@ -2198,6 +2220,124 @@ mod tests {
             channel: "alpha".to_string(),
             generated_at_ms: 1_788_425_000_000,
             components,
+        }
+    }
+
+    #[test]
+    fn core_adds_ck_bus_without_replacing_daemon_from_a_different_release() {
+        use super::super::model::{
+            ComponentState, PartialInstall, PlatformObservation, SetupObserved, SetupOperation,
+            SetupRequest,
+        };
+
+        let index = index_with_core_linux();
+        let daemon_digest = &index.components["core"].assets["linux-x64"]["ck-subc"].sha256;
+        for digest in [daemon_digest.clone(), "cd".repeat(32)] {
+            let root = fixture_dir("pre-bus-core");
+            let bin = root.join("bin");
+            fs::create_dir_all(&bin).unwrap();
+            let mut inventory = Inventory::load(root.join("inventory.json"), "linux-x64").unwrap();
+            for &binary in component_binaries(Component::Core)
+                .iter()
+                .filter(|&&binary| binary != "ck-bus")
+            {
+                let path = fixture_binary_path(&bin, binary);
+                fs::write(&path, binary).unwrap();
+                let fields =
+                    serde_json::from_value(serde_json::json!({"archive_sha256": digest})).unwrap();
+                inventory.record("managed-binary", &path, fields);
+            }
+            assert!(component_is_owned(Component::Core, &bin, &inventory));
+            assert!(is_later_companion(Component::Core, "ck-bus"));
+            let (missing_commands, module_matches_release) = partial_install(
+                Component::Core,
+                &bin,
+                &inventory,
+                &index,
+                AlphaTarget::LinuxX64,
+            )
+            .unwrap();
+            assert_eq!(missing_commands, ["ck-bus"]);
+            assert!(module_matches_release);
+            let mut observed = SetupObserved::unconfigured_current_host();
+            observed.platform = PlatformObservation::Supported(AlphaTarget::LinuxX64);
+            observed
+                .components
+                .insert(Component::Claustrum, ComponentState::Correct);
+            observed.owned_auth_version = Some(super::super::planner::BUS_VAULT_FLOOR.parse());
+            observed.partial_installs.insert(
+                Component::Core,
+                PartialInstall {
+                    missing_commands,
+                    module_matches_release,
+                    module_state: ComponentState::Correct,
+                },
+            );
+            let plan = super::super::planner::plan_setup(
+                &observed,
+                &SetupRequest::install(vec![Component::Claustrum]),
+            );
+            assert!(plan.is_authorized(), "{}", plan.render());
+            assert!(plan.operations.contains(&SetupOperation::InstallComponent {
+                component: Component::Core
+            }));
+            assert!(plan
+                .operations
+                .contains(&SetupOperation::ConfigureMessageBus));
+            assert!(!plan.render().contains("run ck upgrade, then ck setup"));
+            install_component(Component::Core, &bin, &mut inventory, &mut FakeSource).unwrap();
+            assert!(is_installed(Component::Core, &bin, &inventory));
+            for &binary in component_binaries(Component::Core)
+                .iter()
+                .filter(|&&binary| binary != "ck-bus")
+            {
+                assert_eq!(
+                    fs::read(installed_binary_path(&bin, binary)).unwrap(),
+                    binary.as_bytes()
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_refuses_unowned_ck_bus_without_running_its_version_probe() {
+        use super::super::model::{PlanOutcome, PlatformObservation, SetupObserved, SetupRequest};
+        let root = fixture_dir("setup-unowned-ck-bus");
+        let bus = root.join("ck-bus");
+        let sentinel = root.join("version-probe-ran");
+        let inventory = Inventory::load(root.join("inventory.json"), "linux-x64").unwrap();
+        let index = index_with_core_linux();
+        for version in ["0.3.0", "0.0.1"] {
+            crate::setup::test_exec::write_executable(
+                &bus,
+                format!(
+                    "#!/bin/sh\ntouch '{}'\necho 'ck-bus {version}'\n",
+                    sentinel.display()
+                )
+                .as_bytes(),
+            );
+            let mut observed = SetupObserved::unconfigured_current_host();
+            observed.platform = PlatformObservation::Supported(AlphaTarget::LinuxX64);
+            observed.unowned_binaries.insert(
+                Component::Core,
+                observe_unowned_binaries(
+                    Component::Core,
+                    root.path(),
+                    &inventory,
+                    &index,
+                    AlphaTarget::LinuxX64,
+                ),
+            );
+            let plan =
+                super::super::planner::plan_setup(&observed, &SetupRequest::install(Vec::new()));
+            assert!(!sentinel.exists(), "setup ran the unowned ck-bus probe");
+            assert_eq!(
+                plan.blocking_outcome(),
+                Some(&PlanOutcome::Refusal {
+                    reason: super::super::text::unowned_binary_refusal(&bus),
+                })
+            );
         }
     }
 
@@ -2450,6 +2590,11 @@ mod tests {
         let entry = index.components["core"].clone();
         for component in Component::ALL {
             let mut entry = entry.clone();
+            if component == Component::Claustrum {
+                let floor = super::super::planner::BUS_VAULT_FLOOR;
+                entry.release = format!("claustrum-v{floor}");
+                entry.version = Some(floor.into());
+            }
             entry.assets.insert(
                 "linux-x64".to_string(),
                 component_binaries_for_target(component, AlphaTarget::LinuxX64)
@@ -2493,6 +2638,19 @@ mod tests {
                 .unwrap_or_else(|reason| ReleaseAvailability::Unresolvable { reason });
             observed.releases.insert(component, availability);
         }
+        observed.claustrum_release = source
+            .loaded_index()
+            .ok()
+            .and_then(|index| index.components.get("claustrum"))
+            .map(|entry| {
+                (
+                    entry.release.clone(),
+                    entry
+                        .version
+                        .as_deref()
+                        .and_then(|v| CoreVersion::from_release(v).ok()),
+                )
+            });
         super::super::planner::plan_setup(&observed, &SetupRequest::install(picks))
     }
 

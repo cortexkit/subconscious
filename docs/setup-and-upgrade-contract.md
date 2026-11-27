@@ -25,7 +25,7 @@ bootstrap belongs to Rust verbs in `ck`.
 `ck setup` and `ck upgrade` are idempotent, check-then-act commands. A refused
 operation prints its evidence and exits non-zero. Required checks must set the
 exit status directly; decorative shell gates are forbidden. Partial setup is
-resumable, and already-correct state is reported without mutation.
+resumable, and already-correct state is reported as unchanged.
 
 ## Refusal classes
 
@@ -219,11 +219,13 @@ not use a platform mapping table or an aggregate digest manifest.
 
 The binaries each component needs on each target are listed in
 `component_binaries_for_target` (`crates/subc-core/src/setup/components.rs`).
-Core is `ck-subc` and `ck-subc-mcp` from this repository's release lane; `ck`
-itself is placed by the bootstrap installer. Setup never downloads Magic
-Context on Windows. Cerebellum is not offered on Windows and provides only the
-agent browser on Linux. On macOS its native host is a command program and its
-browser extension zip (`ck-cerebellum-extension-darwin-arm64.zip`) is a separate
+Core includes `ck-subc`, `ck-subc-mcp`, `ck-script-runner-bun`,
+`ck-script-runner-python`, `ck-nats-engine`, `ck-nats-server`, and `ck-bus`
+from this repository's release lane; `ck` itself is placed by the bootstrap
+installer. Setup never downloads Magic Context on Windows. Cerebellum is not
+offered on Windows and provides only the agent browser on Linux. On macOS its
+native host is a command program and its browser extension zip
+(`ck-cerebellum-extension-darwin-arm64.zip`) is a separate
 release asset, not a binary. Plexus requires `ck-plexus`, `ck-plexus-admin`,
 and `ck-plexus-catalog` archives. The Windows release is incomplete while those
 assets are withheld. Basal requires `ck-basal` and `ck-basal-worker` archives.
@@ -245,9 +247,11 @@ No installation path or PATH operation requires elevation. The bootstrap script 
 
 `installer-manifest.json` in the platform data directory is the installed
 ownership inventory. `installer.journal` holds write-ahead evidence for an
-in-progress transaction; the inventory changes only at commit. Setup, uninstall,
-and self-update check ownership before replacing or removing installed files.
-User configuration and component stores are never treated as managed binaries.
+in-progress transaction; transaction-owned inventory changes publish at commit.
+The retained `bus-trust` row is written separately and survives transaction
+undo. Setup, uninstall, and self-update check ownership before replacing or
+removing installed files. User configuration and component stores are never
+treated as managed binaries.
 
 ## Setup command model
 
@@ -256,18 +260,28 @@ The command surface is:
 - `ck setup` selects core and all components: `aft`, `mc`, `insula`, `claustrum`,
   `synapse`, `fusiform`, `cingulate`, `entorhinal`, `astrocyte`, `striatum`,
   `broca`, `cerebellum`, `plexus`, and `basal`. Bare setup explains why it left out each
-  component, including dependents whose needs could not be satisfied. It still
-  installs the rest. Core cannot be left out. The plan marks fusiform, striatum and broca as
-  Windows previews: they are offered before their own tests run natively there.
+  optional component, including dependents whose needs could not be satisfied.
+  It still installs the rest. Core and the vault cannot be left out. The plan
+  marks fusiform, striatum and broca as Windows previews: they are offered
+  before their own tests run natively there.
 - `ck setup broca` selects one component. `ck setup --with cerebellum,cingulate`
   selects several. Explicit picks include their needs, transitively, and the
   plan names any missing ones added implicitly. A required component that cannot
   be installed blocks the request, except that an explicit `ck setup mc` keeps
   its existing unavailable notices when not published or on Windows.
+- Every setup that installs core installs or keeps the Claustrum vault and
+  configures the local message bus, even on a component-specific setup. The
+  planner refuses to remove Claustrum while core remains installed. When
+  placing the vault, it requires a complete release for the host at or above
+  `BUS_VAULT_FLOOR`, the first version with `ck auth public-key`. If setup
+  keeps an owned `ck-auth`, it checks that binary's version instead; an older
+  or unreadable version refuses with `the vault is older than this setup needs;
+  run ck upgrade, then ck setup`. These are plan-time refusals, not optional
+  omissions.
 - `--key-path <file>` sets the claustrum key path for both bootstrap and daemon
-  configuration whenever claustrum is selected, including bare setup and an
-  implicit selection such as `ck setup --with striatum --key-path <file>`.
-  Otherwise setup uses the default claustrum key path when claustrum is selected.
+  configuration, including bare setup and an explicit component selection such
+  as `ck setup --with striatum --key-path <file>`. Otherwise setup uses the
+  default claustrum key path.
   Per-module settings (such as `fusiform.jsonc`, `broca.jsonc`, and
   `cerebellum.jsonc`) live under the config home's `cortexkit/` directory,
   alongside `subc.jsonc`. Setup does not overwrite existing settings files.
@@ -329,7 +343,8 @@ The command surface is:
   paths and require confirmation before any mutation.
 - `ck setup --uninstall` prints a removal plan, deregisters only manifest-owned
   runtime registrations, removes manifest-owned links and binaries, and leaves
-  user configuration and stores on disk with a retention note.
+  user configuration and stores on disk with a retention note. It keeps the
+  `bus-trust` row, the NATS directory and both bus module entries.
 
 Before planning installation, setup inspects existing unowned binary
 destinations and reads `--version` with a two-second deadline. A newer binary,
@@ -343,6 +358,13 @@ writes configuration, nor registers services, in a real run or a dry run.
 An unowned binary reporting the same version remains eligible for adoption:
 apply downloads the release and adopts only byte-identical files; a version
 match alone does not establish ownership.
+
+`ck-bus` is an exception: setup and upgrade refuse any occupied unowned
+`ck-bus` destination before changes, even when the file is byte-identical to
+the release. Neither command executes or adopts it. Move it aside before
+rerunning either command. An owned pre-bus core that lacks `ck-bus` gets the
+missing binary as a later companion under either command; setup does not
+replace the owned daemon to add it.
 
 The installed core release comes from the managed `ck-subc --version`, whether
 the daemon is running or stopped. The connection file's `daemon_ver` identifies
@@ -360,10 +382,10 @@ different build does not satisfy readiness or verification. Missing, malformed,
 or dirty offline build identity refuses verification; absent or mismatching
 running identity never satisfies readiness. No new wire field is required.
 
-Configuration writes are additive. Setup prints the proposed diff before a
-write and refuses a conflicting user-owned value by naming the key and leaving
-the file byte-identical. Adding one component must not disturb another
-component’s valid configuration.
+Configuration writes are normally additive. Setup prints the proposed diff
+before a write and refuses a conflicting user-owned value by naming the key
+and leaving the file byte-identical. Adding one component must not disturb
+another component’s valid configuration.
 
 Core configuration includes `version: 1`, `storage.backend: "sqlite"`, and
 `modules.subc-mcp` with `program` set to the binary home's `ck-subc-mcp`
@@ -383,6 +405,27 @@ every OS; file/API providers do not depend on browser-cookie encryption.
 After successful wiring, setup validates with `ck daemon triage`, `ck health`,
 and `ck fleet lint`, and then prints the MCP harness snippet. The relevant
 triage command and selected-component health checks must succeed.
+
+### Local message bus
+
+After component transactions have committed and setup has applied the
+message-key grants, it configures the local message bus in a separate step.
+The preview prints `message bus: checked after the vault is live`. Setup
+records ownership in a retained `bus-trust` row. It mints only missing bus keys
+and, when either install-time JWT is missing or needs replacement, signs both
+with a fresh in-memory root. The [NATS install trust chain](nats-install-trust-chain.md)
+describes the trust record and activation rules. Without a row, an existing
+bus module entry, NATS install file or legacy vault-held root makes the step report
+`message bus installed outside setup; left as is` rather than take over.
+Separate legacy NATS monitoring is not planned for a setup-managed bus.
+
+For a setup-managed bus, the bus step writes or repairs `modules.nats-server`
+and `modules.ckbus` in one journaled transaction, preserving settings such as
+custom health intervals. It commits changed entries before asking the daemon
+to rescan. The daemon starts added or re-enabled entries during the rescan;
+setup never calls `ck module start` for them. A bus-step failure does not undo
+already-committed component installations or vault grants. Rerunning setup
+can complete the bus using the retained state.
 
 ## AFT conversion
 
@@ -609,6 +652,8 @@ Restart semantics are target-specific:
   through retry patience. A module absent from the supervisor roster keeps its
   binary upgrade and post-verification, but reports that its restart was omitted.
   Upgrade does not add a separate process-start path for unsupervised modules.
+  The `ck-bus` target upgrades after the daemon and restarts as `ckbus` when
+  supervised.
 - Completion polling waits up to 180 seconds for a restarted target to be live
   and healthy: the drain may spend its full 30 seconds whenever a consumer holds
   a route open, and a module's own startup follows it (`aft` reports healthy
@@ -626,6 +671,25 @@ durable and do not overwrite their destination. If Windows setup or upgrade is
 interrupted between those moves and `ck` is missing, the verified installer
 helper can recover it. A committed backup still in use is cleaned up on a
 later applying run.
+
+### Message bus during upgrade
+
+When `ck-auth` is installed, the plan places the shared bus configuration
+operation immediately after the message-key grants, before any `ck`
+self-update and after placement of a missing `ck-bus` companion. The operation
+targets `ck-bus` and is reported as `message bus`. It runs outside any binary
+upgrade transaction and uses its own transaction for module entry changes.
+
+If that stage fails, upgrade records `failed: <reason>` under `message bus`
+and continues through the remaining stages, including a planned `ck`
+self-update. It neither aborts the upgrade transaction nor offers rollback
+for the bus failure. It exits non-zero, reports the bus error with
+`run ck setup to retry`, and also reports any later stage failure. Bus entries
+already committed are not rolled back when a later stage fails.
+
+Without an installed vault, upgrade does not install one or run the bus
+operation. It upgrades the installed targets and prints
+`the vault and message bus are not installed yet; run ck setup`.
 
 ## Release lanes
 

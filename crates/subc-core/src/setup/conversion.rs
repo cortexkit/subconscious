@@ -20,7 +20,8 @@ pub fn selected_components(request: &SetupRequest) -> BTreeSet<Component> {
         return Component::ALL.into_iter().collect();
     }
     needs_closure(
-        std::iter::once(Component::Core)
+        [Component::Core, Component::Claustrum]
+            .into_iter()
             .chain(request.optional_components.iter().copied())
             .chain(request.convert),
     )

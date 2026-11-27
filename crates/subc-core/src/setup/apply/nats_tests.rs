@@ -129,6 +129,117 @@ fn nats_setup_disabled_entry_is_rewritten_without_health_wait() {
 }
 
 #[test]
+fn core_repair_leaves_a_stopped_managed_nats_wrapper_to_the_bus_step() {
+    use std::{cell::Cell, rc::Rc, time::{Duration, Instant}};
+    use serde_json::json;
+
+    struct StoppedNats {
+        restarted: Rc<Cell<bool>>,
+        config: PathBuf,
+    }
+
+    impl bus::BusControl for StoppedNats {
+        fn port_is_free(&mut self, _port: u16) -> bool {
+            panic!("the managed bus does not probe ports");
+        }
+
+        fn status(&mut self, module: &str) -> Result<Option<bus::BusStatus>, String> {
+            let live = module == "ckbus" || self.restarted.get();
+            Ok(Some(bus::BusStatus { live, healthy: live }))
+        }
+
+        fn provenance(&mut self, module: &str) -> Result<Option<u32>, String> {
+            assert_eq!(module, "nats-server");
+            Ok(self.restarted.get().then_some(42))
+        }
+
+        fn rescan(&mut self) -> Result<bus::BusRescan, String> {
+            panic!("settled bus entries do not need a rescan");
+        }
+
+        fn restart(&mut self, module: &str, _drain: Duration) -> Result<(), String> {
+            assert_eq!(module, "nats-server");
+            assert!(!self.restarted.replace(true));
+            let (_, document) = subc_jsonc::read_document(&self.config).unwrap();
+            assert!(document["modules"]["subc-mcp"].is_object(), "Core must repair its gateway first");
+            Ok(())
+        }
+
+        fn now(&mut self) -> Instant {
+            Instant::now()
+        }
+
+        fn sleep(&mut self, _duration: Duration) {
+            panic!("the restarted wrapper is immediately ready");
+        }
+    }
+
+    struct BusRunner(Value);
+    impl CommandRunner for BusRunner {
+        fn run(&mut self, program: &str, args: &[String]) -> Result<runtime::CommandResult, String> {
+            let stdout = match args[0].as_str() {
+                "--json" => json!({"module":{"live":true}}).to_string(),
+                "grant" => "already granted (no change)".into(),
+                "list" => json!({"v":1,"credentials":[
+                    {"id":"signing:ck-bus-operator-signer:1","state":"active"},
+                    {"id":"signing:ck-bus-sysaccount:1","state":"active"},
+                    {"id":"signing:ck-bus-account:1","state":"active"}
+                ]}).to_string(),
+                "public-key" => format!("public_key_hex {}\n", "12".repeat(32)),
+                "install-plan" => json!({"status":"no ceremony needed"}).to_string(),
+                "install-apply" => json!({"status":"applied", "env":self.0}).to_string(),
+                _ => panic!("unexpected command {program} {args:?}; legacy verification must not run"),
+            };
+            Ok(runtime::CommandResult { success: true, exit_code: Some(0), stdout, stderr: String::new() })
+        }
+    }
+
+    let root = ScratchDir::new("setup-repair-with-stopped-managed-nats");
+    let mut backend = backend_without_user_manager(&root);
+    backend.inventory = Inventory::load_locked(
+        backend.inventory.manifest().to_owned(), "linux-x64", "setup test", Duration::ZERO,
+    ).unwrap();
+    let nats = backend.paths.data_dir.join("nats");
+    let bin = &backend.paths.binary_home;
+    fs::create_dir_all(bin).unwrap();
+    let ckbus = bin.join(components::platform_binary("ck-bus"));
+    let wrapper = bin.join(components::platform_binary("ck-nats-server"));
+    let engine = bin.join(components::platform_binary("ck-nats-engine"));
+    for path in [&ckbus, &wrapper, &engine, &backend.auth_path()] {
+        fs::write(path, b"fixture binary").unwrap();
+        backend.inventory.record("managed-binary", path, Map::new());
+    }
+    let record = json!({"state":"applied", "root_pub":"34".repeat(32),
+        "signer_pub":"12".repeat(32), "sysaccount_pub":"12".repeat(32), "activation_pending":false});
+    backend.inventory.save().unwrap();
+    backend.inventory.persist_retained(bus::BUS_TRUST, &nats, record.as_object().unwrap().clone()).unwrap();
+    let env = json!({"CKBUS_NATS_URL":"nats://127.0.0.1:14222",
+        "CKBUS_OPERATOR_JWT":nats.join("operator.jwt"), "CKBUS_SYSTEM_ACCOUNT":"fixture-account"});
+    let config = json!({"modules":{
+        "nats-server":{"program":wrapper,
+            "args":["-c",nats.join("server.conf"),"--subc",subc_daemon::bootstrap::connection_file_path()],
+            "protocol":"subc", "registration_channel":true, "reserved":true, "enabled":true},
+        "ckbus":{"program":ckbus, "args":[], "env":env, "registration_channel":true,
+            "reserved":true, "enabled":true},
+    }});
+    fs::write(&backend.paths.config_path, config.to_string()).unwrap();
+    let restarted = Rc::new(Cell::new(false));
+    backend.bus_control = Box::new(StoppedNats { restarted: restarted.clone(), config: backend.paths.config_path.clone() });
+    backend.runner = Box::new(BusRunner(env));
+
+    backend.execute_transactions(&SetupPlan {
+        operations: vec![SetupOperation::ConfigureComponent { component: Component::Core },
+            SetupOperation::GrantMessageKeys, SetupOperation::ConfigureMessageBus],
+        outcomes: vec![], validation: vec![], permission_repair: false,
+    }, false).unwrap();
+
+    assert!(restarted.get());
+    assert!(backend.component_steps[&Component::Core].message_bus_changed);
+    let row = backend.inventory.entry_for_path(bus::BUS_TRUST, &nats).unwrap();
+    assert_eq!(row["activation_pending"], false);
+}
+
+#[test]
 fn nats_setup_verification_failure_restores_entry_and_stock_binary() {
     let root = ScratchDir::new("nats-setup-rollback");
     let (mut backend, _) = nats_setup_fixture(&root, true);
@@ -235,6 +346,8 @@ fn message_plane_setup_uses_the_installed_vault_cli_after_it_is_live() {
     }
     let root = ScratchDir::new("message-setup-vault-cli");
     let mut backend = backend_without_user_manager(&root);
+    let auth = backend.auth_path();
+    backend.inventory.record("managed-binary", &auth, Map::new());
     let calls = std::sync::Arc::new(std::sync::Mutex::new(0));
     backend.runner = Box::new(VaultRunner {
         auth: root.join("bin").join(if cfg!(windows) {
@@ -252,6 +365,27 @@ fn message_plane_setup_uses_the_installed_vault_cli_after_it_is_live() {
     // sign on the fleet-record key.
     assert_eq!(*calls.lock().unwrap(), 19);
     assert!(!backend.component_steps[&Component::Claustrum].message_grants_changed);
+}
+
+#[test]
+fn message_grants_refuse_an_unowned_vault_cli_before_running_it() {
+    struct MustNotRun;
+    impl CommandRunner for MustNotRun {
+        fn run(&mut self, program: &str, args: &[String]) -> Result<runtime::CommandResult, String> {
+            panic!("unowned vault must refuse before running any command: {program} {args:?}");
+        }
+    }
+    let root = ScratchDir::new("message-setup-unowned-vault-cli");
+    let mut backend = backend_without_user_manager(&root);
+    let auth = backend.auth_path();
+    fs::create_dir_all(auth.parent().unwrap()).unwrap();
+    fs::write(&auth, b"unowned vault").unwrap();
+    backend.runner = Box::new(MustNotRun);
+
+    assert_eq!(
+        backend.apply(&SetupOperation::GrantMessageKeys).unwrap_err(),
+        super::super::text::unowned_binary_refusal(&auth),
+    );
 }
 
 #[test]

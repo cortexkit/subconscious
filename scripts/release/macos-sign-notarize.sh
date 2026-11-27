@@ -5,7 +5,7 @@ set -euo pipefail
 SOURCE_DIR="${1:?usage: $0 <source-dir> <dist-dir>}"
 DIST_DIR="${2:?usage: $0 <source-dir> <dist-dir>}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BINARIES=(ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python ck-nats-server ck-nats-engine)
+BINARIES=(ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python ck-nats-server ck-nats-engine ck-bus)
 
 fail() {
   echo "$*" >&2

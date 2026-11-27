@@ -354,6 +354,12 @@ pub struct SetupObserved {
     /// require a byte comparison during apply before ownership can be adopted.
     pub unowned_binaries: BTreeMap<Component, Vec<UnownedBinary>>,
     pub available_core_version: Option<String>,
+    /// The index's Claustrum release tag and parsed version, if listed.
+    pub(crate) claustrum_release: Option<(String, Option<CoreVersion>)>,
+    /// Whether both vault binaries are already present and owned.
+    pub(crate) claustrum_binaries_owned: bool,
+    /// `Some(Err(()))` means an owned ck-auth exists but did not report a version.
+    pub(crate) owned_auth_version: Option<Result<CoreVersion, ()>>,
     /// True when an app-specific directory or inventory-owned file exceeds
     /// setup's permission ceilings.
     pub permissions_need_tightening: bool,
@@ -393,8 +399,8 @@ pub struct SetupObserved {
     /// uninstall that failed partway leaves exactly this: the daemon rows
     /// gone, so no component detects, and the binaries still on disk.
     pub inventory_owned_paths: usize,
-    /// An existing nats-server install `ck setup` can give a health check, read
-    /// without changing anything. Setup does not install the bus itself.
+    /// A managed bus already has health settings; only legacy installs need monitoring.
+    pub(crate) has_bus_trust: bool,
     pub bus_monitoring: BusMonitoring,
 }
 
@@ -424,6 +430,9 @@ impl SetupObserved {
             releases,
             unowned_binaries: BTreeMap::new(),
             available_core_version: None,
+            claustrum_release: None,
+            claustrum_binaries_owned: false,
+            owned_auth_version: None,
             permissions_need_tightening: false,
             requires_core: BTreeMap::new(),
             installed_core_version: None,
@@ -439,6 +448,7 @@ impl SetupObserved {
             detections,
             restart_required: Vec::new(),
             inventory_owned_paths: 0,
+            has_bus_trust: false,
             bus_monitoring: BusMonitoring::NotDeclared,
         }
     }
@@ -674,6 +684,7 @@ pub enum SetupOperation {
         key_path: Option<std::path::PathBuf>,
     },
     GrantMessageKeys,
+    ConfigureMessageBus,
     WriteModuleSettings {
         component: Component,
         path: std::path::PathBuf,
@@ -759,6 +770,7 @@ impl SetupOperation {
                     | Self::ConfigureComponent { .. }
                     | Self::BootstrapClaustrum { .. }
                     | Self::GrantMessageKeys
+                    | Self::ConfigureMessageBus
                     | Self::EnablePlexusAgentPolicies
                     | Self::ConfigureMessageHub
                     | Self::AdoptRunningCk { .. }
@@ -800,6 +812,7 @@ impl SetupOperation {
             | Self::AdoptRunningCk { .. }
             | Self::LinkCkni { .. }
             | Self::GrantMessageKeys
+            | Self::ConfigureMessageBus
             | Self::RestartRuntime { .. }
             | Self::RegisterRuntime
             | Self::UpdateRuntimeDefinition { .. }
@@ -843,6 +856,7 @@ impl fmt::Display for SetupOperation {
                 formatter.write_str("bootstrap claustrum with ck auth bootstrap")
             }
             Self::GrantMessageKeys => formatter.write_str(super::message_plane::GRANT_STEP),
+            Self::ConfigureMessageBus => formatter.write_str("message bus: checked after the vault is live"),
             Self::WriteModuleSettings { path, .. } => write!(formatter, "write {}", path.display()),
             Self::EnsureBrocaKey { observation, .. } => write!(formatter, "ensure Broca deployment key: {observation}"),
             Self::GrantComponentVault { component } => write!(formatter, "ensure {component} vault grants"),
@@ -1038,6 +1052,7 @@ pub enum UpgradeOperation {
     ConfigureMessageHub { target: UpgradeTarget },
     AddRegistrationChannel { target: UpgradeTarget },
     GrantMessageKeys { target: UpgradeTarget },
+    ConfigureMessageBus { target: UpgradeTarget },
     DownloadAndVerify { target: UpgradeTarget },
     CreateRollbackCopy { target: UpgradeTarget },
     StopModule { target: UpgradeTarget },
@@ -1069,6 +1084,9 @@ impl fmt::Display for UpgradeOperation {
                 target.module_id().unwrap_or(target.label())
             ),
             Self::GrantMessageKeys { .. } => formatter.write_str(super::message_plane::GRANT_STEP),
+            Self::ConfigureMessageBus { .. } => {
+                formatter.write_str("message bus: checked after the vault is live")
+            }
             Self::DownloadAndVerify { target } => {
                 write!(
                     formatter,

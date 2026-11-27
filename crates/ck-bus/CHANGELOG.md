@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.13.13
+
+- Print the ck-bus version with `--version` without starting the runtime.
+- Test that a supervised ck-bus recovers when its first NATS connection fails.
+
 ## 0.13.12
 
 - Test-only: require cortexkit-bus-testkit 0.9.7, whose Windows PATH search finds `nats-server.exe`.

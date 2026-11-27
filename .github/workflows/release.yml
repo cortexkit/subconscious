@@ -91,7 +91,7 @@ jobs:
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
               --draft \
               --title "$TAG" \
-              --notes "Subconscious alpha archives: ck, ck-subc, ck-subc-mcp, ck-script-runner-bun, ck-script-runner-python, ck-nats-server, and ck-nats-engine."
+              --notes "Subconscious alpha archives: ck, ck-subc, ck-subc-mcp, ck-script-runner-bun, ck-script-runner-python, ck-nats-server, ck-nats-engine, and ck-bus."
           fi
 
   linux-binaries:
@@ -133,7 +133,7 @@ jobs:
           sudo apt-get install -y binutils zstd
 
       - name: Build release binaries for glibc 2.28
-        run: cargo zigbuild --release --locked --target ${{ matrix.target }}.2.28 -p subc-core -p subc-mcp -p ck-nats-server --bin ck --bin ck-subc --bin ck-subc-mcp --bin ck-nats-server
+        run: cargo zigbuild --release --locked --target ${{ matrix.target }}.2.28 -p subc-core -p subc-mcp -p ck-nats-server -p ck-bus --bin ck --bin ck-subc --bin ck-subc-mcp --bin ck-nats-server --bin ck-bus
 
       - name: Build static NATS engine with checksum-verified Go
         env:
@@ -160,7 +160,7 @@ jobs:
           docker run --rm --network none \
             -v "$PWD/target/${{ matrix.target }}/release:/binaries:ro" \
             debian:10 sh -ec '
-              for binary in ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python ck-nats-server ck-nats-engine; do
+              for binary in ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python ck-nats-server ck-nats-engine ck-bus; do
                 timeout 15s "/binaries/$binary" --version
               done
             '
@@ -204,7 +204,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build release binaries
-        run: cargo build --release --locked --target ${{ matrix.target }} -p subc-core -p subc-mcp -p ck-nats-server --bin ck --bin ck-subc --bin ck-subc-mcp --bin ck-nats-server
+        run: cargo build --release --locked --target ${{ matrix.target }} -p subc-core -p subc-mcp -p ck-nats-server -p ck-bus --bin ck --bin ck-subc --bin ck-subc-mcp --bin ck-nats-server --bin ck-bus
 
       - name: Build NATS engine with checksum-verified Go
         shell: bash
@@ -257,7 +257,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Build release binaries
-        run: cargo build --release --locked -p subc-core -p subc-mcp -p ck-nats-server --bin ck --bin ck-subc --bin ck-subc-mcp --bin ck-nats-server
+        run: cargo build --release --locked -p subc-core -p subc-mcp -p ck-nats-server -p ck-bus --bin ck --bin ck-subc --bin ck-subc-mcp --bin ck-nats-server --bin ck-bus
 
       - name: Build NATS engine with checksum-verified Go
         env:
@@ -287,7 +287,7 @@ jobs:
           cp target/aarch64-apple-darwin/release/ck-script-runner-bun target/release/
           cp target/aarch64-apple-darwin/release/ck-script-runner-python target/release/
           mkdir -p dist
-          for bin in ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python ck-nats-server ck-nats-engine; do
+          for bin in ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python ck-nats-server ck-nats-engine ck-bus; do
             if [ "$bin" = ck-script-runner-bun ]; then
               codesign --force --options runtime --sign - --identifier "$bin" --entitlements clients/script-runner/entitlements.plist "target/release/$bin"
               codesign -d --entitlements :- "target/release/$bin" 2>/dev/null | python3 scripts/release/check-runner-entitlements.py
@@ -312,7 +312,7 @@ jobs:
           ls -la dist/
           gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --clobber
           gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-            --notes "Subconscious alpha archives: ck, ck-subc, ck-subc-mcp, ck-script-runner-bun, ck-script-runner-python, ck-nats-server, and ck-nats-engine. darwin-arm64 assets are adhoc-signed via the explicit alpha fallback; the daemon bundle is unentitled and is not notarized."
+            --notes "Subconscious alpha archives: ck, ck-subc, ck-subc-mcp, ck-script-runner-bun, ck-script-runner-python, ck-nats-server, ck-nats-engine, and ck-bus. darwin-arm64 assets are adhoc-signed via the explicit alpha fallback; the daemon bundle is unentitled and is not notarized."
 
       - name: Import Developer ID Application certificate
         if: vars.ALPHA_DARWIN_UNSIGNED != 'true'
@@ -419,13 +419,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${GITHUB_REF_NAME}"
-          # Every tuple the lanes above build, times the seven binaries, plus
+          # Every tuple the lanes above build, times the eight binaries, plus
           # a sidecar each. A missing name refuses the publish by name; the
           # draft stays for inspection and nothing reaches an installer.
           expected=0; missing=""
           assets=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
           for tuple in darwin-arm64 linux-x64 linux-arm64 windows-x64 windows-arm64; do
-            for bin in ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python ck-nats-server ck-nats-engine; do
+            for bin in ck ck-subc ck-subc-mcp ck-script-runner-bun ck-script-runner-python ck-nats-server ck-nats-engine ck-bus; do
               for name in "$bin-$tuple.zip" "$bin-$tuple.zip.sha256"; do
                 expected=$((expected+1))
                 if ! printf '%s\n' "$assets" | grep -qxF "$name"; then missing="$missing $name"; fi

@@ -18,7 +18,7 @@ Modules talk to the daemon and own their own durable data.
 - Daemon and module logs: `{{log_dir}}`
 
 The `subc-mcp` module (`ck-subc-mcp`) presents the fleet to an MCP host.
-`ck-mcp-stdio-adapter` hosts third-party stdio MCP servers, and `ck-bus`
+`ck-mcp-stdio-adapter` hosts third-party stdio MCP servers, and `ckbus` (`ck-bus`)
 owns the local NATS message plane. `ck` also installs these modules, each from
 its own repository: `aft`, `magic-context`, `insula`, `claustrum`, `synapse`,
 `fusiform`, `cingulate`, `entorhinal`, `astrocyte`, `striatum`, `broca`,

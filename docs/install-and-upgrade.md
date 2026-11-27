@@ -69,9 +69,14 @@ ck setup
 
 `ck setup` places the daemon (`ck-subc`) and the MCP gateway (`ck-subc-mcp`),
 writes the daemon configuration (`<config home>/cortexkit/subc.jsonc`), registers
-the daemon with your login session's service manager, starts it, and then
-offers optional modules. Configuration writes are additive: setup prints the
-change first and refuses to overwrite a value you set yourself.
+the daemon with your login session's service manager, and starts it. Every core
+installation through `ck setup` includes the Claustrum vault and the local
+message bus (`nats-server` and `ckbus`), even when you pick individual modules.
+Setup configures and starts the bus automatically; it reports an existing
+hand-made bus instead of taking it over. See the
+[NATS install trust chain](nats-install-trust-chain.md) for how setup manages
+the bus. Setup prints proposed configuration changes and does not overwrite
+user-owned settings; it can repair entries for a bus it already manages.
 
 | Platform | Service registration |
 | --- | --- |
@@ -128,8 +133,11 @@ The components `ck setup` knows are `aft`, `mc`, `insula`, `claustrum`,
 version is refused before anything is downloaded when the installed daemon is
 older; run `ck upgrade` first.
 
-Bare `ck setup` selects all components with a complete release for this host and
-explains any it leaves out. It does not prompt to select modules.
+Bare `ck setup` selects all components and explains any optional ones it leaves
+out. It does not prompt to select modules. The vault is not optional: setup
+refuses before installing anything if it needs to place the vault but no
+complete, compatible release is available, or if the installed vault it would
+keep is too old. You cannot remove the vault while keeping core installed.
 Insula's file/API providers do not read browser stores; cookies come only from
 vault deposits on every OS.
 
@@ -272,7 +280,10 @@ kept.
 - Supervised modules, including `subc-mcp` configured by core setup, restart
   through `supervisor.restart`; the upgrade waits up to 180 seconds for each to
   report healthy. If a module is not supervised on this host, upgrade says its
-  restart was omitted rather than starting an independent process.
+  restart was omitted rather than starting an independent process. The
+  `ck-bus` binary upgrades after the daemon and restarts as `ckbus` when
+  supervised. A pre-bus installation with an owned `ck-subc` also gets the
+  missing `ck-bus` binary.
 - Before each change, the installer syncs its expected old and new states to
   `installer.journal` beside `installer-manifest.json`. A release becomes
   current only after activation is verified and the inventory is published.
@@ -294,6 +305,20 @@ kept.
   finish it with that build, which understands its recovery records, before
   retrying. Do not delete recovery files.
 
+When the vault is installed, upgrade checks the local bus right after it
+reapplies the message-key grants. If the `message bus` stage fails, upgrade
+does not roll back completed binary upgrades or offer rollback for that stage.
+It continues with the remaining stages, including any `ck` self-update, then
+prints the bus error and `run ck setup to retry` and exits non-zero. A later
+stage's error is reported too if one fails.
+
+On an older installation with no vault, `ck upgrade` upgrades what is already
+installed and does not install the vault or configure the bus. It prints
+`the vault and message bus are not installed yet; run ck setup`.
+If a `ck-bus` binary that the installer does not own occupies its managed
+binary directory, both `ck setup` and `ck upgrade` refuse before making changes.
+Move the file aside before rerunning either command.
+
 The daemon never checks for updates itself. Bare `ck` refreshes a 24-hour
 update cache in the background and never waits on the network for more than a
 moment.
@@ -310,12 +335,11 @@ lock while waiting for your answer. If another installer changes the plan or
 recovers the journal in that time, the answer is discarded. It is safe to
 rerun the command to review the current state.
 
-The vault owns its signing-key grants and ck-bus owns its NATS listener file.
-Setup does not put either external operation in the installer journal. After
-committing installation, it checks and reapplies these idempotent operations
-when needed on each applying run. If setup stops before the external operation,
-run it again; it does not need to unwind the committed installation. Setup's
-own optional health entry is a separate journaled config change.
+Vault changes and the NATS files written by `ck-bus` are not rolled back by
+the installer journal. The bus step commits any changes to its two daemon
+entries in a separate journaled transaction before activating them. If setup
+stops during the bus step, rerun it; it resumes from its recorded bus state
+without unwinding the committed installation.
 Updating a shell profile preserves its permission bits and any symlink to it,
 but replaces the target file. Other hard links keep the old bytes; ACLs,
 extended attributes, and group ownership are not copied.
@@ -340,7 +364,8 @@ ck setup --uninstall
 Uninstall removes only what the installer inventory
 (`<data home>/cortexkit/installer-manifest.json`) records: placed binaries,
 the PATH change and the service registration. Your configuration and every
-module's store stay on disk; the command lists what it kept. Delete
+module's store stay on disk, including the bus entries, NATS data and bus
+ownership record; the command lists what it kept. Delete
 `<config home>/cortexkit/` and `<data home>/cortexkit/` yourself to remove
 them too.
 

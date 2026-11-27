@@ -11,9 +11,49 @@ const LEASE_DELAY: Duration = Duration::from_secs(2);
 type Grant = (&'static str, &'static str, &'static str);
 
 #[derive(Deserialize)]
-pub(super) struct Credential {
+pub(in crate::setup) struct Credential {
     pub id: String,
     pub state: String,
+}
+
+pub(in crate::setup) enum ListError {
+    Runner(String),
+    Exit(CommandResult),
+    InvalidJson(String),
+    UnsupportedVersion(u64, String),
+}
+
+impl ListError {
+    pub(in crate::setup) fn reason(self) -> String {
+        match self {
+            Self::Runner(error) => error,
+            Self::Exit(result) => result.explanation(),
+            Self::InvalidJson(stderr) if stderr.trim().is_empty() => {
+                "invalid JSON or record fields".into()
+            }
+            Self::UnsupportedVersion(v, stderr) if stderr.trim().is_empty() => {
+                format!("unsupported v={v}")
+            }
+            Self::InvalidJson(stderr) | Self::UnsupportedVersion(_, stderr) => stderr.trim().into(),
+        }
+    }
+
+    fn original_message(self) -> String {
+        match self {
+            Self::Runner(error) => error,
+            Self::Exit(result) => format!(
+                "ck auth list --json failed{}: {}",
+                exit_description(&result),
+                result.explanation()
+            ),
+            Self::InvalidJson(_) => {
+                "refusal: ck auth list --json returned invalid JSON or record fields".into()
+            }
+            Self::UnsupportedVersion(v, _) => {
+                format!("refusal: ck auth list --json returned unsupported v={v}")
+            }
+        }
+    }
 }
 
 pub(super) fn component_grants(component: Component) -> &'static [Grant] {
@@ -38,7 +78,7 @@ pub(super) fn component_grants(component: Component) -> &'static [Grant] {
     }
 }
 
-pub(super) struct Auth<'a> {
+pub(in crate::setup) struct Auth<'a> {
     pub program: &'a Path,
     pub runner: &'a mut dyn CommandRunner,
     pub wait: fn(Duration),
@@ -46,26 +86,27 @@ pub(super) struct Auth<'a> {
 
 impl Auth<'_> {
     pub fn list(&mut self) -> Result<Vec<Credential>, String> {
+        self.read_list().map_err(ListError::original_message)
+    }
+
+    pub(in crate::setup) fn read_list(&mut self) -> Result<Vec<Credential>, ListError> {
         #[derive(Deserialize)]
         struct Listing {
             v: u64,
             credentials: Vec<Credential>,
         }
-        let result = self.retry_lease(&["list", "--json"])?;
+        let result = self
+            .retry_lease(&["list", "--json"])
+            .map_err(ListError::Runner)?;
         if result.exit_code != Some(0) {
-            return Err(format!(
-                "ck auth list --json failed{}: {}",
-                exit_description(&result),
-                result.explanation()
-            ));
+            return Err(ListError::Exit(result));
         }
-        let listing: Listing = serde_json::from_str(&result.stdout)
-            .map_err(|_| "refusal: ck auth list --json returned invalid JSON or record fields")?;
+        let listing: Listing = match serde_json::from_str(&result.stdout) {
+            Ok(listing) => listing,
+            Err(_) => return Err(ListError::InvalidJson(result.stderr)),
+        };
         if listing.v != 1 {
-            return Err(format!(
-                "refusal: ck auth list --json returned unsupported v={}",
-                listing.v
-            ));
+            return Err(ListError::UnsupportedVersion(listing.v, result.stderr));
         }
         Ok(listing.credentials)
     }

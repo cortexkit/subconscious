@@ -11001,7 +11001,11 @@ mod tests {
             request.claustrum_key_path,
             setup::default_claustrum_key_path().unwrap()
         );
-        assert!(parse_setup_command(&test_tail(&["fusiform", "--key-path", "key"])).is_err());
+        // Core installs the message bus, and the bus keeps its keys in the vault,
+        // so every install selects the vault and accepts its key path.
+        let request = parse_setup_command(&test_tail(&["fusiform", "--key-path", "key"])).unwrap();
+        assert!(request.needs_claustrum());
+        assert_eq!(request.claustrum_key_path, Some(PathBuf::from("key")));
         assert!(parse_setup_command(&test_tail(&["--uninstall", "--key-path", "key"])).is_err());
     }
 

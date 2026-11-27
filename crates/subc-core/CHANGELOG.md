@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.24.8
+
+- Add the message-bus trust preparation for setup: check ownership, ensure
+  vault keys and grants, and sign validated ceremony inputs with a one-time root.
+- Journal the managed NATS and ckbus entries, recover interrupted activations,
+  and verify both modules are live and healthy before clearing pending activation.
+- Install ck-bus with Core and configure it after vault grants. Setup requires
+  Claustrum 0.4.0 or later and never runs an unowned ck-bus.
+- `ck upgrade` also places ck-bus and configures the message bus after the vault
+  grants, on the daemon it was pointed at, and refuses a signed release that has
+  no ck-bus file. Release archives now include ck-bus.
+
 ## 0.24.7
 
 - Install Basal (Automations) with `ck setup` and upgrade its module and worker

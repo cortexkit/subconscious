@@ -338,6 +338,28 @@ describe("rebuild", () => {
     }
   });
 
+  it("indexes Plexus programs and the catalog on all published targets", async () => {
+    const platforms = ["darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64"];
+    const programs = ["ck-plexus", "ck-plexus-admin", "ck-plexus-catalog"];
+    const { doc, refusals } = await rebuildFixtures([{
+      repository: "cortexkit/plexus",
+      tag: "v0.1.0",
+      zips: platforms.flatMap((platform) => programs.map((name) => `${name}-${platform}.zip`)),
+    }]);
+    expect(refusals).toEqual([]);
+    const plexus = doc.components.plexus;
+    expect(plexus.release).toBe("v0.1.0");
+    expect(Object.keys(plexus.assets).sort()).toEqual(platforms);
+    for (const platform of platforms) {
+      const assets = plexus.assets[platform];
+      expect(Object.keys(assets).sort()).toEqual(programs);
+      expect(assets["ck-plexus"].reports).toBe("0.1.0");
+      expect(assets["ck-plexus-admin"].reports).toBe("0.1.0");
+      expect(assets["ck-plexus-catalog"].reports).toBeNull();
+      expect(assets["ck-plexus-catalog"].sha256).toBe(EMPTY_SHA256);
+    }
+  });
+
   it("skips a withheld-only release, omits the previous component, and logs once per rebuild", async () => {
     const tag = PREVIOUS_MC.release;
     await testEnv().RELEASE_INDEX.put(KV_BUNDLE, canonicalize({

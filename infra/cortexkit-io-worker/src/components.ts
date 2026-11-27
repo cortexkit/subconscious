@@ -11,7 +11,8 @@ export type ComponentId =
   | "broca"
   | "cingulate"
   | "entorhinal"
-  | "cerebellum";
+  | "cerebellum"
+  | "plexus";
 
 export type ResolveRule = "latest-non-draft" | "newest-ck-mc";
 
@@ -43,6 +44,7 @@ export const COMPONENTS: readonly ComponentSpec[] = [
   { id: "cingulate", repository: "cortexkit/cingulate", resolve: "latest-non-draft" },
   { id: "entorhinal", repository: "cortexkit/entorhinal", resolve: "latest-non-draft" },
   { id: "cerebellum", repository: "cortexkit/cerebellum", resolve: "latest-non-draft" },
+  { id: "plexus", repository: "cortexkit/plexus", resolve: "latest-non-draft" },
 ];
 
 export interface TagFields {
@@ -108,7 +110,8 @@ export function parseTag(component: ComponentId, tag: string): TagFields | null 
     case "broca":
     case "cingulate":
     case "entorhinal":
-    case "cerebellum": {
+    case "cerebellum":
+    case "plexus": {
       const m = /^v(.+)$/.exec(tag);
       if (!m || m[1].length === 0) return null;
       return { version: m[1], train: null };

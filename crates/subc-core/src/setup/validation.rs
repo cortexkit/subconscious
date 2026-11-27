@@ -357,6 +357,7 @@ mod tests {
                 expected.push(vec!["health", "broca"]);
             }
             expected.push(vec!["health", "cerebellum"]);
+            expected.push(vec!["health", "plexus"]);
             assert_eq!(validator.calls, expected);
         }
     }

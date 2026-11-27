@@ -472,7 +472,11 @@ fn extract(file: fs::File, destination: &Path) -> Result<(), String> {
     install_journal::sync_parent(&manifest)
 }
 
-fn reject_duplicate_headers(reader: &mut fs::File, start: u64, unique: usize) -> io::Result<()> {
+pub(in crate::setup) fn reject_duplicate_headers(
+    reader: &mut fs::File,
+    start: u64,
+    unique: usize,
+) -> io::Result<()> {
     // ZipArchive indexes entries by decoded name and silently coalesces
     // duplicates. Count the original central file headers at its parsed
     // offset so a hidden entry cannot escape the checks below.

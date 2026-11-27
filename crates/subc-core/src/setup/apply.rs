@@ -34,6 +34,7 @@ mod journal;
 mod module_steps;
 #[cfg(test)]
 mod module_steps_tests;
+mod plexus_policy;
 mod settings;
 mod vault;
 
@@ -56,6 +57,7 @@ pub struct SetupBackend {
 struct ComponentSteps {
     message_hub_change: Option<config::ConfigChange>,
     message_grants_changed: bool,
+    plexus_maintenance_changed: bool,
     nats_migration: Option<super::nats_migration::Migration>,
     failed_bootstrap_directory: Option<BootstrapDirectory>,
     module_step_failed: bool,
@@ -526,7 +528,9 @@ impl SetupBackend {
                 | SetupOperation::EnsureBrocaKey { .. }
                 | SetupOperation::GrantComponentVault { .. }
                 | SetupOperation::RegisterCerebellumNativeHost
-                | SetupOperation::EnsureCerebellumExtension { .. }) => {
+                | SetupOperation::EnsureCerebellumExtension { .. }
+                | SetupOperation::EnsurePlexusCatalog { .. }
+                | SetupOperation::EnablePlexusAgentPolicies) => {
                     steps.push(format!("would {operation}"));
                 }
                 SetupOperation::AdoptRunningCk { path } => steps.push(format!(
@@ -669,13 +673,19 @@ impl SetupBackend {
             && plan.operations.iter().filter(|op| op.mutates()).all(|op| {
                 matches!(
                     op,
-                    SetupOperation::GrantMessageKeys | SetupOperation::ConfigureMessageHub
+                    SetupOperation::GrantMessageKeys
+                        | SetupOperation::ConfigureMessageHub
+                        | SetupOperation::GrantComponentVault {
+                            component: Component::Plexus
+                        }
+                        | SetupOperation::EnablePlexusAgentPolicies
                 )
             });
-        let maintenance_changed = self
-            .component_steps
-            .values()
-            .any(|steps| steps.message_hub_change.is_some() || steps.message_grants_changed);
+        let maintenance_changed = self.component_steps.values().any(|steps| {
+            steps.message_hub_change.is_some()
+                || steps.message_grants_changed
+                || steps.plexus_maintenance_changed
+        });
         println!(
             "{}",
             if maintenance_only && !maintenance_changed {
@@ -1167,7 +1177,8 @@ impl SetupExecutor for SetupBackend {
             | SetupOperation::EnsureBrocaKey { .. }
             | SetupOperation::GrantComponentVault { .. }
             | SetupOperation::RegisterCerebellumNativeHost
-            | SetupOperation::EnsureCerebellumExtension { .. }) => {
+            | SetupOperation::EnsureCerebellumExtension { .. }
+            | SetupOperation::EnsurePlexusCatalog { .. }) => {
                 let result = self.apply_module_step(operation);
                 if result.is_err() {
                     let component = operation.component().expect("module ensure component");
@@ -1177,6 +1188,19 @@ impl SetupExecutor for SetupBackend {
                         .module_step_failed = true;
                 }
                 result
+            }
+            SetupOperation::EnablePlexusAgentPolicies => {
+                let admin = self
+                    .paths
+                    .binary_home
+                    .join(components::platform_binary("ck-plexus-admin"));
+                let changed =
+                    plexus_policy::offer(&admin, &subc_daemon::bootstrap::connection_file_path());
+                self.component_steps
+                    .entry(Component::Plexus)
+                    .or_default()
+                    .plexus_maintenance_changed |= changed;
+                Ok(())
             }
             SetupOperation::GrantMessageKeys => {
                 println!("{}", super::message_plane::GRANT_STEP);

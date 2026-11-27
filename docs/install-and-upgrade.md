@@ -122,22 +122,24 @@ ck setup aft
 ck setup --with aft,insula --dry-run
 ```
 
-The components `ck setup` knows are `aft`, `mc`, `insula`, `claustrum` and
-`synapse` (`SETUP_HELP` in `crates/subc-core/src/bin/ck.rs`). A module that
-declares a minimum daemon version is refused before anything is downloaded
-when the installed daemon is older; run `ck upgrade` first.
+The components `ck setup` knows are `aft`, `mc`, `insula`, `claustrum`,
+`synapse`, `fusiform`, `cingulate`, `entorhinal`, `astrocyte`, `striatum`,
+`broca`, `cerebellum`, and `plexus`. A module that declares a minimum daemon
+version is refused before anything is downloaded when the installed daemon is
+older; run `ck upgrade` first.
 
-Bare `ck setup` lists optional modules that are not set up and have a complete
-release for this host, for example:
-
-```text
-Optional modules: aft, insula, claustrum, synapse. Add one with `ck setup <name>`.
-```
-
-The list reflects this host's available releases; it is omitted when there is
-nothing to add. Setup does not prompt to select modules.
+Bare `ck setup` selects all components with a complete release for this host and
+explains any it leaves out. It does not prompt to select modules.
 Insula's file/API providers do not read browser stores; cookies come only from
 vault deposits on every OS.
+
+`ck setup --with plexus` also selects its hard dependencies, Claustrum and
+Entorhinal. It installs `ck-plexus-admin` in the managed `bin` directory; run it
+by path, not as a `ck` subcommand. Setup offers to enable signed GitHub agent
+policies through operator confirmation once Plexus reports that it may act as
+the connector host. Declining does not stop setup; setup prints the
+command to enable policies later. `ck upgrade` refreshes the programs and
+catalog together without asking to enable policies.
 
 `ck setup aft --convert` and `ck setup mc --convert` move an existing
 standalone installation under the daemon. They print the plan and change

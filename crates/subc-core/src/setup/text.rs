@@ -96,7 +96,7 @@ pub fn upgrade_current_summary(discovered: &[ManagedUpgradeTarget]) -> String {
         );
     for item in ordered {
         let target = item.target;
-        if target.label() == "ck-subc-mcp" {
+        if target.label() == "ck-subc-mcp" || target.is_plexus_catalog() {
             components.push(target.to_string());
         } else {
             components.push(format!("{target} {}", item.installed_version));

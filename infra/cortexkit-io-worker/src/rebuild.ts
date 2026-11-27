@@ -240,8 +240,8 @@ async function buildEntry(
     if (override && Object.prototype.hasOwnProperty.call(override, "reports")) {
       reports = override.reports ?? null;
     }
-    // Neither the extension nor the native host supports a --version probe.
-    if (parsed.binary === "ck-cerebellum-extension" || parsed.binary === "ck-cerebellum-native-host") {
+    // These assets have no --version probe.
+    if (["ck-cerebellum-extension", "ck-cerebellum-native-host", "ck-plexus-catalog"].includes(parsed.binary)) {
       reports = null;
     }
     const platform = platformKey(parsed.os, parsed.arch);

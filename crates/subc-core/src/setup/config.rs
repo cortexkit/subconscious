@@ -604,7 +604,7 @@ fn desired_values_with_key(
                 }),
             );
         }
-        Component::Claustrum => {
+        Component::Claustrum | Component::Plexus => {
             let mut entry = Map::new();
             entry.insert(
                 "program".to_string(),
@@ -617,7 +617,8 @@ fn desired_values_with_key(
             );
             entry.insert("reserved".to_string(), Value::Bool(true));
             entry.insert("registration_channel".to_string(), Value::Bool(true));
-            if let Some(key_path) = claustrum_key_path {
+            if let Some(key_path) = claustrum_key_path.filter(|_| component == Component::Claustrum)
+            {
                 entry.insert(
                     "env".to_string(),
                     serde_json::json!({
@@ -625,7 +626,7 @@ fn desired_values_with_key(
                     }),
                 );
             }
-            values.insert("modules.claustrum".to_string(), Value::Object(entry));
+            values.insert(format!("modules.{component}"), Value::Object(entry));
         }
     }
     values
@@ -1287,5 +1288,21 @@ mod tests {
                 )])
             );
         }
+    }
+
+    #[test]
+    fn setup_plexus_configuration_is_reserved_without_args_or_env() {
+        let binary_home = Path::new("bin");
+        assert_eq!(
+            desired_values_with_key(Component::Plexus, binary_home, Some(Path::new("vault-key"))),
+            BTreeMap::from([(
+                "modules.plexus".into(),
+                serde_json::json!({
+                    "program": binary_home.join(platform_binary("ck-plexus")),
+                    "reserved": true,
+                    "registration_channel": true,
+                })
+            )])
+        );
     }
 }

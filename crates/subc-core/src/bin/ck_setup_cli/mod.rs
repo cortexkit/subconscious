@@ -14,12 +14,12 @@ usage:
   ck setup operator-prompt [--uninstall]
 
   Components: aft, mc, insula, claustrum, synapse, fusiform, cingulate,
-  entorhinal, astrocyte, striatum, broca, cerebellum.
+  entorhinal, astrocyte, striatum, broca, cerebellum, plexus.
 
   Bare setup installs core and all available components. The plan says why
   a component was left out and marks fusiform, striatum and broca as Windows
   previews. Explicit picks also install their needs: for example,
-  ck setup --with cerebellum,cingulate adds claustrum and entorhinal.
+  ck setup --with plexus adds claustrum and entorhinal.
   --key-path is valid whenever claustrum is selected, directly or as a need.
   Module settings live in per-module JSONC files. On macOS the Cerebellum
   browser extension is a separate release asset, not a binary.

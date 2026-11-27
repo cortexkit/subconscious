@@ -76,6 +76,9 @@ pub trait UpgradeExecutionBackend {
     fn create_rollback_copy(&mut self, target: UpgradeTarget) -> Result<String, String>;
     fn replace_destination(&mut self, target: UpgradeTarget) -> Result<String, String>;
     fn warm_execute(&mut self, target: UpgradeTarget) -> Result<String, String>;
+    fn refresh_plexus_catalog(&mut self, _target: UpgradeTarget) -> Result<String, String> {
+        Err("Plexus catalog placement is not implemented by this backend".into())
+    }
     fn initiate_module_restart(
         &mut self,
         target: UpgradeTarget,
@@ -200,6 +203,11 @@ pub fn execute_upgrade<B: UpgradeExecutionBackend>(
             UpgradeOperation::WarmExecute { target } => {
                 (*target, "warm-execution", backend.warm_execute(*target))
             }
+            UpgradeOperation::RefreshPlexusCatalog { target } => (
+                *target,
+                "plexus-catalog",
+                backend.refresh_plexus_catalog(*target),
+            ),
             UpgradeOperation::InitiateModuleRestart { target } => (
                 *target,
                 "restart-initiation",
@@ -230,8 +238,17 @@ pub fn execute_upgrade<B: UpgradeExecutionBackend>(
                         stage: "post-verification",
                         detail: format!("failed: {reason}"),
                     });
-                    let rollback = backend.failure_rollback_target().unwrap_or(*target);
-                    offer_rollback(backend, &mut report, rollback);
+                    let (reason, aborted) = if target.is_plexus_admin() {
+                        // The Plexus module has not been restarted yet; a bad
+                        // companion cannot leave a partly installed release.
+                        abort_before_activation(backend, reason)
+                    } else {
+                        (reason, false)
+                    };
+                    if !aborted {
+                        let rollback = backend.failure_rollback_target().unwrap_or(*target);
+                        offer_rollback(backend, &mut report, rollback);
+                    }
                     return Err(UpgradeExecutionFailure {
                         target: *target,
                         stage: "post-verification",
@@ -263,14 +280,10 @@ pub fn execute_upgrade<B: UpgradeExecutionBackend>(
                         | "rollback-copy"
                         | "destination-replacement"
                         | "warm-execution"
+                        | "plexus-catalog"
                         | "registration-channel-entry"
                 ) {
-                    match backend.abort_before_activation() {
-                        Ok(aborted) => (reason, aborted),
-                        Err(error) => {
-                            (format!("{reason}; install recovery stopped: {error}"), true)
-                        }
-                    }
+                    abort_before_activation(backend, reason)
                 } else {
                     (reason, false)
                 };
@@ -290,6 +303,16 @@ pub fn execute_upgrade<B: UpgradeExecutionBackend>(
         }
     }
     Ok(report)
+}
+
+fn abort_before_activation(
+    backend: &mut impl UpgradeExecutionBackend,
+    reason: String,
+) -> (String, bool) {
+    match backend.abort_before_activation() {
+        Ok(aborted) => (reason, aborted),
+        Err(error) => (format!("{reason}; install recovery stopped: {error}"), true),
+    }
 }
 
 pub(super) fn unpaired_nats_upgrade(plan: &UpgradePlan) -> Option<UpgradeTarget> {

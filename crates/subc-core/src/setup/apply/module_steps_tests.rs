@@ -82,7 +82,7 @@ impl CommandRunner for Fake {
 #[test]
 fn fresh_module_grant_steps_use_only_the_exact_category_tuples() {
     let mut runner = Fake {
-        answers: VecDeque::from(vec![(0, "already granted (no change)\n"); 8]),
+        answers: VecDeque::from(vec![(0, "already granted (no change)\n"); 10]),
         ..Default::default()
     };
     let mut auth = vault::Auth {
@@ -95,6 +95,7 @@ fn fresh_module_grant_steps_use_only_the_exact_category_tuples() {
         Component::Striatum,
         Component::Broca,
         Component::Cerebellum,
+        Component::Plexus,
         Component::Entorhinal,
     ] {
         assert!(!auth.ensure_component(component).unwrap());
@@ -108,6 +109,8 @@ fn fresh_module_grant_steps_use_only_the_exact_category_tuples() {
         ("reserved:broca", "llm-gateway", "read"),
         ("reserved:broca", "llm-gateway", "list"),
         ("reserved:cerebellum", "browser-session", "deposit"),
+        ("reserved:plexus", "github-app-native", "read"),
+        ("reserved:plexus", "web-search", "read"),
     ];
     assert_eq!(runner.calls.len(), tuples.len());
     for ((program, args), (principal, selector, op)) in runner.calls.iter().zip(tuples) {
@@ -553,7 +556,11 @@ fn second_bare_setup_plans_ensures_but_leaves_files_and_inventory_unchanged() {
     backend.platform = RuntimePlatform::Macos;
     backend.runner = Box::new(UnchangedVault);
     fs::create_dir_all(&backend.paths.binary_home).unwrap();
-    write_executable(&backend.executable, b"#!/bin/sh\nexit 0\n");
+    write_executable(&backend.executable, b"#!/bin/sh\nprintf '%s\\n' '{\"status\":\"ok\",\"metrics\":{\"connectorHome\":{\"state\":\"held\",\"lease\":{\"holding\":true}}}}'\n");
+    write_executable(
+        &backend.paths.binary_home.join("ck-plexus-admin"),
+        b"#!/bin/sh\ncase \"$1 $2\" in\n'connector-home status') printf '%s\\n' '{\"result\":{\"connectorHome\":{\"admitted\":true}}}' ;;\n'agent-policy preview') printf '%s\\n' '{\"enabled\":true}' ;;\n*) exit 64 ;;\nesac\n",
+    );
     fs::write(&backend.paths.config_path, "{\"version\":1}\n").unwrap();
     backend.inventory.start_transaction().unwrap();
     backend.apply(&SetupOperation::ConfigureMessageHub).unwrap();
@@ -588,6 +595,7 @@ fn second_bare_setup_plans_ensures_but_leaves_files_and_inventory_unchanged() {
             "ensure broca vault grants",
             "ensure cerebellum vault grants",
             "ensure Chrome native messaging with ck-cerebellum-native-host --register",
+            "ensure plexus vault grants",
         ]
     );
     assert!(!plan.operations.iter().any(|step| matches!(
@@ -595,6 +603,7 @@ fn second_bare_setup_plans_ensures_but_leaves_files_and_inventory_unchanged() {
         SetupOperation::InstallComponent { .. } | SetupOperation::ConfigureComponent { .. }
     )));
     backend.execute_transactions(&plan, false).unwrap();
+    assert!(!backend.component_steps[&Component::Plexus].plexus_maintenance_changed);
     assert_eq!(files(root.path()), before);
 }
 

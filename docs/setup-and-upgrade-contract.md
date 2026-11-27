@@ -224,8 +224,10 @@ itself is placed by the bootstrap installer. Setup never downloads Magic
 Context on Windows. Cerebellum is not offered on Windows and provides only the
 agent browser on Linux. On macOS its native host is a command program and its
 browser extension zip (`ck-cerebellum-extension-darwin-arm64.zip`) is a separate
-release asset, not a binary. Setup checks for every required asset before placing
-any part of a missing component.
+release asset, not a binary. Plexus requires `ck-plexus`, `ck-plexus-admin`,
+and `ck-plexus-catalog` archives. The Windows release is incomplete while those
+assets are withheld. Setup checks for every required asset before placing any
+part of a missing component.
 
 ## Installation destinations, PATH, and ownership
 
@@ -252,9 +254,9 @@ The command surface is:
 
 - `ck setup` selects core and all components: `aft`, `mc`, `insula`, `claustrum`,
   `synapse`, `fusiform`, `cingulate`, `entorhinal`, `astrocyte`, `striatum`,
-  `broca`, and `cerebellum`. Bare setup reports each component left out and why,
-  including dependents whose needs could not be satisfied. It still installs the
-  rest. Core cannot be left out. The plan marks fusiform, striatum and broca as
+  `broca`, `cerebellum`, and `plexus`. Bare setup explains why it left out each
+  component, including dependents whose needs could not be satisfied. It still
+  installs the rest. Core cannot be left out. The plan marks fusiform, striatum and broca as
   Windows previews: they are offered before their own tests run natively there.
 - `ck setup broca` selects one component. `ck setup --with cerebellum,cingulate`
   selects several. Explicit picks include their needs, transitively, and the
@@ -268,6 +270,18 @@ The command surface is:
   Per-module settings (such as `fusiform.jsonc`, `broca.jsonc`, and
   `cerebellum.jsonc`) live under the config home's `cortexkit/` directory,
   alongside `subc.jsonc`. Setup does not overwrite existing settings files.
+- `ck setup --with plexus` selects Claustrum and Entorhinal as hard dependencies.
+  It writes a reserved `modules.plexus` entry with a registration channel but no
+  arguments, environment, or module settings file. It authorizes `reserved:plexus`
+  to read vault entries in the `github-app-native` and `web-search` categories.
+  After installing the programs, setup publishes the verified catalog as one directory at
+  `<data home>/cortexkit/plexus/catalog/`. Upgrade uses the same journaled
+  replacement and places the catalog before restarting Plexus. Once setup has
+  committed, it waits until `ck-plexus-admin connector-home status` reports
+  Plexus admitted as the connector host. It checks whether signed GitHub agent policies are
+  already enabled, and otherwise uses
+  `ck-plexus-admin` to ask for operator confirmation. A refusal is not an install
+  failure. Upgrade does not offer to change the policy.
 - `ck setup --dry-run` is strictly read-only: it prints the full setup plan,
   including observations, proposed mutations, and refusals, without creating,
   replacing, registering, starting, or changing anything. Its plan must be

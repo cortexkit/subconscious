@@ -29,10 +29,11 @@ pub enum Component {
     Striatum,
     Broca,
     Cerebellum,
+    Plexus,
 }
 
 impl Component {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::Core,
         Self::Aft,
         Self::Mc,
@@ -46,6 +47,7 @@ impl Component {
         Self::Striatum,
         Self::Broca,
         Self::Cerebellum,
+        Self::Plexus,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -63,6 +65,7 @@ impl Component {
             Self::Striatum => "striatum",
             Self::Broca => "broca",
             Self::Cerebellum => "cerebellum",
+            Self::Plexus => "plexus",
         }
     }
 
@@ -104,6 +107,7 @@ impl Component {
             Self::Striatum => Some("AI Model Routing"),
             Self::Broca => Some("Model Runner"),
             Self::Cerebellum => Some("Browser and Computer Use"),
+            Self::Plexus => Some("Connectors"),
             _ => None,
         }
     }
@@ -679,6 +683,12 @@ pub enum SetupOperation {
         url: String,
         sha256: String,
     },
+    EnsurePlexusCatalog {
+        path: std::path::PathBuf,
+        url: String,
+        sha256: String,
+    },
+    EnablePlexusAgentPolicies,
     ConfigureMessageHub,
     AdoptRunningCk {
         path: std::path::PathBuf,
@@ -729,6 +739,7 @@ impl SetupOperation {
                 | Self::GrantComponentVault { .. }
                 | Self::RegisterCerebellumNativeHost
                 | Self::EnsureCerebellumExtension { .. }
+                | Self::EnsurePlexusCatalog { .. }
         )
     }
 
@@ -740,6 +751,7 @@ impl SetupOperation {
                     | Self::ConfigureComponent { .. }
                     | Self::BootstrapClaustrum { .. }
                     | Self::GrantMessageKeys
+                    | Self::EnablePlexusAgentPolicies
                     | Self::ConfigureMessageHub
                     | Self::AdoptRunningCk { .. }
                     | Self::LinkCkni { .. }
@@ -768,6 +780,9 @@ impl SetupOperation {
             Self::EnsureBrocaKey { .. } => Some(Component::Broca),
             Self::RegisterCerebellumNativeHost | Self::EnsureCerebellumExtension { .. } => {
                 Some(Component::Cerebellum)
+            }
+            Self::EnsurePlexusCatalog { .. } | Self::EnablePlexusAgentPolicies => {
+                Some(Component::Plexus)
             }
             Self::BootstrapClaustrum { .. } => Some(Component::Claustrum),
             Self::ConfigureMessageHub => Some(Component::Core),
@@ -825,6 +840,8 @@ impl fmt::Display for SetupOperation {
             Self::GrantComponentVault { component } => write!(formatter, "ensure {component} vault grants"),
             Self::RegisterCerebellumNativeHost => formatter.write_str("ensure Chrome native messaging with ck-cerebellum-native-host --register"),
             Self::EnsureCerebellumExtension { path, .. } => write!(formatter, "extract Chrome extension to {}; load that folder in chrome://extensions with Developer mode on; macOS permissions: Accessibility, Screen Recording and Input Monitoring", path.display()),
+            Self::EnsurePlexusCatalog { path, .. } => write!(formatter, "verify and replace the Plexus catalog at {}", path.display()),
+            Self::EnablePlexusAgentPolicies => formatter.write_str("wait until Plexus is this computer's connector host, then offer to turn on signed GitHub agent policies if they are off"),
             Self::ConfigureMessageHub => formatter.write_str(super::message_plane::HUB_STEP),
             Self::AdoptRunningCk { path } => {
                 write!(formatter, "adopt running ck binary at {}", path.display())
@@ -907,6 +924,14 @@ impl UpgradeTarget {
 
     pub fn is_self_replacing(self) -> bool {
         self.component == Component::Core && self.binary == "ck"
+    }
+
+    pub(super) fn is_plexus_admin(self) -> bool {
+        self.component == Component::Plexus && self.binary == "ck-plexus-admin"
+    }
+
+    pub(crate) fn is_plexus_catalog(self) -> bool {
+        self.component == Component::Plexus && self.binary == super::plexus_catalog::ASSET
     }
 
     /// These two existing targets historically accepted their own reported
@@ -1009,6 +1034,7 @@ pub enum UpgradeOperation {
     CreateRollbackCopy { target: UpgradeTarget },
     ReplaceDestination { target: UpgradeTarget },
     WarmExecute { target: UpgradeTarget },
+    RefreshPlexusCatalog { target: UpgradeTarget },
     InitiateModuleRestart { target: UpgradeTarget },
     PollModuleRestartCompletion { target: UpgradeTarget },
     RestartDaemonViaServiceManager { target: UpgradeTarget },
@@ -1046,6 +1072,9 @@ impl fmt::Display for UpgradeOperation {
                 write!(formatter, "replace {target} destination")
             }
             Self::WarmExecute { target } => write!(formatter, "warm-execute {target} destination"),
+            Self::RefreshPlexusCatalog { .. } => {
+                formatter.write_str("download, verify and replace the Plexus catalog")
+            }
             Self::InitiateModuleRestart { target } => {
                 write!(formatter, "initiate supervised restart for {target}")
             }

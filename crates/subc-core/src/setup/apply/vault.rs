@@ -23,6 +23,10 @@ pub(super) fn component_grants(component: Component) -> &'static [Grant] {
             ("reserved:broca", "llm-gateway", "list"),
         ],
         Component::Cerebellum => &[("reserved:cerebellum", "browser-session", "deposit")],
+        Component::Plexus => &[
+            ("reserved:plexus", "github-app-native", "read"),
+            ("reserved:plexus", "web-search", "read"),
+        ],
         _ => &[],
     }
 }

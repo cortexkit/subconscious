@@ -344,6 +344,16 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
         plan.operations.push(SetupOperation::GrantMessageKeys);
     }
 
+    if plan.validation.contains(&Component::Plexus)
+        && !observed
+            .partial_installs
+            .get(&Component::Plexus)
+            .is_some_and(|partial| !partial.module_matches_release)
+    {
+        plan.operations
+            .push(SetupOperation::EnablePlexusAgentPolicies);
+    }
+
     // After every rescan this run makes: a rescan applies a new health check
     // live, and nats-server opens its new listener only when it restarts, so
     // a rescan after this write would probe a listener that is not there yet.
@@ -841,6 +851,12 @@ pub fn plan_upgrade(observed: &UpgradeObserved) -> UpgradePlan {
             .push(UpgradeOperation::ConfigureMessageHub { target });
     }
     for &target in &observed.roster {
+        if target.component == Component::Plexus {
+            if target.module_id() == Some("plexus") {
+                plan_plexus_upgrade(&mut plan, observed, target);
+            }
+            continue;
+        }
         if target.is_self_replacing() {
             append_message_grants(observed, &mut plan);
         }
@@ -916,7 +932,7 @@ pub fn plan_upgrade(observed: &UpgradeObserved) -> UpgradePlan {
                                 ),
                             });
                         } else {
-                            plan_upgrade_target(&mut plan, target, observed);
+                            plan_upgrade_target(&mut plan, target, observed, None);
                             continue;
                         }
                     }
@@ -996,13 +1012,105 @@ fn upgrade_core_floor_refusal(observed: &UpgradeObserved, target: UpgradeTarget)
     })
 }
 
-fn plan_upgrade_target(plan: &mut UpgradePlan, target: UpgradeTarget, observed: &UpgradeObserved) {
+fn plan_plexus_upgrade(plan: &mut UpgradePlan, observed: &UpgradeObserved, module: UpgradeTarget) {
+    let members = observed
+        .roster
+        .iter()
+        .copied()
+        .filter(|target| target.component == Component::Plexus)
+        .collect::<Vec<_>>();
+    let admin = members
+        .iter()
+        .copied()
+        .find(|target| target.is_plexus_admin());
+    let catalog = members
+        .iter()
+        .copied()
+        .find(|target| target.is_plexus_catalog());
+    let (Some(admin), Some(catalog)) = (admin, catalog) else {
+        plan.outcomes.push(PlanOutcome::TargetRefused {
+            component: Component::Plexus,
+            reason: "Plexus must upgrade with its admin command and catalog; run ck setup plexus to repair its installation".into(),
+        });
+        return;
+    };
+    for target in [module, admin, catalog] {
+        match observed.release(target) {
+            ReleaseAvailability::Available => {}
+            ReleaseAvailability::Incomplete { missing_asset } => {
+                plan.outcomes.push(PlanOutcome::ReleaseIncomplete {
+                    component: Component::Plexus,
+                    release_tag: "the resolved release".into(),
+                    missing_asset,
+                });
+                return;
+            }
+            release => {
+                plan.outcomes.push(PlanOutcome::Refusal {
+                    reason: format!("Plexus release is not available: {release:?}"),
+                });
+                return;
+            }
+        }
+    }
+    if !matches!(
+        observed.target_state(module),
+        UpgradeState::UpdateAvailable { .. }
+    ) {
+        append_registration_channel(plan, module, observed);
+        plan.outcomes.push(PlanOutcome::Noop {
+            scope: "Plexus programs and catalog are already current".into(),
+        });
+        return;
+    }
+    if let Some(reason) = upgrade_core_floor_refusal(observed, module) {
+        plan.outcomes.push(PlanOutcome::TargetRefused {
+            component: Component::Plexus,
+            reason,
+        });
+        append_registration_channel(plan, module, observed);
+        return;
+    }
+    if let Some(reason) = &observed.daemon_unreachable_reason {
+        plan.outcomes.push(PlanOutcome::Refusal {
+            reason: format!(
+                "{module} requires a supervised restart, but the daemon is unreachable: {reason}"
+            ),
+        });
+        return;
+    }
+    for target in [admin, module] {
+        if let UpgradeState::UpdateAvailable { from, to, reason } = observed.target_state(target) {
+            plan.outcomes.push(PlanOutcome::UpgradeAvailable {
+                target,
+                from,
+                to,
+                reason,
+            });
+        }
+    }
+    // Verify the admin command first, but commit it only after the supervised
+    // module has restarted with the new catalog.
+    plan_upgrade_target(plan, admin, observed, None);
+    plan_upgrade_target(plan, module, observed, Some(catalog));
+}
+
+fn plan_upgrade_target(
+    plan: &mut UpgradePlan,
+    target: UpgradeTarget,
+    observed: &UpgradeObserved,
+    catalog: Option<UpgradeTarget>,
+) {
     plan.operations.extend([
         UpgradeOperation::DownloadAndVerify { target },
         UpgradeOperation::CreateRollbackCopy { target },
         UpgradeOperation::ReplaceDestination { target },
         UpgradeOperation::WarmExecute { target },
     ]);
+    if let Some(target) = catalog {
+        plan.operations
+            .push(UpgradeOperation::RefreshPlexusCatalog { target });
+    }
     append_registration_channel(plan, target, observed);
     if target.module_id().is_some() {
         if observed.is_module_supervised(target) {
@@ -1230,6 +1338,12 @@ mod tests {
                 missing_asset: "ck-synapse-windows-x64.zip".into(),
             },
         );
+        observed.releases.insert(
+            Component::Plexus,
+            ReleaseAvailability::Incomplete {
+                missing_asset: "ck-plexus-windows-x64.zip".into(),
+            },
+        );
         let plan = plan_setup(&observed, &SetupRequest::install(Vec::new()));
         assert!(plan.is_authorized());
         assert_eq!(
@@ -1247,7 +1361,12 @@ mod tests {
                 Component::Broca
             ]
         );
-        for component in [Component::Mc, Component::Synapse, Component::Cerebellum] {
+        for component in [
+            Component::Mc,
+            Component::Synapse,
+            Component::Cerebellum,
+            Component::Plexus,
+        ] {
             assert!(plan.outcomes.iter().any(|outcome| matches!(outcome,
                 PlanOutcome::LeftOut { component: omitted, .. } if *omitted == component)));
         }
@@ -1272,12 +1391,13 @@ mod tests {
     fn bare_setup_platform_goldens() {
         const COMMON: &str = "install core\ninstall aft\ninstall insula — file/API providers; cookies only from vault deposits on every OS, never browser stores\ninstall claustrum\ninstall synapse — healthy immediately with an empty catalog; inference remains typed-refused until model.load arrives\ninstall fusiform (Model Catalog)\ninstall cingulate (Approvals)\ninstall entorhinal (Agents and Projects)\ninstall astrocyte (Spend Records)\ninstall striatum (AI Model Routing)\ninstall broca (Model Runner)";
         const CEREBELLUM: &str = "install cerebellum (Browser and Computer Use)";
+        const PLEXUS: &str = "install plexus (Connectors)";
         const CATALOG: &str = "fusiform (Model Catalog): fetching the model catalog";
         let unpublished = format!("mc: left out — {}", super::super::text::MC_UNPUBLISHED_NOTE);
         for (target, expected) in [
-            (AlphaTarget::DarwinArm64, format!("{COMMON}\n{CEREBELLUM}\n{unpublished}\n{CATALOG}")),
-            (AlphaTarget::LinuxX64, format!("{COMMON}\n{CEREBELLUM}\n{unpublished}\n{CATALOG}\ncerebellum (Browser and Computer Use): agent browser only on Linux")),
-            (AlphaTarget::WindowsX64, format!("{COMMON}\nmc: left out — magic-context is not available on this platform yet\nfusiform (Model Catalog): offered on Windows before its own tests run natively there\n{CATALOG}\nstriatum (AI Model Routing): offered on Windows before its own tests run natively there\nbroca (Model Runner): offered on Windows before its own tests run natively there\ncerebellum (Browser and Computer Use): left out — cerebellum is not offered on Windows")),
+            (AlphaTarget::DarwinArm64, format!("{COMMON}\n{CEREBELLUM}\n{PLEXUS}\n{unpublished}\n{CATALOG}")),
+            (AlphaTarget::LinuxX64, format!("{COMMON}\n{CEREBELLUM}\n{PLEXUS}\n{unpublished}\n{CATALOG}\ncerebellum (Browser and Computer Use): agent browser only on Linux")),
+            (AlphaTarget::WindowsX64, format!("{COMMON}\nmc: left out — magic-context is not available on this platform yet\nfusiform (Model Catalog): offered on Windows before its own tests run natively there\n{CATALOG}\nstriatum (AI Model Routing): offered on Windows before its own tests run natively there\nbroca (Model Runner): offered on Windows before its own tests run natively there\ncerebellum (Browser and Computer Use): left out — cerebellum is not offered on Windows\nplexus (Connectors): left out — no ck-plexus-windows-x64.zip asset in v0.1.0 yet")),
         ] {
             let mut observed = observed_setup();
             observed.components.clear();
@@ -1285,6 +1405,10 @@ mod tests {
             if target != AlphaTarget::WindowsX64 {
                 observed.releases.insert(Component::Mc, ReleaseAvailability::DeclaredUnavailable {
                     message: super::super::text::MC_UNPUBLISHED_NOTE.to_string(),
+                });
+            } else {
+                observed.releases.insert(Component::Plexus, ReleaseAvailability::NotYetPublished {
+                    release_tag: "v0.1.0".into(), missing_asset: "ck-plexus-windows-x64.zip".into(),
                 });
             }
             let plan = plan_setup(&observed, &SetupRequest::install(vec![]));
@@ -1318,6 +1442,11 @@ mod tests {
                 vec![Striatum],
                 vec![Core, Claustrum, Fusiform, Striatum],
                 "striatum needs claustrum and fusiform; they will be installed too",
+            ),
+            (
+                vec![Plexus],
+                vec![Core, Claustrum, Entorhinal, Plexus],
+                "plexus needs claustrum and entorhinal; they will be installed too",
             ),
         ] {
             let plan = plan_setup(&observed, &SetupRequest::install(picks));
@@ -2181,7 +2310,8 @@ mod tests {
             report.applied,
             [
                 SetupOperation::ConfigureMessageHub,
-                SetupOperation::GrantMessageKeys
+                SetupOperation::GrantMessageKeys,
+                SetupOperation::EnablePlexusAgentPolicies,
             ]
         );
         assert_eq!(executor.applied, report.applied);

@@ -509,10 +509,11 @@ pub fn module_program(component: Component) -> Option<&'static str> {
         Component::Striatum => Some("ck-striatum"),
         Component::Broca => Some("ck-broca"),
         Component::Cerebellum => Some("ck-cerebellum"),
+        Component::Plexus => Some("ck-plexus"),
     }
 }
 
-const SUPERVISED_MODULE_IDS: [(&str, &str); 13] = [
+const SUPERVISED_MODULE_IDS: [(&str, &str); 14] = [
     // Core owns the daemon and MCP bridge, but only the bridge is a supervised
     // module program; Core itself remains outside the setup module lifecycle.
     ("ck-subc-mcp", "subc-mcp"),
@@ -528,6 +529,7 @@ const SUPERVISED_MODULE_IDS: [(&str, &str); 13] = [
     ("ck-striatum", "striatum"),
     ("ck-broca", "broca"),
     ("ck-cerebellum", "cerebellum"),
+    ("ck-plexus", "plexus"),
 ];
 
 /// Returns the managed program names and their corresponding daemon supervisor IDs.
@@ -551,6 +553,7 @@ pub(super) fn component_needs(component: Component) -> &'static [Component] {
         Entorhinal => &[Core, Claustrum],
         Astrocyte | Striatum | Broca => &[Core, Claustrum, Fusiform],
         Cerebellum => &[Core, Claustrum, Cingulate, Entorhinal],
+        Plexus => &[Claustrum, Entorhinal],
     }
 }
 
@@ -575,6 +578,7 @@ pub(super) fn is_new_component_module(component: Component, binary: &str) -> boo
 fn extra_required_assets(component: Component, target: AlphaTarget) -> &'static [&'static str] {
     match (component, target) {
         (Component::Cerebellum, AlphaTarget::DarwinArm64) => &["ck-cerebellum-extension"],
+        (Component::Plexus, _) => &[super::plexus_catalog::ASSET],
         _ => &[],
     }
 }
@@ -638,6 +642,7 @@ pub fn component_binaries_for_target(
             &["ck-cerebellum"]
         }
         (Component::Cerebellum, AlphaTarget::WindowsX64 | AlphaTarget::WindowsArm64) => &[],
+        (Component::Plexus, _) => &["ck-plexus", "ck-plexus-admin"],
     }
 }
 
@@ -698,7 +703,7 @@ pub(super) fn partial_install(
 ) -> Option<(Vec<&'static str>, bool)> {
     if !matches!(
         component,
-        Component::Fusiform | Component::Broca | Component::Cerebellum
+        Component::Fusiform | Component::Broca | Component::Cerebellum | Component::Plexus
     ) {
         return None;
     }
@@ -929,6 +934,13 @@ pub fn upgrade_roster(
                 component,
                 binary,
                 module_id: supervised_module_id(binary),
+            });
+        }
+        if component == Component::Plexus {
+            roster.push(UpgradeTarget {
+                component,
+                binary: super::plexus_catalog::ASSET,
+                module_id: None,
             });
         }
     }
@@ -2439,6 +2451,11 @@ mod tests {
                 component_binaries_for_target(component, AlphaTarget::LinuxX64)
                     .iter()
                     .map(|binary| (binary.to_string(), asset(Some("0.16.0"))))
+                    .chain(
+                        extra_required_assets(component, AlphaTarget::LinuxX64)
+                            .iter()
+                            .map(|name| (name.to_string(), asset(None))),
+                    )
                     .collect(),
             );
             index

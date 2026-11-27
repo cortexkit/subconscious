@@ -3576,6 +3576,81 @@ fn setup_synapse_without_a_host_asset_is_one_complete_refusal_line() {
 }
 
 #[test]
+fn setup_plexus_dry_run_lists_programs_catalog_grants_and_post_health_policy() {
+    let fixture = SetupFixture::installed("ck-setup-plexus-plan");
+    let index = serve_signed_index(|base| {
+        let (mut index, blobs) = setup_index(base, None);
+        let asset = |name| fixture_asset(format!("{base}/{name}.zip"), "12".repeat(32), 100, None);
+        index["components"]["entorhinal"] = index_component(
+            "v0.1.0",
+            Some("0.1.0"),
+            &host_target(),
+            [("ck-entorhinal", asset("ck-entorhinal"))],
+        );
+        let target = if cfg!(windows) {
+            "linux-x64".into()
+        } else {
+            host_target()
+        };
+        index["components"]["plexus"] = index_component(
+            "v0.1.0",
+            Some("0.1.0"),
+            &target,
+            ["ck-plexus", "ck-plexus-admin", "ck-plexus-catalog"].map(|name| (name, asset(name))),
+        );
+        (index, blobs)
+    });
+    let output = fixture
+        .command(&index, &["setup", "--with", "plexus", "--dry-run"])
+        .output()
+        .unwrap();
+    let stdout = text(&output.stdout);
+    if cfg!(windows) {
+        assert_exit(&output, 1);
+        assert!(
+            stdout.contains(&format!("ck-plexus-{}.zip", host_target())),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("not offered on Windows"), "{stdout}");
+        return;
+    }
+    assert_exit(&output, 0);
+    assert!(
+        stdout.contains("plexus needs entorhinal; it will be installed too"),
+        "{stdout}"
+    );
+    let plan = stdout
+        .lines()
+        .filter_map(|line| line.split_once(". would ").map(|(_, step)| step))
+        .filter(|step| step.contains("plexus") || step.contains("Plexus"))
+        .map(|step| {
+            // Normalize scratch paths so the golden plan checks phase order and
+            // destination roles, not the host-specific spelling of a scratch path.
+            if step.starts_with("place ") {
+                format!("place bin/{}", step.rsplit('/').next().unwrap())
+            } else if step.starts_with("configure ") {
+                "configure plexus in subc.jsonc".into()
+            } else if step.starts_with("verify and replace") {
+                "verify and replace the Plexus catalog at cortexkit/plexus/catalog".into()
+            } else {
+                step.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    assert_eq!(plan, include_str!("golden/piped/setup-plexus-plan.txt"));
+    assert!(
+        stdout.contains("+    \"plexus\": {") && stdout.contains("\"registration_channel\": true"),
+        "{stdout}"
+    );
+    let data = fixture.data_home.join("cortexkit");
+    assert!(!data.join("bin/ck-plexus").exists());
+    assert!(!data.join("plexus/catalog").exists());
+    assert!(!fixture.config_home.join("cortexkit/plexus.jsonc").exists());
+}
+
+#[test]
 fn setup_verbose_keeps_every_preexisting_outcome_line() {
     let fixture = SetupFixture::installed("ck-setup-verbose");
     let index = serve_signed_index(|base| setup_index(base, None));

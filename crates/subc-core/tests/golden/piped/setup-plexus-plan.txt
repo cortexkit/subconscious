@@ -1,0 +1,9 @@
+download and verify ck-plexus (0.0 MiB)
+place bin/ck-plexus
+download and verify ck-plexus-admin (0.0 MiB)
+place bin/ck-plexus-admin
+configure plexus in subc.jsonc
+verify and replace the Plexus catalog at cortexkit/plexus/catalog
+ensure plexus vault grants
+register plexus with the daemon and check its health
+wait until Plexus is this computer's connector host, then offer to turn on signed GitHub agent policies if they are off

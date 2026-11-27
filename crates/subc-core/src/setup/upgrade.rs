@@ -17,7 +17,7 @@ use super::{
     file_modes,
     install_lock::InstallHold,
     inventory::Inventory,
-    model::{AlphaTarget, Component, UpgradeObserved, UpgradeTarget},
+    model::{AlphaTarget, Component, UpgradeObserved, UpgradeState, UpgradeTarget},
     release_index::ReleaseIndex,
     update_cache::UpdateMetadata,
     update_check::{observed_from_metadata, InstalledBinary},
@@ -31,6 +31,9 @@ use super::{
 };
 
 mod journal;
+#[cfg(test)]
+#[path = "upgrade/plexus_tests.rs"]
+mod plexus_tests;
 
 const NATIVE_HOST: &str = "ck-cerebellum-native-host";
 
@@ -466,6 +469,23 @@ pub fn discover_managed_upgrade_targets(
     let executable = canonical_or_original(executable);
     let mut targets = Vec::new();
     for target in upgrade_roster(upgrade_components(inventory, &owned)) {
+        if target.is_plexus_catalog() {
+            let data_dir = inventory
+                .manifest()
+                .parent()
+                .ok_or("inventory has no data directory")?;
+            let destination = super::plexus_catalog::path(data_dir);
+            let installed_archive_sha256 =
+                super::plexus_catalog::installed_archive(&destination, inventory)?;
+            targets.push(ManagedUpgradeTarget {
+                target,
+                destination,
+                installed_version: String::new(),
+                installed_archive_sha256,
+                registration_channel_missing: false,
+            });
+            continue;
+        }
         let destination = if target.is_self_replacing() {
             owned
                 .iter()
@@ -474,6 +494,16 @@ pub fn discover_managed_upgrade_targets(
         } else {
             owned_program(&owned, target.binary).map(Path::to_path_buf)
         };
+        let destination = destination.or_else(|| {
+            if !target.is_plexus_admin() {
+                return None;
+            }
+            let home = owned_module_program(&owned, Component::Plexus)?.parent()?;
+            let destination = home.join(components::platform_binary(target.binary));
+            fs::symlink_metadata(&destination)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                .then_some(destination)
+        });
         let Some(destination) = destination else {
             if super::components::is_later_companion(target.component, target.binary) {
                 if let Some(daemon) = owned.iter().find(|path| {
@@ -508,13 +538,19 @@ pub fn discover_managed_upgrade_targets(
             }
             continue;
         };
-        if !destination.is_file() {
+        let missing_admin =
+            target.is_plexus_admin() && owned_program(&owned, target.binary).is_none();
+        if !missing_admin && !destination.is_file() {
             return Err(format!(
                 "refusal: inventory-owned {target} destination is missing: {}",
                 destination.display()
             ));
         }
-        let installed_version = installed_version(target, &destination)?;
+        let installed_version = if missing_admin {
+            String::new()
+        } else {
+            installed_version(target, &destination)?
+        };
         let installed_archive_sha256 = inventory_string(inventory, &destination, "archive_sha256");
         targets.push(ManagedUpgradeTarget {
             target,
@@ -575,6 +611,49 @@ pub fn observed_upgrade_targets(
         })
         .collect::<BTreeMap<_, _>>();
     let mut observed = observed_from_metadata(metadata, &installed);
+    let plexus = observed
+        .roster
+        .iter()
+        .copied()
+        .filter(|target| target.component == Component::Plexus)
+        .collect::<Vec<_>>();
+    if plexus.len() == 3
+        && plexus.iter().any(|target| {
+            matches!(
+                observed.target_state(*target),
+                UpgradeState::UpdateAvailable { .. }
+            )
+        })
+        && plexus.iter().all(|target| {
+            metadata
+                .targets
+                .get(target.label())
+                .is_some_and(|release| release.sha256.is_some())
+        })
+    {
+        // A release is placed as one group; even a byte-identical program is
+        // checked in the same transaction as the changed program or catalog.
+        for target in plexus
+            .into_iter()
+            .filter(|target| !target.is_plexus_catalog())
+        {
+            if observed.target_state(target) == UpgradeState::Current {
+                let release = &metadata.targets[target.label()];
+                observed.targets.insert(
+                    target.label().to_owned(),
+                    UpgradeState::UpdateAvailable {
+                        from: if release.reports_release_version {
+                            installed[target.label()].version.clone()
+                        } else {
+                            String::new()
+                        },
+                        to: release.version.clone(),
+                        reason: Some("upgrading the Plexus programs and catalog together".into()),
+                    },
+                );
+            }
+        }
+    }
     observed.registration_channels_to_add = discovered
         .iter()
         .filter(|item| item.registration_channel_missing)
@@ -623,6 +702,7 @@ pub struct SystemUpgradeBackend {
     runner: Box<dyn super::runtime::CommandRunner>,
     journal_activations: BTreeMap<String, usize>,
     core_cut: CoreCut,
+    plexus_admin_verified: bool,
     platform: AlphaTarget,
     targets: BTreeMap<String, ManagedUpgradeTarget>,
     executable: PathBuf,
@@ -849,6 +929,7 @@ impl SystemUpgradeBackend {
             platform,
             runner: Box::new(crate::setup::runtime::SystemCommandRunner),
             core_cut: CoreCut::default(),
+            plexus_admin_verified: false,
             app_hold: None,
             rollback_prompt: None,
             journal_activations: BTreeMap::new(),
@@ -1178,7 +1259,10 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
     }
 
     fn finish_verified(&mut self, target: UpgradeTarget) -> Result<(), String> {
-        if self.inventory.transaction().is_none() || nats_companion(target) {
+        if self.inventory.transaction().is_none()
+            || nats_companion(target)
+            || target.is_plexus_admin()
+        {
             return Ok(());
         }
         self.verify_journal_activation(target)?;
@@ -1343,6 +1427,20 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
             "destination inode={} executed successfully ({})",
             destination_inode(destination)?,
             version_from_output(&output.stdout)?
+        ))
+    }
+
+    fn refresh_plexus_catalog(&mut self, target: UpgradeTarget) -> Result<String, String> {
+        let asset = self
+            .assets
+            .plexus_catalog(self.platform)
+            .ok_or("Plexus release has no catalog")?
+            .clone();
+        let path = self.target(target)?.destination.clone();
+        super::plexus_catalog::ensure(&path, &mut self.inventory, &asset.url, &asset.sha256)?;
+        Ok(format!(
+            "catalog at {}; archive SHA-256 verified",
+            path.display()
         ))
     }
 
@@ -1533,6 +1631,15 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
     }
 
     fn completed(&mut self, target: UpgradeTarget) {
+        if target.is_plexus_admin() {
+            self.plexus_admin_verified = true;
+            return;
+        }
+        if target.module_id() == Some("plexus") && std::mem::take(&mut self.plexus_admin_verified) {
+            if let Some(admin) = self.targets.get("ck-plexus-admin") {
+                self.lines.completed(self.completion_line(admin.target));
+            }
+        }
         if nats_companion(target) && self.core_cut.captured {
             self.core_cut.deferred.insert(target.label().into());
             return;
@@ -1992,6 +2099,7 @@ pub(super) mod tests {
             platform: AlphaTarget::LinuxX64,
             runner: Box::new(crate::setup::runtime::SystemCommandRunner),
             core_cut: CoreCut::default(),
+            plexus_admin_verified: false,
             app_hold: None,
             rollback_prompt: None,
             journal_activations: BTreeMap::new(),
@@ -2238,6 +2346,7 @@ pub(super) mod tests {
             platform: AlphaTarget::LinuxX64,
             runner: Box::new(crate::setup::runtime::SystemCommandRunner),
             core_cut: CoreCut::default(),
+            plexus_admin_verified: false,
             app_hold: None,
             rollback_prompt: None,
             journal_activations: BTreeMap::new(),
@@ -2640,6 +2749,7 @@ exit 1
             platform: AlphaTarget::LinuxX64,
             runner: Box::new(crate::setup::runtime::SystemCommandRunner),
             core_cut: CoreCut::default(),
+            plexus_admin_verified: false,
             app_hold: None,
             rollback_prompt: None,
             journal_activations: BTreeMap::new(),
@@ -2696,6 +2806,7 @@ exit 1
             platform: AlphaTarget::LinuxX64,
             runner: Box::new(crate::setup::runtime::SystemCommandRunner),
             core_cut: CoreCut::default(),
+            plexus_admin_verified: false,
             app_hold: None,
             rollback_prompt: None,
             journal_activations: BTreeMap::new(),

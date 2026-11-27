@@ -50,6 +50,7 @@ impl<R: CommandRunner> Recovery for SystemRecovery<'_, R> {
 
     fn is_applied_with_mark(&mut self, step: &Step, done: bool) -> Result<bool, String> {
         match step.action {
+            Action::Directory(_) => super::directory::is_applied(step),
             Action::Activation { .. } => activation::verify(step, &mut self.step_control(step)),
             Action::Registration { .. } => self.service().verify(step, done),
             #[cfg(unix)]
@@ -62,6 +63,7 @@ impl<R: CommandRunner> Recovery for SystemRecovery<'_, R> {
 
     fn can_replay(&mut self, id: &str, step: &Step) -> Result<bool, String> {
         match step.action {
+            Action::Directory(_) => super::directory::can_replay(id, step),
             Action::Activation { .. } => activation::can_replay(step, &mut self.step_control(step)),
             Action::Registration { .. } => self.service().can_replay(step),
             #[cfg(unix)]
@@ -74,6 +76,7 @@ impl<R: CommandRunner> Recovery for SystemRecovery<'_, R> {
 
     fn replay(&mut self, id: &str, step: &Step) -> Result<(), String> {
         match step.action {
+            Action::Directory(_) => super::directory::replay(id, step),
             Action::Activation { .. } => activation::replay(step, &mut self.step_control(step)),
             Action::Registration { .. } => self.service().replay(step),
             #[cfg(unix)]
@@ -86,6 +89,8 @@ impl<R: CommandRunner> Recovery for SystemRecovery<'_, R> {
 
     fn undo(&mut self, id: &str, phase: Undo, step: &Step) -> Result<(), String> {
         match (&step.action, phase) {
+            (Action::Directory(_), Undo::Restore) => super::directory::undo(id, step),
+            (Action::Directory(_), _) => Ok(()),
             (Action::Activation { .. }, _) => {
                 activation::undo(step, phase, &mut self.step_control(step))
             }

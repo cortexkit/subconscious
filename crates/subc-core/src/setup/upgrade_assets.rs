@@ -127,6 +127,18 @@ impl ReleaseUpgradeAssetFetcher {
         Self { index }
     }
 
+    pub(super) fn plexus_catalog(
+        &self,
+        platform: AlphaTarget,
+    ) -> Option<&release_index::IndexAsset> {
+        self.index
+            .components
+            .get("plexus")?
+            .assets
+            .get(platform.label())?
+            .get(super::plexus_catalog::ASSET)
+    }
+
     pub fn accepts_reported_version(&self, target: UpgradeTarget, platform: AlphaTarget) -> bool {
         let (component, binary) = upgrade_target_index_path(target);
         self.index

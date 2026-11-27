@@ -22,6 +22,7 @@ pub(super) struct Step {
 pub(super) enum Action {
     File(FileStep),
     Bundle(FileStep),
+    Directory(FileStep),
     Symlink(FileStep),
     Inventory {
         file: FileStep,
@@ -374,6 +375,7 @@ impl Action {
         match self {
             Self::File(file)
             | Self::Bundle(file)
+            | Self::Directory(file)
             | Self::Symlink(file)
             | Self::Inventory { file, .. }
             | Self::Bootstrap { file, .. } => Some(file),
@@ -932,6 +934,7 @@ pub(super) mod activation;
 pub(super) mod bootstrap;
 #[cfg(unix)]
 pub(crate) mod bundle;
+pub(super) mod directory;
 pub(super) mod files;
 mod legacy;
 #[cfg(unix)]

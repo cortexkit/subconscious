@@ -3,8 +3,12 @@ use super::{broca, components, extension, settings, vault, SetupBackend};
 use crate::{
     cli_output::println,
     setup::{
-        model::{Component, ComponentState, SetupObserved, SetupOperation, SetupRequest},
+        model::{
+            Component, ComponentState, PlatformObservation, SetupObserved, SetupOperation,
+            SetupRequest,
+        },
         planner::SetupPlan,
+        plexus_catalog,
         runtime::RuntimePlatform,
     },
 };
@@ -127,7 +131,67 @@ impl SetupBackend {
                 steps.push(step);
             }
         }
+        if component == Component::Plexus {
+            if let Some(step) = self.plexus_catalog_step(eligible, index, observed, &mut notes)? {
+                steps.insert(0, step);
+            }
+        }
         Ok((steps, notes))
+    }
+
+    fn plexus_catalog_step(
+        &self,
+        eligible: &SetupPlan,
+        index: &ReleaseIndex,
+        observed: &SetupObserved,
+        notes: &mut Vec<String>,
+    ) -> Result<Option<SetupOperation>, String> {
+        let PlatformObservation::Supported(target) = observed.platform else {
+            return Ok(None);
+        };
+        let component = Component::Plexus;
+        let Some(assets) = index
+            .components
+            .get(component.label())
+            .and_then(|entry| entry.assets.get(target.label()))
+        else {
+            return Ok(None);
+        };
+        let Some(zip) = assets.get(plexus_catalog::ASSET) else {
+            return Ok(None);
+        };
+        let path = plexus_catalog::path(&self.paths.data_dir);
+        if !plexus_catalog::needs_refresh(&path, &self.inventory, &zip.sha256)? {
+            return Ok(None);
+        }
+        let places_binaries = eligible
+            .operations
+            .contains(&SetupOperation::InstallComponent { component });
+        for &binary in components::component_binaries_for_target(component, target) {
+            let destination = self
+                .paths
+                .binary_home
+                .join(components::platform_binary(binary));
+            let owned = components::OWNED_BINARY_KINDS
+                .iter()
+                .find_map(|kind| self.inventory.entry_for_path(kind, &destination));
+            let matches = if let Some(row) = owned.filter(|_| destination.is_file()) {
+                assets.get(binary).is_some_and(|asset| {
+                    row.get("archive_sha256").and_then(Value::as_str) == Some(&asset.sha256)
+                })
+            } else {
+                places_binaries
+            };
+            if !matches {
+                notes.push("run ck upgrade to refresh the Plexus catalog with its programs".into());
+                return Ok(None);
+            }
+        }
+        Ok(Some(SetupOperation::EnsurePlexusCatalog {
+            path,
+            url: zip.url.clone(),
+            sha256: zip.sha256.clone(),
+        }))
     }
 
     fn extension_step(
@@ -213,10 +277,14 @@ impl SetupBackend {
                     runner: &mut *self.runner,
                     wait: std::thread::sleep,
                 };
-                format!(
-                    "{component} vault grants: {}",
-                    vault::report(auth.ensure_component(*component)?)
-                )
+                let changed = auth.ensure_component(*component)?;
+                if *component == Component::Plexus {
+                    self.component_steps
+                        .entry(*component)
+                        .or_default()
+                        .plexus_maintenance_changed |= changed;
+                }
+                format!("{component} vault grants: {}", vault::report(changed))
             }
             SetupOperation::RegisterCerebellumNativeHost => {
                 if self.platform != RuntimePlatform::Macos {
@@ -242,6 +310,13 @@ impl SetupBackend {
                 }
                 let changed = extension::ensure(&paths, &mut self.inventory, url, sha256)?;
                 format!("Chrome extension at {}: {}. Load this folder in chrome://extensions with Developer mode on; macOS permissions: Accessibility, Screen Recording and Input Monitoring.", path.display(), vault::report(changed))
+            }
+            SetupOperation::EnsurePlexusCatalog { path, url, sha256 } => {
+                if *path != plexus_catalog::path(&self.paths.data_dir) {
+                    return Err("refusal: Plexus catalog step does not match this host".into());
+                }
+                plexus_catalog::ensure(path, &mut self.inventory, url, sha256)?;
+                format!("placed the Plexus catalog at {}", path.display())
             }
             _ => unreachable!("non-ensure step passed to module executor"),
         };

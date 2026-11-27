@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.24.3
+
+- Install and upgrade Plexus with its admin command and a verified, journaled
+  connector catalog. Setup ensures the two vault category grants and offers
+  to enable signed GitHub agent policies after Plexus holds its connector lease.
+
 ## 0.24.2
 
 - Show why a previous instance blocks a module in `ck module list`, including

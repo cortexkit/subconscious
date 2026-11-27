@@ -18,6 +18,7 @@ mod message_plane;
 mod model;
 mod nats_migration;
 mod planner;
+mod plexus_catalog;
 mod prompt;
 pub(crate) mod release_index;
 mod retained_binary;

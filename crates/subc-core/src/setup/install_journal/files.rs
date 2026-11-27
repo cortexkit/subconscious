@@ -522,7 +522,11 @@ pub(super) fn discard_with(
                     }
                 }
                 Some("previous" | "next" | "undone")
-                    if matches!(step.action, Action::Bundle(_)) && kind.is_dir() =>
+                    if matches!(step.action, Action::Bundle(_) | Action::Directory(_))
+                        && kind.is_dir()
+                        && metadata(&path)
+                            .map_err(|error| CleanupRefusal::at(&path, error))?
+                            .is_some_and(|info| !is_reparse_point(&info)) =>
                 {
                     fs::remove_dir_all(&path).map_err(|error| CleanupRefusal::at(&path, error))?;
                 }

@@ -58,6 +58,7 @@ impl SetupBackend {
     ) -> Result<(), String> {
         let mut groups = BTreeMap::<Component, Vec<SetupOperation>>::new();
         let mut grants = false;
+        let mut plexus_policies = false;
         let mut monitor = None;
         for operation in plan
             .operations
@@ -66,6 +67,10 @@ impl SetupBackend {
         {
             if matches!(operation, SetupOperation::GrantMessageKeys) {
                 grants = true;
+                continue;
+            }
+            if matches!(operation, SetupOperation::EnablePlexusAgentPolicies) {
+                plexus_policies = true;
                 continue;
             }
             if let SetupOperation::MonitorNatsServer { target } = operation {
@@ -165,6 +170,10 @@ impl SetupBackend {
             // The vault owns idempotence for its grants; make them only once
             // the installation whose keys will be used has been committed.
             self.apply(&SetupOperation::GrantMessageKeys)?;
+        }
+        if plexus_policies {
+            // The operator owns this change; do not ask until Plexus is committed.
+            self.apply(&SetupOperation::EnablePlexusAgentPolicies)?;
         }
         if let Some(target) = monitor {
             #[cfg(feature = "test-support")]

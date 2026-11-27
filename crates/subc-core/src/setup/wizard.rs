@@ -272,6 +272,7 @@ pub fn operation_stage(operation: &UpgradeOperation) -> Option<(UpgradeTarget, &
         UpgradeOperation::CreateRollbackCopy { target } => (*target, "rollback-copy"),
         UpgradeOperation::ReplaceDestination { target } => (*target, "destination-replacement"),
         UpgradeOperation::WarmExecute { target } => (*target, "warm-execution"),
+        UpgradeOperation::RefreshPlexusCatalog { target } => (*target, "plexus-catalog"),
         UpgradeOperation::InitiateModuleRestart { target } => (*target, "restart-initiation"),
         UpgradeOperation::PollModuleRestartCompletion { target } => (*target, "restart-completion"),
         UpgradeOperation::RestartDaemonViaServiceManager { target } => {
@@ -316,7 +317,10 @@ pub fn plan_rows(
             let target = item.target;
             let replaced = plan
                 .operations
-                .contains(&UpgradeOperation::ReplaceDestination { target });
+                .contains(&UpgradeOperation::ReplaceDestination { target })
+                || plan
+                    .operations
+                    .contains(&UpgradeOperation::RefreshPlexusCatalog { target });
             let restarted = plan
                 .operations
                 .contains(&UpgradeOperation::InitiateModuleRestart { target });

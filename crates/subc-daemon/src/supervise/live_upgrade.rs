@@ -2941,6 +2941,27 @@ mod unix {
             tasks.join_all().await;
         }
 
+        async fn confirmed_pid(module: &SupervisedModule) -> u32 {
+            // A successful start owns the child, but macOS hides its PID until
+            // the actor confirms the trampoline has exec'd the module image.
+            let exec = lock_snapshot(&module.inner.snapshot)
+                .unwrap()
+                .exec_outcome
+                .clone()
+                .expect("the launch must have an exec outcome");
+            let outcome =
+                tokio::task::spawn_blocking(move || exec.wait_for_test(Duration::from_secs(5)))
+                    .await
+                    .unwrap();
+            assert_eq!(
+                outcome,
+                crate::activity::ExecState::CommittedExec,
+                "{} must confirm exec",
+                module.module_id()
+            );
+            module.status().unwrap().pid.expect("confirmed module PID")
+        }
+
         #[tokio::test]
         async fn lingering_registration_after_reap_does_not_strand_partial_stop_cohort() {
             let scratch = ScratchDir::new("upgrade-lingering-registration");
@@ -2969,7 +2990,7 @@ mod unix {
                     .start_registered_configured_async(registered, None, true)
                     .await
                     .unwrap();
-                incumbent.insert(id.clone(), module.status().unwrap().pid.unwrap());
+                incumbent.insert(id.clone(), confirmed_pid(&module).await);
             }
             // Keep a real, authenticated HELLO connection open independently
             // of the supervised child's lifetime.
@@ -3013,17 +3034,15 @@ mod unix {
             assert!(registry.get_module("lingering").unwrap().is_none());
 
             let restarted = attempt.restart_stopped(ids.clone()).await;
+            // Release the paused actors so they can confirm the replacement execs.
+            drop(attempt);
             for id in &ids {
                 assert!(
                     matches!(restarted[id], Ok(true)),
                     "{id} must be replaced: {restarted:?}"
                 );
-                assert_ne!(
-                    handle.get(id).unwrap().status().unwrap().pid.unwrap(),
-                    incumbent[id]
-                );
+                assert_ne!(confirmed_pid(&handle.get(id).unwrap()).await, incumbent[id]);
             }
-            drop(attempt);
             for id in ids {
                 handle.get(&id).unwrap().set_enabled(false).await.unwrap();
             }
@@ -3053,7 +3072,7 @@ mod unix {
                 .start_registered_configured_async(registered, None, true)
                 .await
                 .unwrap();
-            let old = module.status().unwrap().pid.unwrap();
+            let old = confirmed_pid(&module).await;
             let (router, auth, info) = wire_router(&registry, &handle);
             let (socket, mut peer) = tokio::net::UnixStream::pair().unwrap();
             let server = tokio::spawn(crate::server::handle_connection_with_origin(
@@ -3079,12 +3098,12 @@ mod unix {
                 restarted[id].is_ok(),
                 "release error must not skip spawning: {restarted:?}"
             );
-            assert_ne!(module.status().unwrap().pid.unwrap(), old);
             let outcome = restarted[id].as_ref().unwrap();
             assert!(outcome.release_failed.is_some() && outcome.replacement.is_ok());
             drop(peer);
             server.await.unwrap().unwrap();
             drop(attempt);
+            assert_ne!(confirmed_pid(&module).await, old);
             module.set_enabled(false).await.unwrap();
         }
 

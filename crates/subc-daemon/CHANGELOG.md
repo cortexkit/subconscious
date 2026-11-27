@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.54.2
+
+- Test-only: wait for macOS exec confirmation before checking module PIDs in
+  the live-upgrade tests for lingering registrations.
+
 ## 0.54.1
 
 - Expose the daemon's default data-home resolver so setup can check the same

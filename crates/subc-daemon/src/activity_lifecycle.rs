@@ -77,6 +77,16 @@ impl ExecOutcome {
         }
         *state == ExecState::CommittedExec
     }
+
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    pub(crate) fn wait_for_test(&self, timeout: std::time::Duration) -> ExecState {
+        let state = self.state.lock().unwrap();
+        let (state, _) = self
+            .ready
+            .wait_timeout_while(state, timeout, |state| *state == ExecState::Pending)
+            .unwrap();
+        *state
+    }
 }
 
 /// Dropping an unconfirmed child refuses its queued activity, so the activity

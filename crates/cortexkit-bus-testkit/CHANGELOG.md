@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.9.7
+
+- Windows: the PATH search for nats-server looks for `nats-server.exe`, so a rig finds an installed
+  server without `CK_NATS_SERVER_BIN`.
+
 ## 0.9.6
 
 - Require subc-client-rs 0.43.0.

@@ -6,9 +6,10 @@ fn find(what: &'static str, env_var: &'static str, search_path: bool) -> Result<
     let path = configured.map(PathBuf::from).or_else(|| {
         search_path
             .then(|| {
-                std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-                    .map(|dir| dir.join(what))
-                    .find(|path| path.is_file())
+                find_in_dirs(
+                    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+                    what,
+                )
             })
             .flatten()
     });
@@ -27,6 +28,15 @@ fn find(what: &'static str, env_var: &'static str, search_path: bool) -> Result<
             ),
         })?;
     Ok(path)
+}
+
+/// The first directory holding `name` as an executable file. Windows names executables
+/// with `.exe`, so a PATH search for `nats-server` there must look for `nats-server.exe`.
+fn find_in_dirs(dirs: impl IntoIterator<Item = PathBuf>, name: &str) -> Option<PathBuf> {
+    let file = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+    dirs.into_iter()
+        .map(|dir| dir.join(&file))
+        .find(|path| path.is_file())
 }
 
 pub(crate) fn ck_bus_source() -> Result<PathBuf, RigError> {
@@ -73,5 +83,27 @@ pub(crate) fn checked_nats(path: PathBuf) -> Result<(PathBuf, String), RigError>
         _ => Err(RigError::Invalid(format!(
             "nats-server >= 2.10 required; observed {version:?}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_in_dirs;
+
+    #[test]
+    fn path_search_finds_the_platform_executable_name() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        // A file without the platform's executable suffix must not count on Windows.
+        if !std::env::consts::EXE_SUFFIX.is_empty() {
+            std::fs::write(first.path().join("nats-server"), b"").unwrap();
+        }
+        let expected = second
+            .path()
+            .join(format!("nats-server{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&expected, b"").unwrap();
+        let dirs = [first.path().to_path_buf(), second.path().to_path_buf()];
+        assert_eq!(find_in_dirs(dirs.clone(), "nats-server"), Some(expected));
+        assert_eq!(find_in_dirs(dirs, "ck-bus"), None);
     }
 }

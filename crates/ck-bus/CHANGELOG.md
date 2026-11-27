@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.13.12
+
+- Test-only: require cortexkit-bus-testkit 0.9.7, whose Windows PATH search finds `nats-server.exe`.
+
 ## 0.13.11
 
 - Use cortexkit-bus-naming 0.5.11: prefrontal's event durable also reads

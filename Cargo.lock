@@ -542,7 +542,7 @@ dependencies = [
 
 [[package]]
 name = "ck-bus"
-version = "0.13.11"
+version = "0.13.12"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -780,7 +780,7 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-bus-testkit"
-version = "0.9.6"
+version = "0.9.7"
 dependencies = [
  "async-nats",
  "async-trait",

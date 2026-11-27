@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.13.11
+
+- Use cortexkit-bus-naming 0.5.11: prefrontal's event durable also reads
+  `event.basal.flow_version_changed.v1`. Startup changes the durable's filter in
+  place.
+
 ## 0.13.10
 
 - Require subc-daemon 0.54.4 for tests.

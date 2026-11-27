@@ -23,6 +23,7 @@ allow delivery-authority subscribe ck.box_goldenfixture.live.basal.flow_instance
 allow delivery-authority subscribe ck.box_goldenfixture.live.basal.flow_instance_extended.v1
 allow delivery-authority subscribe ck.box_goldenfixture.live.basal.flow_instance_rescheduled.v1
 allow delivery-authority subscribe ck.box_goldenfixture.live.basal.flow_owner_notice.v1
+allow delivery-authority subscribe ck.box_goldenfixture.live.basal.flow_version_changed.v1
 allow delivery-authority subscribe ck.box_goldenfixture.live.basal.late_result_ready.v1.prefrontal
 allow delivery-authority subscribe ck.box_goldenfixture.live.broca.>
 allow delivery-authority subscribe ck.box_goldenfixture.live.cerebellum.late_result_ready.v1.prefrontal

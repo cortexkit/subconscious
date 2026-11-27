@@ -175,6 +175,7 @@
         "ck.box_upgradegolden.event.cerebellum.late_result_ready.v1.prefrontal",
         "ck.box_upgradegolden.event.fusiform.catalog_changed.v1",
         "ck.box_upgradegolden.event.basal.flow_owner_notice.v1",
+        "ck.box_upgradegolden.event.basal.flow_version_changed.v1",
         "ck.box_upgradegolden.event.cingulate.card_settled.v1.prefrontal"
       ],
       "max_ack_pending": 1000,

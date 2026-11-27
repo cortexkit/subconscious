@@ -314,22 +314,35 @@ fn stop_at(fixture: &SetupFixture, index: &SignedIndex, point: &str) {
 }
 
 fn kill_at(mut command: Command, marker: &Path, point: &str) {
+    // The installer's output goes to files, not pipes: nothing reads a pipe
+    // while the installer runs, so a full pipe would block it before it reached
+    // the crash point.
+    let stdout_path = marker.with_extension("stdout");
+    let stderr_path = marker.with_extension("stderr");
     let mut child = command
         .env("CK_TEST_INSTALL_CRASH_POINT", point)
         .env("CK_TEST_INSTALL_CRASH_MARKER", marker)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stdout(fs::File::create(&stdout_path).unwrap())
+        .stderr(fs::File::create(&stderr_path).unwrap())
         .spawn()
         .expect("start installer command");
-    let timeout = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    while !marker.exists() && std::time::Instant::now() < timeout {
+    // At the crash point the installer publishes the marker and then sleeps
+    // until killed, so waiting for the marker or for the installer to exit is
+    // enough. The bound only turns a hang into a clear failure; it is not a
+    // timing assumption, so it is far above any loaded runner's time.
+    let bound = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    while !marker.exists() {
         if child.try_wait().unwrap().is_some() {
-            let output = child.wait_with_output().unwrap();
             panic!(
-                "installer did not reach {point}: {} {}",
-                text(&output.stdout),
-                text(&output.stderr)
+                "installer exited before reaching {point}: {} {}",
+                fs::read_to_string(&stdout_path).unwrap_or_default(),
+                fs::read_to_string(&stderr_path).unwrap_or_default()
             );
+        }
+        if std::time::Instant::now() > bound {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("installer did not reach {point} within 300 seconds");
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.24.6
+
+- Test-only: the installer crash tests wait for the installer to reach its crash point
+  instead of giving up after 15 seconds, and send its output to files rather than pipes
+  nobody reads, so a loaded runner can't fail them.
+
 ## 0.24.5
 
 - Add `ck setup share-keys` to exchange Broca deployment keys between verified

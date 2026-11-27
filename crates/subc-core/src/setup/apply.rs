@@ -36,6 +36,7 @@ mod module_steps;
 mod module_steps_tests;
 mod plexus_policy;
 mod settings;
+pub(super) mod share_keys;
 mod vault;
 
 pub struct SetupBackend {

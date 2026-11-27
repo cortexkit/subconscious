@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.24.5
+
+- Add `ck setup share-keys` to exchange Broca deployment keys between verified
+  paired computers. Setup still creates a local key but no longer pins its ID
+  in Broca settings.
+
 ## 0.24.4
 
 - Require subc-daemon 0.54.4 so `ck module rescan` applies drain timeout edits

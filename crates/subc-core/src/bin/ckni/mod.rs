@@ -48,7 +48,7 @@ pub(super) fn plain_output(command: &Command) -> PlainOutput {
         | Command::PolicyRoot(_)
         | Command::Stack(_)
         | Command::Window(_)
-        | Command::SetupOperatorPrompt { .. }
+        | Command::SetupExtra(_)
         | Command::Upgrade { .. }
         | Command::Routes { .. }
         | Command::Catalog { .. }

@@ -6,7 +6,7 @@ use crate::setup::{
 };
 use cortexkit_test_support::ScratchDir;
 use serde_json::json;
-use std::{collections::VecDeque, io::Write, path::PathBuf};
+use std::{collections::VecDeque, fs, io::Write, path::PathBuf};
 
 #[derive(Clone, Copy)]
 enum Put {
@@ -61,6 +61,13 @@ impl FakeVault {
             runner: self,
             wait: |_| panic!("unexpected wait"),
         }
+    }
+    fn grants(&self) -> Vec<&str> {
+        self.calls
+            .iter()
+            .filter(|args| args[0] == "grant")
+            .map(|args| args[6].as_str())
+            .collect()
     }
 }
 
@@ -152,7 +159,7 @@ fn run(root: &Path, vault: &mut FakeVault) -> Result<String, String> {
 }
 
 #[test]
-fn state1_existing_default_key_is_untouched_and_reports_no_change() {
+fn existing_key_one_is_granted_without_touching_unpinned_settings() {
     let root = ScratchDir::new("broca-state-1");
     let file = root.join("broca.jsonc");
     let settings = "{ // keep comment\n}\n";
@@ -162,28 +169,31 @@ fn state1_existing_default_key_is_untouched_and_reports_no_change() {
     assert_eq!(run(root.path(), &mut vault).unwrap(), "no change");
     assert_eq!(fs::read_to_string(file).unwrap(), settings);
     assert_eq!(vault.calls.len(), 2);
+    assert_eq!(vault.grants(), [id(1)]);
     assert!(vault.puts().is_empty());
 }
 
 #[test]
-fn state2_missing_or_nonactive_settings_key_refuses_before_grant() {
+fn explicit_settings_key_need_not_exist_in_vault_and_is_not_changed() {
+    let settings = keyfile(42);
     for state in [None, Some("retired")] {
         let root = ScratchDir::new("broca-state-2");
         let file = root.join("broca.jsonc");
-        fs::write(&file, "{}\n").unwrap();
+        fs::write(&file, &settings).unwrap();
         let mut vault = FakeVault::new(root.path(), []);
         if let Some(state) = state {
-            vault.add(&id(1), state);
+            vault.add(&id(42), state);
         }
-        let error = run(root.path(), &mut vault).unwrap_err();
-        assert!(error.contains(&id(1)));
-        assert_eq!(vault.calls, [vec!["list", "--json"]]);
-        assert_eq!(fs::read_to_string(file).unwrap(), "{}\n");
+        vault.add(&id(7), "active");
+        assert_eq!(run(root.path(), &mut vault).unwrap(), "no change");
+        assert_eq!(vault.grants(), [id(7)]);
+        assert!(vault.puts().is_empty());
+        assert_eq!(fs::read_to_string(file).unwrap(), settings);
     }
 }
 
 #[test]
-fn state3_pending_active_key_wins_even_when_another_key_is_active() {
+fn pending_active_key_is_granted_along_with_other_active_keys() {
     let root = ScratchDir::new("broca-state-3");
     let file = root.join("broca.jsonc");
     save_intent(&mut inventory(root.path()), &file, 2).unwrap();
@@ -191,11 +201,12 @@ fn state3_pending_active_key_wins_even_when_another_key_is_active() {
     vault.add(&id(2), "active");
     vault.add(&id(3), "active");
     assert_eq!(run(root.path(), &mut vault).unwrap(), "ensured");
-    assert_eq!(fs::read_to_string(&file).unwrap(), keyfile(2));
+    assert!(!file.exists());
+    assert_eq!(vault.grants(), [id(2), id(3)]);
     assert!(vault.puts().is_empty());
     let rows = inventory(root.path());
     assert!(!rows.owns_path(INTENT, &file));
-    assert!(rows.owns_path("settings-receipt", &file));
+    assert!(!rows.owns_path("settings-receipt", &file));
 }
 
 #[test]
@@ -212,7 +223,8 @@ fn state4_pending_absent_key_is_created_but_inactive_key_refuses() {
         if active {
             assert_eq!(result.unwrap(), "ensured");
             assert_eq!(vault.puts(), [id(42)]);
-            assert_eq!(fs::read_to_string(file).unwrap(), keyfile(42));
+            assert_eq!(vault.grants(), [id(42)]);
+            assert!(!file.exists());
         } else {
             assert!(result.unwrap_err().contains(&id(42)));
             assert_eq!(vault.calls, [vec!["list", "--json"]]);
@@ -227,28 +239,26 @@ fn state5_adopts_sole_active_key_including_one() {
     let mut vault = FakeVault::new(root.path(), []);
     vault.add(&id(1), "active");
     vault.add(&id(11), "retired");
-    assert_eq!(run(root.path(), &mut vault).unwrap(), "ensured");
-    assert_eq!(
-        fs::read_to_string(root.join("broca.jsonc")).unwrap(),
-        keyfile(1)
-    );
+    assert_eq!(run(root.path(), &mut vault).unwrap(), "no change");
+    assert_eq!(vault.grants(), [id(1)]);
+    assert!(!root.join("broca.jsonc").exists());
     assert!(vault.puts().is_empty());
 }
 
 #[test]
-fn state6_multiple_active_keys_refuse_and_name_each() {
+fn multiple_active_keys_are_granted_without_minting_another() {
     let root = ScratchDir::new("broca-state-6");
     let mut vault = FakeVault::new(root.path(), []);
     vault.add(&id(2), "active");
     vault.add(&id(34), "active");
-    let error = run(root.path(), &mut vault).unwrap_err();
-    assert!(error.contains(&id(2)) && error.contains(&id(34)), "{error}");
-    assert_eq!(vault.calls, [vec!["list", "--json"]]);
+    assert_eq!(run(root.path(), &mut vault).unwrap(), "no change");
+    assert_eq!(vault.grants(), [id(2), id(34)]);
+    assert!(vault.puts().is_empty());
     assert!(!root.join("broca.jsonc").exists());
 }
 
 #[test]
-fn state7_picks_an_untaken_nondefault_key() {
+fn setup_mints_and_grants_without_writing_key_setting() {
     let root = ScratchDir::new("broca-state-7");
     let mut vault = FakeVault::new(root.path(), []);
     vault.add(&id(2), "needs_reauth");
@@ -257,14 +267,12 @@ fn state7_picks_an_untaken_nondefault_key() {
     assert_eq!(puts.len(), 1);
     let key = parse_id(puts[0].strip_prefix(PREFIX).unwrap()).unwrap();
     assert!(key > 2);
-    assert_eq!(
-        fs::read_to_string(root.join("broca.jsonc")).unwrap(),
-        keyfile(key)
-    );
+    assert_eq!(vault.grants(), [id(key)]);
+    assert!(!root.join("broca.jsonc").exists());
 }
 
 #[test]
-fn invalid_broca_settings_refuse_with_or_without_vault_observation() {
+fn key_step_does_not_read_or_repair_broca_settings() {
     for invalid in [
         "{",
         r#"{"session_storage":{"deployment_key_id":0}}"#,
@@ -276,15 +284,14 @@ fn invalid_broca_settings_refuse_with_or_without_vault_observation() {
         let mut vault = FakeVault::new(root.path(), []);
         let rows = inventory(root.path());
         assert!(observe(&path, &rows, None)
-            .unwrap_err()
-            .contains("broca.jsonc"));
+            .unwrap()
+            .starts_with("reads the vault"));
         assert!(observe(&path, &rows, Some(&mut vault.auth()))
-            .unwrap_err()
-            .contains("broca.jsonc"));
+            .unwrap()
+            .starts_with("found no active keys"));
         drop(rows);
-        assert!(run(root.path(), &mut vault).is_err());
+        assert!(run(root.path(), &mut vault).is_ok());
         assert_eq!(fs::read_to_string(path).unwrap(), invalid);
-        assert!(vault.calls.is_empty());
     }
 }
 
@@ -311,7 +318,7 @@ fn invalid_listed_id_refuses_at_observation_or_after_deferred_read() {
 }
 
 #[test]
-fn operator_file_naming_pending_id_is_receipted_without_rewriting() {
+fn operator_file_naming_pending_id_is_left_unmanaged() {
     let root = ScratchDir::new("broca-operator-pending-settings");
     let path = root.join("broca.jsonc");
     let human = "{\n// written by the operator\n\"session_storage\":{\"deployment_key_id\":78}}\n";
@@ -322,7 +329,7 @@ fn operator_file_naming_pending_id_is_receipted_without_rewriting() {
     assert_eq!(run(root.path(), &mut vault).unwrap(), "ensured");
     assert_eq!(fs::read_to_string(&path).unwrap(), human);
     let rows = inventory(root.path());
-    assert!(rows.owns_path("settings-receipt", &path));
+    assert!(!rows.owns_path("settings-receipt", &path));
     assert!(!rows.owns_path(INTENT, &path));
     assert!(vault.puts().is_empty());
 }
@@ -336,14 +343,14 @@ fn lost_put_active_is_adopted_but_refusal_without_record_stops() {
         let result = run(root.path(), &mut vault);
         assert_eq!(result.is_ok(), succeeds);
         assert_eq!(vault.calls[2], ["list", "--json"]);
-        assert_eq!(path.exists(), succeeds);
+        assert!(!path.exists());
         assert_eq!(inventory(root.path()).owns_path(INTENT, &path), !succeeds);
         assert_eq!(vault.puts().len(), 1);
     }
 }
 
 #[test]
-fn three_collisions_drop_intent_and_next_run_does_not_adopt_third() {
+fn three_collisions_refuse_minting_and_drop_intent_before_next_run() {
     let root = ScratchDir::new("broca-three-collisions");
     let path = root.join("broca.jsonc");
     let mut vault = FakeVault::new(root.path(), [Put::Collision; 3]);
@@ -356,10 +363,10 @@ fn three_collisions_drop_intent_and_next_run_does_not_adopt_third() {
     assert_ne!(puts[0], puts[1]);
     assert_ne!(puts[1], puts[2]);
     assert_ne!(puts[0], puts[2]);
-    assert!(run(root.path(), &mut vault)
-        .unwrap_err()
-        .contains("multiple active"));
+    assert!(vault.grants().is_empty());
+    assert_eq!(run(root.path(), &mut vault).unwrap(), "no change");
     assert_eq!(vault.puts(), puts);
+    assert_eq!(vault.grants().len(), 3);
     assert!(!path.exists());
 }
 
@@ -380,14 +387,14 @@ fn child_broca_checkpoint() {
 
 #[cfg(feature = "test-support")]
 #[test]
-fn process_restart_recovers_saved_broca_intent_at_each_put_and_settings_cut() {
+fn process_restart_recovers_saved_broca_intent_at_each_put_and_grant_cut() {
     use crate::setup::apply::module_steps_tests::crash_at;
     for (cut, collision, before_puts, adds_put) in [
         ("broca-intent-saved", false, 0, true),
         ("broca-put-complete", false, 1, false),
-        ("broca-settings-written", false, 1, false),
+        ("broca-grants-complete", false, 1, false),
         ("broca-put-refused", true, 1, false),
-        ("broca-collision-intent-saved", true, 1, true),
+        ("broca-collision-intent-saved", true, 1, false),
         ("broca-put-complete", true, 2, false),
     ] {
         let root = ScratchDir::new("broca-process-cut");
@@ -405,10 +412,10 @@ fn process_restart_recovers_saved_broca_intent_at_each_put_and_settings_cut() {
         );
         let mut vault = FakeVault::new(root.path(), []);
         assert_eq!(vault.puts().len(), before_puts, "{cut}");
-        assert_eq!(file.exists(), cut == "broca-settings-written", "{cut}");
+        assert!(!file.exists(), "{cut}");
         let rows = restart(root.path());
         assert!(!file.exists(), "{cut}");
-        let intended = intent_key(&rows, &file).unwrap().unwrap();
+        assert!(intent_key(&rows, &file).unwrap().is_some(), "{cut}");
         drop(rows);
         assert_eq!(run(root.path(), &mut vault).unwrap(), "ensured", "{cut}");
         assert_eq!(
@@ -416,11 +423,8 @@ fn process_restart_recovers_saved_broca_intent_at_each_put_and_settings_cut() {
             before_puts + usize::from(adds_put),
             "{cut}"
         );
-        assert_eq!(
-            fs::read_to_string(&file).unwrap(),
-            keyfile(intended),
-            "{cut}"
-        );
+        assert!(!file.exists(), "{cut}");
+        assert!(!vault.grants().is_empty(), "{cut}");
         assert!(!inventory(root.path()).owns_path(INTENT, &file), "{cut}");
     }
 }

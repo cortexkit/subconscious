@@ -145,6 +145,23 @@ catalog together without asking to enable policies.
 standalone installation under the daemon. They print the plan and change
 nothing until you add `--confirm`.
 
+### Share Broca keys between paired computers
+
+If you set up Broca separately on two computers, pair them in Callosum first.
+Then run this command on **each** computer, naming the other one:
+
+```sh
+ck setup share-keys --with <paired-computer>
+```
+
+You can use the paired name or the computer's fingerprint. If the command
+reports missing vault transfer prerequisites, run the fix commands it prints.
+Transfers stay pending until the receiving computer runs `share-keys`; if the
+first computer ran before there was anything to receive, run it there again.
+Both computers keep their existing keys. Broca uses the lowest-numbered key
+it can read for new sessions unless you explicitly configured a key ID.
+Existing sessions keep the keys they were stored with.
+
 ## 4. Connect an agent
 
 The modules the daemon runs are presented to an agent as one MCP server,

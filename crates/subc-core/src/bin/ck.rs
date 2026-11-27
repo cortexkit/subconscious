@@ -49,9 +49,9 @@ use routes_cli::supervisor_routes;
 mod stack_cli;
 mod window_cli;
 use ck_help::{is_builtin_domain, top_help, BUILTIN_DOMAINS};
+use ck_setup_cli::SETUP_HELP;
 #[cfg(test)]
-use ck_setup_cli::parse_setup_component;
-use ck_setup_cli::{parse_setup_command, SETUP_HELP};
+use ck_setup_cli::{parse_setup_command, parse_setup_component};
 use ckni::JsonOutput;
 use log_tail::{follow_module_logs, LogFollower};
 
@@ -539,12 +539,8 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
     if let Command::Setup(request) = &args.command {
         return setup_command(&running_executable()?, request, ckni);
     }
-    if let Command::SetupOperatorPrompt { uninstall } = &args.command {
-        return setup::operator_prompt::run(
-            *uninstall,
-            !ckni && io::stdin().is_terminal() && io::stdout().is_terminal(),
-        )
-        .map_err(|error| CkError::rejected(format!("operator prompt setup: {error}")));
+    if let Command::SetupExtra(action) = args.command {
+        return ck_setup_cli::run(action, args.subc, ckni).await;
     }
     if let Command::Upgrade {
         check,
@@ -758,7 +754,7 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
         }
         Command::FleetLint { .. }
         | Command::Setup(_)
-        | Command::SetupOperatorPrompt { .. }
+        | Command::SetupExtra(_)
         | Command::Upgrade { .. }
         | Command::Help(_)
         | Command::External { .. }
@@ -1520,9 +1516,7 @@ enum Command {
     CliFaceReservedNames,
     Dashboard,
     Setup(setup::SetupRequest),
-    SetupOperatorPrompt {
-        uninstall: bool,
-    },
+    SetupExtra(ck_setup_cli::Extra),
     Upgrade {
         check: bool,
         verbose: bool,
@@ -7189,25 +7183,7 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
         "policy-root" => policy_root_cli::parse(tail),
         "stack" => stack_cli::parse(tail),
         "window" => window_cli::parse(tail),
-        "setup"
-            if tail
-                .iter()
-                .any(|arg| arg == "-h" || arg == "--help" || arg == "help") =>
-        {
-            Ok(Command::Help(SETUP_HELP.into()))
-        }
-        "setup" if tail.first().is_some_and(|value| value == "operator-prompt") => {
-            match &tail[1..] {
-                [] => Ok(Command::SetupOperatorPrompt { uninstall: false }),
-                [flag] if flag == "--uninstall" => {
-                    Ok(Command::SetupOperatorPrompt { uninstall: true })
-                }
-                _ => Err(CkError::Usage(
-                    "usage: ck setup operator-prompt [--uninstall]".into(),
-                )),
-            }
-        }
-        "setup" => parse_setup_command(tail).map(Command::Setup),
+        "setup" => ck_setup_cli::parse(tail),
         "upgrade"
             if tail
                 .iter()
@@ -10970,7 +10946,7 @@ mod tests {
         let command = parse_command("setup", &test_tail(&["operator-prompt"])).unwrap();
         assert!(matches!(
             command,
-            Command::SetupOperatorPrompt { uninstall: false }
+            Command::SetupExtra(ck_setup_cli::Extra::OperatorPrompt { uninstall: false })
         ));
         assert!(matches!(
             ckni::plain_output(&command),
@@ -10979,7 +10955,7 @@ mod tests {
         assert!(JsonOutput::for_command(&command, true, true).is_err());
         assert!(matches!(
             parse_command("setup", &test_tail(&["operator-prompt", "--uninstall"])).unwrap(),
-            Command::SetupOperatorPrompt { uninstall: true }
+            Command::SetupExtra(ck_setup_cli::Extra::OperatorPrompt { uninstall: true })
         ));
         for tail in [
             vec!["operator-prompt", "--yes"],

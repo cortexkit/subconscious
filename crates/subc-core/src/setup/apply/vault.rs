@@ -2,12 +2,19 @@ use super::super::{
     model::Component,
     runtime::{CommandResult, CommandRunner},
 };
+use serde::Deserialize;
 use std::{path::Path, time::Duration};
 
 const LEASE_RETRIES: usize = 10;
 const LEASE_DELAY: Duration = Duration::from_secs(2);
 
 type Grant = (&'static str, &'static str, &'static str);
+
+#[derive(Deserialize)]
+pub(super) struct Credential {
+    pub id: String,
+    pub state: String,
+}
 
 pub(super) fn component_grants(component: Component) -> &'static [Grant] {
     match component {
@@ -38,6 +45,31 @@ pub(super) struct Auth<'a> {
 }
 
 impl Auth<'_> {
+    pub fn list(&mut self) -> Result<Vec<Credential>, String> {
+        #[derive(Deserialize)]
+        struct Listing {
+            v: u64,
+            credentials: Vec<Credential>,
+        }
+        let result = self.retry_lease(&["list", "--json"])?;
+        if result.exit_code != Some(0) {
+            return Err(format!(
+                "ck auth list --json failed{}: {}",
+                exit_description(&result),
+                result.explanation()
+            ));
+        }
+        let listing: Listing = serde_json::from_str(&result.stdout)
+            .map_err(|_| "refusal: ck auth list --json returned invalid JSON or record fields")?;
+        if listing.v != 1 {
+            return Err(format!(
+                "refusal: ck auth list --json returned unsupported v={}",
+                listing.v
+            ));
+        }
+        Ok(listing.credentials)
+    }
+
     fn run(&mut self, args: &[String]) -> Result<CommandResult, String> {
         self.runner.run(&self.program.to_string_lossy(), args)
     }
@@ -65,17 +97,7 @@ impl Auth<'_> {
         selector: &str,
         op: &str,
     ) -> Result<bool, String> {
-        let args = [
-            "grant",
-            "--principal",
-            principal,
-            "--selector-kind",
-            kind,
-            "--selector",
-            selector,
-            "--operation",
-            op,
-        ];
+        let args = grant_args(principal, kind, selector, op);
         let description = || format!("ck auth grant ({principal}, {kind}, {selector}, {op})");
         let (first, retried) = self
             .run_with_retries(&args)
@@ -106,6 +128,25 @@ impl Auth<'_> {
         }
         Ok(changed)
     }
+}
+
+pub(super) fn grant_args<'a>(
+    principal: &'a str,
+    kind: &'a str,
+    selector: &'a str,
+    op: &'a str,
+) -> [&'a str; 9] {
+    [
+        "grant",
+        "--principal",
+        principal,
+        "--selector-kind",
+        kind,
+        "--selector",
+        selector,
+        "--operation",
+        op,
+    ]
 }
 
 pub(super) fn exit_description(result: &CommandResult) -> String {

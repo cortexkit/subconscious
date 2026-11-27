@@ -59,7 +59,7 @@ pub(crate) fn json_form(command: &Command) -> JsonForm {
         Command::MachineShow => JsonForm::Schema("ck.machine.show/v1"),
         Command::MachineAdopt { .. } => JsonForm::Schema("ck.machine.adopt/v1"),
         Command::Quota { .. } => JsonForm::Schema("ck.quota/v1"),
-        Command::Setup(_) | Command::SetupOperatorPrompt { .. } => JsonForm::None("setup"),
+        Command::Setup(_) | Command::SetupExtra(_) => JsonForm::None("setup"),
         Command::Upgrade { .. } => JsonForm::None("upgrade"),
         Command::FleetLint { .. } => JsonForm::None("daemon lint"),
         Command::Help(text) => {

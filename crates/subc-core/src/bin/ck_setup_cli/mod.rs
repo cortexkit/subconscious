@@ -1,8 +1,15 @@
-use std::{collections::BTreeSet, ffi::OsString, path::PathBuf};
+use std::{
+    collections::BTreeSet,
+    ffi::OsString,
+    io::{self, IsTerminal},
+    path::{Path, PathBuf},
+};
 
-use subc_core::setup;
+use subc_core::setup::{self, CommandResult, CommandRunner, SystemCommandRunner};
 
-use super::CkError;
+use super::{
+    discover_connection_file, policy_root_cli, running_executable, CkClient, CkError, Command,
+};
 
 pub(super) const SETUP_HELP: &str = "ck setup — plan managed CortexKit installation
 
@@ -12,6 +19,7 @@ usage:
   ck setup <aft|mc> --convert [--confirm]
   ck setup --uninstall [--dry-run]
   ck setup operator-prompt [--uninstall]
+  ck setup share-keys --with <paired-computer>
 
   Components: aft, mc, insula, claustrum, synapse, fusiform, cingulate,
   entorhinal, astrocyte, striatum, broca, cerebellum, plexus.
@@ -21,6 +29,7 @@ usage:
   previews. Explicit picks also install their needs: for example,
   ck setup --with plexus adds claustrum and entorhinal.
   --key-path is valid whenever claustrum is selected, directly or as a need.
+  share-keys exchanges Broca deployment keys. Run it on both computers after pairing.
   Module settings live in per-module JSONC files. On macOS the Cerebellum
   browser extension is a separate release asset, not a binary.
 
@@ -29,6 +38,124 @@ usage:
   skips the question. Piped or non-terminal setup proceeds without a question.
   --convert requires --confirm before applying a conversion. --verbose includes
   additional plan outcomes and download diagnostics when a network request fails.";
+
+const SHARE_HELP: &str = "usage: ck setup share-keys --with <paired-computer>\n\nExchange Broca deployment keys after pairing two separately set-up computers. Run on both computers, naming the other by its name, fingerprint, or fed-computer member ID.";
+
+#[derive(Debug)]
+pub(super) enum Extra {
+    OperatorPrompt { uninstall: bool },
+    ShareKeys(String),
+}
+
+pub(super) fn parse(tail: &[OsString]) -> Result<Command, CkError> {
+    if let Some((verb, rest)) = tail.split_first() {
+        if verb == "share-keys" {
+            return match rest {
+                [help] if matches!(help.to_str(), Some("help" | "--help" | "-h")) => {
+                    Ok(Command::Help(SHARE_HELP.into()))
+                }
+                [flag, name] if flag == "--with" => {
+                    let name = name
+                        .to_str()
+                        .filter(|name| !name.is_empty() && !name.starts_with('-'))
+                        .ok_or_else(|| CkError::Usage(SHARE_HELP.into()))?;
+                    Ok(Command::SetupExtra(Extra::ShareKeys(name.into())))
+                }
+                _ => Err(CkError::Usage(SHARE_HELP.into())),
+            };
+        }
+    }
+    if tail
+        .iter()
+        .any(|arg| arg == "-h" || arg == "--help" || arg == "help")
+    {
+        return Ok(Command::Help(SETUP_HELP.into()));
+    }
+    if let Some((verb, rest)) = tail.split_first() {
+        if verb == "operator-prompt" {
+            let uninstall = match rest {
+                [] => false,
+                [flag] if flag == "--uninstall" => true,
+                _ => {
+                    return Err(CkError::Usage(
+                        "usage: ck setup operator-prompt [--uninstall]".into(),
+                    ))
+                }
+            };
+            return Ok(Command::SetupExtra(Extra::OperatorPrompt { uninstall }));
+        }
+    }
+    parse_setup_command(tail).map(Command::Setup)
+}
+
+pub(super) async fn run(action: Extra, subc: Option<PathBuf>, ckni: bool) -> Result<(), CkError> {
+    match action {
+        Extra::OperatorPrompt { uninstall } => setup::operator_prompt::run(
+            uninstall,
+            !ckni && io::stdin().is_terminal() && io::stdout().is_terminal(),
+        )
+        .map_err(|error| CkError::rejected(format!("operator prompt setup: {error}"))),
+        Extra::ShareKeys(with) => {
+            if subc.is_some() {
+                // The vault CLI independently discovers the default daemon.
+                return Err(CkError::Usage(
+                    "ck setup share-keys uses the default local daemon; omit --subc.".into(),
+                ));
+            }
+            let ck = running_executable()?;
+            tokio::task::spawn_blocking(move || {
+                setup::share_keys(
+                    &with,
+                    &ck,
+                    &mut ShareRunner(tokio::runtime::Handle::current()),
+                    |line| println!("{line}"),
+                )
+            })
+            .await
+            .map_err(|error| CkError::Message(format!("could not share keys: {error}")))?
+            .map_err(CkError::rejected)
+        }
+    }
+}
+
+struct ShareRunner(tokio::runtime::Handle);
+
+impl CommandRunner for ShareRunner {
+    fn run(&mut self, program: &str, args: &[String]) -> Result<CommandResult, String> {
+        // Run `ck auth` so the same command lookup and executable checks apply
+        // as when the operator invokes it directly.
+        let args = std::iter::once("auth".into())
+            .chain(args.iter().cloned())
+            .collect::<Vec<_>>();
+        SystemCommandRunner.run(program, &args)
+    }
+
+    fn callosum_devices(&mut self) -> Result<CommandResult, String> {
+        let result: Result<_, CkError> = self.0.block_on(async {
+            let mut client = CkClient::connect(discover_connection_file(None::<&Path>)?).await?;
+            let route =
+                policy_root_cli::open_management(&mut client, "callosum", "setup-share-keys")
+                    .await?;
+            let reply = client
+                .route_request_value(
+                    route,
+                    serde_json::json!({"method": "callosum.devices_read", "params": {}}),
+                )
+                .await;
+            client.route_goodbye(route).await;
+            reply
+        });
+        let reply = result
+            .map_err(|error| format!("Could not read Callosum's paired computers: {error}"))?;
+        let body = reply.get("result").unwrap_or(&reply);
+        Ok(CommandResult {
+            success: true,
+            exit_code: Some(0),
+            stdout: body.to_string(),
+            stderr: String::new(),
+        })
+    }
+}
 
 pub(super) fn parse_setup_command(tail: &[OsString]) -> Result<setup::SetupRequest, CkError> {
     let mut optional = BTreeSet::new();

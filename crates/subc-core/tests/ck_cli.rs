@@ -3576,6 +3576,25 @@ fn setup_synapse_without_a_host_asset_is_one_complete_refusal_line() {
 }
 
 #[test]
+fn setup_share_keys_help_and_misuse_do_not_need_a_daemon() {
+    let usage = "ck setup share-keys --with <paired-computer>";
+    for args in [&["setup", "--help"][..], &["setup", "share-keys", "--help"]] {
+        let output = ck_command().args(args).output().unwrap();
+        assert_exit(&output, 0);
+        assert!(text(&output.stdout).contains(usage));
+    }
+    for args in [
+        &["setup", "share-keys"][..],
+        &["setup", "share-keys", "--with"],
+        &["setup", "share-keys", "--with", "Other PC", "--dry-run"],
+    ] {
+        let output = ck_command().args(args).output().unwrap();
+        assert_exit(&output, 2);
+        assert!(text(&output.stderr).contains(usage));
+    }
+}
+
+#[test]
 fn setup_plexus_dry_run_lists_programs_catalog_grants_and_post_health_policy() {
     let fixture = SetupFixture::installed("ck-setup-plexus-plan");
     let index = serve_signed_index(|base| {

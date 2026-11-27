@@ -270,6 +270,20 @@ The command surface is:
   Per-module settings (such as `fusiform.jsonc`, `broca.jsonc`, and
   `cerebellum.jsonc`) live under the config home's `cortexkit/` directory,
   alongside `subc.jsonc`. Setup does not overwrite existing settings files.
+- `ck setup broca` creates a deployment key only if the local vault has no
+  active deployment key, and ensures Broca can read each active key. It does
+  not write `session_storage.deployment_key_id`.
+- After pairing two separately set-up computers, run
+  `ck setup share-keys --with <paired-computer>` on each computer, naming the
+  other by its verified Callosum name, fingerprint, or `fed-computer:` member ID.
+  The command checks the local vault's receiving prerequisites and prints any
+  missing setup commands without running them. It sends all local Broca
+  deployment keys and processes only incoming deployment keys from that
+  computer. It grants Broca read access before accepting a new key and rejects
+  an ID already held rather than replacing a key. Run it again on the first
+  computer if the return transfers arrived after its initial run. The computers
+  retain their existing keys and, absent an explicit key ID, Broca chooses the
+  lowest-numbered readable key for new sessions. No settings are changed.
 - `ck setup --with plexus` selects Claustrum and Entorhinal as hard dependencies.
   It writes a reserved `modules.plexus` entry with a registration channel but no
   arguments, environment, or module settings file. It authorizes `reserved:plexus`

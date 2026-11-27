@@ -100,6 +100,10 @@ impl CommandResult {
 pub trait CommandRunner {
     fn run(&mut self, program: &str, args: &[String]) -> Result<CommandResult, String>;
 
+    fn callosum_devices(&mut self) -> Result<CommandResult, String> {
+        Err("this command runner cannot read Callosum devices".into())
+    }
+
     /// Best-effort daemon restart announcement, separate from service commands
     /// so dry-run runners do not contact a live daemon.
     fn announce_restart(&mut self, _connection: Option<&Path>) -> Result<(), String> {
@@ -122,6 +126,10 @@ pub struct DaemonProcess {
 }
 
 impl<R: CommandRunner + ?Sized> CommandRunner for Box<R> {
+    fn callosum_devices(&mut self) -> Result<CommandResult, String> {
+        (**self).callosum_devices()
+    }
+
     fn announce_restart(&mut self, connection: Option<&Path>) -> Result<(), String> {
         (**self).announce_restart(connection)
     }

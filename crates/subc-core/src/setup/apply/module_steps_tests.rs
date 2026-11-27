@@ -481,11 +481,8 @@ fn failing_cerebellum_grant_undoes_its_component_but_keeps_committed_broca() {
         "{error}"
     );
     assert!(error.ends_with("ck setup --with broca"), "{error}");
-    assert_eq!(
-        fs::read_to_string(&broca_file).unwrap(),
-        "{\"session_storage\":{\"deployment_key_id\":42}}\n"
-    );
-    assert!(backend.inventory.owns_path("settings-receipt", &broca_file));
+    assert!(!broca_file.exists());
+    assert!(!backend.inventory.owns_path("settings-receipt", &broca_file));
     assert!(!backend.inventory.owns_path("broca-key-intent", &broca_file));
     let broca = backend.paths.binary_home.join("ck-broca");
     let cerebellum = backend.paths.binary_home.join("ck-cerebellum");
@@ -591,7 +588,7 @@ fn second_bare_setup_plans_ensures_but_leaves_files_and_inventory_unchanged() {
         [
             "ensure astrocyte vault grants",
             "ensure striatum vault grants",
-            "ensure Broca deployment key: settings name 1; ensures the grant on 1",
+            "ensure Broca deployment key: found 1 active key; ensures Broca's read grant on each",
             "ensure broca vault grants",
             "ensure cerebellum vault grants",
             "ensure Chrome native messaging with ck-cerebellum-native-host --register",
@@ -610,16 +607,11 @@ fn second_bare_setup_plans_ensures_but_leaves_files_and_inventory_unchanged() {
 #[test]
 fn observed_broca_refusal_is_left_out_under_bare_setup_but_blocks_an_explicit_pick() {
     use crate::setup::model::PlanOutcome;
-    for (had_file, listing, named) in [
+    for (listing, named) in [
+        (r#"{"v":2,"credentials":[]}"#, "unsupported v=2"),
         (
-            true,
-            r#"{"v":1,"credentials":[]}"#,
-            "opaque:broca-deployment:1",
-        ),
-        (
-            false,
-            r#"{"v":1,"credentials":[{"id":"opaque:broca-deployment:2","state":"active"},{"id":"opaque:broca-deployment:3","state":"active"}]}"#,
-            "opaque:broca-deployment:2",
+            r#"{"v":1,"credentials":[{"id":"opaque:broca-deployment:0","state":"active"}]}"#,
+            "opaque:broca-deployment:0",
         ),
     ] {
         let root = ScratchDir::new("setup-observable-broca-refusal");
@@ -630,9 +622,6 @@ fn observed_broca_refusal_is_left_out_under_bare_setup_but_blocks_an_explicit_pi
                 .to_string(),
         )
         .unwrap();
-        if had_file {
-            fs::write(root.join("broca.jsonc"), "{}\n").unwrap();
-        }
         let index = backend.artifacts.cloned_index().unwrap();
         backend.runner = Box::new(Fake {
             answers: VecDeque::from([(0, listing), (0, listing)]),

@@ -38,6 +38,8 @@ mod validation;
 pub mod wizard;
 
 pub use apply::data_directory;
+#[doc(hidden)]
+pub use apply::share_keys::share_keys;
 pub(crate) use apply::user_home;
 pub use apply::{
     default_claustrum_key_path, installed_service_facts, start_installed_service, SetupBackend,
@@ -50,6 +52,8 @@ pub use model::{
     SetupObserved, SetupRequest, UpgradeOperation, UpgradeState, UpgradeTarget,
 };
 pub use planner::{plan_setup, plan_upgrade, SetupPlan, UpgradePlan};
+#[doc(hidden)]
+pub use runtime::{CommandResult, CommandRunner, SystemCommandRunner};
 pub use update_cache::{cache_directory, UpdateCache};
 pub use update_check::{
     check_update_metadata, dashboard_update, not_checked_from_cache, IndexReleaseSource,

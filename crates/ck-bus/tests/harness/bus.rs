@@ -248,3 +248,25 @@ pub fn read_json(path: &Path) -> Value {
     )
     .expect("store file is JSON")
 }
+
+/// Reads `path` as JSON once `ready` accepts it, polling for up to `limit`.
+/// The sentinel answers health from memory first and writes its verdict file
+/// just after, so a test that has only seen the health answer polls the file.
+pub async fn wait_json(path: &Path, limit: Duration, ready: impl Fn(&Value) -> bool) -> Value {
+    let deadline = Instant::now() + limit;
+    loop {
+        if let Some(value) = std::fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .filter(|value| ready(value))
+        {
+            return value;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{} did not reach the expected state within {limit:?}",
+            path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}

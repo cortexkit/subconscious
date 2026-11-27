@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.13.9
+
+- Test only: the sentinel restart test waits for the verdict file instead of
+  reading it the moment health answers up, since health reports the verdict
+  from memory just before the file is written.
+
 ## 0.13.8
 
 - Require subc-daemon 0.54.0 for narrow flow-scope authority.

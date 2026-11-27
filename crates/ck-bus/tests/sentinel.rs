@@ -409,8 +409,11 @@ async fn before_its_first_answer_a_restarted_process_answers_down_unavailable() 
         .root
         .path()
         .join("data/cortexkit/ckbus/sentinel_verdict.json");
-    let persisted = bus::read_json(&verdict_file);
-    assert_eq!(persisted["verdict"], "up");
+    // Health answers from memory before the verdict file is written.
+    let persisted = bus::wait_json(&verdict_file, Duration::from_secs(5), |value| {
+        value["verdict"] == "up"
+    })
+    .await;
     assert_eq!(persisted["incarnation"], plane.started.incarnation.as_str());
 
     // The broker stops before the restarted process can probe at all.

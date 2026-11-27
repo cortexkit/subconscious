@@ -92,6 +92,32 @@ pub(super) struct Limits {
     pub(super) window: Duration,
     pub(super) local: Duration,
     pub(super) modules: Duration,
+    #[cfg(test)]
+    pub(super) budget_override: Option<(Budget, Duration)>,
+    #[cfg(test)]
+    pub(super) before_describe_launch: Option<fn(Instant)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Budget {
+    Manager,
+    Cpu,
+    List,
+}
+
+impl Limits {
+    fn budget(&self, stage: Budget) -> Duration {
+        #[cfg(test)]
+        if let Some((overridden, duration)) = self.budget_override {
+            if overridden == stage {
+                return duration;
+            }
+        }
+        match stage {
+            Budget::Manager | Budget::Cpu => self.local,
+            Budget::List => self.rpc,
+        }
+    }
 }
 
 impl Default for Limits {
@@ -102,6 +128,10 @@ impl Default for Limits {
             window: Duration::from_secs(3),
             local: Duration::from_secs(5),
             modules: Duration::from_secs(15),
+            #[cfg(test)]
+            budget_override: None,
+            #[cfg(test)]
+            before_describe_launch: None,
         }
     }
 }
@@ -348,7 +378,7 @@ fn pass(
         let host = host.clone();
         move || stack_checks::disk(host.as_ref())
     });
-    let service = launch(local_deadline, {
+    let service = launch(start + limits.budget(Budget::Manager), {
         let host = host.clone();
         let use_process = connection_override.is_none();
         move || {
@@ -372,6 +402,10 @@ fn pass(
 
     let hint = Arc::new(AtomicU64::new(0));
     let describe_deadline = start + limits.describe;
+    #[cfg(test)]
+    if let Some(before_launch) = limits.before_describe_launch {
+        before_launch(start);
+    }
     let describe = launch(describe_deadline, {
         let (host, connection_override, hint) =
             (host.clone(), connection_override.clone(), hint.clone());
@@ -505,7 +539,7 @@ fn online(
     cutoff: Instant,
     limits: &Limits,
 ) -> (Vec<Finding>, ModuleFindings) {
-    let list = launch_rpc(limits.rpc, {
+    let list = launch_rpc(limits.budget(Budget::List), {
         let daemon = daemon.clone();
         move |deadline| daemon.list(deadline)
     });
@@ -521,9 +555,10 @@ fn online(
     let modules = match check_rpc(list.receive()) {
         Ok(mut list) => {
             if let Some(row) = list.daemon {
-                cpu = Some(launch(Instant::now() + limits.local, move || {
-                    stack_checks::sample_cpu(host.as_ref(), row.pid, row.start_time_ms)
-                }));
+                cpu = Some(launch(
+                    Instant::now() + limits.budget(Budget::Cpu),
+                    move || stack_checks::sample_cpu(host.as_ref(), row.pid, row.start_time_ms),
+                ));
             }
             list.modules.sort_by(|a, b| a.module_id.cmp(&b.module_id));
             list.modules

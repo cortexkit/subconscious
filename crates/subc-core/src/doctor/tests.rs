@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, Condvar, Mutex,
+        mpsc, Arc, Condvar, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -33,7 +33,7 @@ use crate::{
 use super::{
     host::{read_windows, ConnectionFence, DoctorDaemon, RpcError, RpcResult},
     module_checks,
-    run::{now_ms, run_with, Limits, Pass},
+    run::{now_ms, run_with, Budget, Limits, Pass},
     stack_checks::{cpu_delta, resources, Binary},
     window_checks::WindowRow,
 };
@@ -462,14 +462,15 @@ impl DoctorDaemon for FakeDaemon {
 #[derive(Default)]
 struct FakeLogs {
     seen: Mutex<Vec<String>>,
-    block_at: Option<Arc<Gate>>,
+    block_at: Option<(mpsc::Sender<()>, Arc<Gate>)>,
 }
 
 impl LogFallback for FakeLogs {
     fn tail(&self, module: &str) -> LogFallbackRead {
         self.seen.lock().unwrap().push(module.into());
         if module == "slow" {
-            if let Some(gate) = &self.block_at {
+            if let Some((entered, gate)) = &self.block_at {
+                entered.send(()).unwrap();
                 gate.wait();
             }
         }
@@ -502,22 +503,52 @@ impl Gate {
     }
 }
 
-fn short_limits() -> Limits {
+const FAKE_WAIT_CAP: Duration = Duration::from_secs(30);
+const RPC_TIMEOUT: Duration = Duration::from_millis(120);
+const LOCAL_TIMEOUT: Duration = Duration::from_millis(200);
+
+// Only deliberately blocked fixture stages use short deadlines. The cap makes
+// a broken fake fail instead of hanging while allowing for delayed scheduling.
+fn fixture_limits() -> Limits {
     Limits {
-        describe: Duration::from_millis(120),
-        rpc: Duration::from_millis(120),
-        window: Duration::from_millis(120),
-        local: Duration::from_millis(200),
-        modules: Duration::from_millis(700),
+        describe: FAKE_WAIT_CAP,
+        rpc: FAKE_WAIT_CAP,
+        window: FAKE_WAIT_CAP,
+        local: FAKE_WAIT_CAP,
+        modules: FAKE_WAIT_CAP,
+        ..Limits::default()
     }
 }
 
+#[test]
+fn delayed_describe_launch_does_not_make_an_answering_fixture_offline() {
+    let host = Arc::new(Fixture::new("doctor-delayed-launch"));
+    let mut limits = fixture_limits();
+    // Hold Describe until a short RPC deadline would have elapsed, as if the
+    // test runner had descheduled the diagnostic pass before spawning it.
+    limits.before_describe_launch = Some(|start| {
+        thread::sleep((start + RPC_TIMEOUT).saturating_duration_since(Instant::now()));
+    });
+    let result = run_with(
+        host.clone(),
+        DoctorOptions::default(),
+        Arc::new(FakeLogs::default()),
+        &limits,
+    );
+    assert_eq!(host.connects.load(Ordering::Relaxed), 1);
+    assert!(result.document.daemon_answered);
+}
+
 fn execute(host: Fixture) -> DoctorRun {
+    execute_with_limits(host, &fixture_limits())
+}
+
+fn execute_with_limits(host: Fixture, limits: &Limits) -> DoctorRun {
     run_with(
         Arc::new(host),
         DoctorOptions::default(),
         Arc::new(FakeLogs::default()),
-        &short_limits(),
+        limits,
     )
 }
 
@@ -654,7 +685,7 @@ fn check_layout(host: Fixture) -> (Arc<Fixture>, DoctorRun) {
         host.clone(),
         DoctorOptions::default(),
         Arc::new(FakeLogs::default()),
-        &short_limits(),
+        &fixture_limits(),
     );
     (host, result)
 }
@@ -786,7 +817,7 @@ fn offline_override_names_path_no_local_inference_or_logs_or_offer() {
             fix: false,
         },
         logs.clone(),
-        &short_limits(),
+        &fixture_limits(),
     );
     let unreachable = finding(&result, "daemon.unreachable");
     assert!(unreachable.summary.contains(path.to_str().unwrap()));
@@ -810,7 +841,13 @@ pub(crate) fn run_with_blocked_describe(
     let gate = Arc::new(Gate::default());
     host.describe_gate = Some(gate.clone());
     host.manager = observation;
-    let result = execute(host);
+    let result = execute_with_limits(
+        host,
+        &Limits {
+            describe: RPC_TIMEOUT,
+            ..fixture_limits()
+        },
+    );
     // Unblock describe so its detached worker can exit.
     gate.open();
     result
@@ -898,7 +935,7 @@ fn disk_uses_existing_ancestor_and_strict_space_limits() {
             host.clone(),
             DoctorOptions::default(),
             Arc::new(FakeLogs::default()),
-            &short_limits(),
+            &fixture_limits(),
         );
         assert_eq!(host.disk_path.lock().unwrap().as_ref(), Some(&parent));
         assert!(!host.data.exists());
@@ -943,7 +980,7 @@ fn unix_permissions_find_only_access_that_matters_without_repairing() {
             host.clone(),
             DoctorOptions::default(),
             Arc::new(FakeLogs::default()),
-            &short_limits(),
+            &fixture_limits(),
         )
     };
     let result = pass();
@@ -1243,7 +1280,7 @@ fn fix_rechecks_only_after_a_revert_that_changes_something() {
                 ..DoctorOptions::default()
             },
             Arc::new(FakeLogs::default()),
-            &short_limits(),
+            &fixture_limits(),
         );
         assert_eq!(*host.reverts.lock().unwrap(), [window_id]);
         assert_eq!(host.connects.load(Ordering::Relaxed), passes);
@@ -1281,7 +1318,10 @@ fn fix_never_touches_manager_after_deadline_or_with_an_override() {
             ..DoctorOptions::default()
         },
         Arc::new(FakeLogs::default()),
-        &short_limits(),
+        &Limits {
+            budget_override: Some((Budget::Manager, LOCAL_TIMEOUT)),
+            ..fixture_limits()
+        },
     );
     manager.open();
     assert!(host.reverts.lock().unwrap().is_empty());
@@ -1303,7 +1343,7 @@ fn fix_never_touches_manager_after_deadline_or_with_an_override() {
             connection_override: Some("named.json".into()),
         },
         Arc::new(FakeLogs::default()),
-        &short_limits(),
+        &fixture_limits(),
     );
     assert_eq!(host.connects.load(Ordering::Relaxed), 1);
     assert_eq!(result.exit_code, 2);
@@ -1320,7 +1360,7 @@ fn fix_without_an_offer_does_not_revert_and_exits_by_findings() {
             ..DoctorOptions::default()
         },
         Arc::new(FakeLogs::default()),
-        &short_limits(),
+        &fixture_limits(),
     );
     assert!(host.reverts.lock().unwrap().is_empty());
     assert_eq!(result.exit_code, 0);
@@ -1341,7 +1381,14 @@ fn blocked_window_and_cpu_workers_are_abandoned_at_their_own_deadlines() {
         ..FakeDaemon::default()
     });
     let start = Instant::now();
-    let result = execute(host);
+    let result = execute_with_limits(
+        host,
+        &Limits {
+            window: RPC_TIMEOUT,
+            budget_override: Some((Budget::Cpu, LOCAL_TIMEOUT)),
+            ..fixture_limits()
+        },
+    );
     gate.open();
     assert!(start.elapsed() < Duration::from_secs(20));
     assert!(ids(&result).contains(&"daemon.timed_out"));
@@ -1362,7 +1409,13 @@ fn list_timeout_stops_module_calls_but_health_errors_do_not_erase_list_verdicts(
         ..FakeDaemon::default()
     });
     let daemon = host.daemon.clone();
-    let result = execute(host);
+    let result = execute_with_limits(
+        host,
+        &Limits {
+            budget_override: Some((Budget::List, RPC_TIMEOUT)),
+            ..fixture_limits()
+        },
+    );
     gate.open();
     let timeout = finding(&result, "module.timed_out");
     assert_eq!((&*timeout.owner, timeout.severity), ("ck", Severity::Error));
@@ -1473,7 +1526,7 @@ fn lost_connection_after_describe_gets_one_error_not_a_reconnect() {
         host.clone(),
         DoctorOptions::default(),
         Arc::new(FakeLogs::default()),
-        &short_limits(),
+        &fixture_limits(),
     );
     assert_eq!(host.connects.load(Ordering::Relaxed), 1);
     assert!(result.document.daemon_answered);
@@ -1854,24 +1907,25 @@ fn malformed_offline_config_reports_an_error_reading_it() {
 
 #[test]
 fn offline_preserves_truncated_reads_and_records_modules_left_by_deadline() {
+    use module_checks::{offline, OfflineLogs};
+
     let mut host = Fixture::new("doctor-log-fallback-cutoff");
-    host.answers = false;
     host.configured = Ok(vec!["slow".into(), "after".into(), "z-not-started".into()]);
     let gate = Arc::new(Gate::default());
+    let (entered, started) = mpsc::channel();
     let logs = Arc::new(FakeLogs {
-        block_at: Some(gate.clone()),
+        block_at: Some((entered, gate.clone())),
         ..FakeLogs::default()
     });
-    let result = run_with(
-        Arc::new(host),
-        DoctorOptions::default(),
-        logs.clone(),
-        &short_limits(),
-    );
+    let worker = OfflineLogs::start(Arc::new(host), logs.clone(), FAKE_WAIT_CAP);
+    // When the slow read starts, the first tail is already queued for collection.
+    started.recv_timeout(FAKE_WAIT_CAP).unwrap();
+    let result = offline(Some(worker.limit_collection_for_test(LOCAL_TIMEOUT)));
     gate.open();
-    assert_eq!(finding(&result, "module.timed_out").owner, "ck");
-    assert_eq!(result.log_tails.len(), 3);
-    let first = &result.log_tails[0];
+    let finding = |id| result.findings.iter().find(|row| row.id == id).unwrap();
+    assert_eq!(finding("module.timed_out").owner, "ck");
+    assert_eq!(result.tails.len(), 3);
+    let first = &result.tails[0];
     assert_eq!(
         (&*first.module, first.source, first.status),
         ("after", TailSource::LogFile, TailStatus::Read)
@@ -1882,11 +1936,11 @@ fn offline_preserves_truncated_reads_and_records_modules_left_by_deadline() {
     );
     assert!(first.truncated);
     assert_eq!(first.entries.len(), 20);
-    assert_eq!(result.log_tails[1].status, TailStatus::NotRead);
-    assert_eq!(result.log_tails[2].status, TailStatus::NotRead);
+    assert_eq!(result.tails[1].status, TailStatus::NotRead);
+    assert_eq!(result.tails[2].status, TailStatus::NotRead);
     assert_eq!(*logs.seen.lock().unwrap(), ["after", "slow"]);
     assert_eq!(
-        finding(&result, "module.daemon_unavailable").evidence["tails"][0]["entries"]
+        finding("module.daemon_unavailable").evidence["tails"][0]["entries"]
             .as_array()
             .unwrap()
             .len(),
@@ -1958,7 +2012,13 @@ fn blocked_install_and_disk_checks_emit_their_layer_deadlines() {
     let gate = Arc::new(Gate::default());
     host.install_gate = Some(gate.clone());
     host.disk_gate = Some(gate.clone());
-    let result = execute(host);
+    let result = execute_with_limits(
+        host,
+        &Limits {
+            local: LOCAL_TIMEOUT,
+            ..fixture_limits()
+        },
+    );
     gate.open();
     assert_eq!(
         finding(&result, "install.timed_out").severity,

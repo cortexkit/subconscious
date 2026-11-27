@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.24.10
+
+- Test-only: Give answering doctor fixtures time to run on a busy test runner
+  while keeping short deadlines for intentionally blocked checks.
+
 ## 0.24.9
 
 - Release restart-window locks when their guards end, even if a concurrently

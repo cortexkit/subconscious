@@ -61,6 +61,7 @@ struct Rig {
     config: ProgramConfig,
     scenarios: PathBuf,
     interrupt: Arc<Interrupt>,
+    limits: Limits,
 }
 
 impl Rig {
@@ -82,6 +83,7 @@ impl Rig {
             config,
             scenarios,
             interrupt: Arc::new(Interrupt::default()),
+            limits: fixture_limits(),
         }
     }
 
@@ -158,7 +160,7 @@ impl Rig {
                 full_feedback: mode == cortexkit_doctor::Mode::Full,
             },
             Arc::new(FakeLogs::default()),
-            &short_limits(),
+            &self.limits,
             &self.config,
         )
     }
@@ -403,7 +405,7 @@ fn config_errors_and_override_do_not_run_programs() {
         rig.host.clone(),
         DoctorOptions::default(),
         Arc::new(FakeLogs::default()),
-        &short_limits(),
+        &fixture_limits(),
     );
     assert!(serde_json::to_value(stack.document)
         .unwrap()
@@ -533,7 +535,7 @@ fn fix_consent_refusal_or_result_controls_second_pass() {
                 "module":"m", "finding":"module.failed", "class":"safe", "decision":decision,
                 "skip_reason":null, "result":result, "restart":null,
             }),
-            "{scenario}"
+            "{scenario}: {doc}"
         );
         assert_eq!(rig.host.connects.load(Ordering::Relaxed), passes);
         assert_eq!(
@@ -590,6 +592,7 @@ fn revert_or_overdue_manager_takes_precedence_over_module_fixes() {
         let manager = Arc::new(Gate::default());
         if overdue {
             rig.host_mut().manager_gate = Some(manager.clone());
+            rig.limits.budget_override = Some((Budget::Manager, LOCAL_TIMEOUT));
         } else {
             rig.host_mut().outcome = RevertOutcome::Reverted;
         }
@@ -653,7 +656,7 @@ fn failed_signal_setup_checks_but_neither_prompts_nor_stops() {
     rig.write_config();
     rig.interrupt.signal_setup_failed();
     let run = rig.run(true, &Prompt(|_: &str| panic!("registration failed")));
-    assert_eq!(run.checked.len(), 1);
+    assert_eq!(run.checked.len(), 1, "{:?}", run.run.document);
     assert_eq!(
         first_fix(&run).skip_reason,
         Some(ModuleFixSkip::SignalSetupFailed)
@@ -1145,6 +1148,7 @@ fn stop_and_start_have_independent_drain_and_operator_budgets() {
 #[test]
 fn stop_accepts_a_drain_that_exceeds_the_ordinary_read_deadline() {
     let mut rig = Rig::new();
+    rig.limits.rpc = Limits::default().rpc;
     rig.program("m", json!({"needs_stop":true}));
     rig.write_config();
     let running = entry("m", true, "running").with_drain_timeout_ms(Some(5_000));

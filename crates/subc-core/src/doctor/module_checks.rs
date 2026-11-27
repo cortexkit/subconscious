@@ -432,6 +432,12 @@ impl OfflineLogs {
         Self { receiver, deadline }
     }
 
+    #[cfg(test)]
+    pub(super) fn limit_collection_for_test(mut self, budget: Duration) -> Self {
+        self.deadline = Instant::now() + budget;
+        self
+    }
+
     fn collect(self) -> (Vec<LogTailRecord>, Option<Finding>) {
         let mut records = std::collections::BTreeMap::new();
         let mut completed = false;

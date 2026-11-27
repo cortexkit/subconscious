@@ -6,6 +6,8 @@ pub mod id;
 pub(crate) mod owner;
 pub(crate) mod paths;
 mod records;
+#[cfg(all(test, unix))]
+mod tests;
 
 pub use owner::{Liveness, Owner};
 pub use records::{
@@ -267,10 +269,10 @@ pub(crate) fn snapshot(root: &Path, id: &str) -> Result<Snapshot, String> {
     decode().map_err(|error| error_at(&path, error))
 }
 
-pub(crate) fn lock_file(path: &Path) -> Result<File, String> {
+pub(crate) fn lock_file(path: &Path) -> Result<WindowLock, String> {
     let lock = open_lock_file(path)?;
     match lock.try_lock() {
-        Ok(()) => Ok(lock),
+        Ok(()) => Ok(WindowLock(lock)),
         Err(TryLockError::WouldBlock) => {
             Err(error_at(path, "another window command holds the lock"))
         }
@@ -278,9 +280,19 @@ pub(crate) fn lock_file(path: &Path) -> Result<File, String> {
     }
 }
 
+pub(crate) struct WindowLock(File);
+
+impl Drop for WindowLock {
+    fn drop(&mut self) {
+        // On Unix, a concurrent fork can inherit the locked file until exec.
+        // Unlock explicitly so the child's descriptor cannot extend the guard's hold.
+        let _ = self.0.unlock();
+    }
+}
+
 /// Keeps the per-window advisory lock until dropped.
 pub struct Locked {
-    _lock: File,
+    _lock: WindowLock,
     root: PathBuf,
     dir: PathBuf,
     snapshot: Snapshot,

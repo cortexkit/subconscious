@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.24.9
+
+- Release restart-window locks when their guards end, even if a concurrently
+  forked child has not yet executed its new program.
+
 ## 0.24.8
 
 - Add the message-bus trust preparation for setup: check ownership, ensure

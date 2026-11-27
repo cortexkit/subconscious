@@ -1,4 +1,5 @@
 use super::*;
+use crate::live_children::ContainerEndReason;
 
 /// Command-line flag used by supervised modules to find subc.
 ///
@@ -1335,6 +1336,7 @@ pub(super) fn spawn_child(
 ) -> Result<SupervisedChild, SuperviseError> {
     #[cfg(all(test, unix))]
     if let Some(source) = containment_tests::join_failure(spec, roster) {
+        containment::note_end_reason(&roster.containment, ContainerEndReason::SpawnFailed);
         containment::terminate_blocking(&roster.containment);
         return Err(SuperviseError::Spawn {
             program: spec.program.clone(),
@@ -1360,6 +1362,7 @@ pub(super) fn spawn_child(
         .as_ref()
         .is_err_and(|error| !is_launch_deferral(error))
     {
+        containment::note_end_reason(&roster.containment, ContainerEndReason::SpawnFailed);
         if roster.admission_pending(&spec.module_id) {
             containment::terminate_deferred(&roster.containment);
         } else {
@@ -1671,6 +1674,10 @@ pub(super) async fn spawn_child_async(
 ) -> Result<SupervisedChild, SuperviseError> {
     #[cfg(all(test, unix))]
     if let Some(source) = containment_tests::join_failure(spec, &runtime.child_roster) {
+        containment::note_end_reason(
+            &runtime.child_roster.containment,
+            ContainerEndReason::SpawnFailed,
+        );
         containment::terminate_blocking(&runtime.child_roster.containment);
         return Err(SuperviseError::Spawn {
             program: spec.program.clone(),
@@ -1683,6 +1690,10 @@ pub(super) async fn spawn_child_async(
         .as_ref()
         .is_err_and(|error| !is_launch_deferral(error))
     {
+        containment::note_end_reason(
+            &runtime.child_roster.containment,
+            ContainerEndReason::SpawnFailed,
+        );
         if runtime.child_roster.admission_pending(&spec.module_id) {
             containment::terminate_deferred(&runtime.child_roster.containment);
         } else {
@@ -2448,6 +2459,7 @@ pub(super) fn launch_child_in_slot(
                 .and_then(|container| container.group())
                 .is_some()
             {
+                containment::note_end_reason(&roster.containment, ContainerEndReason::SpawnFailed);
                 containment::terminate_blocking(&roster.containment);
             }
             #[cfg(target_os = "linux")]
@@ -2889,6 +2901,7 @@ pub(super) fn launch_child_in_slot(
             }
         }
         if let Err(error) = resume_suspended_child(pid, spec) {
+            containment::note_end_reason(&roster.containment, ContainerEndReason::SpawnFailed);
             containment::terminate_blocking(&roster.containment);
             let _ = supervised.child.start_kill();
             return Err(error);

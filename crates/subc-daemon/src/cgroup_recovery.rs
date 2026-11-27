@@ -131,9 +131,18 @@ pub(crate) fn state(placement: Option<&Placement>, path: &Path) -> Option<Retain
 }
 
 pub(crate) fn signal_frozen(frozen: &FrozenModule, signal: Signal) -> io::Result<()> {
+    signal_frozen_reported(frozen, signal, &mut Default::default())
+}
+
+fn signal_frozen_reported(
+    frozen: &FrozenModule,
+    signal: Signal,
+    end: &mut crate::live_children::ContainerEnd,
+) -> io::Result<()> {
     let ProcsOutcome::Listed(pids) = frozen.processes() else {
         return Err(io::Error::other("cannot list frozen cgroup members"));
     };
+    end.observe_members(pids.len());
     let mut failure = None;
     for pid in pids {
         let result: io::Result<()> = (|| {
@@ -146,7 +155,13 @@ pub(crate) fn signal_frozen(frozen: &FrozenModule, signal: Signal) -> io::Result
             // guard keeps members stable instead.
             match frozen.processes() {
                 ProcsOutcome::Listed(current) if current.contains(&pid) => {
-                    process.signal(signal)?;
+                    if process.signal(signal)? {
+                        end.signal(if signal == Signal::Kill {
+                            "KILL"
+                        } else {
+                            "TERM"
+                        });
+                    }
                 }
                 ProcsOutcome::Listed(_) => {}
                 ProcsOutcome::IoError { error, .. } => return Err(error),
@@ -164,20 +179,26 @@ pub(crate) fn signal_frozen(frozen: &FrozenModule, signal: Signal) -> io::Result
 #[path = "cgroup_recovery_tests.rs"]
 mod tests;
 
-fn kill_checked(placement: &Placement, path: &Path) {
+fn kill_checked(placement: &Placement, path: &Path, end: &mut crate::live_children::ContainerEnd) {
     match subc_cgroup::kill_path(placement, path) {
-        KillOutcome::Killed | KillOutcome::NotPlaced => return,
+        KillOutcome::Killed => {
+            end.signal("KILL");
+            return;
+        }
+        KillOutcome::NotPlaced => return,
         outcome => {
             tracing::warn!(path = %path.display(), ?outcome, "atomic carried-cgroup kill unavailable; trying frozen members")
         }
     }
     match subc_cgroup::freeze_path_blocking(placement, path, FREEZE_BOUND) {
         FreezeOutcome::Frozen(frozen) => {
-            if let Err(error) = signal_frozen(&frozen, Signal::Kill) {
+            if let Err(error) = signal_frozen_reported(&frozen, Signal::Kill, end) {
+                end.failed = true;
                 tracing::warn!(path = %path.display(), %error, "frozen carried-cgroup kill failed");
             }
         }
         outcome => {
+            end.failed = true;
             tracing::warn!(path = %path.display(), ?outcome, "carried-cgroup freezer fallback failed")
         }
     }
@@ -186,15 +207,29 @@ fn kill_checked(placement: &Placement, path: &Path) {
 /// Retry without an async runtime. Never clear a populated or uninspectable
 /// subtree just because its leader is gone or its kill request was accepted.
 pub(crate) fn recheck(placement: Option<&Placement>, path: &Path) -> Option<RetainedReason> {
+    recheck_reported(placement, path, &mut Default::default())
+}
+
+pub(crate) fn recheck_reported(
+    placement: Option<&Placement>,
+    path: &Path,
+    end: &mut crate::live_children::ContainerEnd,
+) -> Option<RetainedReason> {
     let path = match trusted_path(placement, path) {
         Ok(Some(path)) => path,
         Ok(None) => return None,
         Err(reason) => return Some(reason),
     };
     if !matches!(populated(&path), Ok(false)) {
-        kill_checked(placement.expect("validated placement"), &path);
+        kill_checked(placement.expect("validated placement"), &path, end);
+    } else {
+        end.observe_members(0);
     }
-    state(placement, &path)
+    let reason = state(placement, &path);
+    if let Some(RetainedReason::ContainerSurvivors(pids)) = &reason {
+        end.observe_members(pids.len());
+    }
+    reason
 }
 
 fn decision(reason: Option<RetainedReason>, cleared: SweepDecision) -> SweepDecision {
@@ -212,6 +247,7 @@ pub(crate) async fn sweep(
     placement: Option<&Placement>,
     path: &Path,
     bounds: SweepBounds,
+    end: &mut crate::live_children::ContainerEnd,
 ) -> SweepDecision {
     let path = match trusted_path(placement, path) {
         Ok(Some(path)) => path,
@@ -220,12 +256,14 @@ pub(crate) async fn sweep(
     };
     let placement = placement.expect("validated placement");
     if matches!(populated(&path), Ok(false)) {
+        end.observe_members(0);
         return decision(state(Some(placement), &path), SweepDecision::Gone);
     }
     if let FreezeOutcome::Frozen(frozen) =
         subc_cgroup::freeze_path(placement, &path, FREEZE_BOUND).await
     {
-        if let Err(error) = signal_frozen(&frozen, Signal::Terminate) {
+        if let Err(error) = signal_frozen_reported(&frozen, Signal::Terminate, end) {
+            end.failed = true;
             tracing::warn!(path = %path.display(), %error, "frozen carried-cgroup TERM failed");
         }
         drop(frozen);
@@ -240,7 +278,7 @@ pub(crate) async fn sweep(
             tokio::time::sleep(POLL).await;
         }
     }
-    kill_checked(placement, &path);
+    kill_checked(placement, &path, end);
     let deadline = tokio::time::Instant::now() + bounds.kill_bound;
     loop {
         let reason = state(Some(placement), &path);
@@ -249,6 +287,9 @@ pub(crate) async fn sweep(
             .is_none_or(|reason| !reason.blocks_fresh_copy())
             || tokio::time::Instant::now() >= deadline
         {
+            if let Some(RetainedReason::ContainerSurvivors(pids)) = &reason {
+                end.observe_members(pids.len());
+            }
             return decision(reason, SweepDecision::Killed);
         }
         tokio::time::sleep(POLL).await;

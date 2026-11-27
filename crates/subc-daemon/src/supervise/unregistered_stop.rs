@@ -4,6 +4,7 @@ use std::io;
 pub(super) async fn stop_unregistered_child(child: &mut SupervisedChild) -> io::Result<()> {
     child.retire_registration();
     if let Some(container) = child.child.container() {
+        container.note_end_reason(crate::live_children::ContainerEndReason::SpawnFailed);
         container.stop_members().await;
         child.kill_leader()?;
         child.wait().await?;

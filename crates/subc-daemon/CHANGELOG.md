@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.54.5
+
+- Log when the daemon ends a carried container, including the module ID, the
+  reason, and the number of members when known.
+
 ## 0.54.4
 
 - Apply drain timeout edits on module rescan, including changes to the inherited

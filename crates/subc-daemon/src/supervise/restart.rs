@@ -349,6 +349,10 @@ pub(super) async fn finish_reload_child(
             Ok(())
         }
         RegistrationWaitOutcome::Exited(exit_report) => {
+            containment::note_end_reason(
+                &runtime.child_roster.containment,
+                crate::live_children::ContainerEndReason::SpawnFailed,
+            );
             if let Some(active_child) = child.as_mut() {
                 active_child.drain_stderr(&spec.module_id).await;
             }
@@ -387,6 +391,10 @@ pub(super) async fn finish_reload_child(
             result
         }
         RegistrationWaitOutcome::TimedOut => {
+            containment::note_end_reason(
+                &runtime.child_roster.containment,
+                crate::live_children::ContainerEndReason::SpawnFailed,
+            );
             let mut timed_out_child = child
                 .take()
                 .expect("timed-out reload child is still running");
@@ -564,6 +572,10 @@ pub(super) async fn set_child_enabled_with_budget_policy(
             RouteCloseReason::Disable,
         )
         .await?;
+        containment::note_end_reason(
+            &runtime.child_roster.containment,
+            crate::live_children::ContainerEndReason::Disable,
+        );
         drain_optional_child(
             &spec.module_id,
             spec.protocol,

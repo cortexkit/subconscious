@@ -314,6 +314,10 @@ pub(super) async fn budgeted_restart_child(
         update_snapshot(snapshot, Some(&spec.module_id), |state| {
             state.drain_disposition_detail = Some(runtime.restart_policy.budget_exhausted_detail());
         })?;
+        containment::note_end_reason(
+            &runtime.child_roster.containment,
+            crate::live_children::ContainerEndReason::BudgetExhausted,
+        );
         let result = drain_optional_child(
             &spec.module_id,
             spec.protocol,

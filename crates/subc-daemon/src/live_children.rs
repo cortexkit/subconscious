@@ -44,6 +44,87 @@ use crate::run_dir_lock::RunDirLock;
 /// The record's file name inside the daemon run directory.
 pub(crate) const LIVE_CHILDREN_FILE_NAME: &str = "live-children.json";
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) enum ContainerEndReason {
+    DaemonShutdown,
+    Stop,
+    Disable,
+    CleanExit,
+    BudgetExhausted,
+    SpawnFailed,
+    #[default]
+    SupervisorFailure,
+    BootRecovery,
+}
+
+impl ContainerEndReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DaemonShutdown => "daemon_shutdown",
+            Self::Stop => "stop",
+            Self::Disable => "disable",
+            Self::CleanExit => "clean_exit",
+            Self::BudgetExhausted => "budget_exhausted",
+            Self::SpawnFailed => "spawn_failed",
+            Self::SupervisorFailure => "supervisor_failure",
+            Self::BootRecovery => "boot_recovery",
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ContainerEnd {
+    pub(crate) reason: ContainerEndReason,
+    members: Option<(std::time::Instant, usize)>,
+    pub(crate) failed: bool,
+    signals: Vec<(std::time::Instant, &'static str)>,
+}
+
+impl ContainerEnd {
+    pub(crate) fn signal(&mut self, signal: &'static str) {
+        if self.signals.last().map(|&(_, last)| last) != Some(signal) {
+            self.signals.push((std::time::Instant::now(), signal));
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn observe_members(&mut self, members: usize) {
+        // The first complete count is closest to the start of teardown.
+        self.members
+            .get_or_insert_with(|| (std::time::Instant::now(), members));
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.members = self.members.into_iter().chain(other.members).min();
+        self.failed |= other.failed;
+        self.signals.extend(other.signals);
+    }
+
+    pub(crate) fn log(&self, module_id: &str) {
+        let reason = self.reason.as_str();
+        let members = self
+            .members
+            .map_or_else(|| "unknown".into(), |(_, n)| n.to_string());
+        let signals = if self.signals.is_empty() {
+            "none".into()
+        } else {
+            // Shutdown can send KILL while container recovery is still waiting
+            // for members to respond to TERM.
+            let mut ordered = self.signals.clone();
+            ordered.sort_by_key(|&(at, _)| at);
+            let mut signals: Vec<_> = ordered.into_iter().map(|(_, signal)| signal).collect();
+            signals.dedup();
+            signals.join(",")
+        };
+        if self.failed {
+            warn!(%module_id, %reason, %members, %signals, "carried container teardown incomplete or signal failed");
+        } else {
+            info!(%module_id, %reason, %members, %signals, "ended a carried container");
+        }
+    }
+}
+
 /// Bumped on any change a previous daemon's reader would misread. A record
 /// with another version is not swept: nothing in it is trusted enough to
 /// signal on.
@@ -933,7 +1014,19 @@ pub(crate) async fn sweep_orphans_with_placement(
                 .as_ref()
                 .and_then(|container| container.cgroup_path.as_ref())
             {
-                let decision = crate::cgroup_recovery::sweep(placement, path, bounds).await;
+                let mut end = ContainerEnd {
+                    reason: ContainerEndReason::BootRecovery,
+                    ..Default::default()
+                };
+                let decision =
+                    crate::cgroup_recovery::sweep(placement, path, bounds, &mut end).await;
+                if !matches!(decision, SweepDecision::Gone) || end.members.is_some() {
+                    end.failed |= matches!(
+                        decision,
+                        SweepDecision::Unverifiable(_) | SweepDecision::ContainerSurvivors(_)
+                    );
+                    end.log(&entry.child.module_id);
+                }
                 decisions.push((entry, decision));
             } else {
                 other.push(entry);
@@ -1047,14 +1140,22 @@ async fn sweep_entries_with_hooks(
     let mut signalled = Vec::new();
     for entry in entries {
         if let Some(container) = &entry.child.container {
+            let mut end = ContainerEnd {
+                reason: ContainerEndReason::BootRecovery,
+                ..Default::default()
+            };
             let decision = match container.current_boot() {
                 Ok(false) => SweepDecision::Gone,
                 Err(error) => SweepDecision::Unverifiable(error.to_string()),
                 Ok(true) => match container.group() {
-                    Ok(group) => crate::group_recovery::sweep(group, bounds).await,
+                    Ok(group) => crate::group_recovery::sweep(group, bounds, &mut end).await,
                     Err(error) => SweepDecision::Unverifiable(error.to_string()),
                 },
             };
+            if !matches!(decision, SweepDecision::Gone) {
+                end.failed |= matches!(decision, SweepDecision::Unverifiable(_));
+                end.log(&entry.child.module_id);
+            }
             decisions.push((entry, decision));
             continue;
         }
@@ -1239,6 +1340,27 @@ async fn sweep_entries(
             tokio::task::spawn_blocking(move || sweep_windows_entry(&recorded, bounds.kill_bound))
                 .await
                 .unwrap_or_else(|error| SweepDecision::Unverifiable(error.to_string()));
+        if entry.child.container.is_some()
+            && matches!(
+                decision,
+                SweepDecision::ForcedStopped
+                    | SweepDecision::Survived
+                    | SweepDecision::Unverifiable(_)
+            )
+        {
+            let mut end = ContainerEnd {
+                reason: ContainerEndReason::BootRecovery,
+                ..Default::default()
+            };
+            end.failed = !matches!(decision, SweepDecision::ForcedStopped);
+            if matches!(
+                decision,
+                SweepDecision::ForcedStopped | SweepDecision::Survived
+            ) {
+                end.signal("TerminateProcess");
+            }
+            end.log(&entry.child.module_id);
+        }
         decisions.push((entry, decision));
     }
     decisions
@@ -1729,6 +1851,31 @@ mod roster_resume_hash_tests {
 pub(crate) mod tests {
     use super::*;
     use cortexkit_test_support::ScratchDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn carried_end_log_orders_overlapping_teardown_actions() {
+        let (logs, _guard) = crate::router::test_log::log_capture(tracing::Level::INFO);
+        let before = std::time::Instant::now();
+        let after = before + Duration::from_millis(1);
+        let mut shutdown = ContainerEnd {
+            reason: ContainerEndReason::DaemonShutdown,
+            members: Some((after, 0)),
+            signals: vec![(after, "KILL")],
+            ..Default::default()
+        };
+        shutdown.merge(ContainerEnd {
+            members: Some((before, 4)),
+            signals: vec![(before, "TERM")],
+            ..Default::default()
+        });
+        shutdown.log("sample");
+        let captured = crate::router::test_log::captured_logs(&logs);
+        assert!(
+            captured.contains("INFO ended a carried container module_id=sample reason=daemon_shutdown members=4 signals=TERM,KILL"),
+            "{captured}"
+        );
+    }
 
     #[cfg(target_os = "linux")]
     pub(crate) struct NonDumpableChild {

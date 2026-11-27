@@ -1958,6 +1958,18 @@ mod unix_shutdown {
             if live.iter().all(|(key, _)| killed.contains(key))
                 && last_kill.is_some_and(|at| now >= at + reap_bound)
             {
+                // The daemon can exit before container finalization completes.
+                // Publish any report the supervisor has not taken yet.
+                for (_, entry) in &live {
+                    if let Some(container) = entry
+                        .recorded
+                        .carried
+                        .as_ref()
+                        .and_then(std::sync::Weak::upgrade)
+                    {
+                        container.finish_end_log();
+                    }
+                }
                 break;
             }
             if escalated {
@@ -2203,6 +2215,8 @@ mod unix_shutdown {
         if let Some(carried) = &entry.recorded.carried {
             if let Some(container) = carried.upgrade() {
                 if signal == Signal::KILL {
+                    container
+                        .note_end_reason(crate::live_children::ContainerEndReason::DaemonShutdown);
                     container.hard_kill();
                 }
             }

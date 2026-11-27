@@ -158,14 +158,15 @@ fn confirmed_members(
 /// Reuse the roster's existing cadence without waiting. Hold for any survivors,
 /// including the recorded anchor if it has not yet acted on the signal.
 pub(crate) fn recheck(record: RecordedGroup<'_>) -> Option<RetainedReason> {
-    recheck_with(record, signal_recorded_anchor)
+    recheck_with(record, signal_recorded_anchor, &mut Default::default())
 }
 
 pub(crate) fn recheck_with(
     record: RecordedGroup<'_>,
-    signal_anchor: impl FnOnce(RecordedGroup<'_>, Signal) -> io::Result<()>,
+    signal_anchor: impl FnOnce(RecordedGroup<'_>, Signal) -> io::Result<bool>,
+    end: &mut crate::live_children::ContainerEnd,
 ) -> Option<RetainedReason> {
-    recheck_candidates_with(record, subc_os::process_group::pids, signal_anchor)
+    recheck_candidates_with(record, subc_os::process_group::pids, signal_anchor, end)
         .unwrap_or_else(|error| Some(RetainedReason::ContainerUnverifiable(error.to_string())))
 }
 
@@ -174,19 +175,28 @@ fn recheck_candidates(
     record: RecordedGroup<'_>,
     pids: impl Fn() -> io::Result<Vec<u32>>,
 ) -> io::Result<Option<RetainedReason>> {
-    recheck_candidates_with(record, pids, signal_recorded_anchor)
+    recheck_candidates_with(
+        record,
+        pids,
+        signal_recorded_anchor,
+        &mut Default::default(),
+    )
 }
 
 fn recheck_candidates_with(
     record: RecordedGroup<'_>,
     pids: impl Fn() -> io::Result<Vec<u32>>,
-    signal_anchor: impl FnOnce(RecordedGroup<'_>, Signal) -> io::Result<()>,
+    signal_anchor: impl FnOnce(RecordedGroup<'_>, Signal) -> io::Result<bool>,
+    end: &mut crate::live_children::ContainerEnd,
 ) -> io::Result<Option<RetainedReason>> {
     if !subc_os::boot_id::is_current(record.boot_id)? {
         return Ok(None);
     }
     record.validate()?;
     let found = confirmed_members(record, pids)?;
+    if found.unknown.is_none() {
+        end.observe_members(found.live.len());
+    }
     if found.live.is_empty() && found.unknown.is_none() {
         return Ok(None);
     }
@@ -197,20 +207,28 @@ fn recheck_candidates_with(
     }
     let mut reason = found.surviving_reason();
     if found.live.contains(&record.pgid) {
-        if let Err(error) = signal_anchor(record, Signal::Kill) {
-            reason.push_str(&format!("; could not signal the recorded anchor: {error}"));
+        match signal_anchor(record, Signal::Kill) {
+            Ok(true) => end.signal("KILL"),
+            Ok(false) => {}
+            Err(error) => {
+                end.failed |= !gone(&error);
+                reason.push_str(&format!("; could not signal the recorded anchor: {error}"));
+            }
         }
     }
     Ok(Some(RetainedReason::ContainerUnverifiable(reason)))
 }
 
-pub(crate) fn signal_recorded_anchor(record: RecordedGroup<'_>, signal: Signal) -> io::Result<()> {
+pub(crate) fn signal_recorded_anchor(
+    record: RecordedGroup<'_>,
+    signal: Signal,
+) -> io::Result<bool> {
     signal_recorded_anchor_using(
         record,
         signal,
         subc_os::process_group::session_id,
         subc_os::process_group::inspect,
-        |process, signal| process.signal(signal).map(|_| ()),
+        Process::signal,
     )
 }
 
@@ -219,17 +237,17 @@ pub(crate) fn signal_recorded_anchor_using(
     signal: Signal,
     session: impl Fn(u32) -> io::Result<Option<u32>>,
     inspect: impl Fn(u32) -> io::Result<Option<Identity>>,
-    deliver: impl Fn(&Process, Signal) -> io::Result<()>,
-) -> io::Result<()> {
+    deliver: impl Fn(&Process, Signal) -> io::Result<bool>,
+) -> io::Result<bool> {
     // Open first so Linux can deliver through a pidfd. Without one, a numeric
     // PID is trusted only if its birth still matches the child the daemon
     // created. Reuse in the gap before the syscall is still possible.
     let pid = record.pgid;
     let Some(process) = Process::open(pid)? else {
-        return Ok(());
+        return Ok(false);
     };
     if !record.anchor_matches()? {
-        return Ok(());
+        return Ok(false);
     }
     if session(pid)? == Some(record.session_id)
         && inspect(pid)?.is_some_and(|facts| {
@@ -239,21 +257,35 @@ pub(crate) fn signal_recorded_anchor_using(
                 && !facts.exited
         })
     {
-        deliver(&process, signal)?;
+        return deliver(&process, signal);
     }
-    Ok(())
+    Ok(false)
 }
 
-pub(crate) async fn sweep(record: RecordedGroup<'_>, bounds: SweepBounds) -> SweepDecision {
-    sweep_candidates(record, bounds, subc_os::process_group::pids).await
+pub(crate) async fn sweep(
+    record: RecordedGroup<'_>,
+    bounds: SweepBounds,
+    end: &mut crate::live_children::ContainerEnd,
+) -> SweepDecision {
+    sweep_reported(record, bounds, subc_os::process_group::pids, end).await
 }
 
+#[cfg(test)]
 async fn sweep_candidates(
     record: RecordedGroup<'_>,
     bounds: SweepBounds,
     pids: impl Fn() -> io::Result<Vec<u32>> + Send + Sync,
 ) -> SweepDecision {
-    let result = sweep_checked(record, bounds, pids).await;
+    sweep_reported(record, bounds, pids, &mut Default::default()).await
+}
+
+async fn sweep_reported(
+    record: RecordedGroup<'_>,
+    bounds: SweepBounds,
+    pids: impl Fn() -> io::Result<Vec<u32>> + Send + Sync,
+    end: &mut crate::live_children::ContainerEnd,
+) -> SweepDecision {
+    let result = sweep_checked(record, bounds, pids, end).await;
     match result {
         Ok(decision) => decision,
         Err(error) => SweepDecision::Unverifiable(error.to_string()),
@@ -264,12 +296,16 @@ async fn sweep_checked(
     record: RecordedGroup<'_>,
     bounds: SweepBounds,
     pids: impl Fn() -> io::Result<Vec<u32>> + Send + Sync,
+    end: &mut crate::live_children::ContainerEnd,
 ) -> io::Result<SweepDecision> {
     if !subc_os::boot_id::is_current(record.boot_id)? {
         return Ok(SweepDecision::Gone);
     }
     record.validate()?;
     let found = confirmed_members(record, &pids)?;
+    if found.unknown.is_none() {
+        end.observe_members(found.live.len());
+    }
     if found.live.is_empty() {
         return Ok(found
             .unknown
@@ -284,8 +320,13 @@ async fn sweep_checked(
     if !found.live.contains(&record.pgid) {
         return Ok(SweepDecision::Unverifiable(found.surviving_reason()));
     }
-    if let Err(error) = signal_recorded_anchor(record, Signal::Terminate) {
-        tracing::debug!(pgid = record.pgid, %error, "recorded anchor SIGTERM failed");
+    match signal_recorded_anchor(record, Signal::Terminate) {
+        Ok(true) => end.signal("TERM"),
+        Ok(false) => {}
+        Err(error) => {
+            end.failed |= !gone(&error);
+            tracing::debug!(pgid = record.pgid, %error, "recorded anchor SIGTERM failed");
+        }
     }
     let term_deadline = Instant::now() + bounds.term_grace;
     loop {
@@ -327,8 +368,13 @@ async fn sweep_checked(
             return Ok(SweepDecision::Unverifiable(found.surviving_reason()));
         }
         // Never reuse a prior identity check to signal the recorded anchor.
-        if let Err(error) = signal_recorded_anchor(record, Signal::Kill) {
-            tracing::debug!(pgid = record.pgid, %error, "recorded anchor SIGKILL failed");
+        match signal_recorded_anchor(record, Signal::Kill) {
+            Ok(true) => end.signal("KILL"),
+            Ok(false) => {}
+            Err(error) => {
+                end.failed |= !gone(&error);
+                tracing::debug!(pgid = record.pgid, %error, "recorded anchor SIGKILL failed");
+            }
         }
         sleep(Duration::from_millis(10)).await;
     }

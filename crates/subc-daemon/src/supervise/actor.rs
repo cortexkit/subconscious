@@ -1,4 +1,5 @@
 use super::*;
+use crate::live_children::ContainerEndReason;
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -244,6 +245,12 @@ pub(super) async fn supervise_loop(
                 || !lock_snapshot(&snapshot)
                     .is_ok_and(|state| state.enabled && state.state == ModuleState::Restarting))
         {
+            if runtime.child_roster.is_closed() {
+                containment::note_end_reason(
+                    &runtime.child_roster.containment,
+                    ContainerEndReason::DaemonShutdown,
+                );
+            }
             containment::terminate(&runtime.child_roster.containment).await;
         }
         if let Some(command) = requeued.pop_front() {
@@ -474,6 +481,7 @@ pub(super) async fn supervise_loop(
                         && try_park_config_attempt(&spec, &runtime, &snapshot, &runtime.failure_context(true),
                             if refused_program { active_child.admission_base.as_ref() } else { None })
                             .unwrap_or_else(|error| { warn!(module_id=%spec.module_id, %error, "exit hold could not be recorded; using ordinary exit accounting"); false });
+                    let exit_kind = exit_report.kind;
                     let next = if deferred_spawn {
                         record_terminal_with_detail(&spec.module_id,&runtime.terminal_ring,&runtime.spawn_events,&exit_report,TerminalDisposition::Restarting,active_child.exit_cleanup_detail(active_child.spawn_failure.clone()));
                         let _=update_snapshot(&snapshot,Some(&spec.module_id),|state| {
@@ -504,6 +512,20 @@ pub(super) async fn supervise_loop(
                     let carry = matches!(next, NextAction::Restart { .. })
                         && active_child.spawn_failure.is_none()
                         && !runtime.child_roster.is_closed();
+                    if !carry {
+                        let reason = if runtime.child_roster.is_closed() {
+                            ContainerEndReason::DaemonShutdown
+                        } else if active_child.spawn_failure.is_some() || parked {
+                            ContainerEndReason::SpawnFailed
+                        } else if lock_snapshot(&snapshot).is_ok_and(|state| state.state == ModuleState::Failed) {
+                            ContainerEndReason::BudgetExhausted
+                        } else if exit_kind == ExitKind::Clean {
+                            ContainerEndReason::CleanExit
+                        } else {
+                            ContainerEndReason::SupervisorFailure
+                        };
+                        containment::note_end_reason(&runtime.child_roster.containment, reason);
+                    }
                     if let Err(error) = active_child.finish_exit(carry).await {
                         containment::terminate(&runtime.child_roster.containment).await;
                         fail_after_wait_error(&spec.module_id, &snapshot, &runtime.terminal_ring,
@@ -627,6 +649,7 @@ pub(super) async fn supervise_loop(
                         state.state = ModuleState::Stopped;
                         state.respawn_pending = false;
                     });
+                    containment::note_end_reason(&runtime.child_roster.containment, ContainerEndReason::DaemonShutdown);
                     containment::terminate(&runtime.child_roster.containment).await;
                 }
                 _ = async {
@@ -704,6 +727,7 @@ pub(super) async fn supervise_loop(
                             process_liveness.untrack_if_current(&spec.module_id, &snapshot);
                         }
                         Err(err) => {
+                            containment::note_end_reason(&runtime.child_roster.containment, ContainerEndReason::SpawnFailed);
                             fail_snapshot(&snapshot, Some(&spec.module_id), None, &failure);
                             record_approved_attempt_failure(&spec, &snapshot, &failure, &err);
                             process_liveness.untrack_if_current(&spec.module_id, &snapshot);
@@ -1120,6 +1144,7 @@ pub(super) async fn handle_supervisor_command(
                             Err(error) => return Err(error),
                         }
                         if !next.enabled {
+                            containment::note_end_reason(&runtime.child_roster.containment, ContainerEndReason::Disable);
                             containment::terminate(&runtime.child_roster.containment).await;
                         }
                     }
@@ -1394,6 +1419,10 @@ pub(super) async fn handle_supervisor_command(
             true
         }
         SupervisorCommand::Drain { requester, reply } => {
+            containment::note_end_reason(
+                &runtime.child_roster.containment,
+                ContainerEndReason::Stop,
+            );
             // A plain stop runs no forwarding drain, so nothing reaches the
             // module over its connection before the wait: ask by signal.
             let result = drain_optional_child(
@@ -1432,6 +1461,10 @@ pub(super) async fn handle_supervisor_command(
                     .is_some_and(|handle| handle.adoption_blocks(&spec.module_id))
         }
         SupervisorCommand::Retire { requester, reply } => {
+            containment::note_end_reason(
+                &runtime.child_roster.containment,
+                ContainerEndReason::Stop,
+            );
             let result = async {
                 let stop_notice = begin_forwarding_drain_if_configured(
                     spec,
@@ -1620,6 +1653,11 @@ pub(super) async fn handle_supervisor_command(
             let previous_requester = runtime.start_requester.clone();
             if enabled {
                 runtime.start_requester = requester.clone();
+            } else {
+                containment::note_end_reason(
+                    &runtime.child_roster.containment,
+                    ContainerEndReason::Disable,
+                );
             }
             let result = set_child_enabled_with_budget_policy(
                 spec,

@@ -1,6 +1,7 @@
 //! A module actor owns the container; individual launch generations only borrow it.
 
 use super::*;
+use crate::live_children::{ContainerEnd, ContainerEndReason};
 #[cfg(target_os = "linux")]
 use std::path::Path;
 use std::sync::Weak;
@@ -11,8 +12,10 @@ pub(crate) type Slot = Arc<Mutex<Option<Arc<CarriedContainment>>>>;
 pub(crate) struct CarriedContainment {
     #[cfg(unix)]
     binding_retirement: Mutex<Option<super::program_binding::ProgramBindingRetirement>>,
-    #[cfg(unix)]
     module_id: String,
+    // An early kill records its actions here; only the final cleanup owner
+    // takes the report and emits it. Drop covers an abandoned finalizer.
+    end_log: Mutex<Option<ContainerEnd>>,
     #[cfg(unix)]
     counters: crate::observability::DaemonCounters,
     #[cfg(unix)]
@@ -155,6 +158,36 @@ impl LaunchIdentity {
 }
 
 impl CarriedContainment {
+    pub(crate) fn note_end_reason(&self, reason: ContainerEndReason) {
+        self.update_end_log(|end| {
+            if matches!(end.reason, ContainerEndReason::SupervisorFailure) {
+                end.reason = reason;
+            }
+        });
+    }
+
+    fn update_end_log(&self, update: impl FnOnce(&mut ContainerEnd)) {
+        if let Some(end) = self
+            .end_log
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_mut()
+        {
+            update(end);
+        }
+    }
+
+    fn log_end(&self) {
+        let end = self
+            .end_log
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if let Some(end) = end {
+            end.log(&self.module_id);
+        }
+    }
+
     #[cfg(unix)]
     fn launch_identity(&self) -> &LaunchIdentity {
         match &self.resource {
@@ -237,9 +270,25 @@ impl CarriedContainment {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .push(signal);
+            self.update_end_log(|end| {
+                end.signal(if signal == rustix::process::Signal::TERM {
+                    "TERM"
+                } else {
+                    "KILL"
+                })
+            });
             return true;
         }
-        signal_group(*pgid, signal);
+        let delivered = signal_group(*pgid, signal);
+        self.update_end_log(|end| match delivered {
+            Ok(true) => end.signal(if signal == rustix::process::Signal::TERM {
+                "TERM"
+            } else {
+                "KILL"
+            }),
+            Ok(false) | Err(rustix::io::Errno::SRCH) => {}
+            Err(_) => end.failed = true,
+        });
         true
     }
 
@@ -309,9 +358,14 @@ impl CarriedContainment {
                 ));
             return;
         };
-        let decision =
-            crate::group_recovery::sweep(record, crate::live_children::SweepBounds::default())
-                .await;
+        let mut end = ContainerEnd::default();
+        let decision = crate::group_recovery::sweep(
+            record,
+            crate::live_children::SweepBounds::default(),
+            &mut end,
+        )
+        .await;
+        self.update_end_log(|log| log.merge(end));
         *self.cleanup_block.lock().unwrap_or_else(|p| p.into_inner()) = match decision {
             crate::live_children::SweepDecision::Unverifiable(error) => Some(
                 crate::live_children::RetainedReason::ContainerUnverifiable(error),
@@ -372,12 +426,15 @@ impl CarriedContainment {
 
     #[cfg(target_os = "linux")]
     async fn end_cgroup(&self, placement: &subc_cgroup::Placement, path: &Path) {
+        let mut end = ContainerEnd::default();
         let decision = crate::cgroup_recovery::sweep(
             Some(placement),
             path,
             crate::live_children::SweepBounds::default(),
+            &mut end,
         )
         .await;
+        self.update_end_log(|log| log.merge(end));
         let reason = match decision {
             crate::live_children::SweepDecision::Unverifiable(error) => Some(
                 crate::live_children::RetainedReason::ContainerUnverifiable(error),
@@ -417,14 +474,18 @@ impl CarriedContainment {
             Resource::Cgroup {
                 placement, path, ..
             } => {
+                let mut end = ContainerEnd::default();
                 *self.cleanup_block.lock().unwrap_or_else(|p| p.into_inner()) =
-                    crate::cgroup_recovery::recheck(Some(placement), path);
+                    crate::cgroup_recovery::recheck_reported(Some(placement), path, &mut end);
+                self.update_end_log(|log| log.merge(end));
             }
             #[cfg(windows)]
             Resource::Job(job) => {
-                if let Err(error) = job.lock().unwrap_or_else(|p| p.into_inner()).terminate() {
-                    warn!(%error, "carried job termination failed");
-                }
+                let result = job.lock().unwrap_or_else(|p| p.into_inner()).terminate();
+                self.update_end_log(|end| match result {
+                    Ok(()) => end.signal("TerminateJobObject"),
+                    Err(_) => end.failed = true,
+                });
             }
         }
     }
@@ -435,7 +496,7 @@ impl CarriedContainment {
         signal_anchor: impl FnOnce(
             crate::group_recovery::RecordedGroup<'_>,
             subc_os::Signal,
-        ) -> io::Result<()>,
+        ) -> io::Result<bool>,
     ) -> Option<crate::live_children::RetainedReason> {
         #[allow(irrefutable_let_patterns)]
         let Resource::Group { pin, .. } = &self.resource
@@ -449,10 +510,17 @@ impl CarriedContainment {
                 ))
             },
             |record| {
-                crate::group_recovery::recheck_with(record, |record, signal| {
-                    let _reap = pin.lock().unwrap_or_else(|p| p.into_inner());
-                    signal_anchor(record, signal)
-                })
+                let mut end = ContainerEnd::default();
+                let retained = crate::group_recovery::recheck_with(
+                    record,
+                    |record, signal| {
+                        let _reap = pin.lock().unwrap_or_else(|p| p.into_inner());
+                        signal_anchor(record, signal)
+                    },
+                    &mut end,
+                );
+                self.update_end_log(|log| log.merge(end));
+                retained
             },
         )
     }
@@ -591,10 +659,25 @@ impl CarriedContainment {
             #[cfg(windows)]
             Resource::Job(_) => self.hard_kill(),
         }
+        self.finish_end_log();
         self.release_roster();
         self.terminated
             .store(true, std::sync::atomic::Ordering::Release);
         self.cleanup_finished.notify_waiters();
+    }
+
+    pub(crate) fn finish_end_log(&self) {
+        #[cfg(unix)]
+        {
+            let retained = self.cleanup_block.lock().unwrap_or_else(|p| p.into_inner());
+            if retained
+                .as_ref()
+                .is_some_and(crate::live_children::RetainedReason::blocks_fresh_copy)
+            {
+                self.update_end_log(|end| end.failed = true);
+            }
+        }
+        self.log_end();
     }
 
     #[cfg(unix)]
@@ -616,28 +699,37 @@ impl Drop for CarriedContainment {
         // Abort and unwinding cannot await graceful cleanup. Kill before the
         // retained Child can be dropped and handed to Tokio's background reaper.
         self.hard_kill();
+        self.finish_end_log();
         self.release_roster();
     }
 }
 
 #[cfg(unix)]
-fn signal_group(pgid: u32, signal: rustix::process::Signal) {
+fn signal_group(pgid: u32, signal: rustix::process::Signal) -> rustix::io::Result<bool> {
     let Some(group) = i32::try_from(pgid)
         .ok()
         .filter(|pid| *pid > 1)
         .and_then(rustix::process::Pid::from_raw)
     else {
-        return;
+        return Ok(false);
     };
-    if let Err(error) = rustix::process::kill_process_group(group, signal) {
+    let result = rustix::process::kill_process_group(group, signal);
+    if let Err(error) = result {
         if !matches!(error, rustix::io::Errno::SRCH | rustix::io::Errno::PERM) {
             warn!(pgid, errno = error.raw_os_error(), %error, "carried process-group signal failed");
         }
     }
+    result.map(|()| true)
 }
 
 pub(super) fn current(slot: &Slot) -> Option<Arc<CarriedContainment>> {
     slot.lock().unwrap_or_else(|p| p.into_inner()).clone()
+}
+
+pub(super) fn note_end_reason(slot: &Slot, reason: ContainerEndReason) {
+    if let Some(container) = current(slot) {
+        container.note_end_reason(reason);
+    }
 }
 
 pub(super) async fn terminate(slot: &Slot) {
@@ -1045,6 +1137,7 @@ pub(super) fn prepare_before_exec(
         #[cfg(test)]
         group_signals: Mutex::new(None),
         resource,
+        end_log: Mutex::new(Some(ContainerEnd::default())),
         roster: Mutex::new(None),
         terminated: std::sync::atomic::AtomicBool::new(false),
         ending: std::sync::atomic::AtomicBool::new(false),
@@ -1065,12 +1158,14 @@ fn adopt_suspended_job(
     roster: &ChildRoster,
 ) -> Result<Arc<CarriedContainment>, SuperviseError> {
     let owned = Arc::new(CarriedContainment {
+        module_id: spec.module_id.clone(),
         resource: Resource::Job(
             child
                 .job
                 .take()
                 .expect("suspended child was assigned to its job"),
         ),
+        end_log: Mutex::new(Some(ContainerEnd::default())),
         roster: Mutex::new(None),
         terminated: std::sync::atomic::AtomicBool::new(false),
         ending: std::sync::atomic::AtomicBool::new(false),
@@ -1099,6 +1194,7 @@ fn adopt_suspended_job(
         Ok(guard) => *owned.roster.lock().unwrap_or_else(|p| p.into_inner()) = Some(guard),
         Err(failure) => {
             let source = owned.claim_failed_admission(failure);
+            owned.note_end_reason(ContainerEndReason::SpawnFailed);
             terminate_blocking(&roster.containment);
             return Err(SuperviseError::Spawn {
                 program: spec.program.clone(),
@@ -1243,7 +1339,11 @@ impl CarriedContainment {
             owner,
             reap_lock: Some(reap_lock),
         };
-        let unsettled = match settle_inherited_group(&pin) {
+        let mut end = ContainerEnd::default();
+        let result = settle_inherited_group_reported(&pin, &mut end);
+        end.failed |= result.is_err();
+        self.update_end_log(|log| log.merge(end));
+        let unsettled = match result {
             Ok(()) => return,
             Err(unsettled) => unsettled,
         };
@@ -1256,7 +1356,7 @@ impl CarriedContainment {
         };
         let module = self.module_id.clone();
         let retry = async move {
-            hold_until_settled(&module, &pin, held, |_| {}).await;
+            hold_until_settled_inner(&module, &pin, held, |_| {}, None).await;
         };
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => {
@@ -1558,8 +1658,16 @@ fn live_group_members(pgid: u32) -> io::Result<Vec<u32>> {
 /// members are signalled, a complete scan must then find none, and only then
 /// is the pin reaped, under its owner's signal lock when it is an adopted
 /// module process. No replacement may start until this succeeds.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(super) fn settle_inherited_group(pin: &InheritedPin) -> Result<(), Unsettled> {
+    settle_inherited_group_reported(pin, &mut ContainerEnd::default())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn settle_inherited_group_reported(
+    pin: &InheritedPin,
+    end: &mut ContainerEnd,
+) -> Result<(), Unsettled> {
     if subc_os::process_group::session_id(std::process::id())? != Some(pin.session_id) {
         return Err(
             io::Error::other("the handed-over container belongs to another session").into(),
@@ -1567,13 +1675,18 @@ pub(super) fn settle_inherited_group(pin: &InheritedPin) -> Result<(), Unsettled
     }
     exact_exited_pin(pin.pid, pin.birth, &pin.boot_id)?;
     let mut live = live_group_members(pin.pid)?;
+    end.observe_members(live.len());
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     while !live.is_empty() {
         if std::time::Instant::now() >= deadline {
             return Err(Unsettled::Survivors(live));
         }
         exact_exited_pin(pin.pid, pin.birth, &pin.boot_id)?;
-        signal_group(pin.pid, rustix::process::Signal::KILL);
+        match signal_group(pin.pid, rustix::process::Signal::KILL) {
+            Ok(true) => end.signal("KILL"),
+            Ok(false) | Err(rustix::io::Errno::SRCH) => {}
+            Err(_) => end.failed = true,
+        }
         std::thread::sleep(Duration::from_millis(20));
         live = live_group_members(pin.pid)?;
     }
@@ -1623,12 +1736,25 @@ pub(super) async fn hold_until_settled(
     held: crate::child_roster::HeldContainerRow,
     report: impl Fn(&crate::live_children::RetainedReason),
 ) -> bool {
+    hold_until_settled_inner(module, pin, held, report, Some(ContainerEnd::default())).await
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn hold_until_settled_inner(
+    module: &str,
+    pin: &InheritedPin,
+    held: crate::child_roster::HeldContainerRow,
+    report: impl Fn(&crate::live_children::RetainedReason),
+    mut end: Option<ContainerEnd>,
+) -> bool {
     use tokio::signal::unix::{signal, SignalKind};
     let mut child_events = signal(SignalKind::child()).ok();
     let mut reported: Option<crate::live_children::RetainedReason> = None;
     loop {
         let attempt = {
-            let work = || settle_inherited_group(pin);
+            let mut ignored = ContainerEnd::default();
+            let mut work =
+                || settle_inherited_group_reported(pin, end.as_mut().unwrap_or(&mut ignored));
             if tokio::runtime::Handle::try_current().is_ok_and(|handle| {
                 handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
             }) {
@@ -1639,6 +1765,9 @@ pub(super) async fn hold_until_settled(
         };
         match attempt {
             Ok(()) => {
+                if let Some(end) = end {
+                    end.log(module);
+                }
                 // The pin has been reaped. Retry only the durable release;
                 // the original child ownership check cannot succeed again.
                 loop {
@@ -1666,6 +1795,10 @@ pub(super) async fn hold_until_settled(
             }
         }
         if held.daemon_closing() {
+            if let Some(mut end) = end {
+                end.failed = true;
+                end.log(module);
+            }
             return false;
         }
         tokio::select! {
@@ -1799,6 +1932,7 @@ pub(super) fn adopt_after_upgrade(
             }))),
             pending_pin: std::sync::atomic::AtomicBool::new(false),
         },
+        end_log: Mutex::new(Some(ContainerEnd::default())),
         roster: Mutex::new(None),
         terminated: std::sync::atomic::AtomicBool::new(false),
         ending: std::sync::atomic::AtomicBool::new(false),
@@ -1916,7 +2050,7 @@ impl GroupTarget {
                     .id()
                     .filter(|pid| *pid > 1 && subc_os::child_exit::observe(*pid).is_ok())
                 {
-                    signal_group(pid, rustix::process::Signal::KILL);
+                    let _ = signal_group(pid, rustix::process::Signal::KILL);
                 }
             }
             Self::Pinned(container) => container.hard_kill(),
@@ -1988,6 +2122,7 @@ mod anchor_tests {
                 pin: Arc::new(Mutex::new(Some(Pin::Spawned(leader)))),
                 pending_pin: std::sync::atomic::AtomicBool::new(false),
             },
+            end_log: Mutex::new(Some(ContainerEnd::default())),
             roster: Mutex::new(None),
             terminated: std::sync::atomic::AtomicBool::new(false),
             ending: std::sync::atomic::AtomicBool::new(false),
@@ -2065,6 +2200,7 @@ mod anchor_tests {
                 pin: Arc::new(Mutex::new(Some(Pin::Spawned(leader)))),
                 pending_pin: std::sync::atomic::AtomicBool::new(false),
             },
+            end_log: Mutex::new(Some(ContainerEnd::default())),
             roster: Mutex::new(None),
             terminated: std::sync::atomic::AtomicBool::new(false),
             ending: std::sync::atomic::AtomicBool::new(false),
@@ -2104,6 +2240,7 @@ mod anchor_tests {
                 pin: Arc::new(Mutex::new(None)),
                 pending_pin: std::sync::atomic::AtomicBool::new(false),
             },
+            end_log: Mutex::new(Some(ContainerEnd::default())),
             roster: Mutex::new(None),
             terminated: std::sync::atomic::AtomicBool::new(false),
             ending: std::sync::atomic::AtomicBool::new(false),
@@ -2172,6 +2309,7 @@ mod anchor_tests {
                 pin: Arc::new(Mutex::new(Some(Pin::Spawned(leader)))),
                 pending_pin: std::sync::atomic::AtomicBool::new(false),
             },
+            end_log: Mutex::new(Some(ContainerEnd::default())),
             roster: Mutex::new(None),
             terminated: std::sync::atomic::AtomicBool::new(false),
             ending: std::sync::atomic::AtomicBool::new(false),
@@ -2245,6 +2383,7 @@ mod anchor_tests {
                 pin: Arc::new(Mutex::new(Some(Pin::Spawned(leader)))),
                 pending_pin: std::sync::atomic::AtomicBool::new(false),
             },
+            end_log: Mutex::new(Some(ContainerEnd::default())),
             roster: Mutex::new(None),
             terminated: std::sync::atomic::AtomicBool::new(false),
             ending: std::sync::atomic::AtomicBool::new(false),
@@ -2285,7 +2424,7 @@ mod anchor_tests {
                             "reap lock released before delivery"
                         );
                         delivered.set(true);
-                        process.signal(signal).map(|_| ())
+                        process.signal(signal)
                     },
                 )
             });
@@ -2331,6 +2470,7 @@ mod anchor_tests {
                 pin: Arc::new(Mutex::new(None)),
                 pending_pin: std::sync::atomic::AtomicBool::new(false),
             },
+            end_log: Mutex::new(Some(ContainerEnd::default())),
             roster: Mutex::new(None),
             terminated: std::sync::atomic::AtomicBool::new(false),
             ending: std::sync::atomic::AtomicBool::new(true),
@@ -2492,6 +2632,7 @@ mod anchor_tests {
                 pin: Arc::new(Mutex::new(Some(Pin::Spawned(leader)))),
                 pending_pin: std::sync::atomic::AtomicBool::new(false),
             },
+            end_log: Mutex::new(Some(ContainerEnd::default())),
             roster: Mutex::new(None),
             terminated: std::sync::atomic::AtomicBool::new(false),
             ending: std::sync::atomic::AtomicBool::new(false),
@@ -2630,6 +2771,7 @@ mod cgroup_policy_tests {
             counters: crate::observability::DaemonCounters::default(),
             cleanup_block: Mutex::new(None),
             group_signals: Mutex::new(Some(Arc::clone(&signals))),
+            end_log: Mutex::new(Some(ContainerEnd::default())),
             roster: Mutex::new(None),
             terminated: std::sync::atomic::AtomicBool::new(false),
             ending: std::sync::atomic::AtomicBool::new(false),

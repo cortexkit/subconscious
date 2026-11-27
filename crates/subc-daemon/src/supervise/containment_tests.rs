@@ -90,6 +90,16 @@ impl Fixture {
         backoff: Duration,
         config: Option<Arc<crate::config_gate::runtime::RuntimeOwner>>,
     ) -> Self {
+        Self::with_term_trap(label, max_restarts, backoff, config, "exit 0").await
+    }
+
+    async fn with_term_trap(
+        label: &str,
+        max_restarts: u32,
+        backoff: Duration,
+        config: Option<Arc<crate::config_gate::runtime::RuntimeOwner>>,
+        term_action: &str,
+    ) -> Self {
         let dir = ScratchDir::new(label);
         let record = dir.join("live-children.json");
         let holder_path = dir.join("holder.pid");
@@ -98,8 +108,8 @@ impl Fixture {
             module_id: label.to_owned(),
             program: if cfg!(target_os = "macos") { "/bin/bash" } else { "/bin/sh" }.into(),
             args: vec!["-c".into(),
-                "if [ ! -f \"$1\" ]; then /bin/sleep 600 </dev/null >/dev/null 2>&1 & echo $! >\"$1\"; fi; trap 'exit 0' TERM; while :; do /bin/sleep 1; done".into(),
-                "holder-fixture".into(), holder_path.display().to_string()],
+                "trap \"$2\" TERM; if [ ! -f \"$1\" ]; then /bin/sleep 600 </dev/null >/dev/null 2>&1 & echo $! >\"$1\"; fi; while :; do /bin/sleep 1; done".into(),
+                "holder-fixture".into(), holder_path.display().to_string(), term_action.into()],
             env: ["XDG_DATA_HOME", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"].into_iter()
                 .map(|key| (key.to_owned(), dir.display().to_string())).collect(),
             reserved: false,
@@ -285,12 +295,55 @@ async fn carried_crash_restart_keeps_holder() {
 
 #[tokio::test]
 async fn carried_stop_terminates_holder() {
+    let (logs, _guard) = crate::router::test_log::log_capture(tracing::Level::INFO);
     let fixture = Fixture::new("carried-stop", 3, Duration::ZERO).await;
     fixture.module.stop().await.unwrap();
     fixture.holder.gone().await;
     assert!(crate::live_children::read_record(&fixture.record)
         .unwrap()
         .is_empty());
+    assert_carried_end_log(
+        &crate::router::test_log::captured_logs(&logs),
+        "carried-stop",
+        "stop",
+    );
+}
+
+#[tokio::test]
+async fn carried_stop_after_early_kill_logs_once() {
+    let (logs, _guard) = crate::router::test_log::log_capture(tracing::Level::INFO);
+    let fixture =
+        Fixture::with_term_trap("carried-stop-early-kill", 3, Duration::ZERO, None, "").await;
+    fixture.module.stop().await.unwrap();
+    fixture.holder.gone().await;
+    let captured = crate::router::test_log::captured_logs(&logs);
+    assert!(
+        captured.contains("drain budget expired before the module exited"),
+        "{captured}"
+    );
+    assert!(
+        assert_carried_end_log(&captured, "carried-stop-early-kill", "stop")
+            .contains("signals=KILL"),
+        "{captured}"
+    );
+}
+
+fn assert_carried_end_log<'a>(logs: &'a str, module_id: &str, reason: &str) -> &'a str {
+    let lines: Vec<_> = logs
+        .lines()
+        .filter(|line| {
+            (line.contains("ended a carried container")
+                || line.contains("carried container teardown incomplete or signal failed"))
+                && line.contains(&format!("module_id={module_id} "))
+        })
+        .collect();
+    assert_eq!(lines.len(), 1, "expected one teardown log: {logs}");
+    let line = lines[0];
+    assert!(
+        line.contains(&format!("reason={reason} ")) && line.contains("members="),
+        "{line}"
+    );
+    line
 }
 
 #[tokio::test]
@@ -325,6 +378,7 @@ async fn carried_crash_budget_exhaustion_terminates_holder() {
 
 #[tokio::test]
 async fn carried_shutdown_during_backoff_terminates_holder() {
+    let (logs, _guard) = crate::router::test_log::log_capture(tracing::Level::INFO);
     let fixture = Fixture::new("carried-shutdown-backoff", 3, Duration::from_secs(60)).await;
     fixture.backoff().await;
     crate::child_roster::end_children_for_daemon_shutdown(
@@ -337,6 +391,11 @@ async fn carried_shutdown_during_backoff_terminates_holder() {
     assert!(crate::live_children::read_record(&fixture.record)
         .unwrap()
         .is_empty());
+    assert_carried_end_log(
+        &crate::router::test_log::captured_logs(&logs),
+        "carried-shutdown-backoff",
+        "daemon_shutdown",
+    );
 }
 
 #[tokio::test]

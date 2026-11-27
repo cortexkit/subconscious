@@ -98,6 +98,7 @@ impl Drop for Admitted {
             kill_owned_pid(pid, birth);
         }
         if let Some(container) = &self.container {
+            container.note_end_reason(crate::live_children::ContainerEndReason::SpawnFailed);
             container.hard_kill();
         }
         let permit = self.permit.take();

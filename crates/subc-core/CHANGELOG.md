@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.24.16
+
+- On Windows, briefly retry install-journal file operations blocked by sharing
+  or lock violations so transient file users do not interrupt setup or rollback.
+
 ## 0.24.15
 
 - On Windows, make new setup and upgrade data, staging, and private parent

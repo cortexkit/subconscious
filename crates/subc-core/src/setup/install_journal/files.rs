@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 const MARKER: &str = "transaction";
 const CREATE_ONLY_SUFFIX: &str = "-create-only";
@@ -81,7 +82,7 @@ fn create_only_with(
     })?;
     super::super::file_modes::ensure_private_parents(parent)?;
     create_stage(journal.id(), &stage)?;
-    create_bytes(&witness, bytes, mode)?;
+    create_bytes(&witness, bytes, mode, true)?;
     sync_parent(&witness)?;
     before_link();
     let created = match fs::hard_link(&witness, target) {
@@ -124,11 +125,25 @@ fn restore_create_only(id: &str, step: &Step, file: &FileStep) -> Result<(), Str
         return Ok(());
     }
     let identity = |path: &Path| {
-        let fd = subc_os::open_regular_nofollow(path).map_err(|error| refusal(path, error))?;
+        let fd = file_op(path, "open for identity", || {
+            subc_os::open_regular_nofollow(path)
+        })?;
         subc_os::retained_file_identity(&fd).map_err(|error| refusal(path, error))
     };
-    if identity(witness)? == identity(target)? {
-        fs::remove_file(target).map_err(|error| refusal(target, error))?;
+    let owns_target = || -> Result<bool, String> { Ok(identity(witness)? == identity(target)?) };
+    if owns_target()? {
+        guarded_file_op(
+            target,
+            "delete",
+            || fs::remove_file(target),
+            || {
+                if owns_target()? {
+                    Ok(())
+                } else {
+                    Err(refusal(target, "file identity changed before undo"))
+                }
+            },
+        )?;
         sync_parent(target)?;
     }
     Ok(())
@@ -247,10 +262,8 @@ fn perform(id: &str, target: &Path, file: &FileStep, content: Content<'_>) -> Re
         if digest(staged)? != file.after {
             remove_partial(staged)?;
             match content {
-                Content::Bytes(bytes, mode) => create_bytes(staged, bytes, mode)?,
-                Content::File(source) => {
-                    copy(source, staged).map_err(|error| refusal(staged, error))?
-                }
+                Content::Bytes(bytes, mode) => create_bytes(staged, bytes, mode, true)?,
+                Content::File(source) => copy(source, staged)?,
                 Content::Absent => return Err(refusal(target, "missing journal candidate")),
             }
         }
@@ -262,13 +275,13 @@ fn perform(id: &str, target: &Path, file: &FileStep, content: Content<'_>) -> Re
                 .ok_or_else(|| refusal(target, "missing previous image location"))?;
             if !gap {
                 verify_digest(target, &file.before)?;
-                move_out(target, previous)?;
+                move_out(target, previous, Some(&file.before))?;
             }
             #[cfg(feature = "test-support")]
             super::crash_hook("windows-replacement-gap");
-            if let Err(error) = move_out(staged, target) {
+            if let Err(error) = move_out(staged, target, None) {
                 if digest(target)?.is_none() {
-                    move_out(previous, target).map_err(|restore| {
+                    move_out(previous, target, None).map_err(|restore| {
                         format!("{error}; could not restore the previous image: {restore}")
                     })?;
                 }
@@ -277,10 +290,10 @@ fn perform(id: &str, target: &Path, file: &FileStep, content: Content<'_>) -> Re
             return Ok(());
         }
         verify_digest(target, &file.before)?;
-        replace(staged, target)?;
+        replace(staged, target, Some(&file.before))?;
     } else if let Some(previous) = &file.previous {
         verify_digest(target, &file.before)?;
-        move_out(target, previous)?;
+        move_out(target, previous, Some(&file.before))?;
     }
     Ok(())
 }
@@ -291,9 +304,9 @@ fn retain_previous_file(target: &Path, file: &FileStep) -> Result<(), String> {
             // A hard link retains the exact previous inode and its metadata.
             if digest(previous)? != file.before {
                 remove_partial(previous)?;
-                fs::hard_link(target, previous)
-                    .or_else(|_| copy(target, previous))
-                    .map_err(|error| refusal(previous, error))?;
+                if fs::hard_link(target, previous).is_err() {
+                    copy(target, previous)?;
+                }
             }
             verify_digest(previous, &file.before)?;
             sync_parent(previous)?;
@@ -333,17 +346,28 @@ pub(super) fn is_replacement_gap(id: &str, step: &Step) -> Result<bool, String> 
     replacement_gap(id, &step.target, file, &digest(&step.target)?)
 }
 
-fn move_out(source: &Path, target: &Path) -> Result<(), String> {
+fn move_out(
+    source: &Path,
+    target: &Path,
+    public_source: Option<&Option<String>>,
+) -> Result<(), String> {
     #[cfg(windows)]
-    return subc_os::durable_move_to_new_name(source, target)
-        .map_err(|error| refusal(source, error));
+    return guarded_file_op(
+        source,
+        "MoveFileExW",
+        || subc_os::durable_move_to_new_name(source, target),
+        || recheck_digest(source, public_source),
+    );
     #[cfg(not(windows))]
-    replace(source, target)
+    {
+        let _ = public_source;
+        replace(source, target, None)
+    }
 }
 
 fn remove_partial(path: &Path) -> Result<(), String> {
     if metadata(path)?.is_some() {
-        fs::remove_file(path).map_err(|error| refusal(path, error))?;
+        file_op(path, "delete partial file", || fs::remove_file(path))?;
     }
     Ok(())
 }
@@ -422,19 +446,19 @@ pub(in crate::setup) fn restore(id: &str, step: &Step) -> Result<(), String> {
         verify_digest(previous, &file.before)?;
         if actual.is_some() && moves_mapped_image(target) {
             let removed = file.staging_directory.join("undone");
-            move_out(target, &removed)?;
-            if let Err(error) = move_out(previous, target) {
+            move_out(target, &removed, Some(&file.after))?;
+            if let Err(error) = move_out(previous, target, None) {
                 if digest(target)?.is_none() {
-                    move_out(&removed, target).map_err(|restore| {
+                    move_out(&removed, target, None).map_err(|restore| {
                         format!("{error}; could not restore the replacement image: {restore}")
                     })?;
                 }
                 return Err(error);
             }
         } else if actual.is_none() {
-            move_out(previous, target)?;
+            move_out(previous, target, None)?;
         } else {
-            replace(previous, target)?;
+            replace(previous, target, Some(&file.after))?;
         }
     } else {
         // Take the published bytes off the public path with a durable rename.
@@ -443,7 +467,7 @@ pub(in crate::setup) fn restore(id: &str, step: &Step) -> Result<(), String> {
         if metadata(&removed)?.is_some() {
             return Err(refusal(&removed, "undo destination already exists"));
         }
-        move_out(target, &removed)?;
+        move_out(target, &removed, Some(&file.after))?;
     }
     #[cfg(feature = "test-support")]
     super::crash_hook("file-undo");
@@ -627,7 +651,7 @@ fn open_staging_directory(path: &Path) -> io::Result<fs::File> {
 pub(super) fn create_stage(id: &str, dir: &Path) -> Result<(), String> {
     subc_os::create_private_directory_exclusive(dir).map_err(|error| refusal(dir, error))?;
     let marker = dir.join(MARKER);
-    create_bytes(&marker, id.as_bytes(), 0o600)?;
+    create_bytes(&marker, id.as_bytes(), 0o600, false)?;
     sync_parent(&marker)?;
     sync_parent(dir)
 }
@@ -697,12 +721,21 @@ fn metadata(path: &Path) -> Result<Option<fs::Metadata>, String> {
 }
 
 pub(in crate::setup) fn digest(path: &Path) -> Result<Option<String>, String> {
-    let mut fd = match subc_os::open_regular_nofollow(path) {
-        Ok(fd) => fd,
-        Err(subc_os::OpenRegularError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(None)
-        }
-        Err(error) => return Err(refusal(path, error)),
+    let Some(mut fd) = file_op(
+        path,
+        "open for digest",
+        || match subc_os::open_regular_nofollow(path) {
+            Ok(fd) => Ok(Some(fd)),
+            Err(subc_os::OpenRegularError::Io(error))
+                if error.kind() == io::ErrorKind::NotFound =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        },
+    )?
+    else {
+        return Ok(None);
     };
     let mut hash = Sha256::new();
     io::copy(&mut fd, &mut hash).map_err(|error| refusal(path, error))?;
@@ -719,7 +752,14 @@ fn verify_digest(path: &Path, expected: &Option<String>) -> Result<(), String> {
     Ok(())
 }
 
-fn create_bytes(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
+fn recheck_digest(path: &Path, expected: Option<&Option<String>>) -> Result<(), String> {
+    if let Some(expected) = expected {
+        verify_digest(path, expected)?;
+    }
+    Ok(())
+}
+
+fn create_bytes(path: &Path, bytes: &[u8], mode: u32, retry_open: bool) -> Result<(), String> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -729,33 +769,246 @@ fn create_bytes(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
     }
     #[cfg(not(unix))]
     let _ = mode;
-    let mut file = options.open(path).map_err(|error| refusal(path, error))?;
+    let mut file = if retry_open {
+        file_op(path, "open new file", || options.open(path))?
+    } else {
+        options.open(path).map_err(|error| refusal(path, error))?
+    };
     file.write_all(bytes)
         .and_then(|()| file.sync_all())
         .map_err(|error| refusal(path, error))
 }
 
-fn copy(source: &Path, target: &Path) -> io::Result<()> {
-    let mut source = subc_os::open_regular_nofollow(source).map_err(io::Error::other)?;
-    let mut target = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(target)?;
-    io::copy(&mut source, &mut target)?;
+fn copy(source: &Path, target: &Path) -> Result<(), String> {
+    let mut input = file_op(target, "open copy source", || {
+        subc_os::open_regular_nofollow(source)
+    })?;
+    let mut output = file_op(target, "open copy destination", || {
+        OpenOptions::new().write(true).create_new(true).open(target)
+    })?;
+    let refuse = |error| refusal(target, error);
+    io::copy(&mut input, &mut output).map_err(refuse)?;
     // Preserve Unix execute bits. On Windows the staged file must remain
     // writable so the rename can open it and flush the publication to disk.
     #[cfg(unix)]
-    target.set_permissions(source.metadata()?.permissions())?;
-    target.sync_all()
+    output
+        .set_permissions(input.metadata().map_err(refuse)?.permissions())
+        .map_err(refuse)?;
+    output.sync_all().map_err(refuse)
 }
 
-fn replace(source: &Path, target: &Path) -> Result<(), String> {
-    subc_os::durable_replace(source, target).map_err(|error| refusal(target, error))?;
+fn replace(
+    source: &Path,
+    target: &Path,
+    public_target: Option<&Option<String>>,
+) -> Result<(), String> {
+    guarded_file_op(
+        target,
+        "durable replace",
+        || subc_os::durable_replace(source, target),
+        || recheck_digest(target, public_target),
+    )?;
     sync_parent(source)
+}
+
+fn file_op<T, E: std::error::Error + 'static>(
+    path: &Path,
+    operation: &str,
+    run: impl FnMut() -> Result<T, E>,
+) -> Result<T, String> {
+    guarded_file_op(path, operation, run, || Ok(()))
+}
+
+fn guarded_file_op<T, E: std::error::Error + 'static>(
+    path: &Path,
+    operation: &str,
+    mut run: impl FnMut() -> Result<T, E>,
+    recheck: impl FnMut() -> Result<(), String>,
+) -> Result<T, String> {
+    if cfg!(windows) {
+        retry_file_op(path, operation, run, recheck, std::thread::sleep)
+    } else {
+        run().map_err(|error| refusal(path, error))
+    }
+}
+
+fn retry_file_op<T, E: std::error::Error + 'static>(
+    path: &Path,
+    operation: &str,
+    mut run: impl FnMut() -> Result<T, E>,
+    mut recheck: impl FnMut() -> Result<(), String>,
+    mut sleep: impl FnMut(Duration),
+) -> Result<T, String> {
+    // A scanner or the image loader can briefly deny sharing on a new or
+    // recently run executable. Leave permanent errors and other failures alone.
+    let mut delays = [20, 40, 80, 160, 200, 200, 200, 200, 200, 200, 200, 200].into_iter();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut attempts = 1;
+    loop {
+        let error = match run() {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        if !is_retryable_file_error(&error) {
+            return Err(refusal(path, error));
+        }
+        if let Some(delay) = delays.next().map(Duration::from_millis) {
+            if Instant::now() + delay < deadline {
+                sleep(delay);
+                if Instant::now() < deadline {
+                    recheck()?;
+                    if Instant::now() < deadline {
+                        attempts += 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        return Err(refusal(
+            path,
+            format!("{operation} failed after {attempts} attempt(s): {error}"),
+        ));
+    }
+}
+
+fn is_retryable_file_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    // If publication occurred or its outcome is unknown, the old pathname
+    // may no longer refer to the source file. Never retry the file operation.
+    if error
+        .downcast_ref::<subc_os::DurableReplaceError>()
+        .is_some_and(subc_os::DurableReplaceError::renamed)
+    {
+        return false;
+    }
+    let io_error = error
+        .downcast_ref::<io::Error>()
+        .or_else(|| error.source()?.downcast_ref());
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+    matches!(
+        io_error.and_then(io::Error::raw_os_error),
+        Some(ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
+    )
 }
 
 fn refusal(path: &Path, detail: impl std::fmt::Display) -> String {
     format!("refusal: install journal file {}: {detail}", path.display())
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use cortexkit_test_support::ScratchDir;
+
+    #[test]
+    fn windows_file_retry_succeeds_after_sharing_violations() {
+        let mut attempts = 0;
+        let result = retry_file_op(
+            Path::new("ck.exe"),
+            "MoveFileExW",
+            || {
+                attempts += 1;
+                if attempts <= 3 {
+                    Err(io::Error::from_raw_os_error(32))
+                } else {
+                    Ok("moved")
+                }
+            },
+            || Ok(()),
+            |_| {},
+        );
+        assert_eq!(result.unwrap(), "moved");
+        assert_eq!(attempts, 4);
+    }
+
+    #[test]
+    fn windows_file_retry_is_bounded_and_reports_the_final_lock_violation() {
+        let path = Path::new("ck.exe");
+        let mut attempts = 0;
+        let mut waited = Duration::ZERO;
+        let result = retry_file_op(
+            path,
+            "open for digest",
+            || {
+                attempts += 1;
+                Err::<(), _>(io::Error::from_raw_os_error(if attempts == 1 {
+                    32
+                } else {
+                    33
+                }))
+            },
+            || Ok(()),
+            |delay| waited += delay,
+        );
+        assert_eq!(attempts, 13);
+        assert_eq!(waited, Duration::from_millis(1900));
+        assert_eq!(
+            result.unwrap_err(),
+            refusal(
+                path,
+                format!(
+                    "open for digest failed after 13 attempt(s): {}",
+                    io::Error::from_raw_os_error(33)
+                )
+            )
+        );
+    }
+
+    #[test]
+    fn windows_file_retry_returns_other_errors_without_waiting() {
+        let path = Path::new("ck.exe");
+        let result = retry_file_op(
+            path,
+            "MoveFileExW",
+            || Err::<(), _>(io::Error::from_raw_os_error(5)),
+            || panic!("access denied must not trigger a recheck"),
+            |_| panic!("access denied must not trigger a delay"),
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            refusal(path, io::Error::from_raw_os_error(5))
+        );
+    }
+
+    #[test]
+    fn windows_file_retry_refuses_to_move_a_changed_public_file() {
+        let root = ScratchDir::new("ck-rename-retry");
+        let public = root.join("ck.exe");
+        let moved = root.join("previous");
+        let replacement = root.join("operator.exe");
+        fs::write(&public, b"recorded image").unwrap();
+        fs::write(&replacement, b"user image").unwrap();
+        let expected = digest(&public).unwrap();
+        let mut attempts = 0;
+
+        let result = retry_file_op(
+            &public,
+            "MoveFileExW",
+            || {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(io::Error::from_raw_os_error(32))
+                } else {
+                    fs::rename(&public, &moved)
+                }
+            },
+            || recheck_digest(&public, Some(&expected)),
+            |_| {
+                fs::rename(&replacement, &public).unwrap();
+            },
+        );
+
+        assert_eq!(
+            result.unwrap_err(),
+            refusal(
+                &public,
+                "file does not have the digest recorded in the journal"
+            )
+        );
+        assert_eq!(attempts, 1);
+        assert_eq!(fs::read(&public).unwrap(), b"user image");
+        assert!(!moved.exists());
+    }
 }
 
 #[cfg(test)]

@@ -505,7 +505,8 @@ fn replace_and_restore_mapped_ck() {
             &target,
             Kind::File,
             Content::Bytes(&candidate, 0o755),
-        )?;
+        )
+        .map_err(|error| format!("place mapped executable: {error}"))?;
         assert_eq!(fs::read(&target).unwrap(), candidate);
         let new_root = root.join("candidate-child");
         fs::create_dir(&new_root).unwrap();
@@ -515,7 +516,7 @@ fn replace_and_restore_mapped_ck() {
             child.try_wait().unwrap().is_none() && new_child.try_wait().unwrap().is_none();
         let _ = new_child.kill();
         new_child.wait().unwrap();
-        restored?;
+        restored.map_err(|error| format!("restore mapped executable: {error}"))?;
         assert!(both_running);
         assert_eq!(disk::digest(&target)?, disk::digest(&original)?);
         Ok::<_, String>(())

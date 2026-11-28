@@ -542,7 +542,7 @@ dependencies = [
 
 [[package]]
 name = "ck-bus"
-version = "0.13.15"
+version = "0.13.16"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -765,9 +765,9 @@ checksum = "fc920f9de41a06fa8bd7fe6c7e24dd385423ab0a77e434367d91f67bd960a423"
 
 [[package]]
 name = "cortexkit-bus-nats"
-version = "0.5.2"
+version = "0.5.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "045dfeda0459027a681c97dbed015e7e6f495753416656c12a10e0e3966ff386"
+checksum = "8b02dbf4e491433f50c284993c3894e4169c861efd2633dcf51ea0f4131a2635"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -781,11 +781,13 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-bus-testkit"
-version = "0.9.7"
+version = "0.9.8"
 dependencies = [
  "async-nats",
  "async-trait",
  "base64 0.22.1",
+ "cortexkit-bus-nats",
+ "cortexkit-bus-trait",
  "cortexkit-test-support",
  "futures-util",
  "nkeys",
@@ -797,6 +799,7 @@ dependencies = [
  "subc-protocol",
  "subc-transport",
  "tempfile",
+ "time",
  "tokio",
 ]
 

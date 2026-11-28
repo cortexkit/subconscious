@@ -38,6 +38,17 @@ pub(crate) fn encode_jwt(
     iat: i64,
     nats: Value,
 ) -> String {
+    encode_jwt_with_expiration(signer, subject, name, iat, nats, None)
+}
+
+fn encode_jwt_with_expiration(
+    signer: &KeyPair,
+    subject: &str,
+    name: &str,
+    iat: i64,
+    nats: Value,
+    expires_at: Option<i64>,
+) -> String {
     let mut claims = json!({
         "jti": "",
         "iat": iat,
@@ -46,6 +57,9 @@ pub(crate) fn encode_jwt(
         "sub": subject,
         "nats": nats,
     });
+    if let Some(exp) = expires_at {
+        claims["exp"] = json!(exp);
+    }
     let digest = Sha256::digest(claims.to_string().as_bytes());
     claims["jti"] = Value::String(super::signer::hex(&digest).to_uppercase());
     let input = format!(
@@ -156,7 +170,36 @@ impl TrustChain {
         subject: &str,
         iat: i64,
     ) -> String {
-        encode_jwt(
+        self.sign_user_jwt(root_id, account_public, subject, iat, None)
+    }
+
+    /// Issues a fixture user JWT with `exp` set to `expires_at` (Unix seconds).
+    /// The same user key can sign nonces for a later JWT.
+    pub fn expiring_user_jwt(
+        &self,
+        root_id: &str,
+        account_public: &str,
+        user: &KeyPair,
+        expires_at: i64,
+    ) -> String {
+        self.sign_user_jwt(
+            root_id,
+            account_public,
+            &user.public_key(),
+            unix_now(),
+            Some(expires_at),
+        )
+    }
+
+    fn sign_user_jwt(
+        &self,
+        root_id: &str,
+        account_public: &str,
+        subject: &str,
+        iat: i64,
+        expires_at: Option<i64>,
+    ) -> String {
+        encode_jwt_with_expiration(
             &self.signer.root(root_id).pair,
             subject,
             "harness-user",
@@ -165,6 +208,7 @@ impl TrustChain {
                 "type": "user", "version": 2, "issuer_account": account_public,
                 "pub": {}, "sub": {}, "subs": -1, "data": -1, "payload": -1,
             }),
+            expires_at,
         )
     }
 }

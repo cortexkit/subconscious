@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.13.16
+
+- Takes cortexkit-bus-nats 0.5.10 (was 0.5.2).
+- Test against cortexkit-bus-testkit 0.9.8.
+
 ## 0.13.15
 
 - Test against subc-core 0.24.15.

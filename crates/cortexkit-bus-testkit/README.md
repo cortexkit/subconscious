@@ -61,6 +61,15 @@ never contend for one port; each start therefore gets new ports and a new `url`.
 broker restarts or test JWTs without ck-bus bootstrap; an explicitly supplied
 directory remains caller-owned.
 
+For a broker-only JWT test, pass a `PreloadedAccount` with a fresh account nkey
+and list `trust.box_root_public()` in its `signing_keys`. Use the same `TrustChain`
+in `BusOptions::trust`. Preloaded accounts have JetStream enabled, so a fixture
+user can create KV buckets without a daemon or ck-bus. Mint a short-lived user
+credential with `trust.expiring_user_jwt(&box_root_id(), &account_public, &user,
+unix_now() + 5)` (`box_root_id` and `unix_now` are in `trust`). Sign connection
+nonces with that throwaway user key; a renewed JWT for the same key can be issued
+with a later expiration.
+
 `subc_config(ck_bus_path, ckbus_env, modules)` returns JSON (valid JSONC) declaring
 reserved `ckbus` with `protocol: "subc"`, plus modules with program, args, env,
 reserved and enabled fields. `Module::new` defaults to enabled and non-reserved.
@@ -106,3 +115,10 @@ The kit's integration test starts a supervised tiny SDK module, obtains its
 credential and nonce signature over subc, and verifies a real NATS subscriber
 receives its own event publish. Separate tests inspect kernel process images,
 positive child-home evidence, cleanup, and the missing-binary policy.
+
+The register watch expiry tests need only the NATS binary:
+
+```sh
+CK_NATS_SERVER_BIN=/path/to/test/nats-server CK_BUS_TESTKIT_REQUIRE=1 \
+  cargo test -p cortexkit-bus-testkit jwt_expiry --locked
+```

@@ -17,7 +17,7 @@ use tokio::{
 
 pub const LOOPBACK: &str = "127.0.0.1";
 
-/// An additional account for tests that exercise user JWTs without ck-bus bootstrap.
+/// An additional JetStream-enabled account for tests without ck-bus bootstrap.
 pub struct PreloadedAccount {
     pub public_key: String,
     pub signing_keys: Vec<String>,
@@ -107,7 +107,7 @@ impl BusServer {
         // JSON string quoting also escapes fixture paths containing quotes or slashes.
         let conf = format!(
             "listen: \"127.0.0.1:-1\"\n\
-             max_control_line: 65536\ndebug: true\n\
+             max_control_line: 65536\ndebug: true\nlogtime_utc: true\n\
              http: \"127.0.0.1:-1\"\n\
              ports_file_dir: {ports}\n\
              log_file: {log}\njetstream {{ store_dir: {js} }}\n\
@@ -339,8 +339,9 @@ impl TrustChain {
             "fixture-account",
             unix_now() - 120,
             json!({"type": "account", "version": 2,
-                "limits": {"subs": -1, "data": -1, "payload": -1, "imports": -1, "exports": -1,
-                    "wildcards": true, "conn": -1, "leaf": -1},
+                 "limits": {"subs": -1, "data": -1, "payload": -1, "imports": -1, "exports": -1,
+                     "wildcards": true, "conn": -1, "leaf": -1,
+                     "mem_storage": -1, "disk_storage": -1, "streams": -1, "consumer": -1},
                 "signing_keys": signing_keys, "default_permissions": {"pub": {}, "sub": {}}}),
         )
     }

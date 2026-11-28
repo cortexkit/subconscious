@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.8
+
+- Issue short-lived fixture user JWTs with `TrustChain::expiring_user_jwt`.
+- Preloaded test accounts now carry JetStream limits so they can host KV buckets without ck-bus.
+- Use UTC broker log timestamps so tests can compare them with JWT expiration times.
+- Exercise register watch behavior on JWT expiry, with and without renewal, against real NATS.
+
 ## 0.9.7
 
 - Windows: the PATH search for nats-server looks for `nats-server.exe`, so a rig finds an installed

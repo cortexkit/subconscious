@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.56
+
+- Expose the hard-link count from an already-open Windows file handle.
+- Add a Windows test-support helper that restores Ctrl-C delivery in a test
+  launcher whose parent marked Ctrl-C ignored.
+
 ## 0.1.55
 
 - Expose a process-table birth baseline that uses boot-relative ticks on Linux,

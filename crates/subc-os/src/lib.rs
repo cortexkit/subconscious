@@ -102,7 +102,10 @@ pub use retained_file::{
     retained_file_identity, OpenRegularError, RetainedFileIdentity,
 };
 #[cfg(windows)]
-pub use retained_file::{retained_file_index, WindowsFileIndexIdentity};
+pub use retained_file::{
+    retained_file_index, retained_file_information, WindowsFileIndexIdentity,
+    WindowsFileInformation,
+};
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub use retained_replace::{
     create_directory_nofollow_at, move_file_aside_nofollow_at, move_file_to_noreplace_at,

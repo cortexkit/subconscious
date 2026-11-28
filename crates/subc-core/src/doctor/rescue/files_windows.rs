@@ -7,6 +7,7 @@ use std::{
 
 use subc_os::{
     create_private_directory_exclusive, open_directory_nofollow_all, retained_file_index,
+    retained_file_information,
     windows_acl::{
         create_private_dir, create_private_file, verify_current_owner, verify_owner_only,
         verify_private_dir,
@@ -122,6 +123,9 @@ impl Directory {
         };
         regular_handle(&file)?;
         verify_current_owner(&path, false)?;
+        if retained_file_information(&file)?.link_count() != 1 {
+            return Err(refused("credential must not have another hard link"));
+        }
         verify_owner_only(&file).map_err(|error| {
             refused(&format!(
                 "{error}; run ck doctor --agent --forget to remove the credential"

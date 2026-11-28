@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.13.14
+
+- Test against subc-core 0.24.14.
+
 ## 0.13.13
 
 - Print the ck-bus version with `--version` without starting the runtime.

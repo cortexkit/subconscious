@@ -1,6 +1,7 @@
 #![allow(unsafe_code)]
 
 use super::{invalid, OpenRetainedError, Stage};
+use crate::{retained_file_information, WindowsFileInformation};
 use std::{
     ffi::OsStr,
     fs::File,
@@ -30,8 +31,7 @@ use windows_sys::{
         },
         Security::Cryptography::{BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG},
         Storage::FileSystem::{
-            FileDispositionInfo, GetFileInformationByHandle, GetFileType,
-            SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, DELETE,
+            FileDispositionInfo, GetFileType, SetFileInformationByHandle, DELETE,
             FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
             FILE_DISPOSITION_INFO, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES,
             FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK,
@@ -146,7 +146,7 @@ fn open_relative_secured(
     Ok(unsafe { File::from_raw_handle(handle) })
 }
 
-fn object_info(file: &File) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
+fn object_info(file: &File) -> io::Result<WindowsFileInformation> {
     match read_object_info(file) {
         Err(OpenRetainedError::Symlink) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -161,18 +161,13 @@ fn object_info(file: &File) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
     }
 }
 
-fn read_object_info(file: &File) -> Result<BY_HANDLE_FILE_INFORMATION, OpenRetainedError> {
-    let mut info = BY_HANDLE_FILE_INFORMATION::default();
-    // SAFETY: file owns the live handle and info is a writable output buffer.
-    unsafe {
-        if GetFileType(file.as_raw_handle()) != FILE_TYPE_DISK {
-            return Err(OpenRetainedError::NotRegular);
-        }
-        if GetFileInformationByHandle(file.as_raw_handle(), &mut info) == 0 {
-            return Err(io::Error::last_os_error().into());
-        }
+fn read_object_info(file: &File) -> Result<WindowsFileInformation, OpenRetainedError> {
+    // SAFETY: file owns the live handle for the duration of the call.
+    if unsafe { GetFileType(file.as_raw_handle()) } != FILE_TYPE_DISK {
+        return Err(OpenRetainedError::NotRegular);
     }
-    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+    let info = retained_file_information(file)?;
+    if info.attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(OpenRetainedError::Symlink);
     }
     Ok(info)
@@ -183,22 +178,22 @@ pub(super) fn open_read_at(
     name: &OsStr,
     directory: bool,
 ) -> Result<File, OpenRetainedError> {
-    if read_object_info(parent)?.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+    if read_object_info(parent)?.attributes() & FILE_ATTRIBUTE_DIRECTORY == 0 {
         return Err(OpenRetainedError::NotRegular);
     }
     let file = open_relative(parent, name, FILE_GENERIC_READ, SHARE_ALL, FILE_OPEN, 0)?;
     let info = read_object_info(&file)?;
-    if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0) != directory {
+    if (info.attributes() & FILE_ATTRIBUTE_DIRECTORY != 0) != directory {
         return Err(OpenRetainedError::NotRegular);
     }
-    if !directory && info.nNumberOfLinks != 1 {
+    if !directory && info.link_count() != 1 {
         return Err(OpenRetainedError::Hardlinked);
     }
     Ok(file)
 }
 
 pub(super) fn ensure_directory(parent: &File) -> io::Result<()> {
-    if object_info(parent)?.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+    if object_info(parent)?.attributes() & FILE_ATTRIBUTE_DIRECTORY == 0 {
         return Err(invalid("retained parent is not a directory"));
     }
     Ok(())
@@ -206,7 +201,7 @@ pub(super) fn ensure_directory(parent: &File) -> io::Result<()> {
 
 pub(super) fn regular_file_at(parent: &File, leaf: &OsStr) -> io::Result<()> {
     let file = open_relative(parent, leaf, FILE_READ_ATTRIBUTES, SHARE_ALL, FILE_OPEN, 0)?;
-    if object_info(&file)?.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+    if object_info(&file)?.attributes() & FILE_ATTRIBUTE_DIRECTORY != 0 {
         return Err(invalid("expected a regular file"));
     }
     Ok(())
@@ -263,7 +258,7 @@ pub(super) fn open_target(parent: &File, name: &OsStr) -> io::Result<File> {
         0,
     )?;
     let info = object_info(&file)?;
-    if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 || info.nNumberOfLinks != 1 {
+    if info.attributes() & FILE_ATTRIBUTE_DIRECTORY != 0 || info.link_count() != 1 {
         return Err(invalid("expected a singly linked regular file"));
     }
     Ok(file)
@@ -271,7 +266,7 @@ pub(super) fn open_target(parent: &File, name: &OsStr) -> io::Result<File> {
 
 pub(super) fn verify_stage_entry(stage: &Stage<'_>) -> io::Result<()> {
     let info = object_info(&stage.file)?;
-    if !stage.directory && info.nNumberOfLinks != 1 {
+    if !stage.directory && info.link_count() != 1 {
         return Err(invalid("expected a singly linked staging file"));
     }
     // The source of the rename is the staging handle itself. It does not
@@ -358,7 +353,7 @@ pub(super) fn move_aside(parent: &File, leaf: &OsStr, aside: &OsStr) -> io::Resu
         0,
     )?;
     let info = object_info(&file)?;
-    if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 || info.nNumberOfLinks != 1 {
+    if info.attributes() & FILE_ATTRIBUTE_DIRECTORY != 0 || info.link_count() != 1 {
         return Err(invalid("expected a singly linked regular file"));
     }
     rename_open_file(&file, aside, false)?;

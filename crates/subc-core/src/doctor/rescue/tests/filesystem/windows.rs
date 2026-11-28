@@ -159,6 +159,35 @@ fn auth_refuses_a_non_regular_file_and_a_dacl_granting_access_to_other_users() {
 }
 
 #[test]
+fn rescue_refuses_hard_linked_auth_but_forget_unlinks_only_its_name() {
+    let fake = Fake::new().seeded();
+    prepare_with(&fake).unwrap();
+    let auth = fake.profile().join(AUTH);
+    create_private_file(&auth)
+        .unwrap()
+        .write_all(b"credential")
+        .unwrap();
+    prepare_with(&fake).unwrap();
+
+    fake.children.lock().unwrap().clear();
+    let other_link = fake.root.with_file_name("other-auth");
+    fs::hard_link(&auth, &other_link).unwrap();
+    let error = fake.error();
+    assert!(
+        error.ends_with("auth.json: credential must not have another hard link"),
+        "{error}"
+    );
+    assert!(fake.children.lock().unwrap().is_empty());
+    assert_eq!(fs::read(&auth).unwrap(), b"credential");
+
+    assert!(forget_with(&fake).unwrap().removed);
+    assert!(
+        matches!(fs::symlink_metadata(&auth), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    );
+    assert_eq!(fs::read(&other_link).unwrap(), b"credential");
+}
+
+#[test]
 fn package_bin_cannot_escape_pi_install_through_a_link() {
     let mut fake = Fake::new().seeded();
     fake.path_node("v22.19.0", true);

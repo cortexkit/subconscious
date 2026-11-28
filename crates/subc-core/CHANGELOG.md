@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.24.14
+
+- Refuse to use a rescue credential with another hard link on Windows.
+
 ## 0.24.13
 
 - Run `ck doctor` checks and repairs natively on Windows.

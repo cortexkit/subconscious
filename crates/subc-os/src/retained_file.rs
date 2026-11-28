@@ -1,6 +1,8 @@
 //! File-object identity taken from the same handle that supplied captured bytes.
 
 use std::{fs::File, io};
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION;
 
 #[derive(Debug)]
 pub enum OpenRegularError {
@@ -256,21 +258,43 @@ pub struct WindowsFileIndexIdentity {
     pub file_index: u64,
 }
 
-/// Read the legacy 64-bit file index and volume serial from the exact handle.
-/// Registries publish this identity; FILE_ID_INFO's 128-bit identifier is a
-/// different representation and cannot safely be inferred by padding this one.
+/// A snapshot of Windows file information from an open handle.
+#[cfg(windows)]
+pub struct WindowsFileInformation(BY_HANDLE_FILE_INFORMATION);
+
+#[cfg(windows)]
+impl WindowsFileInformation {
+    /// The number of hard links reported for the file when queried.
+    pub fn link_count(&self) -> u32 {
+        self.0.nNumberOfLinks
+    }
+
+    pub(crate) fn attributes(&self) -> u32 {
+        self.0.dwFileAttributes
+    }
+}
+
+/// Query information about the opened object without resolving its path again.
+/// This does not validate the file type or check for reparse points.
 #[cfg(windows)]
 #[allow(unsafe_code)]
-pub fn retained_file_index(file: &File) -> io::Result<WindowsFileIndexIdentity> {
+pub fn retained_file_information(file: &File) -> io::Result<WindowsFileInformation> {
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
-    };
-    let mut info: BY_HANDLE_FILE_INFORMATION = Default::default();
+    use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandle;
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
     // SAFETY: file owns the live handle and info is a writable, correctly sized buffer.
     if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
         return Err(io::Error::last_os_error());
     }
+    Ok(WindowsFileInformation(info))
+}
+
+/// Read the legacy 64-bit file index and volume serial from the exact handle.
+/// Registries publish this identity; FILE_ID_INFO's 128-bit identifier is a
+/// different representation and cannot safely be inferred by padding this one.
+#[cfg(windows)]
+pub fn retained_file_index(file: &File) -> io::Result<WindowsFileIndexIdentity> {
+    let info = retained_file_information(file)?.0;
     Ok(WindowsFileIndexIdentity {
         volume_serial: info.dwVolumeSerialNumber,
         file_index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
@@ -308,6 +332,19 @@ pub fn retained_file_identity(file: &File) -> io::Result<RetainedFileIdentity> {
 #[cfg(all(test, any(unix, windows)))]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_file_information_reports_link_count_from_an_open_handle() {
+        let scratch = cortexkit_test_support::ScratchDir::new("retained-link-count");
+        let path = scratch.join("file");
+        std::fs::write(&path, b"content").unwrap();
+        let file = File::open(&path).unwrap();
+        assert_eq!(retained_file_information(&file).unwrap().link_count(), 1);
+
+        std::fs::hard_link(&path, scratch.join("second-link")).unwrap();
+        assert_eq!(retained_file_information(&file).unwrap().link_count(), 2);
+    }
 
     #[test]
     fn retained_directory_open_checks_type_and_identity() {

@@ -609,9 +609,12 @@ impl ModuleHandle {
         .await
         .map_err(|_| DrainReadyError::Timeout)??;
         match reply.header.ty {
-            FrameType::Response => serde_json::from_slice::<ModuleDrainReady>(&reply.body)
-                .map(|_| ())
-                .map_err(|err| DrainReadyError::Protocol(err.to_string())),
+            FrameType::Response => {
+                serde_json::from_slice::<ModuleDrainReady>(&reply.body)
+                    .map_err(|err| DrainReadyError::Protocol(err.to_string()))?;
+                self.fence_consumer_dials();
+                Ok(())
+            }
             FrameType::Error => {
                 let body = serde_json::from_slice(&reply.body)
                     .map_err(|err| DrainReadyError::Protocol(err.to_string()))?;
@@ -3234,18 +3237,22 @@ fn handle_control_push<H>(
             reason,
             deadline_ms,
         }) => {
+            let accepting = matches!(
+                serde_json::from_slice(&frame.body),
+                Ok(subc_protocol::session::AcceptingDrainCommand::Draining {
+                    accepting: true,
+                    ..
+                })
+            );
+            if !accepting {
+                module_handle.fence_consumer_dials();
+            }
             let started = spawn_draining_hook(
                 handler,
                 DrainNotice {
                     reason: sdk_route_close_reason(reason),
                     deadline: drain_deadline(deadline_ms),
-                    accepting: matches!(
-                        serde_json::from_slice(&frame.body),
-                        Ok(subc_protocol::session::AcceptingDrainCommand::Draining {
-                            accepting: true,
-                            ..
-                        })
-                    ),
+                    accepting,
                 },
                 dispatcher,
             );

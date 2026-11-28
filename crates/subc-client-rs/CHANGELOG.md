@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.43.1
+
+- Stop new local and TCP consumer dials, including reconnect attempts, once the
+  process's SDK registration owner receives a non-accepting drain notice or a
+  `module.drain_ready` acknowledgement. Existing consumer routes can finish
+  their work. Dials remain available during the accepting phase, and the drain
+  fence does not apply to live daemon upgrades.
+
 ## 0.43.0
 
 - Use `CallError::is_route_dead()` and `SubscriptionEnd::is_route_dead()`

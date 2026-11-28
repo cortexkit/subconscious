@@ -11,7 +11,7 @@ use subc_protocol::claim::{
     ClaimRateLimitedDetail,
 };
 
-static OWNER: OnceLock<Arc<dyn ClaimMinter>> = OnceLock::new();
+static OWNER: OnceLock<RegistrationOwner> = OnceLock::new();
 static OWNER_READY: tokio::sync::Notify = tokio::sync::Notify::const_new();
 static HELPER_BOUND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static SUPERVISED: OnceLock<bool> = OnceLock::new();
@@ -96,30 +96,80 @@ pub fn adopt_channel() -> Result<Option<Box<dyn ModuleStream>>, RegistrationErro
 /// it must report a closed registration connection as unavailable. Installation
 /// cannot be undone and must never authorize reconnecting the registration channel.
 pub fn install_claim_minter(minter: Arc<dyn ClaimMinter>) -> Result<(), RegistrationError> {
+    install_adopted_owner(RegistrationOwner::Custom(minter))
+}
+
+fn install_adopted_owner(owner: RegistrationOwner) -> Result<(), RegistrationError> {
     if !CHANNEL_ADOPTED.load(Ordering::Acquire) {
         return Err(RegistrationError::NotAdopted);
     }
-    publish_claim_minter(minter)
+    publish_owner(owner)
 }
 
-fn publish_claim_minter(minter: Arc<dyn ClaimMinter>) -> Result<(), RegistrationError> {
+fn publish_owner(owner: RegistrationOwner) -> Result<(), RegistrationError> {
     OWNER
-        .set(minter)
+        .set(owner)
         .map_err(|_| RegistrationError::AlreadyInstalled)?;
     OWNER_READY.notify_waiters();
     Ok(())
 }
 
-struct SdkClaimMinter(Weak<live_upgrade::Generations>);
+enum RegistrationOwner {
+    Custom(Arc<dyn ClaimMinter>),
+    Sdk(SdkClaimMinter),
+}
+
+impl RegistrationOwner {
+    fn sdk(handle: &ModuleHandle) -> Self {
+        Self::Sdk(SdkClaimMinter {
+            generations: Arc::downgrade(&handle.generations),
+            consumer_dial_stop: CancellationToken::new(),
+        })
+    }
+
+    fn minter(&self) -> &dyn ClaimMinter {
+        match self {
+            Self::Custom(minter) => minter.as_ref(),
+            Self::Sdk(minter) => minter,
+        }
+    }
+}
+
+struct SdkClaimMinter {
+    generations: Weak<live_upgrade::Generations>,
+    consumer_dial_stop: CancellationToken,
+}
 
 #[async_trait]
 impl ClaimMinter for SdkClaimMinter {
     async fn mint(&self, request: ClaimMintRequest) -> Result<ClaimMintReply, ClaimError> {
         ModuleHandle {
-            generations: self.0.upgrade().ok_or(ClaimError::Unavailable)?,
+            generations: self.generations.upgrade().ok_or(ClaimError::Unavailable)?,
         }
         .mint_claim_reply(request)
         .await
+    }
+}
+
+fn sdk_owner() -> Option<&'static SdkClaimMinter> {
+    match OWNER.get()? {
+        RegistrationOwner::Sdk(owner) => Some(owner),
+        RegistrationOwner::Custom(_) => None,
+    }
+}
+
+pub(crate) fn check_consumer_dial() -> Result<(), ConsumerError> {
+    if sdk_owner().is_some_and(|owner| owner.consumer_dial_stop.is_cancelled()) {
+        return Err(ConsumerError::Closed);
+    }
+    Ok(())
+}
+
+pub(crate) async fn consumer_dial_stopped() {
+    if let Some(owner) = sdk_owner() {
+        owner.consumer_dial_stop.cancelled().await;
+    } else {
+        std::future::pending().await
     }
 }
 
@@ -264,10 +314,8 @@ pub(crate) fn install_owner(handle: &ModuleHandle) -> Result<(), SubcModuleError
         .registration
         .active
         .store(true, Ordering::Release);
-    install_claim_minter(Arc::new(SdkClaimMinter(Arc::downgrade(
-        &handle.generations,
-    ))))
-    .map_err(|error| SubcModuleError::RegistrationChannel(io::Error::other(error)))
+    install_adopted_owner(RegistrationOwner::sdk(handle))
+        .map_err(|error| SubcModuleError::RegistrationChannel(io::Error::other(error)))
 }
 
 pub(super) fn rebind_owner(shared: &ModuleHandleShared) {
@@ -278,10 +326,8 @@ pub(super) fn install_resumed_nonce_owner(handle: &ModuleHandle) -> Result<(), S
     // A nonce launch does not have a claim minter until the daemon accepts its
     // first resume. From then on the minter follows the stable handle just as
     // an inherited channel's minter does.
-    publish_claim_minter(Arc::new(SdkClaimMinter(Arc::downgrade(
-        &handle.generations,
-    ))))
-    .map_err(|error| SubcModuleError::RegistrationChannel(io::Error::other(error)))
+    publish_owner(RegistrationOwner::sdk(handle))
+        .map_err(|error| SubcModuleError::RegistrationChannel(io::Error::other(error)))
 }
 
 pub(crate) async fn prefix_claim(module_id: &str) -> Result<Option<Claim>, ClaimError> {
@@ -299,7 +345,7 @@ pub(crate) async fn prefix_claim(module_id: &str) -> Result<Option<Claim>, Claim
             ready.await;
         };
         match mint_claim(
-            owner.as_ref(),
+            owner.minter(),
             ClaimPurpose::Prefix {
                 module_id: module_id.to_owned(),
             },
@@ -329,6 +375,15 @@ pub(crate) fn serve_claim_error(module_id: &str, error: ClaimError) -> SubcModul
 }
 
 impl ModuleHandle {
+    pub(super) fn fence_consumer_dials(&self) {
+        if let Some(owner) = sdk_owner() {
+            // A secondary module can drain without stopping the process owner.
+            if owner.generations.ptr_eq(&Arc::downgrade(&self.generations)) {
+                owner.consumer_dial_stop.cancel();
+            }
+        }
+    }
+
     /// Open or reuse a self-bound TCP consumer. The pool belongs to this spawn's
     /// registration binding; keys compare the exact path and every option. It
     /// holds only weak references: dropping the last Arc closes the connection.
@@ -537,7 +592,7 @@ pub(crate) async fn bind_consumer<S: AsyncRead + AsyncWrite + Unpin>(
     deadline: Duration,
 ) -> Result<(), ClaimError> {
     let claim = if let Some(owner) = OWNER.get() {
-        Some(mint_claim(owner.as_ref(), ClaimPurpose::SelfConnection).await?)
+        Some(mint_claim(owner.minter(), ClaimPurpose::SelfConnection).await?)
     } else if supervised() {
         return Err(ClaimError::Unavailable);
     } else {

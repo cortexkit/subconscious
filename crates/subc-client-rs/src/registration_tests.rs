@@ -1,5 +1,5 @@
 use super::*;
-use consumer::{CallOptions, RetryBackoff};
+use consumer::{CallError, CallOptions, ConnectionState, RetryBackoff};
 use serde_json::{json, Value};
 use std::process::{Command, Stdio};
 use subc_transport::{
@@ -195,6 +195,10 @@ async fn child_case(scenario: &str, test: &str, path: &Path) {
     if matches!(scenario, "custom" | "custom_none") {
         custom_loop(scenario, path).await;
         unreachable!();
+    }
+    if matches!(scenario, "draining" | "accepting_drain") {
+        draining_child(path, scenario == "accepting_drain").await;
+        std::process::exit(0);
     }
     if role == "ordinary" || role == "helper" {
         assert!(!supervised());
@@ -432,6 +436,125 @@ async fn child_case(scenario: &str, test: &str, path: &Path) {
     }
     println!("CASE_DONE");
     std::process::exit(0);
+}
+
+struct DrainHook(mpsc::UnboundedSender<DrainNotice>);
+
+#[async_trait]
+impl ModuleHandler for DrainHook {
+    async fn handle(&self, _: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+        HandlerOutcome::Response(body)
+    }
+
+    async fn on_draining_notice(&self, notice: DrainNotice) {
+        self.0.send(notice).unwrap();
+    }
+}
+
+async fn draining_child(path: &Path, accepting: bool) {
+    let manifest = ModuleManifest::builder("channel-worker", "1.0.0")
+        .registration_channel(true)
+        .build();
+    let (notices, mut notice) = mpsc::unbounded_channel();
+    let (handle, serving) = serve_with_handle(path, manifest, DrainHook(notices))
+        .await
+        .unwrap();
+    let serving = tokio::spawn(serving);
+    if accepting {
+        assert!(notice.recv().await.unwrap().accepting);
+    }
+
+    let client = SubcConsumer::connect(path, options()).await.unwrap();
+    let (states, mut state) = mpsc::unbounded_channel();
+    client.on_connection_state(move |event| {
+        let _ = states.send(event);
+    });
+    query(&client).await;
+    if accepting {
+        handle.drain_ready().await.unwrap();
+    } else {
+        assert!(!notice.recv().await.unwrap().accepting);
+    }
+    query(&client).await;
+    assert_eq!(state.recv().await, Some(ConnectionState::Dropped));
+    let err = client.subscribe_activity(None).await.err().unwrap();
+    assert!(matches!(err, CallError::NotSent(_)), "{err}");
+    assert!(err.to_string().contains("consumer closed"), "{err}");
+    assert!(matches!(
+        SubcConsumer::connect(path, options()).await,
+        Err(ConsumerError::Closed)
+    ));
+    println!("CASE_DONE");
+    serving.abort();
+}
+
+async fn serve_drain_case(
+    registration: &mut Box<dyn ModuleStream>,
+    listener: TcpListener,
+    info: &ConnectionInfo,
+    child: &mut std::process::Child,
+    accepting: bool,
+) {
+    let mut notice = json!({"op":"module.draining","reason":"reload","deadline_ms":0});
+    if accepting {
+        notice["accepting"] = json!(true);
+        send(registration, FrameType::Push, 0, &notice).await;
+    }
+    let (mut stream, _) = timeout(BUDGET, listener.accept()).await.unwrap().unwrap();
+    auth(&mut stream, info).await;
+    let mint = receive(registration).await;
+    let request: ClaimMintRequest = serde_json::from_slice(&mint.body).unwrap();
+    assert_eq!(request.purpose, ClaimPurpose::SelfConnection);
+    let claim = Claim::new("0000000000000000000001".to_owned());
+    send(
+        registration,
+        FrameType::Response,
+        mint.header.corr,
+        ClaimMintReply::new(claim.clone(), 0),
+    )
+    .await;
+    let presentation = receive(&mut stream).await;
+    let presented: ClaimPresentRequest = serde_json::from_slice(&presentation.body).unwrap();
+    assert!(presented.claim == claim);
+    send(
+        &mut stream,
+        FrameType::Response,
+        presentation.header.corr,
+        ClaimPresentReply::new(),
+    )
+    .await;
+
+    for round in 0..2 {
+        let query = receive(&mut stream).await;
+        assert_eq!(
+            serde_json::from_slice::<Value>(&query.body).unwrap()["op"],
+            "activity.query"
+        );
+        if round == 0 && !accepting {
+            send(registration, FrameType::Push, 0, &notice).await;
+        }
+        send(&mut stream, FrameType::Response, query.header.corr,
+            json!({"op":"activity.query","entries":[],"cursor":null,"head":{"daemon_incarnation":"test","seq":0}})).await;
+        if round == 0 && accepting {
+            let ready = receive(registration).await;
+            let body: subc_protocol::session::ModuleDrainReady =
+                serde_json::from_slice(&ready.body).unwrap();
+            send(registration, FrameType::Response, ready.header.corr, body).await;
+        }
+    }
+    stream.shutdown().await.unwrap();
+    drop(stream);
+
+    tokio::select! {
+        biased;
+        accepted = listener.accept() => {
+            accepted.unwrap();
+            let _ = child.kill();
+            child.wait().unwrap();
+            panic!("draining owner attempted a TCP dial");
+        }
+        output = assert_child(child) => assert!(output.contains("CASE_DONE")),
+    }
 }
 
 async fn assert_child(child: &mut std::process::Child) -> String {
@@ -761,12 +884,27 @@ async fn run(scenario: &'static str, test: &str) {
             resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: vec!["claim.mint".into()],
-            subc_capabilities: vec![],
+            subc_capabilities: if scenario == "accepting_drain" {
+                vec![subc_protocol::session::ACCEPTING_DRAIN_CAPABILITY.into()]
+            } else {
+                vec![]
+            },
             storage: None,
             machine_id: None,
         },
     )
     .await;
+    if matches!(scenario, "draining" | "accepting_drain") {
+        serve_drain_case(
+            &mut registration,
+            listener,
+            &info,
+            &mut child,
+            scenario == "accepting_drain",
+        )
+        .await;
+        return;
+    }
     if matches!(
         scenario,
         "multi"
@@ -1037,6 +1175,11 @@ contract_test!(
 );
 contract_test!(weak_pool_reuses_only_equal_binding_options, "pool");
 contract_test!(reconnect_presents_a_fresh_self_claim, "reconnect");
+contract_test!(non_accepting_drain_stops_reconnect_before_dial, "draining");
+contract_test!(
+    accepting_drain_ack_stops_reconnect_before_dial,
+    "accepting_drain"
+);
 contract_test!(rate_limit_observes_retry_after_ms, "rate");
 contract_test!(bound_connection_refuses_identity_override, "identity");
 contract_test!(only_explicit_helper_handoff_delegates_claim, "helper");
@@ -1092,12 +1235,12 @@ async fn live_upgrade_registration_channel_reconnects_then_exits_on_refusal() {
             let owner = OWNER
                 .get()
                 .expect("registration owner should remain installed");
-            let claim = mint_claim(owner.as_ref(), ClaimPurpose::Helper)
+            let claim = mint_claim(owner.minter(), ClaimPurpose::Helper)
                 .await
                 .unwrap();
             assert_eq!(claim, Claim::new("resumed-claim"));
             println!("RESUMED");
-            let _ = mint_claim(owner.as_ref(), ClaimPurpose::SelfConnection).await;
+            let _ = mint_claim(owner.minter(), ClaimPurpose::SelfConnection).await;
         }
         async fn on_connection_end(&self, end: ConnectionEnd) {
             println!("HOOK_{}", end.as_str());

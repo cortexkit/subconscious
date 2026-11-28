@@ -92,6 +92,9 @@ const ACTIVITY_EVENT_BUFFER: usize = 2048;
 mod activity_consumer_tests;
 
 mod cancellation;
+mod reconnect;
+#[cfg(test)]
+use reconnect::is_reconnect_transient;
 mod slots;
 use slots::*;
 mod reservation;
@@ -4271,56 +4274,6 @@ impl Shared {
         true
     }
 
-    async fn reconnect_with_retry(
-        self: &Arc<Self>,
-        reconnect_generation: u64,
-    ) -> Result<(), ConsumerError> {
-        let mut last_error: Option<ConsumerError> = None;
-        for attempt in 1..=self.opts.reconnect_backoff.max_attempts {
-            if self.close_token.is_cancelled() {
-                return Err(ConsumerError::Closed);
-            }
-            if !self.reconnect_attempt_is_current(reconnect_generation) {
-                return Ok(());
-            }
-
-            match open_connection(
-                &self.connection_file,
-                self.opts.handshake_timeout,
-                self.transport,
-                self.operator_app_candidates.as_deref(),
-            )
-            .await
-            {
-                Ok(opened) => {
-                    // A newer drop may have installed its own attempt while this
-                    // connection was opening. Do not let the stale attempt replace it.
-                    if !self.reconnect_attempt_is_current(reconnect_generation) {
-                        return Ok(());
-                    }
-                    let (generation, epoch) = self.install_reconnected(opened)?;
-                    self.schedule_restored(generation, epoch);
-                    return Ok(());
-                }
-                Err(err) => {
-                    let transient = is_reconnect_transient(&err);
-                    last_error = Some(err);
-                    if !transient || attempt >= self.opts.reconnect_backoff.max_attempts {
-                        break;
-                    }
-                    // Jittered like the route.open retries, which share this backoff.
-                    let delay =
-                        self.jittered(self.opts.reconnect_backoff.delay_after_attempt(attempt));
-                    tokio::select! {
-                        () = self.close_token.cancelled() => return Err(ConsumerError::Closed),
-                        () = sleep(delay) => {}
-                    }
-                }
-            }
-        }
-        Err(last_error.unwrap_or(ConsumerError::Closed))
-    }
-
     fn reconnect_attempt_is_current(&self, generation: u64) -> bool {
         let inner = self.lock_inner();
         !inner.closed
@@ -6891,6 +6844,7 @@ async fn open_connection(
             connection_file::LocalEndpoint::Pipe { name } => name.clone(),
             _ => "unsupported local endpoint".to_owned(),
         };
+        crate::registration::check_consumer_dial()?;
         let mut stream =
             connect_local(&endpoint)
                 .await
@@ -6954,6 +6908,7 @@ async fn open_connection_with_info(
             path: path.to_path_buf(),
         })?;
     let endpoint_label = format!("{}:{}", endpoint.host, endpoint.port);
+    crate::registration::check_consumer_dial()?;
     let mut stream = TcpStream::connect(&endpoint_label)
         .await
         .map_err(|source| ConsumerError::Connect {
@@ -7863,44 +7818,6 @@ fn route_is_installed(inner: &Inner, handle: RouteHandle) -> bool {
 
 fn is_retryable_catalog_transport_error(err: &CallError) -> bool {
     matches!(err, CallError::NotSent(_) | CallError::OutcomeUnknown(_))
-}
-
-fn is_reconnect_transient(err: &ConsumerError) -> bool {
-    if let ConsumerError::Connect { source, .. } = err {
-        if let Some(claim) = source
-            .get_ref()
-            .and_then(|source| source.downcast_ref::<crate::ClaimError>())
-        {
-            return matches!(claim, crate::ClaimError::Refused { code } if error_codes::is_retryable_claim(code));
-        }
-    }
-    match err {
-        ConsumerError::Connect { source, .. } => matches!(
-            source.kind(),
-            io::ErrorKind::ConnectionRefused
-                | io::ErrorKind::ConnectionReset
-                | io::ErrorKind::ConnectionAborted
-                | io::ErrorKind::TimedOut
-                | io::ErrorKind::NotConnected
-                | io::ErrorKind::AddrNotAvailable
-        ),
-        ConsumerError::ConnectionFile { source, .. } => match source {
-            ConnectionFileError::Io { source, .. } => source.kind() == io::ErrorKind::NotFound,
-            _ => false,
-        },
-        // Auth failure is transient during reconnect: the daemon rotates its key
-        // on every restart, and with a fixed port a client racing the restart can
-        // read the pre-rotation connection file yet still connect — the proof
-        // mismatch then means "stale key mid-rotation", not "impostor". Each
-        // retry re-reads the connection file (open_connection), so the next
-        // attempt picks up the rotated key, and server-proves-first protects
-        // every attempt. First-connect auth failures stay permanent: connect()
-        // surfaces them directly without entering the reconnect classifier.
-        ConsumerError::Auth { .. } => true,
-        ConsumerError::Discovery { .. }
-        | ConsumerError::NoEndpoint { .. }
-        | ConsumerError::Closed => false,
-    }
 }
 
 impl From<FrameBuildError> for CallError {

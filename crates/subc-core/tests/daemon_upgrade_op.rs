@@ -375,13 +375,13 @@ async fn cold_boot_publishes_discovery_while_identity_hash_is_held() {
     })
     .await
     .expect("discovery must be published while hashing is paused");
-    let (kind, describe) = timeout(
-        Duration::from_secs(1),
-        daemon.call(json!({"op": "server.describe"})),
-    )
-    .await
-    .expect("describe must answer without waiting for the held boot hash")
-    .unwrap();
+    // The boot hash stays held until this test releases the gate below, so a
+    // describe that waited for it would never answer within any bound. WAIT
+    // only absorbs a slow CI runner; it doesn't weaken that proof.
+    let (kind, describe) = timeout(WAIT, daemon.call(json!({"op": "server.describe"})))
+        .await
+        .expect("describe must answer without waiting for the held boot hash")
+        .unwrap();
     assert_eq!(kind, FrameType::Response);
     assert!(describe["counters"].get("daemon_identity").is_none());
 

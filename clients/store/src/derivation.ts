@@ -10,18 +10,19 @@ export function postgresDatabaseName(moduleId: string): string {
 
 /**
  * The platform data home, resolved by THE SUPERVISOR'S RULES — a mirror of
- * `default_data_home` in `crates/subc-core/src/daemon_config.rs`, which is the
+ * `default_data_home` in `crates/subc-daemon/src/daemon_config.rs`, which is the
  * authority: the daemon resolves every module's storage descriptor with that
  * function, so resolving your own path by different rules silently splits it
  * from the directory the supervisor serves. Rule changes land THERE first;
  * this mirror is pinned by the shared golden fixture
  * (`crates/subc-daemon/tests/golden/data_home_resolution.json`).
  *
- * Rules in order: non-empty `XDG_DATA_HOME` AS-IS (relative included, no
- * trimming — compose sites trim); on Windows non-empty `APPDATA`, else
- * `USERPROFILE\AppData\Roaming`; then `$HOME/.local/share`; finally relative
+ * Rules in order: non-empty `XDG_DATA_HOME` AS-IS (even if relative);
+ * on Windows non-empty `LOCALAPPDATA`, else
+ * `USERPROFILE\AppData\Local`; then `$HOME/.local/share`; finally relative
  * `.local/share`. Empty values count as unset. Joins use the platform
- * separator, matching the daemon's PathBuf behavior.
+ * separator, matching the daemon's PathBuf behavior. The resolver preserves
+ * trailing slashes; module path builders trim them before appending components.
  *
  * Modules must not re-derive this by hand: hand-rolled env-or-XDG-or-HOME
  * assembly is how a module directory got fed back in as a data home and
@@ -37,8 +38,8 @@ export function resolveDataHome(
   const xdg = env.XDG_DATA_HOME;
   if (xdg) return xdg;
   if (platform === "win32") {
-    if (env.APPDATA) return env.APPDATA;
-    if (env.USERPROFILE) return `${env.USERPROFILE}${sep}AppData${sep}Roaming`;
+    if (env.LOCALAPPDATA) return env.LOCALAPPDATA;
+    if (env.USERPROFILE) return `${env.USERPROFILE}${sep}AppData${sep}Local`;
   }
   if (env.HOME) return `${env.HOME}${sep}.local${sep}share`;
   return `.local${sep}share`;

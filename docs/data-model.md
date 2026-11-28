@@ -6,8 +6,8 @@ paths, formats, writers and what happens when one is absent or damaged. Paths
 use these roots:
 
 - `<data home>`, as the daemon resolves it: `$XDG_DATA_HOME`; else, on
-  Windows, `%APPDATA%` (or `%USERPROFILE%\AppData\Roaming`); else
-  `$HOME/.local/share` (`default_data_home` in
+  Windows, `%LOCALAPPDATA%` (or `%USERPROFILE%\AppData\Local`); else
+  `$HOME/.local/share`, then relative `.local/share` (`default_data_home` in
   `crates/subc-daemon/src/daemon_config.rs`; test
   `default_data_home_matches_golden_fixture` (`crates/subc-daemon/src/daemon_config.rs`)).
 - `<install home>`, as `ck setup` resolves it for binaries and its inventory:
@@ -18,8 +18,9 @@ use these roots:
   `%USERPROFILE%\AppData\Roaming`); else `$HOME/.config`
   (`default_config_home` in `crates/subc-daemon/src/daemon_config.rs`).
 
-A relative data home (no `HOME` and no absolute `XDG_DATA_HOME`) is refused
-instead of being resolved against the working directory
+Empty values count as unset. Windows data stays local so large module databases
+do not sync with a roaming profile; configuration can still roam. A relative
+data home is refused instead of being resolved against the working directory
 (`daemon_run_dir` in `crates/subc-daemon/src/daemon_config.rs`).
 
 ## 1. Overview

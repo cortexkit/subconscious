@@ -188,8 +188,9 @@ describe("data-home resolver (mirror of subc default_data_home)", () => {
         ran += 1;
       }
     }
-    // Vacuity floor: 11 cases + 1 composed, 'any' rows doubled => 16 runs.
-    expect(ran).toBeGreaterThanOrEqual(16);
+    // Expect at least 17 runs: 12 resolution cases and 1 store-path case,
+    // with the 'any' rows run on both platforms.
+    expect(ran).toBeGreaterThanOrEqual(17);
   });
 
   test("moduleStorePath honours absolute XDG_DATA_HOME", () => {

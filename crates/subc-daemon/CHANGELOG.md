@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.54.8
+
+- On Windows, keep module stores and daemon runtime data in local app data
+  rather than roaming app data. `XDG_DATA_HOME` still overrides the default,
+  and configuration still uses its separate roaming location.
+
 ## 0.54.7
 
 - Test-only: keep the registration retirement socket open in an execed helper

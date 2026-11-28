@@ -55,6 +55,7 @@ mod tests {
             "HOME",
             "USERPROFILE",
             "APPDATA",
+            "LOCALAPPDATA",
             "XDG_RUNTIME_DIR",
             "XDG_CONFIG_HOME",
             "XDG_DATA_HOME",

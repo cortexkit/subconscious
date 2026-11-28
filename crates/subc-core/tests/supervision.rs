@@ -1333,12 +1333,9 @@ async fn a_silent_module_reports_captured_and_empty_rather_than_uncaptured() {
 /// rightly refuses.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_supervised_module_inherits_the_parent_environment() {
-    // The variable is chosen by MEANING, not spelling: whichever one this
-    // platform's `default_data_home()` reads to find the user's home. HOME is a
-    // POSIX concept that does not exist on Windows, where the resolver falls
-    // back to APPDATA then USERPROFILE. Asserting "HOME" on every platform is a
-    // true assertion about a variable the platform never had -- which is how
-    // this test first went red on the Windows leg.
+    // Check the platform's account home variable. The Windows data-home
+    // resolver can use USERPROFILE when LOCALAPPDATA is unset, and Windows
+    // doesn't normally set HOME.
     #[cfg(windows)]
     let home_var = "USERPROFILE";
     #[cfg(not(windows))]

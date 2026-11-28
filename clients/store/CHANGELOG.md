@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.4
+
+- Match the daemon's Windows data-home default: use `LOCALAPPDATA` or
+  `USERPROFILE\AppData\Local` after `XDG_DATA_HOME`. Roaming `APPDATA` is no
+  longer a storage fallback.
+
 ## 0.2.3
 
 - Use the shared POSIX ancestor policy from `@cortexkit/private-files` 0.2.0, preserving the existing public API and refusal messages. Ubuntu's umask-0002 config layout remains accepted when its user-owned directory's effective group has no other members and no other users sharing it as their primary group.

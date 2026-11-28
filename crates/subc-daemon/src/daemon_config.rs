@@ -454,8 +454,7 @@ struct RawDaemonConfig {
 #[serde(tag = "backend", rename_all = "snake_case")]
 enum RawStorageConfig {
     Sqlite {
-        /// Where per-module sqlite files live. Defaults to the platform data home
-        /// (`$XDG_DATA_HOME`, else `~/.local/share`) when omitted.
+        /// Where per-module SQLite files live. Defaults to [`default_data_home`].
         #[serde(default)]
         data_home: Option<PathBuf>,
     },
@@ -689,8 +688,8 @@ pub fn default_config_path() -> PathBuf {
 ///
 /// Resolution: `XDG_CONFIG_HOME` → `APPDATA` (Windows) → `USERPROFILE` +
 /// `AppData\Roaming` (Windows) → `HOME/.config` → `.config` relative.
-/// Empty values count as unset. Mirrors the data-home ladder exactly except for
-/// the per-platform tails (`.local/share` there, `.config` here).
+/// Empty values count as unset. On Windows, config can roam with the user;
+/// [`default_data_home`] uses local app data so databases do not roam.
 ///
 /// A RELATIVE result means one of two things and the resolver does not say
 /// which: no home variable was set (the final rung), or `XDG_CONFIG_HOME` was
@@ -853,8 +852,7 @@ fn ensure_directory_private(path: &Path) -> Result<(), io::Error> {
 
 /// Existing per-user daemon run directory (`<data-home>/cortexkit/run`).
 ///
-/// Refuses a relative data home (HOME and XDG_DATA_HOME both unset, or a
-/// relative XDG_DATA_HOME) instead of resolving it against the working
+/// Refuses a relative data home instead of resolving it against the working
 /// directory. Resolving it there once wrote a stray `.local/` tree into a crate
 /// directory and dirtied a release build: the run directory holds the
 /// connection file, the terminal journal and the daemon's logs, so it must not
@@ -900,7 +898,7 @@ impl std::error::Error for DaemonRunDirError {}
 /// Which environment variables make the data home absolute on this platform.
 #[cfg(windows)]
 const DATA_HOME_REMEDY: &str =
-    "set XDG_DATA_HOME to an absolute path, or set APPDATA, USERPROFILE or HOME";
+    "set XDG_DATA_HOME to an absolute path, or set LOCALAPPDATA, USERPROFILE or HOME";
 #[cfg(not(windows))]
 const DATA_HOME_REMEDY: &str = "set XDG_DATA_HOME to an absolute path, or set HOME";
 
@@ -1180,7 +1178,7 @@ fn parse_doc_with_activity(
                         path: path.to_path_buf(),
                         message: format!(
                             "storage data home resolved to the relative path {} \
-                             (no absolute XDG_DATA_HOME, APPDATA, USERPROFILE, or HOME \
+                             (no absolute XDG_DATA_HOME, LOCALAPPDATA, USERPROFILE, or HOME \
                              in the daemon's environment); refusing to serve a \
                              cwd-relative storage descriptor to modules. Set \
                              XDG_DATA_HOME or HOME to an absolute path, or set \
@@ -1664,8 +1662,11 @@ fn health_action(action: RawHealthAction) -> HealthAction {
     }
 }
 
-/// Platform data home for per-module storage: `$XDG_DATA_HOME`, else
-/// `~/.local/share` (or the Windows roaming app data), else a relative fallback.
+/// Platform data home for per-module storage and daemon runtime state.
+/// Resolution: `XDG_DATA_HOME` → `LOCALAPPDATA` (Windows) →
+/// `USERPROFILE\AppData\Local` (Windows) → `HOME/.local/share` → relative
+/// `.local/share`. Empty values count as unset. Windows databases stay local
+/// rather than syncing with a roaming user profile.
 pub fn default_data_home() -> PathBuf {
     if let Some(data_home) = non_empty_os_var("XDG_DATA_HOME") {
         return PathBuf::from(data_home);
@@ -1673,11 +1674,11 @@ pub fn default_data_home() -> PathBuf {
 
     #[cfg(windows)]
     {
-        if let Some(app_data) = non_empty_os_var("APPDATA") {
-            return PathBuf::from(app_data);
+        if let Some(local_app_data) = non_empty_os_var("LOCALAPPDATA") {
+            return PathBuf::from(local_app_data);
         }
         if let Some(user_profile) = non_empty_os_var("USERPROFILE") {
-            return PathBuf::from(user_profile).join("AppData").join("Roaming");
+            return PathBuf::from(user_profile).join("AppData").join("Local");
         }
     }
 
@@ -1827,9 +1828,15 @@ mod tests {
     /// rule change here that skips the fixture breaks THIS test rather than
     /// silently splitting a module's self-resolved path from the descriptor
     /// the daemon serves (the CKCRED Windows divergence, 2026-08).
-    /// Env-mutating tests share this lock: cargo runs tests on multiple
-    /// threads and the four data-home variables are process-global.
+    /// Env-mutating tests share this lock because the home variables are process-global.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    const DATA_HOME_TEST_VARS: [&str; 5] = [
+        "XDG_DATA_HOME",
+        "LOCALAPPDATA",
+        "APPDATA",
+        "USERPROFILE",
+        "HOME",
+    ];
 
     /// A path that is absolute on the platform running the test. `/data` is
     /// relative on Windows (no drive letter), which is not a bug in the resolver
@@ -1849,7 +1856,7 @@ mod tests {
         let doc: serde_json::Value =
             serde_json::from_str(include_str!("../tests/golden/data_home_resolution.json"))
                 .expect("golden parses");
-        let vars = ["XDG_DATA_HOME", "APPDATA", "USERPROFILE", "HOME"];
+        let vars = DATA_HOME_TEST_VARS;
         let saved: Vec<(&str, Option<std::ffi::OsString>)> =
             vars.iter().map(|v| (*v, env::var_os(v))).collect();
         let platform_matches =
@@ -1889,10 +1896,8 @@ mod tests {
         }
     }
 
-    /// A relative data home is what `default_data_home` returns when HOME and
-    /// XDG_DATA_HOME are both unset (the golden fixture pins `.local/share`), or
-    /// when XDG_DATA_HOME itself is relative. Either must be refused, never
-    /// joined onto the working directory.
+    /// Refuse both a relative fallback and an explicitly relative override
+    /// rather than resolving either against the working directory.
     #[test]
     fn daemon_run_dir_refuses_a_relative_data_home_and_names_the_variables() {
         for data_home in [PathBuf::from(".local/share"), PathBuf::from("relative-xdg")] {
@@ -1994,7 +1999,7 @@ mod tests {
         );
 
         // Arm 2: the resolver's fall-through, with every home variable cleared.
-        let vars = ["XDG_DATA_HOME", "APPDATA", "USERPROFILE", "HOME"];
+        let vars = DATA_HOME_TEST_VARS;
         let saved: Vec<(&str, Option<std::ffi::OsString>)> =
             vars.iter().map(|v| (*v, env::var_os(v))).collect();
         for v in vars {

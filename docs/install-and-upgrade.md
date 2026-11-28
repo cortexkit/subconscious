@@ -32,13 +32,15 @@ installation (`scripts/install/install.sh`, `scripts/install/install.ps1`):
 | macOS, Linux | `<data home>/cortexkit/cmd/ck` | A block between `# cortexkit-managed PATH begin` and `# cortexkit-managed PATH end` in `~/.zshrc` (or `.zshrc` in the startup-file directory selected by zsh's `ZDOTDIR`), `~/.bashrc` or Fish `config.fish`. |
 | Windows | `%LOCALAPPDATA%\cortexkit\cmd\ck.exe` | The user `PATH` in `HKCU\Environment`. |
 
-`<data home>` is `$XDG_DATA_HOME`, else `~/.local/share`. Only the `cmd/`
-directory is added to PATH; the daemon and modules live in `<data home>/cortexkit/bin/`
-and are reached through `ck`. Existing `bin` PATH entries are left intact.
-The installer retires only the old layout's `<data home>/cortexkit/bin/ck`
-(`%LOCALAPPDATA%\cortexkit\bin\ck.exe` on Windows) by
-moving it to a unique `ck[.exe].retired-*` name beside the original. Setup
-records the original path, backup path and digest in `installer-manifest.json`.
+On macOS and Linux, `<data home>` is `$XDG_DATA_HOME`, else `~/.local/share`.
+The [install home](data-model.md) is `<data home>/cortexkit` on those platforms
+and `%LOCALAPPDATA%\cortexkit` on Windows. Only its `cmd/` directory is added
+to PATH; the daemon and modules live in its `bin/` directory and are reached
+through `ck`. Existing `bin` PATH entries are left intact.
+The installer retires only the old layout's `<install home>/bin/ck` (`ck.exe`
+on Windows) by moving it to a unique `ck[.exe].retired-*` name beside the
+original. Setup records the original path, backup path and digest in
+`installer-manifest.json`.
 An operator's or package manager's `ck` anywhere else is left untouched.
 The installer puts `cmd` first in the user
 PATH on Windows and in the persisted shell-profile block on Unix, then checks
@@ -362,7 +364,7 @@ ck setup --uninstall
 ```
 
 Uninstall removes only what the installer inventory
-(`<data home>/cortexkit/installer-manifest.json`) records: placed binaries,
+(`<install home>/installer-manifest.json`) records: placed binaries,
 the PATH change and the service registration. Your configuration and every
 module's store stay on disk, including the bus entries, NATS data and bus
 ownership record; the command lists what it kept. Delete

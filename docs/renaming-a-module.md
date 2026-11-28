@@ -386,9 +386,9 @@ a mutable, aliasable path — a folder rename is its loudest instance.
 
 ## Data-layout convention (referenced by fleet-pulse's LAYOUT ANOMALY line)
 
-One rule: module data lives at `<data home>/cortexkit/<module_id>/` where the
-data home is `$XDG_DATA_HOME` (absolute) else `~/.local/share`. The resolution
-is OWNED BY THE SHARED CRATES — Rust `cortexkit-store-types::module_store_path`
+One rule: module data lives at `<data home>/cortexkit/<module_id>/`, using the
+[daemon's data-home rules](data-model.md). The resolution is owned by the
+shared packages — Rust `cortexkit-store-types::module_store_path`
 / `module_data_dir` (0.2.0+), TS `@cortexkit/store` `moduleStorePath` /
 `moduleDataDir`. Modules do not hand-assemble the home and do not invent
 private `*_DATA_DIR` env conventions; rigs relocate the whole tree via

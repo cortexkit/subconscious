@@ -154,10 +154,12 @@ undeclared name), which is one of the three doors the operator confirmed.
 
 ## Files
 
+See [Durable state](data-model.md) for how the daemon resolves `<data home>`.
+
 ```
 <module data dir>/logs/<module_id>.<YYYY-MM-DD>.log     one segment per UTC day, all lanes
-~/.local/share/cortexkit/run/logs/subc.<YYYY-MM-DD>.log  the daemon's own log (subconscious only)
-~/.local/share/cortexkit/run/logs/<module_id>.stderr.log daemon capture of stray stderr/stdout
+<data home>/cortexkit/run/logs/subc.<YYYY-MM-DD>.log    the daemon's own log (subconscious only)
+<data home>/cortexkit/run/logs/<module_id>.stderr.log   daemon capture of stray stderr/stdout
 ```
 
 - **Capture lines carry the daemon's capture time.** Each line of

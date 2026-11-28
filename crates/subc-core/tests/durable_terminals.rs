@@ -437,7 +437,7 @@ fn the_daemon_binary_refuses_a_relative_data_home_by_name() {
         .env("SUBC_CGROUP_PLACEMENT", "disabled")
         .env_remove("XDG_DATA_HOME")
         .env_remove("HOME")
-        .env_remove("APPDATA")
+        .env_remove("LOCALAPPDATA")
         .env_remove("USERPROFILE")
         .env_remove("CK_LOG")
         .stdout(Stdio::null())

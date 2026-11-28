@@ -4948,22 +4948,44 @@ fn upgrade_refuses_unowned_ck_bus_without_invoking_it() {
 
 #[test]
 fn upgrade_refuses_a_signed_core_release_without_ck_bus_before_writing() {
-    let fixture = UpgradeFixture::new("ck-upgrade-incomplete-bus-release");
+    assert_upgrade_refuses_incomplete_core_release("ck-bus");
+}
+
+#[test]
+fn upgrade_refuses_a_signed_core_release_without_ck_subc_mcp_before_writing() {
+    assert_upgrade_refuses_incomplete_core_release("ck-subc-mcp");
+}
+
+fn assert_upgrade_refuses_incomplete_core_release(missing: &str) {
+    let fixture = UpgradeFixture::new(&format!("ck-upgrade-incomplete-{missing}-release"));
     let data = fixture.home.join(".local/share/cortexkit");
+    let runner = platform_binary("ck-script-runner-bun");
+    let runner_path = data.join("bin").join(&runner);
+    let archive = stored_zip(&[(&runner, &fs::read(&runner_path).unwrap())]);
     let paths = [
         data.join("installer-manifest.json"),
         data.join("nats/server.conf"),
-        data.join("bin").join(platform_binary("ck-bus")),
+        data.join("bin").join(platform_binary(missing)),
         fixture.home.join(".config/cortexkit/subc.jsonc"),
+        runner_path,
     ];
     let before = paths.each_ref().map(|path| fs::read(path).unwrap());
     let index = serve_signed_index(|base| {
-        let (mut index, archives) = current_upgrade_index(base);
-        assert!(index["components"]["core"]["assets"][host_target()]
+        let (mut index, mut archives) = current_upgrade_index(base);
+        let assets = index["components"]["core"]["assets"][host_target()]
             .as_object_mut()
-            .unwrap()
-            .remove("ck-bus")
-            .is_some());
+            .unwrap();
+        assert!(assets.remove(missing).is_some());
+        assets.insert(
+            "ck-script-runner-bun".into(),
+            fixture_asset(
+                format!("{base}/runner.zip"),
+                sha256_hex(&archive),
+                archive.len() as u64,
+                None,
+            ),
+        );
+        archives.insert("/runner.zip".into(), archive);
         (index, archives)
     });
 
@@ -4971,9 +4993,13 @@ fn upgrade_refuses_a_signed_core_release_without_ck_bus_before_writing() {
     assert_exit(&output, 1);
     let stdout = text(&output.stdout);
     assert!(
-        stdout.contains("no ck-bus asset in subc-core-v0.17.10 yet"),
+        stdout.contains(&format!(
+            "core: no {missing}-{}.zip asset in subc-core-v0.17.10 yet",
+            host_target()
+        )),
         "{stdout}"
     );
+    assert_eq!(*index.requests.lock().unwrap(), ["/index.json"]);
     assert_eq!(paths.each_ref().map(|path| fs::read(path).unwrap()), before);
 }
 

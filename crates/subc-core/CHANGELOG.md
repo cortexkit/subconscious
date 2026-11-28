@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.24.12
+
+- Let `ck upgrade` and the terminal update wizard proceed when the ownership
+  check reports only informational notes.
+- Refuse upgrades before any writes if a signed release is missing a required
+  program for the current platform.
+
 ## 0.24.11
 
 - Preserve installer inventory bytes when an otherwise unchanged message-bus

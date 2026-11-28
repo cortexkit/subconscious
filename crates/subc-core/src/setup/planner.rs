@@ -893,6 +893,25 @@ pub fn plan_upgrade(observed: &UpgradeObserved) -> UpgradePlan {
         return plan;
     };
 
+    // A missing program has no release digest, so it may look current.
+    // Refuse incomplete indexed releases before planning any writes.
+    for &target in &observed.roster {
+        if let ReleaseAvailability::NotYetPublished {
+            release_tag,
+            missing_asset,
+        } = observed.release(target)
+        {
+            plan.outcomes.push(PlanOutcome::ReleaseIncomplete {
+                component: target.component,
+                release_tag,
+                missing_asset,
+            });
+        }
+    }
+    if !plan.is_authorized() {
+        return plan;
+    }
+
     if let Some(&target) = observed
         .roster
         .iter()
@@ -916,20 +935,6 @@ pub fn plan_upgrade(observed: &UpgradeObserved) -> UpgradePlan {
         }
         if target.is_self_replacing() {
             append_message_grants(observed, &mut plan);
-        }
-        if target.binary == "ck-bus" {
-            if let ReleaseAvailability::NotYetPublished {
-                release_tag,
-                missing_asset,
-            } = observed.release(target)
-            {
-                plan.outcomes.push(PlanOutcome::ReleaseIncomplete {
-                    component: target.component,
-                    release_tag,
-                    missing_asset,
-                });
-                continue;
-            }
         }
         match observed.target_state(target) {
             UpgradeState::NotInstalled => plan.outcomes.push(PlanOutcome::Noop {

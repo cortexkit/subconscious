@@ -18,7 +18,9 @@ use super::{
     file_modes,
     install_lock::InstallHold,
     inventory::Inventory,
-    model::{AlphaTarget, Component, UpgradeObserved, UpgradeState, UpgradeTarget},
+    model::{
+        AlphaTarget, Component, ReleaseAvailability, UpgradeObserved, UpgradeState, UpgradeTarget,
+    },
     release_index::ReleaseIndex,
     update_cache::UpdateMetadata,
     update_check::{observed_from_metadata, InstalledBinary},
@@ -637,9 +639,8 @@ pub fn observed_upgrade_targets(
                 observed.target_state(member),
                 UpgradeState::UpdateAvailable { .. }
             )
-        }) && members().all(|member| {
-            observed.release(member) == crate::setup::model::ReleaseAvailability::Available
-        }) {
+        }) && members().all(|member| observed.release(member) == ReleaseAvailability::Available)
+        {
             for member in members() {
                 if observed.target_state(member) == UpgradeState::Current {
                     let release = &metadata.targets[member.label()];
@@ -714,19 +715,31 @@ pub fn observed_upgrade_targets(
     if let Some(index) = index {
         let core = index.components.get(Component::Core.label());
         observed.available_core_version = core.and_then(|entry| entry.version.clone());
-        if let (Some(core), super::PlatformObservation::Supported(platform)) =
-            (core, &observed.platform)
-        {
-            if !core
-                .assets
-                .get(platform.label())
-                .is_some_and(|assets| assets.contains_key("ck-bus"))
-            {
+        if let super::PlatformObservation::Supported(platform) = observed.platform {
+            for &target in &observed.roster {
+                // Check programs upgrade would place, including newly added companions.
+                // The component binary table excludes ck itself and non-binary assets.
+                if !components::component_binaries_for_target(target.component, platform)
+                    .contains(&target.binary)
+                {
+                    continue;
+                }
+                let Some(entry) = index.components.get(target.component.label()) else {
+                    // No indexed release is different from an incomplete indexed release.
+                    continue;
+                };
+                if entry
+                    .assets
+                    .get(platform.label())
+                    .is_some_and(|assets| assets.contains_key(target.binary))
+                {
+                    continue;
+                }
                 observed.releases.insert(
-                    "ck-bus".into(),
-                    super::model::ReleaseAvailability::NotYetPublished {
-                        release_tag: core.release.clone(),
-                        missing_asset: "ck-bus".into(),
+                    target.label().into(),
+                    ReleaseAvailability::NotYetPublished {
+                        release_tag: entry.release.clone(),
+                        missing_asset: format!("{}-{}.zip", target.binary, platform.label()),
                     },
                 );
             }
@@ -2844,6 +2857,25 @@ pub(super) mod tests {
 
     #[test]
     fn upgrade_planner_uses_the_artifact_sources_same_signed_index_generation() {
+        let super::super::PlatformObservation::Supported(platform) =
+            super::super::PlatformObservation::current()
+        else {
+            return;
+        };
+        let assets = |binary: &str, version: &str, digest: &str| {
+            BTreeMap::from([(
+                platform.label().to_string(),
+                BTreeMap::from([(
+                    binary.to_string(),
+                    super::super::release_index::IndexAsset {
+                        url: format!("https://example.invalid/{binary}.zip"),
+                        sha256: digest.to_string(),
+                        bytes: 1,
+                        reports: Some(version.to_string()),
+                    },
+                )]),
+            )])
+        };
         let mut index_components = BTreeMap::new();
         index_components.insert(
             "core".to_string(),
@@ -2851,7 +2883,7 @@ pub(super) mod tests {
                 release: "subc-core-v0.17.20".to_string(),
                 version: Some("0.17.20".to_string()),
                 requires_core: None,
-                assets: BTreeMap::new(),
+                assets: assets("ck-subc", "0.17.20", "new-daemon"),
             },
         );
         index_components.insert(
@@ -2860,7 +2892,7 @@ pub(super) mod tests {
                 release: "v1.0.0".to_string(),
                 version: Some("1.0.0".to_string()),
                 requires_core: Some("0.17.20".to_string()),
-                assets: BTreeMap::new(),
+                assets: assets("ck-aft", "1.0.0", "new-aft"),
             },
         );
         let index = ReleaseIndex {
@@ -2869,7 +2901,7 @@ pub(super) mod tests {
             generated_at_ms: 1,
             components: index_components,
         };
-        let mut artifacts = ReleaseArtifactSource::from_index(index, AlphaTarget::LinuxX64);
+        let mut artifacts = ReleaseArtifactSource::from_index(index, platform);
         artifacts.ensure_index().expect("fixture index");
         let planning_index = artifacts.cloned_index().expect("same cached index");
 

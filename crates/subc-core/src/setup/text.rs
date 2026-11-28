@@ -50,13 +50,12 @@ pub fn human_blocking_outcome(outcome: &PlanOutcome) -> String {
 /// when ownership stops an upgrade before anything is checked: each refusal
 /// on its own line. `None` when nothing refuses.
 pub fn upgrade_ownership_refusal(outcomes: &[PlanOutcome]) -> Option<String> {
-    (!outcomes.is_empty()).then(|| {
-        outcomes
-            .iter()
-            .map(human_blocking_outcome)
-            .collect::<Vec<_>>()
-            .join("\n")
-    })
+    let refusals = outcomes
+        .iter()
+        .filter(|outcome| outcome.blocks_execution())
+        .map(human_blocking_outcome)
+        .collect::<Vec<_>>();
+    (!refusals.is_empty()).then(|| refusals.join("\n"))
 }
 
 /// What `ck upgrade` prints, and the update wizard shows, when the plan
@@ -112,6 +111,25 @@ pub fn upgrade_current_summary(discovered: &[ManagedUpgradeTarget]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upgrade_ownership_refusal_ignores_setup_notes() {
+        let note = PlanOutcome::SetupNote {
+            message: "run ck setup to add a companion program".into(),
+        };
+        assert_eq!(upgrade_ownership_refusal(std::slice::from_ref(&note)), None);
+
+        let reason = "Move the unowned binary aside and run ck setup again.";
+        assert_eq!(
+            upgrade_ownership_refusal(&[
+                note,
+                PlanOutcome::Refusal {
+                    reason: reason.into()
+                }
+            ]),
+            Some(reason.to_string())
+        );
+    }
 
     #[test]
     fn an_empty_upgrade_summary_does_not_claim_currency() {

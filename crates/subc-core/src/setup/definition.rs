@@ -14,6 +14,20 @@ pub(super) fn canonical_registered_windows(text: &str) -> Result<String, String>
     canonical_with_mode(RuntimePlatform::Windows, text, true)
 }
 
+pub(super) fn same_semantics(platform: RuntimePlatform, recorded: &str, current: &str) -> bool {
+    let (Ok(mut recorded), Ok(current)) = (
+        serde_json::from_str::<Value>(recorded),
+        serde_json::from_str::<Value>(current),
+    ) else {
+        return false;
+    };
+    if platform == RuntimePlatform::Windows {
+        // Older records sorted unordered children using the build's JSON key order.
+        sort_unordered_task_children(&mut recorded);
+    }
+    recorded == current
+}
+
 /// Compare registered behavior, not registration metadata. Identity aliases must
 /// be resolved by Windows before being supplied here; arbitrary SIDs are not aliases.
 pub(super) fn windows_task_difference(
@@ -100,11 +114,13 @@ fn canonical_with_mode(
                         .ok_or("empty plist")?,
                 )?
             } else {
-                task(document.root_element(), registered)?
+                let mut value = task(document.root_element(), registered)?;
+                sort_unordered_task_children(&mut value);
+                value
             }
         }
     };
-    serde_json::to_string(&value).map_err(|e| e.to_string())
+    Ok(subc_jsonc::to_string_pretty_sorted(&value))
 }
 
 fn plist(node: Node<'_, '_>) -> Result<Value, String> {
@@ -219,16 +235,7 @@ fn task(node: Node<'_, '_>, registered: bool) -> Result<Value, String> {
             .any(|child| child["name"] == "UseUnifiedSchedulingEngine")
         {
             settings.push(json!({"name":"UseUnifiedSchedulingEngine", "namespace":namespace, "attributes":{}, "text":"true", "children":[]}));
-            settings.sort_by_key(Value::to_string);
         }
-    }
-    // These containers use xs:all; array/sequence-constrained containers keep
-    // their order, so argument/action reordering cannot look like formatting.
-    if matches!(
-        name,
-        "Task" | "Settings" | "RestartOnFailure" | "RegistrationInfo" | "Principal"
-    ) {
-        children.sort_by_key(Value::to_string);
     }
     let mut text = if children.is_empty() {
         node.text().unwrap_or_default().trim().to_string()
@@ -242,6 +249,22 @@ fn task(node: Node<'_, '_>, registered: bool) -> Result<Value, String> {
         json!({"name": name, "namespace": node.tag_name().namespace().unwrap_or_default(),
         "attributes": attributes, "text": text, "children": children}),
     )
+}
+
+fn sort_unordered_task_children(node: &mut Value) {
+    // These containers allow children in any order. Keep the order of sequences such as actions.
+    let unordered = matches!(
+        node["name"].as_str(),
+        Some("Task" | "Settings" | "RestartOnFailure" | "RegistrationInfo" | "Principal")
+    );
+    if let Some(children) = node.get_mut("children").and_then(Value::as_array_mut) {
+        for child in children.iter_mut() {
+            sort_unordered_task_children(child);
+        }
+        if unordered {
+            children.sort_by_cached_key(subc_jsonc::to_string_pretty_sorted);
+        }
+    }
 }
 
 fn unit(text: &str) -> Result<Value, String> {
@@ -270,6 +293,20 @@ fn unit(text: &str) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_windows_definition_has_sorted_object_keys() {
+        assert_eq!(
+            canonical(RuntimePlatform::Windows, "<Task/>").unwrap(),
+            r#"{
+  "attributes": {},
+  "children": [],
+  "name": "Task",
+  "namespace": "",
+  "text": ""
+}"#
+        );
+    }
 
     #[test]
     fn legacy_task_registration_materialization_preserves_behavior() {

@@ -1895,10 +1895,6 @@ impl SetupFixture {
                     })
                 })
                 .collect::<Vec<_>>();
-            mutations.push(json!({
-                "kind": "runtime-definition",
-                "path": runtime_definition(&home),
-            }));
             let nats = cortexkit.join("nats");
             fs::create_dir_all(&nats).unwrap();
             fs::write(nats.join("operator.jwt"), b"fixture operator JWT").unwrap();
@@ -1906,6 +1902,10 @@ impl SetupFixture {
                 "kind": "bus-trust", "path": nats, "state": "applied",
                 "root_pub": "78".repeat(32), "signer_pub": public_half(SIGNER_ID),
                 "sysaccount_pub": public_half(SYSACCOUNT_ID), "activation_pending": false,
+            }));
+            mutations.push(json!({
+                "kind": "runtime-definition",
+                "path": runtime_definition(&home),
             }));
             let connection = root
                 .path()
@@ -1939,16 +1939,14 @@ impl SetupFixture {
             )
             .unwrap();
             fs::create_dir_all(&cortexkit).unwrap();
+            let inventory = json!({
+                "schema_version": 1,
+                "platform": host_target(),
+                "mutations": mutations,
+            });
             fs::write(
                 cortexkit.join("installer-manifest.json"),
-                format!(
-                    "{:#}\n",
-                    json!({
-                        "schema_version": 1,
-                        "platform": host_target(),
-                        "mutations": mutations,
-                    })
-                ),
+                format!("{}\n", subc_jsonc::to_string_pretty_sorted(&inventory)),
             )
             .unwrap();
         }
@@ -3071,7 +3069,8 @@ fn setup_live_daemon_uses_core_release_not_connection_library_version() {
     );
     let config = fixture.config_home.join("cortexkit/subc.jsonc");
     let inventory = fixture.data_home.join("cortexkit/installer-manifest.json");
-    let before = (fs::read(&config).unwrap(), fs::read(&inventory).unwrap());
+    let config_before = fs::read_to_string(&config).unwrap();
+    let inventory_before = fs::read_to_string(&inventory).unwrap();
     let index = serve_signed_index(|base| {
         let (mut index, assets) = setup_index(base, None);
         index["components"]["core"]["version"] = json!("0.20.83");
@@ -3097,9 +3096,16 @@ fn setup_live_daemon_uses_core_release_not_connection_library_version() {
             }
         );
         assert_eq!(
-            (fs::read(&config).unwrap(), fs::read(&inventory).unwrap()),
-            before
+            fs::read_to_string(&config).unwrap(),
+            config_before,
+            "{args:?} changed the config"
         );
+        assert_eq!(
+            fs::read_to_string(&inventory).unwrap(),
+            inventory_before,
+            "{args:?} changed the inventory"
+        );
+        assert!(!inventory.with_file_name("installer.journal").exists());
     }
     assert_eq!(
         *index.requests.lock().unwrap(),

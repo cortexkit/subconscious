@@ -56,7 +56,7 @@ cortexkit-test-support = "0.1.3"
 tempfile = "3"
 tokio = { version = "1", features = ["io-util", "net", "test-util"] }
 subc-control = { path = "../subc-control", version = "0.43.0" }
-subc-core = { path = "../subc-core", version = "0.24.10", features = ["test-support"] }
+subc-core = { path = "../subc-core", version = "0.24.11", features = ["test-support"] }
 subc-daemon = { path = "../subc-daemon", version = "0.54.7", features = ["test-support"] }
 subc-jsonc = { path = "../subc-jsonc", version = "0.1.0" }
 subc-transport = { path = "../subc-transport", version = "0.18.0" }

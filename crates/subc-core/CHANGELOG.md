@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.24.11
+
+- Preserve installer inventory bytes when an otherwise unchanged message-bus
+  setup sets and clears its activation recovery flag.
+- Keep Windows scheduled-task ownership independent of JSON key order and the
+  order of settings that Task Scheduler treats as unordered.
+
 ## 0.24.10
 
 - Test-only: Give answering doctor fixtures time to run on a busy test runner

@@ -19,7 +19,7 @@ use lifecycle::{daemon_processes, wait_for_exit};
 #[cfg(test)]
 use super::file_modes;
 use super::{
-    definition::{canonical, windows_task_difference},
+    definition::{canonical, same_semantics, windows_task_difference},
     inventory::Inventory,
     model::RuntimeState,
 };
@@ -680,8 +680,10 @@ pub(super) fn definition_trusted(
     let Ok(parsed) = canonical(platform, text) else {
         return false;
     };
-    match row.get("definition_semantics").and_then(Value::as_str) {
-        Some(recorded) => recorded == parsed,
+    match row.get("definition_semantics") {
+        Some(recorded) => recorded
+            .as_str()
+            .is_some_and(|text| same_semantics(platform, text, &parsed)),
         None => desired_definition_checked(platform, paths).is_ok_and(|desired| {
             legacy_definitions(platform, paths, &desired)
                 .iter()
@@ -2952,6 +2954,39 @@ mod reconciliation_tests {
                 assert!(manager.calls.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn recorded_windows_definition_trusts_equivalent_json_only() {
+        let platform = RuntimePlatform::Windows;
+        let (_root, paths, _inventory, _) = fixture(platform, false, true);
+        let text = "<Task><Settings><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Count>255</Count></RestartOnFailure></Settings></Task>";
+        let recorded = r#"{
+            "name":"Task","namespace":"","attributes":{},"text":"","children":[{
+                "name":"Settings","namespace":"","attributes":{},"text":"","children":[
+                    {"name":"ExecutionTimeLimit","namespace":"","attributes":{},"text":"PT0S","children":[]},
+                    {"name":"RestartOnFailure","namespace":"","attributes":{},"text":"","children":[
+                        {"name":"Count","namespace":"","attributes":{},"text":"255","children":[]}
+                    ]}
+                ]
+            }]
+        }"#;
+        let trust = |semantics: &str, task: &str| {
+            let row = serde_json::json!({"definition_semantics": semantics});
+            definition_trusted(platform, &paths, &row, task)
+        };
+        assert!(trust(recorded, text));
+        assert!(!trust(recorded, &text.replace("<Count>255", "<Count>1")));
+        assert!(!trust("{", text));
+
+        let task_with_actions = |first, second| {
+            format!("<Task><Actions><Exec><Command>{first}</Command></Exec><Exec><Command>{second}</Command></Exec></Actions></Task>")
+        };
+        let recorded = canonical(platform, &task_with_actions("first.exe", "second.exe")).unwrap();
+        assert!(!trust(
+            &recorded,
+            &task_with_actions("second.exe", "first.exe")
+        ));
     }
 
     #[test]

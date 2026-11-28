@@ -196,7 +196,13 @@ impl Inventory {
 
     pub fn remove_owned_path(&mut self, kind: &str, path: &Path) {
         let path = path.to_string_lossy();
-        self.changed |= remove_rows(&mut self.document, kind, &path, self.windows_separators);
+        self.changed |= update_rows(
+            &mut self.document,
+            kind,
+            &path,
+            self.windows_separators,
+            None,
+        );
     }
 
     /// Saves a row that must survive a failed or interrupted install. The
@@ -242,11 +248,13 @@ impl Inventory {
         let path = path.to_string_lossy();
         let windows_separators = self.windows_separators;
         let apply = |document: &mut Value| {
-            let removed = remove_rows(document, kind, &path, windows_separators);
-            if let Some(entry) = &replacement {
-                mutations_mut(document).push(entry.clone());
-            }
-            removed || replacement.is_some()
+            update_rows(
+                document,
+                kind,
+                &path,
+                windows_separators,
+                replacement.clone(),
+            )
         };
 
         let publication = if apply(&mut disk) {
@@ -505,14 +513,33 @@ fn row(kind: &str, path: &Path, mut fields: Map<String, Value>) -> Value {
     Value::Object(fields)
 }
 
-fn remove_rows(document: &mut Value, kind: &str, path: &str, windows_separators: bool) -> bool {
+fn update_rows(
+    document: &mut Value,
+    kind: &str,
+    path: &str,
+    windows_separators: bool,
+    mut replacement: Option<Value>,
+) -> bool {
     let mutations = mutations_mut(document);
     let before = mutations.len();
-    mutations.retain(|entry| {
-        !(entry.get("kind").and_then(Value::as_str) == Some(kind)
-            && entry_has_path(entry, path, windows_separators))
+    let replacing = replacement.is_some();
+    mutations.retain_mut(|entry| {
+        if entry.get("kind").and_then(Value::as_str) != Some(kind)
+            || !entry_has_path(entry, path, windows_separators)
+        {
+            return true;
+        }
+        // Keep the original position so setting and clearing a recovery flag
+        // restores the same inventory bytes. Discard any duplicate matches.
+        if let Some(value) = replacement.take() {
+            *entry = value;
+            true
+        } else {
+            false
+        }
     });
-    mutations.len() != before
+    mutations.extend(replacement);
+    replacing || mutations.len() != before
 }
 
 /// Ordinary Windows paths accept either separator. Do not rewrite recorded
@@ -547,6 +574,53 @@ mod tests {
 
     fn fixture_path(name: &str) -> ScratchDir {
         ScratchDir::new(name)
+    }
+
+    #[test]
+    fn retained_inventory_round_trip_preserves_canonical_bytes() {
+        let root = fixture_path("retained-inventory-round-trip");
+        let manifest = root.join("installer-manifest.json");
+        let trust_path = Path::new("nats");
+        let fields =
+            |pending| json_fields(json!({"state": "applied", "activation_pending": pending}));
+        let mut inventory =
+            Inventory::load_locked(&manifest, "linux-x64", "test", Duration::ZERO).unwrap();
+        inventory.start_transaction().unwrap();
+        inventory.record("bus-trust", trust_path, fields(false));
+        inventory.record("managed-binary", Path::new("ck-bus"), Map::new());
+        inventory.commit_transaction(&mut FileRecovery).unwrap();
+
+        let canonical = r#"{
+  "mutations": [
+    {
+      "activation_pending": false,
+      "kind": "bus-trust",
+      "path": "nats",
+      "state": "applied"
+    },
+    {
+      "kind": "managed-binary",
+      "path": "ck-bus"
+    }
+  ],
+  "platform": "linux-x64",
+  "schema_version": 1
+}
+"#;
+        assert_eq!(fs::read_to_string(&manifest).unwrap(), canonical);
+
+        inventory
+            .persist_retained("bus-trust", trust_path, fields(true))
+            .unwrap();
+        let pending = Inventory::load_snapshot(&manifest, "linux-x64").unwrap();
+        assert_eq!(
+            pending.entry_for_path("bus-trust", trust_path).unwrap()["activation_pending"],
+            true
+        );
+        inventory
+            .persist_retained("bus-trust", trust_path, fields(false))
+            .unwrap();
+        assert_eq!(fs::read_to_string(&manifest).unwrap(), canonical);
     }
 
     #[test]

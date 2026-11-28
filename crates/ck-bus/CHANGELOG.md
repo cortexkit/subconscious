@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.13.15
+
+- Test against subc-core 0.24.15.
+
 ## 0.13.14
 
 - Test against subc-core 0.24.14.

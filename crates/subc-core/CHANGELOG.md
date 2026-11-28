@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.24.15
+
+- On Windows, make new setup and upgrade data, staging, and private parent
+  directories owner-only even when their parents are shared. Leave existing
+  data and parent directory permissions alone.
+
 ## 0.24.14
 
 - Refuse to use a rescue credential with another hard link on Windows.

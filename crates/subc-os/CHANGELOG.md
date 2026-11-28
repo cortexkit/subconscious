@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.57
+
+- Add a Windows directory creator that applies a protected, owner-only DACL
+  to each missing directory without changing existing directories' ACLs.
+
 ## 0.1.56
 
 - Expose the hard-link count from an already-open Windows file handle.

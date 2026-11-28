@@ -1135,11 +1135,10 @@ impl SetupBackend {
 /// Runs `ck-auth bootstrap` through `run`, which executes the command and
 /// reports whether it succeeded. ck-auth refuses a key path whose folder does
 /// not exist, so any missing folders on the key path are created first, on
-/// every platform. On Unix, folders created here are owner-only (an existing
-/// key folder inside the CortexKit data folder is also narrowed to
-/// owner-only), and the command runs under umask 077 so the key it writes is
-/// private from the start. Windows creates the operator's folders without
-/// changing their inherited access permissions.
+/// every platform. New folders are owner-only on Unix and Windows. Windows
+/// leaves existing folders' ACLs untouched. On Unix, an existing key folder
+/// inside the CortexKit data folder is also narrowed to owner-only, and the
+/// command runs under umask 077 so the key it writes is private from the start.
 fn run_auth_bootstrap(
     auth: &Path,
     key_path: Option<&Path>,

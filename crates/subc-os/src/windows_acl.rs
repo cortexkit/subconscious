@@ -392,6 +392,13 @@ fn create_all(path: &Path) -> io::Result<bool> {
     }
 }
 
+/// Create missing directories with a protected DACL granting only the current
+/// user access. Existing directories are left untouched; an existing path
+/// inspected by this operation must be an ordinary directory, not a reparse point.
+pub fn create_missing_private_dirs(path: &Path) -> io::Result<()> {
+    create_all(path).map(|_| ())
+}
+
 /// Create missing directories with a protected owner-only DACL and tighten the
 /// requested directory if it already exists. Foreign owners and reparse points
 /// are refused. Unprotected descendants lose broad inherited grants too;

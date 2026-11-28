@@ -402,7 +402,7 @@ dependencies = [
 
 [[package]]
 name = "subc-control"
-version = "0.43.0"
+version = "0.43.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -412,7 +412,7 @@ dependencies = [
 
 [[package]]
 name = "subc-os"
-version = "0.1.55"
+version = "0.1.57"
 dependencies = [
  "libc",
  "rustix",

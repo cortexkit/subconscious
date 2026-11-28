@@ -49,6 +49,15 @@ pub(super) fn ensure_owned_directory(path: &Path, mode_ceiling: u32) -> Result<(
     }
     #[cfg(not(unix))]
     {
+        #[cfg(windows)]
+        if mode_ceiling & 0o077 == 0 {
+            return subc_os::windows_acl::create_missing_private_dirs(path).map_err(|error| {
+                format!(
+                    "could not create managed directory {}: {error}",
+                    path.display()
+                )
+            });
+        }
         let _ = mode_ceiling;
         fs::create_dir_all(path).map_err(|error| {
             format!(
@@ -129,16 +138,24 @@ pub(super) fn directory_needs_tightening(path: &Path, mode_ceiling: u32) -> Resu
     }
 }
 
-/// Creates a fresh, private staging directory. Existing paths are never
-/// reused: a collision could make a download share a directory with another
-/// process or with files that setup did not create.
+/// Creates a private staging directory, or restricts access to an existing
+/// ordinary directory at the staging path. Existing parents are left unchanged.
 pub(super) fn create_private_directory(path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         create_missing_parent_directories(path)?;
         create_directory_exact(path, 0o700)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        subc_os::windows_acl::create_private_dir(path).map_err(|error| {
+            format!(
+                "could not secure staging directory {}: {error}",
+                path.display()
+            )
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         fs::create_dir_all(path).map_err(|error| {
             format!(
@@ -158,7 +175,11 @@ pub(super) fn ensure_private_parents(path: &Path) -> Result<(), String> {
     }
     #[cfg(not(unix))]
     {
-        fs::create_dir_all(path).map_err(|error| {
+        #[cfg(windows)]
+        let result = subc_os::windows_acl::create_missing_private_dirs(path);
+        #[cfg(not(windows))]
+        let result = fs::create_dir_all(path);
+        result.map_err(|error| {
             format!(
                 "could not create parent directory {}: {error}",
                 path.display()
@@ -781,6 +802,85 @@ mod create_only_tests {
             .collect();
         names.sort();
         assert_eq!(names, expected);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use cortexkit_test_support::ScratchDir;
+    use subc_os::windows_acl::{
+        test_support::{assert_dacl_owner_only, assert_owner_only, grant_everyone},
+        verify_private_dir,
+    };
+
+    use super::*;
+
+    #[test]
+    fn staging_directory_and_missing_parents_are_private() {
+        let root = ScratchDir::new("private-stage");
+        grant_everyone(root.path());
+        let parent = root.join("parent");
+        let stage = parent.join("stage");
+
+        create_private_directory(&stage).unwrap();
+
+        assert_owner_only(&parent, true, true);
+        assert_owner_only(&stage, true, true);
+        assert!(verify_private_dir(root.path()).is_err());
+    }
+
+    #[test]
+    fn existing_staging_directory_is_narrowed_without_changing_its_parent() {
+        let root = ScratchDir::new("existing-stage");
+        grant_everyone(root.path());
+        let stage = root.join("stage");
+        fs::create_dir(&stage).unwrap();
+        let sentinel = stage.join("keep");
+        fs::write(&sentinel, b"keep").unwrap();
+        assert!(verify_private_dir(&stage).is_err());
+
+        create_private_directory(&stage).unwrap();
+
+        assert_dacl_owner_only(&stage, true, true);
+        assert_eq!(fs::read(&sentinel).unwrap(), b"keep");
+        assert!(verify_private_dir(root.path()).is_err());
+    }
+
+    #[test]
+    fn private_parents_create_only_missing_directories() {
+        let root = ScratchDir::new("private-parents");
+        let existing = root.join("existing");
+        fs::create_dir(&existing).unwrap();
+        grant_everyone(&existing);
+        let parent = existing.join("parent");
+        let leaf = parent.join("leaf");
+
+        ensure_private_parents(&existing).unwrap();
+        assert!(verify_private_dir(&existing).is_err());
+        ensure_private_parents(&leaf).unwrap();
+
+        assert_owner_only(&parent, true, true);
+        assert_owner_only(&leaf, true, true);
+        assert!(verify_private_dir(&existing).is_err());
+    }
+
+    #[test]
+    fn installer_lock_creates_a_private_data_root() {
+        use crate::setup::install_lock::InstallLock;
+        use std::time::Duration;
+
+        let home = ScratchDir::new("shared-data-home");
+        grant_everyone(home.path());
+        let data = home.join("cortexkit");
+        let manifest = data.join("installer-manifest.json");
+
+        let _lock = InstallLock::acquire_within(&manifest, "test", Duration::ZERO).unwrap();
+
+        assert_owner_only(&data, true, true);
+        let store = data.join("module-store");
+        fs::create_dir(&store).unwrap();
+        assert_dacl_owner_only(&store, true, false);
+        assert!(verify_private_dir(home.path()).is_err());
     }
 }
 

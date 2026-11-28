@@ -1,6 +1,6 @@
 [package]
 name = "subc-core"
-version = "0.24.14"
+version = "0.24.15"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -103,7 +103,7 @@ subc-control = { path = "../subc-control", version = "0.43.1" }
 subc-client-rs = { path = "../subc-client-rs", version = "0.43.0" }
 subc-jsonc = { path = "../subc-jsonc" }
 terminal_size = "0.4"
-subc-os = { path = "../subc-os", version = "0.1.56" }
+subc-os = { path = "../subc-os", version = "0.1.57" }
 subc-presence = { path = "../subc-presence", version = "0.2.1" }
 subc-protocol = { path = "../subc-protocol", version = "0.37.11" }
 subc-transport = { path = "../subc-transport", version = "0.18.2" }

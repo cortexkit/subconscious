@@ -41,6 +41,58 @@ fn created_directories_have_exact_protected_user_dacls() {
 }
 
 #[test]
+fn create_missing_private_dirs_preserves_the_existing_dacl() {
+    let root = TempDir::new();
+    grant_everyone(&root.0);
+    let before = directory_dacl(&root.0);
+    let parent = root.0.join("parent");
+    let leaf = parent.join("leaf");
+
+    create_missing_private_dirs(&root.0).unwrap();
+    create_missing_private_dirs(&leaf).unwrap();
+
+    assert_owner_only(&parent, true, true);
+    assert_owner_only(&leaf, true, true);
+    assert_eq!(directory_dacl(&root.0), before);
+
+    let file = root.0.join("file");
+    std::fs::write(&file, b"keep").unwrap();
+    assert!(create_missing_private_dirs(&file).is_err());
+    assert_eq!(std::fs::read(&file).unwrap(), b"keep");
+}
+
+fn directory_dacl(path: &Path) -> String {
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSecurityDescriptorToStringSecurityDescriptorW, SDDL_REVISION_1,
+    };
+
+    let handle = open_directory(path, READ_CONTROL).unwrap();
+    let security = Security::query(handle.0).unwrap();
+    let mut text = null_mut();
+    // SAFETY: The descriptor is live and text receives a LocalAlloc'd string.
+    assert_ne!(
+        unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                security.descriptor,
+                SDDL_REVISION_1,
+                DACL_SECURITY_INFORMATION,
+                &mut text,
+                null_mut(),
+            )
+        },
+        0
+    );
+    // SAFETY: The returned string is NUL-terminated until it is freed below.
+    let rendered = unsafe {
+        let len = (0..).take_while(|&i| *text.add(i) != 0).count();
+        String::from_utf16_lossy(std::slice::from_raw_parts(text, len))
+    };
+    // SAFETY: text was allocated by the conversion above.
+    unsafe { LocalFree(text.cast()) };
+    rendered
+}
+
+#[test]
 fn existing_directory_narrows_unprotected_descendants() {
     let root = TempDir::new();
     grant_everyone(&root.0);

@@ -302,14 +302,23 @@ mod tests {
         assert!(!root.join("stack-stopped").exists());
     }
 
-    #[cfg(unix)]
     #[test]
     fn refuses_an_aliased_parent_inside_the_run_folder() {
         let dir = ScratchDir::new("doctor-report-run-alias");
         let run = dir.join("run");
         let alias = dir.join("alias");
         fs::create_dir(&run).unwrap();
+        #[cfg(unix)]
         std::os::unix::fs::symlink(&run, &alias).unwrap();
+        #[cfg(windows)]
+        assert!(std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/j"])
+            .arg(&alias)
+            .arg(&run)
+            .output()
+            .unwrap()
+            .status
+            .success());
         let protected = ProtectedPaths {
             folders: vec![run.clone()],
             ..ProtectedPaths::default()
@@ -364,7 +373,7 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(&unrelated, &first).unwrap();
         #[cfg(windows)]
-        fs::write(&first, "keep").unwrap();
+        std::os::windows::fs::symlink_file(&unrelated, &first).unwrap();
         let target = ReportTarget::create_with(&first, &ProtectedPaths::default()).unwrap();
         let path = target.path.clone();
         assert_eq!(path.file_name().unwrap(), "diagnosis-1.json");
@@ -396,12 +405,14 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(&unrelated).unwrap(), "keep");
         assert_eq!(fs::read_to_string(&first).unwrap(), "keep");
+        assert!(fs::symlink_metadata(&first).unwrap().is_symlink());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert!(fs::symlink_metadata(&first).unwrap().is_symlink());
             assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o077, 0);
         }
+        #[cfg(windows)]
+        subc_os::windows_acl::test_support::assert_owner_only(&path, false, true);
     }
 
     #[test]

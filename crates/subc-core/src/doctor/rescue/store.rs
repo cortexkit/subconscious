@@ -189,6 +189,8 @@ impl Store {
     }
 }
 
+// Windows creates a new process directly, so it has no pre-exec fork interval
+// in which a child could inherit this lock before close-on-exec takes effect.
 #[cfg(all(test, unix))]
 mod tests {
     use std::{

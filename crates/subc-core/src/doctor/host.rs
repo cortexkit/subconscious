@@ -53,9 +53,7 @@ pub(crate) trait DoctorHost: Send + Sync + 'static {
         thread::sleep(Duration::from_secs(3));
     }
     fn data_directory(&self) -> Result<PathBuf, String>;
-    #[cfg(unix)]
     fn settings_directory(&self) -> Option<PathBuf>;
-    #[cfg(unix)]
     fn local_connection_file(&self) -> Result<Option<PathBuf>, String>;
     fn disk_space(&self, path: &Path) -> Option<DiskSpace>;
     fn windows(&self) -> Vec<WindowRow>;
@@ -78,7 +76,6 @@ pub(crate) enum RpcError {
     ConnectionLost,
 }
 
-#[cfg(unix)]
 pub(crate) enum SetEnabledError {
     Reply(String),
     Rpc(RpcError),
@@ -96,7 +93,6 @@ pub(crate) trait DoctorDaemon: Send + Sync + 'static {
         deadline: Instant,
     ) -> RpcResult<StderrTail>;
 
-    #[cfg(unix)]
     fn set_enabled(
         &self,
         _module: &str,
@@ -190,14 +186,12 @@ impl DoctorHost for SystemHost {
         setup::data_directory()
     }
 
-    #[cfg(unix)]
     fn settings_directory(&self) -> Option<PathBuf> {
         daemon_config::default_config_path()
             .parent()
             .map(Path::to_owned)
     }
 
-    #[cfg(unix)]
     fn local_connection_file(&self) -> Result<Option<PathBuf>, String> {
         for path in connection_file::discovery_candidates(None, None) {
             match fs::symlink_metadata(&path) {
@@ -470,7 +464,6 @@ impl DoctorDaemon for SystemDaemon {
         })
     }
 
-    #[cfg(unix)]
     fn set_enabled(
         &self,
         module: &str,

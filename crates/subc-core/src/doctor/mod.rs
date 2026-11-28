@@ -17,7 +17,6 @@ mod tests;
 #[cfg(all(test, feature = "test-support"))]
 pub(crate) use tests::run_with_blocked_describe;
 
-#[cfg(unix)]
 pub use program_checks::run_program_pool;
 pub use program_checks::CheckedProgram;
 pub use program_fixes::{Guard, Interrupt, Programs, Prompter, WaitStatus};

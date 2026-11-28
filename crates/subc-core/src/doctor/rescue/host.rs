@@ -7,7 +7,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use crate::setup::{release_index, upgrade_assets};
+use crate::setup::release_index;
 
 use super::{
     auth::Login,
@@ -178,7 +178,11 @@ impl Host for System {
     }
 
     fn extract(&self, archive: &Path, staging: &Path) -> Result<(), String> {
-        let output = extraction_command(self.platform().windows(), archive, staging)
+        if self.platform().windows() {
+            return super::node_zip::extract(archive, staging)
+                .map_err(|error| format!("could not extract {}: {error}", archive.display()));
+        }
+        let output = extraction_command(archive, staging)
             .output()
             .map_err(|error| format!("could not extract {}: {error}", archive.display()))?;
         if output.status.success() {
@@ -236,10 +240,7 @@ fn run_probe(command: Command, deadline: Duration) -> Result<ChildOutput, String
     })
 }
 
-pub(super) fn extraction_command(windows: bool, archive: &Path, staging: &Path) -> Command {
-    if windows {
-        return upgrade_assets::windows_extract_command(archive, staging);
-    }
+fn extraction_command(archive: &Path, staging: &Path) -> Command {
     let mut command = Command::new("/bin/sh");
     command
         .args([

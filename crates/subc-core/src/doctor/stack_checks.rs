@@ -377,19 +377,70 @@ fn permissions(host: &dyn DoctorHost, data: Option<PathBuf>) -> Vec<Finding> {
         .collect()
 }
 
-#[cfg(not(unix))]
-fn permissions(_: &dyn DoctorHost, _: Option<PathBuf>) -> Vec<Finding> {
-    if cfg!(windows) {
-        vec![Finding::new(
-            "permissions.not_checked_on_windows",
-            Layer::Disk,
-            Severity::Info,
-            "Folder and connection-file permissions are not checked on Windows",
-            json!({}),
-        )]
-    } else {
-        Vec::new()
+#[cfg(windows)]
+fn permissions(host: &dyn DoctorHost, data: Option<PathBuf>) -> Vec<Finding> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use subc_os::windows_acl::{verify_owner_only, verify_private_dir};
+
+    let mut paths = BTreeMap::new();
+    for path in [data, host.settings_directory()].into_iter().flatten() {
+        paths.insert(path, (Severity::Warning, true));
     }
+    match host.local_connection_file() {
+        Ok(Some(path)) => {
+            if let Some(parent) = path.parent() {
+                paths.insert(parent.to_path_buf(), (Severity::Error, true));
+            }
+            paths.insert(path, (Severity::Error, false));
+        }
+        Ok(None) => (),
+        Err(error) => return vec![check_failed(Layer::Disk, "folder_permissions", error)],
+    }
+
+    paths
+        .into_iter()
+        .filter_map(|(path, (severity, directory))| {
+            // SYSTEM and Administrators can take ownership regardless of the access
+            // control list, so the verifier accepts grants to them and the user running ck.
+            let result = if directory {
+                verify_private_dir(&path)
+            } else {
+                const READ_CONTROL: u32 = 0x0002_0000;
+                const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+                fs::OpenOptions::new()
+                    .access_mode(READ_CONTROL)
+                    .custom_flags(OPEN_REPARSE_POINT)
+                    .open(&path)
+                    .and_then(|file| verify_owner_only(&file))
+            };
+            let error = result.err()?;
+            let subject = path.to_string_lossy();
+            match error.kind() {
+                ErrorKind::NotFound => None,
+                ErrorKind::PermissionDenied if error.raw_os_error().is_none() => Some(
+                    Finding::new(
+                        "disk.folder_permissions",
+                        Layer::Disk,
+                        severity,
+                        format!(
+                            "{} does not have private permissions: {error}",
+                            path.display()
+                        ),
+                        json!({"path": subject, "reason": error.to_string()}),
+                    )
+                    .for_subject(subject),
+                ),
+                _ => Some(
+                    check_failed(
+                        Layer::Disk,
+                        "folder_permissions",
+                        format!("{}: {error}", path.display()),
+                    )
+                    .for_subject(subject),
+                ),
+            }
+        })
+        .collect()
 }
 
 fn check_failed(layer: Layer, check: &'static str, error: impl Into<String>) -> Finding {

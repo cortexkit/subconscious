@@ -68,7 +68,25 @@ impl Default for Scenario {
 
 fn main() {
     let executable = env::current_exe().unwrap();
-    let name = executable.file_name().unwrap().to_string_lossy();
+    let name = executable.file_stem().unwrap().to_string_lossy();
+    #[cfg(windows)]
+    if name == "gh" {
+        fake_gh();
+        return;
+    }
+    #[cfg(windows)]
+    if name == "node" {
+        fake_node(&executable);
+        return;
+    }
+    #[cfg(windows)]
+    if env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--redirect-doctor-cli")
+    {
+        redirect_doctor_cli();
+        return;
+    }
     let home = PathBuf::from(env::var_os("XDG_DATA_HOME").expect("data home"));
     let root = home.join("doctor-fixture");
     let scenario: Scenario =
@@ -180,6 +198,10 @@ fn check(scenario: &Scenario, check_kind: &str, fixed: bool) {
         }
         "findings" | "quick" | "clean" => emit(CheckOutput::new(vec![]).unwrap()),
         "unknown" => process::exit(2),
+        "usage_with_output" => {
+            println!("check failed");
+            process::exit(2);
+        }
         "crash" => {
             println!("discarded fixture stdout");
             eprintln!("discarded fixture stderr");
@@ -192,6 +214,89 @@ fn check(scenario: &Scenario, check_kind: &str, fixed: bool) {
         }
         other => panic!("unknown check scenario: {other}"),
     }
+}
+
+#[cfg(windows)]
+fn fake_node(executable: &std::path::Path) {
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let version = || {
+        fs::read_to_string(executable.with_extension("version"))
+            .unwrap_or_else(|_| "v22.19.0".into())
+    };
+    match args.as_slice() {
+        ["-p", _] => println!("{}\n{}", executable.display(), version()),
+        ["--version"] => println!("{}", version()),
+        [_, "--version"] => println!("v1.6.0"),
+        [_, "auth", "check", "--provider", "anthropic", "--json"] => {
+            println!(r#"{{"status":"ready","provider":"anthropic"}}"#);
+        }
+        [_, "--system-prompt", ..] => {
+            fs::write("launch-argv", format!("{}\n", args.join("\n"))).unwrap();
+            let environment = env::vars()
+                .map(|(name, value)| format!("{name}={value}\n"))
+                .collect::<String>();
+            fs::write("launch-env", environment).unwrap();
+            let cwd = env::current_dir().unwrap();
+            fs::write("launch-cwd", format!("{}\n", cwd.display())).unwrap();
+            process::exit(23);
+        }
+        _ => process::exit(99),
+    }
+}
+
+#[cfg(windows)]
+fn fake_gh() {
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    let kind = &args[0];
+    let host = env::var("GH_HOST").unwrap();
+    assert_eq!(env::var("GH_PROMPT_DISABLED").unwrap(), "1");
+    fs::write(
+        format!("gh.{kind}"),
+        format!("{host}\n{}\n", args.join("\n")),
+    )
+    .unwrap();
+    let (auth, create, sleep_ms) =
+        serde_json::from_slice::<(i32, i32, u64)>(&fs::read("gh.json").unwrap()).unwrap();
+    let code = match kind.as_str() {
+        "auth" => auth,
+        "issue" => {
+            let index = args.iter().position(|arg| arg == "--body-file").unwrap();
+            fs::copy(&args[index + 1], "body.sent").unwrap();
+            thread::sleep(Duration::from_millis(sleep_ms));
+            println!("https://github.com/example/doctor-fixture/issues/1");
+            create
+        }
+        _ => 99,
+    };
+    process::exit(code);
+}
+
+#[cfg(windows)]
+#[tokio::main(flavor = "current_thread")]
+async fn redirect_doctor_cli() {
+    subc_jobobject::ensure_root_job().unwrap();
+    subc_os::windows_console_test::restore_ctrl_c().expect("enable Ctrl-C in the test console");
+    // Keep the launcher alive when the pseudoconsole sends a control event to
+    // its console. ck receives the same event and owns cleanup and exit status.
+    let _ctrl_c = tokio::signal::windows::ctrl_c().unwrap();
+    let mut args = env::args_os().skip(2);
+    let program = args.next().unwrap();
+    let mut command = tokio::process::Command::new(program);
+    command
+        .args(args)
+        .stdout(fs::File::create("stdout").unwrap())
+        .kill_on_drop(true);
+    if env::var_os("CK_TEST_REDIRECT_STDIN").is_some() {
+        command.stdin(process::Stdio::piped());
+    }
+    let mut child = command.spawn().unwrap();
+    if let Some(mut stdin) = child.stdin.take() {
+        tokio::io::AsyncWriteExt::write_all(&mut stdin, b"yes\n")
+            .await
+            .unwrap();
+    }
+    process::exit(child.wait().await.unwrap().code().unwrap());
 }
 
 fn fix(scenario: &Scenario, id: &str, digest: &str) {

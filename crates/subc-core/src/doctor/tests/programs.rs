@@ -97,7 +97,10 @@ impl Rig {
             PathBuf::from,
         );
         assert!(fixture.is_file(), "build doctor-module-fixture with `cargo build -p subc-core --features test-support --bin doctor-module-fixture`; fixture not found at {}", fixture.display());
-        let path = self.host.scratch.join(id);
+        let path = self
+            .host
+            .scratch
+            .join(format!("{id}{}", std::env::consts::EXE_SUFFIX));
         fs::hard_link(&fixture, &path)
             .or_else(|_| fs::copy(&fixture, &path).map(|_| ()))
             .unwrap();
@@ -301,6 +304,7 @@ fn classifications_keep_daemon_and_program_findings_separate() {
 }
 
 #[test]
+#[cfg(unix)]
 fn launch_and_usage_exit_classifications_use_runner_results() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -333,6 +337,32 @@ fn launch_and_usage_exit_classifications_use_runner_results() {
             {"id":"exit-two-with-output","outcome":"crashed","findings":0,"detail":"exit:2"},
             {"id":"missing-interpreter","outcome":"spawn_failed","findings":0,"detail":"not_found"},
             {"id":"not-executable","outcome":"spawn_failed","findings":0,"detail":"permission_denied"},
+        ])
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn launch_and_usage_exit_classifications_use_runner_results() {
+    let mut rig = Rig::new();
+    rig.program("exit-two-with-output", json!({"check":"usage_with_output"}));
+    let invalid = rig.host.scratch.join("invalid.exe");
+    fs::write(&invalid, b"not a Windows executable").unwrap();
+    rig.entries
+        .insert("invalid-image".into(), json!({"program":invalid}));
+    rig.entries.insert(
+        "missing".into(),
+        json!({"program":rig.host.scratch.join("missing.exe")}),
+    );
+    rig.write_config();
+    let run = rig.run(false, &NoTerminal);
+    let doc = serde_json::to_value(&run.run.document).unwrap();
+    assert_eq!(
+        doc["modules"],
+        json!([
+            {"id":"exit-two-with-output","outcome":"crashed","findings":0,"detail":"exit:2"},
+            {"id":"invalid-image","outcome":"spawn_failed","findings":0,"detail":"other"},
+            {"id":"missing","outcome":"spawn_failed","findings":0,"detail":"not_found"},
         ])
     );
 }

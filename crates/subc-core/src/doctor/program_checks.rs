@@ -12,7 +12,6 @@ use subc_daemon::daemon_config::{self, DaemonConfigError};
 use super::{Finding, Interrupt, Layer, ModuleCheck, ModuleOutcome, Severity};
 use cortexkit_doctor::Mode;
 
-#[cfg(unix)]
 use {
     super::{program_fixes::Daemon, ModuleCheckMode, ModuleFixSkip, Programs},
     cortexkit_doctor::{runner, RunError},
@@ -24,7 +23,7 @@ use {
 pub struct CheckedProgram {
     pub module_id: String,
     pub path: PathBuf,
-    pub identity: subc_os::FileIdentity,
+    pub identity: subc_os::RetainedFileIdentity,
     pub check: cortexkit_doctor::CheckOutput,
     pub mode: Mode,
 }
@@ -32,34 +31,49 @@ pub struct CheckedProgram {
 impl CheckedProgram {
     /// A point-in-time comparison, not a guarantee about a later path-based launch.
     pub fn unchanged(&self) -> bool {
-        subc_os::file_identity(&self.path) == Some(self.identity)
+        program_identity(&self.path) == Some(self.identity)
     }
+}
+
+#[cfg(unix)]
+fn program_identity(path: &Path) -> Option<subc_os::RetainedFileIdentity> {
+    subc_os::file_identity(path)
+}
+
+#[cfg(windows)]
+fn program_identity(path: &Path) -> Option<subc_os::RetainedFileIdentity> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    // Match the runner's path resolution, but compare the complete volume and
+    // file ID from the opened image rather than a Unix inode or the path itself.
+    const FILE_READ_ATTRIBUTES: u32 = 0x80;
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .open(path)
+        .ok()?;
+    subc_os::retained_file_identity(&file).ok()
 }
 
 pub(super) struct ProgramConfig {
     pub path: PathBuf,
-    #[cfg(unix)]
     pub runner: cortexkit_doctor::runner::Options,
-    #[cfg(unix)]
     pub limits: cortexkit_doctor::runner::Limits,
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub admission: std::time::Duration,
-    #[cfg(all(test, unix))]
-    pub identity_lookup: fn(&Path) -> Option<subc_os::FileIdentity>,
+    #[cfg(test)]
+    pub identity_lookup: fn(&Path) -> Option<subc_os::RetainedFileIdentity>,
 }
 
 impl Default for ProgramConfig {
     fn default() -> Self {
         Self {
             path: daemon_config::default_config_path(),
-            #[cfg(unix)]
             runner: cortexkit_doctor::runner::Options::new(),
-            #[cfg(unix)]
             limits: cortexkit_doctor::runner::Limits::default(),
-            #[cfg(all(test, unix))]
+            #[cfg(test)]
             admission: std::time::Duration::from_secs(11),
-            #[cfg(all(test, unix))]
-            identity_lookup: subc_os::file_identity,
+            #[cfg(test)]
+            identity_lookup: program_identity,
         }
     }
 }
@@ -96,7 +110,7 @@ pub(super) fn check_all(
     override_path: Option<&Path>,
     interrupt: &Interrupt,
     start: Instant,
-    #[cfg(unix)] full: Option<FullChecks<'_>>,
+    full: Option<FullChecks<'_>>,
 ) -> ProgramChecks {
     let mut pass = ProgramChecks::default();
     if override_path.is_some() {
@@ -136,7 +150,7 @@ pub(super) fn check_all(
             Some("script")
         } else if module.protocol == ModuleProtocol::None {
             Some("protocol_none")
-        } else if cfg!(unix) && !module.program.is_absolute() {
+        } else if !module.program.is_absolute() {
             // A relative path could resolve to a different program via PATH or the working directory.
             Some("program_not_absolute")
         } else {
@@ -153,7 +167,6 @@ pub(super) fn check_all(
         }
     }
     jobs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    #[cfg(unix)]
     {
         #[cfg(test)]
         let cutoff = start + config.admission;
@@ -162,7 +175,7 @@ pub(super) fn check_all(
         #[cfg(test)]
         let identity_lookup = config.identity_lookup;
         #[cfg(not(test))]
-        let identity_lookup = subc_os::file_identity;
+        let identity_lookup = program_identity;
         let options = config.runner.clone().with_limits(config.limits);
         if let Some(mut full) = full {
             for (id, path) in jobs {
@@ -198,23 +211,6 @@ pub(super) fn check_all(
             }
         }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = (interrupt, start);
-        if !jobs.is_empty() {
-            pass.findings.push(diagnostic(
-                "unsupported_platform",
-                None,
-                Severity::Info,
-                "Module program checks are not supported on this platform",
-                json!({}),
-            ));
-        }
-        pass.modules.extend(
-            jobs.into_iter()
-                .map(|(id, _)| row(id, ModuleOutcome::UnsupportedPlatform, None)),
-        );
-    }
     pass.modules.sort_unstable_by(|a, b| a.id.cmp(&b.id));
     pass
 }
@@ -232,7 +228,6 @@ fn row(id: String, outcome: ModuleOutcome, detail: Option<String>) -> ModuleChec
 /// Run ordered program jobs in a pool of four with eleven seconds to admit work.
 /// Each job owns its execution deadline; a slot is not freed until cleanup ends.
 /// The returned values preserve input order.
-#[cfg(unix)]
 pub fn run_program_pool<T: Send, R: Send>(
     jobs: Vec<T>,
     run: impl Fn(T) -> R + Sync,
@@ -246,7 +241,6 @@ pub fn run_program_pool<T: Send, R: Send>(
     )
 }
 
-#[cfg(unix)]
 fn pool_until<T: Send, R: Send>(
     jobs: Vec<T>,
     cutoff: Instant,
@@ -292,15 +286,13 @@ fn pool_until<T: Send, R: Send>(
     results.into_iter().map(|(_, result)| result).collect()
 }
 
-#[cfg(unix)]
 enum Job {
-    Checked(subc_os::FileIdentity, cortexkit_doctor::CheckOutput),
+    Checked(subc_os::RetainedFileIdentity, cortexkit_doctor::CheckOutput),
     IdentityUnavailable,
     Failed(cortexkit_doctor::RunError),
     NotStarted,
 }
 
-#[cfg(unix)]
 impl Job {
     fn ran(&self) -> bool {
         !matches!(
@@ -310,7 +302,7 @@ impl Job {
     }
 
     fn from_result(
-        identity: Option<subc_os::FileIdentity>,
+        identity: Option<subc_os::RetainedFileIdentity>,
         result: Result<cortexkit_doctor::CheckOutput, RunError>,
     ) -> Self {
         match (identity, result) {
@@ -321,14 +313,13 @@ impl Job {
     }
 }
 
-#[cfg(unix)]
 fn check_one(
     path: &Path,
     interrupt: &Interrupt,
     options: &cortexkit_doctor::runner::Options,
     limits: cortexkit_doctor::runner::Limits,
     cutoff: Option<Instant>,
-    identity_lookup: impl FnOnce(&Path) -> Option<subc_os::FileIdentity>,
+    identity_lookup: impl FnOnce(&Path) -> Option<subc_os::RetainedFileIdentity>,
 ) -> Job {
     if interrupt.signal().is_some() {
         return Job::NotStarted;
@@ -348,14 +339,12 @@ fn check_one(
     Job::from_result(identity, runner::check(path, Mode::Quick, options))
 }
 
-#[cfg(unix)]
 pub(super) struct FullChecks<'a> {
     pub programs: &'a Programs<'a>,
     pub daemon: Daemon<'a>,
     pub asked: &'a mut BTreeSet<String>,
 }
 
-#[cfg(unix)]
 impl FullChecks<'_> {
     fn check(
         &mut self,
@@ -363,7 +352,7 @@ impl FullChecks<'_> {
         path: &Path,
         options: &runner::Options,
         limits: runner::Limits,
-        identity_lookup: fn(&Path) -> Option<subc_os::FileIdentity>,
+        identity_lookup: fn(&Path) -> Option<subc_os::RetainedFileIdentity>,
         warnings: &mut Vec<Finding>,
     ) -> (Job, Mode, bool) {
         let programs = self.programs;
@@ -440,7 +429,6 @@ impl FullChecks<'_> {
     }
 }
 
-#[cfg(unix)]
 fn wait_for_full_check(
     programs: &Programs<'_>,
     id: &str,
@@ -480,7 +468,6 @@ fn wait_for_full_check(
     })
 }
 
-#[cfg(unix)]
 fn io_kind(kind: std::io::ErrorKind) -> &'static str {
     use std::io::ErrorKind;
     match kind {
@@ -492,7 +479,6 @@ fn io_kind(kind: std::io::ErrorKind) -> &'static str {
     }
 }
 
-#[cfg(unix)]
 fn record(
     pass: &mut ProgramChecks,
     id: String,

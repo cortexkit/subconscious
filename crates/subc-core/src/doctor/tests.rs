@@ -38,7 +38,6 @@ use super::{
     window_checks::WindowRow,
 };
 
-#[cfg(unix)]
 mod programs;
 
 struct Fixture {
@@ -47,7 +46,6 @@ struct Fixture {
     answers: bool,
     describe_gate: Option<Arc<Gate>>,
     connects: AtomicUsize,
-    #[cfg(unix)]
     replacements: Mutex<std::collections::VecDeque<RpcResult<Arc<FakeDaemon>>>>,
     manager: (Result<Job, String>, MarkerState),
     manager_gate: Option<Arc<Gate>>,
@@ -84,7 +82,6 @@ impl Fixture {
             answers: true,
             describe_gate: None,
             connects: AtomicUsize::new(0),
-            #[cfg(unix)]
             replacements: Mutex::default(),
             manager: (
                 Ok(Job {
@@ -253,14 +250,12 @@ impl DoctorHost for Fixture {
         Ok(self.data.clone())
     }
 
-    #[cfg(unix)]
     fn settings_directory(&self) -> Option<PathBuf> {
         Some(self.scratch.path().join("settings"))
     }
 
-    #[cfg(unix)]
     fn local_connection_file(&self) -> Result<Option<PathBuf>, String> {
-        let path = self.scratch.path().join("run/connection.json");
+        let path = self.scratch.path().join("run").join("connection.json");
         Ok(path.exists().then_some(path))
     }
 
@@ -297,7 +292,6 @@ impl DoctorHost for Fixture {
         if let Some(gate) = &self.describe_gate {
             gate.wait();
         }
-        #[cfg(unix)]
         if _attempt != 0 {
             if let Some(next) = self.replacements.lock().unwrap().pop_front() {
                 return next.map(|daemon| daemon as Arc<dyn DoctorDaemon>);
@@ -348,7 +342,6 @@ impl Reply {
 
 #[derive(Default)]
 struct FakeDaemon {
-    #[cfg(unix)]
     program_script: programs::DaemonScript,
     modules: Vec<SupervisorEntry>,
     resource_row: bool,
@@ -381,7 +374,6 @@ impl DoctorDaemon for FakeDaemon {
         if let Some(gate) = &self.list_gate {
             gate.wait();
         }
-        #[cfg(unix)]
         if let Some(result) = self.program_script.next_list() {
             return result.map(|modules| SupervisorListResponse {
                 generation: 1,
@@ -447,7 +439,6 @@ impl DoctorDaemon for FakeDaemon {
             })
     }
 
-    #[cfg(unix)]
     fn set_enabled(
         &self,
         module: &str,
@@ -1030,17 +1021,60 @@ fn unix_permissions_find_only_access_that_matters_without_repairing() {
 
 #[cfg(windows)]
 #[test]
-fn windows_permissions_never_read_a_dacl() {
-    let result = execute(Fixture::new("doctor-windows-permissions"));
-    let disk = result
+fn windows_permissions_find_broad_grants_without_repairing() {
+    use subc_os::windows_acl::{
+        create_private_dir, create_private_file, test_support::grant_everyone_read,
+        verify_private_dir,
+    };
+
+    let host = Arc::new(Fixture::new("doctor-windows-permissions"));
+    let run = host.scratch.join("run");
+    let settings = host.scratch.join("settings");
+    let file = run.join("connection.json");
+    for path in [&host.data, &settings, &run] {
+        create_private_dir(path).unwrap();
+    }
+    drop(create_private_file(&file).unwrap());
+    let pass = || {
+        run_with(
+            host.clone(),
+            DoctorOptions::default(),
+            Arc::new(FakeLogs::default()),
+            &fixture_limits(),
+        )
         .document
         .findings
-        .iter()
+        .into_iter()
         .filter(|f| f.layer == Layer::Disk)
-        .collect::<Vec<_>>();
-    assert_eq!(disk.len(), 1);
-    assert_eq!(disk[0].id, "permissions.not_checked_on_windows");
-    assert_eq!(disk[0].severity, Severity::Info);
+        .collect::<Vec<_>>()
+    };
+    assert!(pass().is_empty(), "owner-only ACLs must not be flagged");
+    for path in [&host.data, &settings, &run, &file] {
+        grant_everyone_read(path);
+    }
+    let findings = pass();
+    assert_eq!(findings.len(), 4, "{findings:?}");
+    for (path, severity) in [
+        (&host.data, Severity::Warning),
+        (&settings, Severity::Warning),
+        (&run, Severity::Error),
+        (&file, Severity::Error),
+    ] {
+        let row = findings
+            .iter()
+            .find(|row| row.evidence["path"] == path.to_string_lossy().as_ref())
+            .unwrap();
+        assert_eq!(row.id, "disk.folder_permissions");
+        assert_eq!(row.severity, severity);
+        assert!(row.evidence["reason"]
+            .as_str()
+            .unwrap()
+            .contains("another user or group"));
+    }
+    assert!(
+        verify_private_dir(&run).is_err(),
+        "checking must not narrow the ACL"
+    );
 }
 
 #[test]

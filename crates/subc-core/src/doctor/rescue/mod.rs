@@ -3,6 +3,7 @@
 mod auth;
 mod files;
 mod host;
+mod node_zip;
 mod pins;
 mod store;
 mod tools;

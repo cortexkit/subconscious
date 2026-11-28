@@ -812,9 +812,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-doctor"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95196e710482160592f3a889195aebc026a98de300e72f9e5bc2023263c0219d"
+checksum = "166d2af88591b901fe5c1553d63284fc68f278d7c1c20016abee928ab6c37f1a"
 dependencies = [
  "cortexkit-log",
  "cortexkit-store-types",
@@ -826,18 +826,20 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-presence 0.2.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "cortexkit-doctor-conformance"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d67908a436fbc0ded1c498f135cb6c640196805bd9cebe4b70248d2be0702d51"
+checksum = "04c0d8a8422a7678870ea36e450e7f1de79fcdc2e6213ecca449ff5cf4870858"
 dependencies = [
  "cortexkit-doctor",
  "rustix",
  "sha2",
  "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3273,7 +3275,7 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.24.12"
+version = "0.24.13"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3300,6 +3302,7 @@ dependencies = [
  "subc-control",
  "subc-core",
  "subc-daemon",
+ "subc-jobobject",
  "subc-jsonc",
  "subc-os",
  "subc-presence 0.2.1",

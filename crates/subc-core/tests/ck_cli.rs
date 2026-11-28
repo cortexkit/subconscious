@@ -39,7 +39,6 @@ use common::{
     start_test_daemon_with_image, TestDaemon, TestDaemonImage,
 };
 
-#[cfg(unix)]
 #[path = "ck_cli/doctor_agent.rs"]
 mod doctor_agent;
 mod inline_actions;
@@ -787,14 +786,16 @@ async fn doctor_existing_report_is_not_replaced() {
     assert!(assert_doctor_report_file(&document, &rig.root.join("existing-1.json")).is_empty());
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn doctor_symlink_report_is_not_followed_or_replaced() {
     let rig = DoctorRig::new();
     let destination = rig.root.join("do-not-write.json");
     fs::write(&destination, b"unrelated file").unwrap();
     let requested = rig.root.join("linked.json");
+    #[cfg(unix)]
     std::os::unix::fs::symlink(&destination, &requested).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(&destination, &requested).unwrap();
     let output = rig.report(&requested).await;
     let document = doctor_document(&output, 1);
     assert_eq!(fs::read_link(&requested).unwrap(), destination);
@@ -821,7 +822,7 @@ async fn doctor_fix_with_subc_is_refused_before_creating_a_report() {
 
 #[cfg(windows)]
 #[tokio::test]
-async fn doctor_windows_reports_unsupported_programs_and_no_issue_candidates() {
+async fn doctor_windows_reports_missing_programs_and_no_issue_candidates() {
     let rig = DoctorRig::new();
     let config = rig.root.join("config/cortexkit");
     fs::create_dir(&config).unwrap();
@@ -840,11 +841,11 @@ async fn doctor_windows_reports_unsupported_programs_and_no_issue_candidates() {
     assert_eq!(
         document["modules"],
         json!([{
-            "id": "binary", "outcome": "unsupported_platform", "findings": 0, "detail": null
+            "id": "binary", "outcome": "spawn_failed", "findings": 0, "detail": "not_found"
         }])
     );
-    let finding = only_doctor_finding(&document, &["module_program.unsupported_platform"]);
-    assert_eq!(finding["severity"], "info");
+    let finding = only_doctor_finding(&document, &["module_program.spawn_failed"]);
+    assert_eq!(finding["severity"], "warning");
 
     let mut command = rig.command();
     command.args(["doctor", "--issue"]);

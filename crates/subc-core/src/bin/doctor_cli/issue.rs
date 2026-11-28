@@ -8,35 +8,22 @@ use super::Terminal;
 pub(super) struct Rows(Vec<Row>);
 
 struct Row {
-    #[cfg(unix)]
     module: String,
-    #[cfg(unix)]
     outcome: String,
-    #[cfg(unix)]
     path: Option<std::path::PathBuf>,
-    #[cfg(unix)]
     notice: Option<&'static str>,
-    #[cfg(unix)]
     failed: bool,
 }
 
 impl Rows {
     pub(super) fn failed(&self) -> bool {
-        #[cfg(unix)]
-        {
-            self.0.iter().any(|row| row.failed)
-        }
-        #[cfg(not(unix))]
-        {
-            false
-        }
+        self.0.iter().any(|row| row.failed)
     }
 
     pub(super) fn write(&self, out: &mut impl Write) -> io::Result<()> {
         if self.0.is_empty() {
             return writeln!(out, "No module findings to file.");
         }
-        #[cfg(unix)]
         for row in &self.0 {
             write!(out, "{}: {}", row.module, row.outcome)?;
             if let Some(path) = &row.path {
@@ -51,25 +38,12 @@ impl Rows {
     }
 }
 
-#[cfg(not(unix))]
-pub(super) fn file(
-    _: Vec<CheckedProgram>,
-    _: &Terminal,
-    _: &Interrupt,
-    _: &dyn LogFallback,
-) -> Rows {
-    Rows::default()
-}
+pub(super) use filing::file;
 
-#[cfg(unix)]
-pub(super) use unix::file;
-
-#[cfg(unix)]
-mod unix {
+mod filing {
     use std::{
         ffi::{OsStr, OsString},
         fs::File,
-        os::fd::OwnedFd,
         path::{Path, PathBuf},
         process::{Output, Stdio},
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -79,6 +53,10 @@ mod unix {
         build_local_report, build_report, redact_secrets, runner, Manifest, ModuleId,
         ReportContext, ReportInput,
     };
+    #[cfg(unix)]
+    use std::os::fd::OwnedFd;
+
+    #[cfg(unix)]
     use rustix::{
         fs::{fchmod, fstat, mkdirat, open, openat, unlinkat, AtFlags, Mode, OFlags},
         io::Errno,
@@ -96,10 +74,13 @@ mod unix {
     const GH_LIMIT: Duration = Duration::from_secs(60);
     const REPORT_BYTES: usize = 64 * 1024;
     const FALLBACK_URL_CHARS: usize = 8_000;
+    #[cfg(unix)]
     const DIRECTORY_FLAGS: OFlags = OFlags::DIRECTORY
         .union(OFlags::NOFOLLOW)
         .union(OFlags::CLOEXEC);
+    #[cfg(unix)]
     const DIRECTORY_MODE: Mode = Mode::from_bits_truncate(0o700);
+    #[cfg(unix)]
     const FILE_MODE: Mode = Mode::from_bits_truncate(0o600);
 
     enum ManifestOutcome {
@@ -265,6 +246,11 @@ mod unix {
         fn handle_saved(&self, repository: &str, title: &str, body: &str, row: &mut Row) {
             if !self.terminal.interactive() {
                 row.outcome = "saved_only".into();
+                #[cfg(windows)]
+                {
+                    row.notice =
+                        Some("The answer must be typed in a console window to file the issue.");
+                }
                 return;
             }
             let Some(guard) = self.interrupt.protect(
@@ -403,8 +389,9 @@ mod unix {
             .env("GH_HOST", "github.com")
             .env("GH_PROMPT_DISABLED", "1")
             .stdin(Stdio::null())
-            .process_group(0)
             .kill_on_drop(true);
+        #[cfg(unix)]
+        command.process_group(0);
         command
     }
 
@@ -417,9 +404,33 @@ mod unix {
         let _guard = interrupt.protect(operation, deadline)?;
         Some(tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                tokio::time::timeout_at(deadline.into(), command.output()).await?
+                tokio::time::timeout_at(deadline.into(), gh_output(command)).await?
             })
         }))
+    }
+
+    #[cfg(unix)]
+    async fn gh_output(command: &mut tokio::process::Command) -> io::Result<Output> {
+        command.output().await
+    }
+
+    #[cfg(windows)]
+    async fn gh_output(command: &mut tokio::process::Command) -> io::Result<Output> {
+        use subc_jobobject::{ContainedChild, JobObject, CREATE_SUSPENDED_FLAG};
+
+        // A separate process group keeps console Ctrl-C from interrupting gh.
+        // Assign while suspended so even children holding the output pipes are
+        // killed when the timeout drops the job.
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        let job = JobObject::new()?;
+        let child = command
+            .creation_flags(CREATE_SUSPENDED_FLAG | CREATE_NEW_PROCESS_GROUP)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let pid = child.id().expect("a newly spawned child has a pid");
+        let ContainedChild { child, job: _job } = ContainedChild::contain(child, job, pid)?;
+        child.wait_with_output().await
     }
 
     fn fallback_url(repo: &str, title: &str, body: &str) -> String {
@@ -497,19 +508,7 @@ mod unix {
     }
 
     fn save(data: &Path, seconds: u64, extension: &str, body: &[u8]) -> io::Result<PathBuf> {
-        let data_fd = match open(data, DIRECTORY_FLAGS | OFlags::RDONLY, Mode::empty()) {
-            Ok(fd) => fd,
-            Err(Errno::NOENT) => {
-                let (Some(parent), Some(name)) = (data.parent(), data.file_name()) else {
-                    return Err(Errno::NOENT.into());
-                };
-                let parent = open(parent, DIRECTORY_FLAGS | OFlags::RDONLY, Mode::empty())?;
-                private_dir(&parent, name)?
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let doctor = private_dir(&data_fd, OsStr::new("doctor"))?;
-        let reports = private_dir(&doctor, OsStr::new("reports"))?;
+        let (reports, directory) = report_directory(data)?;
         let utc = utc_parts_from_epoch_secs(seconds);
         let (year, month, day, hour, minute, second) = (
             utc.year,
@@ -526,30 +525,112 @@ mod unix {
             let name = format!(
                 "{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z-{suffix:016x}.{extension}"
             );
-            let fd = match openat(
-                &reports,
-                name.as_str(),
-                OFlags::WRONLY | OFlags::CLOEXEC | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW,
-                FILE_MODE,
-            ) {
-                Ok(fd) => fd,
-                Err(Errno::EXIST) => continue,
-                Err(error) => return Err(error.into()),
-            };
-            if let Err(error) = (|| {
-                if Mode::from_raw_mode(fstat(&fd)?.st_mode) != FILE_MODE {
-                    fchmod(&fd, FILE_MODE)?;
-                }
-                File::from(fd).write_all(body)
-            })() {
-                let _ = unlinkat(&reports, name.as_str(), AtFlags::empty());
-                return Err(error);
+            let path = directory.join(&name);
+            match write_new(&reports, &path, body) {
+                Ok(()) => return Ok(path),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (),
+                Err(error) => return Err(error),
             }
-            return Ok(data.join("doctor/reports").join(name));
         }
-        Err(Errno::EXIST.into())
+        Err(io::ErrorKind::AlreadyExists.into())
     }
 
+    #[cfg(unix)]
+    fn report_directory(data: &Path) -> io::Result<(OwnedFd, PathBuf)> {
+        let data_fd = match open(data, DIRECTORY_FLAGS | OFlags::RDONLY, Mode::empty()) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT) => {
+                let (Some(parent), Some(name)) = (data.parent(), data.file_name()) else {
+                    return Err(Errno::NOENT.into());
+                };
+                let parent = open(parent, DIRECTORY_FLAGS | OFlags::RDONLY, Mode::empty())?;
+                private_dir(&parent, name)?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let doctor = private_dir(&data_fd, OsStr::new("doctor"))?;
+        let reports = private_dir(&doctor, OsStr::new("reports"))?;
+        Ok((reports, data.join("doctor/reports")))
+    }
+
+    #[cfg(unix)]
+    fn write_new(reports: &OwnedFd, path: &Path, body: &[u8]) -> io::Result<()> {
+        let name = path.file_name().expect("generated report filename");
+        let fd = openat(
+            reports,
+            name,
+            OFlags::WRONLY | OFlags::CLOEXEC | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW,
+            FILE_MODE,
+        )?;
+        let result = (|| {
+            if Mode::from_raw_mode(fstat(&fd)?.st_mode) != FILE_MODE {
+                fchmod(&fd, FILE_MODE)?;
+            }
+            File::from(fd).write_all(body)
+        })();
+        if result.is_err() {
+            let _ = unlinkat(reports, name, AtFlags::empty());
+        }
+        result
+    }
+
+    #[cfg(windows)]
+    fn report_directory(data: &Path) -> io::Result<(Vec<File>, PathBuf)> {
+        use subc_os::windows_acl::verify_private_dir;
+
+        let parent = data.parent().ok_or(io::ErrorKind::InvalidInput)?;
+        let mut names = parent
+            .ancestors()
+            .take_while(|path| path.is_absolute())
+            .collect::<Vec<_>>();
+        names.reverse();
+        let mut handles = names
+            .into_iter()
+            .map(open_dir)
+            .collect::<io::Result<Vec<_>>>()?;
+        let doctor = data.join("doctor");
+        let reports = doctor.join("reports");
+        for path in [data, doctor.as_path(), reports.as_path()] {
+            handles.push(match open_dir(path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    match subc_os::create_private_directory_exclusive(path) {
+                        Ok(()) => (),
+                        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (),
+                        Err(error) => return Err(error),
+                    }
+                    open_dir(path)?
+                }
+                result => result?,
+            });
+            if path != data {
+                // Refuse an existing directory with broad grants instead of
+                // rewriting its ACL. The pinned handles rule out path redirects.
+                verify_private_dir(path)?;
+            }
+        }
+        Ok((handles, reports))
+    }
+
+    #[cfg(windows)]
+    fn open_dir(path: &Path) -> io::Result<File> {
+        subc_os::open_directory_nofollow_all(path).map_err(|error| match error {
+            subc_os::OpenRegularError::Io(error) => error,
+            other => io::Error::new(io::ErrorKind::InvalidInput, other),
+        })
+    }
+
+    #[cfg(windows)]
+    fn write_new(_reports: &[File], path: &Path, body: &[u8]) -> io::Result<()> {
+        let mut file = subc_os::windows_acl::create_private_file(path)?;
+        let result = file.write_all(body);
+        if result.is_err() {
+            drop(file);
+            let _ = std::fs::remove_file(path);
+        }
+        result
+    }
+
+    #[cfg(unix)]
     fn private_dir(parent: &OwnedFd, name: &OsStr) -> io::Result<OwnedFd> {
         let created = match mkdirat(parent, name, DIRECTORY_MODE) {
             Ok(()) => true,

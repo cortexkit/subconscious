@@ -1,4 +1,3 @@
-#[cfg(unix)]
 use std::time::Duration;
 use std::{ffi::OsString, io::Write, sync::Arc};
 
@@ -12,7 +11,6 @@ use subc_core::doctor::{
 use super::{log_tail, response_budget, Command};
 
 mod agent;
-#[cfg(unix)]
 mod interrupt;
 mod issue;
 mod report_file;
@@ -123,7 +121,6 @@ impl LogFallback for LocalLogs {
 
 #[derive(Default)]
 struct Terminal {
-    #[cfg(unix)]
     tty: Option<Tty>,
 }
 
@@ -133,57 +130,36 @@ struct Tty {
     writer: fs::File,
 }
 
+#[cfg(windows)]
+struct Tty {
+    // Use console stderr for Unicode output when available; otherwise open the
+    // console directly so prompts cannot end up in a redirected report.
+    output: Option<fs::File>,
+}
+
 impl Terminal {
     fn open(ckni: bool) -> Self {
-        #[cfg(unix)]
-        if !ckni && env::var_os("CK_RESCUE_SESSION").is_none() {
-            if let Ok(tty) = fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open("/dev/tty")
-            {
-                if let Ok(reader) = tty.try_clone() {
-                    return Self {
-                        tty: Some(Tty {
-                            reader: std::sync::Mutex::new(io::BufReader::new(reader)),
-                            writer: tty,
-                        }),
-                    };
-                }
-            }
+        Self {
+            tty: (!ckni && env::var_os("CK_RESCUE_SESSION").is_none())
+                .then(Tty::open)
+                .flatten(),
         }
-        #[cfg(not(unix))]
-        let _ = ckni;
-        Self::default()
     }
 
-    #[cfg(unix)]
     fn write(&self, text: &str) -> io::Result<()> {
-        let tty = self
-            .tty
+        self.tty
             .as_ref()
-            .ok_or_else(|| io::Error::other("no terminal"))?;
-        (&tty.writer).write_all(text.as_bytes())
+            .ok_or_else(|| io::Error::other("no terminal"))?
+            .write(text)
     }
 
-    #[cfg(unix)]
     fn ask(&self, text: &str) -> Option<String> {
-        use io::BufRead;
-
         self.write(text).ok()?;
         let mut line = String::new();
-        let read = self
-            .tty
-            .as_ref()?
-            .reader
-            .lock()
-            .ok()?
-            .read_line(&mut line)
-            .ok()?;
+        let read = self.tty.as_ref()?.read_line(&mut line).ok()?;
         (read > 0).then(|| line.trim().to_owned())
     }
 
-    #[cfg(unix)]
     fn yes(&self, question: &str) -> bool {
         self.ask(question).is_some_and(|answer| {
             answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes")
@@ -191,50 +167,102 @@ impl Terminal {
     }
 }
 
-impl Prompter for Terminal {
-    fn interactive(&self) -> bool {
-        #[cfg(unix)]
-        {
-            self.tty.is_some()
-        }
-        #[cfg(not(unix))]
-        {
-            false
-        }
+impl Tty {
+    #[cfg(unix)]
+    fn open() -> Option<Self> {
+        let writer = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .ok()?;
+        let reader = writer.try_clone().ok()?;
+        Some(Self {
+            reader: std::sync::Mutex::new(io::BufReader::new(reader)),
+            writer,
+        })
     }
 
-    fn confirm(&self, module: &str, finding: &cortexkit_doctor::Finding) -> bool {
-        #[cfg(unix)]
-        {
-            let fix = finding.fix();
-            let Some(plan) = fix.plan() else { return false };
-            let mut prompt = format!("\n{module}: {}\n", finding.summary());
-            for step in plan.steps() {
-                prompt.push_str(&format!("  - {step}\n"));
-            }
-            prompt.push_str(if fix.needs_stop() {
-                "The module must be stopped before applying this fix.\n"
-            } else {
-                "No module stop is needed.\n"
-            });
-            prompt.push_str("Apply this fix? [y/N] ");
-            self.yes(&prompt)
+    #[cfg(windows)]
+    fn open() -> Option<Self> {
+        use io::IsTerminal;
+
+        // Unix reads /dev/tty even with redirected stdin. On Windows, require
+        // console stdin so Rust uses the Unicode console API and never reads a pipe.
+        if !io::stdin().is_terminal() {
+            return None;
         }
-        #[cfg(not(unix))]
-        {
-            let _ = (module, finding);
-            false
+        let output = if io::stderr().is_terminal() {
+            None
+        } else {
+            Some(
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(r"\\.\CONOUT$")
+                    .ok()?,
+            )
+        };
+        Some(Self { output })
+    }
+
+    #[cfg(unix)]
+    fn write(&self, text: &str) -> io::Result<()> {
+        (&self.writer).write_all(text.as_bytes())
+    }
+
+    #[cfg(windows)]
+    fn write(&self, text: &str) -> io::Result<()> {
+        let text = text.replace('\n', "\r\n");
+        match &self.output {
+            Some(output) => {
+                let mut output = output;
+                output.write_all(text.as_bytes())
+            }
+            None => io::stderr().write_all(text.as_bytes()),
         }
     }
 
     #[cfg(unix)]
+    fn read_line(&self, line: &mut String) -> io::Result<usize> {
+        use io::BufRead;
+        self.reader
+            .lock()
+            .map_err(|_| io::Error::other("terminal reader lock was poisoned"))?
+            .read_line(line)
+    }
+
+    #[cfg(windows)]
+    fn read_line(&self, line: &mut String) -> io::Result<usize> {
+        io::stdin().read_line(line)
+    }
+}
+
+impl Prompter for Terminal {
+    fn interactive(&self) -> bool {
+        self.tty.is_some()
+    }
+
+    fn confirm(&self, module: &str, finding: &cortexkit_doctor::Finding) -> bool {
+        let fix = finding.fix();
+        let Some(plan) = fix.plan() else { return false };
+        let mut prompt = format!("\n{module}: {}\n", finding.summary());
+        for step in plan.steps() {
+            prompt.push_str(&format!("  - {step}\n"));
+        }
+        prompt.push_str(if fix.needs_stop() {
+            "The module must be stopped before applying this fix.\n"
+        } else {
+            "No module stop is needed.\n"
+        });
+        prompt.push_str("Apply this fix? [y/N] ");
+        self.yes(&prompt)
+    }
+
     fn confirm_deep_stop(&self, module: &str) -> bool {
         self.yes(&format!(
             "Stop {module} for up to 30 minutes to finish its deep checks? Agents that use it wait until it is back. [y/N] "
         ))
     }
 
-    #[cfg(unix)]
     fn full_progress(&self, module: &str, elapsed: Duration, limit: Duration) {
         let elapsed = elapsed.as_secs();
         let mins = elapsed / 60;
@@ -258,7 +286,6 @@ impl Prompter for Terminal {
 
 // The test executable can substitute a local GitHub API and simulate failed
 // signal registration. The shipped ck never reads those settings from its environment.
-#[cfg(unix)]
 pub(crate) fn test_settings() -> (Option<OsString>, bool) {
     (None, false)
 }
@@ -311,10 +338,12 @@ pub(super) fn run(
         .transpose()?;
     let terminal = Arc::new(Terminal::open(output.ckni));
     let interrupt = Arc::new(Interrupt::default());
-    #[cfg(unix)]
-    let (github_api, fail_sigterm) = crate::doctor_cli::test_settings();
-    #[cfg(unix)]
-    interrupt::listen(Arc::clone(&interrupt), Arc::clone(&terminal), fail_sigterm);
+    let (github_api, fail_secondary_event) = crate::doctor_cli::test_settings();
+    interrupt::listen(
+        Arc::clone(&interrupt),
+        Arc::clone(&terminal),
+        fail_secondary_event,
+    );
     let logs = Arc::new(LocalLogs);
     let doctor::ProgramRun { run, checked } = doctor::run_with_programs(
         DoctorOptions {
@@ -334,16 +363,9 @@ pub(super) fn run(
         },
         logs.clone(),
     );
-    let issues = options.issue.then(|| {
-        issue::file(
-            checked,
-            &terminal,
-            &interrupt,
-            logs.as_ref(),
-            #[cfg(unix)]
-            github_api,
-        )
-    });
+    let issues = options
+        .issue
+        .then(|| issue::file(checked, &terminal, &interrupt, logs.as_ref(), github_api));
     let exit_code = complete(
         Completion {
             run,
@@ -617,6 +639,10 @@ fn write_module_fix(out: &mut impl Write, fix: &ModuleFix) -> io::Result<()> {
             ModuleFixSkip::SignalSetupFailed => "signal_setup_failed",
         };
         write!(out, " {reason}")?;
+        #[cfg(windows)]
+        if fix.skip_reason == Some(ModuleFixSkip::NoTerminal) {
+            write!(out, "; the answer must be typed in a console window")?;
+        }
     }
     if let Some(result) = &fix.result {
         let outcome = match result.outcome {
@@ -717,9 +743,8 @@ mod tests {
         assert!(document.get("log_tails").is_none());
     }
 
-    #[cfg(unix)]
     #[test]
-    fn latched_sigterm_overrides_a_report_write_failure() {
+    fn latched_interrupt_overrides_a_report_write_failure() {
         let dir = ScratchDir::new("doctor-signal-write-error");
         let target = ReportTarget::create(&dir.join("report.json")).unwrap();
         let output =

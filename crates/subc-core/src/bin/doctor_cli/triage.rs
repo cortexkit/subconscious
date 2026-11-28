@@ -270,13 +270,13 @@ fn triage_file_fact(path: &Path) -> Value {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 #[test]
 fn daemon_triage_reports_a_held_live_start_lock_as_present() {
     let dir = cortexkit_test_support::ScratchDir::new("triage-held-start-lock");
     let connection = dir.join(CONNECTION_FILE_NAME);
     let lock = fs::File::create(triage_start_lock_path(&connection)).unwrap();
-    rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive).unwrap();
+    lock.lock().unwrap();
     fs::write(&connection, serde_json::to_vec(&json!({
         "schema": 1, "wire_version": 1, "endpoints": [{"host": "127.0.0.1", "port": 8757}],
         "key": "fixture-key", "daemon_id": "daemon-test", "pid": process::id(),

@@ -1,6 +1,5 @@
 #![forbid(unsafe_code)]
 
-#[cfg(unix)]
 mod doctor_cli {
     pub(crate) fn test_settings() -> (Option<std::ffi::OsString>, bool) {
         let (github_api, fail_sigterm) = super::ck::doctor_cli::test_settings();

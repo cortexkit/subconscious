@@ -134,6 +134,8 @@ pub mod socket_peer;
 pub mod user_path;
 #[cfg_attr(not(windows), path = "windows_acl_noop.rs")]
 pub mod windows_acl;
+#[cfg(all(windows, feature = "test-support"))]
+pub mod windows_console_test;
 #[cfg(unix)]
 pub use launch_nonce::LaunchNonceHandoff;
 pub use launch_nonce::{

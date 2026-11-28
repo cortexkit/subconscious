@@ -6,7 +6,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(unix)]
 use cortexkit_doctor::runner::Cancel;
 
 /// The caller's terminal dialogue. An unreadable answer counts as no.
@@ -44,20 +43,12 @@ struct InterruptState {
 struct Wait {
     operation: &'static str,
     deadline: Instant,
-    #[cfg(unix)]
     stopped_check: Option<Cancel>,
 }
 
 impl Wait {
     fn restart_after_check(&self) -> bool {
-        #[cfg(unix)]
-        {
-            self.stopped_check.is_some()
-        }
-        #[cfg(not(unix))]
-        {
-            false
-        }
+        self.stopped_check.is_some()
     }
 }
 
@@ -76,7 +67,6 @@ impl Interrupt {
         let mut state = self.0.lock().unwrap();
         if state.signal.is_none() && !state.guards.is_empty() {
             state.signal = Some(signal);
-            #[cfg(unix)]
             for cancel in state
                 .guards
                 .values()
@@ -124,7 +114,6 @@ impl Interrupt {
             Wait {
                 operation,
                 deadline,
-                #[cfg(unix)]
                 stopped_check: None,
             },
         );
@@ -134,7 +123,6 @@ impl Interrupt {
         })
     }
 
-    #[cfg(unix)]
     pub(super) fn setup_failed(&self) -> bool {
         self.0.lock().unwrap().setup_failed
     }
@@ -147,19 +135,16 @@ pub struct Guard<'a> {
 }
 
 impl Guard<'_> {
-    #[cfg(unix)]
     fn update(&self, operation: &'static str, deadline: Instant) {
         self.set_wait(operation, deadline, None);
     }
 
-    #[cfg(unix)]
     pub(super) fn wait_for_stopped_check(&self, deadline: Instant) -> Cancel {
         let cancel = Cancel::new();
         self.set_wait("a full module check", deadline, Some(cancel.clone()));
         cancel
     }
 
-    #[cfg(unix)]
     fn set_wait(&self, operation: &'static str, deadline: Instant, stopped_check: Option<Cancel>) {
         let mut state = self.interrupt.0.lock().unwrap();
         // If Ctrl-C arrived while ck was stopping the module, cancel the full check now,
@@ -186,11 +171,9 @@ impl Drop for Guard<'_> {
     }
 }
 
-#[cfg(unix)]
-pub(super) use unix::*;
+pub(super) use lifecycle::*;
 
-#[cfg(unix)]
-mod unix {
+mod lifecycle {
     use super::{Guard, Programs};
     use crate::doctor::{
         host::{DoctorDaemon, RpcError, SetEnabledError},
@@ -200,7 +183,6 @@ mod unix {
         ModuleFixSkip, ModuleRestart, Severity,
     };
     use cortexkit_doctor::{runner, Crash, FixClass, FixResult, RunError};
-    use rustix::process::Signal;
     use serde_json::json;
     use std::{
         sync::Arc,
@@ -367,11 +349,10 @@ mod unix {
                 program.mode,
                 options,
             );
-            // The terminal sends its interrupt to the foreground fix process,
-            // so the doctor CLI must latch the signal from the fix's exit status.
-            if let Err(RunError::Crashed(Crash::Signal(signal))) = &result {
-                if *signal == Signal::INT.as_raw() || *signal == Signal::QUIT.as_raw() {
-                    programs.interrupt.on_signal(*signal);
+            // A foreground fix can receive the terminal interrupt before ck does.
+            if let Err(RunError::Crashed(crash)) = &result {
+                if let Some(signal) = terminal_interrupt(*crash) {
+                    programs.interrupt.on_signal(signal);
                 }
             }
             row.result = Some(fix_result(result));
@@ -379,6 +360,27 @@ mod unix {
         });
         row.restart = restart;
         result.err()
+    }
+
+    #[cfg(unix)]
+    fn terminal_interrupt(crash: Crash) -> Option<i32> {
+        use rustix::process::Signal;
+
+        match crash {
+            Crash::Signal(signal)
+                if signal == Signal::INT.as_raw() || signal == Signal::QUIT.as_raw() =>
+            {
+                Some(signal)
+            }
+            _ => None,
+        }
+    }
+
+    #[cfg(windows)]
+    fn terminal_interrupt(crash: Crash) -> Option<i32> {
+        // Windows reports a console interrupt as STATUS_CONTROL_C_EXIT, not a signal.
+        const CONTROL_C_EXIT: i32 = 0xc000_013au32 as i32;
+        (crash == Crash::ExitCode(CONTROL_C_EXIT)).then_some(2)
     }
 
     fn fix_result(

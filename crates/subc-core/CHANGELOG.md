@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.24.13
+
+- Run `ck doctor` checks and repairs natively on Windows.
+- Extract the pinned Windows Node distribution ZIP safely when installing the
+  rescue agent.
+
 ## 0.24.12
 
 - Let `ck upgrade` and the terminal update wizard proceed when the ownership

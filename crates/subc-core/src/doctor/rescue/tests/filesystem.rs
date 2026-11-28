@@ -214,6 +214,9 @@ fn rescue_refuses_a_missing_data_home_without_creating_ancestors() {
     assert!(fake.events.lock().unwrap().is_empty());
 }
 
+#[cfg(windows)]
+mod windows;
+
 #[cfg(unix)]
 mod unix {
     use std::{

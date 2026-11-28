@@ -8,7 +8,6 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-#[cfg(unix)]
 use cortexkit_doctor::Mode;
 use serde_json::json;
 
@@ -65,7 +64,6 @@ pub fn run_with_programs(
 ) -> ProgramRun {
     let options = effective_options(options);
     let host = SystemHost::default();
-    #[cfg(unix)]
     let host = if options.fix || (programs.mode == Mode::Full && programs.full_feedback) {
         // The SDK's connection-wide timeout must not cut off a long drain or
         // operator prompt. The host still bounds each call by its own deadline.
@@ -173,10 +171,8 @@ pub(super) fn run_with_programs_on(
         };
         return pass.program_report(path, None, Some(2));
     }
-    #[cfg(unix)]
     let asked = std::cell::RefCell::new(std::collections::BTreeSet::new());
     let check = || {
-        #[cfg(unix)]
         if programs.mode == Mode::Full {
             let mut pass = pass(&host, &logs, path.clone(), limits, true);
             let checks = program_checks::check_all(
@@ -202,14 +198,7 @@ pub(super) fn run_with_programs_on(
             let override_path = path.as_deref();
             let interrupt = programs.interrupt;
             let checks = scope.spawn(move || {
-                program_checks::check_all(
-                    config,
-                    override_path,
-                    interrupt,
-                    start,
-                    #[cfg(unix)]
-                    None,
-                )
+                program_checks::check_all(config, override_path, interrupt, start, None)
             });
             let mut pass = pass(&host, &logs, path.clone(), limits, options.fix);
             pass.add_program_checks(checks.join().expect("program check worker panicked"));
@@ -239,17 +228,13 @@ fn fix_program_pass(
             result: None,
             skipped: Some(FixSkip::Interrupted),
             findings_before: first.findings.clone(),
-            #[cfg(unix)]
             module_fixes: super::program_fixes::skipped(
                 first.checked(),
                 super::ModuleFixSkip::Interrupted,
             ),
-            #[cfg(not(unix))]
-            module_fixes: Vec::new(),
         };
         return (first, report, None);
     }
-    #[cfg(unix)]
     {
         use super::{program_fixes, ModuleFixSkip};
 
@@ -283,11 +268,6 @@ fn fix_program_pass(
         Finding::sort(&mut last.findings);
         (last, report, repairs.failed.then_some(1))
     }
-    #[cfg(not(unix))]
-    {
-        let _ = (limits, config);
-        fix::attempt(host.as_ref(), first, check)
-    }
 }
 
 #[derive(Default)]
@@ -298,7 +278,6 @@ pub(super) struct Pass {
     daemon_answered: bool,
     tails: Vec<LogTailRecord>,
     programs: Option<ProgramChecks>,
-    #[cfg(unix)]
     daemon: Option<Arc<dyn DoctorDaemon>>,
 }
 
@@ -309,7 +288,6 @@ impl Pass {
         self.programs = Some(checks);
     }
 
-    #[cfg(unix)]
     fn checked(&self) -> &[CheckedProgram] {
         self.programs
             .as_ref()
@@ -426,7 +404,6 @@ fn pass(
             .map(|pid| pid as u32),
         override_path: connection_override,
     };
-    #[cfg(unix)]
     let fix_daemon = keep_daemon.then(|| daemon.clone()).flatten();
 
     let mut findings = Vec::new();
@@ -519,8 +496,6 @@ fn pass(
     );
     findings.extend(service_findings);
     Finding::sort(&mut findings);
-    #[cfg(not(unix))]
-    let _ = keep_daemon;
     Pass {
         findings,
         offer: offer.filter(|_| describe.override_path.is_none()),
@@ -528,7 +503,6 @@ fn pass(
         daemon_answered: describe.answered,
         tails,
         programs: None,
-        #[cfg(unix)]
         daemon: fix_daemon,
     }
 }

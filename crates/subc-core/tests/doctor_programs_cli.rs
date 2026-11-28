@@ -1,4 +1,3 @@
-#![cfg(unix)]
 #![forbid(unsafe_code)]
 
 use std::{
@@ -6,7 +5,6 @@ use std::{
     fs, io,
     io::{Read, Write},
     net::TcpListener,
-    os::unix::fs::{symlink, PermissionsExt},
     path::{Path, PathBuf},
     process::{Command, Output},
     sync::{Arc, Mutex},
@@ -16,8 +14,11 @@ use std::{
 
 use cortexkit_test_support::ScratchDir;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+#[cfg(unix)]
 use rustix::process::{kill_process, test_kill_process, Pid, Signal};
 use serde_json::{json, Value};
+#[cfg(unix)]
+use std::os::unix::fs::{symlink, PermissionsExt};
 
 const CK: &str = env!("CARGO_BIN_EXE_ck-under-test");
 const FIXTURE: &str = env!("CARGO_BIN_EXE_doctor-module-fixture");
@@ -27,6 +28,9 @@ const TITLE_PROMPT: &str = "Issue title (required):";
 const DESCRIPTION_PROMPT: &str = "Issue description (optional):";
 const ISSUE_PROMPT: &str = "File this report as a public issue";
 const LIMIT: Duration = Duration::from_secs(25);
+const SECONDARY_EXIT: u32 = if cfg!(windows) { 130 } else { 143 };
+const PTY_SIZE: (u16, u16) = if cfg!(windows) { (150, 512) } else { (30, 180) };
+type PtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
 struct Rig {
     root: ScratchDir,
@@ -46,7 +50,12 @@ impl Rig {
         ] {
             fs::create_dir_all(root.join(path)).unwrap();
         }
+        #[cfg(unix)]
         fs::set_permissions(root.join("run"), fs::Permissions::from_mode(0o700)).unwrap();
+        #[cfg(windows)]
+        for folder in ["run", "config/cortexkit", "data/cortexkit"] {
+            subc_os::windows_acl::create_private_dir(&root.join(folder)).unwrap();
+        }
         Self {
             root,
             entries: BTreeMap::new(),
@@ -54,9 +63,11 @@ impl Rig {
     }
 
     fn program(&mut self, id: &str, mut scenario: Value) -> PathBuf {
-        let path = self
-            .root
-            .join(format!("bin/fixture-{}", self.entries.len()));
+        let path = self.root.join(format!(
+            "bin/fixture-{}{}",
+            self.entries.len(),
+            std::env::consts::EXE_SUFFIX
+        ));
         fs::hard_link(FIXTURE, &path)
             .or_else(|_| fs::copy(FIXTURE, &path).map(|_| ()))
             .unwrap();
@@ -70,19 +81,13 @@ impl Rig {
     fn stage(&self, program: &Path, stage: &str) -> PathBuf {
         self.root.join("data/doctor-fixture").join(format!(
             "{}.{stage}",
-            program.file_name().unwrap().to_str().unwrap()
+            program.file_stem().unwrap().to_str().unwrap()
         ))
     }
 
-    fn pid(&self, program: &Path, stage: &str) -> Pid {
+    fn pid(&self, program: &Path, stage: &str) -> u32 {
         let path = self.stage(program, stage);
-        until(|| {
-            fs::read_to_string(&path)
-                .ok()?
-                .parse::<i32>()
-                .ok()
-                .and_then(Pid::from_raw)
-        })
+        until(|| fs::read_to_string(&path).ok()?.parse::<u32>().ok())
     }
 
     fn write_config(&self) {
@@ -110,6 +115,20 @@ impl Rig {
             .env("PATH", self.root.join("bin"))
             .env("TERM", "xterm-256color")
             .args(args);
+        #[cfg(windows)]
+        {
+            command
+                .env("USERPROFILE", self.root.join("home"))
+                .env("APPDATA", self.root.join("config"))
+                .env("LOCALAPPDATA", self.root.join("data"))
+                .env("TEMP", self.root.path())
+                .env("TMP", self.root.path());
+            for name in ["SystemRoot", "WINDIR", "COMSPEC"] {
+                if let Some(value) = std::env::var_os(name) {
+                    command.env(name, value);
+                }
+            }
+        }
         command
     }
 
@@ -129,7 +148,11 @@ impl Rig {
     }
 
     fn reports(&self) -> PathBuf {
-        self.root.join("data/cortexkit/doctor/reports")
+        self.root
+            .join("data")
+            .join("cortexkit")
+            .join("doctor")
+            .join("reports")
     }
 
     #[cfg(target_os = "linux")]
@@ -151,6 +174,7 @@ impl Rig {
         .unwrap();
     }
 
+    #[cfg(unix)]
     fn gh(&self, auth: u32, create: u32, sleep: bool) {
         let program = self.root.join("bin/gh");
         fs::write(
@@ -177,6 +201,18 @@ exit 99
         .unwrap();
         fs::set_permissions(program, fs::Permissions::from_mode(0o700)).unwrap();
     }
+
+    #[cfg(windows)]
+    fn gh(&self, auth: u32, create: u32, sleep: bool) {
+        fs::hard_link(FIXTURE, self.root.join("bin/gh.exe"))
+            .or_else(|_| fs::copy(FIXTURE, self.root.join("bin/gh.exe")).map(|_| ()))
+            .unwrap();
+        fs::write(
+            self.root.join("gh.json"),
+            json!([auth, create, if sleep { 2000 } else { 0 }]).to_string(),
+        )
+        .unwrap();
+    }
 }
 
 fn until<T>(mut read: impl FnMut() -> Option<T>) -> T {
@@ -202,20 +238,27 @@ fn document(path: &Path) -> Value {
     serde_json::from_slice(&data).unwrap_or_else(|error| panic!("{error}: {}", text(&data)))
 }
 
-fn assert_gone(pid: Pid) {
-    assert_eq!(
-        test_kill_process(pid),
-        Err(rustix::io::Errno::SRCH),
-        "fixture {pid:?} still exists"
-    );
+fn gone(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        test_kill_process(Pid::from_raw(pid as i32).unwrap()) == Err(rustix::io::Errno::SRCH)
+    }
+    #[cfg(windows)]
+    {
+        !subc_jobobject::process_exists(pid)
+    }
+}
+
+fn assert_gone(pid: u32) {
+    assert!(gone(pid), "fixture {pid} still exists");
 }
 
 struct Tty {
-    child: Box<dyn Child + Send + Sync>,
+    child: Option<Box<dyn Child + Send + Sync>>,
     master: Option<Box<dyn MasterPty + Send>>,
-    writer: Option<Box<dyn Write + Send>>,
+    writer: Option<PtyWriter>,
     output: Arc<Mutex<Vec<u8>>>,
-    reader: Option<thread::JoinHandle<()>>,
+    reader: Option<thread::JoinHandle<io::Result<()>>>,
     stdout: PathBuf,
 }
 
@@ -225,14 +268,24 @@ impl Tty {
         let stdout = cwd.join("stdout");
         let pair = native_pty_system()
             .openpty(PtySize {
-                rows: 30,
-                cols: 180,
+                rows: PTY_SIZE.0,
+                cols: PTY_SIZE.1,
                 pixel_width: 0,
                 pixel_height: 0,
             })
             .unwrap();
-        let mut builder = CommandBuilder::new("/bin/sh");
-        builder.args(["-c", "exec \"$@\" > stdout", "doctor-test"]);
+        #[cfg(unix)]
+        let mut builder = {
+            let mut builder = CommandBuilder::new("/bin/sh");
+            builder.args(["-c", "exec \"$@\" > stdout", "doctor-test"]);
+            builder
+        };
+        #[cfg(windows)]
+        let mut builder = {
+            let mut builder = CommandBuilder::new(FIXTURE);
+            builder.arg("--redirect-doctor-cli");
+            builder
+        };
         builder.arg(command.get_program());
         builder.args(command.get_args());
         builder.cwd(cwd);
@@ -242,29 +295,51 @@ impl Tty {
                 builder.env(name, value);
             }
         }
-        let writer = pair.master.take_writer().unwrap();
+        let writer = Arc::new(Mutex::new(pair.master.take_writer().unwrap()));
+        #[cfg(windows)]
+        let console_input = Arc::clone(&writer);
         let mut reader = pair.master.try_clone_reader().unwrap();
         let child = pair.slave.spawn_command(builder).unwrap();
         drop(pair.slave);
         let output = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&output);
         let reader = thread::spawn(move || {
+            #[cfg(windows)]
+            let mut answered_cursor_query = false;
             let mut block = [0; 4096];
             loop {
                 match reader.read(&mut block) {
                     Ok(0) => break,
-                    Ok(n) => captured.lock().unwrap().extend_from_slice(&block[..n]),
+                    Ok(n) => {
+                        captured.lock().unwrap().extend_from_slice(&block[..n]);
+                        #[cfg(windows)]
+                        if !answered_cursor_query
+                            && captured
+                                .lock()
+                                .unwrap()
+                                .windows(4)
+                                .any(|bytes| bytes == b"\x1b[6n")
+                        {
+                            // The Windows pseudo-terminal waits for a cursor position before it emits the prompt.
+                            answered_cursor_query = true;
+                            let mut input = console_input.lock().unwrap();
+                            input.write_all(b"\x1b[1;1R")?;
+                            input.flush()?;
+                        }
+                    }
+                    #[cfg(unix)]
                     Err(error)
                         if error.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error()) =>
                     {
                         break
                     }
-                    Err(error) => panic!("read terminal: {error}"),
+                    Err(error) => return Err(error),
                 }
             }
+            Ok(())
         });
         Self {
-            child,
+            child: Some(child),
             master: Some(pair.master),
             writer: Some(writer),
             output,
@@ -273,24 +348,53 @@ impl Tty {
         }
     }
 
+    #[cfg(unix)]
     fn pid(&self) -> Pid {
-        Pid::from_raw(self.child.process_id().unwrap() as i32).unwrap()
+        Pid::from_raw(self.child.as_ref().unwrap().process_id().unwrap() as i32).unwrap()
     }
 
+    #[cfg(unix)]
     fn signal(&self, signal: Signal) {
         kill_process(self.pid(), signal).unwrap();
     }
 
-    fn foreground(&self) -> Option<Pid> {
+    #[cfg(unix)]
+    fn foreground(&self) -> Option<u32> {
         self.master
             .as_ref()
             .unwrap()
             .process_group_leader()
             .and_then(Pid::from_raw)
+            .map(|pid| pid.as_raw_pid() as u32)
+    }
+
+    fn interrupt(&mut self) {
+        #[cfg(unix)]
+        self.signal(Signal::INT);
+        #[cfg(windows)]
+        self.send("\x03");
+    }
+
+    fn secondary_interrupt(&mut self) {
+        #[cfg(unix)]
+        self.signal(Signal::TERM);
+        // Windows has no SIGTERM delivery to a PID. Use the attached console.
+        #[cfg(windows)]
+        self.interrupt();
     }
 
     fn read_terminal(&self) -> String {
-        text(&self.output.lock().unwrap())
+        let output = self.output.lock().unwrap();
+        #[cfg(unix)]
+        {
+            text(&output)
+        }
+        #[cfg(windows)]
+        {
+            let mut terminal = vt100::Parser::new(PTY_SIZE.0, PTY_SIZE.1, 0);
+            terminal.process(&output);
+            terminal.screen().contents()
+        }
     }
 
     fn expect(&self, needle: &str, count: usize) {
@@ -310,8 +414,12 @@ impl Tty {
     }
 
     fn send(&mut self, answer: &str) {
+        #[cfg(windows)]
+        let answer = answer.replace('\n', "\r");
         self.writer
-            .as_mut()
+            .as_ref()
+            .unwrap()
+            .lock()
             .unwrap()
             .write_all(answer.as_bytes())
             .unwrap();
@@ -325,12 +433,36 @@ impl Tty {
     }
 
     fn finish(mut self, expected: u32) -> (String, String) {
-        let status = until(|| self.child.try_wait().unwrap());
-        drop(self.writer.take());
-        drop(self.master.take());
-        self.reader.take().unwrap().join().unwrap();
+        let deadline = Instant::now() + LIMIT;
+        let status = loop {
+            match self.child.as_mut().unwrap().try_wait() {
+                Ok(Some(status)) => {
+                    self.child.take();
+                    break Ok(status);
+                }
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                Ok(None) => {
+                    break Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "doctor CLI did not exit",
+                    ))
+                }
+                Err(error) => break Err(error),
+            }
+        };
+        // Reap a timed-out child before a test assertion can begin unwinding.
+        self.stop_child();
+        self.close_console();
+        self.reader
+            .take()
+            .unwrap()
+            .join()
+            .unwrap()
+            .expect("read doctor console");
         let stdout = text(&fs::read(&self.stdout).unwrap());
         let dialogue = self.read_terminal();
+        let status = status
+            .unwrap_or_else(|error| panic!("{error}\nterminal:\n{dialogue}\nstdout:\n{stdout}"));
         assert_eq!(
             status.exit_code(),
             expected,
@@ -338,12 +470,24 @@ impl Tty {
         );
         (stdout, dialogue)
     }
+
+    fn stop_child(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    fn close_console(&mut self) {
+        drop(self.writer.take());
+        drop(self.master.take());
+    }
 }
 
 impl Drop for Tty {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.stop_child();
+        self.close_console();
     }
 }
 
@@ -440,7 +584,13 @@ impl FakeApi {
 impl Drop for FakeApi {
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        self.task.take().unwrap().join().unwrap();
+        // A failed request can panic on the server thread. Do not turn an
+        // already-failing test into a process abort by panicking in cleanup.
+        if let Some(Err(failure)) = self.task.take().map(thread::JoinHandle::join) {
+            if !thread::panicking() {
+                std::panic::resume_unwind(failure);
+            }
+        }
     }
 }
 
@@ -483,8 +633,12 @@ fn doctor_issue_conflicts_and_help() {
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     assert!(text(&output.stderr).contains("cannot be used with SUBC_CONNECTION_FILE"));
-    let ckni = rig.root.join("bin/ckni");
-    symlink(CK, &ckni).unwrap();
+    let ckni = rig
+        .root
+        .join(format!("bin/ckni{}", std::env::consts::EXE_SUFFIX));
+    fs::hard_link(CK, &ckni)
+        .or_else(|_| fs::copy(CK, &ckni).map(|_| ()))
+        .unwrap();
     let output = rig
         .command_as(&ckni, &["doctor", "--issue"])
         .output()
@@ -569,11 +723,23 @@ fn doctor_module_fix_refuses_rescue_terminal_and_missing_terminal() {
         );
         assert!(!rig.stage(&program, "fix.started").exists());
     }
+    #[cfg(windows)]
+    {
+        let mut command = rig.command(&["doctor", "--fix"]);
+        command.env("CK_TEST_REDIRECT_STDIN", "1");
+        let (out, dialogue) = Tty::start(&command).finish(1);
+        assert!(
+            out.contains("skipped no_terminal; the answer must be typed in a console window"),
+            "{out}"
+        );
+        assert!(!dialogue.contains(FIX_PROMPT));
+        assert!(!rig.stage(&program, "fix.started").exists());
+    }
 }
 
 #[test]
 fn doctor_signal_during_fix_finishes_and_writes_requested_report() {
-    for (signal, exit, save) in [(Signal::INT, 130, false), (Signal::TERM, 143, true)] {
+    for (exit, save) in [(130, false), (SECONDARY_EXIT, true)] {
         let mut rig = Rig::new();
         let program = rig.program("slow", json!({"fix": "sleep", "record_fix": true}));
         let mut command = rig.command(&["doctor", "--fix", "--json"]);
@@ -585,7 +751,11 @@ fn doctor_signal_during_fix_finishes_and_writes_requested_report() {
         tty.expect(FIX_PROMPT, 1);
         tty.send("y\n");
         let pid = rig.pid(&program, "fix.started");
-        tty.signal(signal);
+        if save {
+            tty.secondary_interrupt();
+        } else {
+            tty.interrupt();
+        }
         tty.expect("waiting for a module fix", 1);
         let (stdout, _) = tty.finish(exit);
         let result: Value = serde_json::from_str(&stdout).unwrap();
@@ -608,10 +778,10 @@ fn doctor_partial_registration_keeps_checks_and_the_sigint_listener() {
         let program = rig.program("slow", json!({"check_sleep_ms": 1000}));
         let mut command = rig.command(&["doctor", "--fix", "--json"]);
         command.env("CK_TEST_FAIL_SIGTERM_REGISTRATION", "1");
-        let tty = Tty::start(&command);
+        let mut tty = Tty::start(&command);
         let pid = rig.pid(&program, "check.started");
         if signal {
-            tty.signal(Signal::INT);
+            tty.interrupt();
             tty.expect("waiting for a module check", 1);
         }
         let (stdout, dialogue) = tty.finish(if signal { 130 } else { 1 });
@@ -632,16 +802,16 @@ fn doctor_partial_registration_keeps_checks_and_the_sigint_listener() {
 }
 
 #[test]
-fn doctor_sigterm_latches_across_pool_jobs_and_during_a_second_pass() {
+fn doctor_interrupt_latches_across_pool_jobs_and_during_a_second_pass() {
     let mut rig = Rig::new();
     let early = rig.program("early", json!({"check": "clean"}));
     let slow = rig.program("slow", json!({"check": "clean", "check_sleep_ms": 1600}));
-    let tty = Tty::start(&rig.command(&["doctor", "--json"]));
+    let mut tty = Tty::start(&rig.command(&["doctor", "--json"]));
     let early_pid = rig.pid(&early, "check.finished");
     let slow_pid = rig.pid(&slow, "check.started");
-    tty.signal(Signal::TERM);
+    tty.secondary_interrupt();
     tty.expect("waiting for a module check", 1);
-    let (stdout, _) = tty.finish(143);
+    let (stdout, _) = tty.finish(SECONDARY_EXIT);
     let result: Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(result["modules"].as_array().unwrap().len(), 2);
     assert_gone(early_pid);
@@ -656,9 +826,9 @@ fn doctor_sigterm_latches_across_pool_jobs_and_during_a_second_pass() {
     tty.expect(FIX_PROMPT, 1);
     tty.send("y\n");
     let pid = rig.pid(&program, "recheck.started");
-    tty.signal(Signal::TERM);
+    tty.secondary_interrupt();
     tty.expect("waiting for a module check", 1);
-    let (stdout, dialogue) = tty.finish(143);
+    let (stdout, dialogue) = tty.finish(SECONDARY_EXIT);
     let result: Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(
         result["fix"]["module_fixes"][0]["result"]["outcome"],
@@ -684,6 +854,7 @@ fn doctor_issue_saves_private_unique_reports_with_isolated_log_tails() {
     rig.log("other", only_b);
     let api = FakeApi::public();
     rig.gh(0, 0, false);
+    #[cfg(unix)]
     let mut command = rig.command_as(
         Path::new("/bin/sh"),
         &[
@@ -695,6 +866,8 @@ fn doctor_issue_saves_private_unique_reports_with_isolated_log_tails() {
             "--issue",
         ],
     );
+    #[cfg(windows)]
+    let mut command = rig.command(&["doctor", "--issue"]);
     command
         .env("CK_DOCTOR_TEST_GITHUB_API", &api.base)
         .env("CK_RESCUE_SESSION", "1");
@@ -710,10 +883,7 @@ fn doctor_issue_saves_private_unique_reports_with_isolated_log_tails() {
     assert!(!stdout.contains("runner-only: saved"));
     for path in &paths {
         assert_eq!(path.parent().unwrap(), rig.reports());
-        assert_eq!(
-            fs::metadata(path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        assert_private(path, false);
         let name = path.file_name().unwrap().to_str().unwrap();
         let (stamp, random) = name.strip_suffix(".md").unwrap().split_once('-').unwrap();
         assert_eq!(stamp.len(), 16);
@@ -722,10 +892,7 @@ fn doctor_issue_saves_private_unique_reports_with_isolated_log_tails() {
         assert!(random.bytes().all(|b| b.is_ascii_hexdigit()));
     }
     for path in [rig.reports(), rig.reports().parent().unwrap().to_owned()] {
-        assert_eq!(
-            fs::metadata(path).unwrap().permissions().mode() & 0o777,
-            0o700
-        );
+        assert_private(&path, true);
     }
     let a = fs::read_to_string(&paths[0]).unwrap();
     let no_log = fs::read_to_string(&paths[1]).unwrap();
@@ -744,26 +911,51 @@ fn doctor_issue_saves_private_unique_reports_with_isolated_log_tails() {
 }
 
 #[test]
-fn doctor_issue_refuses_a_symlink_and_never_chmods_existing_report_dirs() {
+fn doctor_issue_refuses_a_link_and_never_tightens_existing_report_dirs() {
     for link in [true, false] {
         let mut rig = Rig::new();
         rig.program("reportable", json!({}));
-        fs::create_dir(rig.reports().parent().unwrap()).unwrap();
-        fs::set_permissions(
-            rig.reports().parent().unwrap(),
-            fs::Permissions::from_mode(0o700),
-        )
-        .unwrap();
+        let parent = rig.reports();
+        let parent = parent.parent().unwrap();
+        #[cfg(windows)]
+        subc_os::windows_acl::create_private_dir(parent).unwrap();
+        #[cfg(unix)]
+        fs::create_dir(parent).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).unwrap();
         let target = if link {
             rig.root.join("unrelated")
         } else {
             rig.reports()
         };
-        let original_mode = if link { 0o700 } else { 0o750 };
         fs::create_dir(&target).unwrap();
+        #[cfg(unix)]
+        let original_mode = if link { 0o700 } else { 0o750 };
+        #[cfg(unix)]
         fs::set_permissions(&target, fs::Permissions::from_mode(original_mode)).unwrap();
+        #[cfg(windows)]
         if link {
+            subc_os::windows_acl::create_private_dir(&target).unwrap();
+        } else {
+            subc_os::windows_acl::test_support::grant_everyone(&target);
+        }
+        if link {
+            #[cfg(unix)]
             symlink(&target, rig.reports()).unwrap();
+            #[cfg(windows)]
+            {
+                let result = Command::new("cmd.exe")
+                    .args(["/d", "/c", "mklink", "/j"])
+                    .arg(rig.reports())
+                    .arg(&target)
+                    .output()
+                    .unwrap();
+                assert!(
+                    result.status.success(),
+                    "mklink /j: {}",
+                    text(&result.stderr)
+                );
+            }
         }
         let result = rig.output(&["doctor", "--issue"]);
         assert_eq!(result.status.code(), Some(1));
@@ -773,11 +965,26 @@ fn doctor_issue_refuses_a_symlink_and_never_chmods_existing_report_dirs() {
             "{stdout}"
         );
         assert!(fs::read_dir(&target).unwrap().next().is_none());
+        #[cfg(unix)]
         assert_eq!(
             fs::metadata(target).unwrap().permissions().mode() & 0o777,
             original_mode
         );
+        #[cfg(windows)]
+        if !link {
+            assert!(subc_os::windows_acl::verify_private_dir(&target).is_err());
+        }
     }
+}
+
+fn assert_private(path: &Path, directory: bool) {
+    #[cfg(unix)]
+    assert_eq!(
+        fs::metadata(path).unwrap().permissions().mode() & 0o777,
+        if directory { 0o700 } else { 0o600 }
+    );
+    #[cfg(windows)]
+    subc_os::windows_acl::test_support::assert_owner_only(path, directory, true);
 }
 
 #[test]
@@ -805,10 +1012,7 @@ fn doctor_issue_invalid_manifest_saves_local_report_without_raw_log_text() {
     assert_eq!(paths.len(), 1);
     assert_eq!(paths[0].parent().unwrap(), rig.reports());
     assert_eq!(paths[0].extension().unwrap(), "json");
-    assert_eq!(
-        fs::metadata(&paths[0]).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
+    assert_private(&paths[0], false);
     let body = fs::read_to_string(&paths[0]).unwrap();
     assert!(!body.contains("RAW-LOG-CANARY"), "{body}");
     let note: Value = serde_json::from_str(&body).unwrap();
@@ -857,7 +1061,7 @@ fn doctor_issue_awaits_manifest_batch_and_skips_replaced_programs() {
     let api = FakeApi::public();
     let mut tty = rig.issue_tty(&api);
     let pid = rig.pid(&changed, "check.finished");
-    until(|| (test_kill_process(pid) == Err(rustix::io::Errno::SRCH)).then_some(()));
+    until(|| gone(pid).then_some(()));
     fs::rename(&changed, changed.with_extension("saved")).unwrap();
     fs::copy(FIXTURE, &changed).unwrap();
     let hanging_pid = rig.pid(&slow, "manifest.started");
@@ -976,7 +1180,11 @@ fn doctor_issue_file_and_fallback_use_the_preview_and_hide_private_id() {
         );
         let paths = report_paths(&stdout);
         assert_eq!(paths.len(), 1);
-        assert_eq!(fs::read_to_string(&paths[0]).unwrap(), preview);
+        let saved = fs::read_to_string(&paths[0]).unwrap();
+        #[cfg(unix)]
+        assert_eq!(saved, preview);
+        #[cfg(windows)]
+        assert_eq!(saved.trim_end(), preview.trim_end());
         api.assert_requests(1);
         assert_eq!(
             fs::read_to_string(rig.root.join("gh.auth")).unwrap(),
@@ -987,7 +1195,7 @@ fn doctor_issue_file_and_fallback_use_the_preview_and_hide_private_id() {
             assert_eq!(args, format!("github.com\nissue\ncreate\n--repo\ngithub.com/example/doctor-fixture\n--title\n{title}\n--body-file\n{}\n", paths[0].display()));
             assert_eq!(
                 fs::read_to_string(rig.root.join("body.sent")).unwrap(),
-                preview
+                saved
             );
         } else {
             assert!(!rig.root.join("gh.issue").exists());
@@ -1007,18 +1215,18 @@ fn doctor_issue_file_and_fallback_use_the_preview_and_hide_private_id() {
 }
 
 #[test]
-fn doctor_issue_sigterm_during_manifest_batch_skips_all_filing() {
+fn doctor_issue_interrupted_during_manifest_batch_skips_all_filing() {
     let mut rig = Rig::new();
     let a = rig.program("alpha", json!({}));
     let b = rig.program("beta", json!({"manifest_sleep_ms": 1300}));
     let api = FakeApi::public();
     rig.gh(0, 0, false);
-    let tty = rig.issue_tty(&api);
+    let mut tty = rig.issue_tty(&api);
     let a_pid = rig.pid(&a, "manifest.finished");
     let b_pid = rig.pid(&b, "manifest.started");
-    tty.signal(Signal::TERM);
+    tty.secondary_interrupt();
     tty.expect("waiting for a module manifest", 1);
-    let (stdout, terminal) = tty.finish(143);
+    let (stdout, terminal) = tty.finish(SECONDARY_EXIT);
     assert!(
         stdout.ends_with("alpha: skipped interrupted\nbeta: skipped interrupted\n"),
         "{stdout}"
@@ -1032,7 +1240,7 @@ fn doctor_issue_sigterm_during_manifest_batch_skips_all_filing() {
 }
 
 #[test]
-fn doctor_issue_sigterm_during_gh_finishes_the_file_and_skips_the_sibling() {
+fn doctor_issue_interrupted_during_gh_finishes_the_file_and_skips_the_sibling() {
     let mut rig = Rig::new();
     rig.program("alpha", json!({}));
     rig.program("beta", json!({}));
@@ -1043,9 +1251,9 @@ fn doctor_issue_sigterm_during_gh_finishes_the_file_and_skips_the_sibling() {
     tty.expect(ISSUE_PROMPT, 1);
     tty.send("y\n");
     until(|| rig.root.join("body.sent").exists().then_some(()));
-    tty.signal(Signal::TERM);
+    tty.secondary_interrupt();
     tty.expect("waiting for gh issue create", 1);
-    let (stdout, terminal) = tty.finish(143);
+    let (stdout, terminal) = tty.finish(SECONDARY_EXIT);
     assert!(
         stdout.contains("alpha: filed https://github.com/example/doctor-fixture/issues/1 ["),
         "{stdout}"
@@ -1064,7 +1272,7 @@ enum StartReply {
 #[derive(Default)]
 struct WireEvents {
     calls: Mutex<Vec<subc_control::ClientControlRequest>>,
-    interrupt_pid: Mutex<Option<Pid>>,
+    hold_stop: std::sync::atomic::AtomicBool,
     stop_ack: tokio::sync::Notify,
 }
 
@@ -1196,12 +1404,8 @@ impl WireDaemon {
                     if enabled && matches!(start_reply, StartReply::Unanswered) {
                         std::future::pending::<()>().await;
                     }
-                    if !enabled {
-                        let pid = *events.interrupt_pid.lock().unwrap();
-                        if let Some(pid) = pid {
-                            kill_process(pid, Signal::TERM).unwrap();
-                            events.stop_ack.notified().await;
-                        }
+                    if !enabled && events.hold_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        events.stop_ack.notified().await;
                     }
                     row.enabled = enabled;
                     row.live = enabled;
@@ -1414,7 +1618,8 @@ fn doctor_full_ctrl_c_cancels_the_stopped_check_and_restarts_promptly() {
     tty.send("y\n");
     let pid = rig.pid(&program, "full-retry.started");
     assert_eq!(daemon.enabled_calls(), [false]);
-    assert_eq!(tty.foreground(), Some(tty.pid()));
+    #[cfg(unix)]
+    assert_eq!(tty.foreground(), Some(tty.pid().as_raw_pid() as u32));
 
     // The helper sleeps for a minute. The bound allows the runner's two-second
     // TERM-to-KILL grace period, but does not allow waiting for the helper to finish.
@@ -1424,10 +1629,11 @@ fn doctor_full_ctrl_c_cancels_the_stopped_check_and_restarts_promptly() {
         thread::sleep(Duration::from_millis(10));
     }
     let restarted_promptly = daemon.enabled_calls() == [false, true];
+    #[cfg(unix)]
     if !restarted_promptly {
         // A build that doesn't cancel the check on Ctrl-C leaves ck running; end the
         // ck process this test started so the failure doesn't leave it behind.
-        let _ = kill_process(pid, Signal::TERM);
+        let _ = kill_process(Pid::from_raw(pid as i32).unwrap(), Signal::TERM);
     }
     let (stdout, dialogue) = tty.finish(130);
     assert!(
@@ -1539,7 +1745,14 @@ fn doctor_issue_ignores_a_daemon_only_module_finding() {
 
 #[test]
 fn doctor_sigint_to_ck_or_to_the_foreground_fix_restores_owned_stop() {
-    for foreground in [false, true] {
+    // Windows gives the helper a separate process group and has no terminal
+    // foreground group to transfer. Ctrl-C there goes to ck, not the helper.
+    let foreground_cases = if cfg!(windows) {
+        &[false][..]
+    } else {
+        &[false, true]
+    };
+    for &foreground in foreground_cases {
         let mut rig = Rig::new();
         let program = rig.program("stopped", json!({"fix": "sleep", "needs_stop": true}));
         let later = rig.program("z-later", json!({}));
@@ -1555,12 +1768,13 @@ fn doctor_sigint_to_ck_or_to_the_foreground_fix_restores_owned_stop() {
         assert_eq!(daemon.enabled_calls(), [false]);
         if foreground {
             // The child owns the terminal so its own consent dialogue can work.
+            #[cfg(unix)]
             assert_eq!(tty.foreground(), Some(pid));
             tty.send("\x03");
         } else {
-            tty.signal(Signal::INT);
+            tty.interrupt();
             tty.expect("Interrupted; waiting for", 1);
-            tty.signal(Signal::INT);
+            tty.interrupt();
             tty.expect("Interrupted; waiting for", 2);
         }
         let (stdout, dialogue) = tty.finish(130);
@@ -1587,7 +1801,7 @@ fn doctor_sigint_to_ck_or_to_the_foreground_fix_restores_owned_stop() {
 }
 
 #[test]
-fn doctor_sigterm_during_stop_skips_fix_and_sigterm_during_start_overrides_failure() {
+fn doctor_interrupt_during_stop_skips_fix_and_during_start_overrides_failure() {
     for start_reply in [StartReply::Ack, StartReply::Unanswered] {
         let mut rig = Rig::new();
         let program = rig.program("stopped", json!({"needs_stop": true}));
@@ -1602,18 +1816,23 @@ fn doctor_sigterm_during_stop_skips_fix_and_sigterm_during_start_overrides_failu
         tty.expect(FIX_PROMPT, 1);
         let during_stop = matches!(start_reply, StartReply::Ack);
         if during_stop {
-            *daemon.events.interrupt_pid.lock().unwrap() = Some(tty.pid());
+            daemon
+                .events
+                .hold_stop
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
         tty.send("y\n");
         if during_stop {
+            until(|| (daemon.enabled_calls() == [false]).then_some(()));
+            tty.secondary_interrupt();
             tty.expect("waiting for a module stop or operator approval", 1);
             daemon.events.stop_ack.notify_one();
         } else {
             until(|| (daemon.enabled_calls() == [false, true]).then_some(()));
-            tty.signal(Signal::TERM);
+            tty.secondary_interrupt();
             tty.expect("Interrupted; waiting for", 1);
         }
-        let (stdout, _) = tty.finish(143);
+        let (stdout, _) = tty.finish(SECONDARY_EXIT);
         let result: Value = serde_json::from_str(&stdout).unwrap();
         let fix = &result["fix"]["module_fixes"][0];
         assert_eq!(daemon.enabled_calls(), [false, true]);
@@ -1630,7 +1849,7 @@ fn doctor_sigterm_during_stop_skips_fix_and_sigterm_during_start_overrides_failu
 }
 
 #[test]
-fn doctor_sigterm_during_first_pass_does_not_revert_an_offered_window() {
+fn doctor_interrupt_during_first_pass_does_not_revert_an_offered_window() {
     use ck_ui::time::{Timestamp, UtcOffset};
     use subc_core::window::journal::{Action, Owner, Record, Step};
 
@@ -1653,13 +1872,17 @@ fn doctor_sigterm_during_first_pass_does_not_revert_an_offered_window() {
     fs::create_dir_all(&directory).unwrap();
     let journal = directory.join("journal");
     {
+        #[cfg(unix)]
         use std::os::unix::fs::OpenOptionsExt;
+        #[cfg(unix)]
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(&journal)
             .unwrap();
+        #[cfg(windows)]
+        let mut file = subc_os::windows_acl::create_private_file(&journal).unwrap();
         let begin = Record::Begin {
             version: 1,
             id: id.clone(),
@@ -1667,13 +1890,10 @@ fn doctor_sigterm_during_first_pass_does_not_revert_an_offered_window() {
             unprotected: true,
             note: None,
         };
-        let owner = Owner {
-            pid: 42,
-            start_time: 1,
-            executable: Some(root.join("gone")),
-            executable_identity: None,
-            boot: Some("01234567-89ab-cdef-0123-456789abcdef".into()),
-        };
+        // Preserve the platform's boot identity, but represent a process that
+        // no longer owns the window because its start time does not match.
+        let mut owner = Owner::current().unwrap();
+        owner.start_time = if owner.start_time == 1 { 2 } else { 1 };
         let step = Record::Step {
             step: Box::new(Step {
                 target: root.join("test-fixture"),
@@ -1693,11 +1913,11 @@ fn doctor_sigterm_during_first_pass_does_not_revert_an_offered_window() {
         }
     }
     let before = fs::read(&journal).unwrap();
-    let tty = Tty::start(&rig.command(&["doctor", "--fix", "--json"]));
+    let mut tty = Tty::start(&rig.command(&["doctor", "--fix", "--json"]));
     let pid = rig.pid(&program, "check.started");
-    tty.signal(Signal::TERM);
+    tty.secondary_interrupt();
     tty.expect("waiting for a module check", 1);
-    let (stdout, dialogue) = tty.finish(143);
+    let (stdout, dialogue) = tty.finish(SECONDARY_EXIT);
     let result: Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(result["offer"]["window_id"], id, "{result}");
     assert_eq!(result["fix"]["skipped"], "interrupted", "{result}");

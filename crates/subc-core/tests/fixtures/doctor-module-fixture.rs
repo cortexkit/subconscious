@@ -111,9 +111,14 @@ fn main() {
         ["doctor", "manifest"] => "manifest",
         _ => process::exit(2),
     };
+    let stage_identity = scenario.record_stages.then(|| {
+        let pid = process::id();
+        let start_time = subc_os::start_time(pid).expect("read fixture process start time");
+        serde_json::json!({"pid": pid, "start_time": start_time, "image": executable}).to_string()
+    });
     let record_stage = |event: &str| {
-        if scenario.record_stages {
-            fs::write(stage_path(stage, event), process::id().to_string()).unwrap();
+        if let Some(identity) = &stage_identity {
+            fs::write(stage_path(stage, event), identity).unwrap();
         }
     };
     record_stage("started");

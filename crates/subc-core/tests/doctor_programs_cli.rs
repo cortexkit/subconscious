@@ -37,6 +37,13 @@ struct Rig {
     entries: BTreeMap<String, Value>,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct FixtureProcess {
+    pid: u32,
+    start_time: u64,
+    image: PathBuf,
+}
+
 impl Rig {
     fn new() -> Self {
         let root = ScratchDir::new("doctor-programs-cli");
@@ -85,9 +92,9 @@ impl Rig {
         ))
     }
 
-    fn pid(&self, program: &Path, stage: &str) -> u32 {
+    fn process(&self, program: &Path, stage: &str) -> FixtureProcess {
         let path = self.stage(program, stage);
-        until(|| fs::read_to_string(&path).ok()?.parse::<u32>().ok())
+        until(|| serde_json::from_slice(&fs::read(&path).ok()?).ok())
     }
 
     fn write_config(&self) {
@@ -238,19 +245,79 @@ fn document(path: &Path) -> Value {
     serde_json::from_slice(&data).unwrap_or_else(|error| panic!("{error}: {}", text(&data)))
 }
 
-fn gone(pid: u32) -> bool {
+fn observed_start_time(pid: u32) -> io::Result<Option<u64>> {
     #[cfg(unix)]
     {
-        test_kill_process(Pid::from_raw(pid as i32).unwrap()) == Err(rustix::io::Errno::SRCH)
+        if let Some(start_time) = subc_os::start_time(pid) {
+            return Ok(Some(start_time));
+        }
+        // An unreadable or unreaped process is not proof of teardown.
+        match test_kill_process(Pid::from_raw(pid as i32).unwrap()) {
+            Err(rustix::io::Errno::SRCH) => Ok(None),
+            Ok(()) => Err(io::Error::other(
+                "process exists, but its start time is unavailable",
+            )),
+            Err(error) => Err(error.into()),
+        }
     }
     #[cfg(windows)]
     {
-        !subc_jobobject::process_exists(pid)
+        let Some(process) = subc_os::Process::open(pid)? else {
+            return Ok(None);
+        };
+        if let Some(observation) = process.observe() {
+            Ok(Some(observation.start_time))
+        } else if process.wait_for_exit(Duration::ZERO)? {
+            Ok(None)
+        } else {
+            Err(io::Error::other(
+                "process exists, but its start time is unavailable",
+            ))
+        }
     }
 }
 
-fn assert_gone(pid: u32) {
-    assert!(gone(pid), "fixture {pid} still exists");
+impl FixtureProcess {
+    fn absent(&self, observation: &io::Result<Option<u64>>) -> bool {
+        // A replacement at the same PID does not keep the fixture alive.
+        observation
+            .as_ref()
+            .is_ok_and(|time| *time != Some(self.start_time))
+    }
+}
+
+fn gone(process: &FixtureProcess) -> bool {
+    process.absent(&observed_start_time(process.pid))
+}
+
+fn assert_gone(process: &FixtureProcess) {
+    let observed = observed_start_time(process.pid);
+    if !process.absent(&observed) {
+        let current = subc_os::local_peer::DiagnosticProcess::capture(process.pid);
+        let image = current.short_name();
+        let start_time = subc_os::start_time(process.pid);
+        panic!("fixture {} was not gone: expected image {:?}, start {}; liveness probe {observed:?}; current image {image:?}, start {start_time:?}", process.pid, process.image, process.start_time);
+    }
+}
+
+#[test]
+fn doctor_gone_compares_process_start_time_at_the_same_pid() {
+    let pid = std::process::id();
+    let start_time = subc_os::start_time(pid).unwrap();
+    let current = FixtureProcess {
+        pid,
+        start_time,
+        image: std::env::current_exe().unwrap(),
+    };
+    assert!(!gone(&current), "the current process is still alive");
+    let other = FixtureProcess {
+        start_time: start_time ^ 1,
+        ..current
+    };
+    assert!(
+        gone(&other),
+        "a different creation time identifies a different process"
+    );
 }
 
 struct Tty {
@@ -754,7 +821,7 @@ fn doctor_signal_during_fix_finishes_and_writes_requested_report() {
         let mut tty = Tty::start(&command);
         tty.expect(FIX_PROMPT, 1);
         tty.send("y\n");
-        let pid = rig.pid(&program, "fix.started");
+        let fixture = rig.process(&program, "fix.started");
         if save {
             tty.secondary_interrupt();
         } else {
@@ -768,7 +835,7 @@ fn doctor_signal_during_fix_finishes_and_writes_requested_report() {
             "fixed"
         );
         assert!(!rig.stage(&program, "recheck.started").exists());
-        assert_gone(pid);
+        assert_gone(&fixture);
         if save {
             assert_eq!(document(&report)["fix"], result["fix"]);
         }
@@ -783,7 +850,7 @@ fn doctor_partial_registration_keeps_checks_and_the_sigint_listener() {
         let mut command = rig.command(&["doctor", "--fix", "--json"]);
         command.env("CK_TEST_FAIL_SIGTERM_REGISTRATION", "1");
         let mut tty = Tty::start(&command);
-        let pid = rig.pid(&program, "check.started");
+        let fixture = rig.process(&program, "check.started");
         if signal {
             tty.interrupt();
             tty.expect("waiting for a module check", 1);
@@ -801,7 +868,7 @@ fn doctor_partial_registration_keeps_checks_and_the_sigint_listener() {
         );
         assert!(!dialogue.contains(FIX_PROMPT));
         assert!(!rig.stage(&program, "fix.started").exists());
-        assert_gone(pid);
+        assert_gone(&fixture);
     }
 }
 
@@ -811,15 +878,15 @@ fn doctor_interrupt_latches_across_pool_jobs_and_during_a_second_pass() {
     let early = rig.program("early", json!({"check": "clean"}));
     let slow = rig.program("slow", json!({"check": "clean", "check_sleep_ms": 1600}));
     let mut tty = Tty::start(&rig.command(&["doctor", "--json"]));
-    let early_pid = rig.pid(&early, "check.finished");
-    let slow_pid = rig.pid(&slow, "check.started");
+    let early_process = rig.process(&early, "check.finished");
+    let slow_process = rig.process(&slow, "check.started");
     tty.secondary_interrupt();
     tty.expect("waiting for a module check", 1);
     let (stdout, _) = tty.finish(SECONDARY_EXIT);
     let result: Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(result["modules"].as_array().unwrap().len(), 2);
-    assert_gone(early_pid);
-    assert_gone(slow_pid);
+    assert_gone(&early_process);
+    assert_gone(&slow_process);
 
     let mut rig = Rig::new();
     let program = rig.program(
@@ -829,7 +896,7 @@ fn doctor_interrupt_latches_across_pool_jobs_and_during_a_second_pass() {
     let mut tty = Tty::start(&rig.command(&["doctor", "--json", "--fix"]));
     tty.expect(FIX_PROMPT, 1);
     tty.send("y\n");
-    let pid = rig.pid(&program, "recheck.started");
+    let fixture = rig.process(&program, "recheck.started");
     tty.secondary_interrupt();
     tty.expect("waiting for a module check", 1);
     let (stdout, dialogue) = tty.finish(SECONDARY_EXIT);
@@ -840,7 +907,7 @@ fn doctor_interrupt_latches_across_pool_jobs_and_during_a_second_pass() {
     );
     assert_eq!(result["modules"][0]["outcome"], "clean");
     assert_eq!(dialogue.matches(FIX_PROMPT).count(), 1);
-    assert_gone(pid);
+    assert_gone(&fixture);
 }
 
 #[test]
@@ -1064,16 +1131,16 @@ fn doctor_issue_awaits_manifest_batch_and_skips_replaced_programs() {
     let valid = rig.program("gamma-valid", json!({}));
     let api = FakeApi::public();
     let mut tty = rig.issue_tty(&api);
-    let pid = rig.pid(&changed, "check.finished");
-    until(|| gone(pid).then_some(()));
+    let fixture = rig.process(&changed, "check.finished");
+    until(|| gone(&fixture).then_some(()));
     fs::rename(&changed, changed.with_extension("saved")).unwrap();
     fs::copy(FIXTURE, &changed).unwrap();
-    let hanging_pid = rig.pid(&slow, "manifest.started");
-    let valid_pid = rig.pid(&valid, "manifest.finished");
+    let hanging_process = rig.process(&slow, "manifest.started");
+    let valid_process = rig.process(&valid, "manifest.finished");
     assert!(!tty.read_terminal().contains(TITLE_PROMPT));
     tty.expect(TITLE_PROMPT, 1);
-    assert_gone(hanging_pid);
-    assert_gone(valid_pid);
+    assert_gone(&hanging_process);
+    assert_gone(&valid_process);
     assert!(!rig.stage(&changed, "manifest.started").exists());
     tty.answer_title("Ready", "");
     tty.expect(ISSUE_PROMPT, 1);
@@ -1226,8 +1293,8 @@ fn doctor_issue_interrupted_during_manifest_batch_skips_all_filing() {
     let api = FakeApi::public();
     rig.gh(0, 0, false);
     let mut tty = rig.issue_tty(&api);
-    let a_pid = rig.pid(&a, "manifest.finished");
-    let b_pid = rig.pid(&b, "manifest.started");
+    let a_process = rig.process(&a, "manifest.finished");
+    let b_process = rig.process(&b, "manifest.started");
     tty.secondary_interrupt();
     tty.expect("waiting for a module manifest", 1);
     let (stdout, terminal) = tty.finish(SECONDARY_EXIT);
@@ -1237,8 +1304,8 @@ fn doctor_issue_interrupted_during_manifest_batch_skips_all_filing() {
     );
     assert!(!terminal.contains(TITLE_PROMPT));
     assert!(!rig.reports().exists());
-    assert_gone(a_pid);
-    assert_gone(b_pid);
+    assert_gone(&a_process);
+    assert_gone(&b_process);
     api.assert_requests(0);
     assert!(!rig.root.join("gh.auth").exists());
 }
@@ -1543,7 +1610,7 @@ fn doctor_full_runs_one_at_a_time_and_uses_the_check_mode_for_fixes() {
     fs::remove_file(rig.stage(&later, "check.started")).unwrap();
 
     let mut tty = Tty::start(&rig.command(&["doctor", "--full", "--fix"]));
-    rig.pid(&first, "full.started");
+    rig.process(&first, "full.started");
     tty.expect("of up to 30 min", 2);
     let dialogue = tty.read_terminal();
     let mut progress = dialogue
@@ -1585,7 +1652,7 @@ fn doctor_full_restores_after_success_and_failure() {
         tty.expect(DEEP_STOP_PROMPT, 1);
         assert!(daemon.enabled_calls().is_empty());
         tty.send("y\n");
-        let pid = rig.pid(&program, "full-retry.started");
+        let fixture = rig.process(&program, "full-retry.started");
         assert_eq!(daemon.enabled_calls(), [false]);
         fs::write(rig.stage(&program, "full-retry.release"), []).unwrap();
         let (stdout, dialogue) = tty.finish(1);
@@ -1599,7 +1666,7 @@ fn doctor_full_restores_after_success_and_failure() {
         );
         assert!(rig.stage(&later, "full.started").exists());
         assert!(!rig.stage(&program, "check.started").exists());
-        assert_gone(pid);
+        assert_gone(&fixture);
     }
 }
 
@@ -1620,7 +1687,7 @@ fn doctor_full_ctrl_c_cancels_the_stopped_check_and_restarts_promptly() {
     let mut tty = Tty::start(&rig.command(&["doctor", "--full", "--report", "report.json"]));
     tty.expect(DEEP_STOP_PROMPT, 1);
     tty.send("y\n");
-    let pid = rig.pid(&program, "full-retry.started");
+    let fixture = rig.process(&program, "full-retry.started");
     assert_eq!(daemon.enabled_calls(), [false]);
     #[cfg(unix)]
     assert_eq!(tty.foreground(), Some(tty.pid().as_raw_pid() as u32));
@@ -1637,7 +1704,7 @@ fn doctor_full_ctrl_c_cancels_the_stopped_check_and_restarts_promptly() {
     if !restarted_promptly {
         // A build that doesn't cancel the check on Ctrl-C leaves ck running; end the
         // ck process this test started so the failure doesn't leave it behind.
-        let _ = kill_process(Pid::from_raw(pid as i32).unwrap(), Signal::TERM);
+        let _ = kill_process(Pid::from_raw(fixture.pid as i32).unwrap(), Signal::TERM);
     }
     let (stdout, dialogue) = tty.finish(130);
     assert!(
@@ -1664,7 +1731,7 @@ fn doctor_full_ctrl_c_cancels_the_stopped_check_and_restarts_promptly() {
         .iter()
         .any(|row| row["owner"] == "blocked" && row["layer"] == "module_program"));
     assert!(!rig.stage(&later, "full.started").exists());
-    assert_gone(pid);
+    assert_gone(&fixture);
 }
 
 #[test]
@@ -1768,12 +1835,12 @@ fn doctor_sigint_to_ck_or_to_the_foreground_fix_restores_owned_stop() {
         let mut tty = Tty::start(&rig.command(&["doctor", "--fix", "--json"]));
         tty.expect(FIX_PROMPT, 1);
         tty.send("y\n");
-        let pid = rig.pid(&program, "fix.started");
+        let fixture = rig.process(&program, "fix.started");
         assert_eq!(daemon.enabled_calls(), [false]);
         if foreground {
             // The child owns the terminal so its own consent dialogue can work.
             #[cfg(unix)]
-            assert_eq!(tty.foreground(), Some(pid));
+            assert_eq!(tty.foreground(), Some(fixture.pid));
             tty.send("\x03");
         } else {
             tty.interrupt();
@@ -1800,7 +1867,7 @@ fn doctor_sigint_to_ck_or_to_the_foreground_fix_restores_owned_stop() {
         assert_eq!(dialogue.matches(FIX_PROMPT).count(), 1);
         assert!(!rig.stage(&later, "fix.started").exists());
         assert_eq!(daemon.enabled_calls(), [false, true]);
-        assert_gone(pid);
+        assert_gone(&fixture);
     }
 }
 
@@ -1847,7 +1914,7 @@ fn doctor_interrupt_during_stop_skips_fix_and_during_start_overrides_failure() {
         } else {
             assert_eq!(fix["result"]["outcome"], "fixed");
             assert_eq!(fix["restart"], "failed");
-            assert_gone(rig.pid(&program, "fix.finished"));
+            assert_gone(&rig.process(&program, "fix.finished"));
         }
     }
 }
@@ -1918,7 +1985,7 @@ fn doctor_interrupt_during_first_pass_does_not_revert_an_offered_window() {
     }
     let before = fs::read(&journal).unwrap();
     let mut tty = Tty::start(&rig.command(&["doctor", "--fix", "--json"]));
-    let pid = rig.pid(&program, "check.started");
+    let fixture = rig.process(&program, "check.started");
     tty.secondary_interrupt();
     tty.expect("waiting for a module check", 1);
     let (stdout, dialogue) = tty.finish(SECONDARY_EXIT);
@@ -1931,5 +1998,5 @@ fn doctor_interrupt_during_first_pass_does_not_revert_an_offered_window() {
     );
     assert!(!dialogue.contains(FIX_PROMPT));
     assert_eq!(fs::read(&journal).unwrap(), before);
-    assert_gone(pid);
+    assert_gone(&fixture);
 }

@@ -527,6 +527,10 @@ impl FakeApi {
                     }
                     Err(error) => panic!("accept public API request: {error}"),
                 };
+                // On Windows an accepted socket inherits the listener's
+                // non-blocking mode (Unix sockets don't), so a read issued
+                // before the request bytes arrive fails with WouldBlock.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();

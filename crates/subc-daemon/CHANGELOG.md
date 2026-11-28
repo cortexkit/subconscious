@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.54.7
+
+- Test-only: keep the registration retirement socket open in an execed helper
+  so it cannot stall concurrent child spawns before the tests reach retirement.
+
 ## 0.54.6
 
 - Apply workspace settings files only when the workspace root is approved.

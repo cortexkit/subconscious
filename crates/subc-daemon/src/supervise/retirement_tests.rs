@@ -939,38 +939,101 @@ async fn registration_retirement_target_after_readiness_cannot_deliver_committed
     .expect("read-side cleanup must remove the transient route");
 }
 
-struct PreExecSibling {
-    release: std::io::PipeWriter,
+struct RegistrationSocketHolder {
+    release: Option<std::io::PipeWriter>,
     task: tokio::task::JoinHandle<()>,
 }
 
-impl Drop for PreExecSibling {
-    fn drop(&mut self) {
+impl RegistrationSocketHolder {
+    fn release(&mut self) -> std::io::Result<()> {
         use std::io::Write;
-        let _ = self.release.write_all(&[1]);
+        if let Some(mut release) = self.release.take() {
+            release.write_all(b"\n")?;
+        }
+        Ok(())
+    }
+
+    async fn finish(mut self) {
+        self.release().unwrap();
+        (&mut self.task).await.unwrap();
     }
 }
 
-async fn pre_exec_sibling(endpoint: &std::os::unix::net::UnixStream) -> PreExecSibling {
-    use std::os::fd::AsRawFd;
-    let mut command = std::process::Command::new("/bin/true");
-    let (mut ready, release) =
-        subc_os::fork_exec_test::pause_before_exec(&mut command, endpoint.as_raw_fd()).unwrap();
-    let task = tokio::task::spawn_blocking(move || {
-        command.spawn().unwrap().wait().unwrap();
+impl Drop for RegistrationSocketHolder {
+    fn drop(&mut self) {
+        let _ = self.release();
+    }
+}
+
+fn hold_registration_socket(endpoint: &std::os::unix::net::UnixStream) -> RegistrationSocketHolder {
+    use std::{os::fd::OwnedFd, process::Stdio};
+
+    // Keep a copy of the socket in another process until retirement is checked.
+    // Exec before waiting so the holder cannot keep an unrelated concurrent
+    // spawn's close-on-exec status socket open.
+    let (reader, release) = std::io::pipe().unwrap();
+    let mut command = tokio::process::Command::new("/bin/sh");
+    command
+        .args(["-c", "IFS= read -r release"])
+        .stdin(reader)
+        .stdout(Stdio::null())
+        .stderr(OwnedFd::from(endpoint.try_clone().unwrap()))
+        .kill_on_drop(true);
+    let mut child = subc_os::child_spawn::tokio_spawn(&mut command).unwrap();
+    let task = tokio::spawn(async move {
+        assert!(child.wait().await.unwrap().success());
     });
-    tokio::task::spawn_blocking(move || {
-        use std::io::Read;
-        ready.read_exact(&mut [0; 8]).unwrap();
-    })
-    .await
-    .unwrap();
-    PreExecSibling { release, task }
+    RegistrationSocketHolder {
+        release: Some(release),
+        task,
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn registration_socket_holder_does_not_delay_an_earlier_spawn() {
+    let (_, worker) = concat!(module_path!(), "::registration_socket_holder_worker")
+        .split_once("::")
+        .unwrap();
+    let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", worker, "--ignored", "--nocapture"])
+        .kill_on_drop(true);
+    let mut child = subc_os::child_spawn::tokio_spawn(&mut command).unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+        .await
+        .expect("socket-holder worker did not finish")
+        .unwrap();
+    assert!(status.success(), "socket-holder worker failed: {status}");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "subprocess fixture; isolates the exec-status socket from other forks"]
+async fn registration_socket_holder_worker() {
+    let (endpoint, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    // Model a concurrent Command::spawn at the point where its CLOEXEC
+    // exec-status pair is open but the parent has not dropped the child end.
+    let (status, child_status) = std::os::unix::net::UnixStream::pair().unwrap();
+    status.set_nonblocking(true).unwrap();
+    let mut status = tokio::net::UnixStream::from_std(status).unwrap();
+    let holder = hold_registration_socket(&endpoint);
+    // Once the concurrent child execs and the parent drops its own copy,
+    // the holder must not prevent EOF, which is what lets spawn return.
+    drop(child_status);
+    let result = tokio::time::timeout(Duration::from_secs(2), status.read(&mut [0])).await;
+    holder.finish().await;
+    assert_eq!(
+        result
+            .expect("socket holder kept the concurrent exec-status socket open")
+            .unwrap(),
+        0
+    );
 }
 
 async fn first_observation(mode: &'static str, caller: bool) {
     let (endpoint, peer) = std::os::unix::net::UnixStream::pair().unwrap();
-    let sibling = pre_exec_sibling(&endpoint).await;
+    let sibling = hold_registration_socket(&endpoint);
     let mut rig = rig().await;
     let token = mint(&mut rig, ClaimPurpose::SelfConnection).await.claim;
     let pending_claim = mint(&mut rig, ClaimPurpose::Helper).await.claim;
@@ -1112,7 +1175,7 @@ async fn first_observation(mode: &'static str, caller: bool) {
         .unwrap();
     // Retirement has disabled launch readiness and voided pending claims, but
     // has not notified connection loops yet. Neither the unreaped child nor a
-    // pre-exec descriptor copy can keep the channel or a claim alive here.
+    // descriptor copy held by another process can keep the channel or a claim alive.
     assert!(!rig.spawn.launch_ready());
     assert_eq!(rig.spawn.claims.get().unwrap().pending_count_for_test(), 0);
     assert!(subc_os::child_exit::observe(pid).unwrap().is_some());
@@ -1155,10 +1218,7 @@ async fn first_observation(mode: &'static str, caller: bool) {
     crate::control::claims::tests::error(&reply, "claim_invalid");
     assert!(refused.recv().await.is_none());
     child.finish_exit(false).await.unwrap();
-    use std::io::Write;
-    let mut sibling = sibling;
-    sibling.release.write_all(&[1]).unwrap();
-    (&mut sibling.task).await.unwrap();
+    sibling.finish().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

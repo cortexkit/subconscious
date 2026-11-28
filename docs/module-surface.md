@@ -323,10 +323,14 @@ The module keeps running, with its stores, caches and in-flight work. It
 reconnects to the daemon's local socket (the Unix socket named in the
 connection file) before the deadline, with a HELLO that carries the
 `resume_token` in place of a launch nonce. The new daemon accepts it only from
-the same process (pid and start time) with the same declarations. The module
-then repeats its normal start sequence: catalog update, settings, scope sync.
-Everything that lived on the old connection, such as routes, watches and
-subscriptions, must be opened again.
+the same process (pid and start time) with the same declarations. The resume
+HELLO registers the module like a first HELLO: its manifest's `ready` takes
+effect at once, so a module that declares its providers in HELLO needs no
+`catalog.update`. The new daemon holds none of the module's scope records, and
+every scoped route that names one is refused until they return, so a scope
+owner sends `scope.sync` first. Then it reads its settings again and sends any
+`catalog.update` it normally sends. Everything that lived on the old
+connection, such as routes, watches and subscriptions, must be opened again.
 
 While the switch is in progress, the daemon refuses new requests with
 `module_reloading` and `detail.reason: "daemon_upgrade"`, a code that proves
